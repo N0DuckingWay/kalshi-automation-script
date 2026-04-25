@@ -1,0 +1,12 @@
+Channels:
+ - conda-forge
+ - defaults
+Platform: osx-arm64
+Collecting package metadata (repodata.json): - \ | / - \ | / - \ | / - \ done
+Solving environment: / - \ | / failed
+Channels:
+ - conda-forge
+ - defaults
+Platform: osx-arm64
+Collecting package metadata (repodata.json): \ | / - \ | / - \ | / - \ | done
+Solving environment: - \ | / - failed
