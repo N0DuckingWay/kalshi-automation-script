@@ -1,0 +1,551 @@
+"""Generate a self-contained Plotly HTML backtest dashboard."""
+import logging
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import yfinance as yf
+from plotly.subplots import make_subplots
+
+from .backtester import BacktestTrade
+from .config import PROJECT_ROOT
+
+
+# ─── Metric computation ───────────────────────────────────────────────────────
+
+def _sharpe(daily_returns: pd.Series, rf: float = 0.0) -> float:
+    excess = daily_returns - rf / 252
+    std = excess.std()
+    return float(excess.mean() / std * np.sqrt(252)) if std > 0 else 0.0
+
+
+def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
+    excess = daily_returns - rf / 252
+    neg = excess[excess < 0]
+    std_neg = neg.std()
+    return float(excess.mean() / std_neg * np.sqrt(252)) if std_neg > 0 else 0.0
+
+
+def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
+    rolling_max = equity.cummax()
+    dd = (equity - rolling_max) / rolling_max
+    max_dd = float(dd.min())
+    idx = dd.idxmin()
+    when = idx if idx is not None else None
+    return max_dd, when
+
+
+def _brier_score(trades: list[BacktestTrade]) -> float:
+    scores = []
+    for t in trades:
+        for prob, outcome in [(t.entry_pA, t.outcome_a), (t.entry_pB, t.outcome_b)]:
+            actual = 1.0 if outcome == "yes" else 0.0
+            scores.append((prob - actual) ** 2)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def _log_loss(trades: list[BacktestTrade]) -> float:
+    eps = 1e-7
+    losses = []
+    for t in trades:
+        for prob, outcome in [(t.entry_pA, t.outcome_a), (t.entry_pB, t.outcome_b)]:
+            actual = 1.0 if outcome == "yes" else 0.0
+            p = max(eps, min(1 - eps, prob))
+            losses.append(-(actual * np.log(p) + (1 - actual) * np.log(1 - p)))
+    return float(np.mean(losses)) if losses else 0.0
+
+
+def _kelly_fraction(pA: float, nA: float, pB: float) -> float:
+    """Simplified Kelly: edge / (1/return_ratio) for the combined trade."""
+    cost    = nA + pB
+    payoff  = 1.0 - nA - pB
+    if cost <= 0 or payoff <= 0:
+        return 0.0
+    return payoff / (1.0 / (payoff / cost + 1))  # ≈ profit_ratio * (1 - profit_ratio)
+
+
+# ─── Section builders ─────────────────────────────────────────────────────────
+
+_COLORS = {
+    "strategy": "#2196F3",
+    "sp500":    "#FF9800",
+    "naive":    "#9E9E9E",
+    "profit":   "#4CAF50",
+    "loss":     "#F44336",
+    "dd":       "#F44336",
+    "cash":     "#66BB6A",
+    "invested": "#42A5F5",
+}
+
+_SECTION_STYLE = """
+<div style="margin:40px 0 0 0; padding:0 0 8px 0;
+            border-bottom:2px solid #E0E0E0; font-size:22px;
+            font-weight:700; color:#212121; font-family:sans-serif;">
+{title}
+</div>
+"""
+
+_KPI_TEMPLATE = """
+<div style="display:inline-block; margin:12px 16px 12px 0; padding:16px 24px;
+            background:#F5F5F5; border-radius:10px; min-width:140px;
+            font-family:sans-serif;">
+  <div style="font-size:12px; color:#757575; text-transform:uppercase;
+              letter-spacing:0.5px;">{label}</div>
+  <div style="font-size:26px; font-weight:700; color:{color};">{value}</div>
+</div>
+"""
+
+
+def _kpi(label: str, value: str, color: str = "#212121") -> str:
+    return _KPI_TEMPLATE.format(label=label, value=value, color=color)
+
+
+def _fig_html(fig: go.Figure, height: int = 400) -> str:
+    fig.update_layout(
+        height=height,
+        margin=dict(l=60, r=20, t=40, b=40),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="sans-serif", size=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+# ─── Section 1: Portfolio Performance ────────────────────────────────────────
+
+def _section_performance(
+    equity_df: pd.DataFrame,
+    trades: list[BacktestTrade],
+    start_date: date,
+    initial_balance: float,
+) -> str:
+    final_value  = float(equity_df["portfolio_value"].iloc[-1])
+    total_return = (final_value - initial_balance) / initial_balance
+    daily_ret    = equity_df["daily_return"]
+    sharpe       = _sharpe(daily_ret)
+    sortino      = _sortino(daily_ret)
+    max_dd, dd_when = _max_drawdown(equity_df["portfolio_value"])
+    win_rate     = sum(1 for t in trades if t.profit > 0) / len(trades) if trades else 0
+    avg_ret      = np.mean([t.profit_ratio for t in trades]) if trades else 0
+
+    dd_str = f"({dd_when})" if dd_when else ""
+
+    kpis = "".join([
+        _kpi("Total Return",  f"{total_return:+.1%}", "#2196F3"),
+        _kpi("Sharpe Ratio",  f"{sharpe:.2f}"),
+        _kpi("Sortino Ratio", f"{sortino:.2f}"),
+        _kpi("Max Drawdown",  f"{max_dd:.1%} {dd_str}", "#F44336"),
+        _kpi("Win Rate",      f"{win_rate:.1%}", "#4CAF50"),
+        _kpi("Avg Return/Trade", f"{avg_ret:.1%}"),
+        _kpi("Total Trades",  str(len(trades))),
+    ])
+
+    # Equity curve
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=equity_df["date"], y=equity_df["portfolio_value"],
+        name="Strategy", line=dict(color=_COLORS["strategy"], width=2),
+    ))
+    fig.update_layout(title="Equity Curve", yaxis_title="Portfolio Value ($)",
+                      xaxis_title="Date")
+
+    # Drawdown chart
+    rolling_max = equity_df["portfolio_value"].cummax()
+    dd_series   = (equity_df["portfolio_value"] - rolling_max) / rolling_max
+    fig2 = go.Figure(go.Scatter(
+        x=equity_df["date"], y=dd_series * 100,
+        fill="tozeroy", name="Drawdown %",
+        line=dict(color=_COLORS["dd"]), fillcolor="rgba(244,67,54,0.2)",
+    ))
+    fig2.update_layout(title="Drawdown (%)", yaxis_title="Drawdown (%)", xaxis_title="Date")
+
+    return (
+        _SECTION_STYLE.format(title="Portfolio Performance")
+        + kpis
+        + _fig_html(fig)
+        + _fig_html(fig2, height=280)
+    )
+
+
+# ─── Section 2: Returns Decomposition ────────────────────────────────────────
+
+def _section_decomposition(trades: list[BacktestTrade]) -> str:
+    if not trades:
+        return _SECTION_STYLE.format(title="Returns Decomposition") + "<p>No trades.</p>"
+
+    df = pd.DataFrame([{
+        "entry_date":    t.entry_date,
+        "exit_date":     t.exit_date,
+        "profit_ratio":  t.profit_ratio,
+        "profit":        t.profit,
+        "category":      t.category,
+        "holding_days":  t.holding_days,
+        "entry_pA":      t.entry_pA,
+        "n":             t.n,
+        "pair_type":     t.pair_type,
+    } for t in trades])
+
+    df["month"] = pd.to_datetime(df["entry_date"]).dt.to_period("M").astype(str)
+
+    # Monthly returns bar chart
+    monthly = df.groupby("month")["profit"].sum().reset_index()
+    fig_monthly = go.Figure(go.Bar(
+        x=monthly["month"], y=monthly["profit"],
+        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in monthly["profit"]],
+    ))
+    fig_monthly.update_layout(title="Monthly P&L ($)", xaxis_title="Month", yaxis_title="P&L ($)")
+
+    # Category breakdown
+    cat = df.groupby("category")["profit"].sum().sort_values()
+    fig_cat = go.Figure(go.Bar(
+        y=cat.index, x=cat.values, orientation="h",
+        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in cat.values],
+    ))
+    fig_cat.update_layout(title="P&L by Category ($)", xaxis_title="P&L ($)")
+
+    # Entry price bucket
+    bins   = [0, 0.20, 0.40, 0.60, 0.80, 1.01]
+    labels = ["<20¢", "20–40¢", "40–60¢", "60–80¢", ">80¢"]
+    df["price_bucket"] = pd.cut(df["entry_pA"], bins=bins, labels=labels)
+    price_grp = df.groupby("price_bucket", observed=True)["profit"].sum()
+    fig_price = go.Figure(go.Bar(
+        x=price_grp.index.astype(str), y=price_grp.values,
+        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in price_grp.values],
+    ))
+    fig_price.update_layout(title="P&L by Entry Price Bucket", xaxis_title="Price Bucket",
+                            yaxis_title="P&L ($)")
+
+    # Holding duration histogram
+    fig_dur = go.Figure(go.Histogram(
+        x=df["holding_days"], nbinsx=20,
+        marker_color=_COLORS["strategy"],
+    ))
+    fig_dur.update_layout(title="Holding Period Distribution", xaxis_title="Days",
+                           yaxis_title="Count")
+
+    return (
+        _SECTION_STYLE.format(title="Returns Decomposition")
+        + _fig_html(fig_monthly)
+        + _fig_html(fig_cat, height=350)
+        + _fig_html(fig_price)
+        + _fig_html(fig_dur)
+    )
+
+
+# ─── Section 3: Calibration Analysis ─────────────────────────────────────────
+
+def _section_calibration(trades: list[BacktestTrade]) -> str:
+    if not trades:
+        return _SECTION_STYLE.format(title="Calibration Analysis") + "<p>No trades.</p>"
+
+    # Collect (predicted_prob, actual_outcome) pairs
+    probs, actuals = [], []
+    for t in trades:
+        probs.append(t.entry_pA); actuals.append(1 if t.outcome_a == "yes" else 0)
+        probs.append(t.entry_pB); actuals.append(1 if t.outcome_b == "yes" else 0)
+
+    brier = _brier_score(trades)
+    ll    = _log_loss(trades)
+
+    # Reliability diagram — 10 equal-width bins
+    bins   = np.linspace(0, 1, 11)
+    labels = []
+    mean_pred, mean_act = [], []
+    counts = []
+    for i in range(len(bins) - 1):
+        mask = [(bins[i] <= p < bins[i + 1]) for p in probs]
+        if sum(mask) == 0:
+            continue
+        bin_probs = [p for p, m in zip(probs, mask) if m]
+        bin_acts  = [a for a, m in zip(actuals, mask) if m]
+        mean_pred.append(np.mean(bin_probs))
+        mean_act.append(np.mean(bin_acts))
+        counts.append(len(bin_probs))
+        labels.append(f"{bins[i]:.1f}–{bins[i+1]:.1f}")
+
+    fig_cal = go.Figure()
+    fig_cal.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect calibration",
+                                 line=dict(dash="dash", color="#9E9E9E")))
+    fig_cal.add_trace(go.Scatter(
+        x=mean_pred, y=mean_act, mode="lines+markers",
+        name="Actual", line=dict(color=_COLORS["strategy"]),
+        marker=dict(size=[max(6, c // 2) for c in counts]),
+        text=[f"n={c}" for c in counts], hoverinfo="text+x+y",
+    ))
+    fig_cal.update_layout(
+        title=f"Calibration Curve (Brier={brier:.4f}, LogLoss={ll:.4f})",
+        xaxis_title="Predicted probability",
+        yaxis_title="Actual resolution rate",
+        xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]),
+    )
+
+    kpis = "".join([
+        _kpi("Brier Score", f"{brier:.4f}", "#2196F3"),
+        _kpi("Log Loss",    f"{ll:.4f}",    "#2196F3"),
+    ])
+
+    return (
+        _SECTION_STYLE.format(title="Calibration Analysis")
+        + kpis
+        + _fig_html(fig_cal)
+    )
+
+
+# ─── Section 4: Trade-Level Diagnostics ──────────────────────────────────────
+
+def _section_diagnostics(trades: list[BacktestTrade]) -> str:
+    if not trades:
+        return _SECTION_STYLE.format(title="Trade-Level Diagnostics") + "<p>No trades.</p>"
+
+    # Return distribution histogram
+    ratios = [t.profit_ratio for t in trades]
+    fig_hist = go.Figure(go.Histogram(
+        x=[r * 100 for r in ratios], nbinsx=30,
+        marker_color=_COLORS["strategy"],
+    ))
+    fig_hist.update_layout(title="Per-Trade Return Distribution (%)",
+                            xaxis_title="Return (%)", yaxis_title="Count")
+
+    # Slippage distribution
+    slippages = [t.slippage for t in trades]
+    fig_slip = go.Figure(go.Histogram(
+        x=slippages, nbinsx=20,
+        marker_color=[_COLORS["profit"] if s >= 0 else _COLORS["loss"] for s in
+                      [0] * 30],  # uniform color is fine
+        marker_color_apply=False,
+    ))
+    fig_slip = go.Figure(go.Histogram(x=slippages, nbinsx=20,
+                                      marker_color="#7986CB"))
+    fig_slip.update_layout(title="Slippage Distribution (Actual − Expected Payoff, $)",
+                            xaxis_title="Slippage ($)", yaxis_title="Count")
+
+    # Best and worst trades table
+    sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
+    best  = sorted_trades[:5]
+    worst = sorted_trades[-5:]
+
+    def _trow(t: BacktestTrade, color: str) -> str:
+        return (f"<tr style='background:{color}'>"
+                f"<td>{t.entry_date}</td>"
+                f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{t.title_a[:40]}</td>"
+                f"<td>{t.pair_type}</td>"
+                f"<td>{t.n}</td>"
+                f"<td>${t.total_cost:.2f}</td>"
+                f"<td style='color:{'#2E7D32' if t.profit>=0 else '#C62828'}'>"
+                f"${t.profit:+.2f} ({t.profit_ratio:.1%})</td>"
+                f"</tr>")
+
+    table_html = """
+<div style="margin:16px 0; font-family:sans-serif;">
+<b>Top 5 Trades</b>
+<table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
+<tr style="background:#E8F5E9;font-weight:bold;">
+  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost</th><th>Profit</th>
+</tr>
+""" + "".join(_trow(t, "#F9FBE7") for t in best) + """
+</table>
+<br>
+<b>Worst 5 Trades</b>
+<table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
+<tr style="background:#FFEBEE;font-weight:bold;">
+  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost</th><th>Profit</th>
+</tr>
+""" + "".join(_trow(t, "#FFF8F8") for t in worst) + """
+</table>
+</div>
+"""
+
+    return (
+        _SECTION_STYLE.format(title="Trade-Level Diagnostics")
+        + _fig_html(fig_hist)
+        + _fig_html(fig_slip, height=280)
+        + table_html
+    )
+
+
+# ─── Section 5: Risk Metrics ──────────────────────────────────────────────────
+
+def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
+                  initial_balance: float) -> str:
+    if not trades:
+        return _SECTION_STYLE.format(title="Risk Metrics") + "<p>No trades.</p>"
+
+    # Kelly vs actual sizing scatter
+    kelly_fracs = [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB) for t in trades]
+    actual_fracs = [t.total_cost / initial_balance for t in trades]
+
+    fig_kelly = go.Figure(go.Scatter(
+        x=kelly_fracs, y=actual_fracs, mode="markers",
+        marker=dict(color=_COLORS["strategy"], size=7, opacity=0.6),
+        text=[t.title_a[:40] for t in trades],
+    ))
+    fig_kelly.add_trace(go.Scatter(
+        x=[0, max(kelly_fracs + [0.01]) * 1.1],
+        y=[0, max(kelly_fracs + [0.01]) * 1.1],
+        name="1:1 line", line=dict(dash="dash", color="#9E9E9E"),
+    ))
+    fig_kelly.update_layout(
+        title="Kelly Fraction vs Actual Fraction of Balance",
+        xaxis_title="Kelly fraction", yaxis_title="Actual fraction",
+    )
+
+    # Capital deployment over time
+    deployment: dict[date, float] = {}
+    cash_flow: dict[date, float] = {}
+    for t in trades:
+        cash_flow[t.entry_date] = cash_flow.get(t.entry_date, 0) - t.total_cost
+        cash_flow[t.exit_date]  = cash_flow.get(t.exit_date, 0) + t.actual_payoff
+
+    running = 0.0
+    dep_rows = []
+    for _, row in equity_df.iterrows():
+        d = row["date"] if isinstance(row["date"], date) else row["date"].date()
+        running += cash_flow.get(d, 0.0)
+        invested = initial_balance - row["portfolio_value"]
+        dep_rows.append({"date": row["date"], "invested": max(0, -cash_flow.get(d, 0))})
+
+    dep_df = pd.DataFrame(dep_rows)
+    fig_dep = make_subplots()
+    fig_dep.add_trace(go.Scatter(
+        x=equity_df["date"], y=equity_df["portfolio_value"],
+        name="Cash available", fill="tozeroy",
+        line=dict(color=_COLORS["cash"]), fillcolor="rgba(102,187,106,0.15)",
+    ))
+    fig_dep.update_layout(title="Portfolio Value Over Time",
+                           yaxis_title="Value ($)", xaxis_title="Date")
+
+    return (
+        _SECTION_STYLE.format(title="Risk Metrics")
+        + _fig_html(fig_kelly)
+        + _fig_html(fig_dep)
+    )
+
+
+# ─── Section 6: Benchmark Comparison ─────────────────────────────────────────
+
+def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
+                        initial_balance: float) -> str:
+    # Fetch S&P 500
+    sp_raw = None
+    try:
+        sp_raw = yf.download("^GSPC", start=start_date.isoformat(),
+                             progress=False, auto_adjust=True)
+    except Exception as e:
+        logging.warning("Could not fetch S&P 500: %s", e)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=equity_df["date"], y=equity_df["portfolio_value"],
+        name="Strategy", line=dict(color=_COLORS["strategy"], width=2),
+    ))
+
+    bench_rows: list[dict] = []
+
+    if sp_raw is not None and not sp_raw.empty:
+        sp = sp_raw["Close"].dropna()
+        sp_norm = sp / float(sp.iloc[0]) * initial_balance
+        fig.add_trace(go.Scatter(
+            x=sp.index, y=sp_norm.values,
+            name="S&P 500 (normalized)", line=dict(color=_COLORS["sp500"], width=2),
+        ))
+        sp_ret = float(sp_norm.iloc[-1] / initial_balance - 1)
+        sp_daily = sp.pct_change().dropna()
+        bench_rows.append({
+            "name": "S&P 500",
+            "return": f"{sp_ret:+.1%}",
+            "sharpe": f"{_sharpe(sp_daily):.2f}",
+            "max_dd": f"{_max_drawdown(sp_norm)[0]:.1%}",
+        })
+
+    strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
+    strat_sharpe = _sharpe(equity_df["daily_return"])
+    strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
+
+    bench_rows.insert(0, {
+        "name":   "Kalshi Arbitrage Strategy",
+        "return": f"{strat_ret:+.1%}",
+        "sharpe": f"{strat_sharpe:.2f}",
+        "max_dd": f"{strat_dd:.1%}",
+    })
+
+    fig.update_layout(title="Strategy vs Benchmarks", yaxis_title="Portfolio Value ($)",
+                      xaxis_title="Date")
+
+    bench_table = """
+<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;
+              margin:16px 0; width:auto;">
+<tr style="background:#E3F2FD; font-weight:bold;">
+  <th style="padding:8px 16px;">Benchmark</th>
+  <th style="padding:8px 16px;">Total Return</th>
+  <th style="padding:8px 16px;">Sharpe</th>
+  <th style="padding:8px 16px;">Max Drawdown</th>
+</tr>
+""" + "".join(
+    f"<tr style='border-bottom:1px solid #E0E0E0'>"
+    f"<td style='padding:8px 16px; font-weight:{'700' if r['name']=='Kalshi Arbitrage Strategy' else '400'}'>{r['name']}</td>"
+    f"<td style='padding:8px 16px;'>{r['return']}</td>"
+    f"<td style='padding:8px 16px;'>{r['sharpe']}</td>"
+    f"<td style='padding:8px 16px;'>{r['max_dd']}</td>"
+    f"</tr>"
+    for r in bench_rows
+) + "</table>"
+
+    return (
+        _SECTION_STYLE.format(title="Benchmark Comparison")
+        + bench_table
+        + _fig_html(fig, height=450)
+    )
+
+
+# ─── Main entry ──────────────────────────────────────────────────────────────
+
+def generate_dashboard(
+    trades: list[BacktestTrade],
+    equity_df: pd.DataFrame,
+    start_date: date,
+    initial_balance: float,
+) -> Path:
+    """
+    Assemble all dashboard sections into a single self-contained HTML file.
+    Returns the output path.
+    """
+    ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H%M%S")
+    out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
+
+    sections = [
+        _section_performance(equity_df, trades, start_date, initial_balance),
+        _section_decomposition(trades),
+        _section_calibration(trades),
+        _section_diagnostics(trades),
+        _section_risk(trades, equity_df, initial_balance),
+        _section_benchmark(equity_df, start_date, initial_balance),
+    ]
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Kalshi Arbitrage Backtest — {start_date} to today</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body {{ font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 24px; }}
+    h1 {{ color: #1A237E; }}
+  </style>
+</head>
+<body>
+<h1>Kalshi Arbitrage Backtest</h1>
+<p style="color:#616161; font-size:14px;">
+  Period: {start_date} → {date.today()} &nbsp;|&nbsp;
+  Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
+  Trades found: {len(trades)}
+</p>
+{''.join(sections)}
+</body>
+</html>"""
+
+    out_path.write_text(html, encoding="utf-8")
+    logging.info("Dashboard written: %s", out_path)
+    return out_path
