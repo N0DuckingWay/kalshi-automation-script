@@ -68,7 +68,6 @@ class CandidatePair:
     tradeable: bool         # True when guaranteed arbitrage exists
     canonical_title: str    # grouping key (normalized for time-series, raw for same-title)
     pair_type: str          # "time_series" | "same_title"
-    max_contracts: int = 0  # qualifying contracts from order book (0 = not yet enriched)
 
 
 def normalize_title(title: str) -> str:
@@ -344,40 +343,36 @@ def find_same_title_pairs(
 
 # ─── Order-book depth pricing ─────────────────────────────────────────────────
 
-def _pair_orderbooks(
-    no_levels: list[tuple[float, float]],
-    yes_levels: list[tuple[float, float]],
-) -> list[tuple[float, float, float]]:
+def _avg_fill_price(levels: list[tuple[float, float]], budget_dollars: float) -> float | None:
     """
-    Merge-pair NO ask levels (market A) with YES ask levels (market B).
+    Compute average fill price when sweeping ask levels with a given budget.
 
-    Both lists must be sorted ascending by price. Uses a two-pointer sweep:
-    at each step take min(remaining_no, remaining_yes) contracts and emit a
-    (yes_price, no_price, qty) tuple. Contracts in one book with no counterpart
-    in the other are silently dropped.
+    levels: [(price, quantity), ...] sorted ascending (cheapest ask first).
+            price is in dollars (0.01–0.99); quantity is number of contracts.
+    budget_dollars: maximum spend in dollars.
 
-    Returns [(yes_price, no_price, qty), ...] in ascending price order.
+    Returns the weighted average fill price, or None if there is no liquidity.
     """
-    pairs: list[tuple[float, float, float]] = []
-    i, j = 0, 0
-    rem_no  = no_levels[i][1]  if no_levels  else 0.0
-    rem_yes = yes_levels[j][1] if yes_levels else 0.0
+    remaining = budget_dollars
+    total_qty = 0.0
+    total_cost = 0.0
 
-    while i < len(no_levels) and j < len(yes_levels):
-        qty = min(rem_no, rem_yes)
-        pairs.append((yes_levels[j][0], no_levels[i][0], qty))
-        rem_no  -= qty
-        rem_yes -= qty
-        if rem_no == 0:
-            i += 1
-            if i < len(no_levels):
-                rem_no = no_levels[i][1]
-        if rem_yes == 0:
-            j += 1
-            if j < len(yes_levels):
-                rem_yes = yes_levels[j][1]
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        cost_at_level = price * qty
+        if cost_at_level <= remaining:
+            total_qty += qty
+            total_cost += cost_at_level
+            remaining -= cost_at_level
+        else:
+            buyable = math.floor(remaining / price)
+            if buyable > 0:
+                total_qty += buyable
+                total_cost += buyable * price
+            break
 
-    return pairs
+    return total_cost / total_qty if total_qty > 0 else None
 
 
 def _no_ask_levels(yes_bids_raw: list) -> list[tuple[float, float]]:
@@ -450,26 +445,21 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
         return None
 
 
-def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
+def enrich_with_orderbook_prices(
+    client: Any,
+    pairs: list,
+    balance_cents: int,
+) -> list:
     """
-    For each tradeable pair, fetch both order books, pair NO asks (market A)
-    with YES asks (market B) using a merge sweep, then filter to only contract
-    pairs whose combined price meets the per-type gap threshold:
+    Replace nA and pB on each tradeable pair with depth-weighted average fill
+    prices, computed by sweeping the order book assuming 10% of portfolio value
+    is invested per leg.
 
-      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF (0.95)
-      time_series: yes_price + no_price <= 1 - MIN_PRICE_DIFF             (0.85)
-
-    nA and pB are replaced with the weighted-average fill prices over the
-    qualifying contracts. max_contracts is set to the total qualifying count,
-    capping how many contracts strategy.py may size. Pairs with no qualifying
-    contracts are marked tradeable=False.
+    Non-tradeable pairs and pairs where the order book is unavailable are
+    returned unchanged. Pairs that become unprofitable after depth adjustment
+    are returned with tradeable=False.
     """
-    # Per pair-type: max allowed (yes_price + no_price) for a contract pair
-    _max_sum = {
-        "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,  # 0.95
-        "time_series": 1.0 - MIN_PRICE_DIFF,              # 0.85
-    }
-
+    budget_per_leg = (balance_cents / 100.0) * 0.10
     ob_cache: dict[str, dict | None] = {}
 
     def get_ob(ticker: str) -> dict | None:
@@ -494,48 +484,36 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             enriched.append(pair)
             continue
 
+        # NO asks on A derived from A's YES bids; YES asks on B from B's NO bids
         no_levels  = _no_ask_levels(ob_a["yes"])
         yes_levels = _yes_ask_levels(ob_b["no"])
 
-        paired = _pair_orderbooks(no_levels, yes_levels)
+        avg_nA = _avg_fill_price(no_levels,  budget_per_leg)
+        avg_pB = _avg_fill_price(yes_levels, budget_per_leg)
 
-        max_sum = _max_sum.get(pair.pair_type, 0.95)
-        qualifying = [
-            (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
-        ]
-
-        if not qualifying:
-            logging.info(
-                "No qualifying contract pairs for '%s' after price gap filter — skipping",
+        if avg_nA is None or avg_pB is None:
+            logging.warning(
+                "Insufficient liquidity for '%s' — keeping best-ask prices",
                 pair.canonical_title,
             )
-            enriched.append(dc_replace(pair, tradeable=False))
+            enriched.append(pair)
             continue
-
-        total_qty = sum(qty for _, _, qty in qualifying)
-        avg_pB = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
-        avg_nA = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
 
         fee_per_unit = TAKER_FEE_RATE * (avg_nA * (1.0 - avg_nA) + avg_pB * (1.0 - avg_pB))
         new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_unit
 
         if not new_tradeable:
             logging.info(
-                "Pair '%s' unprofitable after depth adjustment: avg_nA=%.3f avg_pB=%.3f",
-                pair.canonical_title, avg_nA, avg_pB,
+                "Pair '%s' unprofitable after depth adjustment: "
+                "nA %.3f→%.3f pB %.3f→%.3f",
+                pair.canonical_title, pair.nA, avg_nA, pair.pB, avg_pB,
             )
 
-        enriched.append(dc_replace(
-            pair,
-            nA=avg_nA,
-            pB=avg_pB,
-            tradeable=new_tradeable,
-            max_contracts=int(total_qty),
-        ))
+        enriched.append(dc_replace(pair, nA=avg_nA, pB=avg_pB, tradeable=new_tradeable))
 
     tradeable_after = sum(1 for p in enriched if p.tradeable)
     logging.info(
-        "Orderbook depth check: %d/%d pairs remain tradeable after price gap filter",
+        "Orderbook depth check: %d/%d pairs remain tradeable after depth adjustment",
         tradeable_after,
         sum(1 for p in pairs if p.tradeable),
     )
