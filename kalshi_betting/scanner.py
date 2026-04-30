@@ -1,9 +1,10 @@
 """Market scanning: fetch open markets and find arbitrage candidate pairs."""
 import logging
+import math
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import Any
 
 from .config import (
@@ -338,3 +339,182 @@ def find_same_title_pairs(
         sum(1 for p in candidate_pairs if p.tradeable),
     )
     return candidate_pairs
+
+
+# ─── Order-book depth pricing ─────────────────────────────────────────────────
+
+def _avg_fill_price(levels: list[tuple[float, float]], budget_dollars: float) -> float | None:
+    """
+    Compute average fill price when sweeping ask levels with a given budget.
+
+    levels: [(price, quantity), ...] sorted ascending (cheapest ask first).
+            price is in dollars (0.01–0.99); quantity is number of contracts.
+    budget_dollars: maximum spend in dollars.
+
+    Returns the weighted average fill price, or None if there is no liquidity.
+    """
+    remaining = budget_dollars
+    total_qty = 0.0
+    total_cost = 0.0
+
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        cost_at_level = price * qty
+        if cost_at_level <= remaining:
+            total_qty += qty
+            total_cost += cost_at_level
+            remaining -= cost_at_level
+        else:
+            buyable = math.floor(remaining / price)
+            if buyable > 0:
+                total_qty += buyable
+                total_cost += buyable * price
+            break
+
+    return total_cost / total_qty if total_qty > 0 else None
+
+
+def _no_ask_levels(yes_bids_raw: list) -> list[tuple[float, float]]:
+    """
+    Derive NO ask levels from YES bids returned by the orderbook API.
+
+    yes_bids_raw: [[price_str, qty_str], ...] from orderbook_fp.yes_dollars,
+                  sorted descending (highest YES bid first).
+    Returns: [(no_ask_price, qty), ...] sorted ascending (cheapest NO ask first).
+
+    Relationship: YES bid at P → NO ask at (1 − P).
+    Descending YES bids naturally produce ascending NO asks after the complement.
+    """
+    levels = []
+    for entry in yes_bids_raw:
+        try:
+            yes_price = float(entry[0])
+            qty = float(entry[1])
+            no_ask = 1.0 - yes_price
+            if _MIN_ACTIVE_PRICE <= no_ask <= _MAX_ACTIVE_PRICE and qty > 0:
+                levels.append((no_ask, qty))
+        except (ValueError, TypeError, IndexError):
+            continue
+    levels.sort(key=lambda x: x[0])
+    return levels
+
+
+def _yes_ask_levels(no_bids_raw: list) -> list[tuple[float, float]]:
+    """
+    Derive YES ask levels from NO bids returned by the orderbook API.
+
+    no_bids_raw: [[price_str, qty_str], ...] from orderbook_fp.no_dollars,
+                 sorted descending (highest NO bid first).
+    Returns: [(yes_ask_price, qty), ...] sorted ascending (cheapest YES ask first).
+
+    Relationship: NO bid at P → YES ask at (1 − P).
+    """
+    levels = []
+    for entry in no_bids_raw:
+        try:
+            no_price = float(entry[0])
+            qty = float(entry[1])
+            yes_ask = 1.0 - no_price
+            if _MIN_ACTIVE_PRICE <= yes_ask <= _MAX_ACTIVE_PRICE and qty > 0:
+                levels.append((yes_ask, qty))
+        except (ValueError, TypeError, IndexError):
+            continue
+    levels.sort(key=lambda x: x[0])
+    return levels
+
+
+def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
+    """
+    Fetch the order book for a market.
+
+    Returns {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes' is
+    YES bids and 'no' is NO bids (both sorted descending by price), or None on
+    failure.
+    """
+    try:
+        resp = _api_call_with_retry(client.get_market_orderbook, ticker=ticker)
+        ob = getattr(resp, "orderbook_fp", None) or getattr(resp, "orderbook", None)
+        if ob is None:
+            return None
+        yes_raw = list(getattr(ob, "yes_dollars", None) or getattr(ob, "yes", None) or [])
+        no_raw  = list(getattr(ob, "no_dollars",  None) or getattr(ob, "no",  None) or [])
+        return {"yes": yes_raw, "no": no_raw}
+    except Exception as exc:
+        logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
+        return None
+
+
+def enrich_with_orderbook_prices(
+    client: Any,
+    pairs: list,
+    balance_cents: int,
+) -> list:
+    """
+    Replace nA and pB on each tradeable pair with depth-weighted average fill
+    prices, computed by sweeping the order book assuming 10% of portfolio value
+    is invested per leg.
+
+    Non-tradeable pairs and pairs where the order book is unavailable are
+    returned unchanged. Pairs that become unprofitable after depth adjustment
+    are returned with tradeable=False.
+    """
+    budget_per_leg = (balance_cents / 100.0) * 0.10
+    ob_cache: dict[str, dict | None] = {}
+
+    def get_ob(ticker: str) -> dict | None:
+        if ticker not in ob_cache:
+            ob_cache[ticker] = _fetch_orderbook(client, ticker)
+        return ob_cache[ticker]
+
+    enriched = []
+    for pair in pairs:
+        if not pair.tradeable:
+            enriched.append(pair)
+            continue
+
+        ob_a = get_ob(pair.market_a.ticker)
+        ob_b = get_ob(pair.market_b.ticker)
+
+        if ob_a is None or ob_b is None:
+            logging.warning(
+                "Orderbook unavailable for '%s' — keeping best-ask prices",
+                pair.canonical_title,
+            )
+            enriched.append(pair)
+            continue
+
+        # NO asks on A derived from A's YES bids; YES asks on B from B's NO bids
+        no_levels  = _no_ask_levels(ob_a["yes"])
+        yes_levels = _yes_ask_levels(ob_b["no"])
+
+        avg_nA = _avg_fill_price(no_levels,  budget_per_leg)
+        avg_pB = _avg_fill_price(yes_levels, budget_per_leg)
+
+        if avg_nA is None or avg_pB is None:
+            logging.warning(
+                "Insufficient liquidity for '%s' — keeping best-ask prices",
+                pair.canonical_title,
+            )
+            enriched.append(pair)
+            continue
+
+        fee_per_unit = TAKER_FEE_RATE * (avg_nA * (1.0 - avg_nA) + avg_pB * (1.0 - avg_pB))
+        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_unit
+
+        if not new_tradeable:
+            logging.info(
+                "Pair '%s' unprofitable after depth adjustment: "
+                "nA %.3f→%.3f pB %.3f→%.3f",
+                pair.canonical_title, pair.nA, avg_nA, pair.pB, avg_pB,
+            )
+
+        enriched.append(dc_replace(pair, nA=avg_nA, pB=avg_pB, tradeable=new_tradeable))
+
+    tradeable_after = sum(1 for p in enriched if p.tradeable)
+    logging.info(
+        "Orderbook depth check: %d/%d pairs remain tradeable after depth adjustment",
+        tradeable_after,
+        sum(1 for p in pairs if p.tradeable),
+    )
+    return enriched
