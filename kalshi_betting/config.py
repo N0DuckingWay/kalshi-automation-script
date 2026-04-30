@@ -18,6 +18,7 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05  # min YES price gap for exact same-title p
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95  # assumed probability that same-title pairs co-resolve
 MAX_DEADLINE_GAP_DAYS         = 30    # max days between pair deadlines
 MIN_BALANCE_CENTS             = 500   # skip run if balance below $5
+TAKER_FEE_RATE                = 0.07  # Kalshi taker fee: ceil(TAKER_FEE_RATE × C × P × (1−P))
 
 # API pagination
 MARKET_PAGE_SIZE   = 1000

@@ -12,6 +12,7 @@ from .config import (
     MIN_PRICE_DIFF,
     POSITION_PAGE_SIZE,
     SAME_TITLE_MIN_PRICE_DIFF,
+    TAKER_FEE_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -215,7 +216,8 @@ def find_candidate_pairs(
                 if abs(pA - pB) < MIN_PRICE_DIFF:
                     continue
 
-                tradeable = (nA + pB < 1.0) and (pA > pB)
+                fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
+                tradeable = ((1.0 - nA - pB) > fee_per_unit) and (pA > pB)
 
                 group_pairs.append(
                     CandidatePair(
@@ -309,7 +311,8 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                tradeable = (nA + pB < 1.0)
+                fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
+                tradeable = (1.0 - nA - pB) > fee_per_unit
                 group_pairs.append(
                     CandidatePair(
                         market_a=mA,

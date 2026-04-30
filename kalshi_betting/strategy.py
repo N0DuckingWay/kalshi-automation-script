@@ -1,10 +1,11 @@
 """Arbitrage trade computation and portfolio selection."""
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB
+from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, TAKER_FEE_RATE
 from .scanner import CandidatePair
 
 
@@ -56,9 +57,11 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
         return None
 
-    profit_ratio = (1.0 - nA - pB) / (nA + pB)
-    if profit_ratio <= 0:
+    fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
+    net_spread = (1.0 - nA - pB) - fee_per_unit
+    if net_spread <= 0:
         return None
+    profit_ratio = net_spread / (nA + pB)
 
     p = _kelly_p(pair)
     q = 1.0 - p
@@ -73,7 +76,9 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
     n = max(1, int(budget_dollars / (nA + pB)))
 
-    min_payoff = n * (1.0 - nA - pB)
+    fee_no = math.ceil(TAKER_FEE_RATE * n * nA * (1.0 - nA) * 100) / 100
+    fee_yes = math.ceil(TAKER_FEE_RATE * n * pB * (1.0 - pB) * 100) / 100
+    min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
     if min_payoff <= 0:
         return None
 
