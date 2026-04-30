@@ -8,7 +8,11 @@ from tabulate import tabulate
 from .auth import build_client, verify_auth
 from .config import MIN_BALANCE_CENTS
 from .reporter import append_to_prod_log, write_dev_simulation
-from .scanner import get_held_tickers, fetch_open_markets, find_candidate_pairs, find_same_title_pairs, enrich_with_orderbook_prices
+from .scanner import (
+    get_held_tickers, fetch_open_markets,
+    find_candidate_pairs, find_same_title_pairs,
+    enrich_with_orderbook_prices, market_title,
+)
 from .strategy import compute_trade, select_portfolio
 from .trader import execute_trades
 
@@ -17,12 +21,28 @@ def _truncate(text: str, n: int = 40) -> str:
     return text[:n] + "…" if len(text) > n else text
 
 
-def _market_display_title(market) -> str:
-    return market.title or market.subtitle or market.ticker
-
-
 def _format_deadline(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "?"
+
+
+def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
+    specs: dict = {}
+    for pair in candidate_pairs:
+        spec = compute_trade(pair, balance_cents)
+        if spec is not None:
+            specs[id(pair)] = spec
+    return specs
+
+
+def _print_portfolio(portfolio: list, label: str) -> None:
+    print(f"\n{label} {len(portfolio)} trade(s):")
+    for spec in portfolio:
+        print(
+            f"  [{spec.pair.pair_type}] {spec.pair.canonical_title[:55]} — "
+            f"{spec.x}× NO(A) + {spec.y}× YES(B) — "
+            f"cost ${spec.total_cost:.2f}, min profit ${spec.min_payoff:.2f} "
+            f"({spec.profit_ratio:.1%} return)"
+        )
 
 
 def _dedup_pairs(primary: list, secondary: list) -> list:
@@ -63,8 +83,8 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
 
         rows.append([
             pair.pair_type,
-            _truncate(_market_display_title(pair.market_a)),
-            _truncate(_market_display_title(pair.market_b)),
+            _truncate(market_title(pair.market_a)),
+            _truncate(market_title(pair.market_b)),
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
             f"{pair.pA:.2%}",
@@ -116,13 +136,8 @@ def _run_dev(client, args) -> None:
         print(f"Dev simulation written (empty): {out}")
         return
 
-    trade_specs: dict = {}
-    for pair in candidate_pairs:
-        spec = compute_trade(pair, sandbox_balance_cents)
-        if spec is not None:
-            trade_specs[id(pair)] = spec
-
-    portfolio    = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
+    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
+    portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
     display_specs = {id(s.pair): s for s in portfolio}
 
     print(f"\nKalshi Sandbox Scan — Virtual Balance: ${args.sandbox_balance:.2f} | Mode: DEV")
@@ -134,14 +149,7 @@ def _run_dev(client, args) -> None:
         print(f"\nDev simulation written (candidates only): {out}")
         return
 
-    print(f"\nSimulated {len(portfolio)} trade(s):")
-    for spec in portfolio:
-        print(
-            f"  [{spec.pair.pair_type}] {spec.pair.canonical_title[:55]} — "
-            f"{spec.x}× NO(A) + {spec.y}× YES(B) — "
-            f"cost ${spec.total_cost:.2f}, min profit ${spec.min_payoff:.2f} "
-            f"({spec.profit_ratio:.1%} return)"
-        )
+    _print_portfolio(portfolio, "Simulated")
 
     # Simulate orders (dry_run=True always in dev)
     results = execute_trades(client, portfolio, dry_run=True)
@@ -178,13 +186,8 @@ def _run_prod(client, args) -> None:
         print("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
         return
 
-    trade_specs: dict = {}
-    for pair in candidate_pairs:
-        spec = compute_trade(pair, balance_cents)
-        if spec is not None:
-            trade_specs[id(pair)] = spec
-
-    portfolio    = select_portfolio(list(trade_specs.values()), balance_cents)
+    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
+    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
     display_specs = {id(s.pair): s for s in portfolio}
 
     print(f"\nKalshi Arbitrage Scan — Balance: ${balance_cents / 100:.2f} | Mode: PROD")
@@ -194,14 +197,7 @@ def _run_prod(client, args) -> None:
         print("\nNo executable arbitrage trades found.")
         return
 
-    print(f"\nSelected {len(portfolio)} trade(s):")
-    for spec in portfolio:
-        print(
-            f"  [{spec.pair.pair_type}] {spec.pair.canonical_title[:55]} — "
-            f"{spec.x}× NO(A) + {spec.y}× YES(B) — "
-            f"cost ${spec.total_cost:.2f}, min profit ${spec.min_payoff:.2f} "
-            f"({spec.profit_ratio:.1%} return)"
-        )
+    _print_portfolio(portfolio, "Selected")
 
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 

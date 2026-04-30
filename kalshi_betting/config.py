@@ -1,4 +1,5 @@
 """Configuration constants for the Kalshi arbitrage bot."""
+import math
 import pathlib
 import sys
 
@@ -23,6 +24,16 @@ TAKER_FEE_RATE                = 0.07  # Kalshi taker fee: ceil(TAKER_FEE_RATE ×
 # API pagination
 MARKET_PAGE_SIZE   = 1000
 POSITION_PAGE_SIZE = 500
+
+
+def fee_per_pair_approx(nA: float, pB: float) -> float:
+    """Continuous approximation of total Kalshi taker fee for a NO(A) + YES(B) pair."""
+    return TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
+
+
+def fee_leg_exact(n: int, p: float) -> float:
+    """Ceiling-rounded Kalshi taker fee for n contracts of one order leg at price p."""
+    return math.ceil(TAKER_FEE_RATE * n * p * (1.0 - p) * 100) / 100
 
 
 def parse_mode() -> str:

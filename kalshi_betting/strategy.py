@@ -1,11 +1,10 @@
 """Arbitrage trade computation and portfolio selection."""
 import logging
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, TAKER_FEE_RATE
+from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact, fee_per_pair_approx
 from .scanner import CandidatePair
 
 
@@ -57,8 +56,7 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
         return None
 
-    fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
-    net_spread = (1.0 - nA - pB) - fee_per_unit
+    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
     if net_spread <= 0:
         return None
     profit_ratio = net_spread / (nA + pB)
@@ -78,8 +76,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pair.max_contracts > 0:
         n = min(n, pair.max_contracts)
 
-    fee_no = math.ceil(TAKER_FEE_RATE * n * nA * (1.0 - nA) * 100) / 100
-    fee_yes = math.ceil(TAKER_FEE_RATE * n * pB * (1.0 - pB) * 100) / 100
+    fee_no  = fee_leg_exact(n, nA)
+    fee_yes = fee_leg_exact(n, pB)
     min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
     if min_payoff <= 0:
         return None

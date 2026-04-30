@@ -1,6 +1,5 @@
 """Backtest simulation: replay the arbitrage strategy on historical Kalshi data."""
 import logging
-import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -14,7 +13,8 @@ from .config import (
     MIN_PRICE_DIFF,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
-    TAKER_FEE_RATE,
+    fee_leg_exact,
+    fee_per_pair_approx,
 )
 from .historical import (
     HistoricalApi,
@@ -68,9 +68,7 @@ def _compute_actual_payoff(n: int, pA: float, pB: float, nA: float,
       A=NO,  B=NO  → n*(1-nA) - n*pB - fee
       A=YES, B=NO  → -(n*nA + n*pB) - fee  [loss for same_title]
     """
-    fee_no  = math.ceil(TAKER_FEE_RATE * n * nA * (1.0 - nA) * 100) / 100
-    fee_yes = math.ceil(TAKER_FEE_RATE * n * pB * (1.0 - pB) * 100) / 100
-    fee = fee_no + fee_yes
+    fee = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
     if outcome_a == "yes" and outcome_b == "yes":
         return n * (1.0 - pB) - n * nA - fee
     if outcome_a == "no" and outcome_b == "yes":
@@ -207,8 +205,7 @@ def _find_entry(
         if pA - pB < threshold:
             continue
 
-        fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
-        if (1.0 - nA - pB) <= fee_per_unit:
+        if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):
             continue  # not tradeable after fees
 
         # For time_series: check deadline gap
@@ -308,8 +305,7 @@ def run_backtest(
         entry_date = entry["entry_date"]
 
         # Kelly sizing: independence model for time_series, fixed prior for same_title
-        fee_per_unit = TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
-        net_spread = (1.0 - nA - pB) - fee_per_unit
+        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
         profit_ratio_entry = net_spread / (nA + pB) if net_spread > 0 else 0.0
         p = (1.0 - pA * (1.0 - pB)) if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB
         q = 1.0 - p
@@ -321,9 +317,7 @@ def run_backtest(
         budget = initial_balance * kelly_f_capped
         n = max(1, int(budget / (nA + pB)))
         total_cost      = n * (nA + pB)
-        fee_no  = math.ceil(TAKER_FEE_RATE * n * nA * (1.0 - nA) * 100) / 100
-        fee_yes = math.ceil(TAKER_FEE_RATE * n * pB * (1.0 - pB) * 100) / 100
-        expected_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
+        expected_payoff = n * (1.0 - nA - pB) - fee_leg_exact(n, nA) - fee_leg_exact(n, pB)
 
         outcome_a = mA.get("result", "")
         outcome_b = mB.get("result", "")

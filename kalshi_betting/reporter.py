@@ -10,6 +10,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from .config import PROJECT_ROOT
+from .scanner import market_title
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
@@ -51,10 +52,6 @@ class TradeResult:
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated"
     error: Optional[str] = None
-
-
-def _market_title(market) -> str:
-    return market.title or market.subtitle or market.ticker
 
 
 def _apply_header_row(ws, fill: PatternFill) -> None:
