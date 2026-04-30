@@ -75,6 +75,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
 
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
     n = max(1, int(budget_dollars / (nA + pB)))
+    if pair.max_contracts > 0:
+        n = min(n, pair.max_contracts)
 
     fee_no = math.ceil(TAKER_FEE_RATE * n * nA * (1.0 - nA) * 100) / 100
     fee_yes = math.ceil(TAKER_FEE_RATE * n * pB * (1.0 - pB) * 100) / 100

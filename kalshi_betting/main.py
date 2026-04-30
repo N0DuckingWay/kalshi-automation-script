@@ -108,7 +108,7 @@ def _run_dev(client, args) -> None:
     time_series_pairs = find_candidate_pairs(client, held_tickers=set(), markets=markets)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs, sandbox_balance_cents)
+    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
         print("No qualifying pairs found in sandbox (≥15% time-series or ≥5% same-title price diff).")
@@ -172,7 +172,7 @@ def _run_prod(client, args) -> None:
     time_series_pairs = find_candidate_pairs(client, held_tickers, markets)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs, balance_cents)
+    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
         print("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
