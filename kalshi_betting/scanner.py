@@ -3,7 +3,7 @@ import logging
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import Any
 
 from .config import (
@@ -12,6 +12,7 @@ from .config import (
     MIN_PRICE_DIFF,
     POSITION_PAGE_SIZE,
     SAME_TITLE_MIN_PRICE_DIFF,
+    fee_per_pair_approx,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,7 @@ class CandidatePair:
     tradeable: bool         # True when guaranteed arbitrage exists
     canonical_title: str    # grouping key (normalized for time-series, raw for same-title)
     pair_type: str          # "time_series" | "same_title"
+    max_contracts: int = 0  # qualifying contracts from order book (0 = not yet enriched)
 
 
 def normalize_title(title: str) -> str:
@@ -117,6 +119,22 @@ def _market_title(market: Any) -> str:
         str: The first non-falsy value among title, subtitle, and ticker.
     """
     return market.title or market.subtitle or market.ticker
+
+
+def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
+    """Return markets with YES ask in [1%, 99%] that are not in excluded_tickers."""
+    excluded = excluded_tickers or set()
+    active = []
+    for m in markets:
+        if m.ticker in excluded:
+            continue
+        try:
+            ya = float(m.yes_ask_dollars)
+            if _MIN_ACTIVE_PRICE <= ya <= _MAX_ACTIVE_PRICE:
+                active.append(m)
+        except (ValueError, TypeError):
+            pass
+    return active
 
 
 def get_held_tickers(client: Any) -> set:
@@ -190,31 +208,17 @@ def find_candidate_pairs(
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
       3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days)
-      4. |pA - pB| >= MIN_PRICE_DIFF (5%)
+      4. |pA - pB| >= MIN_PRICE_DIFF (15%)
 
     Per normalized title, keeps the single best pair (tradeable preferred, then
     largest price gap) to avoid flooding the portfolio with dozens of similar pairs.
 
     tradeable=True when nA + pB < 1 AND pA > pB (all 3 outcome scenarios profitable).
     """
-    if held_tickers is None:
-        held_tickers = set()
-
     if markets is None:
         markets = fetch_open_markets(client)
 
-    markets = [m for m in markets if m.ticker not in held_tickers]
-    logging.info("Markets after excluding held positions: %d", len(markets))
-
-    # Pre-filter: only keep actively priced markets (not settled / illiquid)
-    active = []
-    for m in markets:
-        try:
-            ya = float(m.yes_ask_dollars)
-            if _MIN_ACTIVE_PRICE <= ya <= _MAX_ACTIVE_PRICE:
-                active.append(m)
-        except (ValueError, TypeError):
-            pass
+    active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
     # Group by exact normalized title — O(n) hash, no fuzzy matching
@@ -254,7 +258,7 @@ def find_candidate_pairs(
                 if abs(pA - pB) < MIN_PRICE_DIFF:
                     continue
 
-                tradeable = (nA + pB < 1.0) and (pA > pB)
+                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)
 
                 group_pairs.append(
                     CandidatePair(
@@ -298,19 +302,7 @@ def find_same_title_pairs(
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
     """
-    if held_tickers is None:
-        held_tickers = set()
-
-    active = []
-    for m in markets:
-        if m.ticker in held_tickers:
-            continue
-        try:
-            ya = float(m.yes_ask_dollars)
-            if _MIN_ACTIVE_PRICE <= ya <= _MAX_ACTIVE_PRICE:
-                active.append(m)
-        except (ValueError, TypeError):
-            pass
+    active = _filter_active_markets(markets, held_tickers)
 
     by_terms: dict = defaultdict(list)
     for m in active:
@@ -348,7 +340,7 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                tradeable = (nA + pB < 1.0)
+                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)
                 group_pairs.append(
                     CandidatePair(
                         market_a=mA,
@@ -374,3 +366,173 @@ def find_same_title_pairs(
         sum(1 for p in candidate_pairs if p.tradeable),
     )
     return candidate_pairs
+
+
+# ─── Order-book depth pricing ─────────────────────────────────────────────────
+
+def _pair_orderbooks(
+    no_levels: list[tuple[float, float]],
+    yes_levels: list[tuple[float, float]],
+) -> list[tuple[float, float, float]]:
+    """
+    Merge-pair NO ask levels (market A) with YES ask levels (market B).
+
+    Both lists sorted ascending by price. Two-pointer sweep: at each step take
+    min(remaining_no, remaining_yes) contracts and emit (yes_price, no_price, qty).
+    Contracts left over in one book with no counterpart in the other are dropped.
+
+    Returns [(yes_price, no_price, qty), ...].
+    """
+    pairs: list[tuple[float, float, float]] = []
+    i, j = 0, 0
+    rem_no  = no_levels[i][1]  if no_levels  else 0.0
+    rem_yes = yes_levels[j][1] if yes_levels else 0.0
+
+    while i < len(no_levels) and j < len(yes_levels):
+        qty = min(rem_no, rem_yes)
+        pairs.append((yes_levels[j][0], no_levels[i][0], qty))
+        rem_no  -= qty
+        rem_yes -= qty
+        if rem_no == 0:
+            i += 1
+            if i < len(no_levels):
+                rem_no = no_levels[i][1]
+        if rem_yes == 0:
+            j += 1
+            if j < len(yes_levels):
+                rem_yes = yes_levels[j][1]
+
+    return pairs
+
+
+def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
+    """
+    Convert bid levels to ask levels via the complement price (1 − P).
+
+    bids_raw: [[price_str, qty_str], ...] sorted descending by price.
+    Returns: [(ask_price, qty), ...] sorted ascending (cheapest ask first).
+
+    Applies to both sides: YES bid at P → NO ask at (1−P);
+                           NO bid at P → YES ask at (1−P).
+    Descending bids naturally yield ascending asks after the complement.
+    """
+    levels = []
+    for entry in bids_raw:
+        try:
+            bid_price = float(entry[0])
+            qty = float(entry[1])
+            ask_price = 1.0 - bid_price
+            if _MIN_ACTIVE_PRICE <= ask_price <= _MAX_ACTIVE_PRICE and qty > 0:
+                levels.append((ask_price, qty))
+        except (ValueError, TypeError, IndexError):
+            continue
+    levels.sort(key=lambda x: x[0])
+    return levels
+
+
+def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
+    """
+    Fetch the order book for a market.
+
+    Returns {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes' is
+    YES bids and 'no' is NO bids (both sorted descending by price), or None on
+    failure.
+    """
+    try:
+        resp = _api_call_with_retry(client.get_market_orderbook, ticker=ticker)
+        ob = getattr(resp, "orderbook_fp", None) or getattr(resp, "orderbook", None)
+        if ob is None:
+            return None
+        yes_raw = list(getattr(ob, "yes_dollars", None) or getattr(ob, "yes", None) or [])
+        no_raw  = list(getattr(ob, "no_dollars",  None) or getattr(ob, "no",  None) or [])
+        return {"yes": yes_raw, "no": no_raw}
+    except Exception as exc:
+        logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
+        return None
+
+
+def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
+    """
+    For each tradeable pair, fetch both order books, pair NO asks (market A)
+    with YES asks (market B) using a merge sweep, then filter to only contract
+    pairs whose combined price meets the per-type gap threshold:
+
+      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF (0.95)
+      time_series: yes_price + no_price <= 1 - MIN_PRICE_DIFF             (0.85)
+
+    nA and pB are replaced with weighted-average fill prices over qualifying
+    contracts. max_contracts is set to the total qualifying count. Pairs with
+    no qualifying contracts are marked tradeable=False.
+    """
+    _max_sum = {
+        "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,  # 0.95
+        "time_series": 1.0 - MIN_PRICE_DIFF,              # 0.85
+    }
+    ob_cache: dict[str, dict | None] = {}
+
+    def get_ob(ticker: str) -> dict | None:
+        if ticker not in ob_cache:
+            ob_cache[ticker] = _fetch_orderbook(client, ticker)
+        return ob_cache[ticker]
+
+    enriched = []
+    for pair in pairs:
+        if not pair.tradeable:
+            enriched.append(pair)
+            continue
+
+        ob_a = get_ob(pair.market_a.ticker)
+        ob_b = get_ob(pair.market_b.ticker)
+
+        if ob_a is None or ob_b is None:
+            logging.warning(
+                "Orderbook unavailable for '%s' — keeping best-ask prices",
+                pair.canonical_title,
+            )
+            enriched.append(pair)
+            continue
+
+        no_levels  = _bids_to_ask_levels(ob_a["yes"])
+        yes_levels = _bids_to_ask_levels(ob_b["no"])
+        paired     = _pair_orderbooks(no_levels, yes_levels)
+
+        max_sum    = _max_sum.get(pair.pair_type, 0.95)
+        qualifying = [
+            (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
+        ]
+
+        if not qualifying:
+            logging.info(
+                "No qualifying contract pairs for '%s' after price gap filter — skipping",
+                pair.canonical_title,
+            )
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        total_qty = sum(qty for _, _, qty in qualifying)
+        avg_pB    = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
+        avg_nA    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
+
+        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)
+
+        if not new_tradeable:
+            logging.info(
+                "Pair '%s' unprofitable after depth adjustment: avg_nA=%.3f avg_pB=%.3f",
+                pair.canonical_title, avg_nA, avg_pB,
+            )
+
+        enriched.append(dc_replace(
+            pair,
+            nA=avg_nA,
+            pB=avg_pB,
+            tradeable=new_tradeable,
+            max_contracts=int(total_qty),
+        ))
+
+    tradeable_after = sum(1 for p in enriched if p.tradeable)
+    logging.info(
+        "Orderbook depth check: %d/%d pairs remain tradeable after price gap filter",
+        tradeable_after,
+        sum(1 for p in pairs if p.tradeable),
+    )
+    return enriched

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB
+from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact, fee_per_pair_approx
 from .scanner import CandidatePair
 
 
@@ -79,9 +79,10 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
         return None
 
-    profit_ratio = (1.0 - nA - pB) / (nA + pB)
-    if profit_ratio <= 0:
+    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+    if net_spread <= 0:
         return None
+    profit_ratio = net_spread / (nA + pB)
 
     p = _kelly_p(pair)
     q = 1.0 - p
@@ -95,8 +96,12 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
 
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
     n = max(1, int(budget_dollars / (nA + pB)))
+    if pair.max_contracts > 0:
+        n = min(n, pair.max_contracts)
 
-    min_payoff = n * (1.0 - nA - pB)
+    fee_no  = fee_leg_exact(n, nA)
+    fee_yes = fee_leg_exact(n, pB)
+    min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
     if min_payoff <= 0:
         return None
 
