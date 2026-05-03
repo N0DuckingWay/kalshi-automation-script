@@ -9,29 +9,25 @@ from .strategy import TradeSpec
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
-    """Buy x units of NO on market A."""
-    no_price_cents = int(round(spec.pair.nA * 100))
-    no_price_cents = max(1, min(99, no_price_cents))
+    """Buy x units of NO on market A as a market (taker) order."""
     return CreateOrderRequest(
         ticker=spec.pair.market_a.ticker,
         side="no",
         action="buy",
+        type="market",
         count=spec.x,
-        no_price=no_price_cents,
         time_in_force="fill_or_kill",
     )
 
 
 def _build_yes_order(spec: TradeSpec) -> CreateOrderRequest:
-    """Buy y units of YES on market B."""
-    yes_price_cents = int(round(spec.pair.pB * 100))
-    yes_price_cents = max(1, min(99, yes_price_cents))
+    """Buy y units of YES on market B as a market (taker) order."""
     return CreateOrderRequest(
         ticker=spec.pair.market_b.ticker,
         side="yes",
         action="buy",
+        type="market",
         count=spec.y,
-        yes_price=yes_price_cents,
         time_in_force="fill_or_kill",
     )
 

@@ -47,7 +47,7 @@ class BacktestTrade:
     profit_ratio: float
     monthly_profit_ratio: float  # profit_ratio * 30 / holding_days
     kelly_fraction: float        # capped Kelly fraction used for sizing
-    expected_payoff: float  # n * (1 - nA - pB) — the guaranteed floor
+    expected_payoff: float  # n * (1 - nA - pB) minus fees — the guaranteed floor
     slippage: float         # actual_payoff - expected_payoff
     holding_days: int
 
@@ -55,23 +55,26 @@ class BacktestTrade:
 def _compute_actual_payoff(n: int, pA: float, pB: float, nA: float,
                            outcome_a: str, outcome_b: str) -> float:
     """
-    Compute actual payoff from settlement outcomes.
+    Compute actual payoff from settlement outcomes after Kalshi taker fees.
     Strategy: n NO on A + n YES on B.
+    Fees: ceil(TAKER_FEE_RATE × C × P × (1−P)) per leg, charged at execution
+    regardless of outcome.
 
-    Payoff table (per n contracts):
-      A=YES, B=YES → n*(1-pB) - n*nA
-      A=NO,  B=YES → n*(1-nA) + n*(1-pB)
-      A=NO,  B=NO  → n*(1-nA) - n*pB
-      A=YES, B=NO  → -(n*nA + n*pB)  [impossible for time_series; loss for same_title]
+    Payoff table (per n contracts, net of fees):
+      A=YES, B=YES → n*(1-pB) - n*nA - fee
+      A=NO,  B=YES → n*(1-nA) + n*(1-pB) - fee
+      A=NO,  B=NO  → n*(1-nA) - n*pB - fee
+      A=YES, B=NO  → -(n*nA + n*pB) - fee  [loss for same_title]
     """
+    fee = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
     if outcome_a == "yes" and outcome_b == "yes":
-        return n * (1.0 - pB) - n * nA
+        return n * (1.0 - pB) - n * nA - fee
     if outcome_a == "no" and outcome_b == "yes":
-        return n * (1.0 - nA) + n * (1.0 - pB)
+        return n * (1.0 - nA) + n * (1.0 - pB) - fee
     if outcome_a == "no" and outcome_b == "no":
-        return n * (1.0 - nA) - n * pB
+        return n * (1.0 - nA) - n * pB - fee
     # outcome_a == "yes", outcome_b == "no" (loss scenario)
-    return -(n * nA + n * pB)
+    return -(n * nA + n * pB) - fee
 
 
 # ─── Pair grouping (metadata only, no prices) ─────────────────────────────────
@@ -200,8 +203,8 @@ def _find_entry(
         if pA - pB < threshold:
             continue
 
-        if nA + pB >= 1.0:
-            continue  # not tradeable
+        if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):
+            continue  # not tradeable after fees
 
         # For time_series: check deadline gap
         if pair_type == "time_series":
@@ -300,7 +303,8 @@ def run_backtest(
         entry_date = entry["entry_date"]
 
         # Kelly sizing: independence model for time_series, fixed prior for same_title
-        profit_ratio_entry = (1.0 - nA - pB) / (nA + pB) if (nA + pB) > 0 else 0
+        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+        profit_ratio_entry = net_spread / (nA + pB) if net_spread > 0 else 0.0
         p = (1.0 - pA * (1.0 - pB)) if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB
         q = 1.0 - p
         kelly_f = (p - q / profit_ratio_entry) if profit_ratio_entry > 0 else -1.0
@@ -311,7 +315,7 @@ def run_backtest(
         budget = initial_balance * kelly_f_capped
         n = max(1, int(budget / (nA + pB)))
         total_cost      = n * (nA + pB)
-        expected_payoff = n * (1.0 - nA - pB)
+        expected_payoff = n * (1.0 - nA - pB) - fee_leg_exact(n, nA) - fee_leg_exact(n, pB)
 
         outcome_a = mA.get("result", "")
         outcome_b = mB.get("result", "")
