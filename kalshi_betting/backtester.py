@@ -27,6 +27,41 @@ from .scanner import normalize_title
 
 @dataclass
 class BacktestTrade:
+    """
+    Complete record of a single simulated arbitrage trade from the backtest.
+
+    Captures both the trade setup (entry prices, sizing, pair metadata) and the
+    final outcome (settlement results, P&L, slippage) for use in performance analysis
+    and dashboard generation.
+
+    Attributes:
+        pair_type (str): Strategy variant used: "time_series" or "same_title".
+        ticker_a (str): Kalshi ticker of market A (the NO leg).
+        ticker_b (str): Kalshi ticker of market B (the YES leg).
+        title_a (str): Display title of market A.
+        title_b (str): Display title of market B.
+        category (str): Human-readable market category inferred from event_ticker prefix
+            (e.g. "Crypto", "Sports", "Politics").
+        entry_date (date): The Monday on which the trade was first tradeable and sized.
+        exit_date (date): The date the later-settling market resolved; marks when cash returned.
+        entry_pA (float): YES ask price of market A at entry. Range: [0.01, 0.99].
+        entry_pB (float): YES ask price of market B at entry. Range: [0.01, 0.99].
+        entry_nA (float): NO ask price of market A at entry (≈ 1 − yes_bid_A). Range: [0.01, 0.99].
+        n (int): Number of contracts bought on each leg (x = y = n). Always >= 1.
+        total_cost (float): Total dollar cost of the position: n * (entry_nA + entry_pB).
+        outcome_a (str): Settlement result of market A — "yes" or "no".
+        outcome_b (str): Settlement result of market B — "yes" or "no".
+        actual_payoff (float): Dollar value received at settlement based on outcomes.
+        profit (float): actual_payoff − total_cost. May be negative for same_title loss scenarios.
+        profit_ratio (float): profit / total_cost. Return on invested capital.
+        monthly_profit_ratio (float): profit_ratio scaled to 30 days:
+            profit_ratio * 30 / holding_days.
+        kelly_fraction (float): Capped Kelly fraction used for sizing, <= BUDGET_FRACTION.
+        expected_payoff (float): Guaranteed floor payoff: n * (1 − entry_nA − entry_pB).
+        slippage (float): actual_payoff − expected_payoff. Positive means better than the
+            guaranteed floor (e.g. both markets resolved favorably).
+        holding_days (int): Calendar days between entry_date and exit_date. Always >= 1.
+    """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
     ticker_b: str

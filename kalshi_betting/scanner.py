@@ -58,6 +58,21 @@ _MAX_ACTIVE_PRICE = 0.99
 
 @dataclass
 class CandidatePair:
+    """
+    An arbitrage candidate consisting of two correlated markets with a detectable price gap.
+
+    Attributes:
+        market_a (Any): The market with the higher YES ask (the expensive side of the pair).
+        market_b (Any): The market with the lower YES ask (the cheap side of the pair).
+        pA (float): YES ask price of market A in dollars (cost to buy YES on A). Range: [0, 1].
+        pB (float): YES ask price of market B in dollars (cost to buy YES on B). Range: [0, 1].
+        nA (float): NO ask price of market A in dollars (cost to buy NO on A). Range: [0, 1].
+        tradeable (bool): True when a risk-free arbitrage exists (nA + pB < 1 and pA > pB).
+        canonical_title (str): Grouping key used to identify the pair — normalized title for
+            time-series pairs, raw title for same-title pairs.
+        pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
+            "same_title" for pairs with identical title/subtitle across different event tickers.
+    """
     market_a: Any           # Market with higher YES ask (expensive side)
     market_b: Any           # Market with lower YES ask (cheap side)
     pA: float               # yes_ask_dollars of A (cost to buy YES on A)
@@ -69,7 +84,20 @@ class CandidatePair:
 
 
 def normalize_title(title: str) -> str:
-    """Strip date tokens; return lowercased, collapsed-whitespace string."""
+    """
+    Strip all date and time tokens from a market title, returning a normalized string.
+
+    Removes patterns such as month names, ISO dates, quarters, and relative time
+    expressions, then collapses whitespace and lowercases the result. Two markets
+    that differ only in their deadline will produce the same normalized string,
+    enabling exact-match grouping without fuzzy matching.
+
+    Args:
+        title (str): Raw market title from the Kalshi API.
+
+    Returns:
+        str: Lowercased, whitespace-collapsed title with all date tokens removed.
+    """
     result = title
     for pat in _COMPILED:
         result = pat.sub(" ", result)
@@ -77,6 +105,17 @@ def normalize_title(title: str) -> str:
 
 
 def _market_title(market: Any) -> str:
+    """
+    Return the best available display title for a market object.
+
+    Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
+
+    Args:
+        market (Any): A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
+
+    Returns:
+        str: The first non-falsy value among title, subtitle, and ticker.
+    """
     return market.title or market.subtitle or market.ticker
 
 

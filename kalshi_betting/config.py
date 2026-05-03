@@ -35,4 +35,10 @@ def parse_mode() -> str:
 
 
 def is_dry_run() -> bool:
+    """
+    Check whether the --dry-run flag was passed on the command line.
+
+    Returns:
+        bool: True if '--dry-run' is present in sys.argv, False otherwise.
+    """
     return "--dry-run" in sys.argv

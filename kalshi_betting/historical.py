@@ -28,6 +28,19 @@ _CATEGORY_PREFIXES = [
 
 
 def infer_category(event_ticker: str) -> str:
+    """
+    Map a Kalshi event ticker to a human-readable market category.
+
+    Checks the ticker against a list of known prefixes (e.g. "KXBTC" → "Crypto",
+    "NFL" → "Sports"). Returns "Other" if no prefix matches.
+
+    Args:
+        event_ticker (str): The event ticker string from a Kalshi market (e.g. "KXBTC-2024").
+            May be None or empty, in which case "Other" is returned.
+
+    Returns:
+        str: Category label such as "Crypto", "Finance", "Sports", "Politics", or "Other".
+    """
     upper = (event_ticker or "").upper()
     for prefix, cat in _CATEGORY_PREFIXES:
         if upper.startswith(prefix):
@@ -48,6 +61,20 @@ def build_prod_live_client():
 # ─── Serialization helpers ────────────────────────────────────────────────────
 
 def _market_to_dict(m) -> dict:
+    """
+    Serialize a Kalshi market API object to a plain dict suitable for JSON caching.
+
+    Extracts only the fields needed by the backtester, converting datetime objects
+    to ISO 8601 strings so the result is JSON-serializable.
+
+    Args:
+        m: A Kalshi market object returned by the live or historical API client.
+
+    Returns:
+        dict: A flat dictionary with keys: ticker, event_ticker, title, subtitle,
+            result, yes_ask_dollars, no_ask_dollars, yes_bid_dollars, close_time,
+            settlement_ts, status.
+    """
     return {
         "ticker": m.ticker,
         "event_ticker": m.event_ticker or "",
@@ -64,12 +91,31 @@ def _market_to_dict(m) -> dict:
 
 
 def _load_json_cache(path: Path):
+    """
+    Load and parse a JSON file from disk if it exists.
+
+    Args:
+        path (Path): Filesystem path to the JSON cache file.
+
+    Returns:
+        Any: Parsed JSON content (typically a list or dict) if the file exists,
+            or None if the file does not exist.
+    """
     if path.exists():
         return json.loads(path.read_text())
     return None
 
 
 def _save_json_cache(path: Path, data) -> None:
+    """
+    Serialize data to JSON and write it to path, creating parent directories as needed.
+
+    Uses a default=str serializer to handle datetime objects that may appear in the data.
+
+    Args:
+        path (Path): Destination file path. Parent directories are created if absent.
+        data: JSON-serializable data structure (list, dict, etc.) to write.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, default=str))
 
