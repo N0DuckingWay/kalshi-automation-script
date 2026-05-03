@@ -13,8 +13,6 @@ from .config import (
     MIN_PRICE_DIFF,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
-    fee_leg_exact,
-    fee_per_pair_approx,
 )
 from .historical import (
     HistoricalApi,
