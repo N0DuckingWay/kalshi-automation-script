@@ -115,7 +115,7 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
 
 def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     """
-    Print a formatted table of all qualifying candidate pairs to stdout.
+    Log a formatted table of all qualifying candidate pairs to the log file.
 
     Displays market titles, deadlines, prices, tradeability, and — for pairs
     selected in the portfolio — the computed trade size, minimum profit, monthly
@@ -167,7 +167,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
         "pA (YES)", "pB (YES)",
         "Tradeable?", "Recommended Trade", "Min Profit", "Monthly Return", "Kelly",
     ]
-    print("\n" + tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    table = tabulate(rows, headers=headers, tablefmt="rounded_outline")
+    for line in table.splitlines():
+        logging.info(line)
 
 
 def _run_dev(client, args) -> None:
