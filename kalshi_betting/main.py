@@ -31,20 +31,6 @@ def _truncate(text: str, n: int = 40) -> str:
     return text[:n] + "…" if len(text) > n else text
 
 
-def _market_display_title(market) -> str:
-    """
-    Return the best available display title for a market object.
-
-    Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
-
-    Args:
-        market: A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
-
-    Returns:
-        str: The first non-falsy value among title, subtitle, and ticker.
-    """
-    return market.title or market.subtitle or market.ticker
-
 
 def _format_deadline(dt) -> str:
     """
