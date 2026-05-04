@@ -60,6 +60,19 @@ def _format_deadline(dt) -> str:
 
 
 def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
+    """
+    Compute trade specifications for all qualifying candidate pairs.
+
+    Args:
+        candidate_pairs (list): List of CandidatePair objects to evaluate.
+        balance_cents (int): Current account balance in cents, used to size
+            each trade via Kelly criterion in compute_trade().
+
+    Returns:
+        dict: Mapping of id(pair) -> TradeSpec for each pair that produced
+            a valid trade specification. Pairs that do not meet profitability
+            or size thresholds are excluded.
+    """
     specs: dict = {}
     for pair in candidate_pairs:
         spec = compute_trade(pair, balance_cents)
@@ -69,6 +82,18 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
 
 
 def _print_portfolio(portfolio: list, label: str) -> None:
+    """
+    Print a summary of selected portfolio trades to stdout.
+
+    Args:
+        portfolio (list): List of TradeSpec objects representing the trades
+            selected for execution.
+        label (str): Header label printed before the trade list (e.g.
+            "Executing" or "Dry-run:").
+
+    Returns:
+        None
+    """
     print(f"\n{label} {len(portfolio)} trade(s):")
     for spec in portfolio:
         print(
@@ -100,7 +125,23 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
 
 
 def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
-    """Print all qualifying pairs. display_specs maps id(pair) -> TradeSpec for selected trades."""
+    """
+    Print a formatted table of all qualifying candidate pairs to stdout.
+
+    Displays market titles, deadlines, prices, tradeability, and — for pairs
+    selected in the portfolio — the computed trade size, minimum profit, monthly
+    return, and Kelly fraction.
+
+    Args:
+        candidate_pairs (list): All CandidatePair objects returned by the
+            scanner, regardless of whether they were selected for trading.
+        display_specs (dict): Mapping of id(pair) -> TradeSpec for pairs
+            selected by select_portfolio(). Pairs absent from this dict are
+            shown with "—" in trade columns.
+
+    Returns:
+        None
+    """
     rows = []
     for pair in candidate_pairs:
         spec = display_specs.get(id(pair))
