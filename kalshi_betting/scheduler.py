@@ -6,6 +6,8 @@ import time
 
 import schedule
 
+from .config import PROJECT_ROOT
+
 
 def run_job() -> None:
     """
@@ -42,6 +44,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
+        ],
     )
 
     schedule.every().monday.at("09:00").do(run_job)
@@ -49,15 +54,13 @@ def main() -> None:
     python_path = sys.executable
     project_path = str(__import__("pathlib").Path(__file__).parent.parent)
 
-    print("Scheduler started. Runs every Monday at 09:00.")
-    print()
-    print("To run instead as a cron job, add this line with `crontab -e`:")
-    print(
-        f"  0 9 * * 1 cd '{project_path}' && {python_path} -m kalshi_betting.main --mode prod"
-        f" >> /tmp/kalshi_arb.log 2>&1"
+    logging.info("Scheduler started. Runs every Monday at 09:00.")
+    logging.info(
+        "To run instead as a cron job, add this line with `crontab -e`: "
+        "0 9 * * 1 cd '%s' && %s -m kalshi_betting.main --mode prod >> /tmp/kalshi_arb.log 2>&1",
+        project_path, python_path,
     )
-    print()
-    print("Waiting for next Monday 09:00...")
+    logging.info("Waiting for next Monday 09:00...")
 
     while True:
         schedule.run_pending()
