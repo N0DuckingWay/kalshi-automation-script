@@ -8,6 +8,13 @@ import schedule
 
 
 def run_job() -> None:
+    """
+    Execute a single production arbitrage bot run as a subprocess.
+
+    Invokes `python -m kalshi_betting.main --mode prod` using the current Python
+    interpreter, with the project root as the working directory. Logs stdout on
+    success and stderr on non-zero exit codes.
+    """
     logging.info("Scheduler: starting weekly arbitrage scan.")
     result = subprocess.run(
         [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod"],
@@ -24,6 +31,13 @@ def run_job() -> None:
 
 
 def main() -> None:
+    """
+    Entry point for the weekly scheduler daemon.
+
+    Configures the `schedule` library to call run_job() every Monday at 09:00,
+    prints cron job instructions as an alternative, then enters an infinite
+    polling loop checking for pending jobs every 60 seconds.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",

@@ -49,9 +49,34 @@ _THIN_BORDER      = Border(
 
 @dataclass
 class TradeResult:
+    """
+    Outcome record for a single attempted or simulated trade.
+
+    Attributes:
+        spec (TradeSpec): The trade specification that was executed or simulated.
+        status (str): Execution outcome — "executed" for a real submitted order,
+            "simulated" for a dry-run or dev-mode run, "failed" for a submission error.
+        error (Optional[str]): Error message if status is "failed", otherwise None.
+    """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated"
     error: Optional[str] = None
+
+
+def _market_title(market) -> str:
+    """
+    Return the best available display title for a market object.
+
+    Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
+    Local helper — reporter.py does not import scanner.py.
+
+    Args:
+        market: A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
+
+    Returns:
+        str: The first non-falsy value among title, subtitle, and ticker.
+    """
+    return market.title or market.subtitle or market.ticker
 
 
 def _apply_header_row(ws, fill: PatternFill) -> None:
@@ -67,6 +92,20 @@ def _apply_header_row(ws, fill: PatternFill) -> None:
 
 
 def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
+    """
+    Serialize a TradeResult to a flat list matching the _TRADE_COLUMNS column order.
+
+    Extracts all fields needed for one Excel data row, formatting prices as rounded
+    floats and datetimes as "YYYY-MM-DD" strings.
+
+    Args:
+        result (TradeResult): The trade result to serialize.
+        run_ts (datetime): Timestamp of the current bot run, used to populate the
+            Date and Time columns.
+
+    Returns:
+        list: Ordered list of 18 values, one per column in _TRADE_COLUMNS.
+    """
     spec = result.spec
     pair = spec.pair
     mA   = _market_title(pair.market_a)
@@ -98,6 +137,17 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
 
 
 def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
+    """
+    Apply background fill, border, and alignment styling to a single data row.
+
+    Color-codes rows by trade status: green for "executed", blue for "simulated",
+    red/orange for "failed", white for any unknown status.
+
+    Args:
+        ws: An openpyxl Worksheet object to apply styles to.
+        row_idx (int): 1-based row index of the data row to style.
+        status (str): Trade status string — "executed", "simulated", or "failed".
+    """
     status_colors = {
         "executed":  "E2EFDA",   # light green
         "simulated": "EBF3FB",   # light blue

@@ -10,6 +10,29 @@ from .scanner import CandidatePair
 
 @dataclass
 class TradeSpec:
+    """
+    Fully computed trade specification for an arbitrage pair, ready for execution.
+
+    Encodes both the trade parameters (contract counts, costs, payoff) and the
+    Kelly-sizing metadata used to rank and select trades for the portfolio.
+
+    Attributes:
+        pair (CandidatePair): The underlying arbitrage candidate this trade is based on.
+        x (int): Number of NO contracts to buy on market A. Always equals y.
+        y (int): Number of YES contracts to buy on market B. Always equals x.
+        total_cost (float): Total dollar cost of the position: x * (nA + pB).
+        min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds:
+            x * (1 - nA - pB). Always > 0 for trades that reach execution.
+        profit_ratio (float): Return on cost: (1 - nA - pB) / (nA + pB).
+        days_to_close (int): Calendar days until the later-closing market resolves. >= 1.
+        monthly_profit_ratio (float): Profit ratio normalized to a 30-day period:
+            profit_ratio * 30 / days_to_close. Used for portfolio ranking.
+        kelly_p (float): Probability of profit used in the Kelly formula. For time_series
+            pairs this is the independence-model estimate; for same_title it is the fixed
+            SAME_TITLE_CO_RESOLVE_PROB prior. Range: (0, 1).
+        kelly_fraction (float): Kelly fraction capped at BUDGET_FRACTION (20%). This is the
+            fraction of account balance allocated to this trade.
+    """
     pair: CandidatePair
     x: int
     y: int

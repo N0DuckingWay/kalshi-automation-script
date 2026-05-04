@@ -16,12 +16,37 @@ from .config import PROJECT_ROOT
 # ─── Metric computation ───────────────────────────────────────────────────────
 
 def _sharpe(daily_returns: pd.Series, rf: float = 0.0) -> float:
+    """
+    Compute the annualized Sharpe ratio from a series of daily returns.
+
+    Annualizes by multiplying the mean daily excess return by sqrt(252).
+
+    Args:
+        daily_returns (pd.Series): Series of daily fractional returns (e.g. 0.01 for 1%).
+        rf (float): Annual risk-free rate as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
+
+    Returns:
+        float: Annualized Sharpe ratio. Returns 0.0 if the standard deviation is zero.
+    """
     excess = daily_returns - rf / 252
     std = excess.std()
     return float(excess.mean() / std * np.sqrt(252)) if std > 0 else 0.0
 
 
 def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
+    """
+    Compute the annualized Sortino ratio from a series of daily returns.
+
+    Like the Sharpe ratio but uses only downside (negative) deviations in the
+    denominator, avoiding penalization for upside volatility.
+
+    Args:
+        daily_returns (pd.Series): Series of daily fractional returns.
+        rf (float): Annual risk-free rate as a decimal. Defaults to 0.0.
+
+    Returns:
+        float: Annualized Sortino ratio. Returns 0.0 if there are no negative excess returns.
+    """
     excess = daily_returns - rf / 252
     neg = excess[excess < 0]
     std_neg = neg.std()
@@ -29,6 +54,18 @@ def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
 
 
 def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
+    """
+    Compute the maximum peak-to-trough drawdown for an equity curve.
+
+    Args:
+        equity (pd.Series): Time-indexed series of portfolio values.
+
+    Returns:
+        tuple[float, date | None]: A pair of (max_drawdown, trough_date) where
+            max_drawdown is the largest fractional decline from any prior peak
+            (expressed as a negative number, e.g. -0.15 for a 15% drawdown),
+            and trough_date is the index label at the trough or None if unavailable.
+    """
     rolling_max = equity.cummax()
     dd = (equity - rolling_max) / rolling_max
     max_dd = float(dd.min())
@@ -38,6 +75,20 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
 
 
 def _brier_score(trades: list[BacktestTrade]) -> float:
+    """
+    Compute the mean Brier score across all market predictions in the trade list.
+
+    The Brier score is the mean squared error between predicted probabilities and
+    binary outcomes (1 for "yes", 0 for "no"). Lower scores indicate better calibration.
+    Each trade contributes two predictions: one for market A and one for market B.
+
+    Args:
+        trades (list[BacktestTrade]): List of completed backtest trades with entry prices
+            and settlement outcomes.
+
+    Returns:
+        float: Mean Brier score in [0, 1]. Returns 0.0 if no trades are provided.
+    """
     scores = []
     for t in trades:
         for prob, outcome in [(t.entry_pA, t.outcome_a), (t.entry_pB, t.outcome_b)]:
@@ -47,6 +98,21 @@ def _brier_score(trades: list[BacktestTrade]) -> float:
 
 
 def _log_loss(trades: list[BacktestTrade]) -> float:
+    """
+    Compute the mean binary cross-entropy (log loss) across all market predictions.
+
+    Measures how well predicted probabilities match binary settlement outcomes. Each
+    trade contributes two (probability, outcome) pairs. Probabilities are clipped to
+    [1e-7, 1-1e-7] to avoid log(0).
+
+    Args:
+        trades (list[BacktestTrade]): List of completed backtest trades with entry prices
+            and settlement outcomes.
+
+    Returns:
+        float: Mean log loss. Lower values indicate better calibration. Returns 0.0 if
+            no trades are provided.
+    """
     eps = 1e-7
     losses = []
     for t in trades:
@@ -99,10 +165,35 @@ _KPI_TEMPLATE = """
 
 
 def _kpi(label: str, value: str, color: str = "#212121") -> str:
+    """
+    Render a single KPI card as an HTML snippet using the _KPI_TEMPLATE.
+
+    Args:
+        label (str): Short label displayed above the value (e.g. "Total Return").
+        value (str): Pre-formatted value string to display (e.g. "+12.3%").
+        color (str): CSS hex color for the value text. Defaults to near-black "#212121".
+
+    Returns:
+        str: Rendered HTML string for one KPI card block.
+    """
     return _KPI_TEMPLATE.format(label=label, value=value, color=color)
 
 
 def _fig_html(fig: go.Figure, height: int = 400) -> str:
+    """
+    Apply a standard layout to a Plotly figure and return it as an inline HTML string.
+
+    Configures common layout properties (height, margins, background colors, font,
+    legend position) then serializes to HTML without the full Plotly.js bundle
+    (assumes the CDN script tag is already present in the page <head>).
+
+    Args:
+        fig (go.Figure): Plotly figure to render.
+        height (int): Desired figure height in pixels. Defaults to 400.
+
+    Returns:
+        str: HTML string fragment (no <html>/<body> wrapper, no Plotly.js script tag).
+    """
     fig.update_layout(
         height=height,
         margin=dict(l=60, r=20, t=40, b=40),
@@ -122,6 +213,22 @@ def _section_performance(
     start_date: date,
     initial_balance: float,
 ) -> str:
+    """
+    Build the "Portfolio Performance" HTML section.
+
+    Computes summary KPIs (total return, Sharpe, Sortino, max drawdown, win rate)
+    and renders two charts: the equity curve and a drawdown percentage plot.
+
+    Args:
+        equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value,
+            daily_return] as produced by _build_equity_curve().
+        trades (list[BacktestTrade]): Completed backtest trades for win rate and avg return.
+        start_date (date): Backtest start date for display context.
+        initial_balance (float): Starting portfolio value in dollars.
+
+    Returns:
+        str: Self-contained HTML section string including KPI cards and two Plotly charts.
+    """
     final_value  = float(equity_df["portfolio_value"].iloc[-1])
     total_return = (final_value - initial_balance) / initial_balance
     daily_ret    = equity_df["daily_return"]
@@ -173,6 +280,19 @@ def _section_performance(
 # ─── Section 2: Returns Decomposition ────────────────────────────────────────
 
 def _section_decomposition(trades: list[BacktestTrade]) -> str:
+    """
+    Build the "Returns Decomposition" HTML section.
+
+    Shows four charts: monthly P&L bar chart, P&L by market category, P&L by entry
+    price bucket, and a holding-period histogram.
+
+    Args:
+        trades (list[BacktestTrade]): Completed backtest trades to decompose.
+
+    Returns:
+        str: Self-contained HTML section string. Returns a "No trades" placeholder
+            if the trades list is empty.
+    """
     if not trades:
         return _SECTION_STYLE.format(title="Returns Decomposition") + "<p>No trades.</p>"
 
@@ -238,6 +358,20 @@ def _section_decomposition(trades: list[BacktestTrade]) -> str:
 # ─── Section 3: Calibration Analysis ─────────────────────────────────────────
 
 def _section_calibration(trades: list[BacktestTrade]) -> str:
+    """
+    Build the "Calibration Analysis" HTML section.
+
+    Computes Brier score and log loss KPIs and renders a reliability diagram
+    (actual resolution rate vs. predicted probability per bin).
+
+    Args:
+        trades (list[BacktestTrade]): Completed backtest trades with entry prices
+            and settlement outcomes.
+
+    Returns:
+        str: Self-contained HTML section string with KPIs and calibration curve.
+            Returns a "No trades" placeholder if the list is empty.
+    """
     if not trades:
         return _SECTION_STYLE.format(title="Calibration Analysis") + "<p>No trades.</p>"
 
@@ -297,6 +431,19 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 # ─── Section 4: Trade-Level Diagnostics ──────────────────────────────────────
 
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
+    """
+    Build the "Trade-Level Diagnostics" HTML section.
+
+    Renders a per-trade return distribution histogram, a slippage histogram, and
+    HTML tables listing the top 5 and worst 5 trades by dollar profit.
+
+    Args:
+        trades (list[BacktestTrade]): Completed backtest trades to diagnose.
+
+    Returns:
+        str: Self-contained HTML section string. Returns a "No trades" placeholder
+            if the list is empty.
+    """
     if not trades:
         return _SECTION_STYLE.format(title="Trade-Level Diagnostics") + "<p>No trades.</p>"
 
@@ -328,6 +475,17 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     worst = sorted_trades[-5:]
 
     def _trow(t: BacktestTrade, color: str) -> str:
+        """
+        Render a single HTML table row for a BacktestTrade.
+
+        Args:
+            t (BacktestTrade): Trade to display.
+            color (str): CSS background color string for the row (e.g. "#F9FBE7").
+
+        Returns:
+            str: An HTML <tr>...</tr> string with entry date, title, pair type,
+                contract count, total cost, and profit/return.
+        """
         return (f"<tr style='background:{color}'>"
                 f"<td>{t.entry_date}</td>"
                 f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{t.title_a[:40]}</td>"
@@ -370,6 +528,21 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 
 def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
                   initial_balance: float) -> str:
+    """
+    Build the "Risk Metrics" HTML section.
+
+    Renders a Kelly fraction vs. actual fraction scatter plot (to assess sizing
+    discipline) and a portfolio value over time chart showing capital deployment.
+
+    Args:
+        trades (list[BacktestTrade]): Completed backtest trades for sizing analysis.
+        equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value].
+        initial_balance (float): Starting portfolio value in dollars.
+
+    Returns:
+        str: Self-contained HTML section string. Returns a "No trades" placeholder
+            if the trades list is empty.
+    """
     if not trades:
         return _SECTION_STYLE.format(title="Risk Metrics") + "<p>No trades.</p>"
 
@@ -428,6 +601,25 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
                         initial_balance: float) -> str:
+    """
+    Build the "Benchmark Comparison" HTML section.
+
+    Fetches S&P 500 data via yfinance, normalizes it to the same starting balance,
+    and plots both the strategy and the benchmark on the same chart. Also renders
+    a summary table with total return, Sharpe, and max drawdown for each.
+
+    If yfinance fails (network error, no data), the S&P 500 line is omitted and
+    only the strategy is shown.
+
+    Args:
+        equity_df (pd.DataFrame): Daily equity curve with columns
+            [date, portfolio_value, daily_return].
+        start_date (date): Start date used for downloading benchmark data.
+        initial_balance (float): Starting portfolio value in dollars.
+
+    Returns:
+        str: Self-contained HTML section string with comparison table and chart.
+    """
     # Fetch S&P 500
     sp_raw = None
     try:

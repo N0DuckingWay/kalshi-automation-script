@@ -18,10 +18,44 @@ from .trader import execute_trades
 
 
 def _truncate(text: str, n: int = 40) -> str:
+    """
+    Truncate text to at most n characters, appending an ellipsis if truncated.
+
+    Args:
+        text (str): Input string to truncate.
+        n (int): Maximum number of characters to keep. Defaults to 40.
+
+    Returns:
+        str: The original string if len(text) <= n, otherwise text[:n] + "…".
+    """
     return text[:n] + "…" if len(text) > n else text
 
 
+def _market_display_title(market) -> str:
+    """
+    Return the best available display title for a market object.
+
+    Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
+
+    Args:
+        market: A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
+
+    Returns:
+        str: The first non-falsy value among title, subtitle, and ticker.
+    """
+    return market.title or market.subtitle or market.ticker
+
+
 def _format_deadline(dt) -> str:
+    """
+    Format a market close datetime as a "YYYY-MM-DD" string, or "?" if None.
+
+    Args:
+        dt: A datetime object representing the market deadline, or None.
+
+    Returns:
+        str: ISO date string "YYYY-MM-DD" if dt is not None, otherwise "?".
+    """
     return dt.strftime("%Y-%m-%d") if dt else "?"
 
 
@@ -213,6 +247,13 @@ def _run_prod(client, args) -> None:
 
 
 def main() -> None:
+    """
+    CLI entry point for the Kalshi arbitrage bot.
+
+    Parses command-line arguments (--mode, --dry-run, --sandbox-balance),
+    configures logging, builds the appropriate Kalshi client, and dispatches
+    to _run_dev (sandbox simulation) or _run_prod (real account trading).
+    """
     parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
     parser.add_argument(
         "--mode", choices=["dev", "prod"], default="dev",

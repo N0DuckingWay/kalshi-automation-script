@@ -9,6 +9,15 @@ from .historical import build_historical_client, build_prod_live_client
 
 
 def main() -> None:
+    """
+    CLI entry point for the Kalshi arbitrage backtester.
+
+    Parses command-line arguments (--start-date, --balance, --no-cache),
+    configures logging, constructs historical and live Kalshi API clients,
+    runs the full backtest simulation via run_backtest(), and generates an
+    interactive HTML dashboard via generate_dashboard(). Prints a summary
+    table of key metrics to stdout on completion.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Kalshi Arbitrage Backtester — replays the strategy on all settled "
