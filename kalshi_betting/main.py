@@ -6,7 +6,7 @@ import sys
 from tabulate import tabulate
 
 from .auth import build_client, verify_auth
-from .config import MIN_BALANCE_CENTS
+from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     get_held_tickers, fetch_open_markets,
@@ -69,7 +69,7 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
 
 def _print_portfolio(portfolio: list, label: str) -> None:
     """
-    Print a summary of selected portfolio trades to stdout.
+    Log a summary of selected portfolio trades to the log file.
 
     Args:
         portfolio (list): List of TradeSpec objects representing the trades
@@ -80,13 +80,16 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     Returns:
         None
     """
-    print(f"\n{label} {len(portfolio)} trade(s):")
+    logging.info("%s %d trade(s):", label, len(portfolio))
     for spec in portfolio:
-        print(
-            f"  [{spec.pair.pair_type}] {spec.pair.canonical_title[:55]} — "
-            f"{spec.x}× NO(A) + {spec.y}× YES(B) — "
-            f"cost ${spec.total_cost:.2f}, min profit ${spec.min_payoff:.2f} "
-            f"({spec.profit_ratio:.1%} return)"
+        logging.info(
+            "  [%s] %s — %d× NO(A) + %d× YES(B) — "
+            "cost $%.2f, min profit $%.2f (%.1f%% return)",
+            spec.pair.pair_type,
+            spec.pair.canonical_title[:55],
+            spec.x, spec.y,
+            spec.total_cost, spec.min_payoff,
+            spec.profit_ratio * 100,
         )
 
 
@@ -300,6 +303,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
+        ],
     )
 
     client = build_client(args.mode)
