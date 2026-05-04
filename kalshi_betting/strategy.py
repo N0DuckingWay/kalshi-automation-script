@@ -79,7 +79,7 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
         return None
 
-    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
     if net_spread <= 0:
         return None
     profit_ratio = net_spread / (nA + pB)
@@ -99,8 +99,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
     if pair.max_contracts > 0:
         n = min(n, pair.max_contracts)
 
-    fee_no  = fee_leg_exact(n, nA)
-    fee_yes = fee_leg_exact(n, pB)
+    fee_no  = fee_leg_exact(n, nA)   # returns float — ceiling-rounded taker fee for n NO contracts at price nA
+    fee_yes = fee_leg_exact(n, pB)   # returns float — ceiling-rounded taker fee for n YES contracts at price pB
     min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
     if min_payoff <= 0:
         return None
