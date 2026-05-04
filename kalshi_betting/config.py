@@ -1,7 +1,6 @@
 """Configuration constants for the Kalshi arbitrage bot."""
 import math
 import pathlib
-import sys
 
 PROD_URL    = "https://api.elections.kalshi.com/trade-api/v2"
 SANDBOX_URL = "https://demo-api.kalshi.co/trade-api/v2"
@@ -34,23 +33,3 @@ def fee_per_pair_approx(nA: float, pB: float) -> float:
 def fee_leg_exact(n: int, p: float) -> float:
     """Ceiling-rounded Kalshi taker fee for n contracts of one order leg at price p."""
     return math.ceil(TAKER_FEE_RATE * n * p * (1.0 - p) * 100) / 100
-
-
-def parse_mode() -> str:
-    """Return 'prod' or 'dev' based on --mode CLI arg. Defaults to 'dev'."""
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--mode" and i < len(sys.argv):
-            m = sys.argv[i + 1].lower()
-            if m in ("prod", "dev"):
-                return m
-    return "dev"
-
-
-def is_dry_run() -> bool:
-    """
-    Check whether the --dry-run flag was passed on the command line.
-
-    Returns:
-        bool: True if '--dry-run' is present in sys.argv, False otherwise.
-    """
-    return "--dry-run" in sys.argv
