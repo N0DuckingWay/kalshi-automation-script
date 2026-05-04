@@ -4,6 +4,7 @@ import logging
 from datetime import date
 
 from .backtester import run_backtest
+from .config import PROJECT_ROOT
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client
 
@@ -42,6 +43,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(PROJECT_ROOT / "kalshi_backtest.log"),
+        ],
     )
 
     try:
@@ -69,21 +73,21 @@ def main() -> None:
     )
 
     if not trades:
-        print("No backtest trades found. Dashboard will show empty charts.")
+        logging.info("No backtest trades found. Dashboard will show empty charts.")
     else:
         final_value  = float(equity_df["portfolio_value"].iloc[-1])
         total_return = (final_value - args.balance) / args.balance
         n_win        = sum(1 for t in trades if t.profit > 0)
-        print(f"\nBacktest Summary")
-        print(f"  Period:        {start_date} → {date.today()}")
-        print(f"  Total trades:  {len(trades)}")
-        print(f"  Win rate:      {n_win / len(trades):.1%}")
-        print(f"  Total return:  {total_return:+.1%}")
-        print(f"  Final balance: ${final_value:,.2f}")
+        logging.info("Backtest Summary")
+        logging.info("  Period:        %s → %s", start_date, date.today())
+        logging.info("  Total trades:  %d", len(trades))
+        logging.info("  Win rate:      %.1f%%", n_win / len(trades) * 100)
+        logging.info("  Total return:  %+.1f%%", total_return * 100)
+        logging.info("  Final balance: $%,.2f", final_value)
 
     out = generate_dashboard(trades, equity_df, start_date, args.balance)
-    print(f"\nDashboard written: {out}")
-    print("Open the HTML file in a browser to view the interactive charts.")
+    logging.info("Dashboard written: %s", out)
+    logging.info("Open the HTML file in a browser to view the interactive charts.")
 
 
 if __name__ == "__main__":

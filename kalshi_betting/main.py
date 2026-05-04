@@ -197,22 +197,22 @@ def _run_dev(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        print("No qualifying pairs found in sandbox (≥15% time-series or ≥5% same-title price diff).")
+        logging.info("No qualifying pairs found in sandbox (≥15% time-series or ≥5% same-title price diff).")
         out = write_dev_simulation([], [], sandbox_balance_cents)
-        print(f"Dev simulation written (empty): {out}")
+        logging.info("Dev simulation written (empty): %s", out)
         return
 
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
     portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
     display_specs = {id(s.pair): s for s in portfolio}
 
-    print(f"\nKalshi Sandbox Scan — Virtual Balance: ${args.sandbox_balance:.2f} | Mode: DEV")
+    logging.info("Kalshi Sandbox Scan — Virtual Balance: $%.2f | Mode: DEV", args.sandbox_balance)
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        print("\nNo executable arbitrage trades found.")
+        logging.info("No executable arbitrage trades found.")
         out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
-        print(f"\nDev simulation written (candidates only): {out}")
+        logging.info("Dev simulation written (candidates only): %s", out)
         return
 
     _print_portfolio(portfolio, "Simulated")
@@ -221,7 +221,7 @@ def _run_dev(client, args) -> None:
     results = execute_trades(client, portfolio, dry_run=True)
 
     out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
-    print(f"\nDev simulation written: {out}")
+    logging.info("Dev simulation written: %s", out)
 
 
 def _run_prod(client, args) -> None:
@@ -249,18 +249,18 @@ def _run_prod(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        print("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
+        logging.info("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
         return
 
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
     display_specs = {id(s.pair): s for s in portfolio}
 
-    print(f"\nKalshi Arbitrage Scan — Balance: ${balance_cents / 100:.2f} | Mode: PROD")
+    logging.info("Kalshi Arbitrage Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        print("\nNo executable arbitrage trades found.")
+        logging.info("No executable arbitrage trades found.")
         return
 
     _print_portfolio(portfolio, "Selected")
@@ -269,13 +269,13 @@ def _run_prod(client, args) -> None:
 
     balance_after = verify_auth(client) / 100
     out = append_to_prod_log(results, balance_cents / 100, balance_after)
-    print(f"\nTrade log updated: {out}")
+    logging.info("Trade log updated: %s", out)
 
     if args.dry_run:
-        print("[DRY RUN] No orders were actually submitted.")
+        logging.info("[DRY RUN] No orders were actually submitted.")
     else:
         n_ok = sum(1 for r in results if r.status == "executed")
-        print(f"Submitted {n_ok} of {len(results)} batch order(s) successfully.")
+        logging.info("Submitted %d of %d batch order(s) successfully.", n_ok, len(results))
 
 
 def main() -> None:
@@ -306,7 +306,6 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.StreamHandler(),
             logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
         ],
     )

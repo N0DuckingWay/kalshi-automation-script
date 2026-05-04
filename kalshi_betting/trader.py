@@ -53,11 +53,12 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
         mB_title = spec.pair.market_b.title or spec.pair.market_b.ticker
 
         if dry_run:
-            print(
-                f"[DRY RUN] Batch order:\n"
-                f"  Buy {spec.x}x NO  on '{mA_title[:60]}' @ {spec.pair.nA:.2%}\n"
-                f"  Buy {spec.y}x YES on '{mB_title[:60]}' @ {spec.pair.pB:.2%}\n"
-                f"  Total cost: ${spec.total_cost:.2f} | Min profit: ${spec.min_payoff:.2f}"
+            logging.info(
+                "[DRY RUN] Batch order: Buy %dx NO on '%s' @ %.2f%% | Buy %dx YES on '%s' @ %.2f%% | "
+                "Total cost: $%.2f | Min profit: $%.2f",
+                spec.x, mA_title[:60], spec.pair.nA * 100,
+                spec.y, mB_title[:60], spec.pair.pB * 100,
+                spec.total_cost, spec.min_payoff,
             )
             results.append(TradeResult(spec=spec, status="simulated"))
             continue
