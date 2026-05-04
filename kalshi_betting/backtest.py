@@ -61,8 +61,8 @@ def main() -> None:
     )
 
     # Always uses prod API — historical data only exists there.
-    hist_client = build_historical_client()
-    live_client = build_prod_live_client()
+    hist_client = build_historical_client()  # returns HistoricalApi instance backed by prod credentials
+    live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
 
     trades, equity_df = run_backtest(
         hist_client=hist_client,
@@ -70,7 +70,7 @@ def main() -> None:
         start_date=start_date,
         initial_balance=args.balance,
         use_cache=use_cache,
-    )
+    )  # returns tuple[list[BacktestTrade], pd.DataFrame] — trades and daily equity curve
 
     if not trades:
         logging.info("No backtest trades found. Dashboard will show empty charts.")
@@ -85,7 +85,7 @@ def main() -> None:
         logging.info("  Total return:  %+.1f%%", total_return * 100)
         logging.info("  Final balance: $%,.2f", final_value)
 
-    out = generate_dashboard(trades, equity_df, start_date, args.balance)
+    out = generate_dashboard(trades, equity_df, start_date, args.balance)  # returns Path to the self-contained HTML dashboard file
     logging.info("Dashboard written: %s", out)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
 

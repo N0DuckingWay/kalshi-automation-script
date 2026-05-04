@@ -50,12 +50,12 @@ def infer_category(event_ticker: str) -> str:
 
 def build_historical_client() -> HistoricalApi:
     """HistoricalApi backed by prod credentials (historical data only exists on prod)."""
-    return HistoricalApi(api_client=build_client("prod"))
+    return HistoricalApi(api_client=build_client("prod"))  # returns KalshiClient authenticated via RSA key, pointed at prod URL
 
 
 def build_prod_live_client():
     """KalshiClient pointed at prod for recently-settled market fetching."""
-    return build_client("prod")
+    return build_client("prod")  # returns KalshiClient authenticated via RSA key, pointed at prod URL
 
 
 # ─── Serialization helpers ────────────────────────────────────────────────────

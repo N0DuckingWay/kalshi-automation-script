@@ -101,7 +101,7 @@ def _compute_actual_payoff(n: int, pA: float, pB: float, nA: float,
       A=NO,  B=NO  → n*(1-nA) - n*pB - fee
       A=YES, B=NO  → -(n*nA + n*pB) - fee  [loss for same_title]
     """
-    fee = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
+    fee = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)  # each call returns float — ceiling-rounded taker fee for n contracts at the given price; sum is total fee
     if outcome_a == "yes" and outcome_b == "yes":
         return n * (1.0 - pB) - n * nA - fee
     if outcome_a == "no" and outcome_b == "yes":
@@ -130,7 +130,7 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
     groups: dict = defaultdict(list)
     for m in markets:
         raw = m.get("title") or m.get("subtitle") or m.get("ticker", "")
-        norm = normalize_title(raw)
+        norm = normalize_title(raw)  # returns str — lowercased title with all date/time tokens stripped
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
@@ -238,7 +238,7 @@ def _find_entry(
         if pA - pB < threshold:
             continue
 
-        if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):
+        if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
             continue  # not tradeable after fees
 
         # For time_series: check deadline gap
@@ -282,7 +282,7 @@ def run_backtest(
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
-    markets = fetch_all_settled_markets(hist_client, live_client, start_date, use_cache)
+    markets = fetch_all_settled_markets(hist_client, live_client, start_date, use_cache)  # returns list[dict] — settled market dicts with keys: ticker, title, result, prices, timestamps
     logging.info("Total settled markets to analyze: %d", len(markets))
 
     # Group into potential pairs
@@ -316,7 +316,7 @@ def run_backtest(
         close_ts  = int(close_dt.timestamp()) + 86400  # one day past close
         candles_by_ticker[ticker] = fetch_daily_candlesticks(
             hist_client, ticker, open_ts, close_ts, use_cache
-        )
+        )  # returns list[dict], each with keys: ts (int unix), yes_ask_close (float), no_ask_close (float)
 
     logging.info("Candlestick fetch complete.")
 
@@ -338,7 +338,7 @@ def run_backtest(
         entry_date = entry["entry_date"]
 
         # Kelly sizing: independence model for time_series, fixed prior for same_title
-        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
         profit_ratio_entry = net_spread / (nA + pB) if net_spread > 0 else 0.0
         p = (1.0 - pA * (1.0 - pB)) if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB
         q = 1.0 - p
@@ -350,7 +350,7 @@ def run_backtest(
         budget = initial_balance * kelly_f_capped
         n = max(1, int(budget / (nA + pB)))
         total_cost      = n * (nA + pB)
-        expected_payoff = n * (1.0 - nA - pB) - fee_leg_exact(n, nA) - fee_leg_exact(n, pB)
+        expected_payoff = n * (1.0 - nA - pB) - fee_leg_exact(n, nA) - fee_leg_exact(n, pB)  # each returns float — ceiling-rounded taker fee for n contracts at the given price
 
         outcome_a = mA.get("result", "")
         outcome_b = mB.get("result", "")
@@ -417,7 +417,7 @@ def run_backtest(
             ticker_b=mB["ticker"],
             title_a=c["title_a"],
             title_b=c["title_b"],
-            category=infer_category(mA.get("event_ticker", "")),
+            category=infer_category(mA.get("event_ticker", "")),  # returns str category label, e.g. "Crypto", "Finance", "Sports", or "Other"
             entry_date=c["entry_date"],
             exit_date=c["exit_date"],
             entry_pA=c["pA"],

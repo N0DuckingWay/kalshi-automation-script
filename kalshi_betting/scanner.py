@@ -258,7 +258,7 @@ def find_candidate_pairs(
                 if abs(pA - pB) < MIN_PRICE_DIFF:
                     continue
 
-                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)
+                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
 
                 group_pairs.append(
                     CandidatePair(
@@ -340,7 +340,7 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)
+                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)  # same
                 group_pairs.append(
                     CandidatePair(
                         market_a=mA,
@@ -513,7 +513,7 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         avg_pB    = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
         avg_nA    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
 
-        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)
+        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)  # returns float — continuous taker fee estimate, using depth-weighted average prices
 
         if not new_tradeable:
             logging.info(

@@ -60,7 +60,7 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 spec.y, mB_title[:60], spec.pair.pB * 100,
                 spec.total_cost, spec.min_payoff,
             )
-            results.append(TradeResult(spec=spec, status="simulated"))
+            results.append(TradeResult(spec=spec, status="simulated"))  # constructs TradeResult dataclass (from reporter.py) with spec (TradeSpec) and status str
             continue
 
         try:
@@ -71,13 +71,13 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 spec.x,
                 spec.y,
             )
-            results.append(TradeResult(spec=spec, status="executed"))
+            results.append(TradeResult(spec=spec, status="executed"))  # same — status="executed" indicates a real submitted order
         except Exception as e:
             logging.error(
                 "Batch order FAILED for '%s' (NOT retrying — partial fill risk): %s",
                 spec.pair.canonical_title,
                 e,
             )
-            results.append(TradeResult(spec=spec, status="failed", error=str(e)))
+            results.append(TradeResult(spec=spec, status="failed", error=str(e)))  # same — status="failed" with error message str
 
     return results
