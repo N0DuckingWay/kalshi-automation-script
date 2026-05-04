@@ -63,21 +63,6 @@ class TradeResult:
     error: Optional[str] = None
 
 
-def _market_title(market) -> str:
-    """
-    Return the best available display title for a market object.
-
-    Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
-    Local helper — reporter.py does not import scanner.py.
-
-    Args:
-        market: A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
-
-    Returns:
-        str: The first non-falsy value among title, subtitle, and ticker.
-    """
-    return market.title or market.subtitle or market.ticker
-
 
 def _apply_header_row(ws, fill: PatternFill) -> None:
     """Write and style the column header row."""
@@ -108,8 +93,8 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     """
     spec = result.spec
     pair = spec.pair
-    mA   = _market_title(pair.market_a)
-    mB   = _market_title(pair.market_b)
+    mA   = market_title(pair.market_a)
+    mB   = market_title(pair.market_b)
 
     def fmt_dt(dt) -> str:
         return dt.strftime("%Y-%m-%d") if dt else ""
@@ -289,8 +274,8 @@ def write_dev_simulation(
         diff    = pair.pA - pair.pB
         row_data = [
             pair.pair_type,
-            _market_title(pair.market_a), pair.market_a.ticker,
-            _market_title(pair.market_b), pair.market_b.ticker,
+            market_title(pair.market_a), pair.market_a.ticker,
+            market_title(pair.market_b), pair.market_b.ticker,
             pair.market_a.close_time.strftime("%Y-%m-%d") if pair.market_a.close_time else "",
             pair.market_b.close_time.strftime("%Y-%m-%d") if pair.market_b.close_time else "",
             round(pair.pA, 4),

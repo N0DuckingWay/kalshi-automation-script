@@ -106,7 +106,7 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", result).strip().lower()
 
 
-def _market_title(market: Any) -> str:
+def market_title(market: Any) -> str:
     """
     Return the best available display title for a market object.
 
@@ -224,7 +224,7 @@ def find_candidate_pairs(
     # Group by exact normalized title — O(n) hash, no fuzzy matching
     by_title: dict = defaultdict(list)
     for m in active:
-        norm = normalize_title(_market_title(m))
+        norm = normalize_title(market_title(m))
         if norm:  # skip empty strings
             by_title[norm].append(m)
 
