@@ -1,4 +1,30 @@
-"""Market scanning: fetch open markets and find arbitrage candidate pairs."""
+"""
+File: scanner.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Fetches all open Kalshi markets from the REST API and identifies pairs of
+    contracts that are candidates for arbitrage. Two detection paths exist:
+    (1) time-series pairs — contracts that ask the same question at different
+    deadlines, identified by stripping date tokens from their titles and
+    exact-matching the remainder; and (2) same-title pairs — contracts with
+    identical title and subtitle on different event tickers. Both paths then
+    check the live order book to replace best-ask prices with depth-weighted
+    fill prices and confirm the edge survives real liquidity.
+
+Dependencies:
+    Imports constants and fee helpers from config.py. Exports the CandidatePair
+    dataclass and scanning functions consumed by main.py, backtester.py, and
+    (via normalize_title) historical.py. Depends on the KalshiClient produced
+    by auth.py.
+
+Notes:
+    The normalize_title() approach avoids fuzzy matching entirely — it relies on
+    the observation that Kalshi titles differ only in date tokens when the same
+    question is asked across multiple deadline-indexed markets. The _DATE_PATTERNS
+    list must cover all Kalshi date formats to avoid missed pairs or false positives.
+"""
 import logging
 import re
 import time
@@ -122,7 +148,23 @@ def market_title(market: Any) -> str:
 
 
 def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
-    """Return markets with YES ask in [1%, 99%] that are not in excluded_tickers."""
+    """
+    Filter markets to those that are actively priced and not already held.
+
+    A market is considered actively priced when its YES ask is between 1¢ and 99¢.
+    Markets at 0¢ or 100¢ are effectively settled or completely illiquid — trading
+    them offers no edge. Markets whose tickers are in excluded_tickers are already
+    held in the portfolio and must not be traded again.
+
+    Args:
+        markets (list): List of Kalshi market API objects to filter.
+        excluded_tickers (set | None): Set of ticker strings to skip. If None,
+            no tickers are excluded.
+
+    Returns:
+        list: Subset of markets that have a parseable YES ask in [0.01, 0.99]
+            and whose ticker is not in excluded_tickers.
+    """
     excluded = excluded_tickers or set()
     active = []
     for m in markets:
@@ -130,6 +172,7 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
             continue
         try:
             ya = float(m.yes_ask_dollars)
+            # Skip markets at or near 0¢ (already settled NO) or 100¢ (already settled YES)
             if _MIN_ACTIVE_PRICE <= ya <= _MAX_ACTIVE_PRICE:
                 active.append(m)
         except (ValueError, TypeError):
@@ -138,21 +181,38 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
 
 
 def get_held_tickers(client: Any) -> set:
-    """Return set of tickers where the user currently holds a non-zero position."""
+    """
+    Fetch all tickers where the account currently holds a non-zero position.
+
+    Iterates through all pages of the portfolio positions endpoint and collects
+    tickers with a non-zero position_fp (fractional position). These tickers are
+    excluded from new trades to avoid doubling up on an existing position.
+
+    Args:
+        client (Any): An authenticated KalshiClient produced by auth.build_client().
+
+    Returns:
+        set: Set of ticker strings (e.g. {"KXBTC-23DEC-T40000", ...}) where the
+            user currently holds a non-zero position. Empty set if no positions exist.
+    """
     held: set = set()
     cursor: str | None = None
     while True:
         kwargs: dict = dict(limit=POSITION_PAGE_SIZE, count_filter="position")
+        # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
         resp = client.get_positions(**kwargs)
         for pos in resp.market_positions:
             try:
+                # position_fp is a float string — add to held set if non-zero
                 if float(pos.position_fp) != 0:
                     held.add(pos.ticker)
             except (ValueError, AttributeError):
+                # If we can't parse the position, be conservative and treat it as held
                 held.add(pos.ticker)
         cursor = resp.cursor
+        # A None or empty cursor signals the last page
         if not cursor:
             break
     logging.info("Held positions: %d tickers", len(held))
@@ -160,7 +220,25 @@ def get_held_tickers(client: Any) -> set:
 
 
 def _api_call_with_retry(fn, *args, **kwargs):
-    """Call fn(*args, **kwargs) with exponential backoff on 429 responses."""
+    """
+    Call an API function with exponential backoff on HTTP 429 (rate limit) errors.
+
+    Retries up to 5 times with a starting delay of 2 seconds, doubling each time
+    up to a maximum of 60 seconds. Any non-429 exception is re-raised immediately
+    without retrying (e.g. 401 auth errors, 404 not found).
+
+    Args:
+        fn: A callable that performs an API call (e.g. client.get_markets).
+        *args: Positional arguments forwarded to fn.
+        **kwargs: Keyword arguments forwarded to fn.
+
+    Returns:
+        The return value of fn(*args, **kwargs) on success.
+
+    Raises:
+        Exception: Re-raises the original exception if it is not a 429 error, or
+            if all 5 retries are exhausted.
+    """
     delay = 2.0
     for attempt in range(6):
         try:
@@ -169,22 +247,39 @@ def _api_call_with_retry(fn, *args, **kwargs):
             if "429" in str(e) and attempt < 5:
                 logging.warning("Rate limited — retrying in %.0fs (attempt %d/5)", delay, attempt + 1)
                 time.sleep(delay)
+                # Exponential backoff capped at 60 seconds to avoid waiting indefinitely
                 delay = min(delay * 2, 60)
             else:
                 raise
 
 
 def fetch_open_markets(client: Any) -> list:
-    """Fetch all open, non-multivariate markets via paginated API calls."""
+    """
+    Fetch all open, non-multivariate Kalshi markets via paginated API calls.
+
+    Uses the mve_filter="exclude" parameter to skip multivariate (multi-choice)
+    markets, which have fundamentally different pricing semantics and would
+    generate false positives in the arbitrage scanner. Iterates through all
+    pages of results using cursor-based pagination.
+
+    Args:
+        client (Any): An authenticated KalshiClient produced by auth.build_client().
+
+    Returns:
+        list: All open, non-multivariate Kalshi market API objects. May contain
+            thousands of items depending on the current state of the platform.
+    """
     markets = []
     cursor: str | None = None
     while True:
         kwargs: dict = dict(status="open", limit=MARKET_PAGE_SIZE, mve_filter="exclude")
+        # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
         resp = _api_call_with_retry(client.get_markets, **kwargs)
         markets.extend(resp.markets)
         cursor = resp.cursor
+        # A None or empty cursor signals the last page
         if not cursor:
             break
     logging.info("Fetched %d open markets", len(markets))
@@ -216,34 +311,44 @@ def find_candidate_pairs(
     tradeable=True when nA + pB < 1 AND pA > pB (all 3 outcome scenarios profitable).
     """
     if markets is None:
+        # Fetch all open markets from the Kalshi API if not supplied by the caller
         markets = fetch_open_markets(client)
 
+    # Remove markets already held and those priced at or near 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
-    # Group by exact normalized title — O(n) hash, no fuzzy matching
+    # Group by exact normalized title — O(n) hash, no fuzzy matching.
+    # Stripping date tokens from titles means two markets that differ ONLY in their
+    # deadline produce the same key, so they end up in the same group.
     by_title: dict = defaultdict(list)
     for m in active:
         norm = normalize_title(market_title(m))
-        if norm:  # skip empty strings
+        # Skip markets whose title collapses entirely to an empty string after stripping
+        if norm:
             by_title[norm].append(m)
 
     logging.info("Distinct normalized titles with >= 1 market: %d", len(by_title))
 
     candidate_pairs: list = []
     for norm_title, members in by_title.items():
+        # Need at least two markets in a group to form any pair
         if len(members) < 2:
             continue
 
+        # Sort ascending by close_time so mA is always the earlier-closing contract
         members_sorted = sorted(members, key=lambda m: m.close_time)
         group_pairs: list = []
 
         for i, mA in enumerate(members_sorted):
             for mB in members_sorted[i + 1:]:
-                # Same event = options within a multi-choice event, not time-series
+                # Same event_ticker means these are options within a multi-choice event,
+                # not separate time-series markets — skip them
                 if mA.event_ticker == mB.event_ticker:
                     continue
 
+                # Deadline gap check: pairs more than 30 days apart are too weakly
+                # correlated for the time-series arbitrage assumption to hold reliably
                 gap_days = (mB.close_time - mA.close_time).days
                 if gap_days > MAX_DEADLINE_GAP_DAYS:
                     continue
@@ -255,10 +360,15 @@ def find_candidate_pairs(
                 except (ValueError, TypeError):
                     continue
 
+                # Enforce the minimum 15% YES price difference required for time-series pairs.
+                # Smaller gaps don't provide enough edge to cover fees and uncertainty.
                 if abs(pA - pB) < MIN_PRICE_DIFF:
                     continue
 
-                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
+                # tradeable=True when buying NO on A and YES on B is guaranteed profitable
+                # in all three resolution scenarios (before exact fee computation).
+                # fee_per_pair_approx returns a continuous estimate of total taker fees.
+                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)
 
                 group_pairs.append(
                     CandidatePair(
@@ -276,7 +386,9 @@ def find_candidate_pairs(
         if not group_pairs:
             continue
 
-        # Keep the single best pair per title group
+        # Keep only the single best pair per normalized title group to avoid flooding
+        # the portfolio with many near-identical positions. Tradeable pairs rank above
+        # non-tradeable ones; within each tier, the largest price gap wins.
         group_pairs.sort(key=lambda p: (p.tradeable, abs(p.pA - p.pB)), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
@@ -302,8 +414,11 @@ def find_same_title_pairs(
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
     """
+    # Remove markets already held and those priced at or near 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
 
+    # Group by exact (title, subtitle) tuple — no normalization.
+    # Two markets with identical text in both fields are asking the same question.
     by_terms: dict = defaultdict(list)
     for m in active:
         title    = m.title or ""
@@ -313,13 +428,17 @@ def find_same_title_pairs(
 
     candidate_pairs: list = []
     for (title, subtitle), members in by_terms.items():
+        # Use whichever of title or subtitle is non-empty as the display label
         raw_title = title or subtitle
+        # Need at least two markets in a group to form any pair
         if len(members) < 2:
             continue
 
         group_pairs: list = []
         for i, mA in enumerate(members):
             for mB in members[i + 1:]:
+                # Same event_ticker means these are options in the same multi-choice event,
+                # not separate markets asking the same question — skip them
                 if mA.event_ticker == mB.event_ticker:
                     continue
                 try:
@@ -328,10 +447,13 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                # Ensure A is the expensive side (higher YES ask)
+                # Canonicalize so market_a is always the more expensive side (higher YES ask).
+                # The strategy buys NO on the expensive side and YES on the cheap side.
                 if pA < pB:
                     mA, mB, pA, pB = mB, mA, pB, pA
 
+                # Enforce the minimum 5% YES price difference for same-title pairs.
+                # A smaller gap is within normal bid-ask spread noise.
                 if pA - pB < SAME_TITLE_MIN_PRICE_DIFF:
                     continue
 
@@ -340,7 +462,9 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)  # same
+                # tradeable=True when buying NO on A and YES on B covers all costs.
+                # fee_per_pair_approx returns a continuous estimate of total taker fees.
+                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)
                 group_pairs.append(
                     CandidatePair(
                         market_a=mA,
@@ -357,6 +481,8 @@ def find_same_title_pairs(
         if not group_pairs:
             continue
 
+        # Keep only the best pair per exact title group — largest price gap among
+        # tradeable pairs wins; tradeable is preferred over non-tradeable
         group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
@@ -468,15 +594,20 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,  # 0.95
         "time_series": 1.0 - MIN_PRICE_DIFF,              # 0.85
     }
+    # Cache order books by ticker to avoid fetching the same book twice
+    # when the same market appears in multiple pairs
     ob_cache: dict[str, dict | None] = {}
 
     def get_ob(ticker: str) -> dict | None:
         if ticker not in ob_cache:
+            # Fetch the order book from the Kalshi API and cache the result
             ob_cache[ticker] = _fetch_orderbook(client, ticker)
         return ob_cache[ticker]
 
     enriched = []
     for pair in pairs:
+        # Non-tradeable pairs (failed best-ask check) are passed through unchanged —
+        # they still appear in the dev simulation Excel sheet for transparency
         if not pair.tradeable:
             enriched.append(pair)
             continue
@@ -485,6 +616,8 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         ob_b = get_ob(pair.market_b.ticker)
 
         if ob_a is None or ob_b is None:
+            # If either order book is unavailable, keep the pair with best-ask prices
+            # rather than marking it untradeable — the scanner already validated the gap
             logging.warning(
                 "Orderbook unavailable for '%s' — keeping best-ask prices",
                 pair.canonical_title,
@@ -492,16 +625,25 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             enriched.append(pair)
             continue
 
+        # Convert YES bids of market A into NO ask levels (complement prices)
+        # because we are buying NO on market A — YES bids are the counterparties
         no_levels  = _bids_to_ask_levels(ob_a["yes"])
+        # Convert NO bids of market B into YES ask levels (complement prices)
+        # because we are buying YES on market B — NO bids are the counterparties
         yes_levels = _bids_to_ask_levels(ob_b["no"])
+
+        # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
         paired     = _pair_orderbooks(no_levels, yes_levels)
 
         max_sum    = _max_sum.get(pair.pair_type, 0.95)
+        # Keep only contract pairs where the combined fill price leaves the required gap:
+        # same_title requires ≥5% gap (sum ≤ 0.95); time_series requires ≥15% gap (sum ≤ 0.85)
         qualifying = [
             (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
         ]
 
         if not qualifying:
+            # No depth available at the required gap — mark untradeable to skip execution
             logging.info(
                 "No qualifying contract pairs for '%s' after price gap filter — skipping",
                 pair.canonical_title,
@@ -510,10 +652,13 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             continue
 
         total_qty = sum(qty for _, _, qty in qualifying)
+        # Compute depth-weighted average fill prices to replace the best-ask estimates
         avg_pB    = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
         avg_nA    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
 
-        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)  # returns float — continuous taker fee estimate, using depth-weighted average prices
+        # Re-validate tradeability at the depth-weighted prices (the pair may still be
+        # unprofitable if all qualifying contracts are at the edge of the gap threshold)
+        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)
 
         if not new_tradeable:
             logging.info(
@@ -521,6 +666,8 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
                 pair.canonical_title, avg_nA, avg_pB,
             )
 
+        # Replace best-ask prices and contract count with depth-accurate values;
+        # strategy.py will use these to compute the final Kelly-sized trade
         enriched.append(dc_replace(
             pair,
             nA=avg_nA,

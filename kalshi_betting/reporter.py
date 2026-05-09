@@ -1,4 +1,27 @@
-"""Excel reporting: logs executed trades (prod) or simulated trades (dev)."""
+"""
+File: reporter.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Handles all Excel output for the bot. In production mode, appends a run-
+    separator row followed by per-trade rows to a persistent trade_log.xlsx file
+    so the full trading history accumulates across runs. In dev/sandbox mode,
+    writes a fresh timestamped simulation file containing two sheets: one for
+    simulated trades and one for all candidate pairs discovered (tradeable or not).
+    All Excel formatting — column widths, color-coded status rows, number formats,
+    frozen header rows — is applied via openpyxl.
+
+Dependencies:
+    Imports market_title from scanner.py and TradeSpec from strategy.py. Imports
+    PROJECT_ROOT from config.py. Exports the TradeResult dataclass (consumed by
+    trader.py) and the two public write functions (consumed by main.py).
+
+Notes:
+    The TradeResult dataclass is defined here (not in trader.py) because reporter.py
+    is the authoritative consumer of trade outcomes — trader.py only needs to
+    construct and return these objects.
+"""
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -163,21 +186,34 @@ def _apply_number_formats(ws, row_idx: int) -> None:
 
 def append_to_prod_log(results: list, balance_before: float, balance_after: float) -> Path:
     """
-    Append executed trade results to the persistent production trade log.
-    Creates the file with a header row if it doesn't exist.
-    Returns the path to the file.
+    Append executed trade results to the persistent production trade log Excel file.
+
+    If the file does not yet exist, creates it with a styled dark-blue header row.
+    Each call appends a run-separator row (showing timestamp and balance change)
+    followed by one data row per trade result, color-coded by status. The file is
+    designed to accumulate all runs over the life of the bot.
+
+    Args:
+        results (list): List of TradeResult objects from trader.execute_trades().
+            May be empty if no trades were executed this run.
+        balance_before (float): Account balance in dollars before this run's trades.
+        balance_after (float): Account balance in dollars after this run's trades.
+
+    Returns:
+        Path: Absolute path to the trade log file (PROJECT_ROOT / "trade_log.xlsx").
     """
     if PROD_LOG_PATH.exists():
         wb = openpyxl.load_workbook(PROD_LOG_PATH)
         ws = wb.active
     else:
+        # First run — create the workbook and apply the header row
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Trade Log"
         _apply_header_row(ws, _HEADER_FILL_PROD)
 
-    run_ts = datetime.now(timezone.utc).astimezone()  # local time for readability
-    first_new_row = ws.max_row + 1
+    # Use local time for the separator row so timestamps are human-readable
+    run_ts = datetime.now(timezone.utc).astimezone()
 
     # Write a run-separator row
     sep_row = ws.max_row + 1
@@ -212,10 +248,26 @@ def write_dev_simulation(
     balance_cents: int,
 ) -> Path:
     """
-    Write a new dev simulation Excel file.
-    Sheet 1 — "Simulated Trades": trades that WOULD have been executed.
-    Sheet 2 — "All Candidates": every qualifying pair found (tradeable or not).
-    Returns the path to the new file.
+    Write a new timestamped dev simulation Excel file with two sheets.
+
+    Sheet 1 ("Simulated Trades") contains trades that would have been executed
+    if this were a real production run. Sheet 2 ("All Candidates") lists every
+    qualifying pair discovered by the scanner — tradeable and non-tradeable alike —
+    so the developer can see what the bot found before sizing decisions were applied.
+
+    A new file is created on each dev run (never appended to) so simulation outputs
+    are preserved for later comparison. The filename embeds the run timestamp.
+
+    Args:
+        results (list): List of TradeResult objects from trader.execute_trades()
+            with status="simulated". May be empty.
+        all_candidates (list): List of CandidatePair objects from scanner.py,
+            representing all pairs discovered this run (regardless of tradeability).
+        balance_cents (int): Virtual account balance in cents used for trade sizing.
+
+    Returns:
+        Path: Absolute path to the newly created simulation file
+            (PROJECT_ROOT / "dev_simulation_YYYY-MM-DD_HHMMSS.xlsx").
     """
     run_ts   = datetime.now(timezone.utc).astimezone()
     filename = f"dev_simulation_{run_ts.strftime('%Y-%m-%d_%H%M%S')}.xlsx"

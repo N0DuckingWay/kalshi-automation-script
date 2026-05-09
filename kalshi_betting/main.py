@@ -1,4 +1,24 @@
-"""Kalshi Arbitrage Bot — main orchestration script."""
+"""
+File: main.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Top-level orchestration for the Kalshi arbitrage bot's live trading pipeline.
+    Parses command-line arguments to select dev (sandbox simulation) or prod
+    (real-money trading) mode, then coordinates the full scan-size-execute-log
+    cycle: building an authenticated API client, fetching open markets, finding
+    arbitrage candidate pairs, sizing trades via Kelly criterion, submitting batch
+    orders to the Kalshi REST API, and writing results to Excel. This is the only
+    module that ties all other modules together in the live trading path.
+
+Dependencies:
+    Imports from auth.py (client construction and auth verification), config.py
+    (balance threshold and file paths), reporter.py (Excel output), scanner.py
+    (market fetching and pair detection), strategy.py (trade sizing and portfolio
+    selection), and trader.py (order execution). Entry point for
+    `python3 -m kalshi_betting.main`.
+"""
 import argparse
 import logging
 import sys
@@ -95,9 +115,22 @@ def _print_portfolio(portfolio: list, label: str) -> None:
 
 def _dedup_pairs(primary: list, secondary: list) -> list:
     """
-    Combine two pair lists, dropping duplicates from secondary.
-    A duplicate is any pair whose {ticker_a, ticker_b} frozenset already appears
-    in primary (time_series is preferred over same_title when both detect the same pair).
+    Merge two pair lists, excluding any pair from secondary that already appears in primary.
+
+    A duplicate is defined as any pair whose frozenset of {ticker_a, ticker_b} already
+    exists in primary. This can occur when both the time-series scanner and the same-title
+    scanner detect the same two markets — in that case the time-series pair is preferred
+    because it uses the more conservative 15% price gap threshold.
+
+    Args:
+        primary (list): List of CandidatePair objects from find_candidate_pairs()
+            (time-series detection). These are always kept.
+        secondary (list): List of CandidatePair objects from find_same_title_pairs().
+            Entries whose ticker pair already appears in primary are dropped.
+
+    Returns:
+        list: Combined list with primary entries first, then non-duplicate secondary
+            entries appended in their original order.
     """
     seen: set = set()
     result = []
@@ -107,6 +140,7 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
         result.append(pair)
     for pair in secondary:
         key = frozenset([pair.market_a.ticker, pair.market_b.ticker])
+        # Only add if this exact ticker pair was not already found by the time-series scanner
         if key not in seen:
             seen.add(key)
             result.append(pair)
@@ -174,11 +208,18 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
 
 def _run_dev(client, args) -> None:
     """
-    Dev/sandbox mode:
-      - Fetches real market data from the Kalshi sandbox (public endpoint, no auth needed).
-      - Skips held-positions check and balance lookup (sandbox requires separate credentials).
-      - Uses --sandbox-balance as the virtual account size for trade sizing.
-      - Never submits real orders; always writes a simulation Excel file.
+    Execute a full dev/sandbox mode scan and simulation.
+
+    Dev mode uses real sandbox market data from demo-api.kalshi.co but never
+    submits real orders. The held-positions check and real balance lookup are
+    skipped because the production API key is not accepted by the sandbox
+    endpoint. Instead, a virtual balance is supplied via --sandbox-balance.
+    All results are written to a timestamped dev simulation Excel file.
+
+    Args:
+        client: KalshiClient pointed at the sandbox endpoint, produced by
+            auth.build_client("dev").
+        args: Parsed argparse Namespace with sandbox_balance attribute.
     """
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
@@ -186,24 +227,33 @@ def _run_dev(client, args) -> None:
         args.sandbox_balance,
     )
 
-    # Fetch real sandbox markets (public endpoint — no auth required)
-    markets = fetch_open_markets(client)  # returns list of Kalshi market API objects (all open, non-multivariate markets)
+    # Fetch all open sandbox markets — the sandbox public endpoint does not require
+    # valid authentication for read operations, so this works with the prod key too
+    markets = fetch_open_markets(client)
     logging.info("Sandbox markets fetched: %d", len(markets))
 
-    # Skip held-positions filter — sandbox auth not available with production key
-    time_series_pairs = find_candidate_pairs(client, held_tickers=set(), markets=markets)  # returns list[CandidatePair] — time-series pairs grouped by normalized (date-stripped) title
-    same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())  # returns list[CandidatePair] — pairs with identical title but different event tickers
+    # Skip held-positions filter — sandbox requires a separate account and credentials.
+    # Pass an empty set so _filter_active_markets does not exclude any tickers.
+    time_series_pairs = find_candidate_pairs(client, held_tickers=set(), markets=markets)
+    # Detect same-title pairs separately — uses a different grouping key (exact title match)
+    same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
+    # Merge both lists, preferring time_series when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)  # returns list[CandidatePair] with nA/pB replaced by depth-weighted average fill prices
+    # Replace best-ask prices with depth-weighted order book averages to validate liquidity
+    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
         logging.info("No qualifying pairs found in sandbox (≥15% time-series or ≥5% same-title price diff).")
-        out = write_dev_simulation([], [], sandbox_balance_cents)  # returns Path to the newly written xlsx file
+        # Write an empty simulation file so the run is still recorded
+        out = write_dev_simulation([], [], sandbox_balance_cents)
         logging.info("Dev simulation written (empty): %s", out)
         return
 
+    # Apply Kelly sizing to each candidate pair using the virtual balance
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
-    portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)  # returns list[TradeSpec] ranked by monthly_profit_ratio desc, capped to available balance
+    # Greedy portfolio selection ranked by monthly_profit_ratio descending
+    portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
+    # Map pair id → TradeSpec for fast lookup in the pairs table display
     display_specs = {id(s.pair): s for s in portfolio}
 
     logging.info("Kalshi Sandbox Scan — Virtual Balance: $%.2f | Mode: DEV", args.sandbox_balance)
@@ -211,27 +261,44 @@ def _run_dev(client, args) -> None:
 
     if not portfolio:
         logging.info("No executable arbitrage trades found.")
-        out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)  # returns Path to the newly written xlsx file
+        # Write a simulation file showing candidates even though no trades were sized
+        out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
         logging.info("Dev simulation written (candidates only): %s", out)
         return
 
     _print_portfolio(portfolio, "Simulated")
 
-    # Simulate orders (dry_run=True always in dev)
-    results = execute_trades(client, portfolio, dry_run=True)  # returns list[TradeResult], each with status "simulated"|"executed"|"failed"
+    # Simulate order execution (dry_run=True is always enforced in dev mode)
+    # Returns TradeResult objects with status="simulated" — no API orders are placed
+    results = execute_trades(client, portfolio, dry_run=True)
 
-    out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)  # returns Path to the newly written xlsx file
+    # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all candidates
+    out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
     logging.info("Dev simulation written: %s", out)
 
 
 def _run_prod(client, args) -> None:
     """
-    Production mode: real auth, real balance, real orders, appends to trade_log.xlsx.
+    Execute a full production run using the real Kalshi account.
+
+    Verifies authentication, reads the live account balance, fetches currently
+    held positions to exclude them from scanning, discovers arbitrage candidates,
+    sizes trades using Kelly criterion, and submits batch orders. Results are
+    appended to the persistent trade_log.xlsx file. In dry_run mode (--dry-run
+    flag), all steps run normally except order submission — the log still records
+    rows with status="simulated".
+
+    Args:
+        client: KalshiClient pointed at the production endpoint, produced by
+            auth.build_client("prod").
+        args: Parsed argparse Namespace with dry_run attribute.
     """
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
-    balance_cents = verify_auth(client)  # returns int — account balance in cents
+    # Confirm auth works and read the pre-trade balance in cents
+    balance_cents = verify_auth(client)
     if balance_cents < MIN_BALANCE_CENTS:
+        # Don't waste API calls scanning when there's insufficient capital to trade
         logging.warning(
             "Balance $%.2f is below minimum $%.2f — skipping run.",
             balance_cents / 100,
@@ -239,21 +306,29 @@ def _run_prod(client, args) -> None:
         )
         return
 
-    held_tickers      = get_held_tickers(client)  # returns set[str] of tickers where the user currently holds a non-zero position
-    markets           = fetch_open_markets(client)  # returns list of Kalshi market API objects (all open, non-multivariate markets)
+    # Get current open positions so we don't re-enter markets we already hold
+    held_tickers      = get_held_tickers(client)
+    # Fetch all open markets and pre-filter held tickers for downstream efficiency
+    markets           = fetch_open_markets(client)
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
-    time_series_pairs = find_candidate_pairs(client, held_tickers, markets)  # returns list[CandidatePair] — time-series pairs grouped by normalized (date-stripped) title
-    same_title_pairs  = find_same_title_pairs(markets, held_tickers)  # returns list[CandidatePair] — pairs with identical title but different event tickers
+    # Run both pair detection paths: time-series (deadline-gap) and same-title
+    time_series_pairs = find_candidate_pairs(client, held_tickers, markets)
+    same_title_pairs  = find_same_title_pairs(markets, held_tickers)
+    # Merge both lists, preferring time_series when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)  # returns list[CandidatePair] with nA/pB replaced by depth-weighted average fill prices
+    # Replace best-ask prices with depth-weighted order book averages to validate liquidity
+    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
         logging.info("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
         return
 
+    # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
-    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)  # returns list[TradeSpec] ranked by monthly_profit_ratio desc, capped to available balance
+    # Greedy portfolio selection ranked by monthly_profit_ratio descending
+    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
+    # Map pair id → TradeSpec for fast lookup in the pairs table display
     display_specs = {id(s.pair): s for s in portfolio}
 
     logging.info("Kalshi Arbitrage Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
@@ -265,10 +340,14 @@ def _run_prod(client, args) -> None:
 
     _print_portfolio(portfolio, "Selected")
 
-    results = execute_trades(client, portfolio, dry_run=args.dry_run)  # returns list[TradeResult], each with status "simulated"|"executed"|"failed"
+    # Submit batch orders (or simulate in dry_run mode); returns list of TradeResult objects
+    results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
-    balance_after = verify_auth(client) / 100  # verify_auth returns int (cents); dividing by 100 converts to float dollars
-    out = append_to_prod_log(results, balance_cents / 100, balance_after)  # returns Path to trade_log.xlsx (appended or created)
+    # Read the post-trade balance to record in the Excel log separator row;
+    # verify_auth returns cents, so divide by 100 to convert to dollars
+    balance_after = verify_auth(client) / 100
+    # Append this run's results to the cumulative trade_log.xlsx file
+    out = append_to_prod_log(results, balance_cents / 100, balance_after)
     logging.info("Trade log updated: %s", out)
 
     if args.dry_run:
