@@ -1,4 +1,28 @@
-"""Backtesting entry point: python3 -m kalshi_betting.backtest"""
+"""
+File: backtest.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Command-line entry point for the Kalshi arbitrage backtester. Parses CLI
+    arguments (start date, initial balance, cache behavior), configures logging
+    to kalshi_backtest.log, constructs the necessary API clients, delegates the
+    full backtest simulation to backtester.run_backtest(), and then calls
+    dashboard.generate_dashboard() to produce the interactive HTML report.
+    Prints a summary of key metrics (trade count, win rate, total return) to
+    the log on completion.
+
+Dependencies:
+    Imports run_backtest from backtester.py, generate_dashboard from dashboard.py,
+    and build_historical_client / build_prod_live_client from historical.py.
+    Imports PROJECT_ROOT from config.py. Entry point for
+    `python3 -m kalshi_betting.backtest`.
+
+Notes:
+    Historical data only exists on the production Kalshi API, so both API clients
+    always use prod credentials regardless of what mode the live bot was run in.
+    The backtest reads market data but never submits any orders.
+"""
 import argparse
 import logging
 from datetime import date

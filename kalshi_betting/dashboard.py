@@ -1,4 +1,29 @@
-"""Generate a self-contained Plotly HTML backtest dashboard."""
+"""
+File: dashboard.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Generates a self-contained interactive HTML performance dashboard from the
+    results of a backtest run. Assembles six sections — portfolio performance
+    (equity curve, Sharpe, drawdown), returns decomposition (by month, category,
+    entry price), calibration analysis (Brier score, reliability diagram), trade-
+    level diagnostics (distribution, slippage, best/worst trades), risk metrics
+    (Kelly sizing scatter, capital deployment), and benchmark comparison (S&P 500
+    via yfinance) — into a single HTML file with embedded Plotly charts. The file
+    is written to PROJECT_ROOT and can be opened directly in any browser.
+
+Dependencies:
+    Imports BacktestTrade from backtester.py and PROJECT_ROOT from config.py.
+    Uses plotly, numpy, pandas, and yfinance (all external). Called by backtest.py
+    after run_backtest() completes.
+
+Notes:
+    The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
+    connection is required to view the charts. If yfinance fails to fetch S&P 500
+    data (e.g. network unavailable), the benchmark section degrades gracefully
+    and shows only the strategy equity curve.
+"""
 import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -701,8 +726,25 @@ def generate_dashboard(
     initial_balance: float,
 ) -> Path:
     """
-    Assemble all dashboard sections into a single self-contained HTML file.
-    Returns the output path.
+    Assemble all six dashboard sections into a single self-contained HTML file.
+
+    Calls each _section_*() builder in order, concatenates the resulting HTML
+    fragments into a full page with an embedded Plotly CDN script tag, then
+    writes the file to PROJECT_ROOT. The output file is timestamped so multiple
+    backtest runs can be compared without overwriting previous results.
+
+    Args:
+        trades (list[BacktestTrade]): Completed backtest trades from run_backtest().
+            May be empty, in which case all charts show placeholder messages.
+        equity_df (pd.DataFrame): Daily equity curve DataFrame with columns
+            [date, portfolio_value, daily_return], produced by _build_equity_curve().
+        start_date (date): Backtest start date shown in the page title and header.
+        initial_balance (float): Starting portfolio value in dollars, used for
+            return calculations and benchmark normalization.
+
+    Returns:
+        Path: Absolute path to the generated HTML file
+            (PROJECT_ROOT / "backtest_dashboard_YYYY-MM-DD_HHMMSS.html").
     """
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H%M%S")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"

@@ -1,4 +1,22 @@
-"""Arbitrage trade computation and portfolio selection."""
+"""
+File: strategy.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Converts scanner.py CandidatePair objects into fully sized trade specifications
+    using the Kelly criterion, then selects a portfolio subset that fits within
+    the available account balance. The Kelly fraction determines how much of the
+    balance to allocate to each pair based on the implied edge and the probability
+    that the trade is profitable. Both time-series and same-title pairs use
+    different probability models to reflect how correlated their outcomes are.
+
+Dependencies:
+    Imports BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, and fee helpers from
+    config.py. Imports CandidatePair from scanner.py. Exports TradeSpec (consumed
+    by trader.py and reporter.py) and select_portfolio() (called by main.py and
+    backtester.py).
+"""
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,56 +83,106 @@ def _kelly_p(pair: CandidatePair) -> float:
 
 def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec]:
     """
-    Compute Kelly-sized trade for a guaranteed-arbitrage pair.
+    Compute a Kelly-sized trade specification for a guaranteed-arbitrage pair.
 
-    b = net profit per dollar risked = profit_ratio = (1 - nA - pB) / (nA + pB)
-    Kelly fraction f* = p - (1-p)/b, capped at BUDGET_FRACTION (20%).
-    Returns None when Kelly fraction ≤ 0 (negative expected value — don't bet).
+    Applies the Kelly criterion to determine the optimal fraction of the account
+    balance to allocate, then derives the integer contract count and verifies that
+    the exact net profit (after ceiling-rounded per-leg fees) remains positive.
+
+    Kelly formula used:
+        b = net_spread / (nA + pB)   [net profit per dollar risked]
+        f* = p - (1-p)/b             [optimal Kelly fraction]
+        f_capped = min(BUDGET_FRACTION, f*)
+
+    Where net_spread = (1 − nA − pB) − fee_per_pair_approx(nA, pB).
+
+    Args:
+        pair (CandidatePair): The candidate arbitrage pair. Must have tradeable=True.
+            Uses pair.nA and pair.pB (depth-weighted fill prices from scanner.py)
+            and pair.max_contracts (qualifying order book depth, 0 = uncapped).
+        balance_cents (int): Current account balance in cents. Used to convert the
+            Kelly fraction to a dollar budget for contract sizing.
+
+    Returns:
+        Optional[TradeSpec]: A fully specified trade including contract count n,
+            total cost, minimum guaranteed payoff, time-normalized monthly return,
+            and Kelly metadata. Returns None if:
+            - The pair is not tradeable.
+            - The prices are out of the valid (0, 1) range.
+            - The net spread is zero or negative after fees.
+            - The Kelly fraction is zero or negative (no edge).
+            - The exact minimum payoff at the computed n is zero or negative.
+
+    Raises:
+        None: All error conditions are handled by returning None.
     """
     if not pair.tradeable:
         return None
 
     nA, pB = pair.nA, pair.pB
 
+    # Validate that both prices are in the open interval (0, 1).
+    # Edge cases at 0 or 1 indicate a settled market and would break the fee formula.
     if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
         return None
 
-    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)  # returns float — continuous approximation of total taker fee for the combined NO+YES leg
+    # Subtract the continuous fee approximation from the gross spread to get the
+    # net edge. A zero or negative net_spread means the trade costs more than it pays.
+    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
     if net_spread <= 0:
         return None
+
+    # profit_ratio is the net return per dollar invested — this is "b" in the Kelly formula
     profit_ratio = net_spread / (nA + pB)
 
+    # Compute the probability that the trade is profitable using the appropriate model
     p = _kelly_p(pair)
     q = 1.0 - p
-    b = profit_ratio  # net profit per dollar risked
+    # b is the net payoff per dollar risked (same as profit_ratio)
+    b = profit_ratio
 
+    # Kelly formula: f* = p - q/b. A negative result means negative expected value.
     kelly_fraction = p - q / b
     if kelly_fraction <= 0:
-        return None  # negative EV — Kelly says don't bet
+        # Kelly says don't bet — expected value is negative despite the positive spread
+        return None
 
+    # Cap at BUDGET_FRACTION (20%) to avoid over-concentrating in a single pair
     kelly_fraction_capped = min(BUDGET_FRACTION, kelly_fraction)
 
+    # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
     n = max(1, int(budget_dollars / (nA + pB)))
+
+    # Respect the order book depth limit set by scanner.enrich_with_orderbook_prices()
     if pair.max_contracts > 0:
         n = min(n, pair.max_contracts)
 
-    fee_no  = fee_leg_exact(n, nA)   # returns float — ceiling-rounded taker fee for n NO contracts at price nA
-    fee_yes = fee_leg_exact(n, pB)   # returns float — ceiling-rounded taker fee for n YES contracts at price pB
+    # Compute exact ceiling-rounded fees for the final integer n
+    fee_no  = fee_leg_exact(n, nA)
+    fee_yes = fee_leg_exact(n, pB)
+
+    # Verify the guaranteed minimum payoff is positive after exact fees.
+    # At very small n the ceiling rounding can eat the entire profit margin.
     min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
     if min_payoff <= 0:
         return None
 
     total_cost = n * (nA + pB)
 
+    # Compute the number of calendar days until the later-closing market resolves.
+    # This is used to normalize the profit ratio to a monthly (30-day) figure for ranking.
     now = datetime.now(timezone.utc)
     close_a = pair.market_a.close_time
     close_b = pair.market_b.close_time
+    # Add UTC timezone info if the API returned naive datetimes to avoid comparison errors
     if close_a.tzinfo is None:
         close_a = close_a.replace(tzinfo=timezone.utc)
     if close_b.tzinfo is None:
         close_b = close_b.replace(tzinfo=timezone.utc)
+    # Use the later close time — capital is tied up until both legs resolve
     days_to_close = max(1, (max(close_a, close_b) - now).days)
+    # Scale the profit ratio to a 30-day equivalent to fairly compare short and long positions
     monthly_profit_ratio = profit_ratio * 30.0 / days_to_close
 
     logging.info(
@@ -145,11 +213,33 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
 
 def select_portfolio(specs: list, balance_cents: int) -> list:
     """
-    Greedy portfolio selection sorted by monthly_profit_ratio descending.
-    At equal monthly profit, same_title ranks above time_series (simpler guarantee).
-    Trade sizes are already Kelly-weighted via compute_trade().
+    Select a portfolio of trades using a greedy algorithm prioritized by monthly return.
+
+    Sorts all candidate TradeSpec objects by monthly_profit_ratio descending, then
+    greedily adds each trade as long as the remaining available balance covers its
+    cost. Trade sizes are already Kelly-fraction-weighted by compute_trade(), so
+    each entry fits within the budget constraint by construction — this function
+    only resolves conflicts between multiple trades competing for the same capital.
+
+    At equal monthly profit ratios, same_title pairs rank above time_series because
+    the same-title guarantee is simpler (identical questions must co-resolve) and
+    does not depend on an independence-model probability estimate.
+
+    Args:
+        specs (list): List of TradeSpec objects produced by compute_trade(), one
+            per qualifying CandidatePair.
+        balance_cents (int): Total available account balance in cents. The greedy
+            selection stops adding trades when the remaining balance is insufficient.
+
+    Returns:
+        list: Ordered list of TradeSpec objects selected for execution, sorted by
+            monthly_profit_ratio descending. May be empty if no spec fits.
     """
+    # Convert balance to dollars for cost comparisons
     available = balance_cents / 100.0
+
+    # Primary sort: monthly_profit_ratio descending (best capital efficiency first).
+    # Secondary sort: same_title > time_series at equal monthly return.
     specs_sorted = sorted(
         specs,
         key=lambda s: (s.monthly_profit_ratio, s.pair.pair_type == "same_title"),
@@ -157,6 +247,7 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
     )
     selected = []
     for spec in specs_sorted:
+        # Skip this trade if it would exceed the remaining available balance
         if spec.total_cost <= available:
             selected.append(spec)
             available -= spec.total_cost
