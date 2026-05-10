@@ -29,7 +29,7 @@ import logging
 from kalshi_python_sync import KalshiClient
 from kalshi_python_sync.configuration import Configuration
 
-from .config import PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE
+from .config import PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, DEV_PEM_FILE
 
 
 def build_client(mode: str) -> KalshiClient:
@@ -66,17 +66,15 @@ def build_client(mode: str) -> KalshiClient:
         raw = "{" + raw + "}"
     secrets  = json.loads(raw)
 
-    # Read the full PEM text (not a file path) — KalshiClient requires the
-    # key content as a string, not a filesystem reference
-    pem_text = PEM_FILE.read_text()
-
     if mode == "prod":
-        url    = PROD_URL
-        key_id = secrets["Kalshi-api-key"]
+        url      = PROD_URL
+        key_id   = secrets["Kalshi-api-key"]
+        pem_text = PEM_FILE.read_text()
     else:
-        # Prefer a dedicated sandbox key if configured; fall back to prod key
-        url    = SANDBOX_URL
-        key_id = secrets.get("dev_api_key", secrets["Kalshi-api-key"])
+        url      = SANDBOX_URL
+        key_id   = secrets.get("dev_api_key", secrets["Kalshi-api-key"])
+        pem_file = DEV_PEM_FILE if DEV_PEM_FILE.exists() else PEM_FILE
+        pem_text = pem_file.read_text()
 
     cfg = Configuration(host=url)
     # KalshiClient.__init__ detects these attributes via hasattr() and builds

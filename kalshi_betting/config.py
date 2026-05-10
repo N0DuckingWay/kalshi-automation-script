@@ -47,6 +47,10 @@ SECRETS_FILE = PROJECT_ROOT / "secrets.json"
 # RSA private key PEM file used to sign Kalshi API requests.
 PEM_FILE     = PROJECT_ROOT / "kalshi_private_key.pem"
 
+# RSA private key PEM file for the sandbox (demo) account. Separate from prod
+# because the sandbox account is registered independently at demo.kalshi.co.
+DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
+
 # ── Trading parameters ────────────────────────────────────────────────────────
 
 # Hard cap on the Kelly fraction allocated to any single trade. Even if the

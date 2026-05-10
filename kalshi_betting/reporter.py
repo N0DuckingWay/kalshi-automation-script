@@ -78,8 +78,9 @@ class TradeResult:
     Attributes:
         spec (TradeSpec): The trade specification that was executed or simulated.
         status (str): Execution outcome — "executed" for a real submitted order,
-            "simulated" for a dry-run or dev-mode run, "failed" for a submission error.
-        error (Optional[str]): Error message if status is "failed", otherwise None.
+            "simulated" for a dry-run or dev-mode run, "failed" for a submission error,
+            "rolled_back" if leg A filled but leg B failed and leg A was unwound.
+        error (Optional[str]): Error message if status is "failed" or "rolled_back", otherwise None.
     """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated"
@@ -149,17 +150,18 @@ def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
     Apply background fill, border, and alignment styling to a single data row.
 
     Color-codes rows by trade status: green for "executed", blue for "simulated",
-    red/orange for "failed", white for any unknown status.
+    red/orange for "failed", yellow for "rolled_back", white for any unknown status.
 
     Args:
         ws: An openpyxl Worksheet object to apply styles to.
         row_idx (int): 1-based row index of the data row to style.
-        status (str): Trade status string — "executed", "simulated", or "failed".
+        status (str): Trade status string — "executed", "simulated", "failed", or "rolled_back".
     """
     status_colors = {
-        "executed":  "E2EFDA",   # light green
-        "simulated": "EBF3FB",   # light blue
-        "failed":    "FCE4D6",   # light red/orange
+        "executed":     "E2EFDA",   # light green
+        "simulated":    "EBF3FB",   # light blue
+        "failed":       "FCE4D6",   # light red/orange
+        "rolled_back":  "FFF2CC",   # light yellow — leg A unwound, no net position
     }
     fill_color = status_colors.get(status, "FFFFFF")
     fill = PatternFill("solid", fgColor=fill_color)
@@ -299,7 +301,7 @@ def write_dev_simulation(
         row_data = _result_to_row(result, run_ts)
         for col_idx, value in enumerate(row_data, start=1):
             ws_trades.cell(row=row_idx, column=col_idx, value=value)
-        _apply_data_row_styles(ws_trades, row_idx, "simulated")
+        _apply_data_row_styles(ws_trades, row_idx, result.status)
         _apply_number_formats(ws_trades, row_idx)
 
     # ── Sheet 2: All Candidates ────────────────────────────
