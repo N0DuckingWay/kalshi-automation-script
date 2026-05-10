@@ -301,7 +301,7 @@ def write_dev_simulation(
         row_data = _result_to_row(result, run_ts)
         for col_idx, value in enumerate(row_data, start=1):
             ws_trades.cell(row=row_idx, column=col_idx, value=value)
-        _apply_data_row_styles(ws_trades, row_idx, "simulated")
+        _apply_data_row_styles(ws_trades, row_idx, result.status)
         _apply_number_formats(ws_trades, row_idx)
 
     # ── Sheet 2: All Candidates ────────────────────────────
