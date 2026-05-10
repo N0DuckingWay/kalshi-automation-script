@@ -14,3 +14,4 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+kalshi_demo_private_key.pem

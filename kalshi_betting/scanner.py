@@ -683,3 +683,60 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         sum(1 for p in pairs if p.tradeable),
     )
     return enriched
+
+
+def validate_pair_price(client: Any, spec: Any) -> bool:
+    """
+    Re-fetch both order books for a TradeSpec immediately before execution and
+    confirm the gap threshold still holds at the required contract depth.
+
+    Returns True only if qualifying depth >= spec.x contracts remain at the
+    pair's gap threshold. A False result means prices have moved since the
+    scan and the trade should be skipped.
+
+    Args:
+        client: Authenticated KalshiClient from auth.build_client().
+        spec: TradeSpec whose pair prices should be re-validated.
+
+    Returns:
+        bool: True if the pair still qualifies; False if prices moved or order
+            books are unavailable.
+    """
+    _max_sum = {
+        "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,
+        "time_series": 1.0 - MIN_PRICE_DIFF,
+    }
+    pair   = spec.pair
+    ob_a   = _fetch_orderbook(client, pair.market_a.ticker)
+    ob_b   = _fetch_orderbook(client, pair.market_b.ticker)
+
+    if ob_a is None or ob_b is None:
+        logging.warning(
+            "Pre-execution orderbook unavailable for '%s' — skipping",
+            pair.canonical_title,
+        )
+        return False
+
+    no_levels  = _bids_to_ask_levels(ob_a["yes"])
+    yes_levels = _bids_to_ask_levels(ob_b["no"])
+    paired     = _pair_orderbooks(no_levels, yes_levels)
+    max_sum    = _max_sum.get(pair.pair_type, 0.95)
+    qualifying = [(yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum]
+
+    if not qualifying:
+        logging.info(
+            "Pre-execution check failed for '%s' — gap no longer qualifies",
+            pair.canonical_title,
+        )
+        return False
+
+    # Require enough depth to fill our full intended contract count via FoK
+    total_qty = sum(qty for _, _, qty in qualifying)
+    if total_qty < spec.x:
+        logging.info(
+            "Pre-execution check failed for '%s' — only %.1f contracts at gap (need %d)",
+            pair.canonical_title, total_qty, spec.x,
+        )
+        return False
+
+    return True

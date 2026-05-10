@@ -34,7 +34,7 @@ from .scanner import (
     enrich_with_orderbook_prices, market_title,
 )
 from .strategy import compute_trade, select_portfolio
-from .trader import execute_trades
+from .trader import execute_trades, pre_execution_check
 
 
 def _truncate(text: str, n: int = 40) -> str:
@@ -340,7 +340,13 @@ def _run_prod(client, args) -> None:
 
     _print_portfolio(portfolio, "Selected")
 
-    # Submit batch orders (or simulate in dry_run mode); returns list of TradeResult objects
+    # Re-fetch order books for each pair concurrently and drop any whose prices moved
+    portfolio = pre_execution_check(client, portfolio)
+    if not portfolio:
+        logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
+        return
+
+    # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
     # Read the post-trade balance to record in the Excel log separator row;
@@ -353,8 +359,12 @@ def _run_prod(client, args) -> None:
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
     else:
-        n_ok = sum(1 for r in results if r.status == "executed")
-        logging.info("Submitted %d of %d batch order(s) successfully.", n_ok, len(results))
+        n_ok       = sum(1 for r in results if r.status == "executed")
+        n_rolled   = sum(1 for r in results if r.status == "rolled_back")
+        logging.info(
+            "Submitted %d of %d order pair(s) successfully. %d rolled back.",
+            n_ok, len(results), n_rolled,
+        )
 
 
 def main() -> None:
