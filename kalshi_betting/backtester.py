@@ -26,8 +26,7 @@ Notes:
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 
@@ -37,6 +36,8 @@ from .config import (
     MIN_PRICE_DIFF,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
+    fee_leg_exact,
+    fee_per_pair_approx,
 )
 from .historical import (
     HistoricalApi,
@@ -45,7 +46,6 @@ from .historical import (
     infer_category,
 )
 from .scanner import normalize_title
-
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
@@ -227,12 +227,12 @@ def _monday_timestamps(start_date: date, end_date: date) -> list[int]:
         d += timedelta(days=1)
     ts_list = []
     while d <= end_date:
-        ts_list.append(int(datetime(d.year, d.month, d.day, 9, 0, tzinfo=timezone.utc).timestamp()))
+        ts_list.append(int(datetime(d.year, d.month, d.day, 9, 0, tzinfo=UTC).timestamp()))
         d += timedelta(weeks=1)
     return ts_list
 
 
-def _candle_at_or_before(candles: list[dict], ts: int) -> Optional[dict]:
+def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     """
     Find the most recent candlestick at or before a given Unix timestamp.
 
@@ -266,7 +266,7 @@ def _find_entry(
     mB: dict,
     pair_type: str,
     start_date: date,
-) -> Optional[dict]:
+) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
 
@@ -353,7 +353,7 @@ def _find_entry(
             if gap > MAX_DEADLINE_GAP_DAYS:
                 continue
 
-        entry_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
         return {
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA,
@@ -422,7 +422,7 @@ def run_backtest(
         close_dt  = datetime.fromisoformat(close_time)
         # open_ts: start of the backtest window
         open_ts   = int(datetime(start_date.year, start_date.month, start_date.day,
-                                 tzinfo=timezone.utc).timestamp())
+                                 tzinfo=UTC).timestamp())
         # close_ts: one day past market close to include the final candle
         close_ts  = int(close_dt.timestamp()) + 86400
         # Returns list[dict] with keys: ts (unix int), yes_ask_close (float), no_ask_close (float)

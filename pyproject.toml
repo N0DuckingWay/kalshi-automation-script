@@ -1,0 +1,66 @@
+[project]
+name = "kalshi-betting"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "kalshi-python-sync==3.13.0",
+    "schedule>=1.2.0",
+    "tabulate>=0.9.0",
+    "cryptography>=41.0.0",
+    "python-dateutil>=2.8.2",
+    "openpyxl>=3.1.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "yfinance>=0.2.36",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["kalshi_betting"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line length handled by formatter
+    "B008",  # function calls in default arguments (used by some stdlib patterns)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.isort]
+known-first-party = ["kalshi_betting"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true  # kalshi_python_sync has no type stubs
+disallow_untyped_defs = false  # tighten incrementally as stubs are added
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

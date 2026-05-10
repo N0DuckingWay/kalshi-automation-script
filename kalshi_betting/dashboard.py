@@ -25,7 +25,7 @@ Notes:
     and shows only the strategy equity curve.
 """
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +36,6 @@ from plotly.subplots import make_subplots
 
 from .backtester import BacktestTrade
 from .config import PROJECT_ROOT
-
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
@@ -746,7 +745,7 @@ def generate_dashboard(
         Path: Absolute path to the generated HTML file
             (PROJECT_ROOT / "backtest_dashboard_YYYY-MM-DD_HHMMSS.html").
     """
-    ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H%M%S")
+    ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
 
     sections = [

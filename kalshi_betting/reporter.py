@@ -24,12 +24,11 @@ Notes:
 """
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .config import PROJECT_ROOT
@@ -84,7 +83,7 @@ class TradeResult:
     """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated"
-    error: Optional[str] = None
+    error: str | None = None
 
 
 
@@ -215,7 +214,7 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
         _apply_header_row(ws, _HEADER_FILL_PROD)
 
     # Use local time for the separator row so timestamps are human-readable
-    run_ts = datetime.now(timezone.utc).astimezone()
+    run_ts = datetime.now(UTC).astimezone()
 
     # Write a run-separator row
     sep_row = ws.max_row + 1
@@ -271,7 +270,7 @@ def write_dev_simulation(
         Path: Absolute path to the newly created simulation file
             (PROJECT_ROOT / "dev_simulation_YYYY-MM-DD_HHMMSS.xlsx").
     """
-    run_ts   = datetime.now(timezone.utc).astimezone()
+    run_ts   = datetime.now(UTC).astimezone()
     filename = f"dev_simulation_{run_ts.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
     out_path = PROJECT_ROOT / filename
 

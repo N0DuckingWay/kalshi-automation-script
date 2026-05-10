@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest*)",
+      "Bash(python3 -m ruff*)",
+      "Bash(python3 -m py_compile*)",
+      "Bash(ruff check*)",
+      "Bash(ruff format*)",
+      "Bash(grep*)",
+      "Bash(find . *)",
+      "Bash(ls*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /home/user/kalshi-automation-script && python3 -m py_compile \"$CLAUDE_FILE_PATH\" 2>&1 && python3 -m ruff check --fix \"$CLAUDE_FILE_PATH\" 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

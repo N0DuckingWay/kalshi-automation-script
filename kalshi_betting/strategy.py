@@ -19,8 +19,7 @@ Dependencies:
 """
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact, fee_per_pair_approx
 from .scanner import CandidatePair
@@ -81,7 +80,7 @@ def _kelly_p(pair: CandidatePair) -> float:
     return SAME_TITLE_CO_RESOLVE_PROB
 
 
-def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec]:
+def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     """
     Compute a Kelly-sized trade specification for a guaranteed-arbitrage pair.
 
@@ -172,14 +171,14 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> Optional[TradeSpec
 
     # Compute the number of calendar days until the later-closing market resolves.
     # This is used to normalize the profit ratio to a monthly (30-day) figure for ranking.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     close_a = pair.market_a.close_time
     close_b = pair.market_b.close_time
     # Add UTC timezone info if the API returned naive datetimes to avoid comparison errors
     if close_a.tzinfo is None:
-        close_a = close_a.replace(tzinfo=timezone.utc)
+        close_a = close_a.replace(tzinfo=UTC)
     if close_b.tzinfo is None:
-        close_b = close_b.replace(tzinfo=timezone.utc)
+        close_b = close_b.replace(tzinfo=UTC)
     # Use the later close time — capital is tied up until both legs resolve
     days_to_close = max(1, (max(close_a, close_b) - now).days)
     # Scale the profit ratio to a 30-day equivalent to fairly compare short and long positions

@@ -1,17 +1,29 @@
+# Credentials — never commit these
 kalshi_private_key.pem
+kalshi_demo_private_key.pem
 kalshi_public_key.pem
 kalshi_public_key.pem3
-secrets.json
 kalshi_public_key_sandbox.pem3
 kalshi_private_key_sandbox.pem
+secrets.json
 
 # Excel / simulation output
 *.xlsx
 ~$*.xlsx
+
+# Bot output
+*.log
+backtest_cache/
+dashboard.html
+backtest_dashboard*.html
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-kalshi_demo_private_key.pem
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
