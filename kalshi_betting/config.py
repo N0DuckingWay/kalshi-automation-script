@@ -17,8 +17,8 @@ Dependencies:
     scheduler.py, and main.py.
 
 Notes:
-    PROJECT_ROOT is hard-coded to an absolute path so the package works correctly
-    regardless of which git worktree or working directory it is invoked from.
+    PROJECT_ROOT is derived from __file__ so the package works correctly on any
+    machine regardless of where the repo is cloned.
     The sandbox URL (demo-api.kalshi.co) requires a completely separate account
     registered at demo.kalshi.co — the production API key will return 401 there.
 """
@@ -36,9 +36,9 @@ SANDBOX_URL = "https://demo-api.kalshi.co/trade-api/v2"
 
 # ── Filesystem paths ──────────────────────────────────────────────────────────
 
-# Absolute path to project root (where secrets.json and the PEM key live).
-# This is fixed regardless of which git worktree the package runs from.
-PROJECT_ROOT = pathlib.Path("/Users/zdhoffman/Documents/Coding Projects/Kalshi Betting App")
+# Path to project root (where secrets.json and the PEM key live).
+# Derived from __file__ so the package works on any machine after cloning.
+PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 
 # JSON file with API key IDs. Expected keys: "Kalshi-api-key" (prod) and
 # optionally "dev_api_key" (sandbox). See README for the full format.

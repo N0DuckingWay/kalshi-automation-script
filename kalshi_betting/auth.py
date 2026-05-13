@@ -29,7 +29,7 @@ import logging
 from kalshi_python_sync import KalshiClient
 from kalshi_python_sync.configuration import Configuration
 
-from .config import PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, DEV_PEM_FILE
+from .config import DEV_PEM_FILE, PEM_FILE, PROD_URL, SANDBOX_URL, SECRETS_FILE
 
 
 def build_client(mode: str) -> KalshiClient:

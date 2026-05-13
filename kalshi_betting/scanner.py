@@ -29,7 +29,8 @@ import logging
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass, replace as dc_replace
+from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from typing import Any
 
 from .config import (

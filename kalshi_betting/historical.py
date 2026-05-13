@@ -26,7 +26,7 @@ Notes:
 import json
 import logging
 import time
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from kalshi_python_sync.api.historical_api import HistoricalApi
@@ -209,7 +209,7 @@ def fetch_all_settled_markets(
 
     # Convert start_date to a unix timestamp for filtering individual market records
     start_ts = int(datetime(start_date.year, start_date.month, start_date.day,
-                            tzinfo=timezone.utc).timestamp())
+                            tzinfo=UTC).timestamp())
 
     # Get the cutoff timestamp that divides historical archive from live endpoint coverage
     cutoff      = hist_client.get_historical_cutoff()

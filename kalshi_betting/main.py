@@ -21,7 +21,6 @@ Dependencies:
 """
 import argparse
 import logging
-import sys
 
 from tabulate import tabulate
 
@@ -29,9 +28,12 @@ from .auth import build_client, verify_auth
 from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
-    get_held_tickers, fetch_open_markets,
-    find_candidate_pairs, find_same_title_pairs,
-    enrich_with_orderbook_prices, market_title,
+    enrich_with_orderbook_prices,
+    fetch_open_markets,
+    find_candidate_pairs,
+    find_same_title_pairs,
+    get_held_tickers,
+    market_title,
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import execute_trades, pre_execution_check
