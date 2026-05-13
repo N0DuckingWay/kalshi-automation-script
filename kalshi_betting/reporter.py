@@ -13,7 +13,7 @@ Purpose:
     frozen header rows — is applied via openpyxl.
 
 Dependencies:
-    Imports market_title from scanner.py and TradeSpec from strategy.py. Imports
+    Imports display_title from scanner.py and TradeSpec from strategy.py. Imports
     PROJECT_ROOT from config.py. Exports the TradeResult dataclass (consumed by
     trader.py) and the two public write functions (consumed by main.py).
 
@@ -32,7 +32,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .config import PROJECT_ROOT
-from .scanner import market_title
+from .scanner import display_title
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
@@ -116,8 +116,8 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     """
     spec = result.spec
     pair = spec.pair
-    mA   = market_title(pair.market_a)
-    mB   = market_title(pair.market_b)
+    mA   = display_title(pair.market_a)
+    mB   = display_title(pair.market_b)
 
     def fmt_dt(dt) -> str:
         return dt.strftime("%Y-%m-%d") if dt else ""
@@ -327,8 +327,8 @@ def write_dev_simulation(
         diff    = pair.pA - pair.pB
         row_data = [
             pair.pair_type,
-            market_title(pair.market_a), pair.market_a.ticker,
-            market_title(pair.market_b), pair.market_b.ticker,
+            display_title(pair.market_a), pair.market_a.ticker,
+            display_title(pair.market_b), pair.market_b.ticker,
             pair.market_a.close_time.strftime("%Y-%m-%d") if pair.market_a.close_time else "",
             pair.market_b.close_time.strftime("%Y-%m-%d") if pair.market_b.close_time else "",
             round(pair.pA, 4),

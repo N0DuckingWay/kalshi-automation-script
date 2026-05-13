@@ -50,7 +50,7 @@ secrets.json + PEM key
 ```
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
-  ├─ scanner.fetch_open_markets()  — fetch all open markets
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping)
   ├─ scanner.find_candidate_pairs()     — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection
   ├─ scanner.enrich_with_orderbook_prices() — validate depth & real fills

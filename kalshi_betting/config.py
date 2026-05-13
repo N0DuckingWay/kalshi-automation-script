@@ -78,6 +78,13 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # aborts to avoid wasting API calls when there is insufficient capital to trade.
 MIN_BALANCE_CENTS             = 500
 
+# Whether to include multivariate (multi-choice) markets in scanning and backtesting.
+# When True, markets are grouped by (event_title + market_title) so cross-event
+# option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive
+# into a same-title or time-series pair. When False, mve_filter="exclude" is passed
+# to all market-fetch APIs and the bot operates only on binary events.
+INCLUDE_MVE_MARKETS           = True
+
 # Kalshi taker fee rate. The exact per-leg fee is:
 #   ceil(TAKER_FEE_RATE × n_contracts × price × (1 − price) × 100) / 100
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
