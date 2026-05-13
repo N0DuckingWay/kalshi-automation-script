@@ -287,7 +287,7 @@ def fetch_open_markets(client: Any) -> list:
     return markets
 
 
-def find_candidate_pairs(
+def find_ts_pairs(
     client: Any,
     held_tickers: set | None = None,
     markets: list | None = None,
