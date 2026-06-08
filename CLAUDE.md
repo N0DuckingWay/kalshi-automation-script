@@ -20,7 +20,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 |--------|------|-------------|
 | `config.py` | All constants and fee helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()` |
 | `auth.py` | Builds authenticated `KalshiClient` | `build_client(mode)`, `verify_auth(client)` |
-| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `normalize_title()`, `fetch_open_markets()`, `find_candidate_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
+| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `normalize_title()`, `fetch_open_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
 | `strategy.py` | Kelly sizing, portfolio selection | `TradeSpec`, `compute_trade()`, `select_portfolio()` |
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |
 | `reporter.py` | Excel logging and dev simulation output | `TradeResult`, `append_to_prod_log()`, `write_dev_simulation()` |
@@ -105,7 +105,7 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 
 **Use `@dataclass` for all data transfer objects.** Existing: `CandidatePair`, `TradeSpec`, `TradeResult`, `BacktestTrade`. Never use a plain dict when a dataclass fits.
 
-**Return `None` for validation failures; don't raise.** `compute_trade()` returns `None` when there's no edge. `find_candidate_pairs()` skips bad markets silently. Only raise for truly unexpected errors.
+**Return `None` for validation failures; don't raise.** `compute_trade()` returns `None` when there's no edge. `find_time_series_pairs()` skips bad markets silently. Only raise for truly unexpected errors.
 
 **Two-stage fee calculation:**
 1. `fee_per_pair_approx(nA, pB)` — continuous approximation; use during pair *filtering* before the integer contract count `n` is known.
