@@ -173,7 +173,7 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
             continue
         try:
             ya = float(m.yes_ask_dollars)
-            # Skip markets at or near 0¢ (already settled NO) or 100¢ (already settled YES)
+            # Skip markets at 0¢ (already settled NO) or 100¢ (already settled YES)
             if _MIN_ACTIVE_PRICE <= ya <= _MAX_ACTIVE_PRICE:
                 active.append(m)
         except (ValueError, TypeError):
@@ -287,7 +287,7 @@ def fetch_open_markets(client: Any) -> list:
     return markets
 
 
-def find_candidate_pairs(
+def find_time_series_pairs(
     client: Any,
     held_tickers: set | None = None,
     markets: list | None = None,
@@ -315,7 +315,7 @@ def find_candidate_pairs(
         # Fetch all open markets from the Kalshi API if not supplied by the caller
         markets = fetch_open_markets(client)
 
-    # Remove markets already held and those priced at or near 0¢/100¢ (settled/illiquid)
+    # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
@@ -415,7 +415,7 @@ def find_same_title_pairs(
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
     """
-    # Remove markets already held and those priced at or near 0¢/100¢ (settled/illiquid)
+    # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
 
     # Group by exact (title, subtitle) tuple — no normalization.

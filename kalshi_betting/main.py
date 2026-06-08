@@ -30,8 +30,8 @@ from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     enrich_with_orderbook_prices,
     fetch_open_markets,
-    find_candidate_pairs,
     find_same_title_pairs,
+    find_time_series_pairs,
     get_held_tickers,
     market_title,
 )
@@ -120,14 +120,16 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
     Merge two pair lists, excluding any pair from secondary that already appears in primary.
 
     A duplicate is defined as any pair whose frozenset of {ticker_a, ticker_b} already
-    exists in primary. This can occur when both the time-series scanner and the same-title
-    scanner detect the same two markets — in that case the time-series pair is preferred
-    because it uses the more conservative 15% price gap threshold.
+    exists in primary. This can occur when both the same-title scanner and the time-series
+    scanner detect the same two markets — in that case the same-title pair is preferred
+    because the co-resolution guarantee is simpler (identical questions must co-resolve)
+    and does not depend on an independence-model probability estimate. This matches the
+    same_title > time_series tie-break already used by strategy.select_portfolio().
 
     Args:
-        primary (list): List of CandidatePair objects from find_candidate_pairs()
-            (time-series detection). These are always kept.
-        secondary (list): List of CandidatePair objects from find_same_title_pairs().
+        primary (list): List of CandidatePair objects from find_same_title_pairs().
+            These are always kept.
+        secondary (list): List of CandidatePair objects from find_time_series_pairs().
             Entries whose ticker pair already appears in primary are dropped.
 
     Returns:
@@ -236,11 +238,11 @@ def _run_dev(client, args) -> None:
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
-    time_series_pairs = find_candidate_pairs(client, held_tickers=set(), markets=markets)
+    time_series_pairs = find_time_series_pairs(client, held_tickers=set(), markets=markets)
     # Detect same-title pairs separately — uses a different grouping key (exact title match)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
-    # Merge both lists, preferring time_series when both scanners found the same pair
-    candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
+    # Merge both lists, preferring same_title when both scanners found the same pair
+    candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Replace best-ask prices with depth-weighted order book averages to validate liquidity
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
@@ -315,10 +317,10 @@ def _run_prod(client, args) -> None:
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Run both pair detection paths: time-series (deadline-gap) and same-title
-    time_series_pairs = find_candidate_pairs(client, held_tickers, markets)
+    time_series_pairs = find_time_series_pairs(client, held_tickers, markets)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
-    # Merge both lists, preferring time_series when both scanners found the same pair
-    candidate_pairs   = _dedup_pairs(time_series_pairs, same_title_pairs)
+    # Merge both lists, preferring same_title when both scanners found the same pair
+    candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Replace best-ask prices with depth-weighted order book averages to validate liquidity
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
