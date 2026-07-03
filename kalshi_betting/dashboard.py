@@ -35,7 +35,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import BacktestTrade
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, SAME_TITLE_CO_RESOLVE_PROB, fee_per_pair_approx
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
@@ -147,13 +147,31 @@ def _log_loss(trades: list[BacktestTrade]) -> float:
     return float(np.mean(losses)) if losses else 0.0
 
 
-def _kelly_fraction(pA: float, nA: float, pB: float) -> float:
-    """Simplified Kelly: edge / (1/return_ratio) for the combined trade."""
-    cost    = nA + pB
-    payoff  = 1.0 - nA - pB
-    if cost <= 0 or payoff <= 0:
+def _kelly_fraction(pA: float, nA: float, pB: float, pair_type: str) -> float:
+    """
+    Uncapped Kelly fraction f* = p - (1-p)/b for the combined arbitrage trade.
+
+    Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
+    shows the same theoretical Kelly the live sizer would compute (before the
+    BUDGET_FRACTION cap). Returns 0.0 when there is no edge.
+
+    Args:
+        pA (float): YES ask price of market A at entry.
+        nA (float): NO ask price of market A at entry.
+        pB (float): YES ask price of market B at entry.
+        pair_type (str): "time_series" or "same_title" — selects the probability model.
+
+    Returns:
+        float: Uncapped Kelly fraction, clamped to be >= 0.
+    """
+    cost = nA + pB
+    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+    if cost <= 0 or net_spread <= 0:
         return 0.0
-    return payoff / (1.0 / (payoff / cost + 1))  # ≈ profit_ratio * (1 - profit_ratio)
+    b = net_spread / cost
+    p = SAME_TITLE_CO_RESOLVE_PROB if pair_type == "same_title" else (1.0 - pA * (1.0 - pB))
+    q = 1.0 - p
+    return max(0.0, p - q / b)
 
 
 # ─── Section builders ─────────────────────────────────────────────────────────
@@ -571,7 +589,7 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
         return _SECTION_STYLE.format(title="Risk Metrics") + "<p>No trades.</p>"
 
     # Kelly vs actual sizing scatter
-    kelly_fracs = [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB) for t in trades]
+    kelly_fracs = [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.pair_type) for t in trades]
     actual_fracs = [t.total_cost / initial_balance for t in trades]
 
     fig_kelly = go.Figure(go.Scatter(
