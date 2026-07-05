@@ -607,30 +607,30 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
         xaxis_title="Kelly fraction", yaxis_title="Actual fraction",
     )
 
-    # Capital deployment over time
-    deployment: dict[date, float] = {}
-    cash_flow: dict[date, float] = {}
+    # Capital deployment over time: net running position size (cost still tied up
+    # in unsettled trades). Positive on entry days, back down to zero on exit days.
+    entry_by_date: dict[date, float] = {}
+    exit_by_date: dict[date, float] = {}
     for t in trades:
-        cash_flow[t.entry_date] = cash_flow.get(t.entry_date, 0) - t.total_cost
-        cash_flow[t.exit_date]  = cash_flow.get(t.exit_date, 0) + t.actual_payoff
+        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + t.total_cost
+        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + t.total_cost
 
-    running = 0.0
-    dep_rows = []
+    invested_by_date: list[float] = []
+    running_invested = 0.0
     for _, row in equity_df.iterrows():
         d = row["date"] if isinstance(row["date"], date) else row["date"].date()
-        running += cash_flow.get(d, 0.0)
-        invested = initial_balance - row["portfolio_value"]
-        dep_rows.append({"date": row["date"], "invested": max(0, -cash_flow.get(d, 0))})
+        running_invested += entry_by_date.get(d, 0.0) - exit_by_date.get(d, 0.0)
+        invested_by_date.append(max(0.0, running_invested))
 
-    dep_df = pd.DataFrame(dep_rows)
     fig_dep = make_subplots()
     fig_dep.add_trace(go.Scatter(
-        x=equity_df["date"], y=equity_df["portfolio_value"],
-        name="Cash available", fill="tozeroy",
-        line=dict(color=_COLORS["cash"]), fillcolor="rgba(102,187,106,0.15)",
+        x=equity_df["date"], y=invested_by_date,
+        name="Capital deployed", fill="tozeroy",
+        line=dict(color=_COLORS["invested"]),
+        fillcolor="rgba(66,165,245,0.15)",
     ))
-    fig_dep.update_layout(title="Portfolio Value Over Time",
-                           yaxis_title="Value ($)", xaxis_title="Date")
+    fig_dep.update_layout(title="Capital Deployed Over Time",
+                           yaxis_title="Capital in open trades ($)", xaxis_title="Date")
 
     return (
         _SECTION_STYLE.format(title="Risk Metrics")

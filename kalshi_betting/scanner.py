@@ -27,12 +27,12 @@ Notes:
 """
 import logging
 import re
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from typing import Any
 
+from ._http import api_call_with_retry
 from .config import (
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
@@ -220,40 +220,6 @@ def get_held_tickers(client: Any) -> set:
     return held
 
 
-def _api_call_with_retry(fn, *args, **kwargs):
-    """
-    Call an API function with exponential backoff on HTTP 429 (rate limit) errors.
-
-    Retries up to 5 times with a starting delay of 2 seconds, doubling each time
-    up to a maximum of 60 seconds. Any non-429 exception is re-raised immediately
-    without retrying (e.g. 401 auth errors, 404 not found).
-
-    Args:
-        fn: A callable that performs an API call (e.g. client.get_markets).
-        *args: Positional arguments forwarded to fn.
-        **kwargs: Keyword arguments forwarded to fn.
-
-    Returns:
-        The return value of fn(*args, **kwargs) on success.
-
-    Raises:
-        Exception: Re-raises the original exception if it is not a 429 error, or
-            if all 5 retries are exhausted.
-    """
-    delay = 2.0
-    for attempt in range(6):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            if "429" in str(e) and attempt < 5:
-                logging.warning("Rate limited — retrying in %.0fs (attempt %d/5)", delay, attempt + 1)
-                time.sleep(delay)
-                # Exponential backoff capped at 60 seconds to avoid waiting indefinitely
-                delay = min(delay * 2, 60)
-            else:
-                raise
-
-
 def fetch_open_markets(client: Any) -> list:
     """
     Fetch all open, non-multivariate Kalshi markets via paginated API calls.
@@ -277,7 +243,7 @@ def fetch_open_markets(client: Any) -> list:
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = _api_call_with_retry(client.get_markets, **kwargs)
+        resp = api_call_with_retry(client.get_markets, **kwargs)
         markets.extend(resp.markets)
         cursor = resp.cursor
         # A None or empty cursor signals the last page
@@ -436,22 +402,24 @@ def find_same_title_pairs(
             continue
 
         group_pairs: list = []
-        for i, mA in enumerate(members):
-            for mB in members[i + 1:]:
+        for i, m_outer in enumerate(members):
+            for m_inner in members[i + 1:]:
                 # Same event_ticker means these are options in the same multi-choice event,
                 # not separate markets asking the same question — skip them
-                if mA.event_ticker == mB.event_ticker:
+                if m_outer.event_ticker == m_inner.event_ticker:
                     continue
                 try:
-                    pA = float(mA.yes_ask_dollars)
-                    pB = float(mB.yes_ask_dollars)
+                    p_outer = float(m_outer.yes_ask_dollars)
+                    p_inner = float(m_inner.yes_ask_dollars)
                 except (ValueError, TypeError):
                     continue
 
                 # Canonicalize so market_a is always the more expensive side (higher YES ask).
-                # The strategy buys NO on the expensive side and YES on the cheap side.
-                if pA < pB:
-                    mA, mB, pA, pB = mB, mA, pB, pA
+                # Use fresh locals per iteration so the swap does not leak into the next mB.
+                if p_outer >= p_inner:
+                    mA, mB, pA, pB = m_outer, m_inner, p_outer, p_inner
+                else:
+                    mA, mB, pA, pB = m_inner, m_outer, p_inner, p_outer
 
                 # Enforce the minimum 5% YES price difference for same-title pairs.
                 # A smaller gap is within normal bid-ask spread noise.
@@ -566,7 +534,7 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     failure.
     """
     try:
-        resp = _api_call_with_retry(client.get_market_orderbook, ticker=ticker)
+        resp = api_call_with_retry(client.get_market_orderbook, ticker=ticker)
         ob = getattr(resp, "orderbook_fp", None) or getattr(resp, "orderbook", None)
         if ob is None:
             return None
@@ -617,13 +585,16 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         ob_b = get_ob(pair.market_b.ticker)
 
         if ob_a is None or ob_b is None:
-            # If either order book is unavailable, keep the pair with best-ask prices
-            # rather than marking it untradeable — the scanner already validated the gap
+            # If either order book is unavailable we cannot validate depth, so
+            # mark the pair non-tradeable. Passing best-ask prices through with
+            # tradeable=True would let strategy.compute_trade size against unbounded
+            # depth (max_contracts=0 is treated as "no cap" downstream) — the
+            # opposite of what pre_execution_check is meant to catch.
             logging.warning(
-                "Orderbook unavailable for '%s' — keeping best-ask prices",
+                "Orderbook unavailable for '%s' — marking non-tradeable",
                 pair.canonical_title,
             )
-            enriched.append(pair)
+            enriched.append(dc_replace(pair, tradeable=False))
             continue
 
         # Convert YES bids of market A into NO ask levels (complement prices)
