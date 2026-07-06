@@ -27,7 +27,7 @@ Notes:
     a worse price and creating an unhedged directional position.
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
@@ -113,12 +113,23 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
     if not portfolio:
         return []
 
-    def _check(spec: TradeSpec):
-        return spec, validate_pair_price(client, spec)
-
     valid = []
     with ThreadPoolExecutor(max_workers=min(8, len(portfolio))) as pool:
-        for spec, ok in pool.map(_check, portfolio):
+        future_to_spec = {
+            pool.submit(validate_pair_price, client, spec): spec for spec in portfolio
+        }
+        # Iterate as futures complete so one raising thread does not swallow the others;
+        # a raised exception is caught per-spec and the spec is dropped like a False check.
+        for future in as_completed(future_to_spec):
+            spec = future_to_spec[future]
+            try:
+                ok = future.result()
+            except Exception as exc:
+                logging.warning(
+                    "Pre-execution check raised for '%s' — dropping: %s",
+                    spec.pair.canonical_title, exc,
+                )
+                continue
             if ok:
                 valid.append(spec)
             else:
@@ -236,6 +247,10 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             result has status="executed" (both legs filled), "simulated" (dry run),
             "failed" (leg A failed), or "rolled_back" (leg B failed, leg A unwound).
     """
+    # ThreadPoolExecutor(max_workers=0) raises ValueError, so short-circuit empty input
+    if not specs:
+        return []
+
     if dry_run:
         results = []
         for spec in specs:

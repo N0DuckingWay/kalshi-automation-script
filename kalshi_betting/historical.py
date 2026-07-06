@@ -31,11 +31,17 @@ from pathlib import Path
 
 from kalshi_python_sync.api.historical_api import HistoricalApi
 
+from ._http import api_call_with_retry
 from .auth import build_client
 from .config import PROJECT_ROOT
 
 CACHE_DIR = PROJECT_ROOT / "backtest_cache"
 _CANDLES_DIR = CACHE_DIR / "candlesticks"
+
+# Cached-empty candles may be genuinely empty markets, but they are also what
+# a fetch failure previously produced. Treat empty cache files as stale after
+# this many seconds so a transient API failure self-heals on the next run.
+_EMPTY_CANDLE_TTL_SECONDS = 86_400
 
 # Map event_ticker prefixes to human-readable categories
 _CATEGORY_PREFIXES = [
@@ -212,7 +218,7 @@ def fetch_all_settled_markets(
                             tzinfo=UTC).timestamp())
 
     # Get the cutoff timestamp that divides historical archive from live endpoint coverage
-    cutoff      = hist_client.get_historical_cutoff()
+    cutoff      = api_call_with_retry(hist_client.get_historical_cutoff)
     cutoff_ts   = int(cutoff.market_settled_ts.timestamp())
 
     all_markets: list[dict] = []
@@ -225,7 +231,7 @@ def fetch_all_settled_markets(
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = hist_client.get_historical_markets(**kwargs)
+        resp = api_call_with_retry(hist_client.get_historical_markets, **kwargs)
         for m in resp.markets:
             # Skip markets without a settlement timestamp or with a non-binary result
             if m.settlement_ts is None or m.result not in ("yes", "no"):
@@ -251,7 +257,7 @@ def fetch_all_settled_markets(
                       min_settled_ts=cutoff_ts)
         if cursor:
             kwargs["cursor"] = cursor
-        resp = live_client.get_markets(**kwargs)
+        resp = api_call_with_retry(live_client.get_markets, **kwargs)
         for m in resp.markets:
             if m.settlement_ts is None or m.result not in ("yes", "no"):
                 continue
@@ -316,11 +322,20 @@ def fetch_daily_candlesticks(
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CANDLES_DIR / f"{ticker}.json"
     if use_cache and cache_path.exists():
-        return json.loads(cache_path.read_text())
+        cached = json.loads(cache_path.read_text())
+        # Honor the cache if it has real content, or if a recorded empty is still fresh.
+        # Otherwise let the code fall through and retry — a stale empty was likely a
+        # previous transient failure, not a genuinely empty market.
+        if cached:
+            return cached
+        age = time.time() - cache_path.stat().st_mtime
+        if age < _EMPTY_CANDLE_TTL_SECONDS:
+            return cached
 
     try:
         # period_interval=1440 requests one candle per 1440 minutes (1 day)
-        resp = hist_client.get_market_candlesticks_historical(
+        resp = api_call_with_retry(
+            hist_client.get_market_candlesticks_historical,
             ticker=ticker,
             start_ts=open_ts,
             end_ts=close_ts,
@@ -342,12 +357,13 @@ def fetch_daily_candlesticks(
         # Rate limit: sleep briefly after each call to avoid 429 responses
         time.sleep(rate_limit_sleep)
         if use_cache:
+            # Only successful fetches are cached; failures fall through the except
+            # branch and return [] without persisting so the next run retries.
             _save_json_cache(cache_path, candles)
         return candles
     except Exception as e:
         logging.warning("Candlestick fetch failed for %s: %s", ticker, e)
         time.sleep(rate_limit_sleep)
-        if use_cache:
-            # Cache an empty list so this ticker is not retried on future runs
-            _save_json_cache(cache_path, [])
+        # Deliberately DO NOT cache — a poisoned empty file would silence this
+        # ticker on every subsequent run until manually deleted.
         return []

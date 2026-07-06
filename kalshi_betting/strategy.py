@@ -214,11 +214,17 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
     """
     Select a portfolio of trades using a greedy algorithm prioritized by monthly return.
 
-    Sorts all candidate TradeSpec objects by monthly_profit_ratio descending, then
-    greedily adds each trade as long as the remaining available balance covers its
-    cost. Trade sizes are already Kelly-fraction-weighted by compute_trade(), so
-    each entry fits within the budget constraint by construction — this function
-    only resolves conflicts between multiple trades competing for the same capital.
+    Sorts all candidate TradeSpec objects by monthly_profit_ratio descending and
+    walks the list once. Each spec is selected if (a) both of its tickers are still
+    free and (b) its total_cost fits in the remaining balance. The loop does NOT
+    break when a spec doesn't fit — it keeps scanning so a cheaper trade further
+    down can still be added.
+
+    Ticker-conflict filter: once a spec is chosen, both of its market tickers are
+    marked used and no later spec that touches either ticker is selected. This
+    prevents a single market from being a leg in two overlapping pairs, matching
+    the "one active position per ticker" invariant that get_held_tickers enforces
+    across runs and that the backtester enforces in its Pass-2 filter.
 
     At equal monthly profit ratios, same_title pairs rank above time_series because
     the same-title guarantee is simpler (identical questions must co-resolve) and
@@ -228,7 +234,7 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         specs (list): List of TradeSpec objects produced by compute_trade(), one
             per qualifying CandidatePair.
         balance_cents (int): Total available account balance in cents. The greedy
-            selection stops adding trades when the remaining balance is insufficient.
+            selection skips trades that don't fit but keeps scanning cheaper ones.
 
     Returns:
         list: Ordered list of TradeSpec objects selected for execution, sorted by
@@ -245,11 +251,20 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         reverse=True,
     )
     selected = []
+    used_tickers: set[str] = set()
     for spec in specs_sorted:
+        ta = spec.pair.market_a.ticker
+        tb = spec.pair.market_b.ticker
+        # Skip trades that would re-use a ticker already committed to a higher-priority pair
+        if ta in used_tickers or tb in used_tickers:
+            continue
         # Skip this trade if it would exceed the remaining available balance
-        if spec.total_cost <= available:
-            selected.append(spec)
-            available -= spec.total_cost
+        if spec.total_cost > available:
+            continue
+        selected.append(spec)
+        available -= spec.total_cost
+        used_tickers.add(ta)
+        used_tickers.add(tb)
     logging.info(
         "Portfolio: %d trades selected, total cost $%.2f",
         len(selected),
