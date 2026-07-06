@@ -246,7 +246,7 @@ def get_held_tickers(client: Any) -> set:
     held: set = set()
     cursor: str | None = None
     while True:
-        kwargs: dict = dict(limit=POSITION_PAGE_SIZE, count_filter="position")
+        kwargs: dict = {"limit": POSITION_PAGE_SIZE, "count_filter": "position"}
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
@@ -297,11 +297,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
     while True:
-        kwargs: dict = dict(
-            status="open",
-            limit=MARKET_PAGE_SIZE,
-            with_nested_markets=True,
-        )
+        kwargs: dict = {
+            "status": "open",
+            "limit": MARKET_PAGE_SIZE,
+            "with_nested_markets": True,
+        }
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor

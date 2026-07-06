@@ -21,7 +21,7 @@ Notes:
 """
 import logging
 import time
-from typing import Callable
+from collections.abc import Callable
 
 # HTTP status codes worth retrying: 429 (rate limit) plus common transient 5xx errors.
 # 500 / 502 / 503 / 504 sometimes appear during Kalshi maintenance or upstream blips.
