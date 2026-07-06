@@ -333,7 +333,7 @@ def fetch_all_settled_markets(
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
     # when False, the legacy "exclude" behaviour is preserved.
-    hist_base_kwargs: dict = dict(limit=1000)
+    hist_base_kwargs: dict = {"limit": 1000}
     if not INCLUDE_MVE_MARKETS:
         hist_base_kwargs["mve_filter"] = "exclude"
 
@@ -367,7 +367,7 @@ def fetch_all_settled_markets(
     cursor = None
     while True:
         # min_settled_ts=cutoff_ts ensures we only get markets not covered by the historical endpoint
-        kwargs = dict(status="settled", limit=1000, min_settled_ts=cutoff_ts)
+        kwargs = {"status": "settled", "limit": 1000, "min_settled_ts": cutoff_ts}
         if not INCLUDE_MVE_MARKETS:
             kwargs["mve_filter"] = "exclude"
         if cursor:

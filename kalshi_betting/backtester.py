@@ -476,7 +476,7 @@ def run_backtest(
     all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
     candidates = []
 
-    for (mA_orig, mB_orig, canon), pair_type in all_pairs:
+    for (mA_orig, mB_orig, _canon), pair_type in all_pairs:
         candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
         candles_b = candles_by_ticker.get(mB_orig["ticker"], [])
 
@@ -543,27 +543,27 @@ def run_backtest(
         title_a = mA.get("title") or mA.get("subtitle") or mA.get("ticker", "")
         title_b = mB.get("title") or mB.get("subtitle") or mB.get("ticker", "")
 
-        candidates.append(dict(
-            pair_type=pair_type,
-            mA=mA, mB=mB,
-            pA=pA, pB=pB, nA=nA,
-            entry_date=entry_date,
-            exit_date=exit_date,
-            n=n,
-            total_cost=total_cost,
-            expected_payoff=expected_payoff,
-            outcome_a=outcome_a,
-            outcome_b=outcome_b,
-            actual_payoff=actual_payoff,
-            profit=profit,
-            profit_ratio=profit_ratio,
-            monthly_profit_ratio=monthly_profit_ratio,
-            kelly_fraction=kelly_f_capped,
-            slippage=slippage,
-            holding_days=holding_days,
-            title_a=title_a,
-            title_b=title_b,
-        ))
+        candidates.append({
+            "pair_type": pair_type,
+            "mA": mA, "mB": mB,
+            "pA": pA, "pB": pB, "nA": nA,
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "n": n,
+            "total_cost": total_cost,
+            "expected_payoff": expected_payoff,
+            "outcome_a": outcome_a,
+            "outcome_b": outcome_b,
+            "actual_payoff": actual_payoff,
+            "profit": profit,
+            "profit_ratio": profit_ratio,
+            "monthly_profit_ratio": monthly_profit_ratio,
+            "kelly_fraction": kelly_f_capped,
+            "slippage": slippage,
+            "holding_days": holding_days,
+            "title_a": title_a,
+            "title_b": title_b,
+        })
 
     # Sort by monthly_profit_ratio descending; prefer same_title at equal monthly return
     candidates.sort(
