@@ -34,6 +34,7 @@ from typing import Any
 
 from ._http import api_call_with_retry
 from .config import (
+    INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF,
@@ -148,6 +149,52 @@ def market_title(market: Any) -> str:
     return market.title or market.subtitle or market.ticker
 
 
+def pair_key(market: Any) -> str:
+    """
+    Combined grouping key — event title joined with market title.
+
+    Used by the pair-finders to ensure two markets with the same option label in
+    different unrelated events (e.g. "Trump" in "2024 Election" vs. "Trump" in
+    "2024 Time Person of the Year") do NOT get grouped as the same question.
+    Falls back to the bare market_title when `_event_title` is missing — this
+    keeps backwards-compat for test fixtures and any caller that hasn't been
+    migrated to attach event titles, but disables cross-event collision
+    protection for that market.
+
+    Args:
+        market (Any): A Kalshi market object. May have an `_event_title` attribute
+            attached by `fetch_open_events_with_markets`.
+
+    Returns:
+        str: "<event_title> | <market_title>" when an event title is attached,
+            otherwise just the market title.
+    """
+    event_title = getattr(market, "_event_title", "") or ""
+    if not event_title:
+        return market_title(market)
+    return f"{event_title} | {market_title(market)}"
+
+
+def display_title(market: Any) -> str:
+    """
+    Human-readable label for console and Excel output.
+
+    Returns "<event_title>: <market_title>" when an event title is attached
+    (so multivariate option labels like "Trump" or "Above $80k" carry their
+    event context for manual spot-checking). Falls back to the bare market
+    title for non-MVE markets.
+
+    Args:
+        market (Any): A Kalshi market object. May have an `_event_title` attribute.
+
+    Returns:
+        str: Display label suitable for user-facing tables and Excel rows.
+    """
+    event_title = getattr(market, "_event_title", "") or ""
+    base = market_title(market)
+    return f"{event_title}: {base}" if event_title else base
+
+
 def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
     """
     Filter markets to those that are actively priced and not already held.
@@ -220,36 +267,78 @@ def get_held_tickers(client: Any) -> set:
     return held
 
 
-def fetch_open_markets(client: Any) -> list:
+def fetch_open_events_with_markets(client: Any) -> list:
     """
-    Fetch all open, non-multivariate Kalshi markets via paginated API calls.
+    Fetch all open Kalshi markets via the events endpoint (with nested markets).
 
-    Uses the mve_filter="exclude" parameter to skip multivariate (multi-choice)
-    markets, which have fundamentally different pricing semantics and would
-    generate false positives in the arbitrage scanner. Iterates through all
-    pages of results using cursor-based pagination.
+    Iterates the /events endpoint with `with_nested_markets=True` so each event
+    response contains its constituent markets. Each market gets the parent event's
+    title attached as a `_event_title` attribute — this is the key change that
+    allows MVE (multivariate) markets to be safely scanned: pair-grouping uses
+    `event_title + market_title`, so cross-event option-label collisions (e.g.
+    "Trump" in two unrelated events) no longer false-positive into a same-title
+    or time-series pair.
+
+    When `INCLUDE_MVE_MARKETS` is True, also pulls the dedicated multivariate
+    events endpoint, since `get_events` excludes MVE events by API design.
+    When False, only the standard endpoint is hit and the previous binary-only
+    behaviour is preserved.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
     Returns:
-        list: All open, non-multivariate Kalshi market API objects. May contain
-            thousands of items depending on the current state of the platform.
+        list: Flat list of all open Kalshi market API objects, each with an
+            `_event_title` attribute set to its parent event's full title (may
+            be empty string if the event had no title). May contain thousands
+            of items.
     """
-    markets = []
+    markets: list = []
+    # Standard (non-MVE) events with nested markets
     cursor: str | None = None
     while True:
-        kwargs: dict = dict(status="open", limit=MARKET_PAGE_SIZE, mve_filter="exclude")
+        kwargs: dict = dict(
+            status="open",
+            limit=MARKET_PAGE_SIZE,
+            with_nested_markets=True,
+        )
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = api_call_with_retry(client.get_markets, **kwargs)
-        markets.extend(resp.markets)
+        resp = api_call_with_retry(client.get_events, **kwargs)
+        for ev in resp.events or []:
+            ev_title = ev.title or ""
+            for m in ev.markets or []:
+                # Attach the parent event title so pair_key()/display_title() can find it
+                m._event_title = ev_title
+                markets.append(m)
         cursor = resp.cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
-    logging.info("Fetched %d open markets", len(markets))
+
+    # Multivariate events — fetched only when MVE inclusion is enabled.
+    # The /events endpoint excludes these by API design, so they need their own pull.
+    if INCLUDE_MVE_MARKETS:
+        cursor = None
+        while True:
+            kwargs = {"limit": MARKET_PAGE_SIZE, "with_nested_markets": True}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = api_call_with_retry(client.get_multivariate_events, **kwargs)
+            for ev in resp.events or []:
+                ev_title = ev.title or ""
+                for m in ev.markets or []:
+                    # Only include markets that are still open — MVE response may
+                    # include closed/settled options inside an otherwise-open event.
+                    if getattr(m, "status", "") == "open":
+                        m._event_title = ev_title
+                        markets.append(m)
+            cursor = resp.cursor
+            if not cursor:
+                break
+
+    logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
 
@@ -261,10 +350,12 @@ def find_time_series_pairs(
     """
     Find time-series arbitrage candidate pairs.
 
-    Grouping strategy: EXACT normalized-title matching.
-    If two contracts differ ONLY in their deadline, stripping all date tokens
-    from the title yields the exact same string. This is more precise than
-    fuzzy matching (which groups unrelated contracts with similar templates).
+    Grouping strategy: EXACT normalized-title matching over the combined
+    `event_title + market_title` key (see `pair_key`). If two contracts differ
+    ONLY in their deadline, stripping all date tokens from the combined key
+    yields the exact same string. The event-title prefix is what keeps
+    multivariate option labels (e.g. "Trump" appearing in unrelated events)
+    from false-positive pairing.
 
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
@@ -279,18 +370,19 @@ def find_time_series_pairs(
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the caller
-        markets = fetch_open_markets(client)
+        markets = fetch_open_events_with_markets(client)
 
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
-    # Group by exact normalized title — O(n) hash, no fuzzy matching.
-    # Stripping date tokens from titles means two markets that differ ONLY in their
-    # deadline produce the same key, so they end up in the same group.
+    # Group by exact normalized title over the combined (event + market) key.
+    # Stripping date tokens means two markets that differ ONLY in their deadline
+    # produce the same key. Using event_title in the key prevents two unrelated
+    # MVE events sharing an option label (e.g. "Trump") from being grouped.
     by_title: dict = defaultdict(list)
     for m in active:
-        norm = normalize_title(market_title(m))
+        norm = normalize_title(pair_key(m))
         # Skip markets whose title collapses entirely to an empty string after stripping
         if norm:
             by_title[norm].append(m)
@@ -378,23 +470,30 @@ def find_same_title_pairs(
     Both markets should resolve identically (same question), so buying NO on the
     expensive market and YES on the cheap market is guaranteed profit when nA+pB<1.
 
+    Grouping key is (event_title, title, subtitle). The event_title component is
+    what prevents cross-event option-label collisions in MVE markets — e.g. two
+    markets both titled "Trump" in unrelated events will have different event
+    titles and therefore won't be grouped together.
+
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
 
-    # Group by exact (title, subtitle) tuple — no normalization.
-    # Two markets with identical text in both fields are asking the same question.
+    # Group by exact (event_title, title, subtitle) tuple — no normalization.
+    # Three-element key: event_title prevents MVE cross-event collisions; the
+    # (title, subtitle) pair distinguishes markets within an event.
     by_terms: dict = defaultdict(list)
     for m in active:
+        event_title = getattr(m, "_event_title", "") or ""
         title    = m.title or ""
         subtitle = m.subtitle or ""
         if title or subtitle:
-            by_terms[(title, subtitle)].append(m)
+            by_terms[(event_title, title, subtitle)].append(m)
 
     candidate_pairs: list = []
-    for (title, subtitle), members in by_terms.items():
+    for (_event_title, title, subtitle), members in by_terms.items():
         # Use whichever of title or subtitle is non-empty as the display label
         raw_title = title or subtitle
         # Need at least two markets in a group to form any pair

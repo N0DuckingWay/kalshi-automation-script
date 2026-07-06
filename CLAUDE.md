@@ -12,6 +12,8 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 
 **Same-title pairs:** Two contracts with identical title + subtitle on different event tickers. Any divergence >5% is anomalous; the bot exploits it assuming 95% co-resolution probability.
 
+**Multivariate (MVE) markets:** Both pair types include MVE markets (option markets within a multi-choice event, e.g. "Trump" inside "2024 Election Winner") when `INCLUDE_MVE_MARKETS=True` in `config.py`. Pairs are grouped by `event_title + market_title` (see `scanner.pair_key`) so option labels like "Trump" or "Above $80k" can't false-positive across unrelated events. Set `INCLUDE_MVE_MARKETS=False` to fall back to binary-only behaviour.
+
 ---
 
 ## Module Map
@@ -20,7 +22,8 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 |--------|------|-------------|
 | `config.py` | All constants and fee helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()` |
 | `auth.py` | Builds authenticated `KalshiClient` | `build_client(mode)`, `verify_auth(client)` |
-| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `normalize_title()`, `fetch_open_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
+| `_http.py` | Shared HTTP retry helper for market-data API calls | `api_call_with_retry()` |
+| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
 | `strategy.py` | Kelly sizing, portfolio selection | `TradeSpec`, `compute_trade()`, `select_portfolio()` |
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |
 | `reporter.py` | Excel logging and dev simulation output | `TradeResult`, `append_to_prod_log()`, `write_dev_simulation()` |
@@ -33,7 +36,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 
 **Dependency order (no circular imports):**
 ```
-config.py
+config.py, _http.py
   └─ auth.py, scanner.py
        └─ strategy.py
             └─ trader.py, reporter.py
@@ -112,7 +115,7 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 2. `fee_leg_exact(n, p)` — ceiling-rounded exact fee; use for *final validation* once `n` is determined.
 Never swap these — the approximation underestimates and will let bad trades through if used for final validation.
 
-**Retry pattern:** Use `_api_call_with_retry()` in `scanner.py` for all new market-data API calls. It handles HTTP 429 with exponential backoff (2s → 60s, 6 attempts). Do NOT add retry logic to order submission in `trader.py` — a failed leg means price moved, not a transient error.
+**Retry pattern:** Use `api_call_with_retry()` from `_http.py` for all new market-data API calls. It handles HTTP 429 with exponential backoff (2s → 60s, 6 attempts). Do NOT add retry logic to order submission in `trader.py` — a failed leg means price moved, not a transient error.
 
 **Use `pathlib.Path` for all file paths.** Never `os.path` or string concatenation.
 
@@ -145,6 +148,8 @@ Check `pair.tradeable` to distinguish.
 **Dev mode skips `get_held_tickers()`** because the sandbox account is separate and has no positions from production. Don't add held-ticker filtering to `_run_dev()`.
 
 **`normalize_title()` pattern order matters.** `_DATE_PATTERNS` in `scanner.py` applies patterns sequentially. Longer/more specific patterns must come before shorter ones to avoid partial matches leaving date fragments. If adding new patterns, prepend them before similar shorter ones.
+
+**MVE event-title plumbing.** The live scanner attaches an `_event_title` attribute to each `Market` object inside `fetch_open_events_with_markets()`. The backtest stores it as the `event_title` key in cached market dicts. Both pair-finder paths (`find_time_series_pairs`, `find_same_title_pairs`) and their backtester counterparts (`_group_by_normalized_title`, `_group_by_exact_title`) require this to be set for MVE markets — without it they fall back to grouping by market title alone, which would let cross-event option-label collisions through. If you add a new entry point that produces markets, attach `_event_title` (or `event_title` in dict form) before passing into the grouping functions. Old backtest caches written before this change have no `event_title` field; re-run with `--no-cache` to refresh.
 
 ---
 

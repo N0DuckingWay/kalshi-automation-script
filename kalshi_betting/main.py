@@ -28,12 +28,12 @@ from .auth import build_client, verify_auth
 from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
+    display_title,
     enrich_with_orderbook_prices,
-    fetch_open_markets,
+    fetch_open_events_with_markets,
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_tickers,
-    market_title,
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import execute_trades, pre_execution_check
@@ -185,8 +185,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
 
         rows.append([
             pair.pair_type,
-            _truncate(market_title(pair.market_a)),  # returns str — best available display title (.title → .subtitle → .ticker)
-            _truncate(market_title(pair.market_b)),  # same
+            # display_title prefixes the event title for MVE markets so multi-choice
+            # option labels (e.g. "Trump", "Above $80k") carry their event context
+            _truncate(display_title(pair.market_a)),
+            _truncate(display_title(pair.market_b)),
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
             f"{pair.pA:.2%}",
@@ -233,7 +235,7 @@ def _run_dev(client, args) -> None:
 
     # Fetch all open sandbox markets — the sandbox public endpoint does not require
     # valid authentication for read operations, so this works with the prod key too
-    markets = fetch_open_markets(client)
+    markets = fetch_open_events_with_markets(client)
     logging.info("Sandbox markets fetched: %d", len(markets))
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
@@ -313,7 +315,7 @@ def _run_prod(client, args) -> None:
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
     # Fetch all open markets and pre-filter held tickers for downstream efficiency
-    markets           = fetch_open_markets(client)
+    markets           = fetch_open_events_with_markets(client)
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Run both pair detection paths: time-series (deadline-gap) and same-title

@@ -159,23 +159,48 @@ def _compute_actual_payoff(n: int, pA: float, pB: float, nA: float,
 
 # ─── Pair grouping (metadata only, no prices) ─────────────────────────────────
 
+def _pair_key(m: dict) -> str:
+    """
+    Combined grouping key for a market dict — event title joined with market title.
+
+    Mirrors scanner.pair_key() for the backtester's dict-based market representation.
+    The event_title prefix prevents cross-event option-label collisions in MVE
+    markets — e.g. two markets both titled "Trump" in unrelated events will have
+    different event titles and therefore won't be grouped together.
+
+    Falls back to the bare title when event_title is missing (older cache files
+    or non-MVE markets).
+    """
+    event_title = m.get("event_title") or ""
+    title = m.get("title") or m.get("subtitle") or m.get("ticker", "")
+    if not event_title:
+        return title
+    return f"{event_title} | {title}"
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
-    """Group markets by exact (title, subtitle) pair for same-title pair detection."""
+    """Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
+
+    Three-element key: the event_title component prevents cross-event option-label
+    collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+    """
     groups: dict = defaultdict(list)
     for m in markets:
+        event_title = m.get("event_title") or ""
         title    = m.get("title") or ""
         subtitle = m.get("subtitle") or ""
         if title or subtitle:
-            groups[(title, subtitle)].append(m)
+            groups[(event_title, title, subtitle)].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
 def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
-    """Group markets by date-stripped title (for time-series pair detection)."""
+    """Group markets by date-stripped combined key (event_title + title) for time-series pair detection."""
     groups: dict = defaultdict(list)
     for m in markets:
-        raw = m.get("title") or m.get("subtitle") or m.get("ticker", "")
-        norm = normalize_title(raw)  # returns str — lowercased title with all date/time tokens stripped
+        # _pair_key combines event_title + market title before normalization so that
+        # two MVE markets sharing an option label across unrelated events do not collide.
+        norm = normalize_title(_pair_key(m))
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
@@ -185,11 +210,20 @@ def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str]]
     """
     Return list of (market_a, market_b, canonical_title) tuples where the two
     markets have different event_tickers. No price filtering at this stage.
-    Keys may be strings (normalized-title groups) or (title, subtitle) tuples.
+
+    Group keys may be:
+      - a string (normalized-title group from _group_by_normalized_title), or
+      - a 3-tuple (event_title, title, subtitle) from _group_by_exact_title.
+    For the 3-tuple form, the display canonical is taken from title-or-subtitle;
+    the event_title slot is grouping-only and not user-facing here.
     """
     pairs = []
     for key, members in groups.items():
-        canon = key if isinstance(key, str) else (key[0] or key[1])
+        if isinstance(key, str):
+            canon = key
+        else:
+            # 3-tuple (event_title, title, subtitle) — use title-or-subtitle for display
+            canon = key[1] or key[2]
         seen: set[frozenset] = set()
         for i, mA in enumerate(members):
             for mB in members[i + 1:]:

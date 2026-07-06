@@ -72,8 +72,11 @@ def _kelly_p(pair: CandidatePair) -> float:
     Market prices are the best available signal for P(A=YES, B=NO).
 
     same_title: p = SAME_TITLE_CO_RESOLVE_PROB — fixed prior for markets confirmed to ask
-    the exact same question (matching title + subtitle). Divergence is an anomaly, not
-    an expected outcome, so a fixed base rate is more appropriate than market prices.
+    the exact same question (matching event_title + title + subtitle, see scanner.pair_key).
+    Divergence is an anomaly, not an expected outcome, so a fixed base rate is more
+    appropriate than market prices. This prior is calibrated for binary contracts and
+    applies equally to MVE option markets once cross-event collisions are eliminated by
+    the event_title component of the grouping key.
     """
     if pair.pair_type == "time_series":
         return 1.0 - pair.pA * (1.0 - pair.pB)

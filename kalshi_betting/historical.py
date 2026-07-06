@@ -33,10 +33,14 @@ from kalshi_python_sync.api.historical_api import HistoricalApi
 
 from ._http import api_call_with_retry
 from .auth import build_client
-from .config import PROJECT_ROOT
+from .config import INCLUDE_MVE_MARKETS, PROJECT_ROOT
 
 CACHE_DIR = PROJECT_ROOT / "backtest_cache"
 _CANDLES_DIR = CACHE_DIR / "candlesticks"
+# Maps event_ticker → event_title, populated lazily by _load_or_build_event_titles
+# so the backtester can construct the same (event_title + market_title) grouping
+# key the live scanner uses.
+_EVENT_TITLES_CACHE = CACHE_DIR / "event_titles.json"
 
 # Cached-empty candles may be genuinely empty markets, but they are also what
 # a fetch failure previously produced. Treat empty cache files as stale after
@@ -122,13 +126,19 @@ def _market_to_dict(m) -> dict:
         m: A Kalshi market object returned by the live or historical API client.
 
     Returns:
-        dict: A flat dictionary with keys: ticker, event_ticker, title, subtitle,
-            result, yes_ask_dollars, no_ask_dollars, yes_bid_dollars, close_time,
-            settlement_ts, status.
+        dict: A flat dictionary with keys: ticker, event_ticker, event_title,
+            title, subtitle, result, yes_ask_dollars, no_ask_dollars,
+            yes_bid_dollars, close_time, settlement_ts, status.
+
+            event_title is populated from the `_event_title` attribute, which
+            the caller must attach (see `fetch_all_settled_markets`) so the
+            backtester can group pairs by combined event+market title.
     """
     return {
         "ticker": m.ticker,
         "event_ticker": m.event_ticker or "",
+        # Populated by fetch_all_settled_markets via _load_or_build_event_titles
+        "event_title": getattr(m, "_event_title", "") or "",
         "title": m.title,
         "subtitle": getattr(m, "subtitle", None),
         "result": m.result,
@@ -169,6 +179,101 @@ def _save_json_cache(path: Path, data) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, default=str))
+
+
+def _load_or_build_event_titles(
+    live_client,
+    event_tickers: set[str],
+    use_cache: bool = True,
+) -> dict[str, str]:
+    """
+    Resolve a set of event_ticker values to their human-readable event titles.
+
+    The backtester needs event titles to construct the same combined
+    (event_title + market_title) grouping key the live scanner uses. The Market
+    objects returned by the historical endpoint only carry event_ticker, so we
+    fetch the title mapping separately via the events endpoint.
+
+    Two-tier resolution to keep API calls bounded:
+      1. Bulk pull events (settled, closed, open) and their multivariate counterparts.
+         For most backtests this covers nearly every event_ticker in a few hundred
+         paginated calls.
+      2. For any tickers still unresolved (very old archived events that have aged
+         out of the bulk listings), fall back to per-ticker get_event() calls.
+
+    Results are persisted to _EVENT_TITLES_CACHE so subsequent runs are essentially
+    free. Tickers that cannot be resolved are stored as empty strings (poison pill)
+    so we do not retry them every run.
+
+    Args:
+        live_client: A KalshiClient with the events API methods available
+            (e.g. the client from build_prod_live_client()).
+        event_tickers (set[str]): The set of event_ticker values whose titles
+            we need. May contain hundreds or thousands of entries.
+        use_cache (bool): If True, load existing cache from disk first. If False,
+            re-fetch all titles. The on-disk cache is written either way.
+
+    Returns:
+        dict[str, str]: Mapping event_ticker → event_title. Tickers that could
+            not be resolved map to "". Caller treats those markets as ungrouped
+            (effectively MVE-excluded).
+    """
+    cached: dict[str, str] = (_load_json_cache(_EVENT_TITLES_CACHE) or {}) if use_cache else {}
+    missing = event_tickers - cached.keys()
+    if not missing:
+        return cached
+
+    # Bulk pull non-MVE events across all statuses. Each get_events call returns
+    # up to 200 events; pagination continues until cursor is empty or all misses
+    # are resolved (whichever comes first).
+    for status in ("settled", "closed", "open"):
+        if not missing:
+            break
+        cursor = None
+        while True:
+            resp = api_call_with_retry(
+                live_client.get_events,
+                status=status,
+                limit=200,
+                cursor=cursor,
+            )
+            for ev in resp.events or []:
+                if ev.event_ticker in missing:
+                    cached[ev.event_ticker] = ev.title or ""
+                    missing.discard(ev.event_ticker)
+            cursor = resp.cursor
+            if not cursor or not missing:
+                break
+
+    # Bulk pull multivariate events — these are excluded from get_events by API design.
+    if missing:
+        cursor = None
+        while True:
+            resp = api_call_with_retry(
+                live_client.get_multivariate_events,
+                limit=200,
+                cursor=cursor,
+            )
+            for ev in resp.events or []:
+                if ev.event_ticker in missing:
+                    cached[ev.event_ticker] = ev.title or ""
+                    missing.discard(ev.event_ticker)
+            cursor = resp.cursor
+            if not cursor or not missing:
+                break
+
+    # Per-ticker fallback for archived events that aren't in the bulk listings.
+    # Failures are recorded as "" so we don't retry on every backtest run.
+    for tkr in list(missing):
+        try:
+            resp = api_call_with_retry(live_client.get_event, event_ticker=tkr)
+            cached[tkr] = (resp.event.title or "") if resp.event else ""
+        except Exception as e:
+            logging.warning("Could not resolve event title for %s: %s", tkr, e)
+            cached[tkr] = ""
+
+    _save_json_cache(_EVENT_TITLES_CACHE, cached)
+    return cached
 
 
 # ─── Market fetching ──────────────────────────────────────────────────────────
@@ -221,13 +326,22 @@ def fetch_all_settled_markets(
     cutoff      = api_call_with_retry(hist_client.get_historical_cutoff)
     cutoff_ts   = int(cutoff.market_settled_ts.timestamp())
 
-    all_markets: list[dict] = []
+    # Collect Market objects first (deferred dict conversion) so we can attach
+    # event titles after fetching the event_ticker → event_title mapping in one batch.
+    selected_markets: list = []
+
+    # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
+    # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
+    # when False, the legacy "exclude" behaviour is preserved.
+    hist_base_kwargs: dict = dict(limit=1000)
+    if not INCLUDE_MVE_MARKETS:
+        hist_base_kwargs["mve_filter"] = "exclude"
 
     # ── Historical endpoint ───────────────────────────────────────────────────
     logging.info("Fetching historical settled markets (settled before API cutoff)...")
     cursor = None
     while True:
-        kwargs: dict = dict(limit=1000, mve_filter="exclude")
+        kwargs: dict = dict(hist_base_kwargs)
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
@@ -240,21 +354,22 @@ def fetch_all_settled_markets(
             # Only include markets that settled within our [start_ts, cutoff_ts) window
             if settle_epoch < start_ts or settle_epoch >= cutoff_ts:
                 continue
-            all_markets.append(_market_to_dict(m))
+            selected_markets.append(m)
         cursor = resp.cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
-    logging.info("Historical endpoint: %d markets from %s", len(all_markets), start_date)
+    logging.info("Historical endpoint: %d markets from %s", len(selected_markets), start_date)
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
     logging.info("Fetching recently settled markets (after API cutoff)...")
-    recent: list[dict] = []
+    recent_count = 0
     cursor = None
     while True:
         # min_settled_ts=cutoff_ts ensures we only get markets not covered by the historical endpoint
-        kwargs = dict(status="settled", limit=1000, mve_filter="exclude",
-                      min_settled_ts=cutoff_ts)
+        kwargs = dict(status="settled", limit=1000, min_settled_ts=cutoff_ts)
+        if not INCLUDE_MVE_MARKETS:
+            kwargs["mve_filter"] = "exclude"
         if cursor:
             kwargs["cursor"] = cursor
         resp = api_call_with_retry(live_client.get_markets, **kwargs)
@@ -264,13 +379,27 @@ def fetch_all_settled_markets(
             # Apply start_date filter here too since the API doesn't filter by settlement date
             if int(m.settlement_ts.timestamp()) < start_ts:
                 continue
-            recent.append(_market_to_dict(m))
+            selected_markets.append(m)
+            recent_count += 1
         cursor = resp.cursor
         if not cursor:
             break
-    logging.info("Live endpoint: %d recently settled markets", len(recent))
+    logging.info("Live endpoint: %d recently settled markets", recent_count)
 
-    all_markets.extend(recent)
+    # ── Attach event titles ───────────────────────────────────────────────────
+    # Collect unique event_tickers and look up their titles in one batch so the
+    # backtester can build (event_title + market_title) grouping keys. Skipped
+    # entirely when MVE is excluded, since the live scanner's combined-key logic
+    # wouldn't change anything for binary-only markets.
+    if INCLUDE_MVE_MARKETS:
+        unique_tickers = {m.event_ticker for m in selected_markets if m.event_ticker}
+        logging.info("Resolving event titles for %d unique event_tickers", len(unique_tickers))
+        titles = _load_or_build_event_titles(live_client, unique_tickers, use_cache=use_cache)
+        for m in selected_markets:
+            # Attach as _event_title so _market_to_dict picks it up
+            m._event_title = titles.get(m.event_ticker or "", "")
+
+    all_markets: list[dict] = [_market_to_dict(m) for m in selected_markets]
     logging.info("Total settled markets from %s: %d", start_date, len(all_markets))
 
     if use_cache:
