@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 from kalshi_betting.scanner import (
     display_title,
-    find_candidate_pairs,
     find_same_title_pairs,
+    find_time_series_pairs,
     normalize_title,
     pair_key,
 )
@@ -236,5 +236,5 @@ class TestTimeSeriesGrouping:
             close_time=datetime(2026, 3, 20, tzinfo=UTC),
         )
         # client is unused when `markets` is provided
-        pairs = find_candidate_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
         assert pairs == [], f"Expected no pairs across unrelated MVE events; got {pairs}"

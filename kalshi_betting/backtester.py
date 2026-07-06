@@ -357,21 +357,25 @@ def _find_entry(
             continue
 
         try:
-            pA = float(ca["yes_ask_close"])
-            pB = float(cb["yes_ask_close"])
-            nA = float(ca["no_ask_close"])
+            p_a_raw = float(ca["yes_ask_close"])
+            p_b_raw = float(cb["yes_ask_close"])
+            n_a_raw = float(ca["no_ask_close"])
+            n_b_raw = float(cb["no_ask_close"])
         except (ValueError, TypeError):
             continue
 
         # Skip settled or illiquid candles (prices at the extreme ends of the range)
-        if not (0.01 <= pA <= 0.99 and 0.01 <= pB <= 0.99):
+        if not (0.01 <= p_a_raw <= 0.99 and 0.01 <= p_b_raw <= 0.99):
             continue
 
-        # Canonicalize so market A is always the more expensive side (higher YES ask).
-        # If pA < pB, swap all references locally (does not affect outer loop variables).
-        if pA < pB:
-            pA, pB, nA = pB, pA, float(cb["no_ask_close"])
-            mA, mB = mB, mA
+        # Canonicalize per iteration so the swap never leaks to the next Monday.
+        # Market A is the more expensive side; nA is A's NO ask.
+        if p_a_raw >= p_b_raw:
+            mA_i, mB_i = mA, mB
+            pA, pB, nA = p_a_raw, p_b_raw, n_a_raw
+        else:
+            mA_i, mB_i = mB, mA
+            pA, pB, nA = p_b_raw, p_a_raw, n_b_raw
 
         # Enforce the minimum price gap for this pair type
         if pA - pB < threshold:
@@ -391,7 +395,7 @@ def _find_entry(
         return {
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA,
-            "mA": mA, "mB": mB,
+            "mA": mA_i, "mB": mB_i,
         }
 
     return None
@@ -418,7 +422,7 @@ def run_backtest(
       6. Build an equity curve from the trade timeline.
 
     Returns (trades, equity_df) where equity_df has columns:
-      [date, portfolio_value, cash, invested]
+      [date, portfolio_value, daily_return]
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -642,12 +646,15 @@ def _build_equity_curve(
 
     Returns:
         pd.DataFrame: DataFrame with one row per calendar day from start_date to
-            today, with columns:
+            today (UTC), with columns:
             - "date" (date): Calendar date.
             - "portfolio_value" (float): Cumulative portfolio value in dollars.
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
     """
-    today = date.today()
+    # entry_date and exit_date come from UTC-derived timestamps, so use UTC today
+    # here as well — otherwise `date.today()` in a non-UTC timezone can drop or add
+    # a day around the boundary and misalign the equity curve.
+    today = datetime.now(UTC).date()
     dates = [start_date + timedelta(days=i) for i in range((today - start_date).days + 1)]
 
     # Accumulate cash inflows and outflows per date

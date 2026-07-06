@@ -82,7 +82,7 @@ class TradeResult:
         error (Optional[str]): Error message if status is "failed" or "rolled_back", otherwise None.
     """
     spec: TradeSpec
-    status: str            # "executed" | "failed" | "simulated"
+    status: str            # "executed" | "failed" | "simulated" | "rolled_back"
     error: str | None = None
 
 
