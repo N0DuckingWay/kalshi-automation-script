@@ -144,7 +144,8 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
         result.append(pair)
     for pair in secondary:
         key = frozenset([pair.market_a.ticker, pair.market_b.ticker])
-        # Only add if this exact ticker pair was not already found by the time-series scanner
+        # Only add if this exact ticker pair was not already found by the
+        # same-title scanner (the primary list, which is kept on conflict)
         if key not in seen:
             seen.add(key)
             result.append(pair)
@@ -355,22 +356,59 @@ def _run_prod(client, args) -> None:
     # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
-    # Read the post-trade balance to record in the Excel log separator row;
-    # verify_auth returns cents, so divide by 100 to convert to dollars
-    balance_after = verify_auth(client) / 100
-    # Append this run's results to the cumulative trade_log.xlsx file
-    out = append_to_prod_log(results, balance_cents / 100, balance_after)
-    logging.info("Trade log updated: %s", out)
+    # Read the post-trade balance for the Excel log separator row. Real orders
+    # may already have filled at this point, so a failure here must not lose the
+    # trade records — fall back to the pre-trade balance and keep going.
+    try:
+        balance_after = verify_auth(client) / 100
+    except Exception as exc:
+        logging.error(
+            "Post-trade balance fetch failed: %s — logging with pre-trade balance", exc,
+        )
+        balance_after = balance_cents / 100
+
+    # Append this run's results to the cumulative trade_log.xlsx file. If the
+    # write fails (e.g. the file is open in Excel), dump every result to the log
+    # so the record of real fills is never lost, then re-raise.
+    try:
+        out = append_to_prod_log(results, balance_cents / 100, balance_after)
+        logging.info("Trade log updated: %s", out)
+    except Exception as exc:
+        logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
+        for r in results:
+            logging.critical(
+                "  RESCUE | %s | %s | A=%s B=%s | x=%d cost=$%.2f | %s",
+                r.status,
+                r.spec.pair.canonical_title,
+                r.spec.pair.market_a.ticker,
+                r.spec.pair.market_b.ticker,
+                r.spec.x,
+                r.spec.total_cost,
+                r.error or "",
+            )
+        raise
 
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
     else:
         n_ok       = sum(1 for r in results if r.status == "executed")
         n_rolled   = sum(1 for r in results if r.status == "rolled_back")
+        n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
+        # "manual_review" means leg B's fill state was undetermined and no
+        # automated rollback was attempted — just as urgent as an orphaned
+        # rollback failure, so it's counted in the same manual-review alert.
+        n_unknown  = sum(1 for r in results if r.status == "manual_review")
         logging.info(
-            "Submitted %d of %d order pair(s) successfully. %d rolled back.",
-            n_ok, len(results), n_rolled,
+            "Submitted %d of %d order pair(s) successfully. %d rolled back, "
+            "%d rollback failure(s), %d unknown fill state(s).",
+            n_ok, len(results), n_rolled, n_orphaned, n_unknown,
         )
+        if n_orphaned or n_unknown:
+            logging.critical(
+                "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
+                "UNDETERMINED fill state — manual review required (see trade log).",
+                n_orphaned, n_unknown,
+            )
 
 
 def main() -> None:

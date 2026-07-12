@@ -19,9 +19,14 @@ Dependencies:
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
-    without ticker conflict checking, sorts by priority, then Pass 2 applies a
-    greedy ticker-conflict filter so each market ticker appears in at most one trade.
-    This mirrors the live bot's behavior of not entering a market already held.
+    (prices, dates, Kelly fraction — no sizing) and keeps only the best entry per
+    title group, mirroring the live scanners' one-pair-per-group rule. Pass 2 walks
+    entries in chronological order (priority-ordered within a date using the
+    ENTRY-TIME expected return, never realized results), maintains a running cash
+    balance — sizing each trade against the cash available at entry and releasing
+    settlement receipts on exit dates — and applies a greedy ticker-conflict filter
+    so each market ticker appears in at most one trade. This mirrors the live bot's
+    Kelly sizing against the current balance and its no-re-entry rule.
 """
 import logging
 from collections import defaultdict
@@ -72,19 +77,30 @@ class BacktestTrade:
         entry_pB (float): YES ask price of market B at entry. Range: [0.01, 0.99].
         entry_nA (float): NO ask price of market A at entry (≈ 1 − yes_bid_A). Range: [0.01, 0.99].
         n (int): Number of contracts bought on each leg (x = y = n). Always >= 1.
-        total_cost (float): Total dollar cost of the position: n * (entry_nA + entry_pB).
+        total_cost (float): Dollar cost of the contracts: n * (entry_nA + entry_pB).
+            Excludes taker fees (see fees).
+        fees (float): Exact ceiling-rounded taker fee for both legs, charged at entry.
         outcome_a (str): Settlement result of market A — "yes" or "no".
         outcome_b (str): Settlement result of market B — "yes" or "no".
-        actual_payoff (float): Dollar value received at settlement based on outcomes.
-        profit (float): actual_payoff − total_cost. May be negative for same_title loss scenarios.
-        profit_ratio (float): profit / total_cost. Return on invested capital.
-        monthly_profit_ratio (float): profit_ratio scaled to 30 days:
-            profit_ratio * 30 / holding_days.
+        actual_payoff (float): Gross dollar value received at settlement: $1 per
+            contract for each leg that pays out (0, n, or 2n). Fees and entry cost
+            are NOT deducted here — they are accounted in profit.
+        profit (float): actual_payoff − total_cost − fees. Negative in the
+            A=YES, B=NO loss scenario.
+        profit_ratio (float): profit / (total_cost + fees). Return on the cash
+            actually invested.
+        monthly_profit_ratio (float): Realized profit_ratio scaled to 30 days:
+            profit_ratio * 30 / holding_days. Reporting only — trade selection
+            uses the entry-time expected ratio to avoid look-ahead bias.
         kelly_fraction (float): Capped Kelly fraction used for sizing, <= BUDGET_FRACTION.
-        expected_payoff (float): Guaranteed floor payoff: n * (1 − entry_nA − entry_pB).
-        slippage (float): actual_payoff − expected_payoff. Positive means better than the
-            guaranteed floor (e.g. both markets resolved favorably).
+        expected_payoff (float): Guaranteed NET profit floor:
+            n * (1 − entry_nA − entry_pB) − fees. Always > 0 for recorded trades.
+        slippage (float): profit − expected_payoff. Positive means better than the
+            guaranteed floor (e.g. both markets resolved favorably); negative only
+            in the loss scenario.
         holding_days (int): Calendar days between entry_date and exit_date. Always >= 1.
+        balance_at_entry (float): Simulated cash balance in dollars immediately
+            before this trade's entry deduction — the base the Kelly budget used.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -99,62 +115,52 @@ class BacktestTrade:
     entry_nA: float      # NO ask of A at entry (≈ 1 - yes_bid_A)
     n: int               # contracts bought on each leg (x = y = n)
     total_cost: float
+    fees: float          # exact both-leg taker fees, charged at entry
     outcome_a: str       # "yes" | "no"
     outcome_b: str       # "yes" | "no"
     actual_payoff: float
     profit: float
     profit_ratio: float
-    monthly_profit_ratio: float  # profit_ratio * 30 / holding_days
+    monthly_profit_ratio: float  # realized profit_ratio * 30 / holding_days (reporting only)
     kelly_fraction: float        # capped Kelly fraction used for sizing
-    expected_payoff: float  # n * (1 - nA - pB) minus fees — the guaranteed floor
-    slippage: float         # actual_payoff - expected_payoff
+    expected_payoff: float  # n * (1 - nA - pB) minus fees — the guaranteed NET floor
+    slippage: float         # profit - expected_payoff
     holding_days: int
+    balance_at_entry: float  # simulated cash available when the trade was sized
 
 
-def _compute_actual_payoff(n: int, pA: float, pB: float, nA: float,
-                           outcome_a: str, outcome_b: str) -> float:
+def _settlement_receipt(n: int, outcome_a: str, outcome_b: str) -> float:
     """
-    Compute the actual dollar payoff for a completed arbitrage trade based on settlement outcomes.
+    Compute the gross dollar amount received at settlement for one pair trade.
 
     The strategy is n NO contracts on market A + n YES contracts on market B.
-    Kalshi taker fees are charged at execution time regardless of outcome, so
-    the fee amount is subtracted from every scenario's payoff.
+    Each contract pays exactly $1 when its side wins and $0 otherwise, so the
+    receipt is independent of entry prices:
 
-    Payoff table (n contracts, net of fees):
-      A=YES, B=YES: n*(1-pB) - n*nA - fee  [B pays out, A costs nA at entry]
-      A=NO,  B=YES: n*(1-nA) + n*(1-pB) - fee  [both legs pay out — best scenario]
-      A=NO,  B=NO:  n*(1-nA) - n*pB - fee  [NO on A pays, YES on B expires worthless]
-      A=YES, B=NO:  -(n*nA + n*pB) - fee  [loss scenario — both legs expire worthless]
+      A=YES, B=YES: n   [YES on B pays; NO on A worthless]
+      A=NO,  B=YES: 2n  [both legs pay — best scenario]
+      A=NO,  B=NO:  n   [NO on A pays; YES on B worthless]
+      A=YES, B=NO:  0   [loss scenario — both legs worthless]
 
-    The A=YES, B=NO scenario is the only loss scenario. For time-series pairs this
-    is unlikely but possible; for same-title pairs it should be very rare (same question).
+    Entry cost and taker fees are deliberately NOT deducted here — callers
+    subtract them exactly once when computing profit and the equity curve.
 
     Args:
         n (int): Number of contracts bought on each leg.
-        pA (float): YES ask price of market A at entry (cost to buy YES on A).
-        pB (float): YES ask price of market B at entry (cost to buy YES on B).
-        nA (float): NO ask price of market A at entry (cost to buy NO on A).
         outcome_a (str): Settlement result of market A — "yes" or "no".
         outcome_b (str): Settlement result of market B — "yes" or "no".
 
     Returns:
-        float: Net dollar payoff received at settlement (after Kalshi taker fees).
-            May be negative in the A=YES, B=NO loss scenario.
+        float: Gross settlement receipt in dollars: 0.0, n, or 2n.
     """
-    # Total taker fee: ceiling-rounded per leg, charged regardless of outcome
-    fee = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
-    if outcome_a == "yes" and outcome_b == "yes":
-        # B resolves YES (pays 1-pB per contract) but A resolves YES (NO position worthless)
-        return n * (1.0 - pB) - n * nA - fee
-    if outcome_a == "no" and outcome_b == "yes":
-        # Both legs pay out — the maximum profit scenario
-        return n * (1.0 - nA) + n * (1.0 - pB) - fee
-    if outcome_a == "no" and outcome_b == "no":
-        # NO on A pays out; YES on B expires worthless (we lose the pB cost)
-        return n * (1.0 - nA) - n * pB - fee
-    # outcome_a == "yes", outcome_b == "no" — the loss scenario:
-    # NO on A expires worthless; YES on B expires worthless; we lose the full entry cost
-    return -(n * nA + n * pB) - fee
+    receipt = 0.0
+    if outcome_a == "no":
+        # The NO leg on market A pays $1 per contract
+        receipt += n
+    if outcome_b == "yes":
+        # The YES leg on market B pays $1 per contract
+        receipt += n
+    return receipt
 
 
 # ─── Pair grouping (metadata only, no prices) ─────────────────────────────────
@@ -206,16 +212,20 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
-def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str]]:
+def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str, object]]:
     """
-    Return list of (market_a, market_b, canonical_title) tuples where the two
-    markets have different event_tickers. No price filtering at this stage.
+    Return list of (market_a, market_b, canonical_title, group_key) tuples where
+    the two markets have different event_tickers. No price filtering at this stage.
 
     Group keys may be:
       - a string (normalized-title group from _group_by_normalized_title), or
       - a 3-tuple (event_title, title, subtitle) from _group_by_exact_title.
-    For the 3-tuple form, the display canonical is taken from title-or-subtitle;
-    the event_title slot is grouping-only and not user-facing here.
+    For the 3-tuple form, the display canonical is taken from title-or-subtitle,
+    but the FULL 3-tuple (including event_title) is also returned as group_key —
+    the one-pair-per-group dedup in run_backtest must key on the full group, not
+    just the display title, or two unrelated events sharing an option label
+    (e.g. "Trump" in two different events) would collide into a single group
+    and silently drop one of the two legitimate pairs.
     """
     pairs = []
     for key, members in groups.items():
@@ -233,7 +243,7 @@ def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str]]
                 if pair_key in seen:
                     continue
                 seen.add(pair_key)
-                pairs.append((mA, mB, canon))
+                pairs.append((mA, mB, canon, key))
     return pairs
 
 
@@ -306,9 +316,17 @@ def _find_entry(
 
     Scans weekly Monday snapshots from the backtest start date up to one calendar
     year before the earlier of the two market close dates. At each Monday, reads
-    the candlestick prices, canonicalizes which market is the expensive side (market A),
-    applies the price gap and fee filters from the live trading logic, and returns
-    the entry data for the first qualifying week.
+    the candlestick prices, applies the price gap, price-sum, and fee filters from
+    the live trading logic, and returns the entry data for the first qualifying week.
+
+    Direction rules mirror the live scanner exactly:
+      - time_series: market A is fixed as the EARLIER-closing contract, and an
+        entry requires pA − pB >= threshold (the earlier contract priced higher —
+        the anomaly). A pricier later contract is normal term structure and is
+        never traded.
+      - same_title: market A is canonicalized per Monday as the more expensive
+        side (the two contracts ask the identical question, so direction is
+        price-only).
 
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
@@ -343,8 +361,22 @@ def _find_entry(
     # Look back at most 1 year from scan_end to keep the scan window manageable
     scan_start = max(start_date, scan_end - timedelta(days=365))
 
-    if scan_start >= scan_end:
+    # A single-day window (scan_start == scan_end) is still a valid scan window
+    if scan_start > scan_end:
         return None
+
+    if pair_type == "time_series":
+        # Live-scanner invariant: market A is the EARLIER-closing contract.
+        # Never swap by price — the trade only exists when the earlier contract
+        # is priced higher (checked per Monday below).
+        if close_b < close_a:
+            mA, mB = mB, mA
+            candles_a, candles_b = candles_b, candles_a
+            close_a, close_b = close_b, close_a
+        # Deadline gap is loop-invariant: pairs more than 30 days apart are too
+        # weakly correlated for the time-series assumption to hold reliably
+        if (close_b - close_a).days > MAX_DEADLINE_GAP_DAYS:
+            return None
 
     # Use the appropriate minimum price gap for this pair type
     threshold = MIN_PRICE_DIFF if pair_type == "time_series" else SAME_TITLE_MIN_PRICE_DIFF
@@ -368,28 +400,39 @@ def _find_entry(
         if not (0.01 <= p_a_raw <= 0.99 and 0.01 <= p_b_raw <= 0.99):
             continue
 
-        # Canonicalize per iteration so the swap never leaks to the next Monday.
-        # Market A is the more expensive side; nA is A's NO ask.
-        if p_a_raw >= p_b_raw:
+        if pair_type == "time_series":
+            # A stays the earlier-closing market — no price canonicalization
             mA_i, mB_i = mA, mB
             pA, pB, nA = p_a_raw, p_b_raw, n_a_raw
         else:
-            mA_i, mB_i = mB, mA
-            pA, pB, nA = p_b_raw, p_a_raw, n_b_raw
+            # same_title: canonicalize per iteration so the swap never leaks to
+            # the next Monday. Market A is the more expensive side this week.
+            if p_a_raw >= p_b_raw:
+                mA_i, mB_i = mA, mB
+                pA, pB, nA = p_a_raw, p_b_raw, n_a_raw
+            else:
+                mA_i, mB_i = mB, mA
+                pA, pB, nA = p_b_raw, p_a_raw, n_b_raw
 
-        # Enforce the minimum price gap for this pair type
+        # Enforce the minimum price gap for this pair type. For time_series this
+        # is directional: the earlier contract must be the expensive one.
         if pA - pB < threshold:
+            continue
+
+        # The NO leg's price must also be a live (0.01–0.99) quote — mirrors the
+        # live pipeline's (0, 1) price validation in compute_trade
+        if not (0.01 <= nA <= 0.99):
+            continue
+
+        # Live orderbook-depth parity: enrich_with_orderbook_prices only keeps
+        # contracts whose combined price leaves the required gap
+        # (nA + pB <= 1 - threshold) — apply the same cut to candle entries
+        if nA + pB > 1.0 - threshold:
             continue
 
         # Check that the gross spread exceeds the continuous fee estimate
         if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):
             continue
-
-        # For time_series pairs: enforce the maximum 30-day deadline gap constraint
-        if pair_type == "time_series":
-            gap = (close_b - close_a).days if close_b > close_a else (close_a - close_b).days
-            if gap > MAX_DEADLINE_GAP_DAYS:
-                continue
 
         entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
         return {
@@ -417,8 +460,11 @@ def run_backtest(
       1. Fetch all settled markets since start_date.
       2. Group into potential time-series and same-title pairs (metadata only).
       3. For each potential pair, fetch daily candlesticks for both legs.
-      4. Find the first Monday where the pair was tradeable at the threshold.
-      5. Compute trade size and record actual P&L from settlement outcomes.
+      4. Find the first Monday where the pair was tradeable at the threshold;
+         keep only the best entry per title group (live one-pair-per-group rule).
+      5. Walk entries chronologically with a running cash balance: Kelly-size
+         each trade against the cash available at entry, and record actual P&L
+         from settlement outcomes.
       6. Build an equity curve from the trade timeline.
 
     Returns (trades, equity_df) where equity_df has columns:
@@ -441,7 +487,7 @@ def run_backtest(
     # Collect only the tickers that actually appear in a potential pair to avoid
     # fetching candlesticks for thousands of unrelated markets
     needed_tickers: dict[str, dict] = {}
-    for mA, mB, _ in ts_pairs + same_pairs:
+    for mA, mB, _, _ in ts_pairs + same_pairs:
         needed_tickers[mA["ticker"]] = mA
         needed_tickers[mB["ticker"]] = mB
 
@@ -470,13 +516,13 @@ def run_backtest(
 
     logging.info("Candlestick fetch complete.")
 
-    # ── Pass 1: collect all tradeable entries without conflict filtering ──────
+    # ── Pass 1: collect all tradeable entries (no sizing, no conflict filter) ──
 
     # Combine both pair types for the scan loop
     all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
     candidates = []
 
-    for (mA_orig, mB_orig, canon), pair_type in all_pairs:
+    for (mA_orig, mB_orig, canon, group_key), pair_type in all_pairs:
         candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
         candles_b = candles_by_ticker.get(mB_orig["ticker"], [])
 
@@ -491,7 +537,7 @@ def run_backtest(
         pA, pB, nA = entry["pA"], entry["pB"], entry["nA"]
         entry_date = entry["entry_date"]
 
-        # ── Kelly sizing ──────────────────────────────────────────────────────
+        # ── Kelly fraction (sizing happens in Pass 2 against running cash) ────
         # Compute the net spread after the continuous fee approximation
         net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
         profit_ratio_entry = net_spread / (nA + pB) if net_spread > 0 else 0.0
@@ -508,25 +554,11 @@ def run_backtest(
         # Cap at BUDGET_FRACTION (20%) to avoid over-concentration
         kelly_f_capped = min(BUDGET_FRACTION, kelly_f)
 
-        # Convert the Kelly fraction to an integer contract count
-        budget = initial_balance * kelly_f_capped
-        n = max(1, int(budget / (nA + pB)))
-        total_cost      = n * (nA + pB)
-        # Expected guaranteed payoff: gross spread per contract minus exact per-leg fees
-        expected_payoff = n * (1.0 - nA - pB) - fee_leg_exact(n, nA) - fee_leg_exact(n, pB)
-
         # Skip pairs where the settlement result is missing or non-binary
         outcome_a = mA.get("result", "")
         outcome_b = mB.get("result", "")
         if outcome_a not in ("yes", "no") or outcome_b not in ("yes", "no"):
             continue
-
-        # Compute actual P&L based on what the markets resolved to
-        actual_payoff = _compute_actual_payoff(n, pA, pB, nA, outcome_a, outcome_b)
-        profit        = actual_payoff - total_cost
-        profit_ratio  = profit / total_cost if total_cost > 0 else 0.0
-        # Slippage = how much better (or worse) the actual payoff was vs. the guaranteed floor
-        slippage      = actual_payoff - expected_payoff
 
         # Determine the exit date as the later of the two settlement timestamps
         st_a = mA.get("settlement_ts")
@@ -536,8 +568,15 @@ def run_backtest(
         exit_date   = max(exit_date_a, exit_date_b)
 
         holding_days = max(1, (exit_date - entry_date).days)
-        # Normalize profit ratio to a 30-day equivalent for fair comparison across durations
-        monthly_profit_ratio = profit_ratio * 30.0 / holding_days
+
+        # Entry-time priority metric: the expected return normalized to 30 days
+        # using only information available at entry (entry prices and the market
+        # close dates). Sorting Pass 2 by REALIZED returns would leak settlement
+        # outcomes into trade selection (look-ahead bias).
+        close_a_d = datetime.fromisoformat(mA["close_time"]).date()
+        close_b_d = datetime.fromisoformat(mB["close_time"]).date()
+        expected_days = max(1, (max(close_a_d, close_b_d) - entry_date).days)
+        entry_monthly_ratio = profit_ratio_entry * 30.0 / expected_days
 
         # Use title > subtitle > ticker as the display label for each market
         title_a = mA.get("title") or mA.get("subtitle") or mA.get("ticker", "")
@@ -545,43 +584,94 @@ def run_backtest(
 
         candidates.append(dict(
             pair_type=pair_type,
+            canon=canon,
+            group_key=group_key,
             mA=mA, mB=mB,
             pA=pA, pB=pB, nA=nA,
             entry_date=entry_date,
             exit_date=exit_date,
-            n=n,
-            total_cost=total_cost,
-            expected_payoff=expected_payoff,
             outcome_a=outcome_a,
             outcome_b=outcome_b,
-            actual_payoff=actual_payoff,
-            profit=profit,
-            profit_ratio=profit_ratio,
-            monthly_profit_ratio=monthly_profit_ratio,
-            kelly_fraction=kelly_f_capped,
-            slippage=slippage,
+            kelly_f_capped=kelly_f_capped,
+            entry_monthly_ratio=entry_monthly_ratio,
             holding_days=holding_days,
             title_a=title_a,
             title_b=title_b,
         ))
 
-    # Sort by monthly_profit_ratio descending; prefer same_title at equal monthly return
+    # Keep only the single best candidate per title group — mirrors the live
+    # scanners, which keep one pair per normalized-title / exact-title group so
+    # the portfolio isn't flooded with near-identical correlated positions.
+    # Dedup on the FULL group_key (which includes event_title for same_title
+    # groups), not the display-only canon — two unrelated events sharing an
+    # option label (e.g. "Trump" in two different events) have the same canon
+    # but distinct group_keys, and must remain two separate candidates.
+    best_by_group: dict = {}
+    for c in candidates:
+        key = (c["pair_type"], c["group_key"])
+        cur = best_by_group.get(key)
+        if cur is None or c["entry_monthly_ratio"] > cur["entry_monthly_ratio"]:
+            best_by_group[key] = c
+    candidates = list(best_by_group.values())
+
+    # Chronological order for the cash simulation; within one entry date, take
+    # the best ENTRY-TIME expected return first (same_title preferred at ties,
+    # matching strategy.select_portfolio)
     candidates.sort(
-        key=lambda c: (c["monthly_profit_ratio"], c["pair_type"] == "same_title"),
-        reverse=True,
+        key=lambda c: (c["entry_date"], -c["entry_monthly_ratio"], c["pair_type"] != "same_title"),
     )
 
-    # ── Pass 2: greedy ticker-conflict filter ─────────────────────────────────
-    # In priority order, add each candidate only if neither of its tickers is already
-    # used by a higher-priority trade — mirrors the live bot's no-re-entry rule
+    # ── Pass 2: chronological cash-constrained greedy selection ───────────────
+    # Walk entries in date order, maintaining a running cash balance: each trade
+    # is Kelly-sized against the cash available at its entry (like the live bot
+    # sizing against the current account balance), and settlement receipts return
+    # to cash on their exit dates. A ticker-conflict filter mirrors the live
+    # bot's no-re-entry rule.
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
+    cash = initial_balance
+    pending_exits: list[tuple[date, float]] = []  # (exit_date, settlement receipt)
 
     for c in candidates:
+        d = c["entry_date"]
+        # Release settlement receipts from trades that exited on or before this entry
+        cash += sum(amt for ed, amt in pending_exits if ed <= d)
+        pending_exits = [(ed, amt) for ed, amt in pending_exits if ed > d]
+
         mA, mB = c["mA"], c["mB"]
-        # Skip if either ticker is already committed to a higher-priority trade
+        # Skip if either ticker is already committed to an earlier trade
         if mA["ticker"] in active_tickers or mB["ticker"] in active_tickers:
             continue
+
+        nA, pB = c["nA"], c["pB"]
+
+        # Kelly sizing against the cash available NOW, not the initial balance
+        budget = cash * c["kelly_f_capped"]
+        n = int(budget / (nA + pB))
+        if n < 1:
+            # Kelly budget can't afford one contract — live compute_trade skips too
+            continue
+
+        total_cost = n * (nA + pB)
+        # Exact ceiling-rounded taker fees for both legs, charged at entry
+        fees = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
+        # Guaranteed NET profit floor after exact fees — reject if the ceiling
+        # rounding ate the margin (mirrors live compute_trade's min_payoff gate)
+        expected_payoff = n * (1.0 - nA - pB) - fees
+        if expected_payoff <= 0:
+            continue
+        if total_cost + fees > cash:
+            continue
+
+        # Realized P&L from the settlement outcomes
+        receipt      = _settlement_receipt(n, c["outcome_a"], c["outcome_b"])
+        profit       = receipt - total_cost - fees
+        invested     = total_cost + fees
+        profit_ratio = profit / invested if invested > 0 else 0.0
+        # Normalize realized return to a 30-day equivalent (reporting only)
+        monthly_profit_ratio = profit_ratio * 30.0 / c["holding_days"]
+        # Slippage = realized profit vs. the guaranteed floor (net vs. net)
+        slippage = profit - expected_payoff
 
         trades.append(BacktestTrade(
             pair_type=c["pair_type"],
@@ -596,21 +686,27 @@ def run_backtest(
             entry_pA=c["pA"],
             entry_pB=c["pB"],
             entry_nA=c["nA"],
-            n=c["n"],
-            total_cost=c["total_cost"],
+            n=n,
+            total_cost=total_cost,
+            fees=fees,
             outcome_a=c["outcome_a"],
             outcome_b=c["outcome_b"],
-            actual_payoff=c["actual_payoff"],
-            profit=c["profit"],
-            profit_ratio=c["profit_ratio"],
-            monthly_profit_ratio=c["monthly_profit_ratio"],
-            kelly_fraction=c["kelly_fraction"],
-            expected_payoff=c["expected_payoff"],
-            slippage=c["slippage"],
+            actual_payoff=receipt,
+            profit=profit,
+            profit_ratio=profit_ratio,
+            monthly_profit_ratio=monthly_profit_ratio,
+            kelly_fraction=c["kelly_f_capped"],
+            expected_payoff=expected_payoff,
+            slippage=slippage,
             holding_days=c["holding_days"],
+            balance_at_entry=cash,
         ))
 
-        # Mark both tickers as active so no overlapping pair is added below them
+        # Cash out the door: contracts plus fees; the receipt comes back at exit
+        cash -= invested
+        pending_exits.append((c["exit_date"], receipt))
+
+        # Mark both tickers as active so no overlapping pair is added later
         active_tickers.add(mA["ticker"])
         active_tickers.add(mB["ticker"])
 
@@ -634,9 +730,11 @@ def _build_equity_curve(
     """
     Construct a daily equity curve DataFrame from the list of backtest trades.
 
-    For each trade, subtracts the total_cost from cash on the entry_date and
-    adds the actual_payoff on the exit_date. This models a simple accounting
-    treatment where capital is deployed on entry and returned at settlement.
+    For each trade, subtracts the full cash outlay (total_cost + fees, both paid
+    at execution) from cash on the entry_date and adds the gross settlement
+    receipt (actual_payoff) on the exit_date. This models a simple accounting
+    treatment where capital is deployed on entry and returned at settlement,
+    with each dollar counted exactly once.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
@@ -660,9 +758,9 @@ def _build_equity_curve(
     # Accumulate cash inflows and outflows per date
     cash_changes: dict[date, float] = defaultdict(float)
     for t in trades:
-        # Capital leaves the portfolio on entry day (we pay the cost)
-        cash_changes[t.entry_date] -= t.total_cost
-        # Capital returns to the portfolio on exit day (settlement payoff received)
+        # Capital leaves the portfolio on entry day (contract cost + taker fees)
+        cash_changes[t.entry_date] -= t.total_cost + t.fees
+        # Gross settlement receipt returns to the portfolio on exit day
         cash_changes[t.exit_date]  += t.actual_payoff
 
     rows = []

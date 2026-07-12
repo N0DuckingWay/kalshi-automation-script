@@ -12,9 +12,10 @@ Purpose:
     Kalshi API receives a KalshiClient produced by this module.
 
 Dependencies:
-    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, and PEM_FILE from config.py.
-    build_client() is called by main.py, historical.py, and (indirectly) backtest.py.
-    verify_auth() is called by main.py to confirm credentials and read balance.
+    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, and PEM_FILE from config.py, and
+    api_call_with_retry from _http.py. build_client() is called by main.py,
+    historical.py, and (indirectly) backtest.py. verify_auth() is called by
+    main.py to confirm credentials and read balance.
 
 Notes:
     KalshiClient does NOT accept api_key_id and private_key_pem as constructor
@@ -29,6 +30,7 @@ import logging
 from kalshi_python_sync import KalshiClient
 from kalshi_python_sync.configuration import Configuration
 
+from ._http import api_call_with_retry
 from .config import DEV_PEM_FILE, PEM_FILE, PROD_URL, SANDBOX_URL, SECRETS_FILE
 
 
@@ -91,10 +93,12 @@ def verify_auth(client: KalshiClient) -> int:
     """
     Verify that the client's credentials are valid and return the account balance.
 
-    Calls the Kalshi get_balance() endpoint. If authentication fails, this call
-    will raise an exception from the underlying HTTP client. Used in production
-    mode both at startup (to confirm auth works and read the pre-trade balance)
-    and after trading (to read the post-trade balance for the Excel log).
+    Calls the Kalshi get_balance() endpoint through api_call_with_retry() so a
+    transient 429/5xx doesn't abort the run before scanning even starts. If
+    authentication fails, this call will raise an exception from the underlying
+    HTTP client. Used in production mode both at startup (to confirm auth works
+    and read the pre-trade balance) and after trading (to read the post-trade
+    balance for the Excel log).
 
     Args:
         client (KalshiClient): An authenticated client produced by build_client().
@@ -106,7 +110,7 @@ def verify_auth(client: KalshiClient) -> int:
         Exception: Any exception raised by the Kalshi API client if the request
             fails (e.g. 401 Unauthorized if credentials are wrong, network error).
     """
-    resp = client.get_balance()
+    resp = api_call_with_retry(client.get_balance)
     logging.info(
         "Auth OK — balance: %d cents  ($%.2f)",
         resp.balance,

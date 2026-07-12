@@ -27,7 +27,10 @@ from typing import Callable
 # 500 / 502 / 503 / 504 sometimes appear during Kalshi maintenance or upstream blips.
 _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-# Retry policy: 6 attempts total, backoff doubling from 2s to a 60s cap.
+# Retry policy: 6 attempts total (1 initial + 5 retries), backoff doubling
+# 2s/4s/8s/16s/32s between attempts. _MAX_DELAY is a defensive ceiling on the
+# doubling, not a delay this policy actually reaches — with 5 retries the
+# largest computed sleep is 32s; the cap only matters if _MAX_ATTEMPTS grows.
 _MAX_ATTEMPTS = 6
 _INITIAL_DELAY = 2.0
 _MAX_DELAY = 60.0

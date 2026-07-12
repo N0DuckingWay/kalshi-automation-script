@@ -26,18 +26,23 @@ class TestFeeLegExact:
         assert fee_leg_exact(1, 0.5) == 0.02
 
     def test_large_n(self):
-        # Floating-point: 0.07 * 100 * 0.5 * 0.5 * 100 = 175.0000000000003 → ceil → 176 → 1.76
-        expected = math.ceil(TAKER_FEE_RATE * 100 * 0.5 * 0.5 * 100) / 100
-        assert fee_leg_exact(100, 0.5) == expected
+        # The TRUE fee is exactly 175¢ (0.07 * 100 * 0.5 * 0.5 * 100 = 175).
+        # Binary float noise (175.00000000000003) must NOT bump the ceiling to
+        # 176¢ — fee_leg_exact rounds before applying the ceiling, matching the
+        # fee Kalshi actually charges.
+        assert fee_leg_exact(100, 0.5) == 1.75
 
     def test_minimum_fee_one_cent(self):
         # At extreme prices, fee rounds up to at least 0.01
         assert fee_leg_exact(1, 0.01) == 0.01
 
     def test_formula_matches_definition(self):
+        # Expected mirrors the definition ceil(rate*n*p*(1-p)*100)/100 computed
+        # on the true value — round before ceil so float noise on exact-cent
+        # amounts (e.g. n=20, p=0.5 → 35¢) doesn't inflate the expectation.
         for n in [1, 5, 20]:
             for p in [0.1, 0.3, 0.5, 0.7, 0.9]:
-                expected = math.ceil(TAKER_FEE_RATE * n * p * (1 - p) * 100) / 100
+                expected = math.ceil(round(TAKER_FEE_RATE * n * p * (1 - p) * 100, 6)) / 100
                 assert fee_leg_exact(n, p) == pytest.approx(expected)
 
     def test_symmetric_in_price(self):

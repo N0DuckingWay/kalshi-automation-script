@@ -29,7 +29,7 @@ import time
 
 import schedule
 
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS
 
 
 def run_job() -> None:
@@ -39,21 +39,32 @@ def run_job() -> None:
     Spawns `python -m kalshi_betting.main --mode prod` using the same Python
     interpreter that is running this scheduler. Running in a subprocess isolates
     any unhandled exceptions in the bot from the scheduler process — a crash in
-    one run does not prevent future runs from being triggered.
+    one run does not prevent future runs from being triggered. A hung run is
+    killed after SCHEDULER_JOB_TIMEOUT_SECONDS so it cannot block the daemon
+    past the next scheduled fire.
 
     Logs stdout on success and stderr + exit code on failure so every run is
     traceable in kalshi_arb.log.
     """
     logging.info("Scheduler: starting weekly arbitrage scan.")
-    # Use sys.executable to ensure the subprocess uses the same Python environment
-    # (venv, conda, etc.) as the scheduler itself
-    result = subprocess.run(
-        [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod"],
-        capture_output=True,
-        text=True,
-        # Run from the project root so relative paths in main.py resolve correctly
-        cwd=str(__import__("pathlib").Path(__file__).parent.parent),
-    )
+    try:
+        # Use sys.executable to ensure the subprocess uses the same Python environment
+        # (venv, conda, etc.) as the scheduler itself
+        result = subprocess.run(
+            [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod"],
+            capture_output=True,
+            text=True,
+            # Run from the project root so relative paths in main.py resolve correctly
+            cwd=str(__import__("pathlib").Path(__file__).parent.parent),
+            # Kill a hung run rather than blocking the daemon forever
+            timeout=SCHEDULER_JOB_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.error(
+            "Job killed after %ds timeout. Partial stdout:\n%s",
+            SCHEDULER_JOB_TIMEOUT_SECONDS, exc.stdout or "",
+        )
+        return
     if result.stdout:
         logging.info("stdout:\n%s", result.stdout)
     if result.returncode != 0:
@@ -96,7 +107,13 @@ def main() -> None:
     # Poll for pending scheduled jobs every 60 seconds.
     # The schedule library tracks the next fire time internally.
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception:
+            # The subprocess isolates bot crashes, but a host-level failure
+            # (e.g. the spawn itself raising) must not kill the daemon —
+            # log it and keep waiting for the next scheduled run.
+            logging.exception("Scheduler tick raised — daemon continues")
         time.sleep(60)
 
 

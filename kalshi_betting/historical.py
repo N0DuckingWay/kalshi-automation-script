@@ -29,7 +29,14 @@ import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from kalshi_python_sync.api.historical_api import HistoricalApi
+try:
+    from kalshi_python_sync.api.historical_api import HistoricalApi
+except ImportError:
+    # Some installed SDK builds ship without the historical_api module. Keep
+    # the import soft so this module (and backtester.py, which imports from
+    # it) stays importable and unit-testable offline — the real data-fetch
+    # path fails loudly in build_historical_client() instead.
+    HistoricalApi = None
 
 from ._http import api_call_with_retry
 from .auth import build_client
@@ -93,7 +100,17 @@ def build_historical_client() -> HistoricalApi:
     Returns:
         HistoricalApi: A Kalshi historical API client authenticated via the prod
             RSA key and pointed at the production endpoint.
+
+    Raises:
+        RuntimeError: If the installed kalshi_python_sync build has no
+            historical_api module — the backtest data fetch cannot run until
+            an SDK version providing it is installed.
     """
+    if HistoricalApi is None:
+        raise RuntimeError(
+            "The installed kalshi_python_sync has no historical_api module — "
+            "install an SDK version that provides it to fetch backtest data."
+        )
     # build_client("prod") returns a KalshiClient authenticated via RSA key from secrets.json
     return HistoricalApi(api_client=build_client("prod"))
 
@@ -296,6 +313,9 @@ def fetch_all_settled_markets(
     Results are serialized to a JSON cache file keyed by start_date so subsequent
     backtests do not re-fetch. Pass use_cache=False or use --no-cache to force a
     fresh pull (necessary when new markets have settled since the last cache write).
+    A freshly fetched result is always written back to the cache file regardless
+    of use_cache, so a --no-cache run actually refreshes what the next default
+    (cached) run will load.
 
     Args:
         hist_client (HistoricalApi): Historical API client from build_historical_client().
@@ -303,7 +323,8 @@ def fetch_all_settled_markets(
         start_date (date): Earliest settlement date to include. Markets that settled
             before this date are skipped even if the API returns them.
         use_cache (bool): If True (default), load from disk cache if available and
-            save to disk after fetching. If False, always fetch from the API.
+            skip the API fetch entirely. If False, always fetch from the API. Either
+            way, a fetch that occurs is always saved to disk.
 
     Returns:
         list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
@@ -402,8 +423,11 @@ def fetch_all_settled_markets(
     all_markets: list[dict] = [_market_to_dict(m) for m in selected_markets]
     logging.info("Total settled markets from %s: %d", start_date, len(all_markets))
 
-    if use_cache:
-        _save_json_cache(cache_path, all_markets)
+    # Always persist a fresh fetch — use_cache only controls whether reads are
+    # allowed to come from disk. Gating the save on use_cache meant --no-cache
+    # runs (whose whole point is to refresh stale data) never updated the file
+    # the very next default run would load.
+    _save_json_cache(cache_path, all_markets)
     return all_markets
 
 
@@ -425,9 +449,16 @@ def fetch_daily_candlesticks(
     of the YES bid close (1 − yes_bid_close), which is exact in a binary market
     with no bid-ask spread and a close approximation in practice.
 
-    Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json.
-    On fetch failure, an empty list is cached so the same ticker isn't retried
-    on every subsequent run.
+    Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json,
+    tagged with the [open_ts, close_ts] window that was actually fetched. A
+    cache hit requires the cached window to COVER the requested window —
+    open_ts varies between backtest runs with different --start-date values,
+    so a cache built for a later start_date must not be reused for an earlier
+    one (it would be silently missing the earlier candles). Only successful
+    fetches are cached; a fetch failure returns [] WITHOUT persisting it, so
+    the ticker is retried on the next run (a cached empty file would otherwise
+    silence it forever). Pre-existing empty cache files are honored only
+    while younger than _EMPTY_CANDLE_TTL_SECONDS.
 
     Args:
         hist_client (HistoricalApi): Historical API client from build_historical_client().
@@ -452,14 +483,24 @@ def fetch_daily_candlesticks(
     cache_path = _CANDLES_DIR / f"{ticker}.json"
     if use_cache and cache_path.exists():
         cached = json.loads(cache_path.read_text())
-        # Honor the cache if it has real content, or if a recorded empty is still fresh.
-        # Otherwise let the code fall through and retry — a stale empty was likely a
-        # previous transient failure, not a genuinely empty market.
-        if cached:
-            return cached
-        age = time.time() - cache_path.stat().st_mtime
-        if age < _EMPTY_CANDLE_TTL_SECONDS:
-            return cached
+        # Legacy cache files are a bare list with no window metadata — we can't
+        # confirm what range they cover, so fall through and refetch. The
+        # refetch below re-saves in the new tagged format, migrating it.
+        if isinstance(cached, dict) and cached.get("open_ts", None) is not None:
+            covers_window = (
+                cached["open_ts"] <= open_ts and cached["close_ts"] >= close_ts
+            )
+            candles = cached.get("candles", [])
+            if covers_window:
+                # Honor the cache if it has real content, or if a recorded empty
+                # is still fresh. Otherwise fall through and retry — a stale
+                # empty was likely a previous transient failure, not a
+                # genuinely empty market.
+                if candles:
+                    return candles
+                age = time.time() - cache_path.stat().st_mtime
+                if age < _EMPTY_CANDLE_TTL_SECONDS:
+                    return candles
 
     try:
         # period_interval=1440 requests one candle per 1440 minutes (1 day)
@@ -473,22 +514,30 @@ def fetch_daily_candlesticks(
         candles = []
         for c in resp.candlesticks:
             try:
-                yes_ask = float(c.yes_ask.close)
+                # close_dollars is the fixed-point dollar string; the bare
+                # .close field is an integer price in CENTS and must not be
+                # fed into the dollar-denominated backtest math
+                yes_ask = float(c.yes_ask.close_dollars)
                 # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                no_ask  = 1.0 - float(c.yes_bid.close)
+                no_ask  = 1.0 - float(c.yes_bid.close_dollars)
                 candles.append({
                     "ts": c.end_period_ts,
                     "yes_ask_close": yes_ask,
                     "no_ask_close": max(0.01, min(0.99, no_ask)),
                 })
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
         # Rate limit: sleep briefly after each call to avoid 429 responses
         time.sleep(rate_limit_sleep)
-        if use_cache:
-            # Only successful fetches are cached; failures fall through the except
-            # branch and return [] without persisting so the next run retries.
-            _save_json_cache(cache_path, candles)
+        # Only successful fetches are cached (tagged with the window just
+        # fetched); failures fall through the except branch and return []
+        # without persisting so the next run retries. Saved unconditionally —
+        # use_cache only controls whether reads may come from disk, mirroring
+        # fetch_all_settled_markets — otherwise a --no-cache run would never
+        # actually refresh the file the next default run loads.
+        _save_json_cache(cache_path, {
+            "open_ts": open_ts, "close_ts": close_ts, "candles": candles,
+        })
         return candles
     except Exception as e:
         logging.warning("Candlestick fetch failed for %s: %s", ticker, e)
