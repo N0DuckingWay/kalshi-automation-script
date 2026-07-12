@@ -1,8 +1,10 @@
 """Tests for config.py fee helpers and PROJECT_ROOT."""
 import math
+import pathlib
 
 import pytest
 
+from kalshi_betting import config
 from kalshi_betting.config import (
     PROJECT_ROOT,
     TAKER_FEE_RATE,
@@ -15,9 +17,11 @@ class TestProjectRoot:
     def test_resolves_to_repo_root(self):
         assert (PROJECT_ROOT / "kalshi_betting" / "config.py").exists()
 
-    def test_not_hardcoded_path(self):
-        assert "zdhoffman" not in str(PROJECT_ROOT)
-        assert "Users" not in str(PROJECT_ROOT)
+    def test_derived_from_file_not_hardcoded(self):
+        # PROJECT_ROOT must track config.py's actual location (two levels up:
+        # kalshi_betting/config.py -> kalshi_betting/ -> repo root), not a
+        # hardcoded absolute path baked in at some point in time.
+        assert PROJECT_ROOT == pathlib.Path(config.__file__).resolve().parent.parent
 
 
 class TestFeeLegExact:

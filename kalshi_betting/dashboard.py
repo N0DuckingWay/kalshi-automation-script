@@ -241,11 +241,11 @@ def _fig_html(fig: go.Figure, height: int = 400) -> str:
     """
     fig.update_layout(
         height=height,
-        margin=dict(l=60, r=20, t=40, b=40),
+        margin={"l": 60, "r": 20, "t": 40, "b": 40},
         plot_bgcolor="white",
         paper_bgcolor="white",
-        font=dict(family="sans-serif", size=12),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        font={"family": "sans-serif", "size": 12},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
     )
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
@@ -304,7 +304,7 @@ def _section_performance(
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=equity_df["date"], y=equity_df["portfolio_value"],
-        name="Strategy", line=dict(color=_COLORS["strategy"], width=2),
+        name="Strategy", line={"color": _COLORS["strategy"], "width": 2},
     ))
     fig.update_layout(title="Equity Curve", yaxis_title="Portfolio Value ($)",
                       xaxis_title="Date")
@@ -315,7 +315,7 @@ def _section_performance(
     fig2 = go.Figure(go.Scatter(
         x=equity_df["date"], y=dd_series * 100,
         fill="tozeroy", name="Drawdown %",
-        line=dict(color=_COLORS["dd"]), fillcolor="rgba(244,67,54,0.2)",
+        line={"color": _COLORS["dd"]}, fillcolor="rgba(244,67,54,0.2)",
     ))
     fig2.update_layout(title="Drawdown (%)", yaxis_title="Drawdown (%)", xaxis_title="Date")
 
@@ -428,8 +428,10 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     # Collect (predicted_prob, actual_outcome) pairs
     probs, actuals = [], []
     for t in trades:
-        probs.append(t.entry_pA); actuals.append(1 if t.outcome_a == "yes" else 0)
-        probs.append(t.entry_pB); actuals.append(1 if t.outcome_b == "yes" else 0)
+        probs.append(t.entry_pA)
+        actuals.append(1 if t.outcome_a == "yes" else 0)
+        probs.append(t.entry_pB)
+        actuals.append(1 if t.outcome_b == "yes" else 0)
 
     brier = _brier_score(trades)
     ll    = _log_loss(trades)
@@ -443,8 +445,8 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
         mask = [(bins[i] <= p < bins[i + 1]) for p in probs]
         if sum(mask) == 0:
             continue
-        bin_probs = [p for p, m in zip(probs, mask) if m]
-        bin_acts  = [a for a, m in zip(actuals, mask) if m]
+        bin_probs = [p for p, m in zip(probs, mask, strict=True) if m]
+        bin_acts  = [a for a, m in zip(actuals, mask, strict=True) if m]
         mean_pred.append(np.mean(bin_probs))
         mean_act.append(np.mean(bin_acts))
         counts.append(len(bin_probs))
@@ -452,18 +454,18 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
     fig_cal = go.Figure()
     fig_cal.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect calibration",
-                                 line=dict(dash="dash", color="#9E9E9E")))
+                                 line={"dash": "dash", "color": "#9E9E9E"}))
     fig_cal.add_trace(go.Scatter(
         x=mean_pred, y=mean_act, mode="lines+markers",
-        name="Actual", line=dict(color=_COLORS["strategy"]),
-        marker=dict(size=[max(6, c // 2) for c in counts]),
+        name="Actual", line={"color": _COLORS["strategy"]},
+        marker={"size": [max(6, c // 2) for c in counts]},
         text=[f"n={c}" for c in counts], hoverinfo="text+x+y",
     ))
     fig_cal.update_layout(
         title=f"Calibration Curve (Brier={brier:.4f}, LogLoss={ll:.4f})",
         xaxis_title="Predicted probability",
         yaxis_title="Actual resolution rate",
-        xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]),
+        xaxis={"range": [0, 1]}, yaxis={"range": [0, 1]},
     )
 
     kpis = "".join([
@@ -601,13 +603,13 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 
     fig_kelly = go.Figure(go.Scatter(
         x=kelly_fracs, y=actual_fracs, mode="markers",
-        marker=dict(color=_COLORS["strategy"], size=7, opacity=0.6),
+        marker={"color": _COLORS["strategy"], "size": 7, "opacity": 0.6},
         text=[t.title_a[:40] for t in trades],
     ))
     fig_kelly.add_trace(go.Scatter(
         x=[0, max(kelly_fracs + [0.01]) * 1.1],
         y=[0, max(kelly_fracs + [0.01]) * 1.1],
-        name="1:1 line", line=dict(dash="dash", color="#9E9E9E"),
+        name="1:1 line", line={"dash": "dash", "color": "#9E9E9E"},
     ))
     fig_kelly.update_layout(
         title="Kelly Fraction vs Actual Fraction of Balance",
@@ -633,7 +635,7 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     fig_dep.add_trace(go.Scatter(
         x=equity_df["date"], y=invested_by_date,
         name="Capital deployed", fill="tozeroy",
-        line=dict(color=_COLORS["invested"]),
+        line={"color": _COLORS["invested"]},
         fillcolor="rgba(66,165,245,0.15)",
     ))
     fig_dep.update_layout(title="Capital Deployed Over Time",
@@ -680,7 +682,7 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=equity_df["date"], y=equity_df["portfolio_value"],
-        name="Strategy", line=dict(color=_COLORS["strategy"], width=2),
+        name="Strategy", line={"color": _COLORS["strategy"], "width": 2},
     ))
 
     bench_rows: list[dict] = []
@@ -699,7 +701,7 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             sp_norm = sp / float(sp.iloc[0]) * initial_balance
             fig.add_trace(go.Scatter(
                 x=sp.index, y=sp_norm.values,
-                name="S&P 500 (normalized)", line=dict(color=_COLORS["sp500"], width=2),
+                name="S&P 500 (normalized)", line={"color": _COLORS["sp500"], "width": 2},
             ))
             sp_ret = float(sp_norm.iloc[-1] / initial_balance - 1)
             sp_daily = sp.pct_change().dropna()
