@@ -582,22 +582,22 @@ def run_backtest(
         title_a = mA.get("title") or mA.get("subtitle") or mA.get("ticker", "")
         title_b = mB.get("title") or mB.get("subtitle") or mB.get("ticker", "")
 
-        candidates.append(dict(
-            pair_type=pair_type,
-            canon=canon,
-            group_key=group_key,
-            mA=mA, mB=mB,
-            pA=pA, pB=pB, nA=nA,
-            entry_date=entry_date,
-            exit_date=exit_date,
-            outcome_a=outcome_a,
-            outcome_b=outcome_b,
-            kelly_f_capped=kelly_f_capped,
-            entry_monthly_ratio=entry_monthly_ratio,
-            holding_days=holding_days,
-            title_a=title_a,
-            title_b=title_b,
-        ))
+        candidates.append({
+            "pair_type": pair_type,
+            "canon": canon,
+            "group_key": group_key,
+            "mA": mA, "mB": mB,
+            "pA": pA, "pB": pB, "nA": nA,
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "outcome_a": outcome_a,
+            "outcome_b": outcome_b,
+            "kelly_f_capped": kelly_f_capped,
+            "entry_monthly_ratio": entry_monthly_ratio,
+            "holding_days": holding_days,
+            "title_a": title_a,
+            "title_b": title_b,
+        })
 
     # Keep only the single best candidate per title group — mirrors the live
     # scanners, which keep one pair per normalized-title / exact-title group so
