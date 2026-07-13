@@ -275,6 +275,67 @@ class TestFetchAllSettledMarkets:
         assert m["settlement_ts"] == "2026-02-15T00:00:00Z"
         assert m["event_title"] == ""
 
+    def test_live_sweep_bounds_min_settled_ts_to_start_date(self, tmp_path, monkeypatch):
+        # Regression: min_settled_ts used to be hardcoded to cutoff_ts, so a
+        # narrow recent start_date still forced the live endpoint to walk the
+        # ENTIRE [cutoff_ts, now) range server-side (observed: 20k+ pages,
+        # 20M+ records scanned just to reach a one-week window) even though
+        # the server honors min_settled_ts and could narrow it directly. When
+        # start_date is LATER than the API cutoff, min_settled_ts must be
+        # raised to start_ts, not left at cutoff_ts.
+        from datetime import UTC, date, datetime
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        start_date = date(2026, 7, 6)
+        historical.fetch_all_settled_markets(
+            MagicMock(), live, start_date=start_date, use_cache=False,
+        )
+        expected_min_ts = int(datetime(2026, 7, 6, tzinfo=UTC).timestamp())
+        _, kwargs = live.get_markets_without_preload_content.call_args
+        assert kwargs["min_settled_ts"] == expected_min_ts
+
+    def test_live_sweep_min_settled_ts_falls_back_to_cutoff_when_later(self, tmp_path, monkeypatch):
+        # When start_date is EARLIER than the API cutoff (the common case —
+        # default start_date is 2024-01-01), the live sweep must still start
+        # at cutoff_ts, not start_date — the archive already covers everything
+        # before cutoff, so starting the live sweep earlier would just re-walk
+        # markets the historical endpoint already returned.
+        from datetime import UTC, date, datetime
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        historical.fetch_all_settled_markets(
+            MagicMock(), live, start_date=date(2024, 1, 1), use_cache=False,
+        )
+        expected_min_ts = int(datetime(2026, 3, 1, tzinfo=UTC).timestamp())
+        _, kwargs = live.get_markets_without_preload_content.call_args
+        assert kwargs["min_settled_ts"] == expected_min_ts
+
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
                         legacy_format=False) -> MagicMock:
@@ -296,12 +357,12 @@ def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
     return mock
 
 
-class TestFetchDailyCandlesticks:
+class TestFetchCandlesticks:
     def test_parses_current_dollar_string_close(self, tmp_path, monkeypatch):
         # Current wire format: yes_ask.close is the fixed-point DOLLAR string
         monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
         _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        out = historical.fetch_daily_candlesticks(
+        out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
         )
         assert out == [{
@@ -310,13 +371,27 @@ class TestFetchDailyCandlesticks:
             "no_ask_close": pytest.approx(0.47),  # 1 - yes_bid 0.53
         }]
 
+    def test_requests_hourly_period_interval(self, tmp_path, monkeypatch):
+        # Regression: daily granularity (period_interval=1440) only emits a
+        # candle for markets whose lifespan crosses a UTC midnight boundary,
+        # which silently produced zero data for most short-lived Kalshi
+        # markets. Must request CANDLESTICK_PERIOD_INTERVAL_MINUTES (60).
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        mock = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+        historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
+        )
+        _, kwargs = mock.call_args
+        assert kwargs["period_interval"] == historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES
+        assert historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES == 60
+
     def test_legacy_close_dollars_still_preferred(self, tmp_path, monkeypatch):
         # Pre-drift shape: close_dollars string beside integer-cent close.
         # Regression: reading the cent int fed 1–99 values into the
         # dollar-denominated backtest filters, silently rejecting every candle.
         monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
         _patch_candle_fetch(monkeypatch, 1_700_000_000, legacy_format=True)
-        out = historical.fetch_daily_candlesticks(
+        out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
         )
         assert out[0]["yes_ask_close"] == pytest.approx(0.55)
@@ -327,11 +402,11 @@ class TestFetchDailyCandlesticks:
         # must not hit the API again.
         monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
         _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        historical.fetch_daily_candlesticks(
+        historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
         )
         fetch2 = _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        out = historical.fetch_daily_candlesticks(
+        out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=150, close_ts=180, rate_limit_sleep=0.0,
         )
         assert fetch2.call_count == 0
@@ -344,15 +419,34 @@ class TestFetchDailyCandlesticks:
         # (wider) range, so it's missing candles the caller actually needs.
         monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
         _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        historical.fetch_daily_candlesticks(
+        historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=500, close_ts=1000, rate_limit_sleep=0.0,
         )
         # New request starts EARLIER than the cached window — must refetch
         fetch2 = _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        historical.fetch_daily_candlesticks(
+        historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=1000, rate_limit_sleep=0.0,
         )
         assert fetch2.call_count == 1
+
+    def test_stale_interval_cache_forces_refetch(self, tmp_path, monkeypatch):
+        # A cache written under a different period_interval (e.g. an older
+        # daily-granularity cache from before this change) must not be reused
+        # as if it were hourly — even though its [open_ts, close_ts] window
+        # covers the request, the underlying candle spacing doesn't match.
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        (candles_dir / "T1.json").write_text(json.dumps({
+            "open_ts": 0, "close_ts": 1000, "period_interval": 1440,
+            "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
+        }))
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+        )
+        assert fetch.call_count == 1
+        assert out[0]["ts"] == 1_700_000_000
 
     def test_legacy_bare_list_cache_is_migrated(self, tmp_path, monkeypatch):
         # Cache files written before the windowed-cache fix are a bare list
@@ -366,7 +460,7 @@ class TestFetchDailyCandlesticks:
             '[{"ts": 1, "yes_ask_close": 0.5, "no_ask_close": 0.5}]'
         )
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        out = historical.fetch_daily_candlesticks(
+        out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
         )
         assert fetch.call_count == 1
@@ -378,11 +472,11 @@ class TestFetchDailyCandlesticks:
         # the very next default (cached) run would keep loading stale data.
         monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
         _patch_candle_fetch(monkeypatch, 1_700_000_000)
-        historical.fetch_daily_candlesticks(
+        historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, use_cache=False, rate_limit_sleep=0.0,
         )
         fetch2 = _patch_candle_fetch(monkeypatch, 9_999_999_999)
-        out = historical.fetch_daily_candlesticks(
+        out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, use_cache=True, rate_limit_sleep=0.0,
         )
         assert fetch2.call_count == 0

@@ -142,6 +142,19 @@ MVE_TITLE_LOOKUP_MAX_PAGES = 500
 # resumes automatically if the API starts sending nested markets again.
 MVE_MAX_EMPTY_PAGES = 25
 
+# ── Backtest candlestick granularity ────────────────────────────────────────
+
+# Minutes per candle requested from /historical/markets/{ticker}/candlesticks.
+# Daily (1440) only emits a bar for a market whose lifespan crosses a UTC
+# midnight boundary — confirmed 2026-07 by direct API testing: a 2-hour-long
+# market entirely within one day returned 0 daily candles but 2 hourly ones.
+# Most Kalshi markets are single-game/few-hour windows within one calendar
+# day, so daily granularity structurally produced zero price data for most
+# markets regardless of liquidity, which silently zeroed out backtest entries.
+# 60 (hourly) is the finest granularity actually available — period_interval=1
+# (minute) returns HTTP 400.
+CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
+
 
 def min_price_diff_for_gap(gap_days: int) -> float:
     """

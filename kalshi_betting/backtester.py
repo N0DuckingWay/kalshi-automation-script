@@ -6,7 +6,7 @@ Last edited by: Zachary Hoffman
 Purpose:
     Replays the arbitrage strategy on the full history of settled Kalshi markets.
     Groups settled markets into potential time-series and same-title pairs, fetches
-    daily candlestick price series for each involved market, then scans weekly
+    hourly candlestick price series for each involved market, then scans weekly
     Monday snapshots to find the first date each pair was tradeable at the required
     threshold. Applies Kelly sizing to compute trade size, records actual P&L from
     settlement outcomes, deduplicates overlapping pairs by priority, and builds
@@ -63,7 +63,7 @@ from .config import (
 )
 from .historical import (
     fetch_all_settled_markets,
-    fetch_daily_candlesticks,
+    fetch_candlesticks,
     infer_category,
 )
 from .scanner import normalize_title
@@ -478,8 +478,8 @@ def _find_entry(
     the first market closes, the pair is no longer open for entry.
 
     Args:
-        candles_a (list[dict]): Daily candlestick dicts for market A (sorted by ts).
-        candles_b (list[dict]): Daily candlestick dicts for market B (sorted by ts).
+        candles_a (list[dict]): Hourly candlestick dicts for market A (sorted by ts).
+        candles_b (list[dict]): Hourly candlestick dicts for market B (sorted by ts).
         mA (dict): Market A metadata dict (with "close_time", "result", etc.).
         mB (dict): Market B metadata dict (with "close_time", "result", etc.).
         pair_type (str): "time_series" or "same_title" — controls price gap threshold
@@ -610,7 +610,7 @@ def run_backtest(
       1. Fetch all settled markets since start_date.
       2. Drop markets that provably can never enter any pair (_can_ever_enter).
       3. Group into potential time-series and same-title pairs (metadata only).
-      4. For each potential pair, fetch daily candlesticks for both legs.
+      4. For each potential pair, fetch hourly candlesticks for both legs.
       5. Find the first Monday where the pair was tradeable at the threshold;
          keep only the best entry per title group (live one-pair-per-group rule).
       6. Walk entries chronologically with a running cash balance: Kelly-size
@@ -657,7 +657,7 @@ def run_backtest(
 
     logging.info("Fetching candlesticks for %d markets (cached per ticker)...", len(needed_tickers))
 
-    # Fetch daily candlestick price series for all needed tickers.
+    # Fetch hourly candlestick price series for all needed tickers.
     # Results are cached per ticker so a second run is much faster.
     candles_by_ticker: dict[str, list[dict]] = {}
     for i, (ticker, m) in enumerate(needed_tickers.items()):
@@ -674,7 +674,7 @@ def run_backtest(
         # close_ts: one day past market close to include the final candle
         close_ts  = int(close_dt.timestamp()) + 86400
         # Returns list[dict] with keys: ts (unix int), yes_ask_close (float), no_ask_close (float)
-        candles_by_ticker[ticker] = fetch_daily_candlesticks(
+        candles_by_ticker[ticker] = fetch_candlesticks(
             hist_client, ticker, open_ts, close_ts, use_cache
         )
 

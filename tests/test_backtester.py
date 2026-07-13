@@ -272,7 +272,7 @@ class TestRunBacktestPnL:
         }
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
-        monkeypatch.setattr(backtester, "fetch_daily_candlesticks",
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles[ticker])
 
         trades, equity = run_backtest(
@@ -576,7 +576,7 @@ class TestRunBacktestEndToEndWithPrefilter:
             # filter silently failing, not just a slow path.
             return candles[ticker]
 
-        monkeypatch.setattr(backtester, "fetch_daily_candlesticks", _fetch_candles)
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _fetch_candles)
 
         trades, equity = run_backtest(
             hist_client=MagicMock(), live_client=MagicMock(),

@@ -68,7 +68,7 @@ backtest.py (CLI)
   ├─ historical.build_prod_live_client()     — prod API client for recent data
   ├─ backtester.run_backtest()
   │    ├─ historical.fetch_all_settled_markets() — market metadata
-  │    ├─ historical.fetch_daily_candlesticks()  — price series per ticker
+  │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker
   │    ├─ _find_entry()                          — first tradeable Monday per pair
   │    ├─ Kelly sizing + P&L from outcomes
   │    └─ _build_equity_curve()                 — daily portfolio value
@@ -90,7 +90,7 @@ backtest.py (CLI)
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
-| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints) and daily candlestick price series needed by the backtester. |
+| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints) and hourly candlestick price series needed by the backtester. |
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 

@@ -8,20 +8,23 @@ Purpose:
     Two data types are collected: (1) settled market metadata (title, outcome,
     prices, timestamps) from both the /historical/markets endpoint and the
     regular /markets?status=settled endpoint (which covers more recent settlements);
-    and (2) daily candlestick price series for individual markets used to find
+    and (2) hourly candlestick price series for individual markets used to find
     the week when each pair first became tradeable. All data is cached to JSON
     files on disk so re-runs do not re-fetch from the API.
 
 Dependencies:
     Imports build_client from auth.py and PROJECT_ROOT from config.py. Exports
     build_historical_client(), build_prod_live_client(), fetch_all_settled_markets(),
-    fetch_daily_candlesticks(), and infer_category() — all called by backtester.py.
+    fetch_candlesticks(), and infer_category() — all called by backtester.py.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
     not have a historical endpoint. The backtest always uses prod credentials.
     Candlesticks are cached per ticker in backtest_cache/candlesticks/<ticker>.json
-    to avoid thousands of API calls on repeated runs.
+    to avoid thousands of API calls on repeated runs. Candles are fetched at
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES (hourly) — daily candles only cover
+    markets whose lifespan crosses a UTC midnight boundary, which silently
+    excludes most Kalshi markets (see config.py for the full explanation).
 
     The pinned SDK (kalshi-python-sync==3.2.0) ships no historical_api module,
     and 2026-07 API drift broke its Market response model anyway (legacy
@@ -41,7 +44,13 @@ from urllib.parse import urlencode, urlparse
 
 from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
-from .config import INCLUDE_MVE_MARKETS, MVE_TITLE_LOOKUP_MAX_PAGES, PROD_URL, PROJECT_ROOT
+from .config import (
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    INCLUDE_MVE_MARKETS,
+    MVE_TITLE_LOOKUP_MAX_PAGES,
+    PROD_URL,
+    PROJECT_ROOT,
+)
 
 # Host and path prefix split out of PROD_URL ("https://host/trade-api/v2") so
 # _signed_raw_get can sign the path component and hit arbitrary API routes.
@@ -376,6 +385,8 @@ def fetch_all_settled_markets(
       This endpoint holds the bulk of historical data.
     - /markets?status=settled — markets that settled after the API cutoff, fetched
       via the regular live endpoint. This fills the gap between the archive and now.
+      Bounded server-side by min_settled_ts=max(cutoff_ts, start_ts) so a narrow
+      recent start_date doesn't force a walk of the entire cutoff→now range.
 
     Results are serialized to a JSON cache file keyed by start_date so subsequent
     backtests do not re-fetch. Pass use_cache=False or use --no-cache to force a
@@ -481,14 +492,23 @@ def fetch_all_settled_markets(
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
     # min_settled_ts is honored server-side here (unlike the archive), so this
-    # loop is bounded to the cutoff→now window by the API itself.
+    # loop is bounded to the [live_min_ts, now) window by the API itself.
     logging.info("Fetching recently settled markets (after API cutoff)...")
     recent_count = 0
     cursor = None
     page_no = 0
+    # Bug fixed 2026-07: this used to always pass cutoff_ts, so a narrow recent
+    # start_date (e.g. last 7 days) still forced the server to walk the ENTIRE
+    # [cutoff_ts, now) range — observed 20k+ pages (20M+ records) scanned with
+    # the client-side start_ts filter silently discarding nearly all of them,
+    # because cutoff_ts can trail far behind now. Since the server already
+    # honors min_settled_ts, raising it to start_ts whenever start_ts is the
+    # tighter (later) bound eliminates that wasted paging entirely — it can
+    # only narrow the server-side window, never miss markets the client-side
+    # settle_epoch < start_ts check wasn't already going to discard anyway.
+    live_min_ts = max(cutoff_ts, start_ts)
     while True:
-        # min_settled_ts=cutoff_ts ensures we only get markets not covered by the historical endpoint
-        kwargs = {"status": "settled", "limit": 1000, "min_settled_ts": cutoff_ts}
+        kwargs = {"status": "settled", "limit": 1000, "min_settled_ts": live_min_ts}
         if not INCLUDE_MVE_MARKETS:
             kwargs["mve_filter"] = "exclude"
         if cursor:
@@ -543,7 +563,7 @@ def fetch_all_settled_markets(
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────
 
-def fetch_daily_candlesticks(
+def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
     open_ts: int,
@@ -552,23 +572,30 @@ def fetch_daily_candlesticks(
     rate_limit_sleep: float = 0.15,
 ) -> list[dict]:
     """
-    Fetch daily OHLC candlesticks for one market over its active lifetime.
+    Fetch OHLC candlesticks for one market over its active lifetime.
 
-    Returns one candle per calendar day with the YES ask close price and an
-    approximated NO ask close price. The NO ask is computed as the complement
-    of the YES bid close (1 − yes_bid_close), which is exact in a binary market
-    with no bid-ask spread and a close approximation in practice.
+    Returns one candle per CANDLESTICK_PERIOD_INTERVAL_MINUTES (hourly) with
+    the YES ask close price and an approximated NO ask close price. The NO ask
+    is computed as the complement of the YES bid close (1 − yes_bid_close),
+    which is exact in a binary market with no bid-ask spread and a close
+    approximation in practice. Hourly (not daily) granularity is required
+    because most Kalshi markets are single-game/few-hour windows that don't
+    cross a UTC midnight boundary — daily candles return zero bars for them
+    (see config.py CANDLESTICK_PERIOD_INTERVAL_MINUTES for the full explanation).
 
     Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json,
-    tagged with the [open_ts, close_ts] window that was actually fetched. A
-    cache hit requires the cached window to COVER the requested window —
-    open_ts varies between backtest runs with different --start-date values,
-    so a cache built for a later start_date must not be reused for an earlier
-    one (it would be silently missing the earlier candles). Only successful
-    fetches are cached; a fetch failure returns [] WITHOUT persisting it, so
-    the ticker is retried on the next run (a cached empty file would otherwise
-    silence it forever). Pre-existing empty cache files are honored only
-    while younger than _EMPTY_CANDLE_TTL_SECONDS.
+    tagged with the [open_ts, close_ts] window and period_interval that were
+    actually fetched. A cache hit requires the cached window to COVER the
+    requested window AND the cached period_interval to match the current
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES — open_ts varies between backtest runs
+    with different --start-date values, so a cache built for a later start_date
+    must not be reused for an earlier one (it would be silently missing the
+    earlier candles), and a cache built under a different granularity (e.g. an
+    older daily-interval cache) must not be silently reused as if it were
+    hourly. Only successful fetches are cached; a fetch failure returns []
+    WITHOUT persisting it, so the ticker is retried on the next run (a cached
+    empty file would otherwise silence it forever). Pre-existing empty cache
+    files are honored only while younger than _EMPTY_CANDLE_TTL_SECONDS.
 
     Args:
         hist_client (Any): Authenticated KalshiClient from build_historical_client().
@@ -583,7 +610,7 @@ def fetch_daily_candlesticks(
             within the Kalshi rate limit. Defaults to 0.15 seconds.
 
     Returns:
-        list[dict]: List of daily candlestick dicts with keys:
+        list[dict]: List of candlestick dicts with keys:
             - "ts" (int): Unix timestamp of the candle's end period.
             - "yes_ask_close" (float): YES ask price at close. Range: [0.01, 0.99].
             - "no_ask_close" (float): Approximated NO ask price at close (1 − yes_bid_close).
@@ -593,12 +620,14 @@ def fetch_daily_candlesticks(
     cache_path = _CANDLES_DIR / f"{ticker}.json"
     if use_cache and cache_path.exists():
         cached = json.loads(cache_path.read_text())
-        # Legacy cache files are a bare list with no window metadata — we can't
-        # confirm what range they cover, so fall through and refetch. The
-        # refetch below re-saves in the new tagged format, migrating it.
+        # Legacy cache files are a bare list with no window metadata (or predate
+        # the period_interval tag) — we can't confirm what range/granularity
+        # they cover, so fall through and refetch. The refetch below re-saves
+        # in the current tagged format, migrating it.
         if isinstance(cached, dict) and cached.get("open_ts", None) is not None:
             covers_window = (
                 cached["open_ts"] <= open_ts and cached["close_ts"] >= close_ts
+                and cached.get("period_interval") == CANDLESTICK_PERIOD_INTERVAL_MINUTES
             )
             candles = cached.get("candles", [])
             if covers_window:
@@ -613,7 +642,6 @@ def fetch_daily_candlesticks(
                     return candles
 
     try:
-        # period_interval=1440 requests one candle per 1440 minutes (1 day).
         # Raw signed GET — the pinned SDK has no historical_api module and its
         # candlestick models predate the current wire format anyway.
         data = _historical_get(
@@ -621,7 +649,7 @@ def fetch_daily_candlesticks(
             f"{_API_PREFIX}/historical/markets/{ticker}/candlesticks",
             start_ts=open_ts,
             end_ts=close_ts,
-            period_interval=1440,
+            period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
         )
         candles = []
         for c in data.get("candlesticks") or []:
@@ -645,14 +673,17 @@ def fetch_daily_candlesticks(
                 pass
         # Rate limit: sleep briefly after each call to avoid 429 responses
         time.sleep(rate_limit_sleep)
-        # Only successful fetches are cached (tagged with the window just
-        # fetched); failures fall through the except branch and return []
-        # without persisting so the next run retries. Saved unconditionally —
-        # use_cache only controls whether reads may come from disk, mirroring
-        # fetch_all_settled_markets — otherwise a --no-cache run would never
-        # actually refresh the file the next default run loads.
+        # Only successful fetches are cached (tagged with the window and
+        # granularity just fetched); failures fall through the except branch
+        # and return [] without persisting so the next run retries. Saved
+        # unconditionally — use_cache only controls whether reads may come
+        # from disk, mirroring fetch_all_settled_markets — otherwise a
+        # --no-cache run would never actually refresh the file the next
+        # default run loads.
         _save_json_cache(cache_path, {
-            "open_ts": open_ts, "close_ts": close_ts, "candles": candles,
+            "open_ts": open_ts, "close_ts": close_ts,
+            "period_interval": CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+            "candles": candles,
         })
         return candles
     except Exception as e:
