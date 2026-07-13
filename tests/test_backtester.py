@@ -1,5 +1,5 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -140,10 +140,13 @@ _MONDAY_TS = int(datetime(2026, 1, 5, 9, 0, tzinfo=UTC).timestamp())
 
 class TestFindEntryDirection:
     def _markets(self):
+        # 13-day deadline gap — inside the short (15%) tier, so these tests
+        # exercise direction rules, not the deadline-gap threshold tiers
+        # (covered separately in TestFindEntryTieredThreshold).
         mA = {"ticker": "EARLY", "event_ticker": "E1",
               "close_time": "2026-02-01T00:00:00+00:00"}
         mB = {"ticker": "LATE", "event_ticker": "E2",
-              "close_time": "2026-02-20T00:00:00+00:00"}
+              "close_time": "2026-02-14T00:00:00+00:00"}
         return mA, mB
 
     def test_time_series_rejects_pricier_later_contract(self):
@@ -158,8 +161,9 @@ class TestFindEntryDirection:
         assert entry is None
 
     def test_time_series_accepts_pricier_earlier_contract(self):
-        # Earlier pricey (pA=0.60, nA=0.40), later cheap (pB=0.30):
-        # gap 0.30 >= 0.15, nA+pB = 0.70 <= 0.85, spread clears fees.
+        # Earlier pricey (pA=0.60, nA=0.40), later cheap (pB=0.30). At the
+        # 13-day deadline gap the short tier applies: price gap 0.30 >= 0.15,
+        # nA+pB = 0.70 <= 0.85, spread clears fees.
         mA, mB = self._markets()
         candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
         candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
@@ -180,6 +184,61 @@ class TestFindEntryDirection:
                             "same_title", date(2026, 1, 1))
         assert entry is not None
         assert entry["mA"]["ticker"] == "LATE"  # the pricier side becomes A
+
+
+class TestFindEntryTieredThreshold:
+    """_find_entry mirrors the scanner's deadline-gap-tiered price threshold:
+    15% for deadline gaps <= 15 days, 30% for 16-30 days, nothing beyond 30."""
+
+    def _markets(self, gap_days: int):
+        close_a = datetime(2026, 2, 1, tzinfo=UTC)
+        close_b = close_a + timedelta(days=gap_days)
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": close_a.isoformat()}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": close_b.isoformat()}
+        return mA, mB
+
+    def _entry(self, gap_days: int, pA: float, pB: float):
+        mA, mB = self._markets(gap_days)
+        candles_early = [_candle(_MONDAY_TS, pA, round(1.0 - pA, 4))]
+        candles_late  = [_candle(_MONDAY_TS, pB, round(1.0 - pB, 4))]
+        return _find_entry(candles_early, candles_late, mA, mB,
+                           "time_series", date(2026, 1, 1))
+
+    def test_short_gap_18pct_price_gap_accepted(self):
+        # 10-day deadline gap → 15% tier; pA=0.48/pB=0.30 (18% gap, nA+pB=0.82
+        # <= 0.85) qualifies
+        entry = self._entry(10, pA=0.48, pB=0.30)
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+
+    def test_long_gap_18pct_price_gap_rejected(self):
+        # The SAME prices at a 20-day deadline gap fall under the 30% tier
+        # and must be rejected — this is exactly what the old flat 15%
+        # threshold would have (wrongly) accepted
+        assert self._entry(20, pA=0.48, pB=0.30) is None
+
+    def test_long_gap_38pct_price_gap_accepted(self):
+        # 20-day gap → 30% tier; pA=0.68/pB=0.30 (38% gap, nA+pB=0.62 <= 0.70)
+        # clears both the tiered threshold and the tiered price-sum ceiling
+        entry = self._entry(20, pA=0.68, pB=0.30)
+        assert entry is not None
+
+    def test_over_max_gap_rejected_regardless_of_price(self):
+        # 35-day deadline gap exceeds MAX_DEADLINE_GAP_DAYS — even a 40% price
+        # gap never enters
+        assert self._entry(35, pA=0.70, pB=0.30) is None
+
+    def test_same_title_ignores_deadline_gap(self):
+        # same_title keeps the flat 5% threshold: a 6% divergence on markets
+        # closing 20 days apart is still an entry (nA+pB = 0.94 <= 0.95)
+        mA, mB = self._markets(20)
+        candles_a = [_candle(_MONDAY_TS, 0.36, 0.64)]
+        candles_b = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_a, candles_b, mA, mB,
+                            "same_title", date(2026, 1, 1))
+        assert entry is not None
 
 
 class TestRunBacktestPnL:

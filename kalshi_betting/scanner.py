@@ -14,33 +14,42 @@ Purpose:
     fill prices and confirm the edge survives real liquidity.
 
 Dependencies:
-    Imports constants and fee helpers from config.py. Exports the CandidatePair
-    dataclass and scanning functions consumed by main.py, backtester.py, and
-    (via normalize_title) historical.py. Depends on the KalshiClient produced
-    by auth.py.
+    Imports constants and fee helpers from config.py and the retry/raw-fetch
+    helpers from _http.py. Exports the CandidatePair and ApiMarket dataclasses
+    and scanning functions consumed by main.py, backtester.py, and (via
+    normalize_title) historical.py. Depends on the KalshiClient produced by
+    auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
     the observation that Kalshi titles differ only in date tokens when the same
     question is asked across multiple deadline-indexed markets. The _DATE_PATTERNS
     list must cover all Kalshi date formats to avoid missed pairs or false positives.
+
+    Market fetching deliberately bypasses the SDK's response models: as of
+    2026-07 the API stopped sending the legacy integer-cent price fields the
+    pinned SDK's Market model requires, so fetch_open_events_with_markets()
+    uses the *_without_preload_content raw-response variants and parses JSON
+    into ApiMarket itself (see fetch_json_page for the error-handling contract).
 """
 import logging
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
+from datetime import datetime
 from typing import Any
 
-from ._http import api_call_with_retry
+from ._http import api_call_with_retry, fetch_json_page
 from .config import (
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
-    MIN_PRICE_DIFF,
+    MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
     SAME_TITLE_MIN_PRICE_DIFF,
     fee_per_pair_approx,
+    min_price_diff_for_gap,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,6 +247,12 @@ def get_held_tickers(client: Any) -> set:
     = NO side, positive = YES side). These tickers are excluded from new trades
     to avoid doubling up on an existing position.
 
+    Uses the raw-response variant + JSON parsing because the pinned SDK's
+    MarketPosition model requires legacy integer-cent fields the API stopped
+    sending in 2026-07 (position counts now arrive as the `position_fp`
+    string) — the modeled get_positions call raises ValidationError on any
+    non-empty positions page.
+
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
@@ -252,21 +267,107 @@ def get_held_tickers(client: Any) -> set:
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = api_call_with_retry(client.get_positions, **kwargs)
-        for pos in resp.market_positions:
+        # Raw-response call: bypasses the broken MarketPosition model, keeps retry
+        data = api_call_with_retry(
+            fetch_json_page, client.get_positions_without_preload_content, **kwargs
+        )
+        for pos in data.get("market_positions") or []:
+            ticker = pos.get("ticker") or ""
             try:
-                # position is a signed contract count — add to held set if non-zero
-                if int(pos.position) != 0:
-                    held.add(pos.ticker)
-            except (ValueError, TypeError, AttributeError):
+                # position_fp is the signed (possibly fractional) contract count
+                # the API now sends; fall back to the legacy integer field for
+                # any account still receiving it
+                raw = pos.get("position_fp")
+                if raw is None:
+                    raw = pos.get("position")
+                if float(raw) != 0:
+                    held.add(ticker)
+            except (ValueError, TypeError):
                 # If we can't parse the position, be conservative and treat it as held
-                held.add(pos.ticker)
-        cursor = resp.cursor
+                if ticker:
+                    held.add(ticker)
+        cursor = data.get("cursor")
         # A None or empty cursor signals the last page
         if not cursor:
             break
     logging.info("Held positions: %d tickers", len(held))
     return held
+
+
+@dataclass
+class ApiMarket:
+    """
+    Lightweight market object parsed from a raw /events JSON dict.
+
+    Stands in for the SDK's Market model, which can no longer deserialize live
+    responses: as of 2026-07 the API stopped populating the legacy integer-cent
+    price fields (yes_ask, no_bid, ...) that the pinned SDK (3.2.0) types as
+    required, so every nested-markets page raises pydantic ValidationError.
+    Carries exactly the attributes the pipeline reads off a market object
+    (scanner, strategy, trader, reporter, main) — prices stay the raw
+    `*_dollars` strings the API sends, matching what downstream float() calls
+    already expect.
+
+    Attributes:
+        ticker (str): Market ticker, e.g. "KXBTC-24MAR-T80".
+        event_ticker (str): Parent event ticker.
+        title (str): Market question text.
+        subtitle (str): Market subtitle ("" when the API omits it, as it
+            currently does — matches the SDK model's empty default).
+        status (str): SDK-style status string; open markets are "active".
+        close_time (datetime | None): Parsed tz-aware close time, or None if
+            missing/unparseable.
+        yes_ask_dollars: YES ask as a dollar string (e.g. "0.35") or None.
+        no_ask_dollars: NO ask as a dollar string or None.
+        yes_bid_dollars: YES bid as a dollar string or None.
+        _event_title (str): Parent event title attached for pair_key grouping.
+    """
+    ticker: str
+    event_ticker: str
+    title: str
+    subtitle: str
+    status: str
+    close_time: Any
+    yes_ask_dollars: Any = None
+    no_ask_dollars: Any = None
+    yes_bid_dollars: Any = None
+    _event_title: str = field(default="")
+
+
+def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
+    """
+    Build an ApiMarket from one raw market JSON dict.
+
+    Missing fields become the same falsy defaults the SDK model would have
+    produced (None for prices, "" for strings) so downstream filters behave
+    identically. close_time is parsed with datetime.fromisoformat, which
+    handles the API's trailing-"Z" UTC format on Python >= 3.11.
+
+    Args:
+        m (dict): One market object from a raw events-endpoint JSON payload.
+        event_title (str): Parent event's title, attached as _event_title.
+
+    Returns:
+        ApiMarket: Parsed market ready for the pair-detection pipeline.
+    """
+    close_dt = None
+    if m.get("close_time"):
+        try:
+            close_dt = datetime.fromisoformat(m["close_time"])
+        except (ValueError, TypeError):
+            close_dt = None
+    return ApiMarket(
+        ticker=m.get("ticker") or "",
+        event_ticker=m.get("event_ticker") or "",
+        title=m.get("title") or "",
+        subtitle=m.get("subtitle") or "",
+        status=m.get("status") or "",
+        close_time=close_dt,
+        yes_ask_dollars=m.get("yes_ask_dollars"),
+        no_ask_dollars=m.get("no_ask_dollars"),
+        yes_bid_dollars=m.get("yes_bid_dollars"),
+        _event_title=event_title,
+    )
 
 
 def fetch_open_events_with_markets(client: Any) -> list:
@@ -281,6 +382,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
     "Trump" in two unrelated events) no longer false-positive into a same-title
     or time-series pair.
 
+    Uses the SDK's raw-response variants + ApiMarket parsing instead of the
+    modeled `get_events` call — the pinned SDK's Market model can no longer
+    deserialize live responses (see ApiMarket docstring). Page size must be
+    <= 200 (MARKET_PAGE_SIZE): the API returns HTTP 400 for larger limits.
+
     When `INCLUDE_MVE_MARKETS` is True, also pulls the dedicated multivariate
     events endpoint, since `get_events` excludes MVE events by API design.
     When False, only the standard endpoint is hit and the previous binary-only
@@ -290,10 +396,9 @@ def fetch_open_events_with_markets(client: Any) -> list:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
     Returns:
-        list: Flat list of all open Kalshi market API objects, each with an
-            `_event_title` attribute set to its parent event's full title (may
-            be empty string if the event had no title). May contain thousands
-            of items.
+        list: Flat list of ApiMarket objects for all open markets, each with
+            `_event_title` set to its parent event's full title (may be empty
+            string if the event had no title). May contain thousands of items.
     """
     markets: list = []
     # Standard (non-MVE) events with nested markets
@@ -307,10 +412,13 @@ def fetch_open_events_with_markets(client: Any) -> list:
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = api_call_with_retry(client.get_events, **kwargs)
-        for ev in resp.events or []:
-            ev_title = ev.title or ""
-            for m in ev.markets or []:
+        # Raw-response call: bypasses the broken Market model, keeps 429/5xx retry
+        data = api_call_with_retry(
+            fetch_json_page, client.get_events_without_preload_content, **kwargs
+        )
+        for ev in data.get("events") or []:
+            ev_title = ev.get("title") or ""
+            for m in ev.get("markets") or []:
                 # An "open" event can still nest closed/settled/determined markets
                 # (e.g. one option in a multi-choice event already resolved while
                 # the event stays open) — status="open" on get_events() filters
@@ -318,12 +426,12 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # MVE branch below; the 1%-99% price filter downstream catches
                 # most stale markets too, but this stops them from being paired
                 # (and shown as tradeable candidates) in the first place.
-                if getattr(m, "status", "") != "active":
+                if (m.get("status") or "") != "active":
                     continue
-                # Attach the parent event title so pair_key()/display_title() can find it
-                m._event_title = ev_title
-                markets.append(m)
-        cursor = resp.cursor
+                # Parse into ApiMarket with the parent event title attached so
+                # pair_key()/display_title() can find it
+                markets.append(_market_from_dict(m, ev_title))
+        cursor = data.get("cursor")
         # A None or empty cursor signals the last page
         if not cursor:
             break
@@ -332,23 +440,46 @@ def fetch_open_events_with_markets(client: Any) -> list:
     # The /events endpoint excludes these by API design, so they need their own pull.
     if INCLUDE_MVE_MARKETS:
         cursor = None
+        # The MVE listing is effectively unbounded (hundreds of thousands of
+        # auto-generated collection events) and currently returns no nested
+        # markets at all, so the pull bails out after MVE_MAX_EMPTY_PAGES
+        # consecutive marketless pages instead of paging for hours. Pages that
+        # contain markets reset the counter.
+        empty_pages = 0
         while True:
             kwargs = {"limit": MARKET_PAGE_SIZE, "with_nested_markets": True}
             if cursor:
                 kwargs["cursor"] = cursor
-            resp = api_call_with_retry(client.get_multivariate_events, **kwargs)
-            for ev in resp.events or []:
-                ev_title = ev.title or ""
-                for m in ev.markets or []:
+            data = api_call_with_retry(
+                fetch_json_page,
+                client.get_multivariate_events_without_preload_content,
+                **kwargs,
+            )
+            events = data.get("events") or []
+            page_market_count = sum(len(ev.get("markets") or []) for ev in events)
+            for ev in events:
+                ev_title = ev.get("title") or ""
+                for m in ev.get("markets") or []:
                     # Only include markets that are still open — MVE response may
                     # include closed/settled options inside an otherwise-open event.
-                    # The SDK Market.status enum for an open market is "active"
+                    # The API status string for an open market is "active"
                     # (allowed values: initialized/active/closed/settled/determined
                     # — there is no "open" status).
-                    if getattr(m, "status", "") == "active":
-                        m._event_title = ev_title
-                        markets.append(m)
-            cursor = resp.cursor
+                    if (m.get("status") or "") == "active":
+                        markets.append(_market_from_dict(m, ev_title))
+            if page_market_count == 0:
+                empty_pages += 1
+                if empty_pages >= MVE_MAX_EMPTY_PAGES:
+                    logging.warning(
+                        "MVE fetch: %d consecutive pages with no nested markets — "
+                        "stopping the MVE pull early (the API currently returns "
+                        "none; the listing itself is effectively unbounded)",
+                        empty_pages,
+                    )
+                    break
+            else:
+                empty_pages = 0
+            cursor = data.get("cursor")
             if not cursor:
                 break
 
@@ -375,9 +506,11 @@ def find_time_series_pairs(
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
       3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days)
-      4. pA - pB >= MIN_PRICE_DIFF (15%) — directional: the earlier-closing
-         contract (A) must be priced higher than the later one (B), the anomaly
-         this strategy exploits. A pricier later contract is normal term
+      4. pA - pB >= min_price_diff_for_gap(gap_days) — directional: the
+         earlier-closing contract (A) must be priced higher than the later
+         one (B), the anomaly this strategy exploits. The required gap is
+         tiered by deadline distance (15% when the deadlines are <= 15 days
+         apart, 30% for 16-30 days). A pricier later contract is normal term
          structure and is never a candidate.
 
     Per normalized title, keeps the single best pair (tradeable preferred, then
@@ -436,8 +569,10 @@ def find_time_series_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                # Enforce the minimum 15% YES price difference required for time-series
-                # pairs. Directional, not abs(): mA is always the earlier-closing
+                # Enforce the minimum YES price difference required for time-series
+                # pairs, tiered by deadline gap (15% for gaps <= 15 days, 30% for
+                # 16-30 days — wider gaps mean weaker correlation, so more edge is
+                # required). Directional, not abs(): mA is always the earlier-closing
                 # contract (sorted above), and the tradeable arbitrage only exists
                 # when the EARLIER contract is priced higher (pA > pB) — that's the
                 # anomaly being exploited. A pricier later contract (pA < pB) is
@@ -445,7 +580,7 @@ def find_time_series_pairs(
                 # such pairs through as untradeable placeholders that could still
                 # win the group's one-pair-per-title slot below. Mirrors the
                 # directional check in backtester._find_entry.
-                if pA - pB < MIN_PRICE_DIFF:
+                if pA - pB < min_price_diff_for_gap(gap_days):
                     continue
 
                 # tradeable=True when buying NO on A and YES on B is guaranteed profitable
@@ -662,35 +797,61 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     failure.
     """
     try:
-        resp = api_call_with_retry(client.get_market_orderbook, ticker=ticker)
-        ob = getattr(resp, "orderbook_fp", None) or getattr(resp, "orderbook", None)
+        # Raw-response call: the live API returns only the orderbook_fp key,
+        # which the pinned SDK's modeled response (orderbook required) rejects
+        data = api_call_with_retry(
+            fetch_json_page, client.get_market_orderbook_without_preload_content, ticker=ticker
+        )
+        ob = data.get("orderbook_fp") or data.get("orderbook")
         if ob is None:
             return None
-        yes_raw = list(getattr(ob, "yes_dollars", None) or getattr(ob, "yes", None) or [])
-        no_raw  = list(getattr(ob, "no_dollars",  None) or getattr(ob, "no",  None) or [])
+        yes_raw = list(ob.get("yes_dollars") or ob.get("yes") or [])
+        no_raw  = list(ob.get("no_dollars") or ob.get("no") or [])
         return {"yes": yes_raw, "no": no_raw}
     except Exception as exc:
         logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
         return None
 
 
+def _pair_max_sum(pair: Any) -> float:
+    """
+    Return the maximum allowed yes_price + no_price sum for one pair's orderbook
+    depth levels — the complement of the pair's minimum price-gap threshold.
+
+    same_title pairs use the flat 5% threshold (sum <= 0.95). time_series pairs
+    use the deadline-gap-tiered threshold: sum <= 0.85 when the deadlines are
+    <= 15 days apart, sum <= 0.70 for 16-30 days. market_a is always the
+    earlier-closing leg for time_series pairs (guaranteed by the sort in
+    find_time_series_pairs), so the gap is non-negative.
+
+    Args:
+        pair (CandidatePair): The pair whose ceiling is needed.
+
+    Returns:
+        float: Maximum qualifying yes_price + no_price sum (dollars, 0-1).
+    """
+    if pair.pair_type == "time_series":
+        # Tier the ceiling by the same deadline gap used at candidate detection
+        gap_days = (pair.market_b.close_time - pair.market_a.close_time).days
+        return 1.0 - min_price_diff_for_gap(gap_days)
+    return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
+
+
 def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
     """
     For each tradeable pair, fetch both order books, pair NO asks (market A)
     with YES asks (market B) using a merge sweep, then filter to only contract
-    pairs whose combined price meets the per-type gap threshold:
+    pairs whose combined price meets the pair's gap threshold (see
+    _pair_max_sum):
 
       same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF (0.95)
-      time_series: yes_price + no_price <= 1 - MIN_PRICE_DIFF             (0.85)
+      time_series: yes_price + no_price <= 1 - min_price_diff_for_gap(gap)
+                   (0.85 for deadline gaps <= 15 days, 0.70 for 16-30 days)
 
     nA and pB are replaced with weighted-average fill prices over qualifying
     contracts. max_contracts is set to the total qualifying count. Pairs with
     no qualifying contracts are marked tradeable=False.
     """
-    _max_sum = {
-        "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,  # 0.95
-        "time_series": 1.0 - MIN_PRICE_DIFF,              # 0.85
-    }
     # Cache order books by ticker to avoid fetching the same book twice
     # when the same market appears in multiple pairs
     ob_cache: dict[str, dict | None] = {}
@@ -735,9 +896,10 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
         paired     = _pair_orderbooks(no_levels, yes_levels)
 
-        max_sum    = _max_sum.get(pair.pair_type, 0.95)
-        # Keep only contract pairs where the combined fill price leaves the required gap:
-        # same_title requires ≥5% gap (sum ≤ 0.95); time_series requires ≥15% gap (sum ≤ 0.85)
+        # Keep only contract pairs where the combined fill price leaves the required
+        # gap: same_title requires ≥5% (sum ≤ 0.95); time_series requires the
+        # deadline-gap-tiered 15%/30% (sum ≤ 0.85 / 0.70)
+        max_sum    = _pair_max_sum(pair)
         qualifying = [
             (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
         ]
@@ -802,10 +964,6 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
         bool: True if the pair still qualifies; False if prices moved or order
             books are unavailable.
     """
-    _max_sum = {
-        "same_title":  1.0 - SAME_TITLE_MIN_PRICE_DIFF,
-        "time_series": 1.0 - MIN_PRICE_DIFF,
-    }
     pair   = spec.pair
     ob_a   = _fetch_orderbook(client, pair.market_a.ticker)
     ob_b   = _fetch_orderbook(client, pair.market_b.ticker)
@@ -820,7 +978,9 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
     no_levels  = _bids_to_ask_levels(ob_a["yes"])
     yes_levels = _bids_to_ask_levels(ob_b["no"])
     paired     = _pair_orderbooks(no_levels, yes_levels)
-    max_sum    = _max_sum.get(pair.pair_type, 0.95)
+    # Same per-pair gap ceiling used at scan time (deadline-gap-tiered for
+    # time_series) — the trade must still qualify at execution time
+    max_sum    = _pair_max_sum(pair)
     qualifying = [(yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum]
 
     if not qualifying:

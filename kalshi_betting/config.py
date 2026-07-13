@@ -57,9 +57,18 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 # mathematical Kelly says to bet more, we never exceed 20% of the balance on one pair.
 BUDGET_FRACTION               = 0.20
 
-# Minimum YES ask price difference required for the bot to consider a time-series
-# pair. A 15% gap provides a meaningful edge after fees; smaller gaps are too risky.
-MIN_PRICE_DIFF                = 0.15
+# Tiered minimum YES ask price difference for time-series pairs, keyed by the
+# deadline gap between the two legs. The wider the deadline gap, the weaker the
+# correlation assumption, so a larger price gap is required to justify the trade:
+#   gap <= SHORT_DEADLINE_GAP_DAYS (15 days)  -> MIN_PRICE_DIFF_SHORT_GAP (15%)
+#   gap 16..MAX_DEADLINE_GAP_DAYS  (30 days)  -> MIN_PRICE_DIFF_LONG_GAP  (30%)
+# Use min_price_diff_for_gap() below to pick the tier — never hardcode these.
+MIN_PRICE_DIFF_SHORT_GAP      = 0.15
+MIN_PRICE_DIFF_LONG_GAP       = 0.30
+
+# Inclusive boundary (in calendar days) between the two time-series price-gap
+# tiers: deadline gaps up to and including this many days use the short tier.
+SHORT_DEADLINE_GAP_DAYS       = 15
 
 # Minimum YES ask price difference for same-title pairs. These are markets asking
 # the exact same question, so even a small divergence (5%) is anomalous and worth trading.
@@ -103,11 +112,45 @@ SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
-# Number of markets to request per page when paginating the /markets endpoint.
-MARKET_PAGE_SIZE   = 1000
+# Number of items to request per page when paginating market/event endpoints.
+# The API rejects limits above 200 with HTTP 400 (observed 2026-07; it used to
+# accept 1000), so this must stay <= 200.
+MARKET_PAGE_SIZE   = 200
 
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
+
+# Stop the multivariate-events pull after this many CONSECUTIVE pages that
+# contain no nested markets. The MVE listing is effectively unbounded (Kalshi
+# auto-generates hundreds of thousands of collection events) and as of 2026-07
+# the API returns zero nested markets on it regardless of with_nested_markets —
+# without this cap the scan pages forever (observed: 75+ minutes, no end).
+# Pages that DO contain markets reset the counter, so real MVE coverage
+# resumes automatically if the API starts sending nested markets again.
+MVE_MAX_EMPTY_PAGES = 25
+
+
+def min_price_diff_for_gap(gap_days: int) -> float:
+    """
+    Return the minimum time-series YES price gap required for a deadline gap.
+
+    Picks the price-gap tier for a time-series pair based on how many calendar
+    days separate the two legs' deadlines: gaps up to SHORT_DEADLINE_GAP_DAYS
+    (15 days, inclusive) require MIN_PRICE_DIFF_SHORT_GAP (15%); anything wider
+    requires MIN_PRICE_DIFF_LONG_GAP (30%). Callers must already have enforced
+    gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
+    does not reject over-cap gaps itself.
+
+    Args:
+        gap_days (int): Calendar days between the two legs' deadlines.
+            Range: 0..MAX_DEADLINE_GAP_DAYS (caller-enforced).
+
+    Returns:
+        float: The minimum required YES ask price difference (dollars, 0-1).
+    """
+    if gap_days <= SHORT_DEADLINE_GAP_DAYS:
+        return MIN_PRICE_DIFF_SHORT_GAP
+    return MIN_PRICE_DIFF_LONG_GAP
 
 
 def fee_per_pair_approx(nA: float, pB: float) -> float:

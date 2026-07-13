@@ -1,6 +1,7 @@
 """Tests for trader.py — order construction, rollback verification, and
 exception disambiguation. All Kalshi API interaction is mocked per project
 policy (tests must run offline)."""
+import json
 import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,19 +27,23 @@ def make_spec(x: int = 5, nA: float = 0.40, pB: float = 0.35) -> MagicMock:
     return spec
 
 
-def order_resp(status: str) -> MagicMock:
-    resp = MagicMock()
-    resp.order.status = status
-    return resp
+def order_resp(status: str) -> SimpleNamespace:
+    """Raw create_order response — trader parses the JSON body directly
+    because the SDK's Order response model can't deserialize live payloads."""
+    payload = {"order": {"status": status}}
+    return SimpleNamespace(status=201, data=json.dumps(payload).encode("utf-8"))
 
 
-def positions_resp(ticker: str | None = None, position: int = 0) -> SimpleNamespace:
-    """get_positions response with zero or one market position."""
-    if ticker is None:
-        return SimpleNamespace(market_positions=[])
-    return SimpleNamespace(
-        market_positions=[SimpleNamespace(ticker=ticker, position=position)]
-    )
+def positions_resp(ticker: str | None = None, position: float = 0) -> SimpleNamespace:
+    """Raw get_positions response with zero or one market position.
+
+    _position_count parses the raw JSON body (the SDK's MarketPosition model
+    can't deserialize live responses anymore), with the count in the
+    position_fp string field — mocks mirror that wire format.
+    """
+    mps = [] if ticker is None else [{"ticker": ticker, "position_fp": str(position)}]
+    payload = {"market_positions": mps, "cursor": None}
+    return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
 
 
 class TestOrderPriceProtection:
@@ -65,7 +70,7 @@ class TestRollbackVerification:
         # rejected — the orphaned leg-A position must surface as
         # "rollback_failed", never be logged away as a successful rollback.
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # leg A
             order_resp("canceled"),   # leg B rejected (confirmed non-fill)
             order_resp("canceled"),   # rollback rejected → orphaned position
@@ -76,7 +81,7 @@ class TestRollbackVerification:
 
     def test_filled_rollback_reports_rolled_back(self):
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # leg A
             order_resp("canceled"),   # leg B rejected
             order_resp("executed"),   # rollback filled
@@ -86,37 +91,38 @@ class TestRollbackVerification:
 
     def test_rollback_order_is_reduce_only_sell(self):
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),
             order_resp("canceled"),
             order_resp("executed"),
         ])
         _execute_one(client, make_spec())
-        rollback_kwargs = client.create_order.call_args_list[2].kwargs
-        assert rollback_kwargs["action"] == "sell"
-        assert rollback_kwargs["side"] == "no"
-        assert rollback_kwargs["reduce_only"] is True
+        rollback_call = client.create_order_without_preload_content.call_args_list[2]
+        rollback_req = rollback_call.kwargs["create_order_request"]
+        assert rollback_req.action == "sell"
+        assert rollback_req.side == "no"
+        assert rollback_req.reduce_only is True
 
 
 class TestExceptionDisambiguation:
     def test_leg_a_exception_with_no_position_is_failed(self):
         # Exception + confirmed zero position → clean failure, no rollback sent
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=TimeoutError("timeout"))
-        client.get_positions = MagicMock(return_value=positions_resp())
+        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
-        assert client.create_order.call_count == 1
+        assert client.create_order_without_preload_content.call_count == 1
 
     def test_leg_a_exception_with_position_is_unwound(self):
         # Exception but the position exists (timeout AFTER the fill) — the
         # half-filled pair must be unwound, not abandoned as "failed".
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             TimeoutError("timeout"),  # leg A raises after actually filling
             order_resp("executed"),   # rollback fills
         ])
-        client.get_positions = MagicMock(
+        client.get_positions_without_preload_content = MagicMock(
             return_value=positions_resp("TICK-A", position=-5)
         )
         result = _execute_one(client, make_spec())
@@ -126,26 +132,26 @@ class TestExceptionDisambiguation:
         # Leg B raises but the YES position exists — the pair actually
         # completed; rolling back leg A would REVERSE the unhedged exposure.
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # leg A
             TimeoutError("timeout"),  # leg B raises after actually filling
         ])
-        client.get_positions = MagicMock(
+        client.get_positions_without_preload_content = MagicMock(
             return_value=positions_resp("TICK-B", position=5)
         )
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
         # No rollback order was submitted
-        assert client.create_order.call_count == 2
+        assert client.create_order_without_preload_content.call_count == 2
 
     def test_leg_b_exception_with_no_position_rolls_back(self):
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # leg A
             TimeoutError("timeout"),  # leg B raises, truly unfilled
             order_resp("executed"),   # rollback fills
         ])
-        client.get_positions = MagicMock(return_value=positions_resp())
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
 
@@ -157,12 +163,12 @@ class TestExceptionDisambiguation:
         # reporting "rolled_back" (which implies flat). Must surface for
         # manual review instead of guessing.
         client = MagicMock()
-        client.create_order = MagicMock(side_effect=[
+        client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # leg A
             TimeoutError("timeout"),  # leg B raises
         ])
-        client.get_positions = MagicMock(side_effect=RuntimeError("lookup failed"))
+        client.get_positions_without_preload_content = MagicMock(side_effect=RuntimeError("lookup failed"))
         result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         # No rollback order was submitted — only leg A and leg B's attempt
-        assert client.create_order.call_count == 2
+        assert client.create_order_without_preload_content.call_count == 2

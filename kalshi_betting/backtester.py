@@ -38,11 +38,11 @@ import pandas as pd
 from .config import (
     BUDGET_FRACTION,
     MAX_DEADLINE_GAP_DAYS,
-    MIN_PRICE_DIFF,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
     fee_leg_exact,
     fee_per_pair_approx,
+    min_price_diff_for_gap,
 )
 from .historical import (
     HistoricalApi,
@@ -321,9 +321,10 @@ def _find_entry(
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract, and an
-        entry requires pA − pB >= threshold (the earlier contract priced higher —
-        the anomaly). A pricier later contract is normal term structure and is
-        never traded.
+        entry requires pA − pB >= the deadline-gap-tiered threshold from
+        min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
+        the earlier contract priced higher is the anomaly. A pricier later
+        contract is normal term structure and is never traded.
       - same_title: market A is canonicalized per Monday as the more expensive
         side (the two contracts ask the identical question, so direction is
         price-only).
@@ -375,11 +376,15 @@ def _find_entry(
             close_a, close_b = close_b, close_a
         # Deadline gap is loop-invariant: pairs more than 30 days apart are too
         # weakly correlated for the time-series assumption to hold reliably
-        if (close_b - close_a).days > MAX_DEADLINE_GAP_DAYS:
+        gap_days = (close_b - close_a).days
+        if gap_days > MAX_DEADLINE_GAP_DAYS:
             return None
-
-    # Use the appropriate minimum price gap for this pair type
-    threshold = MIN_PRICE_DIFF if pair_type == "time_series" else SAME_TITLE_MIN_PRICE_DIFF
+        # Tier the required price gap by deadline distance (15% for gaps
+        # <= 15 days, 30% for 16-30 days) — mirrors scanner.find_time_series_pairs
+        threshold = min_price_diff_for_gap(gap_days)
+    else:
+        # same_title pairs have no deadline-gap concept — flat 5% threshold
+        threshold = SAME_TITLE_MIN_PRICE_DIFF
 
     for ts in _monday_timestamps(scan_start, scan_end):
         # Read the closing prices at this Monday snapshot

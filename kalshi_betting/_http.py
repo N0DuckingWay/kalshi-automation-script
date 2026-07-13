@@ -4,24 +4,36 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Shared HTTP retry helper for Kalshi SDK calls. Retries on rate-limit (429) and
-    transient server errors (5xx) with exponential backoff, using the exception's
-    HTTP status attribute rather than substring matching on the message. Both the
-    live scanner and the historical fetch pipeline import from here so backoff
-    behavior stays consistent and there is no scanner → historical reverse import.
+    Shared HTTP helpers for Kalshi SDK calls: a retry wrapper (429/5xx with
+    exponential backoff) and a raw-response JSON fetcher for the SDK's
+    `*_without_preload_content` endpoint variants. Both the live scanner and
+    the historical fetch pipeline import from here so backoff behavior stays
+    consistent and there is no scanner → historical reverse import.
 
 Dependencies:
-    No project imports — this module is a leaf so both scanner.py and historical.py
-    can import from it without introducing cycles.
+    No project imports — this module is a leaf so scanner.py, trader.py, and
+    historical.py can import from it without introducing cycles. Imports
+    ApiException from the kalshi_python_sync SDK to re-raise raw-response
+    HTTP errors with the same exception types the modeled calls used.
 
 Notes:
     The Kalshi SDK's ApiException exposes .status; requests-based errors expose
     .response.status_code. We look for either. Anything else is treated as
     non-retryable and re-raised immediately.
+
+    fetch_json_page() exists because of 2026-07 API drift: several endpoints
+    stopped sending the legacy integer-cent fields the pinned SDK's response
+    models type as required, so modeled calls raise pydantic ValidationError.
+    Raw-response variants bypass the models — but they also skip the SDK's
+    status check, which fetch_json_page restores.
 """
+import json
 import logging
 import time
 from collections.abc import Callable
+from typing import Any
+
+from kalshi_python_sync.exceptions import ApiException
 
 # HTTP status codes worth retrying: 429 (rate limit) plus common transient 5xx errors.
 # 500 / 502 / 503 / 504 sometimes appear during Kalshi maintenance or upstream blips.
@@ -60,6 +72,43 @@ def _extract_status(exc: BaseException) -> int | None:
         if isinstance(code, int):
             return code
     return None
+
+
+def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
+    """
+    Call a `*_without_preload_content` SDK method and parse the JSON body.
+
+    The raw-response variants bypass the SDK's response models (which 2026-07
+    API drift broke — see module Notes) but they ALSO skip the SDK's status
+    check and return 4xx/5xx bodies without raising. This helper restores the
+    original error behavior by raising ApiException.from_response on non-2xx
+    statuses, so api_call_with_retry keeps retrying 429/5xx exactly as it did
+    for the modeled calls.
+
+    Args:
+        fetch_fn: A bound `*_without_preload_content` method on KalshiClient.
+        **kwargs: Query parameters forwarded to the SDK method.
+
+    Returns:
+        dict: The parsed JSON response body.
+
+    Raises:
+        ApiException: (or a status-specific subclass) when the HTTP status is
+            not 2xx.
+    """
+    resp = fetch_fn(**kwargs)
+    # RESTResponse.data may be unread until .read() is called, depending on
+    # how the underlying urllib3 response was created
+    body = getattr(resp, "data", None)
+    if body is None and hasattr(resp, "read"):
+        body = resp.read()
+    if not 200 <= resp.status < 300:
+        raise ApiException.from_response(
+            http_resp=resp,
+            body=body.decode("utf-8") if isinstance(body, bytes) else body,
+            data=None,
+        )
+    return json.loads(body)
 
 
 def api_call_with_retry(fn: Callable, *args, **kwargs):
