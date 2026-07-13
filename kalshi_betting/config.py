@@ -87,6 +87,13 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # aborts to avoid wasting API calls when there is insufficient capital to trade.
 MIN_BALANCE_CENTS             = 5000
 
+# Warn (never cap/drop) when a backtester pair-extraction group still has more
+# than this many members after the eligibility prefilter and (for time-series
+# groups) the close-time windowing. Purely observability — lets us confirm
+# the O(n^2)-avoidance measures in backtester._extract_pairs are actually
+# keeping group sizes tractable at current Kalshi market volumes.
+LARGE_GROUP_WARN_THRESHOLD    = 1000
+
 # Whether to include multivariate (multi-choice) markets in scanning and backtesting.
 # When True, markets are grouped by (event_title + market_title) so cross-event
 # option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive

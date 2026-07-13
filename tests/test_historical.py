@@ -180,6 +180,7 @@ def _raw_market_dict(**overrides) -> dict:
         "yes_ask_dollars": "0.45",
         "no_ask_dollars": "0.55",
         "yes_bid_dollars": "0.43",
+        "open_time": "2024-12-01T00:00:00Z",
         "close_time": "2025-01-01T00:00:00Z",
         "settlement_ts": "2025-01-02T00:00:00Z",
         "status": "finalized",
@@ -206,6 +207,19 @@ class TestMarketToDict:
         # None, matching what the old SDK-model path produced
         d = historical._market_to_dict(_raw_market_dict())
         assert d["subtitle"] is None
+
+    def test_carries_open_time(self):
+        # open_time feeds backtester._can_ever_enter()'s eligibility prefilter
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["open_time"] == "2024-12-01T00:00:00Z"
+
+    def test_missing_open_time_maps_to_none(self):
+        # Pre-existing cache files / payloads without open_time must not crash
+        # the pipeline — _can_ever_enter treats None as "can't prove ineligibility"
+        raw = _raw_market_dict()
+        del raw["open_time"]
+        d = historical._market_to_dict(raw)
+        assert d["open_time"] is None
 
 
 class TestFetchAllSettledMarkets:
