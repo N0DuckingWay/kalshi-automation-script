@@ -225,9 +225,12 @@ class TestMarketToDict:
 class TestFetchAllSettledMarkets:
     def test_archive_early_stop_and_dict_output(self, tmp_path, monkeypatch):
         # The /historical/markets archive ignores settlement-time filters and
-        # is ordered newest-first; pagination must stop once a page predates
-        # start_date instead of walking the multi-million-market archive.
-        # Also verifies raw dicts flow through to the cached output format.
+        # is paged newest-first; the sequential walk must stop once a page
+        # predates start_date instead of walking the multi-million-market
+        # archive. These fake pages use opaque cursors and records without
+        # created_time, so the sharded path's synthesis check fails and the
+        # fetch exercises the sequential fallback — the path this early-stop
+        # rule lives on. Also verifies dicts flow through to the cached format.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
         monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
         from datetime import date
@@ -253,7 +256,7 @@ class TestFetchAllSettledMarkets:
                 return _raw_resp(pages["cutoff"])
             assert path.endswith("/historical/markets")
             calls["hist"] += 1
-            return _raw_resp(pages["hist1"] if calls["hist"] == 1 else pages["hist2"])
+            return _raw_resp(pages["hist2"] if params.get("cursor") == "C2" else pages["hist1"])
 
         monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
         live = MagicMock()
@@ -264,9 +267,11 @@ class TestFetchAllSettledMarkets:
         out = historical.fetch_all_settled_markets(
             MagicMock(), live, start_date=date(2026, 2, 1), use_cache=False,
         )
-        # Early stop: page 2 (all pre-start) is fetched, detected, and pagination
-        # halts even though its cursor points at a page 3
-        assert calls["hist"] == 2
+        # 3 archive calls: 1 synthesis probe (fails — opaque cursor), then the
+        # sequential walk's page 1 and page 2. Early stop: page 2 (all
+        # pre-start) is fetched, detected, and pagination halts even though
+        # its cursor points at a page 3.
+        assert calls["hist"] == 3
         tickers = {m["ticker"] for m in out}
         assert tickers == {"IN-WINDOW", "RECENT"}
         # Output dicts carry the exact cached format
@@ -281,8 +286,9 @@ class TestFetchAllSettledMarkets:
         # ENTIRE [cutoff_ts, now) range server-side (observed: 20k+ pages,
         # 20M+ records scanned just to reach a one-week window) even though
         # the server honors min_settled_ts and could narrow it directly. When
-        # start_date is LATER than the API cutoff, min_settled_ts must be
-        # raised to start_ts, not left at cutoff_ts.
+        # start_date is LATER than the API cutoff, no live window may reach
+        # below start_ts (the windowed sweep issues one call per settled-day,
+        # so the assertion covers the minimum across all calls).
         from datetime import UTC, date, datetime
 
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
@@ -304,15 +310,16 @@ class TestFetchAllSettledMarkets:
             MagicMock(), live, start_date=start_date, use_cache=False,
         )
         expected_min_ts = int(datetime(2026, 7, 6, tzinfo=UTC).timestamp())
-        _, kwargs = live.get_markets_without_preload_content.call_args
-        assert kwargs["min_settled_ts"] == expected_min_ts
+        seen_min_ts = [kwargs["min_settled_ts"] for _, kwargs
+                       in live.get_markets_without_preload_content.call_args_list]
+        assert min(seen_min_ts) == expected_min_ts
 
     def test_live_sweep_min_settled_ts_falls_back_to_cutoff_when_later(self, tmp_path, monkeypatch):
         # When start_date is EARLIER than the API cutoff (the common case —
         # default start_date is 2024-01-01), the live sweep must still start
         # at cutoff_ts, not start_date — the archive already covers everything
-        # before cutoff, so starting the live sweep earlier would just re-walk
-        # markets the historical endpoint already returned.
+        # before cutoff, and the live endpoint does not even serve pre-cutoff
+        # settlements (they migrate to the archive; live-verified 2026-07-13).
         from datetime import UTC, date, datetime
 
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
@@ -333,8 +340,388 @@ class TestFetchAllSettledMarkets:
             MagicMock(), live, start_date=date(2024, 1, 1), use_cache=False,
         )
         expected_min_ts = int(datetime(2026, 3, 1, tzinfo=UTC).timestamp())
-        _, kwargs = live.get_markets_without_preload_content.call_args
-        assert kwargs["min_settled_ts"] == expected_min_ts
+        seen_min_ts = [kwargs["min_settled_ts"] for _, kwargs
+                       in live.get_markets_without_preload_content.call_args_list]
+        assert min(seen_min_ts) == expected_min_ts
+
+
+# ─── Sharded-fetch fakes ──────────────────────────────────────────────────────
+#
+# _FakeArchive reproduces the real /historical/markets contract established by
+# live probing (2026-07-13): records paged in (created_time DESC, ticker DESC)
+# order behind a protobuf keyset cursor of the last record's position, with
+# every time-filter param ignored. _FakeLive reproduces /markets?status=settled:
+# settle-DESC ordering with min/max_settled_ts honored server-side. Together
+# they let the sharded fetch (cursor synthesis, day slicing, windowing,
+# fallbacks) be exercised entirely offline.
+
+def _mk_raw_market(tkr, created, settled, result="yes", **overrides):
+    m = {"ticker": tkr, "event_ticker": f"EV-{tkr}", "title": f"Q {tkr}",
+         "result": result, "yes_ask_dollars": "0.40", "no_ask_dollars": "0.60",
+         "yes_bid_dollars": "0.38", "created_time": created, "open_time": created,
+         "close_time": settled, "settlement_ts": settled, "status": "finalized"}
+    m.update(overrides)
+    return m
+
+
+def _created_key(m):
+    parts = historical._iso_epoch_parts(m["created_time"])
+    return (parts[0] + parts[1] / 1e9, m["ticker"])
+
+
+class _FakeArchive:
+    """In-memory /historical/markets: (created DESC, ticker DESC) keyset pages."""
+
+    def __init__(self, markets, page_size=3, opaque_cursors=False, fail_after=None):
+        self.markets = sorted(markets, key=_created_key, reverse=True)
+        self.page_size = page_size
+        self.opaque = opaque_cursors
+        self.fail_after = fail_after  # raise RuntimeError after N page calls
+        self.calls = 0
+
+    def page(self, cursor=None, **_):
+        self.calls += 1
+        if self.fail_after is not None and self.calls > self.fail_after:
+            raise RuntimeError("simulated network failure")
+        idx = 0
+        if cursor:
+            if self.opaque:
+                idx = int(cursor[1:])
+            else:
+                seconds, nanos, ticker = historical._decode_archive_cursor(cursor)
+                cursor_key = (seconds + nanos / 1e9, ticker)
+                # Keyset: first record strictly AFTER the cursor position in
+                # descending order, i.e. with a smaller (created, ticker) key.
+                idx = len(self.markets)
+                for i, m in enumerate(self.markets):
+                    if _created_key(m) < cursor_key:
+                        idx = i
+                        break
+        page = self.markets[idx: idx + self.page_size]
+        nxt = None
+        if page and idx + self.page_size < len(self.markets):
+            if self.opaque:
+                nxt = f"@{idx + self.page_size}"
+            else:
+                last = page[-1]
+                sec, nanos = historical._iso_epoch_parts(last["created_time"])
+                nxt = historical._encode_archive_cursor(sec, nanos, last["ticker"])
+        return {"markets": page, "cursor": nxt}
+
+
+class _FakeLive:
+    """In-memory /markets?status=settled honoring min/max_settled_ts."""
+
+    def __init__(self, markets, page_size=3, ignore_max=False):
+        self.markets = sorted(
+            markets, key=lambda m: historical._iso_epoch(m["settlement_ts"]),
+            reverse=True,
+        )
+        self.page_size = page_size
+        self.ignore_max = ignore_max
+        self.calls = 0
+
+    def get_markets_without_preload_content(self, min_settled_ts=None,
+                                            max_settled_ts=None, cursor=None, **_):
+        self.calls += 1
+        if self.ignore_max:
+            max_settled_ts = None
+        pool = [
+            m for m in self.markets
+            if (min_settled_ts is None
+                or historical._iso_epoch(m["settlement_ts"]) >= min_settled_ts)
+            and (max_settled_ts is None
+                 or historical._iso_epoch(m["settlement_ts"]) <= max_settled_ts)
+        ]
+        idx = int(cursor) if cursor else 0
+        page = pool[idx: idx + self.page_size]
+        nxt = str(idx + self.page_size) if page and idx + self.page_size < len(pool) else None
+        return _raw_resp({"markets": page, "cursor": nxt})
+
+
+def _install_sharded_fakes(monkeypatch, tmp_path, archive, cutoff_iso):
+    """Wire a _FakeArchive behind _signed_raw_get, isolate CACHE_DIR, and stub
+    out event-title resolution (network-only concern, tested separately)."""
+    monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(historical, "_load_or_build_event_titles",
+                        lambda *a, **k: {})
+
+    def fake_signed_get(client, path, **params):
+        if path.endswith("/historical/cutoff"):
+            return _raw_resp({"market_settled_ts": cutoff_iso})
+        assert path.endswith("/historical/markets")
+        return _raw_resp(archive.page(**params))
+
+    monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+
+
+def _old_semantics_expected(archive_markets, live_markets, start_ts, cutoff_ts,
+                            page_size=3):
+    """Oracle: the ticker set the ORIGINAL sequential implementation returns —
+    walk the archive newest-first with the settlement early-stop rule, then
+    sweep the live endpoint from max(cutoff_ts, start_ts)."""
+    expected = set()
+    walk = sorted(archive_markets, key=_created_key, reverse=True)
+    for page_start in range(0, len(walk), page_size):
+        page = walk[page_start: page_start + page_size]
+        for m in page:
+            settle = historical._iso_epoch(m["settlement_ts"])
+            if (m["result"] in ("yes", "no") and settle is not None
+                    and start_ts <= settle < cutoff_ts):
+                expected.add(m["ticker"])
+        newest = historical._iso_epoch(page[0]["settlement_ts"])
+        if newest is not None and newest < start_ts:
+            break
+    live_min = max(cutoff_ts, start_ts)
+    for m in live_markets:
+        settle = historical._iso_epoch(m["settlement_ts"])
+        if m["result"] in ("yes", "no") and settle is not None and settle >= live_min:
+            expected.add(m["ticker"])
+    return expected
+
+
+class TestShardedFetch:
+    """The parallel day-sliced fetch must return the same market set as the
+    original sequential walks, resume from day-slice files, and degrade to the
+    sequential paths whenever a runtime self-check fails."""
+
+    START = "2026-06-05"
+    CUTOFF = "2026-06-10T00:00:00Z"
+
+    @staticmethod
+    def _ts(iso):
+        from datetime import datetime
+        return int(datetime.fromisoformat(iso).timestamp())
+
+    def _fixture_markets(self):
+        # Archive spread over several created-days with edge cases:
+        # multiple pages per day, a created_time tie, a non-binary result, a
+        # record with no settlement_ts, a long-lived market created BEFORE
+        # start_date settling inside the window (tail territory), and
+        # fast-settled pre-start markets that trigger the early stop.
+        archive = [
+            # day 2026-06-09 (top day, 4 records → 2 pages at page_size 3)
+            _mk_raw_market("A1", "2026-06-09T20:00:00.500000Z", "2026-06-09T22:00:00Z"),
+            _mk_raw_market("A2", "2026-06-09T20:00:00.500000Z", "2026-06-09T21:00:00Z"),
+            _mk_raw_market("A3", "2026-06-09T10:00:00Z", "2026-06-09T12:00:00Z"),
+            _mk_raw_market("VOID", "2026-06-09T09:00:00Z", "2026-06-09T11:00:00Z",
+                           result="void"),
+            # day 2026-06-08
+            _mk_raw_market("B1", "2026-06-08T15:00:00Z", "2026-06-08T18:00:00Z"),
+            _mk_raw_market("NOSETTLE", "2026-06-08T14:00:00Z", "2026-06-08T16:00:00Z",
+                           settlement_ts=None),
+            # day 2026-06-07 (empty), day 2026-06-06
+            _mk_raw_market("C1", "2026-06-06T08:00:00Z", "2026-06-06T09:00:00Z"),
+            # day 2026-06-05 (bottom slice, record at the exact day boundary)
+            _mk_raw_market("D1", "2026-06-05T00:00:00Z", "2026-06-05T02:00:00Z"),
+            # tail: created before start_date but settled inside the window
+            _mk_raw_market("LONGLIVED", "2026-06-04T23:00:00Z", "2026-06-06T10:00:00Z"),
+            # pre-start fast markets: settle before start → early stop fodder
+            _mk_raw_market("OLD1", "2026-06-04T20:00:00Z", "2026-06-04T21:00:00Z"),
+            _mk_raw_market("OLD2", "2026-06-04T10:00:00Z", "2026-06-04T11:00:00Z"),
+            _mk_raw_market("OLD3", "2026-06-03T10:00:00Z", "2026-06-03T11:00:00Z"),
+            _mk_raw_market("OLD4", "2026-06-02T10:00:00Z", "2026-06-02T11:00:00Z"),
+        ]
+        # Live: post-cutoff settles across two days (frontier day is empty)
+        live = [
+            _mk_raw_market("L1", "2026-06-10T01:00:00Z", "2026-06-10T03:00:00Z"),
+            _mk_raw_market("L2", "2026-06-10T04:00:00Z", "2026-06-10T06:00:00Z"),
+            _mk_raw_market("L3", "2026-06-11T01:00:00Z", "2026-06-11T02:00:00Z"),
+            _mk_raw_market("LVOID", "2026-06-11T03:00:00Z", "2026-06-11T04:00:00Z",
+                           result="void"),
+        ]
+        return archive, live
+
+    def _run(self, monkeypatch, tmp_path, archive, live):
+        from datetime import date
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, self.CUTOFF)
+        return historical.fetch_all_settled_markets(
+            MagicMock(), live, start_date=date(2026, 6, 5), use_cache=False,
+        )
+
+    def test_sharded_matches_sequential_semantics(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        live = _FakeLive(live_markets)
+        out = self._run(monkeypatch, tmp_path, archive, live)
+
+        expected = _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert {m["ticker"] for m in out} == expected
+        assert "LONGLIVED" in expected  # the tail case is actually exercised
+        # No duplicate tickers despite deliberately overlapping slice boundaries
+        assert len(out) == len({m["ticker"] for m in out})
+        # Compact dict format survives the day store round-trip
+        a1 = next(m for m in out if m["ticker"] == "A1")
+        assert a1["open_time"] == "2026-06-09T20:00:00.500000Z"
+        assert a1["yes_ask_dollars"] == "0.40"
+
+    def test_second_run_reuses_day_slices(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        live = _FakeLive(live_markets)
+        out1 = self._run(monkeypatch, tmp_path, archive, live)
+        cold_archive_calls, cold_live_calls = archive.calls, live.calls
+
+        archive.calls = live.calls = 0
+        out2 = self._run(monkeypatch, tmp_path, archive, live)
+        assert {m["ticker"] for m in out2} == {m["ticker"] for m in out1}
+        # Run 2 skips every stored day slice: archive pays only the synthesis
+        # probe + the tail walk; live pays only the frontier window.
+        assert archive.calls < cold_archive_calls
+        assert live.calls < cold_live_calls
+        assert (tmp_path / "cache" / "archive_days").exists()
+        assert (tmp_path / "cache" / "live_days").exists()
+
+    def test_interrupted_run_resumes_from_day_slices(self, tmp_path, monkeypatch):
+        # Serialize the workers so the interruption point is deterministic:
+        # synthesis probe (1 call) + top day slice (2 pages) complete, then
+        # the next slice's first call dies.
+        monkeypatch.setattr(historical, "SETTLED_FETCH_MAX_WORKERS", 1)
+        archive_markets, live_markets = self._fixture_markets()
+
+        # Baseline: how many archive pages a cold, uninterrupted run costs.
+        cold_archive = _FakeArchive(archive_markets)
+        self._run(monkeypatch, tmp_path / "cold", cold_archive, _FakeLive(live_markets))
+        cold_calls = cold_archive.calls
+
+        archive = _FakeArchive(archive_markets, fail_after=3)
+        live = _FakeLive(live_markets)
+        with pytest.raises(RuntimeError):
+            self._run(monkeypatch, tmp_path / "warm", archive, live)
+        saved_before_crash = list(
+            (tmp_path / "warm" / "cache" / "archive_days").glob("*.json.gz"))
+        assert saved_before_crash  # at least one completed slice persisted
+
+        # Retry without the fault: completed slices are reused, result is whole.
+        archive.fail_after = None
+        archive.calls = 0
+        out = self._run(monkeypatch, tmp_path / "warm", archive, live)
+        expected = _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert {m["ticker"] for m in out} == expected
+        # The resumed run skips the slice(s) persisted before the crash, so it
+        # refetches strictly fewer archive pages than the cold run did.
+        assert archive.calls < cold_calls
+
+    def test_opaque_cursor_falls_back_to_sequential(self, tmp_path, monkeypatch):
+        # If the cursor format drifts, the synthesis probe must fail closed:
+        # no day slicing, no synthesized jumps — just the original walk.
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets, opaque_cursors=True)
+        live = _FakeLive(live_markets)
+        out = self._run(monkeypatch, tmp_path, archive, live)
+        expected = _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert {m["ticker"] for m in out} == expected
+        # The sequential path must not fabricate day-slice files
+        assert not (tmp_path / "cache" / "archive_days").exists()
+
+    def test_cutoff_advance_invalidates_archive_slices(self, tmp_path, monkeypatch):
+        # When Kalshi advances the archive cutoff, markets that settled in the
+        # gap MIGRATE from the live endpoint into the archive (and stop being
+        # served by the live endpoint — verified 2026-07-13). Day-slice files
+        # stamped with the old cutoff would silently miss them, so they must
+        # be refetched, not reused.
+        from datetime import date
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        live = _FakeLive(live_markets)
+        out1 = self._run(monkeypatch, tmp_path, archive, live)
+        assert "L1" in {m["ticker"] for m in out1}  # served by live pre-advance
+
+        # Advance the cutoff past 2026-06-11: L1/L2/L3 migrate to the archive.
+        new_cutoff = "2026-06-12T00:00:00Z"
+        migrated = _FakeArchive(archive_markets + live_markets)
+        empty_live = _FakeLive([])
+        _install_sharded_fakes(monkeypatch, tmp_path, migrated, new_cutoff)
+        out2 = historical.fetch_all_settled_markets(
+            MagicMock(), empty_live, start_date=date(2026, 6, 5), use_cache=False,
+        )
+        assert {m["ticker"] for m in out2} == _old_semantics_expected(
+            archive_markets + live_markets, [],
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(new_cutoff),
+        )
+        # The migrated markets must come from the refetched archive slices
+        assert {"L1", "L2", "L3"} <= {m["ticker"] for m in out2}
+
+    def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
+        # If the live endpoint stops honoring max_settled_ts, every window
+        # would silently re-walk the whole range; the first window detects it
+        # and the phase degrades to the original single sequential sweep.
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        live = _FakeLive(live_markets, ignore_max=True)
+        out = self._run(monkeypatch, tmp_path, archive, live)
+        expected = _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert {m["ticker"] for m in out} == expected
+
+
+class TestArchiveCursorCodec:
+    def test_roundtrip(self):
+        cursor = historical._encode_archive_cursor(
+            1778713796, 165186000, "KXMVECROSSCATEGORY-S2026AED5FC84CB7-70D7C8ECAC6",
+        )
+        assert historical._decode_archive_cursor(cursor) == (
+            1778713796, 165186000, "KXMVECROSSCATEGORY-S2026AED5FC84CB7-70D7C8ECAC6",
+        )
+
+    def test_known_bytes(self):
+        # Hand-computed protobuf: field 1 = Timestamp{seconds=1} (2-byte nested
+        # message 08 01), field 2 = "A" → 0a 02 08 01 12 01 41 → base64url
+        # "CgIIARIBQQ" (padding stripped).
+        assert historical._encode_archive_cursor(1, 0, "A") == "CgIIARIBQQ"
+
+    def test_zero_nanos_omitted(self):
+        # Synthesized boundary cursors carry nanos=0, which protobuf encoders
+        # omit; the decoder must default it back to 0.
+        cursor = historical._encode_archive_cursor(1_750_000_000, 0, "TICK")
+        assert historical._decode_archive_cursor(cursor) == (1_750_000_000, 0, "TICK")
+
+    def test_garbage_cursor_returns_none(self):
+        assert historical._decode_archive_cursor("!!not-base64!!") is None
+
+    def test_negative_varint_raises_instead_of_hanging(self):
+        # Python's arithmetic right shift never carries a negative value to 0,
+        # so without the guard a negative input (e.g. a pre-1970 timestamp)
+        # would spin the encoding loop forever inside a fetch worker.
+        with pytest.raises(ValueError):
+            historical._pb_varint(-1)
+        with pytest.raises(ValueError):
+            historical._encode_archive_cursor(-100, 0, "T")
+
+    def test_iso_epoch_parts_microsecond_to_nanos(self):
+        seconds, nanos = historical._iso_epoch_parts("2026-05-13T23:09:56.165186Z")
+        assert nanos == 165186000
+        from datetime import UTC, datetime
+        assert seconds == int(datetime(2026, 5, 13, 23, 9, 56, tzinfo=UTC).timestamp())
+
+
+class TestDayStore:
+    def test_meta_mismatch_rejects_file(self, tmp_path):
+        path = tmp_path / "2026-06-09.json.gz"
+        meta = {"kind": "archive_created_day", "cutoff_ts": 100,
+                "include_mve": True, "complete": True}
+        historical._day_store_save(path, meta, [{"ticker": "T1"}])
+        assert historical._day_store_load(path, meta) == [{"ticker": "T1"}]
+        # Any drifted expectation (advanced cutoff, flipped MVE flag) → refetch
+        assert historical._day_store_load(path, {**meta, "cutoff_ts": 200}) is None
+        assert historical._day_store_load(path, {**meta, "include_mve": False}) is None
+
+    def test_missing_or_corrupt_file(self, tmp_path):
+        path = tmp_path / "2026-06-09.json.gz"
+        assert historical._day_store_load(path, {}) is None
+        path.write_bytes(b"not gzip")
+        assert historical._day_store_load(path, {}) is None
 
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",

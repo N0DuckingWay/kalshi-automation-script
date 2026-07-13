@@ -32,10 +32,25 @@ Notes:
     therefore reached with direct signed GETs (_signed_raw_get) through the
     SDK's own KalshiAuth + rest client, and responses are parsed as raw JSON —
     same pattern as scanner.py/trader.py (see _http.fetch_json_page).
+
+    fetch_all_settled_markets is sharded and incremental (2026-07 rewrite):
+    the /historical/markets archive is paged by (created_time DESC, ticker
+    DESC) behind a protobuf cursor that this module can synthesize, so the
+    archive walk is split into per-day slices fetched in parallel and cached
+    to disk one day at a time (backtest_cache/archive_days/). The live
+    recently-settled sweep is likewise split into per-settled-day windows
+    (backtest_cache/live_days/) using the documented min/max_settled_ts
+    params. Both sharded paths runtime-verify their assumptions and fall back
+    to the original sequential walks if the API drifts. See
+    fetch_all_settled_markets for the full contract.
 """
+import base64
+import gzip
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
@@ -50,6 +65,7 @@ from .config import (
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
     PROJECT_ROOT,
+    SETTLED_FETCH_MAX_WORKERS,
 )
 
 # Host and path prefix split out of PROD_URL ("https://host/trade-api/v2") so
@@ -371,6 +387,853 @@ def _load_or_build_event_titles(
 
 # ─── Market fetching ──────────────────────────────────────────────────────────
 
+class _ShardedFetchUnsupported(Exception):
+    """
+    Raised when a runtime self-check shows the sharded fetch path cannot be
+    trusted: the archive cursor format has drifted, archive records stopped
+    carrying created_time, or the live endpoint stopped honoring
+    max_settled_ts. fetch_all_settled_markets catches this and falls back to
+    the original sequential walks, which rely only on documented behavior.
+    """
+
+
+# One archive/live day slice, in seconds. Slices are UTC calendar days.
+_DAY_SECONDS = 86_400
+
+# The /historical/markets archive rejects limit > 1000 and ignores every
+# server-side time-filter param (min/max_settled_ts and friends — all
+# live-verified 2026-07-13 to return the identical newest-first page), so the
+# only way to avoid one serial walk of the multi-million-record archive is its
+# pagination cursor. That cursor is a urlsafe-base64 protobuf of the keyset
+# position (created_time DESC, ticker DESC):
+#   field 1: google.protobuf.Timestamp of the last record's created_time
+#   field 2: the last record's ticker
+# Verified 2026-07-13: re-encoding a page's last record reproduces the server
+# cursor byte-for-byte, and a synthesized cursor continues the record stream
+# exactly. _archive_cursor_synthesis_ok re-verifies this at the start of every
+# fetch, so format drift degrades to the sequential path instead of silently
+# corrupting results.
+#
+# The sentinel sorts above every real ticker at a created_time tie, so a
+# synthesized cursor (T, sentinel) yields every record with created_time <= T
+# under the DESC tie-break. Records at exactly T with a ticker sorting above
+# the sentinel are still covered, because the slice ABOVE sweeps down through
+# its own lower boundary — no record can fall between two adjacent slices.
+_CURSOR_TICKER_SENTINEL = "ZZZZZZZZZZ"
+
+
+def _iso_epoch(ts: str | None) -> float | None:
+    """
+    Parse an ISO 8601 timestamp string to epoch seconds.
+
+    Args:
+        ts (str | None): ISO timestamp as sent by the API (e.g.
+            "2026-05-13T23:09:56.165186Z"), or None/empty.
+
+    Returns:
+        float | None: Epoch seconds, or None if ts is missing or unparseable.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _iso_epoch_parts(ts: str | None) -> tuple[int, int] | None:
+    """
+    Parse an ISO 8601 timestamp into (whole epoch seconds, nanoseconds).
+
+    Used to rebuild archive cursors, whose protobuf Timestamp splits the
+    instant into integer seconds + nanos. The API sends microsecond precision,
+    so nanos is microsecond * 1000 — this matches the server's own cursor
+    encoding (verified byte-for-byte, see _CURSOR_TICKER_SENTINEL block).
+
+    Args:
+        ts (str | None): ISO timestamp string, or None.
+
+    Returns:
+        tuple[int, int] | None: (seconds, nanos), or None if unparseable.
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    # Zero out the microseconds before .timestamp() so float rounding can
+    # never bleed a fraction into the integer seconds.
+    return int(dt.replace(microsecond=0).timestamp()), dt.microsecond * 1000
+
+
+def _pb_varint(value: int) -> bytes:
+    """
+    Encode a non-negative integer as a protobuf base-128 varint.
+
+    Args:
+        value (int): Non-negative integer to encode.
+
+    Returns:
+        bytes: Varint encoding (little-endian groups of 7 bits).
+
+    Raises:
+        ValueError: If value is negative — Python's arithmetic right shift
+            never carries a negative number to 0, so the encoding loop below
+            would otherwise run forever.
+    """
+    if value < 0:
+        raise ValueError(f"varint requires a non-negative integer, got {value}")
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _pb_read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """
+    Decode a protobuf varint from buf starting at pos.
+
+    Args:
+        buf (bytes): Buffer containing the varint.
+        pos (int): Offset of the varint's first byte.
+
+    Returns:
+        tuple[int, int]: (decoded value, offset just past the varint).
+
+    Raises:
+        IndexError: If the varint runs past the end of buf.
+    """
+    value = shift = 0
+    while True:
+        byte = buf[pos]
+        value |= (byte & 0x7F) << shift
+        pos += 1
+        if not (byte & 0x80):
+            return value, pos
+        shift += 7
+
+
+def _encode_archive_cursor(seconds: int, nanos: int, ticker: str) -> str:
+    """
+    Build an archive pagination cursor for a (created_time, ticker) position.
+
+    Produces the exact protobuf layout the server itself emits (field 1: a
+    nested Timestamp message with seconds/nanos varints; field 2: the ticker
+    string), base64url-encoded without padding.
+
+    Args:
+        seconds (int): created_time whole epoch seconds of the position.
+        nanos (int): created_time nanoseconds (0 for synthesized boundaries).
+        ticker (str): Ticker of the position; use _CURSOR_TICKER_SENTINEL for
+            synthesized slice boundaries.
+
+    Returns:
+        str: Cursor accepted by /historical/markets' cursor parameter.
+    """
+    ts_msg = b"\x08" + _pb_varint(seconds)
+    if nanos:
+        ts_msg += b"\x10" + _pb_varint(nanos)
+    tkr = ticker.encode()
+    msg = (b"\x0a" + _pb_varint(len(ts_msg)) + ts_msg
+           + b"\x12" + _pb_varint(len(tkr)) + tkr)
+    return base64.urlsafe_b64encode(msg).decode().rstrip("=")
+
+
+def _decode_archive_cursor(cursor: str) -> tuple[int, int, str] | None:
+    """
+    Decode an archive pagination cursor into its keyset position.
+
+    Args:
+        cursor (str): Cursor string returned by /historical/markets.
+
+    Returns:
+        tuple[int, int, str] | None: (created_time seconds, nanos, ticker),
+            or None if the cursor doesn't parse as the expected protobuf.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        pos = 0
+        seconds = nanos = 0
+        ticker = ""
+        while pos < len(raw):
+            tag, pos = _pb_read_varint(raw, pos)
+            field, wire_type = tag >> 3, tag & 7
+            if wire_type == 2:  # length-delimited
+                length, pos = _pb_read_varint(raw, pos)
+                payload = raw[pos:pos + length]
+                pos += length
+                if field == 1:  # nested Timestamp
+                    sub = 0
+                    while sub < len(payload):
+                        sub_tag, sub = _pb_read_varint(payload, sub)
+                        sub_val, sub = _pb_read_varint(payload, sub)
+                        if sub_tag >> 3 == 1:
+                            seconds = sub_val
+                        elif sub_tag >> 3 == 2:
+                            nanos = sub_val
+                elif field == 2:
+                    ticker = payload.decode()
+            elif wire_type == 0:
+                _, pos = _pb_read_varint(raw, pos)
+            else:
+                return None
+        return seconds, nanos, ticker
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return None
+
+
+class _FetchProgress:
+    """
+    Thread-safe page/market counters shared by parallel fetch workers.
+
+    Emits an INFO log line every 100 pages with the same wording the old
+    sequential loops used, so long fetches remain observable in the log.
+    """
+
+    def __init__(self, label: str):
+        """
+        Args:
+            label (str): Log-line prefix, e.g. "Historical archive".
+        """
+        self._label = label
+        self._lock = threading.Lock()
+        self.pages = 0
+        self.kept = 0
+
+    def tick(self, kept_delta: int) -> None:
+        """
+        Record one fetched page and how many of its markets were kept.
+
+        Args:
+            kept_delta (int): Number of markets kept from this page.
+        """
+        with self._lock:
+            self.pages += 1
+            self.kept += kept_delta
+            if self.pages % 100 == 0:
+                logging.info("%s: %d pages scanned, %d markets kept so far",
+                             self._label, self.pages, self.kept)
+
+
+# ─── Day-slice disk store ─────────────────────────────────────────────────────
+
+def _day_store_path(store: str, day_lo: int) -> Path:
+    """
+    Compute the on-disk path for one day-slice file.
+
+    Args:
+        store (str): Store subdirectory name ("archive_days" or "live_days").
+        day_lo (int): Epoch seconds of the slice's UTC midnight lower bound.
+
+    Returns:
+        Path: CACHE_DIR/<store>/<YYYY-MM-DD>.json.gz. CACHE_DIR is resolved at
+            call time so tests can monkeypatch it.
+    """
+    day = datetime.fromtimestamp(day_lo, tz=UTC).date().isoformat()
+    return CACHE_DIR / store / f"{day}.json.gz"
+
+
+def _day_store_load(path: Path, expect_meta: dict) -> list[dict] | None:
+    """
+    Load a day-slice file if it exists and its metadata matches expectations.
+
+    Args:
+        path (Path): File path from _day_store_path().
+        expect_meta (dict): Key/value pairs the file's meta block must match
+            exactly (e.g. cutoff_ts, include_mve, complete). A mismatch means
+            the file was written under different fetch conditions and must be
+            ignored (the caller refetches the day).
+
+    Returns:
+        list[dict] | None: The slice's compact market dicts, or None when the
+            file is absent, unreadable, or written under different conditions.
+    """
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    meta = payload.get("meta") or {}
+    if any(meta.get(k) != v for k, v in expect_meta.items()):
+        return None
+    return payload.get("markets") or []
+
+
+def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
+    """
+    Atomically persist one completed day slice to disk.
+
+    Written gzip-compressed (the settled-market history is tens of millions of
+    records; plain JSON would be ~10x larger) via a temp file + rename so an
+    interrupted run can never leave a truncated file that a later run would
+    trust.
+
+    Args:
+        path (Path): Destination path from _day_store_path().
+        meta (dict): Metadata block checked by _day_store_load on reuse.
+        markets (list[dict]): Compact market dicts (see _market_to_dict).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as fh:
+        json.dump({"meta": meta, "markets": markets}, fh)
+    tmp.replace(path)
+
+
+# ─── Archive (pre-cutoff) fetching ────────────────────────────────────────────
+
+def _archive_cursor_synthesis_ok(hist_client: Any, hist_kwargs: dict) -> bool:
+    """
+    Runtime check that archive cursors still follow the known protobuf format.
+
+    Fetches the archive's first page and re-encodes the last record's
+    (created_time, ticker) position; if the result matches the server-returned
+    cursor byte-for-byte, synthesized cursors are trustworthy and the sharded
+    fetch may proceed. Any mismatch (format drift, missing fields, empty
+    archive) disables sharding for this run.
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient from build_historical_client().
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+
+    Returns:
+        bool: True when cursor synthesis is verified safe to use.
+    """
+    data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets", **hist_kwargs)
+    page = data.get("markets") or []
+    cursor = data.get("cursor")
+    if not page or not cursor:
+        return False
+    last = page[-1]
+    parts = _iso_epoch_parts(last.get("created_time"))
+    ticker = last.get("ticker")
+    if parts is None or not ticker:
+        return False
+    seconds, nanos = parts
+    return _encode_archive_cursor(seconds, nanos, ticker) == cursor.rstrip("=")
+
+
+def _fetch_archive_day(
+    hist_client: Any,
+    day_lo: int,
+    day_hi: int,
+    hist_kwargs: dict,
+    progress: _FetchProgress,
+) -> list[dict]:
+    """
+    Fetch every settled binary market whose created_time falls in [day_lo, day_hi).
+
+    Jumps into the created-time-ordered archive with a synthesized cursor at
+    day_hi and pages downward until the slice's lower bound is crossed.
+    Records outside the created window are skipped (boundary records belong to
+    the adjacent slice); the settlement window is NOT applied here so the
+    stored slice stays valid for any start_date.
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient.
+        day_lo (int): Slice lower bound, epoch seconds (UTC midnight, inclusive).
+        day_hi (int): Slice upper bound, epoch seconds (exclusive).
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+        progress (_FetchProgress): Shared page counter for log output.
+
+    Returns:
+        list[dict]: Compact market dicts (created within the slice, binary
+            result, settlement_ts present), newest created_time first.
+
+    Raises:
+        _ShardedFetchUnsupported: If the synthesized cursor lands above day_hi
+            (server ignored it) or a record has no parseable created_time.
+    """
+    cursor = _encode_archive_cursor(day_hi, 0, _CURSOR_TICKER_SENTINEL)
+    kept: list[dict] = []
+    first_page = True
+    while True:
+        data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
+                               cursor=cursor, **hist_kwargs)
+        page = data.get("markets") or []
+        if first_page and page:
+            newest = _iso_epoch(page[0].get("created_time"))
+            # An invalid synthesized cursor silently restarts from the top of
+            # the archive (observed behavior) — detect the jump landing above
+            # the slice and bail out rather than crawling the whole archive.
+            if newest is None or newest > day_hi + 1.0:
+                raise _ShardedFetchUnsupported(
+                    f"synthesized cursor landed at {page[0].get('created_time')}, "
+                    f"above slice bound {day_hi}"
+                )
+        first_page = False
+        oldest_created = None
+        kept_before = len(kept)
+        for m in page:
+            created = _iso_epoch(m.get("created_time"))
+            if created is None:
+                raise _ShardedFetchUnsupported("archive record without created_time")
+            oldest_created = created
+            if not day_lo <= created < day_hi:
+                continue
+            if m.get("result") not in ("yes", "no") or not m.get("settlement_ts"):
+                continue
+            # Normalize immediately — holding raw archive payloads (30+ fields
+            # plus nested mve_selected_legs) for millions of records is what
+            # caused the multi-minute GC/memory stalls in the old fetch.
+            kept.append(_market_to_dict(m))
+        progress.tick(len(kept) - kept_before)
+        cursor = data.get("cursor")
+        # Stop once the page bottom crossed below the slice (deeper pages are
+        # older still), the archive is exhausted, or the server sent nothing.
+        if not cursor or not page or (oldest_created is not None and oldest_created < day_lo):
+            return kept
+
+
+def _fetch_archive_tail(
+    hist_client: Any,
+    start_ts: int,
+    cutoff_ts: int,
+    hist_kwargs: dict,
+    progress: _FetchProgress,
+) -> list[dict]:
+    """
+    Continue the archive walk below created_time == start_ts.
+
+    The archive is ordered by created_time, not settlement time, so markets
+    CREATED before start_date can still SETTLE inside the backtest window
+    (long-lived markets). The sequential walk caught those by keeping any
+    in-window settlement it passed until its settlement-based early stop
+    fired; this tail reproduces exactly that behavior — page downward from
+    created_time == start_ts, keep in-window settlements, and stop at the
+    first page whose newest record settled before start_ts (the original
+    early-stop rule).
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient.
+        start_ts (int): Backtest window start, epoch seconds (UTC midnight).
+        cutoff_ts (int): Archive/live boundary from /historical/cutoff.
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+        progress (_FetchProgress): Shared page counter for log output.
+
+    Returns:
+        list[dict]: Compact market dicts created before start_ts that settled
+            within [start_ts, cutoff_ts).
+
+    Raises:
+        _ShardedFetchUnsupported: If the synthesized start cursor lands above
+            start_ts (server ignored it).
+    """
+    cursor = _encode_archive_cursor(start_ts, 0, _CURSOR_TICKER_SENTINEL)
+    kept: list[dict] = []
+    first_page = True
+    while True:
+        data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
+                               cursor=cursor, **hist_kwargs)
+        page = data.get("markets") or []
+        if first_page and page:
+            newest = _iso_epoch(page[0].get("created_time"))
+            if newest is None or newest > start_ts + 1.0:
+                raise _ShardedFetchUnsupported(
+                    "synthesized tail cursor landed above start_ts"
+                )
+        first_page = False
+        kept_before = len(kept)
+        for m in page:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or m.get("result") not in ("yes", "no"):
+                continue
+            if not start_ts <= settle < cutoff_ts:
+                continue
+            created = _iso_epoch(m.get("created_time"))
+            # Records created exactly at start_ts belong to the bottom day
+            # slice; skipping them here avoids double-collection (the final
+            # ticker dedup would drop them anyway).
+            if created is not None and created >= start_ts:
+                continue
+            kept.append(_market_to_dict(m))
+        progress.tick(len(kept) - kept_before)
+        next_cursor = data.get("cursor")
+        if not next_cursor or not page:
+            return kept
+        # Original early-stop rule: once even the newest record on a page
+        # settled before start_ts, deeper pages hold nothing collectible.
+        newest_settle = _iso_epoch(page[0].get("settlement_ts"))
+        if newest_settle is not None and newest_settle < start_ts:
+            logging.info(
+                "Historical archive tail page predates the backtest window — "
+                "stopping pagination early"
+            )
+            return kept
+        cursor = next_cursor
+
+
+def _fetch_archive_sequential(
+    hist_client: Any,
+    start_ts: int,
+    cutoff_ts: int,
+    hist_kwargs: dict,
+) -> list[dict]:
+    """
+    Original sequential archive walk — the sharding fallback path.
+
+    Pages the archive from the top with the server-provided cursor chain,
+    keeping every binary market that settled within [start_ts, cutoff_ts),
+    and stops at the first page whose newest record settled before start_ts.
+    Relies only on documented pagination behavior, so it works even if the
+    cursor format drifts. Slow (one serial request per 1000 records) but
+    always correct.
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient.
+        start_ts (int): Backtest window start, epoch seconds.
+        cutoff_ts (int): Archive/live boundary from /historical/cutoff.
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+
+    Returns:
+        list[dict]: Compact market dicts settled within [start_ts, cutoff_ts).
+    """
+    selected: list[dict] = []
+    cursor = None
+    page_no = 0
+    while True:
+        kwargs: dict = dict(hist_kwargs)
+        # Include cursor for pages after the first to continue pagination
+        if cursor:
+            kwargs["cursor"] = cursor
+        data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets", **kwargs)
+        page_markets = data.get("markets") or []
+        for m in page_markets:
+            # Skip markets without a settlement timestamp or with a non-binary result
+            settle_epoch = _iso_epoch(m.get("settlement_ts"))
+            if settle_epoch is None or m.get("result") not in ("yes", "no"):
+                continue
+            # Only include markets that settled within our [start_ts, cutoff_ts) window
+            if settle_epoch < start_ts or settle_epoch >= cutoff_ts:
+                continue
+            selected.append(_market_to_dict(m))
+        page_no += 1
+        if page_no % 100 == 0:
+            logging.info("Historical archive: %d pages scanned, %d markets kept so far",
+                         page_no, len(selected))
+        cursor = data.get("cursor")
+        # A None or empty cursor signals the last page
+        if not cursor:
+            break
+        # The archive walk must stop once a page lies entirely before the
+        # backtest window — the archive ignores settlement-time filters
+        # server-side, so without this the loop pages the full multi-million-
+        # market archive no matter how recent start_date is. The newest market
+        # on the page is its first entry; if even that predates start_ts,
+        # every later page is older still.
+        newest_epoch = _iso_epoch(page_markets[0].get("settlement_ts")) if page_markets else None
+        if newest_epoch is not None and newest_epoch < start_ts:
+            logging.info(
+                "Historical archive page predates the backtest window — "
+                "stopping pagination early"
+            )
+            break
+    return selected
+
+
+def _fetch_archive_phase(
+    hist_client: Any,
+    start_ts: int,
+    cutoff_ts: int,
+    hist_kwargs: dict,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Fetch the archive's contribution: created-day slices plus the below-start tail.
+
+    Sharded path (preferred): verify cursor synthesis, then fetch one slice
+    per UTC created-day in [start_ts, cutoff_ts) — reusing any slice already
+    on disk from a previous run — with SETTLED_FETCH_MAX_WORKERS parallel
+    workers, then walk the tail below start_ts. Each completed slice is
+    persisted immediately, so an interrupted fetch resumes at day granularity
+    instead of restarting the multi-hour walk.
+
+    Slice files are stamped with the cutoff_ts they were fetched under and are
+    ONLY reused while the stamp matches the current cutoff: when Kalshi
+    advances the cutoff, markets that settled in the gap migrate from the live
+    endpoint into the archive (and disappear from the live endpoint —
+    verified 2026-07-13), so pre-advance slice files would silently miss them.
+
+    Falls back to _fetch_archive_sequential on any _ShardedFetchUnsupported.
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient.
+        start_ts (int): Backtest window start, epoch seconds (UTC midnight).
+        cutoff_ts (int): Archive/live boundary from /historical/cutoff.
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+
+    Returns:
+        tuple[list[dict], list[dict]]: (day-slice records newest-day first,
+            tail records). Day-slice records are NOT yet settlement-filtered
+            (the caller applies the [start_ts, cutoff_ts) window); tail
+            records already are. On the sequential fallback, everything is
+            returned fully filtered in the first list and the second is empty.
+    """
+    try:
+        if not _archive_cursor_synthesis_ok(hist_client, hist_kwargs):
+            raise _ShardedFetchUnsupported("archive cursor re-encoding mismatch")
+
+        # One slice per UTC day of created_time. All archive records satisfy
+        # created < settle < cutoff, so days at/above the cutoff can't exist.
+        day_los = list(range(start_ts, cutoff_ts, _DAY_SECONDS))
+        expect_meta = {
+            "kind": "archive_created_day",
+            "cutoff_ts": cutoff_ts,
+            "include_mve": INCLUDE_MVE_MARKETS,
+            "complete": True,
+        }
+        results: dict[int, list[dict]] = {}
+        to_fetch: list[int] = []
+        for lo in day_los:
+            cached = _day_store_load(_day_store_path("archive_days", lo), expect_meta)
+            if cached is not None:
+                results[lo] = cached
+            else:
+                to_fetch.append(lo)
+        logging.info("Archive day slices: %d reused from disk, %d to fetch",
+                     len(results), len(to_fetch))
+
+        progress = _FetchProgress("Historical archive")
+        if to_fetch:
+            # Newest days first so the biggest slices (recent volume is far
+            # higher) start immediately and the pool drains evenly.
+            to_fetch.sort(reverse=True)
+            with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
+                futures = {
+                    pool.submit(_fetch_archive_day, hist_client, lo, lo + _DAY_SECONDS,
+                                hist_kwargs, progress): lo
+                    for lo in to_fetch
+                }
+                for future in as_completed(futures):
+                    lo = futures[future]
+                    day_markets = future.result()
+                    # Persist each slice as soon as it completes so an
+                    # interrupted run resumes here instead of refetching.
+                    _day_store_save(
+                        _day_store_path("archive_days", lo),
+                        {**expect_meta,
+                         "day": datetime.fromtimestamp(lo, tz=UTC).date().isoformat(),
+                         "fetched_at": datetime.now(UTC).isoformat()},
+                        day_markets,
+                    )
+                    results[lo] = day_markets
+
+        # Long-lived markets created before start_date but settling inside the
+        # window — same records the sequential walk picked up past start_ts.
+        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+
+        day_records = [m for lo in sorted(results, reverse=True) for m in results[lo]]
+        return day_records, tail
+    except _ShardedFetchUnsupported as exc:
+        logging.warning(
+            "Archive fetch: sharded path unavailable (%s) — falling back to the "
+            "sequential walk", exc,
+        )
+        return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts, hist_kwargs), []
+
+
+# ─── Live (post-cutoff) fetching ──────────────────────────────────────────────
+
+def _fetch_live_window(
+    live_client,
+    win_lo: int,
+    win_hi: int | None,
+    progress: _FetchProgress,
+) -> list[dict]:
+    """
+    Fetch settled binary markets from the live endpoint for one settled-time window.
+
+    Uses the documented min_settled_ts/max_settled_ts params (both honored
+    server-side — verified 2026-07-13), so unlike the archive this needs no
+    cursor synthesis. Results are sorted newest-settled first by the server.
+
+    Args:
+        live_client: KalshiClient from build_prod_live_client().
+        win_lo (int): Window lower bound (min_settled_ts), epoch seconds.
+        win_hi (int | None): Window upper bound (max_settled_ts), or None for
+            the open-ended frontier window that runs to "now".
+        progress (_FetchProgress): Shared page counter for log output.
+
+    Returns:
+        list[dict]: Compact market dicts with a binary result and a
+            settlement_ts (no settlement-window filtering beyond the server's;
+            the caller applies the backtest window).
+
+    Raises:
+        _ShardedFetchUnsupported: If the first page contains a settlement
+            far above win_hi, i.e. the server stopped honoring max_settled_ts.
+    """
+    kept: list[dict] = []
+    cursor = None
+    first_page = True
+    while True:
+        kwargs: dict = {"status": "settled", "limit": 1000, "min_settled_ts": win_lo}
+        if win_hi is not None:
+            kwargs["max_settled_ts"] = win_hi
+        if not INCLUDE_MVE_MARKETS:
+            kwargs["mve_filter"] = "exclude"
+        if cursor:
+            kwargs["cursor"] = cursor
+        # Raw-response call: the modeled get_markets can no longer deserialize
+        # live payloads (see module Notes); retry semantics are unchanged
+        data = api_call_with_retry(
+            fetch_json_page, live_client.get_markets_without_preload_content, **kwargs
+        )
+        page = data.get("markets") or []
+        kept_before = len(kept)
+        for m in page:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or m.get("result") not in ("yes", "no"):
+                continue
+            if first_page and win_hi is not None and settle > win_hi + 3600:
+                # Results are newest-first; a first record an hour past the
+                # requested ceiling means max_settled_ts is being ignored and
+                # every window would re-walk the whole range.
+                raise _ShardedFetchUnsupported("live endpoint ignored max_settled_ts")
+            kept.append(_market_to_dict(m))
+        first_page = False
+        progress.tick(len(kept) - kept_before)
+        cursor = data.get("cursor")
+        if not cursor or not page:
+            return kept
+
+
+def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
+    """
+    Original single-sweep live fetch — the windowing fallback path.
+
+    One serial cursor walk over [live_min_ts, now), exactly the pre-sharding
+    behavior. Used only when _fetch_live_window detects that max_settled_ts is
+    no longer honored server-side.
+
+    Args:
+        live_client: KalshiClient from build_prod_live_client().
+        live_min_ts (int): Server-side window start (min_settled_ts).
+
+    Returns:
+        list[dict]: Compact market dicts with a binary result and settlement_ts.
+    """
+    kept: list[dict] = []
+    cursor = None
+    page_no = 0
+    while True:
+        kwargs: dict = {"status": "settled", "limit": 1000, "min_settled_ts": live_min_ts}
+        if not INCLUDE_MVE_MARKETS:
+            kwargs["mve_filter"] = "exclude"
+        if cursor:
+            kwargs["cursor"] = cursor
+        # Raw-response call: the modeled get_markets can no longer deserialize
+        # live payloads (see module Notes); retry semantics are unchanged
+        data = api_call_with_retry(
+            fetch_json_page, live_client.get_markets_without_preload_content, **kwargs
+        )
+        for m in data.get("markets") or []:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or m.get("result") not in ("yes", "no"):
+                continue
+            kept.append(_market_to_dict(m))
+        page_no += 1
+        if page_no % 100 == 0:
+            logging.info("Live settled sweep: %d pages scanned, %d markets kept so far",
+                         page_no, len(kept))
+        cursor = data.get("cursor")
+        if not cursor:
+            return kept
+
+
+def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
+    """
+    Fetch the live endpoint's contribution: per-settled-day windows in parallel.
+
+    Splits [live_min_ts, now) into UTC settled-day windows plus an open-ended
+    frontier window for the current day. Fully-elapsed days are immutable
+    (settlement timestamps never change), so completed day windows are
+    persisted to backtest_cache/live_days/ and reused by later runs — only
+    the frontier day and any never-fetched days hit the API. The frontier
+    window is deliberately never persisted: it was fetched mid-day and would
+    otherwise be reused as if complete.
+
+    Falls back to _fetch_live_sequential if the server stops honoring
+    max_settled_ts (detected per window by _fetch_live_window).
+
+    Args:
+        live_client: KalshiClient from build_prod_live_client().
+        live_min_ts (int): Server-side window start — max(cutoff_ts, start_ts).
+            Bug fixed 2026-07: this used to always be cutoff_ts, which forced
+            the server to walk the entire [cutoff_ts, now) range for a narrow
+            recent start_date (observed 20k+ pages discarded client-side).
+        now_ts (int): Current epoch seconds; determines the frontier day.
+
+    Returns:
+        list[dict]: Compact market dicts, frontier first then past days
+            newest-first (no settlement filtering beyond min_settled_ts; the
+            caller applies the backtest window).
+    """
+    first_lo = live_min_ts - (live_min_ts % _DAY_SECONDS)
+    today_lo = now_ts - (now_ts % _DAY_SECONDS)
+    frontier_lo = max(today_lo, first_lo)
+    past_day_los = list(range(first_lo, frontier_lo, _DAY_SECONDS))
+
+    expect_meta = {
+        "kind": "live_settled_day",
+        "include_mve": INCLUDE_MVE_MARKETS,
+        "complete": True,
+    }
+    try:
+        results: dict[int, list[dict]] = {}
+        to_fetch: list[int] = []
+        for lo in past_day_los:
+            cached = _day_store_load(_day_store_path("live_days", lo), expect_meta)
+            if cached is not None:
+                results[lo] = cached
+            else:
+                to_fetch.append(lo)
+        logging.info("Live settled-day windows: %d reused from disk, %d to fetch "
+                     "(plus the frontier day)", len(results), len(to_fetch))
+
+        progress = _FetchProgress("Live settled sweep")
+        to_fetch.sort(reverse=True)
+        frontier: list[dict] = []
+        with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
+            frontier_future = pool.submit(
+                _fetch_live_window, live_client, frontier_lo, None, progress
+            )
+            futures = {
+                pool.submit(_fetch_live_window, live_client, lo, lo + _DAY_SECONDS,
+                            progress): lo
+                for lo in to_fetch
+            }
+            for future in as_completed(futures):
+                lo = futures[future]
+                day_markets = future.result()
+                # Persist each completed (fully-elapsed, hence immutable) day
+                # so later runs and interrupted-run resumes skip it entirely.
+                _day_store_save(
+                    _day_store_path("live_days", lo),
+                    {**expect_meta,
+                     "day": datetime.fromtimestamp(lo, tz=UTC).date().isoformat(),
+                     "fetched_at": datetime.now(UTC).isoformat()},
+                    day_markets,
+                )
+                results[lo] = day_markets
+            frontier = frontier_future.result()
+
+        return frontier + [m for lo in sorted(results, reverse=True) for m in results[lo]]
+    except _ShardedFetchUnsupported as exc:
+        logging.warning(
+            "Live fetch: windowed path unavailable (%s) — falling back to the "
+            "sequential sweep", exc,
+        )
+        return _fetch_live_sequential(live_client, live_min_ts)
+
+
 def fetch_all_settled_markets(
     hist_client: Any,
     live_client,
@@ -381,34 +1244,50 @@ def fetch_all_settled_markets(
     Fetch all settled Kalshi markets from start_date onward and return them as plain dicts.
 
     Uses two complementary API endpoints to get full coverage:
-    - /historical/markets — settled markets archived before the API cutoff timestamp.
-      This endpoint holds the bulk of historical data.
-    - /markets?status=settled — markets that settled after the API cutoff, fetched
-      via the regular live endpoint. This fills the gap between the archive and now.
-      Bounded server-side by min_settled_ts=max(cutoff_ts, start_ts) so a narrow
-      recent start_date doesn't force a walk of the entire cutoff→now range.
+    - /historical/markets — settled markets archived before the API cutoff
+      timestamp. Fetched as parallel per-created-day slices via synthesized
+      pagination cursors (see _fetch_archive_phase), plus a tail walk below
+      start_date for long-lived markets; falls back to the original
+      sequential walk if the cursor format ever drifts.
+    - /markets?status=settled — markets that settled after the API cutoff.
+      Fetched as parallel per-settled-day windows bounded server-side by
+      min/max_settled_ts (see _fetch_live_phase), starting at
+      max(cutoff_ts, start_ts) so a narrow recent start_date doesn't force a
+      walk of the entire cutoff→now range.
 
-    Results are serialized to a JSON cache file keyed by start_date so subsequent
-    backtests do not re-fetch. Pass use_cache=False or use --no-cache to force a
-    fresh pull (necessary when new markets have settled since the last cache write).
-    A freshly fetched result is always written back to the cache file regardless
-    of use_cache, so a --no-cache run actually refreshes what the next default
-    (cached) run will load.
+    Both phases persist each completed day slice to disk
+    (backtest_cache/archive_days/, backtest_cache/live_days/), so an
+    interrupted fetch resumes at day granularity and later runs only fetch
+    days not already covered. Day slices are reused regardless of use_cache
+    because they cannot go stale: archive slices are only reused while their
+    recorded cutoff matches the current one (a cutoff advance migrates
+    markets between endpoints and invalidates them), and live slices cover
+    fully-elapsed UTC days whose settlements are immutable — the current
+    (frontier) day is always refetched.
+
+    The assembled result is serialized to a JSON cache file keyed by
+    start_date so subsequent backtests skip fetching entirely. Pass
+    use_cache=False (--no-cache) to rebuild it — thanks to the day stores
+    that now only costs the frontier day plus any newly-appeared days. A
+    fresh result is always written back regardless of use_cache, so a
+    --no-cache run refreshes what the next default run will load.
 
     Args:
         hist_client (Any): Authenticated KalshiClient from build_historical_client().
         live_client: KalshiClient from build_prod_live_client() for recent settlements.
         start_date (date): Earliest settlement date to include. Markets that settled
             before this date are skipped even if the API returns them.
-        use_cache (bool): If True (default), load from disk cache if available and
-            skip the API fetch entirely. If False, always fetch from the API. Either
-            way, a fetch that occurs is always saved to disk.
+        use_cache (bool): If True (default), load the assembled per-start_date
+            cache if available and skip fetching entirely. If False, always
+            re-assemble from the API + day stores. Either way the result is
+            saved to disk.
 
     Returns:
         list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
-            title, subtitle, result ("yes" | "no"), yes_ask_dollars, no_ask_dollars,
-            yes_bid_dollars, close_time (ISO str), settlement_ts (ISO str), status.
-            Only includes markets with a non-null settlement_ts and a binary result.
+            event_title, title, subtitle, result ("yes" | "no"), yes_ask_dollars,
+            no_ask_dollars, yes_bid_dollars, open_time, close_time (ISO str),
+            settlement_ts (ISO str), status. Only includes markets with a
+            non-null settlement_ts and a binary result; tickers are unique.
     """
     cache_path = CACHE_DIR / f"settled_markets_{start_date.isoformat()}.json"
     if use_cache:
@@ -425,116 +1304,54 @@ def fetch_all_settled_markets(
     cutoff    = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")
     cutoff_ts = int(datetime.fromisoformat(cutoff["market_settled_ts"]).timestamp())
 
-    # Collect raw market dicts first (deferred normalization) so event titles
-    # can be resolved in one batch after both endpoints are drained.
-    selected_markets: list[dict] = []
-
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
     # when False, the legacy "exclude" behaviour is preserved.
-    hist_base_kwargs: dict = {"limit": 1000}
+    hist_kwargs: dict = {"limit": 1000}
     if not INCLUDE_MVE_MARKETS:
-        hist_base_kwargs["mve_filter"] = "exclude"
-
-    def _settle_epoch(m: dict) -> int | None:
-        """Parse a raw market's settlement_ts ISO string to epoch seconds."""
-        ts = m.get("settlement_ts")
-        if not ts:
-            return None
-        try:
-            return int(datetime.fromisoformat(ts).timestamp())
-        except (ValueError, TypeError):
-            return None
+        hist_kwargs["mve_filter"] = "exclude"
 
     # ── Historical endpoint ───────────────────────────────────────────────────
     logging.info("Fetching historical settled markets (settled before API cutoff)...")
-    cursor = None
-    page_no = 0
-    while True:
-        kwargs: dict = dict(hist_base_kwargs)
-        # Include cursor for pages after the first to continue pagination
-        if cursor:
-            kwargs["cursor"] = cursor
-        data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets", **kwargs)
-        page_markets = data.get("markets") or []
-        for m in page_markets:
-            # Skip markets without a settlement timestamp or with a non-binary result
-            settle_epoch = _settle_epoch(m)
-            if settle_epoch is None or m.get("result") not in ("yes", "no"):
+    # Sharded parallel fetch with day-level disk reuse; sequential on fallback
+    day_records, tail_records = _fetch_archive_phase(
+        hist_client, start_ts, cutoff_ts, hist_kwargs
+    )
+
+    # Assembly: settlement-window filter + first-wins ticker dedup. Adjacent
+    # day slices, the tail walk, and live windows deliberately overlap at
+    # their boundaries so no record can fall in a gap; dedup collapses those
+    # overlaps without changing the set (tickers are unique per market).
+    selected: dict[str, dict] = {}
+
+    def _merge(records: list[dict], max_settle: int | None) -> None:
+        """Merge compact dicts into `selected`, keeping settlements within
+        [start_ts, max_settle) (max_settle None = unbounded above)."""
+        for m in records:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or settle < start_ts:
                 continue
-            # Only include markets that settled within our [start_ts, cutoff_ts) window
-            if settle_epoch < start_ts or settle_epoch >= cutoff_ts:
+            if max_settle is not None and settle >= max_settle:
                 continue
-            selected_markets.append(m)
-        page_no += 1
-        if page_no % 100 == 0:
-            logging.info("Historical archive: %d pages scanned, %d markets kept so far",
-                         page_no, len(selected_markets))
-        cursor = data.get("cursor")
-        # A None or empty cursor signals the last page
-        if not cursor:
-            break
-        # The archive is ordered newest-first by settlement time and ignores
-        # settlement-time filters server-side, so paging must stop once a page
-        # lies ENTIRELY before the backtest window — otherwise the loop pages
-        # the full multi-million-market archive (observed ~60k settlements per
-        # day) no matter how recent start_date is. The newest market on the
-        # page is its first entry; if even that predates start_ts, every later
-        # page is older still.
-        newest_epoch = _settle_epoch(page_markets[0]) if page_markets else None
-        if newest_epoch is not None and newest_epoch < start_ts:
-            logging.info(
-                "Historical archive page predates start_date %s — stopping pagination early",
-                start_date,
-            )
-            break
-    logging.info("Historical endpoint: %d markets from %s", len(selected_markets), start_date)
+            ticker = m.get("ticker")
+            if ticker and ticker not in selected:
+                selected[ticker] = m
+
+    _merge(day_records, cutoff_ts)
+    _merge(tail_records, cutoff_ts)
+    archive_count = len(selected)
+    logging.info("Historical endpoint: %d markets from %s", archive_count, start_date)
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
-    # min_settled_ts is honored server-side here (unlike the archive), so this
-    # loop is bounded to the [live_min_ts, now) window by the API itself.
+    # min_settled_ts is honored server-side, so the sweep is bounded to
+    # [live_min_ts, now) by the API itself; see _fetch_live_phase for why the
+    # lower bound is max(cutoff_ts, start_ts) rather than bare cutoff_ts.
     logging.info("Fetching recently settled markets (after API cutoff)...")
-    recent_count = 0
-    cursor = None
-    page_no = 0
-    # Bug fixed 2026-07: this used to always pass cutoff_ts, so a narrow recent
-    # start_date (e.g. last 7 days) still forced the server to walk the ENTIRE
-    # [cutoff_ts, now) range — observed 20k+ pages (20M+ records) scanned with
-    # the client-side start_ts filter silently discarding nearly all of them,
-    # because cutoff_ts can trail far behind now. Since the server already
-    # honors min_settled_ts, raising it to start_ts whenever start_ts is the
-    # tighter (later) bound eliminates that wasted paging entirely — it can
-    # only narrow the server-side window, never miss markets the client-side
-    # settle_epoch < start_ts check wasn't already going to discard anyway.
     live_min_ts = max(cutoff_ts, start_ts)
-    while True:
-        kwargs = {"status": "settled", "limit": 1000, "min_settled_ts": live_min_ts}
-        if not INCLUDE_MVE_MARKETS:
-            kwargs["mve_filter"] = "exclude"
-        if cursor:
-            kwargs["cursor"] = cursor
-        # Raw-response call: the modeled get_markets can no longer deserialize
-        # live payloads (see module Notes); retry semantics are unchanged
-        data = api_call_with_retry(
-            fetch_json_page, live_client.get_markets_without_preload_content, **kwargs
-        )
-        for m in data.get("markets") or []:
-            settle_epoch = _settle_epoch(m)
-            if settle_epoch is None or m.get("result") not in ("yes", "no"):
-                continue
-            # Apply start_date filter here too since the API doesn't filter by settlement date
-            if settle_epoch < start_ts:
-                continue
-            selected_markets.append(m)
-            recent_count += 1
-        page_no += 1
-        if page_no % 100 == 0:
-            logging.info("Live settled sweep: %d pages scanned, %d markets kept so far",
-                         page_no, recent_count)
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-    logging.info("Live endpoint: %d recently settled markets", recent_count)
+    # Windowed parallel fetch with settled-day disk reuse; sequential on fallback
+    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()))
+    _merge(live_records, None)
+    logging.info("Live endpoint: %d recently settled markets", len(selected) - archive_count)
 
     # ── Attach event titles ───────────────────────────────────────────────────
     # Collect unique event_tickers and look up their titles in one batch so the
@@ -543,14 +1360,17 @@ def fetch_all_settled_markets(
     # wouldn't change anything for binary-only markets.
     titles: dict[str, str] = {}
     if INCLUDE_MVE_MARKETS:
-        unique_tickers = {m.get("event_ticker") for m in selected_markets if m.get("event_ticker")}
+        unique_tickers = {m.get("event_ticker") for m in selected.values()
+                          if m.get("event_ticker")}
         logging.info("Resolving event titles for %d unique event_tickers", len(unique_tickers))
         titles = _load_or_build_event_titles(live_client, unique_tickers, use_cache=use_cache)
 
-    all_markets: list[dict] = [
-        _market_to_dict(m, titles.get(m.get("event_ticker") or "", ""))
-        for m in selected_markets
-    ]
+    all_markets: list[dict] = list(selected.values())
+    if titles:
+        # Day-store records were normalized before titles existed, so the
+        # event_title field is patched in here rather than at _market_to_dict time.
+        for m in all_markets:
+            m["event_title"] = titles.get(m.get("event_ticker") or "", "")
     logging.info("Total settled markets from %s: %d", start_date, len(all_markets))
 
     # Always persist a fresh fetch — use_cache only controls whether reads are

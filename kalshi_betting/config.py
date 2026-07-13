@@ -133,6 +133,16 @@ POSITION_PAGE_SIZE = 500
 # to bounded per-ticker /events/{ticker} lookups instead of paging for hours.
 MVE_TITLE_LOOKUP_MAX_PAGES = 500
 
+# Number of worker threads used by historical.fetch_all_settled_markets to
+# fetch archive day-slices and live settled-day windows in parallel. The
+# settled-market history is tens of millions of records at 1000/page (the
+# API's hard page-size cap), so a sequential walk takes hours; sharding the
+# fetch across workers was live-verified 2026-07-13 at 12 workers / ~20 req/s
+# with zero HTTP 429s. Each worker's calls still go through
+# api_call_with_retry, so if Kalshi does start throttling, the normal
+# exponential backoff applies per worker. Raise cautiously.
+SETTLED_FETCH_MAX_WORKERS = 8
+
 # Stop the multivariate-events pull after this many CONSECUTIVE pages that
 # contain no nested markets. The MVE listing is effectively unbounded (Kalshi
 # auto-generates hundreds of thousands of collection events) and as of 2026-07
