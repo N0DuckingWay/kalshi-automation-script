@@ -20,10 +20,10 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 
 | Module | Role | Key exports |
 |--------|------|-------------|
-| `config.py` | All constants and fee helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()` |
+| `config.py` | All constants and fee/threshold helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()`, `min_price_diff_for_gap()` |
 | `auth.py` | Builds authenticated `KalshiClient` | `build_client(mode)`, `verify_auth(client)` |
-| `_http.py` | Shared HTTP retry helper for market-data API calls | `api_call_with_retry()` |
-| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
+| `_http.py` | Shared HTTP retry + raw-response JSON fetch helpers | `api_call_with_retry()`, `fetch_json_page()` |
+| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `ApiMarket`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
 | `strategy.py` | Kelly sizing, portfolio selection | `TradeSpec`, `compute_trade()`, `select_portfolio()` |
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |
 | `reporter.py` | Excel logging and dev simulation output | `TradeResult`, `append_to_prod_log()`, `write_dev_simulation()` |
@@ -115,7 +115,7 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 
 ## Key Patterns — Always Follow These
 
-**Constants live in `config.py` exclusively.** Never hardcode `0.07` (fee rate), `0.20` (Kelly cap), `0.15` or `0.05` (price thresholds), `5000` (min balance cents), `1` (buy_max_cost slippage cents), or `3600` (scheduler job timeout) inline. Always import from `config.py`.
+**Constants live in `config.py` exclusively.** Never hardcode `0.07` (fee rate), `0.20` (Kelly cap), `0.15`/`0.30` (tiered time-series price thresholds — always go through `min_price_diff_for_gap()`), `0.05` (same-title price threshold), `5000` (min balance cents), `1` (buy_max_cost slippage cents), or `3600` (scheduler job timeout) inline. Always import from `config.py`.
 
 **Use `@dataclass` for all data transfer objects.** Existing: `CandidatePair`, `TradeSpec`, `TradeResult`, `BacktestTrade`. Never use a plain dict when a dataclass fits.
 
@@ -130,7 +130,7 @@ Never swap these — the approximation underestimates and will let bad trades th
 
 **Pair dedup prefers same-title.** When both scanners detect the same ticker pair, `main._dedup_pairs(same_title_pairs, time_series_pairs)` keeps the same-title entry — its co-resolution model is simpler and doesn't depend on the time-series independence assumption. This matches `strategy.select_portfolio()`'s same_title > time_series tie-breaker. Don't flip the argument order.
 
-**Directional price-gap filter.** `find_time_series_pairs()` requires `pA - pB >= MIN_PRICE_DIFF` (earlier-deadline leg priced HIGHER) — not `abs(pA - pB)`. A pricier later-closing contract is normal term structure, not an arbitrage; reintroducing `abs()` would create losing candidates.
+**Directional, deadline-gap-tiered price filter.** `find_time_series_pairs()` requires `pA - pB >= min_price_diff_for_gap(gap_days)` (earlier-deadline leg priced HIGHER) — not `abs(pA - pB)`. A pricier later-closing contract is normal term structure, not an arbitrage; reintroducing `abs()` would create losing candidates. The threshold is tiered by the deadline gap between the two legs: 15% (`MIN_PRICE_DIFF_SHORT_GAP`) when the deadlines are ≤ 15 days apart (`SHORT_DEADLINE_GAP_DAYS`, inclusive), 30% (`MIN_PRICE_DIFF_LONG_GAP`) for 16–30 days; gaps over `MAX_DEADLINE_GAP_DAYS` (30) are never candidates. The same tier drives the orderbook price-sum ceiling (`1 - threshold`, i.e. 0.85 / 0.70) via `scanner._pair_max_sum()` in both `enrich_with_orderbook_prices()` and `validate_pair_price()`, and the backtester's `_find_entry` mirrors all of it. Never bypass `min_price_diff_for_gap()` with a flat threshold — a flat 15% admits weakly-correlated wide-gap pairs the strategy was retuned to exclude.
 
 **Budget fitting in `compute_trade()`.** After Kelly sizing, `n` is shrunk until the fee-inclusive total cost fits within the Kelly-capped budget. Don't remove the shrink loop — sizing on price alone systematically overshoots `BUDGET_FRACTION`.
 
@@ -141,6 +141,8 @@ Never swap these — the approximation underestimates and will let bad trades th
 ---
 
 ## Known Gotchas
+
+**Live fetching bypasses the SDK's response models (2026-07 API drift).** The Kalshi API (a) rejects events page sizes above 200 with HTTP 400 (`MARKET_PAGE_SIZE` is now 200 and must stay ≤ 200), and (b) no longer populates the legacy integer fields the pinned SDK's response models type as required: markets lost `yes_ask`/`no_bid`/… (prices now only in `*_dollars` strings) and positions lost `position`/`market_exposure`/… (count now in the `position_fp` string) — so modeled calls that deserialize nested markets, any non-empty positions page, or any order (`Order` lost `yes_price`/`fill_count`/…) raise pydantic `ValidationError`. Therefore `scanner.fetch_open_events_with_markets()`, `scanner.get_held_tickers()`, `trader._position_count()`, and `trader._submit_order()` call the SDK's `*_without_preload_content` raw-response variants and parse the JSON themselves (markets into `scanner.ApiMarket` dataclasses). Order submission is the highest-stakes case: the modeled `create_order` raises AFTER the order is placed, which would shove every real fill into the ambiguous-exception path and unwind successfully filled legs. Two rules: (1) the raw variants do NOT raise on 4xx/5xx, so every raw call must go through `_http.fetch_json_page()`, which re-raises non-2xx as `ApiException` to keep prior error semantics (`api_call_with_retry`'s 429/5xx backoff for market data; order submission stays retry-free per the rule above); (2) don't "simplify" back to the modeled calls (`client.get_events(...)`, `client.get_positions(...)`, `client.create_order(...)`) — they crash on live responses. Events fetched WITHOUT nested markets (e.g. `historical._load_or_build_event_titles`) still deserialize fine through the modeled calls. Related drift: the MVE events listing is effectively unbounded (hundreds of thousands of auto-generated collection events) and currently returns zero nested markets regardless of `with_nested_markets` — the MVE pull in `fetch_open_events_with_markets()` bails out after `MVE_MAX_EMPTY_PAGES` (25) consecutive marketless pages; without that cap the scan hangs for hours (this is likely why the 2026-07-06 prod run logged nothing after auth). Don't remove the bail-out. KNOWN BROKEN as of 2026-07-12: the backtest fetch path (`historical.py` — `get_markets`/`get_historical_markets` at `limit=1000` with modeled `Market` deserialization) has the same drift and needs the same raw-response treatment.
 
 **`KalshiClient` monkey-patch pattern:** The SDK does NOT accept `api_key_id` or `private_key_pem` as constructor parameters. They must be set as attributes on the `Configuration` object:
 ```python

@@ -6,10 +6,15 @@ import pytest
 
 from kalshi_betting import config
 from kalshi_betting.config import (
+    MAX_DEADLINE_GAP_DAYS,
+    MIN_PRICE_DIFF_LONG_GAP,
+    MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
+    SHORT_DEADLINE_GAP_DAYS,
     TAKER_FEE_RATE,
     fee_leg_exact,
     fee_per_pair_approx,
+    min_price_diff_for_gap,
 )
 
 
@@ -71,3 +76,25 @@ class TestFeePairApprox:
 
     def test_symmetric(self):
         assert fee_per_pair_approx(0.3, 0.4) == pytest.approx(fee_per_pair_approx(0.4, 0.3))
+
+
+class TestMinPriceDiffForGap:
+    def test_short_tier_from_zero_gap(self):
+        # Same-day deadlines are the tightest correlation — short tier applies
+        assert min_price_diff_for_gap(0) == MIN_PRICE_DIFF_SHORT_GAP
+
+    def test_short_tier_boundary_inclusive(self):
+        # A gap of exactly SHORT_DEADLINE_GAP_DAYS (15) still uses the 15% tier
+        assert min_price_diff_for_gap(SHORT_DEADLINE_GAP_DAYS) == MIN_PRICE_DIFF_SHORT_GAP
+
+    def test_long_tier_starts_at_sixteen_days(self):
+        assert min_price_diff_for_gap(SHORT_DEADLINE_GAP_DAYS + 1) == MIN_PRICE_DIFF_LONG_GAP
+
+    def test_long_tier_at_max_gap(self):
+        # 30 days is still an allowed gap (MAX_DEADLINE_GAP_DAYS) — long tier
+        assert min_price_diff_for_gap(MAX_DEADLINE_GAP_DAYS) == MIN_PRICE_DIFF_LONG_GAP
+
+    def test_tier_values(self):
+        # The tiers the strategy is specified against: 15% short, 30% long
+        assert MIN_PRICE_DIFF_SHORT_GAP == 0.15
+        assert MIN_PRICE_DIFF_LONG_GAP == 0.30

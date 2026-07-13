@@ -26,15 +26,23 @@ Purpose:
 
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
-    CreateOrderRequest from the kalshi_python_sync SDK. Imports validate_pair_price
-    from scanner.py and BUY_MAX_COST_SLIPPAGE_CENTS from config.py. Called by
-    main.py after select_portfolio() selects the final trade list. Depends on
-    the KalshiClient produced by auth.py.
+    CreateOrderRequest from the kalshi_python_sync SDK and fetch_json_page from
+    _http.py. Imports validate_pair_price from scanner.py and
+    BUY_MAX_COST_SLIPPAGE_CENTS from config.py. Called by main.py after
+    select_portfolio() selects the final trade list. Depends on the
+    KalshiClient produced by auth.py.
 
 Notes:
     Do NOT add retry logic to order submission. A failed leg indicates the market
     moved between scan time and execution time — retrying risks buying one leg at
     a worse price and creating an unhedged directional position.
+
+    Order submission and position lookups use the SDK's raw-response variants
+    (via _submit_order / _position_count) because 2026-07 API drift broke the
+    pinned SDK's Order and MarketPosition response models — the modeled calls
+    raise ValidationError AFTER submission, misclassifying real fills. The
+    request side still uses the modeled CreateOrderRequest and serializes
+    through the same SDK code path, so the wire format is unchanged.
 """
 import logging
 import math
@@ -43,6 +51,7 @@ from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
 
+from ._http import fetch_json_page
 from .config import BUY_MAX_COST_SLIPPAGE_CENTS
 from .reporter import TradeResult
 from .scanner import validate_pair_price
@@ -132,7 +141,7 @@ def _build_yes_order(spec: TradeSpec) -> CreateOrderRequest:
     )
 
 
-def _position_count(client: Any, ticker: str) -> int | None:
+def _position_count(client: Any, ticker: str) -> float | None:
     """
     Fetch the signed contract position for one ticker, or None if the lookup fails.
 
@@ -141,24 +150,69 @@ def _position_count(client: Any, ticker: str) -> int | None:
     account's actual position is the ground truth. Kalshi convention: negative
     counts are NO contracts, positive counts are YES contracts.
 
+    Uses the raw-response variant + JSON parsing because the pinned SDK's
+    MarketPosition model requires legacy integer fields the API stopped
+    sending in 2026-07 (the count now arrives as the `position_fp` string) —
+    the modeled get_positions call raises ValidationError on any non-empty
+    page, which would turn every ambiguous order into manual_review.
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         ticker (str): Market ticker to look up.
 
     Returns:
-        int | None: Signed contract count (0 = confirmed no position), or None
-            when the lookup itself failed and the state remains unknown.
+        float | None: Signed contract count (0 = confirmed no position; may be
+            fractional — callers only test zero/non-zero), or None when the
+            lookup itself failed and the state remains unknown.
     """
     try:
         # Filter server-side by ticker so a single page is guaranteed to contain it
-        resp = client.get_positions(ticker=ticker)
-        for pos in resp.market_positions or []:
-            if pos.ticker == ticker:
-                return int(pos.position)
+        data = fetch_json_page(client.get_positions_without_preload_content, ticker=ticker)
+        for pos in data.get("market_positions") or []:
+            if pos.get("ticker") == ticker:
+                # position_fp is the signed contract count the API now sends;
+                # fall back to the legacy integer field if it ever reappears
+                raw = pos.get("position_fp")
+                if raw is None:
+                    raw = pos.get("position")
+                return float(raw)
         return 0
     except Exception as exc:
         logging.warning("Position lookup failed for %s: %s", ticker, exc)
         return None
+
+
+def _submit_order(client: Any, order: CreateOrderRequest) -> str:
+    """
+    Submit one order via the raw-response endpoint and return its fill status.
+
+    Uses create_order_without_preload_content because the pinned SDK's Order
+    response model requires legacy integer fields the API stopped sending in
+    2026-07 — the modeled create_order call raises ValidationError AFTER the
+    order has been submitted, which would shove every real fill into the
+    ambiguous-exception path (and unwind successfully filled legs). The raw
+    variant serializes the request through the exact same code path as the
+    modeled call, so the HTTP request on the wire is identical.
+
+    Deliberately NOT wrapped in api_call_with_retry: retrying a FoK order
+    could double-submit a leg at a different price (see module docstring).
+    fetch_json_page raises ApiException on non-2xx just like the modeled call
+    did, so callers' exception handling is unchanged.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        order (CreateOrderRequest): The order to submit.
+
+    Returns:
+        str: The submitted order's status (e.g. "executed", "canceled").
+
+    Raises:
+        ApiException: On non-2xx HTTP status.
+        KeyError/TypeError: If the response lacks order.status — callers treat
+            any exception as an ambiguous submission and consult the position.
+    """
+    data = fetch_json_page(client.create_order_without_preload_content, create_order_request=order)
+    return data["order"]["status"]
 
 
 def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
@@ -193,8 +247,9 @@ def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
         reduce_only=True,
     )
     try:
-        rb_resp = client.create_order(**rollback.model_dump(exclude_none=True))
-        rb_status = rb_resp.order.status
+        # Raw-response submission — see _submit_order for why the modeled
+        # create_order call can no longer be used
+        rb_status = _submit_order(client, rollback)
     except Exception as rb_err:
         logging.critical(
             "ROLLBACK FAILED for '%s' — ORPHANED POSITION: %d NO contracts on %s."
@@ -303,18 +358,18 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker
     mB_title = spec.pair.market_b.title or spec.pair.market_b.ticker
 
-    # Submit leg A — NO on market A
+    # Submit leg A — NO on market A (raw-response endpoint; see _submit_order)
     try:
-        resp_a = client.create_order(**order_a.model_dump(exclude_none=True))
-        if resp_a.order.status != "executed":
+        status_a = _submit_order(client, order_a)
+        if status_a != "executed":
             # FoK rejection is a confirmed non-fill — safe to walk away
             logging.info(
                 "Leg A (NO on '%s') not filled (status=%s) — aborting pair",
-                mA_title[:60], resp_a.order.status,
+                mA_title[:60], status_a,
             )
             return TradeResult(
                 spec=spec, status="failed",
-                error=f"Leg A FoK not filled: status={resp_a.order.status}",
+                error=f"Leg A FoK not filled: status={status_a}",
             )
     except Exception as e:
         # Ambiguous: the order may have filled before the exception (e.g. a
@@ -334,13 +389,13 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
         )
         return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
 
-    # Leg A filled — submit leg B — YES on market B
+    # Leg A filled — submit leg B — YES on market B (raw-response endpoint)
     leg_b_error: str | None = None
     leg_b_ambiguous = False
     try:
-        resp_b = client.create_order(**order_b.model_dump(exclude_none=True))
-        if resp_b.order.status != "executed":
-            leg_b_error = f"Leg B FoK not filled: status={resp_b.order.status}"
+        status_b = _submit_order(client, order_b)
+        if status_b != "executed":
+            leg_b_error = f"Leg B FoK not filled: status={status_b}"
     except Exception as e:
         leg_b_error = f"Leg B error: {e}"
         leg_b_ambiguous = True

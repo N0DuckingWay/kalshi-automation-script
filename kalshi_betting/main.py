@@ -250,7 +250,7 @@ def _run_dev(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info("No qualifying pairs found in sandbox (≥15% time-series or ≥5% same-title price diff).")
+        logging.info("No qualifying pairs found in sandbox (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
         # Write an empty simulation file so the run is still recorded
         out = write_dev_simulation([], [], sandbox_balance_cents)
         logging.info("Dev simulation written (empty): %s", out)
@@ -328,7 +328,7 @@ def _run_prod(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info("No qualifying pairs found (≥15% time-series or ≥5% same-title price diff).")
+        logging.info("No qualifying pairs found (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
         return
 
     # Apply Kelly sizing to each candidate pair using the real account balance
