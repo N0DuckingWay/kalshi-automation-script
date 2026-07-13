@@ -90,7 +90,7 @@ backtest.py (CLI)
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
-| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints) and hourly candlestick price series needed by the backtester. |
+| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester. |
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 
@@ -138,6 +138,10 @@ kalshi_private_key.pem
   kalshi_arb.log            ← Live bot log file (auto-created)
   kalshi_backtest.log       ← Backtest log file (auto-created)
   backtest_cache/           ← Disk cache for historical data
+    settled_markets_*.json  ← Assembled per-start-date market list
+    archive_days/           ← Per-created-day archive slices (incremental/resumable)
+    live_days/              ← Per-settled-day recent-market slices (incremental/resumable)
+    candlesticks/           ← Per-ticker hourly price series
   kalshi_betting/           ← Python package
 ```
 
@@ -185,8 +189,15 @@ Options:
 
 ```bash
 python3 -m kalshi_betting.backtest --start-date 2023-01-01 --balance 50000
-python3 -m kalshi_betting.backtest --no-cache   # force fresh API fetch
+python3 -m kalshi_betting.backtest --no-cache   # rebuild the assembled market list
 ```
+
+The settled-market fetch is sharded into one slice per UTC day and fetched with
+`SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each completed slice
+is cached in `backtest_cache/archive_days/` / `backtest_cache/live_days/`. An
+interrupted fetch resumes at day granularity, and `--no-cache` reuses the day
+slices (they cannot go stale — see CLAUDE.md), so a refresh only fetches the
+current day plus any days not yet on disk.
 
 ### Weekly scheduler daemon
 
