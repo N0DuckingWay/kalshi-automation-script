@@ -78,11 +78,16 @@ class TradeResult:
         spec (TradeSpec): The trade specification that was executed or simulated.
         status (str): Execution outcome — "executed" for a real submitted order,
             "simulated" for a dry-run or dev-mode run, "failed" for a submission error,
-            "rolled_back" if leg A filled but leg B failed and leg A was unwound.
-        error (Optional[str]): Error message if status is "failed" or "rolled_back", otherwise None.
+            "rolled_back" if leg A filled but leg B failed and leg A was unwound,
+            "rollback_failed" if the leg A unwind itself did not fill (orphaned
+            position requiring manual review), or "manual_review" if leg B's fill
+            state could not be determined (position lookup failed) and no
+            automated rollback was attempted to avoid reversing a possible real fill.
+        error (Optional[str]): Error message if status is "failed", "rolled_back",
+            "rollback_failed", or "manual_review", otherwise None.
     """
     spec: TradeSpec
-    status: str            # "executed" | "failed" | "simulated" | "rolled_back"
+    status: str            # "executed" | "failed" | "simulated" | "rolled_back" | "rollback_failed" | "manual_review"
     error: str | None = None
 
 
@@ -149,18 +154,22 @@ def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
     Apply background fill, border, and alignment styling to a single data row.
 
     Color-codes rows by trade status: green for "executed", blue for "simulated",
-    red/orange for "failed", yellow for "rolled_back", white for any unknown status.
+    red/orange for "failed", yellow for "rolled_back", strong red for
+    "rollback_failed" and "manual_review", white for any unknown status.
 
     Args:
         ws: An openpyxl Worksheet object to apply styles to.
         row_idx (int): 1-based row index of the data row to style.
-        status (str): Trade status string — "executed", "simulated", "failed", or "rolled_back".
+        status (str): Trade status string — "executed", "simulated", "failed",
+            "rolled_back", "rollback_failed", or "manual_review".
     """
     status_colors = {
-        "executed":     "E2EFDA",   # light green
-        "simulated":    "EBF3FB",   # light blue
-        "failed":       "FCE4D6",   # light red/orange
-        "rolled_back":  "FFF2CC",   # light yellow — leg A unwound, no net position
+        "executed":        "E2EFDA",   # light green
+        "simulated":       "EBF3FB",   # light blue
+        "failed":          "FCE4D6",   # light red/orange
+        "rolled_back":     "FFF2CC",   # light yellow — leg A unwound, no net position
+        "rollback_failed": "F4B7B4",   # strong red — orphaned position, manual review
+        "manual_review":   "F4B7B4",   # strong red — fill state unknown, manual review
     }
     fill_color = status_colors.get(status, "FFFFFF")
     fill = PatternFill("solid", fgColor=fill_color)

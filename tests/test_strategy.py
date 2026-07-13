@@ -31,7 +31,12 @@ def make_pair(
     return pair
 
 
-def make_spec(monthly_profit_ratio: float = 0.10, pair_type: str = "time_series", total_cost: float = 100.0) -> TradeSpec:
+def make_spec(
+    monthly_profit_ratio: float = 0.10,
+    pair_type: str = "time_series",
+    total_cost: float = 100.0,
+    total_cost_with_fees: float | None = None,
+) -> TradeSpec:
     """Factory for TradeSpec with the minimum fields needed by select_portfolio()."""
     pair = make_pair(pair_type=pair_type)
     return TradeSpec(
@@ -39,6 +44,9 @@ def make_spec(monthly_profit_ratio: float = 0.10, pair_type: str = "time_series"
         x=1,
         y=1,
         total_cost=total_cost,
+        # select_portfolio budgets against the fee-inclusive cost; default to
+        # total_cost so affordability-by-cost tests keep their semantics
+        total_cost_with_fees=total_cost if total_cost_with_fees is None else total_cost_with_fees,
         min_payoff=0.10,
         profit_ratio=0.05,
         days_to_close=30,
@@ -122,6 +130,32 @@ class TestComputeTrade:
         assert result is not None
         assert result.days_to_close >= 1
 
+    def test_returns_none_when_budget_cannot_afford_one_contract(self):
+        # Balance $1, Kelly cap 20% → budget $0.20 < one pair at $0.50.
+        # Forcing n=1 would silently exceed the Kelly fraction, so: None.
+        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        assert compute_trade(pair, 100) is None
+
+    def test_total_cost_with_fees_exceeds_total_cost(self):
+        # The fee-inclusive cost must include both legs' exact taker fees
+        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        result = compute_trade(pair, 100_000)
+        assert result is not None
+        assert result.total_cost_with_fees > result.total_cost
+
+    def test_fee_inclusive_cost_never_exceeds_kelly_budget(self):
+        # Regression: n was originally derived from budget_dollars / (nA + pB),
+        # which excludes fees entirely — fees were added on top afterward, so
+        # total_cost_with_fees could exceed the capped Kelly budget the fraction
+        # was supposed to bound. balance_cents=5000 with this pair reproduces
+        # the overshoot under the old (pre-fix) sizing: naive n=16 costs $10.08
+        # against a $10.00 budget.
+        pair = make_pair(nA=0.30, pB=0.30, pair_type="same_title")
+        result = compute_trade(pair, balance_cents=5000)
+        assert result is not None
+        budget_dollars = (5000 / 100.0) * result.kelly_fraction
+        assert result.total_cost_with_fees <= budget_dollars + 1e-9
+
 
 class TestSelectPortfolio:
     def test_empty_input(self):
@@ -159,3 +193,13 @@ class TestSelectPortfolio:
         result = select_portfolio([cheap, expensive], 20_000)
         assert cheap in result
         assert expensive not in result
+
+    def test_budget_accounts_for_taker_fees(self):
+        # Contract cost alone fits the $500 balance, but the real cash need
+        # (cost + both legs' fees) does not — the trade must be skipped, or
+        # order submission would be rejected for insufficient funds.
+        spec = make_spec(total_cost=498.0, total_cost_with_fees=503.0)
+        assert select_portfolio([spec], 50_000) == []
+        # Sanity: with fees still inside the balance, it is selected
+        spec_ok = make_spec(total_cost=490.0, total_cost_with_fees=499.0)
+        assert select_portfolio([spec_ok], 50_000) == [spec_ok]

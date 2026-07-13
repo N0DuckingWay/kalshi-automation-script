@@ -2,8 +2,12 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+from kalshi_betting.config import INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     display_title,
+    fetch_open_events_with_markets,
     find_same_title_pairs,
     find_time_series_pairs,
     normalize_title,
@@ -238,3 +242,73 @@ class TestTimeSeriesGrouping:
         # client is unused when `markets` is provided
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
         assert pairs == [], f"Expected no pairs across unrelated MVE events; got {pairs}"
+
+    def test_pricier_later_contract_is_not_a_candidate(self):
+        # Regression: the price-gap filter used to be abs(pA - pB) >= threshold,
+        # which let a pair through (as untradeable) when the LATER-closing
+        # contract was priced higher — normal term structure, not the anomaly
+        # this strategy exploits (the arbitrage only exists when the EARLIER
+        # contract is priced higher). Such a pair must not be a candidate at
+        # all, directional only: pA - pB >= MIN_PRICE_DIFF.
+        from datetime import UTC, datetime
+        mA = _mock_market(  # earlier-closing, CHEAPER — normal term structure
+            ticker="EARLY", event_ticker="EVT-A",
+            title="Will BTC exceed $80k",
+            yes_ask=0.20, no_ask=0.80,
+            close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(  # later-closing, more expensive
+            ticker="LATE", event_ticker="EVT-B",
+            title="Will BTC exceed $80k",
+            yes_ask=0.45, no_ask=0.55,
+            close_time=datetime(2026, 3, 20, tzinfo=UTC),
+        )
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert pairs == [], f"Pricier later contract must not be a candidate; got {pairs}"
+
+
+class TestFetchOpenEventsMveStatusFilter:
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_active_markets_kept_others_dropped(self):
+        # The SDK Market.status enum for an open market is "active" (allowed
+        # values: initialized/active/closed/settled/determined — there is no
+        # "open"). Regression: comparing against "open" silently dropped every
+        # MVE market.
+        active  = SimpleNamespace(ticker="MVE-ACT", title="Trump", subtitle="", status="active")
+        settled = SimpleNamespace(ticker="MVE-SET", title="Harris", subtitle="", status="settled")
+        mve_event = SimpleNamespace(title="2024 Election Winner", markets=[active, settled])
+
+        client = MagicMock()
+        client.get_events = MagicMock(return_value=SimpleNamespace(events=[], cursor=None))
+        client.get_multivariate_events = MagicMock(
+            return_value=SimpleNamespace(events=[mve_event], cursor=None)
+        )
+
+        markets = fetch_open_events_with_markets(client)
+        tickers = {m.ticker for m in markets}
+        assert "MVE-ACT" in tickers, "open MVE market (status='active') must be included"
+        assert "MVE-SET" not in tickers, "settled MVE market must be excluded"
+        # The parent event title must be attached for pair_key grouping
+        assert markets[0]._event_title == "2024 Election Winner"
+
+    def test_standard_events_also_filter_nested_market_status(self):
+        # Regression: an "open" event can still nest a market that has already
+        # resolved (e.g. one option in a multi-choice event settles while the
+        # event itself stays open). status="open" on get_events() filters
+        # EVENTS, not their nested markets — the standard (non-MVE) path must
+        # apply the same "active" filter the MVE path already had, or a
+        # stale settled market slips into pair detection.
+        active  = SimpleNamespace(ticker="STD-ACT", title="Rain tomorrow", subtitle="", status="active")
+        settled = SimpleNamespace(ticker="STD-SET", title="Snow tomorrow", subtitle="", status="settled")
+        event = SimpleNamespace(title="Weather Event", markets=[active, settled])
+
+        client = MagicMock()
+        client.get_events = MagicMock(return_value=SimpleNamespace(events=[event], cursor=None))
+        client.get_multivariate_events = MagicMock(
+            return_value=SimpleNamespace(events=[], cursor=None)
+        )
+
+        markets = fetch_open_events_with_markets(client)
+        tickers = {m.ticker for m in markets}
+        assert "STD-ACT" in tickers, "open standard market (status='active') must be included"
+        assert "STD-SET" not in tickers, "settled nested market must be excluded"

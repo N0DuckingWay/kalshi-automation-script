@@ -232,9 +232,11 @@ def get_held_tickers(client: Any) -> set:
     """
     Fetch all tickers where the account currently holds a non-zero position.
 
-    Iterates through all pages of the portfolio positions endpoint and collects
-    tickers with a non-zero position_fp (fractional position). These tickers are
-    excluded from new trades to avoid doubling up on an existing position.
+    Iterates through all pages of the portfolio positions endpoint (via
+    api_call_with_retry so a transient 429/5xx doesn't abort the run) and
+    collects tickers with a non-zero position (signed contract count: negative
+    = NO side, positive = YES side). These tickers are excluded from new trades
+    to avoid doubling up on an existing position.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
@@ -250,13 +252,13 @@ def get_held_tickers(client: Any) -> set:
         # Include cursor for pages after the first to continue pagination
         if cursor:
             kwargs["cursor"] = cursor
-        resp = client.get_positions(**kwargs)
+        resp = api_call_with_retry(client.get_positions, **kwargs)
         for pos in resp.market_positions:
             try:
-                # position_fp is a float string — add to held set if non-zero
-                if float(pos.position_fp) != 0:
+                # position is a signed contract count — add to held set if non-zero
+                if int(pos.position) != 0:
                     held.add(pos.ticker)
-            except (ValueError, AttributeError):
+            except (ValueError, TypeError, AttributeError):
                 # If we can't parse the position, be conservative and treat it as held
                 held.add(pos.ticker)
         cursor = resp.cursor
@@ -309,6 +311,15 @@ def fetch_open_events_with_markets(client: Any) -> list:
         for ev in resp.events or []:
             ev_title = ev.title or ""
             for m in ev.markets or []:
+                # An "open" event can still nest closed/settled/determined markets
+                # (e.g. one option in a multi-choice event already resolved while
+                # the event stays open) — status="open" on get_events() filters
+                # events, not their nested markets. Same "active" check as the
+                # MVE branch below; the 1%-99% price filter downstream catches
+                # most stale markets too, but this stops them from being paired
+                # (and shown as tradeable candidates) in the first place.
+                if getattr(m, "status", "") != "active":
+                    continue
                 # Attach the parent event title so pair_key()/display_title() can find it
                 m._event_title = ev_title
                 markets.append(m)
@@ -331,7 +342,10 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 for m in ev.markets or []:
                     # Only include markets that are still open — MVE response may
                     # include closed/settled options inside an otherwise-open event.
-                    if getattr(m, "status", "") == "open":
+                    # The SDK Market.status enum for an open market is "active"
+                    # (allowed values: initialized/active/closed/settled/determined
+                    # — there is no "open" status).
+                    if getattr(m, "status", "") == "active":
                         m._event_title = ev_title
                         markets.append(m)
             cursor = resp.cursor
@@ -361,7 +375,10 @@ def find_time_series_pairs(
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
       3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days)
-      4. |pA - pB| >= MIN_PRICE_DIFF (15%)
+      4. pA - pB >= MIN_PRICE_DIFF (15%) — directional: the earlier-closing
+         contract (A) must be priced higher than the later one (B), the anomaly
+         this strategy exploits. A pricier later contract is normal term
+         structure and is never a candidate.
 
     Per normalized title, keeps the single best pair (tradeable preferred, then
     largest price gap) to avoid flooding the portfolio with dozens of similar pairs.
@@ -419,9 +436,16 @@ def find_time_series_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                # Enforce the minimum 15% YES price difference required for time-series pairs.
-                # Smaller gaps don't provide enough edge to cover fees and uncertainty.
-                if abs(pA - pB) < MIN_PRICE_DIFF:
+                # Enforce the minimum 15% YES price difference required for time-series
+                # pairs. Directional, not abs(): mA is always the earlier-closing
+                # contract (sorted above), and the tradeable arbitrage only exists
+                # when the EARLIER contract is priced higher (pA > pB) — that's the
+                # anomaly being exploited. A pricier later contract (pA < pB) is
+                # normal term structure, not a candidate, and using abs() here let
+                # such pairs through as untradeable placeholders that could still
+                # win the group's one-pair-per-title slot below. Mirrors the
+                # directional check in backtester._find_entry.
+                if pA - pB < MIN_PRICE_DIFF:
                     continue
 
                 # tradeable=True when buying NO on A and YES on B is guaranteed profitable
@@ -447,8 +471,10 @@ def find_time_series_pairs(
 
         # Keep only the single best pair per normalized title group to avoid flooding
         # the portfolio with many near-identical positions. Tradeable pairs rank above
-        # non-tradeable ones; within each tier, the largest price gap wins.
-        group_pairs.sort(key=lambda p: (p.tradeable, abs(p.pA - p.pB)), reverse=True)
+        # non-tradeable ones; within each tier, the largest price gap wins. pA > pB is
+        # now guaranteed for every entry in group_pairs (see the directional filter
+        # above), so no abs() is needed.
+        group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
     logging.info(
@@ -493,6 +519,9 @@ def find_same_title_pairs(
             by_terms[(event_title, title, subtitle)].append(m)
 
     candidate_pairs: list = []
+    # members = all active markets that share this exact (event_title, title, subtitle)
+    # key. Each entry is a separate market object from a different event — any two of
+    # them are candidates for a same-title arbitrage if their prices diverge.
     for (_event_title, title, subtitle), members in by_terms.items():
         # Use whichever of title or subtitle is non-empty as the display label
         raw_title = title or subtitle

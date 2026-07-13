@@ -1,0 +1,168 @@
+"""Tests for trader.py — order construction, rollback verification, and
+exception disambiguation. All Kalshi API interaction is mocked per project
+policy (tests must run offline)."""
+import math
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from kalshi_betting.config import BUY_MAX_COST_SLIPPAGE_CENTS
+from kalshi_betting.trader import _build_no_order, _build_yes_order, _execute_one
+
+
+def make_spec(x: int = 5, nA: float = 0.40, pB: float = 0.35) -> MagicMock:
+    """Factory for a TradeSpec-like mock with the fields trader.py reads."""
+    pair = MagicMock()
+    pair.market_a.ticker = "TICK-A"
+    pair.market_a.title = "Market A"
+    pair.market_b.ticker = "TICK-B"
+    pair.market_b.title = "Market B"
+    pair.nA = nA
+    pair.pB = pB
+    pair.canonical_title = "test pair"
+    spec = MagicMock()
+    spec.pair = pair
+    spec.x = x
+    spec.y = x
+    return spec
+
+
+def order_resp(status: str) -> MagicMock:
+    resp = MagicMock()
+    resp.order.status = status
+    return resp
+
+
+def positions_resp(ticker: str | None = None, position: int = 0) -> SimpleNamespace:
+    """get_positions response with zero or one market position."""
+    if ticker is None:
+        return SimpleNamespace(market_positions=[])
+    return SimpleNamespace(
+        market_positions=[SimpleNamespace(ticker=ticker, position=position)]
+    )
+
+
+class TestOrderPriceProtection:
+    def test_no_leg_has_buy_max_cost(self):
+        spec = make_spec(x=5, nA=0.40)
+        order = _build_no_order(spec)
+        expected = math.ceil(5 * 0.40 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
+        assert order.buy_max_cost == expected
+        assert order.side == "no"
+        assert order.action == "buy"
+        assert order.time_in_force == "fill_or_kill"
+
+    def test_yes_leg_has_buy_max_cost(self):
+        spec = make_spec(x=5, pB=0.35)
+        order = _build_yes_order(spec)
+        expected = math.ceil(5 * 0.35 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
+        assert order.buy_max_cost == expected
+        assert order.side == "yes"
+
+
+class TestRollbackVerification:
+    def test_unfilled_rollback_reports_rollback_failed(self):
+        # Leg A fills, leg B FoK is rejected, and the rollback FoK is ALSO
+        # rejected — the orphaned leg-A position must surface as
+        # "rollback_failed", never be logged away as a successful rollback.
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            order_resp("canceled"),   # leg B rejected (confirmed non-fill)
+            order_resp("canceled"),   # rollback rejected → orphaned position
+        ])
+        result = _execute_one(client, make_spec())
+        assert result.status == "rollback_failed"
+        assert "rollback FoK not filled" in result.error
+
+    def test_filled_rollback_reports_rolled_back(self):
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            order_resp("canceled"),   # leg B rejected
+            order_resp("executed"),   # rollback filled
+        ])
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+
+    def test_rollback_order_is_reduce_only_sell(self):
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),
+            order_resp("canceled"),
+            order_resp("executed"),
+        ])
+        _execute_one(client, make_spec())
+        rollback_kwargs = client.create_order.call_args_list[2].kwargs
+        assert rollback_kwargs["action"] == "sell"
+        assert rollback_kwargs["side"] == "no"
+        assert rollback_kwargs["reduce_only"] is True
+
+
+class TestExceptionDisambiguation:
+    def test_leg_a_exception_with_no_position_is_failed(self):
+        # Exception + confirmed zero position → clean failure, no rollback sent
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=TimeoutError("timeout"))
+        client.get_positions = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert client.create_order.call_count == 1
+
+    def test_leg_a_exception_with_position_is_unwound(self):
+        # Exception but the position exists (timeout AFTER the fill) — the
+        # half-filled pair must be unwound, not abandoned as "failed".
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            TimeoutError("timeout"),  # leg A raises after actually filling
+            order_resp("executed"),   # rollback fills
+        ])
+        client.get_positions = MagicMock(
+            return_value=positions_resp("TICK-A", position=-5)
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+
+    def test_leg_b_exception_with_position_is_executed(self):
+        # Leg B raises but the YES position exists — the pair actually
+        # completed; rolling back leg A would REVERSE the unhedged exposure.
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            TimeoutError("timeout"),  # leg B raises after actually filling
+        ])
+        client.get_positions = MagicMock(
+            return_value=positions_resp("TICK-B", position=5)
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "executed"
+        # No rollback order was submitted
+        assert client.create_order.call_count == 2
+
+    def test_leg_b_exception_with_no_position_rolls_back(self):
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            TimeoutError("timeout"),  # leg B raises, truly unfilled
+            order_resp("executed"),   # rollback fills
+        ])
+        client.get_positions = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+
+    def test_leg_b_exception_with_unknown_position_does_not_auto_rollback(self):
+        # Leg B raises AND the position lookup itself fails — the fill state
+        # is genuinely unknown (not confirmed zero, not confirmed non-zero).
+        # Auto-rolling-back here would be wrong if leg B actually filled: it
+        # would sell the leg-A hedge and leave a naked YES position on B while
+        # reporting "rolled_back" (which implies flat). Must surface for
+        # manual review instead of guessing.
+        client = MagicMock()
+        client.create_order = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            TimeoutError("timeout"),  # leg B raises
+        ])
+        client.get_positions = MagicMock(side_effect=RuntimeError("lookup failed"))
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        # No rollback order was submitted — only leg A and leg B's attempt
+        assert client.create_order.call_count == 2

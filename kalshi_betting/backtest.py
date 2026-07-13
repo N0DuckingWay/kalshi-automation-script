@@ -107,7 +107,8 @@ def main() -> None:
         logging.info("  Total trades:  %d", len(trades))
         logging.info("  Win rate:      %.1f%%", n_win / len(trades) * 100)
         logging.info("  Total return:  %+.1f%%", total_return * 100)
-        logging.info("  Final balance: $%,.2f", final_value)
+        # %-style logging has no thousands-separator flag — pre-format the value
+        logging.info("  Final balance: $%s", f"{final_value:,.2f}")
 
     out = generate_dashboard(trades, equity_df, start_date, args.balance)  # returns Path to the self-contained HTML dashboard file
     logging.info("Dashboard written: %s", out)

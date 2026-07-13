@@ -72,9 +72,12 @@ def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
         float: Annualized Sortino ratio. Returns 0.0 if there are no negative excess returns.
     """
     excess = daily_returns - rf / 252
-    neg = excess[excess < 0]
-    std_neg = neg.std()
-    return float(excess.mean() / std_neg * np.sqrt(252)) if std_neg > 0 else 0.0
+    # Standard downside deviation: RMS of the negative excess returns over ALL
+    # periods (positives clipped to 0). Using the sample std of only the
+    # negative values returns NaN with a single loss and is not Sortino.
+    downside = np.minimum(excess, 0.0)
+    dd = float(np.sqrt(np.mean(np.square(downside))))
+    return float(excess.mean() / dd * np.sqrt(252)) if dd > 0 else 0.0
 
 
 def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
@@ -276,7 +279,12 @@ def _section_performance(
     daily_ret    = equity_df["daily_return"]
     sharpe       = _sharpe(daily_ret)
     sortino      = _sortino(daily_ret)
-    max_dd, dd_when = _max_drawdown(equity_df["portfolio_value"])
+    # _max_drawdown reports the trough via the Series' index, so it must be
+    # indexed by date rather than equity_df's default RangeIndex — otherwise
+    # the KPI shows a meaningless row number instead of a calendar date.
+    max_dd, dd_when = _max_drawdown(
+        equity_df["portfolio_value"].set_axis(equity_df["date"])
+    )
     win_rate     = sum(1 for t in trades if t.profit > 0) / len(trades) if trades else 0
     avg_ret      = np.mean([t.profit_ratio for t in trades]) if trades else 0
 
@@ -502,12 +510,6 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 
     # Slippage distribution
     slippages = [t.slippage for t in trades]
-    fig_slip = go.Figure(go.Histogram(
-        x=slippages, nbinsx=20,
-        marker_color=[_COLORS["profit"] if s >= 0 else _COLORS["loss"] for s in
-                      [0] * 30],  # uniform color is fine
-        marker_color_apply=False,
-    ))
     fig_slip = go.Figure(go.Histogram(x=slippages, nbinsx=20,
                                       marker_color="#7986CB"))
     fig_slip.update_layout(title="Slippage Distribution (Actual − Expected Payoff, $)",
@@ -590,9 +592,14 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     if not trades:
         return _SECTION_STYLE.format(title="Risk Metrics") + "<p>No trades.</p>"
 
-    # Kelly vs actual sizing scatter
+    # Kelly vs actual sizing scatter. The actual fraction uses the simulated
+    # balance at each trade's entry (the base its Kelly budget was computed
+    # from) — dividing by the initial balance would distort as equity drifts.
     kelly_fracs = [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.pair_type) for t in trades]
-    actual_fracs = [t.total_cost / initial_balance for t in trades]
+    actual_fracs = [
+        (t.total_cost + t.fees) / t.balance_at_entry if t.balance_at_entry > 0 else 0.0
+        for t in trades
+    ]
 
     fig_kelly = go.Figure(go.Scatter(
         x=kelly_fracs, y=actual_fracs, mode="markers",
@@ -681,20 +688,31 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     bench_rows: list[dict] = []
 
     if sp_raw is not None and not sp_raw.empty:
-        sp = sp_raw["Close"].dropna()
-        sp_norm = sp / float(sp.iloc[0]) * initial_balance
-        fig.add_trace(go.Scatter(
-            x=sp.index, y=sp_norm.values,
-            name="S&P 500 (normalized)", line={"color": _COLORS["sp500"], "width": 2},
-        ))
-        sp_ret = float(sp_norm.iloc[-1] / initial_balance - 1)
-        sp_daily = sp.pct_change().dropna()
-        bench_rows.append({
-            "name": "S&P 500",
-            "return": f"{sp_ret:+.1%}",
-            "sharpe": f"{_sharpe(sp_daily):.2f}",
-            "max_dd": f"{_max_drawdown(sp_norm)[0]:.1%}",
-        })
+        # The whole benchmark computation degrades gracefully (per the section
+        # docstring): yfinance's return shape varies by version — modern
+        # releases use MultiIndex columns, making sp_raw["Close"] a DataFrame —
+        # so any surprise here must not crash the dashboard.
+        try:
+            sp = sp_raw["Close"]
+            if hasattr(sp, "columns"):
+                # Single-ticker download with MultiIndex columns → flatten to a Series
+                sp = sp.iloc[:, 0]
+            sp = sp.dropna()
+            sp_norm = sp / float(sp.iloc[0]) * initial_balance
+            fig.add_trace(go.Scatter(
+                x=sp.index, y=sp_norm.values,
+                name="S&P 500 (normalized)", line={"color": _COLORS["sp500"], "width": 2},
+            ))
+            sp_ret = float(sp_norm.iloc[-1] / initial_balance - 1)
+            sp_daily = sp.pct_change().dropna()
+            bench_rows.append({
+                "name": "S&P 500",
+                "return": f"{sp_ret:+.1%}",
+                "sharpe": f"{_sharpe(sp_daily):.2f}",
+                "max_dd": f"{_max_drawdown(sp_norm)[0]:.1%}",
+            })
+        except Exception as e:
+            logging.warning("Benchmark computation failed: %s — omitting S&P 500", e)
 
     strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
     strat_sharpe = _sharpe(equity_df["daily_return"])

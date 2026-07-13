@@ -1,16 +1,21 @@
-"""Tests for backtester.py grouping helpers — combined-key MVE handling."""
+"""Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
+from datetime import UTC, date, datetime
+from unittest.mock import MagicMock
+
 import pytest
 
-# backtester.py transitively imports historical.py, which in turn imports
-# kalshi_python_sync.api.historical_api (only present in SDK >= 3.13.0).
-# Skip cleanly so older-SDK environments don't fail test collection.
-pytest.importorskip("kalshi_python_sync.api.historical_api")
-
-from kalshi_betting.backtester import (  # noqa: E402
+# historical.py imports kalshi_python_sync.api.historical_api softly (the
+# module is absent in some SDK builds), so backtester.py is always importable
+# and its pure-logic functions are unit-testable offline.
+from kalshi_betting import backtester
+from kalshi_betting.backtester import (
     _extract_pairs,
+    _find_entry,
     _group_by_exact_title,
     _group_by_normalized_title,
     _pair_key,
+    _settlement_receipt,
+    run_backtest,
 )
 
 
@@ -93,5 +98,138 @@ class TestExtractPairsCanonHandling:
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups, "same_title")
         assert len(pairs) == 1
-        _, _, canon = pairs[0]
+        _, _, canon, _ = pairs[0]
         assert canon == "Republicans win majority"
+
+    def test_group_key_includes_event_title_for_dedup(self):
+        # Two unrelated events sharing an option label ("Trump") must produce
+        # DIFFERENT group_keys even though they share the same display canon —
+        # otherwise run_backtest's one-pair-per-group dedup collapses two
+        # legitimate, independent pairs into one.
+        mA1 = _md("E1-A", "EVT1A", title="Trump", event_title="Election Winner")
+        mA2 = _md("E1-B", "EVT1B", title="Trump", event_title="Election Winner")
+        mB1 = _md("E2-A", "EVT2A", title="Trump", event_title="Person of the Year")
+        mB2 = _md("E2-B", "EVT2B", title="Trump", event_title="Person of the Year")
+        groups = _group_by_exact_title([mA1, mA2, mB1, mB2])
+        pairs = _extract_pairs(groups, "same_title")
+        assert len(pairs) == 2
+        canons = {canon for _, _, canon, _ in pairs}
+        assert canons == {"Trump"}
+        group_keys = {group_key for _, _, _, group_key in pairs}
+        assert len(group_keys) == 2, "distinct events must yield distinct group_keys"
+
+
+class TestSettlementReceipt:
+    def test_payoff_table(self):
+        # n NO contracts on A + n YES contracts on B; each winning contract
+        # pays exactly $1 — the receipt is independent of entry prices.
+        n = 10
+        assert _settlement_receipt(n, "yes", "yes") == 10   # only B pays
+        assert _settlement_receipt(n, "no", "yes") == 20    # both pay
+        assert _settlement_receipt(n, "no", "no") == 10     # only A pays
+        assert _settlement_receipt(n, "yes", "no") == 0     # loss scenario
+
+
+def _candle(ts: int, yes_ask: float, no_ask: float) -> dict:
+    return {"ts": ts, "yes_ask_close": yes_ask, "no_ask_close": no_ask}
+
+
+# Monday 2026-01-05 09:00 UTC — first Monday on/after 2026-01-01
+_MONDAY_TS = int(datetime(2026, 1, 5, 9, 0, tzinfo=UTC).timestamp())
+
+
+class TestFindEntryDirection:
+    def _markets(self):
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": "2026-02-20T00:00:00+00:00"}
+        return mA, mB
+
+    def test_time_series_rejects_pricier_later_contract(self):
+        # Earlier cheap (0.30), later pricey (0.60): normal term structure —
+        # the live scanner never trades this direction (requires the EARLIER
+        # contract to be the expensive one), so the backtest must not either.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
+        assert entry is None
+
+    def test_time_series_accepts_pricier_earlier_contract(self):
+        # Earlier pricey (pA=0.60, nA=0.40), later cheap (pB=0.30):
+        # gap 0.30 >= 0.15, nA+pB = 0.70 <= 0.85, spread clears fees.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        # Market A must be the earlier-closing contract (the NO leg)
+        assert entry["mA"]["ticker"] == "EARLY"
+        assert entry["pA"] == pytest.approx(0.60)
+        assert entry["pB"] == pytest.approx(0.30)
+
+    def test_same_title_canonicalizes_by_price(self):
+        # For same-title pairs, direction is price-only: A = expensive side.
+        mA, mB = self._markets()
+        candles_a = [_candle(_MONDAY_TS, 0.55, 0.47)]
+        candles_b = [_candle(_MONDAY_TS, 0.70, 0.32)]
+        entry = _find_entry(candles_a, candles_b, mA, mB,
+                            "same_title", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "LATE"  # the pricier side becomes A
+
+
+class TestRunBacktestPnL:
+    def test_profit_not_double_counted_and_cash_sized(self, monkeypatch):
+        """End-to-end regression for the P&L double-subtraction and sizing bugs.
+
+        One same-title pair, both markets resolve YES (co-resolution): the
+        realized profit must equal the guaranteed floor (receipt n, cost+fees
+        out), the equity curve must end at initial_balance + profit, and the
+        trade must be sized against the running balance.
+        """
+        markets = [
+            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        ]
+        candles = {
+            # SA is the expensive side: pA=0.70, nA=0.32
+            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
+            # SB is the cheap side: pB=0.55
+            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_daily_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, equity = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+
+        assert len(trades) == 1
+        t = trades[0]
+        # Sized against the balance at entry, not hardcoded
+        assert t.balance_at_entry == pytest.approx(1000.0)
+        assert t.total_cost + t.fees <= 1000.0
+        # Both YES → only the YES leg pays: receipt is exactly n dollars
+        assert t.actual_payoff == pytest.approx(float(t.n))
+        # Profit deducts cost and fees exactly once
+        assert t.profit == pytest.approx(t.actual_payoff - t.total_cost - t.fees)
+        # Both-YES is the guaranteed-floor scenario: profit == expected_payoff
+        assert t.profit == pytest.approx(t.expected_payoff)
+        assert t.profit > 0
+        assert t.slippage == pytest.approx(0.0, abs=1e-9)
+        # Equity curve: ends at initial balance + realized profit (no double count)
+        final_value = float(equity["portfolio_value"].iloc[-1])
+        assert final_value == pytest.approx(1000.0 + t.profit)

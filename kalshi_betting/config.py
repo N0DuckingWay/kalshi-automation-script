@@ -90,6 +90,17 @@ INCLUDE_MVE_MARKETS           = True
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
+# Slippage allowance, in cents per contract, added on top of the scanned price
+# when computing the buy_max_cost cap for each market FoK order leg. The cap
+# protects against the order book moving between the pre-execution check and
+# submission: the order fills at or below (scanned price + allowance) or not at all.
+BUY_MAX_COST_SLIPPAGE_CENTS   = 1
+
+# Maximum seconds a scheduler-spawned bot run may take before being killed.
+# Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
+# weekly scheduler daemon forever.
+SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
+
 # ── API pagination ────────────────────────────────────────────────────────────
 
 # Number of markets to request per page when paginating the /markets endpoint.
@@ -117,9 +128,11 @@ def fee_per_pair_approx(nA: float, pB: float) -> float:
 
     Returns:
         float: Approximate total taker fee per contract pair (in dollars).
-            This is an underestimate relative to the exact ceiling formula, so
-            it is conservative (makes pairs look slightly more profitable than
-            they actually are at small sizes).
+            This is an underestimate relative to the exact ceiling formula —
+            i.e. it is OPTIMISTIC (makes pairs look slightly more profitable
+            than they actually are at small sizes). That is why it must only
+            be used for filtering: final validation always re-checks with
+            fee_leg_exact() so an underestimated fee cannot admit a bad trade.
     """
     return TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
 
@@ -141,4 +154,7 @@ def fee_leg_exact(n: int, p: float) -> float:
     Returns:
         float: Taker fee in dollars, rounded up to the nearest cent.
     """
-    return math.ceil(TAKER_FEE_RATE * n * p * (1.0 - p) * 100) / 100
+    # Round to 6 decimals before the ceiling so binary floating-point noise
+    # (e.g. 0.07*100*0.25*100 = 175.00000000000003) cannot bump an exact
+    # cent amount up an extra cent — Kalshi charges ceil of the TRUE value.
+    return math.ceil(round(TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100

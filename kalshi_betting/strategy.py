@@ -37,7 +37,11 @@ class TradeSpec:
         pair (CandidatePair): The underlying arbitrage candidate this trade is based on.
         x (int): Number of NO contracts to buy on market A. Always equals y.
         y (int): Number of YES contracts to buy on market B. Always equals x.
-        total_cost (float): Total dollar cost of the position: x * (nA + pB).
+        total_cost (float): Total dollar cost of the contracts: x * (nA + pB).
+            Excludes taker fees — used for reporting.
+        total_cost_with_fees (float): total_cost plus the exact ceiling-rounded
+            taker fee for both legs. This is the real cash the trade consumes at
+            execution — select_portfolio() budgets against this value.
         min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds:
             x * (1 - nA - pB). Always > 0 for trades that reach execution.
         profit_ratio (float): Return on cost: (1 - nA - pB) / (nA + pB).
@@ -54,6 +58,7 @@ class TradeSpec:
     x: int
     y: int
     total_cost: float
+    total_cost_with_fees: float
     min_payoff: float
     profit_ratio: float
     days_to_close: int
@@ -113,6 +118,7 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
             - The prices are out of the valid (0, 1) range.
             - The net spread is zero or negative after fees.
             - The Kelly fraction is zero or negative (no edge).
+            - The Kelly budget cannot afford a single contract pair.
             - The exact minimum payoff at the computed n is zero or negative.
 
     Raises:
@@ -154,15 +160,31 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
 
     # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
-    n = max(1, int(budget_dollars / (nA + pB)))
+    n = int(budget_dollars / (nA + pB))
+    if n < 1:
+        # The Kelly budget can't afford even one contract pair — forcing n=1
+        # would silently exceed both the Kelly fraction and BUDGET_FRACTION
+        return None
 
     # Respect the order book depth limit set by scanner.enrich_with_orderbook_prices()
     if pair.max_contracts > 0:
         n = min(n, pair.max_contracts)
 
-    # Compute exact ceiling-rounded fees for the final integer n
+    # Compute exact ceiling-rounded fees for the final integer n. budget_dollars
+    # above only covers the contract cost (n * (nA + pB)) — fees are added on
+    # top, so the straight n from that division can push total_cost_with_fees
+    # slightly past the capped Kelly budget. Shrink n until the fee-inclusive
+    # cost actually fits, so the real cash consumed never exceeds what the
+    # Kelly fraction (and BUDGET_FRACTION) allowed.
     fee_no  = fee_leg_exact(n, nA)
     fee_yes = fee_leg_exact(n, pB)
+    while n > 0 and n * (nA + pB) + fee_no + fee_yes > budget_dollars:
+        n -= 1
+        fee_no  = fee_leg_exact(n, nA)
+        fee_yes = fee_leg_exact(n, pB)
+    if n < 1:
+        # Fees ate the entire Kelly budget — no contract count fits
+        return None
 
     # Verify the guaranteed minimum payoff is positive after exact fees.
     # At very small n the ceiling rounding can eat the entire profit margin.
@@ -171,6 +193,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         return None
 
     total_cost = n * (nA + pB)
+    # Fees are cash out the door at execution — the portfolio budget must cover them
+    total_cost_with_fees = total_cost + fee_no + fee_yes
 
     # Compute the number of calendar days until the later-closing market resolves.
     # This is used to normalize the profit ratio to a monthly (30-day) figure for ranking.
@@ -204,6 +228,7 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         x=n,
         y=n,
         total_cost=total_cost,
+        total_cost_with_fees=total_cost_with_fees,
         min_payoff=min_payoff,
         profit_ratio=profit_ratio,
         days_to_close=days_to_close,
@@ -219,9 +244,10 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
 
     Sorts all candidate TradeSpec objects by monthly_profit_ratio descending and
     walks the list once. Each spec is selected if (a) both of its tickers are still
-    free and (b) its total_cost fits in the remaining balance. The loop does NOT
-    break when a spec doesn't fit — it keeps scanning so a cheaper trade further
-    down can still be added.
+    free and (b) its total_cost_with_fees — the real cash the trade consumes,
+    including both legs' taker fees — fits in the remaining balance. The loop does
+    NOT break when a spec doesn't fit — it keeps scanning so a cheaper trade
+    further down can still be added.
 
     Ticker-conflict filter: once a spec is chosen, both of its market tickers are
     marked used and no later spec that touches either ticker is selected. This
@@ -261,11 +287,12 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         # Skip trades that would re-use a ticker already committed to a higher-priority pair
         if ta in used_tickers or tb in used_tickers:
             continue
-        # Skip this trade if it would exceed the remaining available balance
-        if spec.total_cost > available:
+        # Skip this trade if its full cash requirement (contracts + taker fees)
+        # would exceed the remaining available balance
+        if spec.total_cost_with_fees > available:
             continue
         selected.append(spec)
-        available -= spec.total_cost
+        available -= spec.total_cost_with_fees
         used_tickers.add(ta)
         used_tickers.add(tb)
     logging.info(
