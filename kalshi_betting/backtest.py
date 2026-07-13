@@ -85,7 +85,7 @@ def main() -> None:
     )
 
     # Always uses prod API — historical data only exists there.
-    hist_client = build_historical_client()  # returns HistoricalApi instance backed by prod credentials
+    hist_client = build_historical_client()  # authenticated prod KalshiClient for /historical raw GETs
     live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
 
     trades, equity_df = run_backtest(

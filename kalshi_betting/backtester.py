@@ -32,6 +32,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pandas as pd
 
@@ -45,7 +46,6 @@ from .config import (
     min_price_diff_for_gap,
 )
 from .historical import (
-    HistoricalApi,
     fetch_all_settled_markets,
     fetch_daily_candlesticks,
     infer_category,
@@ -452,7 +452,7 @@ def _find_entry(
 # ─── Main backtest loop ───────────────────────────────────────────────────────
 
 def run_backtest(
-    hist_client: HistoricalApi,
+    hist_client: Any,
     live_client,
     start_date: date = date(2024, 1, 1),
     initial_balance: float = 10_000.0,
