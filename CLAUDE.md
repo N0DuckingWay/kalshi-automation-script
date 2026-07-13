@@ -28,7 +28,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |
 | `reporter.py` | Excel logging and dev simulation output | `TradeResult`, `append_to_prod_log()`, `write_dev_simulation()` |
 | `main.py` | Orchestrator for live trading pipeline — no business logic | `_run_dev()`, `_run_prod()` |
-| `scheduler.py` | Weekly daemon that calls main.py every Monday at 09:00 | `main()` |
+| `scheduler.py` | Weekly daemon — runs main.py as a subprocess every Monday 09:00, killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` | `main()` |
 | `historical.py` | Fetches and disk-caches historical market data | `fetch_all_settled_markets()`, `fetch_daily_candlesticks()` |
 | `backtester.py` | Replays strategy on settled market history | `run_backtest()` |
 | `dashboard.py` | Generates self-contained HTML performance report | `generate_dashboard()` |
@@ -49,9 +49,12 @@ historical.py → backtester.py → dashboard.py → backtest.py
 
 ## Run Commands
 
-All commands must be run from the **repo root** (`/home/user/kalshi-automation-script/`):
+All commands must be run from the **repo root**:
 
 ```bash
+# One-time setup (Python >= 3.11)
+pip install -e ".[dev]"
+
 # Sandbox simulation with virtual $1k balance
 python3 -m kalshi_betting.main --mode dev --sandbox-balance 1000
 
@@ -82,6 +85,14 @@ python3 -m ruff check kalshi_betting/
 
 ---
 
+## CI and Packaging
+
+- `.github/workflows/ci.yml` runs two jobs on every push/PR to `main`: **Lint (ruff)** and **Test (pytest)**. Both must pass before merging — run them locally first.
+- `pyproject.toml` declares `requires-python = ">=3.11"` and pins `kalshi-python-sync==3.2.0`. Do NOT bump the SDK pin to 3.13.0 — that version's own metadata requires Python >= 3.13 and breaks `pip install -e ".[dev]"` on 3.11 (i.e. breaks CI).
+- Tests live in `tests/` (`test_backtester.py`, `test_config.py`, `test_historical.py`, `test_scanner.py`, `test_strategy.py`, `test_trader.py`) and run fully offline against `MagicMock` clients.
+
+---
+
 ## Credential Setup
 
 Two files must exist in the **repo root** (not committed — in `.gitignore`):
@@ -104,7 +115,7 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 
 ## Key Patterns — Always Follow These
 
-**Constants live in `config.py` exclusively.** Never hardcode `0.07` (fee rate), `0.20` (Kelly cap), `0.15` or `0.05` (price thresholds), or `500` (min balance cents) inline. Always import from `config.py`.
+**Constants live in `config.py` exclusively.** Never hardcode `0.07` (fee rate), `0.20` (Kelly cap), `0.15` or `0.05` (price thresholds), `5000` (min balance cents), `1` (buy_max_cost slippage cents), or `3600` (scheduler job timeout) inline. Always import from `config.py`.
 
 **Use `@dataclass` for all data transfer objects.** Existing: `CandidatePair`, `TradeSpec`, `TradeResult`, `BacktestTrade`. Never use a plain dict when a dataclass fits.
 
@@ -115,7 +126,13 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 2. `fee_leg_exact(n, p)` — ceiling-rounded exact fee; use for *final validation* once `n` is determined.
 Never swap these — the approximation underestimates and will let bad trades through if used for final validation.
 
-**Retry pattern:** Use `api_call_with_retry()` from `_http.py` for all new market-data API calls. It handles HTTP 429 with exponential backoff (2s → 60s, 6 attempts). Do NOT add retry logic to order submission in `trader.py` — a failed leg means price moved, not a transient error.
+**Retry pattern:** Use `api_call_with_retry()` from `_http.py` for all new market-data API calls (this includes read-only portfolio calls like `get_balance` and `get_held_tickers`). It handles HTTP 429 and 5xx with exponential backoff doubling 2s → 32s across 6 attempts (`_MAX_DELAY = 60s` is only a defensive ceiling). Do NOT add retry logic to order submission in `trader.py` — a failed leg means price moved, not a transient error.
+
+**Pair dedup prefers same-title.** When both scanners detect the same ticker pair, `main._dedup_pairs(same_title_pairs, time_series_pairs)` keeps the same-title entry — its co-resolution model is simpler and doesn't depend on the time-series independence assumption. This matches `strategy.select_portfolio()`'s same_title > time_series tie-breaker. Don't flip the argument order.
+
+**Directional price-gap filter.** `find_time_series_pairs()` requires `pA - pB >= MIN_PRICE_DIFF` (earlier-deadline leg priced HIGHER) — not `abs(pA - pB)`. A pricier later-closing contract is normal term structure, not an arbitrage; reintroducing `abs()` would create losing candidates.
+
+**Budget fitting in `compute_trade()`.** After Kelly sizing, `n` is shrunk until the fee-inclusive total cost fits within the Kelly-capped budget. Don't remove the shrink loop — sizing on price alone systematically overshoots `BUDGET_FRACTION`.
 
 **Use `pathlib.Path` for all file paths.** Never `os.path` or string concatenation.
 
@@ -134,7 +151,13 @@ client = KalshiClient(configuration=cfg)
 ```
 Do not "fix" this by moving them to the constructor — it will break silently.
 
-**Fee ceiling rounding at small `n`:** `fee_leg_exact(1, 0.5)` = `ceil(0.07 * 1 * 0.5 * 0.5 * 100) / 100` = `ceil(1.75) / 100` = `$0.02`. At `n=1`, fees round up aggressively. The exact payoff check `min_payoff > 0` in `compute_trade()` catches this and returns `None` — this is intentional, not a bug.
+**Fee ceiling rounding at small `n`:** `fee_leg_exact(1, 0.5)` = `ceil(0.07 * 1 * 0.5 * 0.5 * 100) / 100` = `ceil(1.75) / 100` = `$0.02`. At `n=1`, fees round up aggressively. The exact payoff check `min_payoff > 0` in `compute_trade()` catches this and returns `None` — this is intentional, not a bug. Also: `fee_leg_exact()` rounds to 6 decimals *before* the ceiling so binary float noise (e.g. `175.00000000000003`) can't bump an exact-cent fee up an extra cent — don't remove the `round()`.
+
+**`TradeResult.status` vocabulary:** `"executed"` (both legs filled), `"simulated"` (dry run), `"failed"` (leg A never filled — nothing to unwind), `"rolled_back"` (leg B failed, leg A unwind FoK filled), `"rollback_failed"` (unwind did not fill — orphaned position), `"manual_review"` (leg B errored AND the position lookup also failed, so leg B's fill state is unknown — the bot deliberately does NOT auto-rollback, since unwinding could reverse a real fill; a human must check the account). Don't "simplify" `manual_review` into an automatic rollback.
+
+**FoK price protection:** Both buy legs carry `buy_max_cost` = `count × (scanned price + BUY_MAX_COST_SLIPPAGE_CENTS)`, so an order fills at or below scanned-price-plus-slippage or not at all. Any new order-building code must set this cap.
+
+**Backtest cache semantics:** `fetch_all_settled_markets()` and `fetch_daily_candlesticks()` always persist a fresh fetch to disk even when `use_cache=False`, so `--no-cache` refreshes what the next default run loads. Candlestick cache files are tagged with the `[open_ts, close_ts]` window they cover — a cache built for one `--start-date` is not reused for an earlier one.
 
 **`secrets.json` may be missing outer braces.** `auth.py` wraps it if needed. New code must call `auth.build_client()` rather than reading `secrets.json` directly.
 
@@ -212,7 +235,7 @@ Single-line calls to stdlib or well-known helpers (e.g. `logging.info(...)`, `so
 
 ## What NOT To Do
 
-- **Do not bypass the rollback logic in `trader._execute_one()`**. If leg B fails after leg A fills, a market sell must be attempted immediately. An orphaned leg-A NO position is an unhedged directional bet.
+- **Do not bypass the rollback logic in `trader._execute_one()`**. If leg B is confirmed unfilled after leg A fills, an unwind must be attempted immediately — an orphaned leg-A NO position is an unhedged directional bet. But if leg B's fill state is *unknown* (order errored and the position lookup also failed), the correct behavior is `status="manual_review"`, NOT an automatic rollback that could reverse a real fill.
 - **Do not add retry logic to order submission**. One retry after a fill-or-kill rejection could submit leg A twice at different prices, creating an unhedged position.
 - **Do not import `trader.py` from `scanner.py` or `strategy.py`** — circular dependency.
 - **Do not write output files outside `PROJECT_ROOT`**. All logs, Excel files, and HTML dashboards write relative to `PROJECT_ROOT`.
