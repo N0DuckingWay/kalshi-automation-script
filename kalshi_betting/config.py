@@ -120,6 +120,12 @@ MARKET_PAGE_SIZE   = 200
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
 
+# Cap on the number of multivariate-events pages the backtester's event-title
+# lookup will scan (historical._load_or_build_event_titles). The MVE listing is
+# effectively unbounded, so titles not found within this many pages fall back
+# to bounded per-ticker /events/{ticker} lookups instead of paging for hours.
+MVE_TITLE_LOOKUP_MAX_PAGES = 500
+
 # Stop the multivariate-events pull after this many CONSECUTIVE pages that
 # contain no nested markets. The MVE listing is effectively unbounded (Kalshi
 # auto-generates hundreds of thousands of collection events) and as of 2026-07
