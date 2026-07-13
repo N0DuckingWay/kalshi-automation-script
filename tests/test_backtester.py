@@ -1,4 +1,5 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
+import time
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -9,14 +10,17 @@ import pytest
 # and its pure-logic functions are unit-testable offline.
 from kalshi_betting import backtester
 from kalshi_betting.backtester import (
+    _can_ever_enter,
     _extract_pairs,
     _find_entry,
     _group_by_exact_title,
     _group_by_normalized_title,
     _pair_key,
+    _parse_iso_date,
     _settlement_receipt,
     run_backtest,
 )
+from kalshi_betting.config import MAX_DEADLINE_GAP_DAYS
 
 
 def _md(ticker, event_ticker, title="", subtitle="", event_title=""):
@@ -292,3 +296,337 @@ class TestRunBacktestPnL:
         # Equity curve: ends at initial balance + realized profit (no double count)
         final_value = float(equity["portfolio_value"].iloc[-1])
         assert final_value == pytest.approx(1000.0 + t.profit)
+
+
+# Anchor Monday reused across the eligibility-prefilter tests below — matches
+# _MONDAY_TS's 2026-01-05 anchor so date arithmetic stays consistent with the
+# rest of this file. All offsets are computed with timedelta so weekday
+# arithmetic can't be hand-miscounted.
+_KNOWN_MONDAY = date(2026, 1, 5)
+
+
+def _mkt(open_d: date | None, close_d: date | None) -> dict:
+    """Minimal market dict for _can_ever_enter — only open_time/close_time matter."""
+    m = {}
+    if open_d is not None:
+        m["open_time"] = datetime(open_d.year, open_d.month, open_d.day,
+                                   tzinfo=UTC).isoformat()
+    if close_d is not None:
+        m["close_time"] = datetime(close_d.year, close_d.month, close_d.day,
+                                    tzinfo=UTC).isoformat()
+    return m
+
+
+class TestParseIsoDate:
+    def test_parses_valid_iso_string(self):
+        assert _parse_iso_date("2026-01-05T09:00:00+00:00") == date(2026, 1, 5)
+
+    def test_none_returns_none(self):
+        assert _parse_iso_date(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_iso_date("") is None
+
+    def test_unparseable_string_returns_none(self):
+        assert _parse_iso_date("not-a-date") is None
+
+
+class TestCanEverEnter:
+    """_can_ever_enter mirrors _find_entry's exact scan-window construction:
+    lower = max(open_time, start_date), upper = close_time - 1 day, and the
+    market is eligible iff a Monday falls in [lower, upper]."""
+
+    def test_two_hour_market_never_spans_a_monday(self):
+        # open == close date (a 2-hour market truncates to the same calendar
+        # day) — upper = close_date - 1 day is always before lower, so this
+        # short-circuits to False regardless of which weekday it falls on.
+        d = _KNOWN_MONDAY + timedelta(days=3)
+        m = _mkt(d, d)
+        assert _can_ever_enter(m, start_date=_KNOWN_MONDAY) is False
+
+    def test_market_spanning_a_monday_comfortably_is_eligible(self):
+        # Opens the Thursday before, closes three weeks after the Monday —
+        # multiple Mondays fall well inside [open, close - 1 day].
+        open_d  = _KNOWN_MONDAY - timedelta(days=4)
+        close_d = _KNOWN_MONDAY + timedelta(days=15)
+        m = _mkt(open_d, close_d)
+        assert _can_ever_enter(m, start_date=open_d) is True
+
+    def test_tuesday_open_closing_following_wednesday_spans_with_margin(self):
+        # Opens the Tuesday after _KNOWN_MONDAY, closes 8 days later (the
+        # following Wednesday). upper = close - 1 day lands exactly on the
+        # next Monday, so it just barely spans it.
+        open_d  = _KNOWN_MONDAY + timedelta(days=1)   # Tuesday
+        close_d = open_d + timedelta(days=8)           # following Wednesday
+        m = _mkt(open_d, close_d)
+        assert _can_ever_enter(m, start_date=_KNOWN_MONDAY) is True
+
+    def test_closes_same_week_as_the_spanned_monday_is_ineligible(self):
+        # Opens the Sunday before a Monday, but CLOSES on that same Monday —
+        # upper = close_date - 1 day is the Sunday, strictly before the
+        # Monday the window nominally "spans". No candle-eligible checkpoint
+        # exists (Monday > close - 1 day), so this must be ineligible.
+        open_d  = _KNOWN_MONDAY - timedelta(days=1)  # Sunday
+        close_d = _KNOWN_MONDAY                       # closes ON the Monday
+        m = _mkt(open_d, close_d)
+        assert _can_ever_enter(m, start_date=open_d) is False
+
+    def test_missing_open_time_keeps_the_market(self):
+        m = _mkt(None, _KNOWN_MONDAY + timedelta(days=10))
+        assert _can_ever_enter(m, start_date=_KNOWN_MONDAY) is True
+
+    def test_missing_close_time_keeps_the_market(self):
+        m = _mkt(_KNOWN_MONDAY - timedelta(days=10), None)
+        assert _can_ever_enter(m, start_date=_KNOWN_MONDAY) is True
+
+    def test_both_missing_keeps_the_market(self):
+        assert _can_ever_enter({}, start_date=_KNOWN_MONDAY) is True
+
+    def test_monday_before_start_date_is_not_counted(self):
+        # The market's own window contains a Monday, but that Monday falls
+        # strictly before start_date — _find_entry never scans before
+        # start_date, so this must be ineligible.
+        prev_monday = _KNOWN_MONDAY - timedelta(days=7)
+        open_d  = prev_monday - timedelta(days=3)
+        close_d = prev_monday + timedelta(days=2)
+        m = _mkt(open_d, close_d)
+        assert _can_ever_enter(m, start_date=_KNOWN_MONDAY) is False
+
+    def test_same_window_eligible_once_start_date_moves_earlier(self):
+        # Identical market window to the previous test, but start_date no
+        # longer clips out the Monday the window actually contains.
+        prev_monday = _KNOWN_MONDAY - timedelta(days=7)
+        open_d  = prev_monday - timedelta(days=3)
+        close_d = prev_monday + timedelta(days=2)
+        m = _mkt(open_d, close_d)
+        earlier_start = prev_monday - timedelta(days=10)
+        assert _can_ever_enter(m, start_date=earlier_start) is True
+
+
+def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
+    """Minimal time-series group member for _extract_pairs windowing tests."""
+    m = {"ticker": ticker, "event_ticker": event_ticker}
+    if close_d is not None:
+        m["close_time"] = datetime(close_d.year, close_d.month, close_d.day,
+                                    tzinfo=UTC).isoformat()
+    return m
+
+
+def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
+    """Independent oracle: naive O(n^2) double loop over the same group,
+    filtering by the same margin-inclusive close-time gap and event_ticker
+    rule _extract_pairs applies, but without any sorting/windowing. Written
+    standalone (no backtester internals besides plain dict/date arithmetic)
+    so it can serve as ground truth for the windowed implementation.
+    """
+    result: set[frozenset] = set()
+    n = len(members)
+    for i in range(n):
+        a = members[i]
+        close_a_raw = a.get("close_time")
+        if not close_a_raw:
+            continue
+        da = datetime.fromisoformat(close_a_raw).date()
+        for j in range(i + 1, n):
+            b = members[j]
+            close_b_raw = b.get("close_time")
+            if not close_b_raw:
+                continue
+            db = datetime.fromisoformat(close_b_raw).date()
+            if abs((db - da).days) > margin_days:
+                continue
+            if a["event_ticker"] == b["event_ticker"]:
+                continue
+            result.add(frozenset([a["ticker"], b["ticker"]]))
+    return result
+
+
+class TestExtractPairsWindowedEquivalence:
+    """_extract_pairs' close-time-windowed sweep for time-series groups must
+    select exactly the same candidate pairs as a naive double loop using the
+    same MAX_DEADLINE_GAP_DAYS + 1 margin (the margin is deliberate slack —
+    _find_entry applies the exact .days > MAX_DEADLINE_GAP_DAYS cutoff itself
+    afterwards, so a few boundary candidates one day past the true limit are
+    harmless to include here and are proven out separately in
+    TestFindEntryTieredThreshold.test_over_max_gap_rejected_regardless_of_price).
+    """
+
+    def _build_synthetic_group(self) -> list[dict]:
+        base = date(2026, 1, 1)
+        members = []
+
+        # Cluster A: five markets closely spaced, well inside the window.
+        for i, offset in enumerate([0, 5, 10, 15, 20]):
+            members.append(_ts_member(f"A{i}", f"EA{i}", base + timedelta(days=offset)))
+
+        # Cluster B: another tight cluster, but its earliest member is 80
+        # days after cluster A's latest — far outside the window, so no
+        # cross-cluster pairs should ever appear.
+        for i, offset in enumerate([100, 105, 110, 115, 120]):
+            members.append(_ts_member(f"B{i}", f"EB{i}", base + timedelta(days=offset)))
+
+        # Boundary probes around the exact margin edge (MAX_DEADLINE_GAP_DAYS
+        # + 1 = 31 days): 30 (in), 31 (in, margin), 32 (out).
+        ref = base + timedelta(days=200)
+        members.append(_ts_member("REF", "EREF", ref))
+        members.append(_ts_member("PLUS30", "EPLUS30", ref + timedelta(days=30)))
+        members.append(_ts_member("PLUS31", "EPLUS31", ref + timedelta(days=31)))
+        members.append(_ts_member("PLUS32", "EPLUS32", ref + timedelta(days=32)))
+
+        # Same-event_ticker pair close in time — must be skipped regardless
+        # of how close their close_time gap is.
+        members.append(_ts_member("SAMEEVT-1", "SHARED-EVT", base + timedelta(days=300)))
+        members.append(_ts_member("SAMEEVT-2", "SHARED-EVT", base + timedelta(days=301)))
+
+        # Missing close_time — must be dropped from the sweep entirely rather
+        # than crashing or pairing with anything.
+        m = _ts_member("NOCLOSE", "ENOCLOSE", base + timedelta(days=300))
+        del m["close_time"]
+        members.append(m)
+
+        return members
+
+    def test_matches_naive_oracle_exactly(self):
+        members = self._build_synthetic_group()
+        groups = {"synthetic": members}
+
+        windowed = _extract_pairs(groups, "time_series")
+        windowed_set = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
+
+        margin_days = MAX_DEADLINE_GAP_DAYS + 1
+        naive_set = _naive_time_series_pairs(members, margin_days)
+
+        assert windowed_set == naive_set
+        # Sanity: the set isn't trivially empty or trivially "everything"
+        assert 0 < len(windowed_set) < (len(members) * (len(members) - 1)) // 2
+
+    def test_boundary_probes_land_exactly_where_expected(self):
+        members = self._build_synthetic_group()
+        groups = {"synthetic": members}
+        windowed = _extract_pairs(groups, "time_series")
+        pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
+
+        assert frozenset(["REF", "PLUS30"]) in pair_tickers
+        assert frozenset(["REF", "PLUS31"]) in pair_tickers   # inside the +1 margin
+        assert frozenset(["REF", "PLUS32"]) not in pair_tickers  # outside the margin
+
+    def test_cross_cluster_pairs_never_appear(self):
+        members = self._build_synthetic_group()
+        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        for a, b, _, _ in windowed:
+            assert not (a["ticker"].startswith("A") and b["ticker"].startswith("B"))
+            assert not (a["ticker"].startswith("B") and b["ticker"].startswith("A"))
+
+    def test_same_event_ticker_pair_is_skipped(self):
+        members = self._build_synthetic_group()
+        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
+        assert frozenset(["SAMEEVT-1", "SAMEEVT-2"]) not in pair_tickers
+
+    def test_missing_close_time_member_produces_no_pairs(self):
+        members = self._build_synthetic_group()
+        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        for a, b, _, _ in windowed:
+            assert a["ticker"] != "NOCLOSE"
+            assert b["ticker"] != "NOCLOSE"
+
+
+class TestRunBacktestEndToEndWithPrefilter:
+    """The eligibility prefilter must not change results — only skip work.
+    A hourly-ladder flood sharing the same exact-title group as a genuinely
+    tradeable pair must be dropped before grouping/extraction/candlestick
+    fetching, leaving the recorded trade identical to the pre-filter
+    baseline in TestRunBacktestPnL.test_profit_not_double_counted_and_cash_sized.
+    """
+
+    def test_hourly_noise_is_filtered_without_changing_the_trade(self, monkeypatch):
+        valid_markets = [
+            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        ]
+        # 200 intraday markets in the SAME exact-title group ("EV" | "Q") —
+        # each has an explicit open_time/close_time 2 hours apart, so
+        # _can_ever_enter drops every one of them before grouping.
+        noise_markets = [
+            {"ticker": f"NOISE-{i}", "event_ticker": f"NEV-{i}", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "open_time": "2026-01-10T00:00:00+00:00",
+             "close_time": "2026-01-10T02:00:00+00:00",
+             "settlement_ts": "2026-01-10T02:00:00+00:00"}
+            for i in range(200)
+        ]
+        markets = valid_markets + noise_markets
+
+        candles = {
+            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
+            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+
+        def _fetch_candles(_c, ticker, *a, **k):
+            # A KeyError here means a noise market slipped past the
+            # eligibility prefilter and got queried — that would be the
+            # filter silently failing, not just a slow path.
+            return candles[ticker]
+
+        monkeypatch.setattr(backtester, "fetch_daily_candlesticks", _fetch_candles)
+
+        trades, equity = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.ticker_a == "SA"
+        assert t.ticker_b == "SB"
+        assert t.balance_at_entry == pytest.approx(1000.0)
+        assert t.profit == pytest.approx(t.expected_payoff)
+        final_value = float(equity["portfolio_value"].iloc[-1])
+        assert final_value == pytest.approx(1000.0 + t.profit)
+
+
+class TestExtractPairsPerformanceSmoke:
+    """Performance regression guard for the windowed time-series sweep.
+
+    Scoped to _extract_pairs directly rather than the full run_backtest
+    pipeline: grouping (_group_by_normalized_title / _group_by_exact_title)
+    is already a single O(n) pass over the market list, so it was never the
+    bottleneck — _extract_pairs' pairwise enumeration is the O(n^2) risk this
+    whole change exists to fix, so it's the meaningful unit to time here.
+    """
+
+    def test_50k_member_group_completes_in_seconds(self):
+        n = 50_000
+        base = date(2020, 1, 1)
+        # close_time spaced 1 calendar day apart: with a ~31-day window, each
+        # member has on the order of ~30 eligible neighbors, so the windowed
+        # sweep does roughly n * 30 comparisons (~1.5M) instead of the naive
+        # n^2/2 (~1.25 billion) the un-windowed loop would require.
+        members = [
+            _ts_member(f"T{i}", f"E{i}", base + timedelta(days=i))
+            for i in range(n)
+        ]
+        groups = {"synthetic-ladder": members}
+
+        t0 = time.perf_counter()
+        pairs = _extract_pairs(groups, "time_series")
+        elapsed = time.perf_counter() - t0
+
+        assert elapsed < 30, f"windowed _extract_pairs took {elapsed:.1f}s for {n} members"
+        assert len(pairs) > 0
+
+        # Spot-check a sample of results stay within the margin-inclusive gap
+        # (proves the speed isn't coming from silently dropping the loop body)
+        margin_days = MAX_DEADLINE_GAP_DAYS + 1
+        for mA, mB, _, _ in pairs[:2000]:
+            da = datetime.fromisoformat(mA["close_time"]).date()
+            db = datetime.fromisoformat(mB["close_time"]).date()
+            assert abs((db - da).days) <= margin_days

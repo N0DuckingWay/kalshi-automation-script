@@ -186,7 +186,7 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
     Normalize a raw market JSON dict to the flat dict format the backtester caches.
 
     Extracts only the fields needed by the backtester. The raw API already
-    sends close_time/settlement_ts as ISO 8601 strings and prices as
+    sends open_time/close_time/settlement_ts as ISO 8601 strings and prices as
     `*_dollars` strings, so values pass through unchanged; missing fields
     become the same falsy defaults the old SDK-model path produced.
 
@@ -200,7 +200,13 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
     Returns:
         dict: A flat dictionary with keys: ticker, event_ticker, event_title,
             title, subtitle, result, yes_ask_dollars, no_ask_dollars,
-            yes_bid_dollars, close_time, settlement_ts, status.
+            yes_bid_dollars, open_time, close_time, settlement_ts, status.
+            Note: open_time is a new field (added alongside the backtester's
+            eligibility prefilter) — cache files written before this change
+            don't have it and will read back as None until refreshed with
+            --no-cache; backtester._can_ever_enter() treats that as "can't
+            prove ineligibility" and keeps the market (no speedup, no
+            incorrect drop).
     """
     return {
         "ticker": m.get("ticker"),
@@ -213,6 +219,9 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         "yes_ask_dollars": m.get("yes_ask_dollars"),
         "no_ask_dollars": m.get("no_ask_dollars"),
         "yes_bid_dollars": m.get("yes_bid_dollars"),
+        # Feeds backtester._can_ever_enter()'s eligibility prefilter — needed
+        # to prove a market's tradeable window contains no Monday checkpoint
+        "open_time": m.get("open_time"),
         "close_time": m.get("close_time"),
         "settlement_ts": m.get("settlement_ts"),
         "status": m.get("status"),

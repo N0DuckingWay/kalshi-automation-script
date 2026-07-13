@@ -27,6 +27,21 @@ Notes:
     settlement receipts on exit dates — and applies a greedy ticker-conflict filter
     so each market ticker appears in at most one trade. This mirrors the live bot's
     Kelly sizing against the current balance and its no-re-entry rule.
+
+    Before grouping, run_backtest() filters markets through _can_ever_enter(),
+    a necessary-condition prefilter: _find_entry() can only open a trade at a
+    Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
+    have a daily candle at-or-before that Monday (i.e. opened by then). A
+    market whose [open_time, close_time - 1 day] window contains no such
+    Monday can never appear in any entered pair, as either leg, in either pair
+    type — dropping it up front avoids materializing it into any group at all.
+    This matters because normalized-title groups can have 10,000+ members at
+    current Kalshi volumes (hourly/intraday crypto ladders collapsing into one
+    group) — without the prefilter, and without the close-time-windowed
+    enumeration in _extract_pairs() for time-series groups, pair extraction is
+    O(n^2) per group and infeasible (500B+ iterations observed on a single
+    53k-member group). Neither optimization changes results: both only skip
+    work that provably cannot produce an entry.
 """
 import logging
 from collections import defaultdict
@@ -38,6 +53,7 @@ import pandas as pd
 
 from .config import (
     BUDGET_FRACTION,
+    LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
@@ -163,6 +179,80 @@ def _settlement_receipt(n: int, outcome_a: str, outcome_b: str) -> float:
     return receipt
 
 
+# ─── Eligibility prefilter ─────────────────────────────────────────────────────
+
+def _parse_iso_date(value: str | None) -> date | None:
+    """
+    Parse an ISO 8601 timestamp string to a date, tolerating missing/bad input.
+
+    Shared by _can_ever_enter() and _extract_pairs()'s close-time windowing so
+    the "can't parse it → treat as unknown, not an error" behavior is written
+    exactly once.
+
+    Args:
+        value (str | None): An ISO 8601 timestamp string (e.g. "close_time" or
+            "open_time" from a market dict), or None/empty if absent.
+
+    Returns:
+        date | None: The parsed date, or None if value is falsy or fails to
+            parse. Never raises.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _can_ever_enter(m: dict, start_date: date) -> bool:
+    """
+    Necessary-condition prefilter: could this market possibly appear in any
+    entered pair, as either leg, of either pair type?
+
+    _find_entry() only opens a trade at a Monday-09:00-UTC checkpoint inside
+    [start_date, min(close_a, close_b) - 1 day], and requires a daily candle
+    at-or-before that Monday for BOTH legs — which requires each market to
+    have opened on or before it. So a market whose own
+    [open_time, close_time - 1 day] window contains no Monday on/after
+    start_date can never satisfy that condition for any partner market,
+    regardless of pair_type. Dropping such a market before grouping/pairing
+    is therefore provably safe — it would have contributed entry=None to
+    every possible pair anyway (see CLAUDE.md for the full invariant).
+
+    Args:
+        m (dict): Market dict as produced by historical._market_to_dict().
+        start_date (date): Backtest start date — _find_entry() never scans a
+            Monday before this.
+
+    Returns:
+        bool: True if the market MIGHT be enterable (keep it) — this includes
+            the case where open_time or close_time is missing/unparseable,
+            since then we can't prove ineligibility (also keeps older cache
+            files, written before open_time was added, working correctly —
+            just without the speedup). False only when we can prove no
+            Monday checkpoint falls in the market's eligible window.
+    """
+    open_d = _parse_iso_date(m.get("open_time"))
+    close_d = _parse_iso_date(m.get("close_time"))
+    if open_d is None or close_d is None:
+        # Can't prove ineligibility — keep it rather than risk dropping a
+        # market that could actually enter a pair.
+        return True
+
+    lower = max(open_d, start_date)
+    upper = close_d - timedelta(days=1)  # mirrors _find_entry's scan_end
+    if lower > upper:
+        return False
+
+    # Advance to the first Monday on/after `lower` — identical convention to
+    # _monday_timestamps' own advance-to-Monday step, so the two stay in sync.
+    d = lower
+    while d.weekday() != 0:
+        d += timedelta(days=1)
+    return d <= upper
+
+
 # ─── Pair grouping (metadata only, no prices) ─────────────────────────────────
 
 def _pair_key(m: dict) -> str:
@@ -226,6 +316,24 @@ def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str, 
     just the display title, or two unrelated events sharing an option label
     (e.g. "Trump" in two different events) would collide into a single group
     and silently drop one of the two legitimate pairs.
+
+    For string-keyed (time-series) groups, members are sorted ascending by
+    close_time and swept with a two-pointer window bounded by
+    MAX_DEADLINE_GAP_DAYS + 1 day of margin: _find_entry() unconditionally
+    rejects any time-series pair whose close dates differ by more than
+    MAX_DEADLINE_GAP_DAYS, so pairs outside that window can never produce an
+    entry and are skipped without ever being materialized as a candidate
+    pair. The +1 day margin is slack only (it can never cause a pair within
+    the true limit to be skipped) — _find_entry() still applies the exact
+    `.days > MAX_DEADLINE_GAP_DAYS` cutoff itself. Members with a missing or
+    unparseable close_time are dropped from this sweep (group-local only —
+    _group_by_exact_title's same-title groups are untouched), because
+    _find_entry() unconditionally requires close_time on both legs and
+    returns None immediately without it, regardless of pair_type.
+
+    3-tuple-keyed (same-title) groups have no deadline-gap concept, so they
+    stay naive — the eligibility prefilter (_can_ever_enter, applied in
+    run_backtest before grouping) keeps these groups small in practice.
     """
     pairs = []
     for key, members in groups.items():
@@ -234,16 +342,53 @@ def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str, 
         else:
             # 3-tuple (event_title, title, subtitle) — use title-or-subtitle for display
             canon = key[1] or key[2]
+
+        if len(members) > LARGE_GROUP_WARN_THRESHOLD:
+            # Visibility only — not a cap. Confirms the prefilter/windowing
+            # above are actually keeping group sizes tractable in practice.
+            logging.warning(
+                "Pair-extraction group %r has %d members after filtering — "
+                "still large; verify the eligibility prefilter is firing as expected",
+                canon, len(members),
+            )
+
         seen: set[frozenset] = set()
-        for i, mA in enumerate(members):
-            for mB in members[i + 1:]:
-                if mA["event_ticker"] == mB["event_ticker"]:
-                    continue
-                pair_key = frozenset([mA["ticker"], mB["ticker"]])
-                if pair_key in seen:
-                    continue
-                seen.add(pair_key)
-                pairs.append((mA, mB, canon, key))
+
+        if isinstance(key, str):
+            # Time-series: sort by close_time and sweep only the pairs within
+            # the deadline-gap window (see docstring above) instead of the
+            # naive O(n^2) double loop over the whole group.
+            dated = [(_parse_iso_date(m.get("close_time")), m) for m in members]
+            dated = [(d, m) for d, m in dated if d is not None]
+            dated.sort(key=lambda pair: pair[0])
+            margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
+            n = len(dated)
+            for i in range(n):
+                close_a, mA = dated[i]
+                for j in range(i + 1, n):
+                    close_b, mB = dated[j]
+                    if close_b - close_a > margin:
+                        # Sorted ascending by close_time — every further j is
+                        # at least this far from mA, so nothing later qualifies.
+                        break
+                    if mA["event_ticker"] == mB["event_ticker"]:
+                        continue
+                    pair_key = frozenset([mA["ticker"], mB["ticker"]])
+                    if pair_key in seen:
+                        continue
+                    seen.add(pair_key)
+                    pairs.append((mA, mB, canon, key))
+        else:
+            # Same-title: no deadline-gap constraint, stays naive.
+            for i, mA in enumerate(members):
+                for mB in members[i + 1:]:
+                    if mA["event_ticker"] == mB["event_ticker"]:
+                        continue
+                    pair_key = frozenset([mA["ticker"], mB["ticker"]])
+                    if pair_key in seen:
+                        continue
+                    seen.add(pair_key)
+                    pairs.append((mA, mB, canon, key))
     return pairs
 
 
@@ -463,14 +608,15 @@ def run_backtest(
 
     Algorithm:
       1. Fetch all settled markets since start_date.
-      2. Group into potential time-series and same-title pairs (metadata only).
-      3. For each potential pair, fetch daily candlesticks for both legs.
-      4. Find the first Monday where the pair was tradeable at the threshold;
+      2. Drop markets that provably can never enter any pair (_can_ever_enter).
+      3. Group into potential time-series and same-title pairs (metadata only).
+      4. For each potential pair, fetch daily candlesticks for both legs.
+      5. Find the first Monday where the pair was tradeable at the threshold;
          keep only the best entry per title group (live one-pair-per-group rule).
-      5. Walk entries chronologically with a running cash balance: Kelly-size
+      6. Walk entries chronologically with a running cash balance: Kelly-size
          each trade against the cash available at entry, and record actual P&L
          from settlement outcomes.
-      6. Build an equity curve from the trade timeline.
+      7. Build an equity curve from the trade timeline.
 
     Returns (trades, equity_df) where equity_df has columns:
       [date, portfolio_value, daily_return]
@@ -480,6 +626,19 @@ def run_backtest(
     # Fetch all settled markets from start_date onward (uses disk cache if available)
     markets = fetch_all_settled_markets(hist_client, live_client, start_date, use_cache)
     logging.info("Total settled markets to analyze: %d", len(markets))
+
+    # Necessary-condition prefilter: drop markets whose [open_time, close_time
+    # - 1 day] window contains no Monday checkpoint on/after start_date, since
+    # _find_entry() can then never enter them as either leg of either pair
+    # type. This is what makes grouping/pairing tractable at current Kalshi
+    # volumes (hourly/intraday ladders are the overwhelming majority of
+    # settled markets and almost never span a scannable Monday).
+    eligible_markets = [m for m in markets if _can_ever_enter(m, start_date)]
+    logging.info(
+        "Eligibility prefilter: skipping %d/%d markets that cannot appear in any tradeable pair",
+        len(markets) - len(eligible_markets), len(markets),
+    )
+    markets = eligible_markets
 
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
