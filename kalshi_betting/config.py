@@ -74,9 +74,9 @@ SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 # be reliably correlated.
 MAX_DEADLINE_GAP_DAYS         = 30
 
-# Minimum account balance in cents required to run the bot. Below $5 the bot
+# Minimum account balance in cents required to run the bot. Below $50 the bot
 # aborts to avoid wasting API calls when there is insufficient capital to trade.
-MIN_BALANCE_CENTS             = 500
+MIN_BALANCE_CENTS             = 5000
 
 # Whether to include multivariate (multi-choice) markets in scanning and backtesting.
 # When True, markets are grouped by (event_title + market_title) so cross-event
