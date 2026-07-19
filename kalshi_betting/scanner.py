@@ -743,20 +743,21 @@ def _pair_orderbooks(
     """
     pairs: list[tuple[float, float, float]] = []
     i, j = 0, 0
+    # Default to 0.0 when empty so the while loop below never indexes into it
     rem_no  = no_levels[i][1]  if no_levels  else 0.0
     rem_yes = yes_levels[j][1] if yes_levels else 0.0
 
     while i < len(no_levels) and j < len(yes_levels):
-        qty = min(rem_no, rem_yes)
+        qty = min(rem_no, rem_yes)  # contracts matchable at these two price levels
         pairs.append((yes_levels[j][0], no_levels[i][0], qty))
         rem_no  -= qty
         rem_yes -= qty
         if rem_no == 0:
-            i += 1
+            i += 1  # NO level exhausted, advance to next cheapest
             if i < len(no_levels):
                 rem_no = no_levels[i][1]
         if rem_yes == 0:
-            j += 1
+            j += 1  # YES level exhausted, advance to next cheapest
             if j < len(yes_levels):
                 rem_yes = yes_levels[j][1]
 
