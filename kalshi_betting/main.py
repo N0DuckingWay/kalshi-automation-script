@@ -31,6 +31,7 @@ from .scanner import (
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_tickers,
@@ -226,7 +227,8 @@ def _run_dev(client, args) -> None:
     Args:
         client: KalshiClient pointed at the sandbox endpoint, produced by
             auth.build_client("dev").
-        args: Parsed argparse Namespace with sandbox_balance attribute.
+        args: Parsed argparse Namespace with sandbox_balance and
+            max_horizon_days attributes.
     """
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
@@ -238,6 +240,10 @@ def _run_dev(client, args) -> None:
     # valid authentication for read operations, so this works with the prod key too
     markets = fetch_open_events_with_markets(client)
     logging.info("Sandbox markets fetched: %d", len(markets))
+
+    # Optional opt-in cap so both bet types only see markets closing within
+    # the requested window — a no-op (returns markets unchanged) when unset
+    markets = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
@@ -298,7 +304,8 @@ def _run_prod(client, args) -> None:
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
             auth.build_client("prod").
-        args: Parsed argparse Namespace with dry_run attribute.
+        args: Parsed argparse Namespace with dry_run and max_horizon_days
+            attributes.
     """
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
@@ -318,6 +325,10 @@ def _run_prod(client, args) -> None:
     # Fetch all open markets and pre-filter held tickers for downstream efficiency
     markets           = fetch_open_events_with_markets(client)
     markets           = [m for m in markets if m.ticker not in held_tickers]
+
+    # Optional opt-in cap so both bet types only see markets closing within
+    # the requested window — a no-op (returns markets unchanged) when unset
+    markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Run both pair detection paths: time-series (deadline-gap) and same-title
     time_series_pairs = find_time_series_pairs(client, held_tickers, markets)
@@ -415,9 +426,10 @@ def main() -> None:
     """
     CLI entry point for the Kalshi arbitrage bot.
 
-    Parses command-line arguments (--mode, --dry-run, --sandbox-balance),
-    configures logging, builds the appropriate Kalshi client, and dispatches
-    to _run_dev (sandbox simulation) or _run_prod (real account trading).
+    Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
+    --max-horizon-days), configures logging, builds the appropriate Kalshi
+    client, and dispatches to _run_dev (sandbox simulation) or _run_prod
+    (real account trading).
     """
     parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
     parser.add_argument(
@@ -432,7 +444,13 @@ def main() -> None:
         "--sandbox-balance", type=float, default=1000.0, metavar="DOLLARS",
         help="Virtual balance in dollars used for trade sizing in dev mode (default: 1000)",
     )
+    parser.add_argument(
+        "--max-horizon-days", type=int, default=None, metavar="DAYS",
+        help="Only consider markets closing within DAYS from now (both modes; default: no limit)",
+    )
     args = parser.parse_args()
+    if args.max_horizon_days is not None and args.max_horizon_days < 1:
+        parser.error("--max-horizon-days must be a positive integer")
 
     logging.basicConfig(
         level=logging.INFO,

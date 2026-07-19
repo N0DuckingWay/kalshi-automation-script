@@ -37,7 +37,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
@@ -105,7 +105,10 @@ class CandidatePair:
         pA (float): YES ask price of market A in dollars (cost to buy YES on A). Range: [0, 1].
         pB (float): YES ask price of market B in dollars (cost to buy YES on B). Range: [0, 1].
         nA (float): NO ask price of market A in dollars (cost to buy NO on A). Range: [0, 1].
-        tradeable (bool): True when a risk-free arbitrage exists (nA + pB < 1 and pA > pB).
+        tradeable (bool): True when nA + pB < 1 - fee_per_pair_approx(nA, pB) and pA > pB.
+            For time-series pairs this is only truly risk-free under the monotonicity
+            assumption that P(B) >= P(A) — see find_time_series_pairs for the scenario
+            this doesn't cover.
         canonical_title (str): Grouping key used to identify the pair — normalized title for
             time-series pairs, raw title for same-title pairs.
         pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
@@ -235,6 +238,45 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
         except (ValueError, TypeError):
             pass
     return active
+
+
+def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -> list:
+    """
+    Filter markets to those closing within a given number of days from now.
+
+    Optional opt-in bet-horizon cap for the live trading path: when set, drops
+    any market whose close_time is farther out than max_horizon_days from the
+    moment this function runs. Applied upstream of both find_time_series_pairs
+    and find_same_title_pairs so both bet types see an identical filtered list
+    and a single cutoff timestamp.
+
+    Args:
+        markets (list): List of ApiMarket objects to filter.
+        max_horizon_days (int | None): Maximum number of days from now a
+            market's close_time may be. If None, no filtering is applied and
+            markets is returned unchanged.
+
+    Returns:
+        list: Subset of markets whose close_time is <= now + max_horizon_days.
+            A market with a missing or unparseable close_time is dropped when
+            a horizon is active, since "closes within X days" can't be proven
+            true for an unknown deadline. Returns markets unchanged when
+            max_horizon_days is None.
+    """
+    if max_horizon_days is None:
+        return markets
+
+    cutoff = datetime.now(UTC) + timedelta(days=max_horizon_days)
+    within_horizon = []
+    for m in markets:
+        try:
+            # None close_time or a naive datetime (can't compare to a tz-aware
+            # cutoff) both fail this comparison and are dropped, not raised
+            if m.close_time is not None and m.close_time <= cutoff:
+                within_horizon.append(m)
+        except TypeError:
+            pass
+    return within_horizon
 
 
 def get_held_tickers(client: Any) -> set:
@@ -516,7 +558,16 @@ def find_time_series_pairs(
     Per normalized title, keeps the single best pair (tradeable preferred, then
     largest price gap) to avoid flooding the portfolio with dozens of similar pairs.
 
-    tradeable=True when nA + pB < 1 AND pA > pB (all 3 outcome scenarios profitable).
+    tradeable=True when nA + pB < 1 - fee_per_pair_approx(nA, pB) AND pA > pB. Buying
+    NO on A (earlier close) and YES on B (later close) is profitable in 3 of the 4
+    outcome combinations (A=NO/B=NO, A=YES/B=YES, A=NO/B=YES all pay out >= the cost).
+    The 4th, A=YES/B=NO — the underlying crosses the threshold by A's deadline and
+    falls back below it by B's — pays out $0 on both legs, a total loss of nA + pB.
+    This flag assumes that reversal has ~zero probability (P(B) >= P(A), i.e. the
+    later deadline is monotonically at least as likely to resolve YES); it does not
+    hedge against it. That's the time-series independence assumption CLAUDE.md flags,
+    and why same-title pairs (no deadline gap, simpler co-resolution model) are
+    preferred over time-series ones wherever both exist.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the caller
@@ -743,20 +794,21 @@ def _pair_orderbooks(
     """
     pairs: list[tuple[float, float, float]] = []
     i, j = 0, 0
+    # Default to 0.0 when empty so the while loop below never indexes into it
     rem_no  = no_levels[i][1]  if no_levels  else 0.0
     rem_yes = yes_levels[j][1] if yes_levels else 0.0
 
     while i < len(no_levels) and j < len(yes_levels):
-        qty = min(rem_no, rem_yes)
+        qty = min(rem_no, rem_yes)  # contracts matchable at these two price levels
         pairs.append((yes_levels[j][0], no_levels[i][0], qty))
         rem_no  -= qty
         rem_yes -= qty
         if rem_no == 0:
-            i += 1
+            i += 1  # NO level exhausted, advance to next cheapest
             if i < len(no_levels):
                 rem_no = no_levels[i][1]
         if rem_yes == 0:
-            j += 1
+            j += 1  # YES level exhausted, advance to next cheapest
             if j < len(yes_levels):
                 rem_yes = yes_levels[j][1]
 
