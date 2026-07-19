@@ -23,7 +23,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 | `config.py` | All constants and fee/threshold helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()`, `min_price_diff_for_gap()` |
 | `auth.py` | Builds authenticated `KalshiClient` | `build_client(mode)`, `verify_auth(client)` |
 | `_http.py` | Shared HTTP retry + raw-response JSON fetch helpers | `api_call_with_retry()`, `fetch_json_page()` |
-| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `ApiMarket`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()` |
+| `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `ApiMarket`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()`, `filter_markets_within_horizon()` |
 | `strategy.py` | Kelly sizing, portfolio selection | `TradeSpec`, `compute_trade()`, `select_portfolio()` |
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |
 | `reporter.py` | Excel logging and dev simulation output | `TradeResult`, `append_to_prod_log()`, `write_dev_simulation()` |
@@ -67,11 +67,17 @@ python3 -m kalshi_betting.main --mode prod
 # Production discovery only, no orders
 python3 -m kalshi_betting.main --mode prod --dry-run
 
+# Live trading (either mode), only consider markets closing within 14 days from now
+python3 -m kalshi_betting.main --mode dev --max-horizon-days 14
+
 # Backtest from 2024-01-01 with $10k starting balance
 python3 -m kalshi_betting.backtest --start-date 2024-01-01 --balance 10000
 
 # Backtest forcing fresh API fetch (ignores disk cache)
 python3 -m kalshi_betting.backtest --no-cache
+
+# Backtest, only enter trades whose later-closing leg is within 14 days of the simulated entry date
+python3 -m kalshi_betting.backtest --max-horizon-days 14
 
 # Weekly scheduler daemon (runs prod every Monday 09:00)
 python3 -m kalshi_betting.scheduler

@@ -177,6 +177,17 @@ Fetches the live account balance, scans real markets, submits batch orders, and 
 python3 -m kalshi_betting.main --mode prod --dry-run
 ```
 
+### Limit how far out a contract's deadline can be
+
+```bash
+python3 -m kalshi_betting.main --mode dev --max-horizon-days 14
+```
+
+Optional in both dev and prod. Only markets closing within the given number of
+days from the moment the bot runs are considered — applies to both time-series
+and same-title pairs. Omit the flag (the default) to consider all otherwise-eligible
+markets regardless of deadline.
+
 ### Backtest
 
 ```bash
@@ -190,7 +201,12 @@ Options:
 ```bash
 python3 -m kalshi_betting.backtest --start-date 2023-01-01 --balance 50000
 python3 -m kalshi_betting.backtest --no-cache   # rebuild the assembled market list
+python3 -m kalshi_betting.backtest --max-horizon-days 14
 ```
+
+`--max-horizon-days` only enters trades where the later-closing leg is within the
+given number of days of the *simulated* entry checkpoint (each Monday evaluated
+during the replay), not today's real date. Optional; omit for no limit.
 
 The settled-market fetch is sharded into one slice per UTC day and fetched with
 `SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each completed slice

@@ -37,11 +37,11 @@ def main() -> None:
     """
     CLI entry point for the Kalshi arbitrage backtester.
 
-    Parses command-line arguments (--start-date, --balance, --no-cache),
-    configures logging, constructs historical and live Kalshi API clients,
-    runs the full backtest simulation via run_backtest(), and generates an
-    interactive HTML dashboard via generate_dashboard(). Prints a summary
-    table of key metrics to stdout on completion.
+    Parses command-line arguments (--start-date, --balance, --no-cache,
+    --max-horizon-days), configures logging, constructs historical and live
+    Kalshi API clients, runs the full backtest simulation via run_backtest(),
+    and generates an interactive HTML dashboard via generate_dashboard().
+    Prints a summary table of key metrics to stdout on completion.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -61,7 +61,14 @@ def main() -> None:
         "--no-cache", action="store_true",
         help="Re-fetch all data from the API instead of reading the disk cache",
     )
+    parser.add_argument(
+        "--max-horizon-days", type=int, default=None, metavar="DAYS",
+        help="Only enter trades where the later-closing leg closes within DAYS "
+             "of the simulated entry checkpoint (default: no limit)",
+    )
     args = parser.parse_args()
+    if args.max_horizon_days is not None and args.max_horizon_days < 1:
+        parser.error("--max-horizon-days must be a positive integer")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -94,6 +101,7 @@ def main() -> None:
         start_date=start_date,
         initial_balance=args.balance,
         use_cache=use_cache,
+        max_horizon_days=args.max_horizon_days,
     )  # returns tuple[list[BacktestTrade], pd.DataFrame] — trades and daily equity curve
 
     if not trades:

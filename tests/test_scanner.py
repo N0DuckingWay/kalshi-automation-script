@@ -1,6 +1,6 @@
 """Tests for scanner.py normalize_title() — the core pair-detection function."""
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,6 +12,7 @@ from kalshi_betting.scanner import (
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
     normalize_title,
@@ -654,3 +655,47 @@ class TestFetchOpenEventsMveStatusFilter:
 
         with pytest.raises(ApiException):
             fetch_open_events_with_markets(client)
+
+
+class TestFilterMarketsWithinHorizon:
+    def test_none_horizon_returns_markets_unchanged(self):
+        markets = [
+            _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 6, 1, tzinfo=UTC)),
+            _mock_market(ticker="T2", event_ticker="E2", close_time=None),
+        ]
+        result = filter_markets_within_horizon(markets, None)
+        assert result == markets
+
+    def test_market_within_horizon_is_kept(self):
+        now = datetime.now(UTC)
+        m = _mock_market(ticker="T1", event_ticker="E1", close_time=now + timedelta(days=3))
+        result = filter_markets_within_horizon([m], 7)
+        assert result == [m]
+
+    def test_market_beyond_horizon_is_dropped(self):
+        now = datetime.now(UTC)
+        m = _mock_market(ticker="T1", event_ticker="E1", close_time=now + timedelta(days=30))
+        result = filter_markets_within_horizon([m], 7)
+        assert result == []
+
+    def test_none_close_time_dropped_when_horizon_active(self):
+        # _mock_market's close_time=None falls back to its own default via
+        # `close_time or ...`, so build the None case directly
+        m = _mock_market(ticker="T1", event_ticker="E1")
+        m.close_time = None
+        result = filter_markets_within_horizon([m], 7)
+        assert result == []
+
+    def test_boundary_close_time_at_cutoff_is_kept(self):
+        # cutoff is computed as now + max_horizon_days at call time, so a
+        # close_time set slightly earlier than a fresh now() + horizon
+        # reliably lands at-or-before the cutoff, exercising the inclusive <=
+        now = datetime.now(UTC)
+        m = _mock_market(ticker="T1", event_ticker="E1", close_time=now + timedelta(days=7) - timedelta(seconds=1))
+        result = filter_markets_within_horizon([m], 7)
+        assert result == [m]
+
+    def test_naive_close_time_dropped_not_raised(self):
+        m = _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 12, 1))
+        result = filter_markets_within_horizon([m], 7)
+        assert result == []
