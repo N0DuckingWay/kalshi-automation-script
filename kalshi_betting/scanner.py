@@ -856,6 +856,17 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
         )
         ob = data.get("orderbook_fp") or data.get("orderbook")
         if ob is None:
+            # Neither recognized key held a usable book. Log the keys that WERE
+            # present: if the API renames the orderbook key again (as it did when
+            # orderbook -> orderbook_fp), every book resolves to None and every
+            # pair is silently marked non-tradeable — a 0-trade run with nothing
+            # but generic "unavailable" warnings. Naming the actual keys makes
+            # that drift diagnosable instead of looking like an empty book.
+            logging.warning(
+                "No usable orderbook for %s (response keys: %s) — treating as unavailable",
+                ticker,
+                sorted(data.keys()),
+            )
             return None
         yes_raw = list(ob.get("yes_dollars") or ob.get("yes") or [])
         no_raw  = list(ob.get("no_dollars") or ob.get("no") or [])
