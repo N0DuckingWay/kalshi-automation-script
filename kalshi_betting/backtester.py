@@ -455,6 +455,7 @@ def _find_entry(
     mB: dict,
     pair_type: str,
     start_date: date,
+    max_horizon_days: int | None = None,
 ) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
@@ -485,6 +486,11 @@ def _find_entry(
         pair_type (str): "time_series" or "same_title" — controls price gap threshold
             and deadline gap check.
         start_date (date): Backtest start date; no entry is recorded before this date.
+        max_horizon_days (int | None): Optional cap on how far a checkpoint's Monday
+            may be from the later-closing leg's close date. A Monday where
+            (later close date − Monday) exceeds this is skipped (not rejected
+            outright — a later Monday closer to the close dates may still
+            qualify). None means no cap (default), matching live-path semantics.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB" (float),
@@ -532,6 +538,16 @@ def _find_entry(
         threshold = SAME_TITLE_MIN_PRICE_DIFF
 
     for ts in _monday_timestamps(scan_start, scan_end):
+        entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
+
+        # Optional opt-in bet-horizon cap: skip checkpoints where the
+        # later-closing leg (close_b, since time_series always keeps
+        # close_b >= close_a and same_title has no ordering) would close
+        # further out than max_horizon_days from THIS simulated checkpoint —
+        # a cheap comparison done before touching candle data
+        if max_horizon_days is not None and (max(close_a, close_b) - entry_date).days > max_horizon_days:
+            continue
+
         # Read the closing prices at this Monday snapshot
         ca = _candle_at_or_before(candles_a, ts)
         cb = _candle_at_or_before(candles_b, ts)
@@ -584,7 +600,6 @@ def _find_entry(
         if (1.0 - nA - pB) <= fee_per_pair_approx(nA, pB):
             continue
 
-        entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
         return {
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA,
@@ -602,6 +617,7 @@ def run_backtest(
     start_date: date = date(2024, 1, 1),
     initial_balance: float = 10_000.0,
     use_cache: bool = True,
+    max_horizon_days: int | None = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay the arbitrage strategy on all settled Kalshi markets from start_date.
@@ -617,6 +633,20 @@ def run_backtest(
          each trade against the cash available at entry, and record actual P&L
          from settlement outcomes.
       7. Build an equity curve from the trade timeline.
+
+    Args:
+        hist_client (Any): Signed client for the historical archive/live endpoints.
+        live_client: Client passed through to fetch_all_settled_markets.
+        start_date (date): Earliest settlement date to include.
+        initial_balance (float): Simulated starting cash balance in dollars.
+        use_cache (bool): Whether to reuse the disk-cached assembled market list.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
+            scanner.filter_markets_within_horizon on the live path, but relative
+            to each simulated checkpoint rather than real-world now: at a given
+            Monday checkpoint, a pair can only enter if the later-closing leg
+            closes within max_horizon_days of THAT checkpoint. None (default)
+            applies no cap, matching current behavior. Passed straight through
+            to _find_entry() for each candidate pair.
 
     Returns (trades, equity_df) where equity_df has columns:
       [date, portfolio_value, daily_return]
@@ -690,8 +720,13 @@ def run_backtest(
         candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
         candles_b = candles_by_ticker.get(mB_orig["ticker"], [])
 
-        # Find the first Monday where this pair was tradeable at the threshold prices
-        entry = _find_entry(candles_a, candles_b, mA_orig, mB_orig, pair_type, start_date)
+        # Find the first Monday where this pair was tradeable at the threshold
+        # prices — max_horizon_days (if set) restricts entries to checkpoints
+        # close enough to the legs' close dates
+        entry = _find_entry(
+            candles_a, candles_b, mA_orig, mB_orig, pair_type, start_date,
+            max_horizon_days=max_horizon_days,
+        )
         if entry is None:
             continue
 

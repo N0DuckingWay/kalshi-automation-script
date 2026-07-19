@@ -245,6 +245,67 @@ class TestFindEntryTieredThreshold:
         assert entry is not None
 
 
+class TestFindEntryHorizon:
+    """_find_entry's optional max_horizon_days caps how far the later-closing
+    leg's close date may be from the checkpoint being evaluated — relative to
+    the SIMULATED Monday, not real-world now."""
+
+    def _markets(self):
+        # Same 13-day-gap fixture as TestFindEntryDirection — close_a
+        # 2026-02-01, close_b 2026-02-14.
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": "2026-02-14T00:00:00+00:00"}
+        return mA, mB
+
+    def test_none_horizon_matches_unfiltered_behavior(self):
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1), max_horizon_days=None)
+        assert entry is not None
+        assert entry["entry_date"] == date(2026, 1, 5)
+
+    def test_within_horizon_at_first_checkpoint_enters_immediately(self):
+        # At the first Monday (Jan 5), close_b (Feb 14) is 40 days out — well
+        # within a generous 60-day horizon, so entry is unaffected.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1), max_horizon_days=60)
+        assert entry is not None
+        assert entry["entry_date"] == date(2026, 1, 5)
+
+    def test_beyond_horizon_at_early_checkpoints_defers_to_a_later_monday(self):
+        # close_b (Feb 14) is 40 days from Jan 5, 33 from Jan 12, 26 from
+        # Jan 19 — all beyond a 20-day horizon — but only 19 days from Jan 26,
+        # so entry must land on Jan 26 rather than the earliest price-qualifying
+        # Monday. A single candle at _MONDAY_TS is found by _candle_at_or_before
+        # for every later checkpoint too, so price qualifies throughout.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1), max_horizon_days=20)
+        assert entry is not None
+        assert entry["entry_date"] == date(2026, 1, 26)
+
+    def test_no_checkpoint_in_scan_window_satisfies_horizon_returns_none(self):
+        # The scan window ends at close_a - 1 day (Jan 31); the closest that
+        # gets to close_b (Feb 14) within the window is Jan 26 at 19 days out.
+        # A 3-day horizon excludes every checkpoint in range, even though the
+        # price gap would otherwise qualify at every one of them.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1), max_horizon_days=3)
+        assert entry is None
+
+
 class TestRunBacktestPnL:
     def test_profit_not_double_counted_and_cash_sized(self, monkeypatch):
         """End-to-end regression for the P&L double-subtraction and sizing bugs.
@@ -296,6 +357,40 @@ class TestRunBacktestPnL:
         # Equity curve: ends at initial balance + realized profit (no double count)
         final_value = float(equity["portfolio_value"].iloc[-1])
         assert final_value == pytest.approx(1000.0 + t.profit)
+
+    def test_max_horizon_days_threads_through_and_excludes_trade(self, monkeypatch):
+        # Same fixture as test_profit_not_double_counted_and_cash_sized: both
+        # legs close 2026-02-01, only candle is at _MONDAY_TS (2026-01-05),
+        # 27 days before close. A 3-day horizon excludes every checkpoint in
+        # the scan window (Jan 5 - Jan 31), so run_backtest must report zero
+        # trades even though the same fixture produces exactly one trade with
+        # max_horizon_days=None.
+        markets = [
+            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        ]
+        candles = {
+            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
+            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+            max_horizon_days=3,
+        )
+
+        assert trades == []
 
 
 # Anchor Monday reused across the eligibility-prefilter tests below — matches
