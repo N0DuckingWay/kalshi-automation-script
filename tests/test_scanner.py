@@ -1,5 +1,6 @@
 """Tests for scanner.py normalize_title() — the core pair-detection function."""
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,6 +10,7 @@ import pytest
 from kalshi_betting.config import INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
+    _fetch_orderbook,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -479,6 +481,84 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         spec = SimpleNamespace(pair=pair, x=10)
         client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
         assert validate_pair_price(client, spec) is True
+
+
+def _orderbook_payload_client(payload: dict):
+    """Mock KalshiClient whose orderbook endpoint returns `payload` (serialized to
+    raw JSON bytes) for any ticker — for exercising _fetch_orderbook key handling
+    directly with arbitrary response shapes."""
+    client = MagicMock()
+    client.get_market_orderbook_without_preload_content = MagicMock(
+        side_effect=lambda ticker: SimpleNamespace(
+            status=200, data=json.dumps(payload).encode("utf-8")
+        )
+    )
+    return client
+
+
+class TestFetchOrderbookKeyMapping:
+    """_fetch_orderbook must couple the container key to its matched side keys:
+    orderbook_fp -> yes_dollars/no_dollars, orderbook -> yes/no. A container whose
+    matched side keys are missing is a potential API-shape mismatch — logged and
+    treated as unavailable (None), never cross-read against the other generation."""
+
+    def test_current_format_parses(self):
+        # orderbook_fp container with dollar-string side arrays (the live shape)
+        payload = {"orderbook_fp": {"yes_dollars": [["0.50", "10"]],
+                                    "no_dollars": [["0.40", "5"]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CURRENT")
+        assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+
+    def test_legacy_format_parses(self):
+        # orderbook container with legacy yes/no side arrays still routes correctly
+        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
+        assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+
+    def test_mixed_generation_keys_return_none_and_warn(self, caplog):
+        # orderbook_fp container but with the OTHER generation's side keys —
+        # must not cross-read; returns None and logs a key-mismatch warning.
+        payload = {"orderbook_fp": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-MIXED")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+        assert "MKT-MIXED" in caplog.text
+
+    def test_empty_and_null_sides_are_not_a_mismatch(self, caplog):
+        # Side keys present but empty ([]) or null map to empty sides, NOT a
+        # mismatch — a market with no resting bids on a side is normal.
+        payload = {"orderbook_fp": {"yes_dollars": [], "no_dollars": None}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-EMPTY")
+        assert ob == {"yes": [], "no": []}
+        assert "key mismatch" not in caplog.text
+
+    def test_non_dict_container_returns_none_and_warns(self, caplog):
+        # Container key present but its value is not a dict (e.g. null) — fail closed.
+        payload = {"orderbook_fp": None}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NULLC")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+
+    def test_unknown_container_key_returns_none_and_warns(self, caplog):
+        # No recognized container key at all — log the actual response keys so a
+        # future rename is diagnosable rather than a silent 0-trade run.
+        payload = {"orderbook_v2": {"yes_dollars": [["0.50", "10"]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-UNKNOWN")
+        assert ob is None
+        assert "No usable orderbook" in caplog.text
+        assert "orderbook_v2" in caplog.text
+
+    def test_mismatch_marks_pair_untradeable(self):
+        # End-to-end: a mismatched orderbook makes enrich_with_orderbook_prices
+        # mark the pair non-tradeable (both legs resolve to None depth).
+        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
+        payload = {"orderbook_fp": {"yes": [["0.55", "100"]], "no": [["0.65", "100"]]}}
+        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
+        assert enriched.tradeable is False
 
 
 def _raw_page(events: list, cursor: str | None = None) -> SimpleNamespace:
