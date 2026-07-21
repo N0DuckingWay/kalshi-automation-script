@@ -840,13 +840,45 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     return levels
 
 
+# Matched wire-format generations for the orderbook response: each container key
+# pairs with its OWN side keys and units, and the two must never be mixed. The
+# current live API returns the book under `orderbook_fp` with dollar-string bid
+# arrays; the legacy `orderbook` container carried integer-cent arrays. Resolving
+# container and side keys independently (a plain `or` across both generations)
+# risked cross-reading a cents array through the dollars parser, so the pairing is
+# enforced explicitly in _fetch_orderbook. Order matters: orderbook_fp (current)
+# is tried before orderbook (legacy).
+_ORDERBOOK_SIDE_KEYS: dict[str, tuple[str, str]] = {
+    "orderbook_fp": ("yes_dollars", "no_dollars"),
+    "orderbook": ("yes", "no"),
+}
+
+
 def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     """
     Fetch the order book for a market.
 
-    Returns {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes' is
-    YES bids and 'no' is NO bids (both sorted descending by price), or None on
-    failure.
+    The live Kalshi API returns the book under one of two matched key generations
+    (see _ORDERBOOK_SIDE_KEYS): the current `orderbook_fp` container with
+    `yes_dollars`/`no_dollars` dollar-string bid arrays, or the legacy `orderbook`
+    container with `yes`/`no` arrays. The container key selects which side keys are
+    expected — the two generations are never mixed. Once a container is found, its
+    matched side keys MUST be present (either may be empty or null for a side with
+    no resting bids); a container whose matched side keys are absent, or which is
+    not even a dict, signals a Kalshi API shape change and is treated as a hard
+    failure rather than silently cross-reading the other generation's keys.
+
+    Args:
+        client (Any): Authenticated KalshiClient exposing the raw-response
+            get_market_orderbook_without_preload_content variant.
+        ticker (str): Market ticker whose order book to fetch.
+
+    Returns:
+        dict | None: {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes'
+            is YES bids and 'no' is NO bids, or None on failure. Returns None when
+            no recognized container key is present, when the selected container is
+            not a dict, or when the container's matched side keys are missing (a
+            potential key mismatch — logged as such).
     """
     try:
         # Raw-response call: the live API returns only the orderbook_fp key,
@@ -854,10 +886,13 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
         data = api_call_with_retry(
             fetch_json_page, client.get_market_orderbook_without_preload_content, ticker=ticker
         )
-        ob = data.get("orderbook_fp") or data.get("orderbook")
-        if ob is None:
-            # Neither recognized key held a usable book. Log the keys that WERE
-            # present: if the API renames the orderbook key again (as it did when
+        # Select the container by key PRESENCE (not truthiness) so its matched
+        # side keys can be enforced below — an empty book still selects its own
+        # container instead of falling through to the other generation.
+        container_key = next((k for k in _ORDERBOOK_SIDE_KEYS if k in data), None)
+        if container_key is None:
+            # No recognized container key at all. Log the keys that WERE present:
+            # if the API renames the orderbook key again (as it did when
             # orderbook -> orderbook_fp), every book resolves to None and every
             # pair is silently marked non-tradeable — a 0-trade run with nothing
             # but generic "unavailable" warnings. Naming the actual keys makes
@@ -868,8 +903,30 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
                 sorted(data.keys()),
             )
             return None
-        yes_raw = list(ob.get("yes_dollars") or ob.get("yes") or [])
-        no_raw  = list(ob.get("no_dollars") or ob.get("no") or [])
+        ob = data[container_key]
+        yes_key, no_key = _ORDERBOOK_SIDE_KEYS[container_key]
+        # TODO: validate this strict container->side-key mapping against captured
+        # test data from Kalshi's live API.
+        if not isinstance(ob, dict) or yes_key not in ob or no_key not in ob:
+            # Container present but its matched side keys are absent (or it is not
+            # even a dict). This is a potential key mismatch — the container and
+            # side keys have drifted out of sync, or Kalshi changed the response
+            # shape. Fail closed instead of cross-reading the other generation's
+            # keys (which could feed a cents array through the dollars parser).
+            logging.warning(
+                "Potential orderbook key mismatch for %s: container '%s' present but its "
+                "expected side keys %s are missing (got %s) — check for bugs or changes to "
+                "Kalshi's API",
+                ticker,
+                container_key,
+                (yes_key, no_key),
+                sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__,
+            )
+            return None
+        # Matched side keys are guaranteed present; a side with no resting bids
+        # arrives as null or [] and must read as an empty (not missing) side.
+        yes_raw = list(ob[yes_key] or [])
+        no_raw  = list(ob[no_key] or [])
         return {"yes": yes_raw, "no": no_raw}
     except Exception as exc:
         logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
