@@ -155,6 +155,25 @@ SETTLED_FETCH_MAX_WORKERS = 8
 # the current predicate would not have produced.
 SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
 
+# Hard cap on the per-ticker event-title fallback in
+# historical._load_or_build_event_titles. That fallback exists for the handful
+# of archived events the bulk listings no longer carry, and it costs ONE HTTP
+# GET per ticker. At current Kalshi volumes a 3-week backtest can reach the
+# fallback with hundreds of thousands of unresolved tickers (live-measured
+# 2026-08-03: 289,235 unique event_tickers for a 21-day window) — sequentially
+# that is many hours with no visible progress, which reads as a hang.
+#
+# Tickers past the cap are recorded as "" (the same poison pill used for a
+# failed lookup): the backtester then treats those markets as ungrouped, which
+# is the identical outcome a failed lookup already produced. Correctness is
+# unaffected; only MVE grouping coverage degrades, and the log says by how much.
+EVENT_TITLE_FALLBACK_MAX_LOOKUPS = 5_000
+
+# Worker threads for the per-ticker event-title fallback. Each lookup is an
+# independent read-only GET, so this is pure I/O overlap — the same rationale
+# (and the same retry-per-worker behaviour) as SETTLED_FETCH_MAX_WORKERS.
+EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
+
 # Stop the multivariate-events pull after this many CONSECUTIVE pages that
 # contain no nested markets. The MVE listing is effectively unbounded (Kalshi
 # auto-generates hundreds of thousands of collection events) and as of 2026-07

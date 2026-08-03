@@ -68,6 +68,8 @@ from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
 from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
+    EVENT_TITLE_FALLBACK_MAX_WORKERS,
     INCLUDE_MVE_MARKETS,
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
@@ -321,11 +323,20 @@ def _load_or_build_event_titles(
          For most backtests this covers nearly every event_ticker in a few hundred
          paginated calls.
       2. For any tickers still unresolved (very old archived events that have aged
-         out of the bulk listings), fall back to per-ticker get_event() calls.
+         out of the bulk listings), fall back to per-ticker get_event() calls —
+         run in parallel and capped at EVENT_TITLE_FALLBACK_MAX_LOOKUPS, since
+         each costs a round trip and the miss set can run to six figures at
+         current Kalshi volumes.
+
+    Every phase logs progress. This function can legitimately run for many
+    minutes, and when it was silent an in-progress run was indistinguishable
+    from a hang (observed 2026-08-03).
 
     Results are persisted to _EVENT_TITLES_CACHE so subsequent runs are essentially
-    free. Tickers that cannot be resolved are stored as empty strings (poison pill)
-    so we do not retry them every run.
+    free. Tickers that cannot be resolved — lookup failed, or skipped by the cap —
+    are stored as empty strings (poison pill) so we do not retry them every run.
+    An unresolved ticker is not an error: the caller groups those markets by
+    market title alone, which is exactly what a failed lookup has always done.
 
     Args:
         live_client: A KalshiClient with the events API methods available
@@ -354,10 +365,12 @@ def _load_or_build_event_titles(
     # API now sends `category: null` on some events (observed 2026-08-03), so
     # the modeled call raises pydantic ValidationError mid-listing. Same drift,
     # and same fix, as the market/order/orderbook endpoints — see module Notes.
+    total_missing = len(missing)
     for status in ("settled", "closed", "open"):
         if not missing:
             break
         cursor = None
+        pages = 0
         while True:
             kwargs: dict = {"status": status, "limit": 200}
             if cursor:
@@ -370,6 +383,13 @@ def _load_or_build_event_titles(
                 if tkr in missing:
                     cached[tkr] = ev.get("title") or ""
                     missing.discard(tkr)
+            pages += 1
+            # Without this the whole phase is silent for however long it runs —
+            # which at current volumes is long enough to look like a hang.
+            if pages % 100 == 0:
+                logging.info("Event titles [%s listing]: %d pages scanned, "
+                             "%d/%d still unresolved",
+                             status, pages, len(missing), total_missing)
             cursor = data.get("cursor")
             if not cursor or not missing:
                 break
@@ -382,7 +402,7 @@ def _load_or_build_event_titles(
     # Raw-response for the same nullable-category reason as above.
     if missing:
         cursor = None
-        for _ in range(MVE_TITLE_LOOKUP_MAX_PAGES):
+        for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
             kwargs = {"limit": 200}
             if cursor:
                 kwargs["cursor"] = cursor
@@ -396,6 +416,10 @@ def _load_or_build_event_titles(
                 if tkr in missing:
                     cached[tkr] = ev.get("title") or ""
                     missing.discard(tkr)
+            if page_no % 100 == 0:
+                logging.info("Event titles [MVE listing]: %d/%d pages scanned, "
+                             "%d/%d still unresolved", page_no,
+                             MVE_TITLE_LOOKUP_MAX_PAGES, len(missing), total_missing)
             cursor = data.get("cursor")
             if not cursor or not missing:
                 break
@@ -405,15 +429,58 @@ def _load_or_build_event_titles(
     # get_event embeds nested Market models the pinned SDK can no longer
     # deserialize (see module Notes). Failures are recorded as "" so we don't
     # retry on every backtest run.
-    for tkr in list(missing):
-        try:
-            data = _historical_get(live_client, f"{_API_PREFIX}/events/{tkr}")
-            cached[tkr] = (data.get("event") or {}).get("title") or ""
-        except Exception as e:
-            logging.warning("Could not resolve event title for %s: %s", tkr, e)
+    #
+    # This costs one HTTP round-trip per ticker, so it is BOUNDED and RUN IN
+    # PARALLEL: it was written for a handful of stragglers, but at current
+    # Kalshi volumes the bulk listings can leave hundreds of thousands
+    # unresolved (live-measured 2026-08-03), and sequentially that is hours of
+    # silent grinding. Anything past the cap is poison-pilled to "" — the same
+    # value a failed lookup produces, so the caller's behaviour is unchanged.
+    if missing:
+        to_look_up = sorted(missing)  # sorted → deterministic which ones the cap keeps
+        capped = to_look_up[EVENT_TITLE_FALLBACK_MAX_LOOKUPS:]
+        to_look_up = to_look_up[:EVENT_TITLE_FALLBACK_MAX_LOOKUPS]
+        if capped:
+            # Never drop coverage silently — say exactly how much was skipped.
+            logging.warning(
+                "Event titles: %d tickers unresolved after the bulk listings; "
+                "looking up %d individually and marking the remaining %d as "
+                "untitled (cap EVENT_TITLE_FALLBACK_MAX_LOOKUPS=%d). Those "
+                "markets group by market title alone, exactly as a failed "
+                "lookup would.",
+                len(missing), len(to_look_up), len(capped),
+                EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
+            )
+        else:
+            logging.info("Event titles: looking up %d tickers individually",
+                         len(to_look_up))
+        for tkr in capped:
             cached[tkr] = ""
 
+        def _lookup_one(tkr: str) -> tuple[str, str]:
+            """Resolve one event title; "" on any failure (poison pill)."""
+            try:
+                data = _historical_get(live_client, f"{_API_PREFIX}/events/{tkr}")
+                return tkr, (data.get("event") or {}).get("title") or ""
+            except Exception as e:
+                logging.warning("Could not resolve event title for %s: %s", tkr, e)
+                return tkr, ""
+
+        done = 0
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=EVENT_TITLE_FALLBACK_MAX_WORKERS) as pool:
+            for tkr, title in pool.map(_lookup_one, to_look_up):
+                cached[tkr] = title
+                done += 1
+                if done % 500 == 0:
+                    elapsed = max(time.monotonic() - started, 1e-9)
+                    remaining = (len(to_look_up) - done) / (done / elapsed)
+                    logging.info("Event titles: %d/%d individual lookups done "
+                                 "(ETA %s)", done, len(to_look_up),
+                                 _format_duration(remaining))
+
     _save_json_cache(_EVENT_TITLES_CACHE, cached)
+    logging.info("Event titles resolved: %d cached entries", len(cached))
     return cached
 
 

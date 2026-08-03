@@ -180,6 +180,70 @@ class TestEventTitlesCache:
         assert client.get_events_without_preload_content.call_count >= 1
         assert client.get_multivariate_events_without_preload_content.call_count >= 1
 
+    def test_per_ticker_fallback_is_capped(self, isolated_cache, monkeypatch, caplog):
+        # The per-ticker fallback costs one HTTP round trip each. It was
+        # written for a handful of stragglers, but a 21-day window measured
+        # 289,235 unresolved tickers live (2026-08-03) — uncapped and
+        # sequential that is hours of silent grinding. Past the cap, tickers
+        # are poison-pilled to "" exactly as a failed lookup already did.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(10)}
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, wanted)
+
+        # Every requested ticker is present — capped ones as the "" poison pill.
+        assert set(result) == wanted
+        assert fallback.call_count == 3
+        resolved = {t for t, v in result.items() if v}
+        assert len(resolved) == 3
+        assert all(result[t] == "" for t in wanted - resolved)
+        # The cap is deterministic (sorted), so a re-run can't shuffle coverage.
+        assert resolved == {"E00", "E01", "E02"}
+        # And it must never be silent about what it skipped.
+        assert any("marking the remaining 7 as untitled" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_per_ticker_fallback_runs_in_parallel(self, isolated_cache, monkeypatch):
+        # Each lookup is an independent read-only GET, so they must overlap
+        # rather than run one-at-a-time.
+        import threading
+
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_WORKERS", 4)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(8)}
+
+        concurrent = 0
+        peak = 0
+        lock = threading.Lock()
+        barrier_wait = threading.Event()
+
+        def slow_get(_client, path, **_params):
+            nonlocal concurrent, peak
+            with lock:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            # Hold the "connection" until enough workers pile up (or we give
+            # up), so peak concurrency is observable without a fixed sleep.
+            barrier_wait.wait(timeout=2.0)
+            with lock:
+                if peak >= 4:
+                    barrier_wait.set()
+                concurrent -= 1
+            tkr = path.rsplit("/", 1)[-1]
+            return _raw_resp({"event": {"title": f"Title {tkr}"}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", MagicMock(side_effect=slow_get))
+        result = historical._load_or_build_event_titles(client, wanted)
+
+        assert set(result) == wanted
+        assert all(v.startswith("Title ") for v in result.values())
+        assert peak > 1, f"lookups ran sequentially (peak concurrency {peak})"
+
     def test_cache_hit_skips_api(self, isolated_cache):
         # First call populates the cache; second call should not touch the API
         client1 = _make_client_with_event_pages(non_mve_pages=[[("E1", "Title One")]])
