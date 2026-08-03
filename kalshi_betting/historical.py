@@ -720,6 +720,64 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
     tmp.replace(path)
 
 
+def _day_store_meta(lo: int, expect_meta: dict) -> dict:
+    """
+    Build the metadata block written alongside one completed day slice.
+
+    Args:
+        lo (int): Epoch seconds of the slice's UTC midnight lower bound.
+        expect_meta (dict): Reuse-gating keys (kind, cutoff_ts, include_mve,
+            complete) that _day_store_load will check on a later run.
+
+    Returns:
+        dict: expect_meta plus human-readable `day` and `fetched_at` fields.
+    """
+    return {
+        **expect_meta,
+        "day": datetime.fromtimestamp(lo, tz=UTC).date().isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _assemble_day_slices(store: str, day_los: list[int], expect_meta: dict) -> list[dict]:
+    """
+    Rebuild a phase's record list by streaming completed day slices off disk.
+
+    Slices are read back rather than held in RAM because a full-history fetch
+    spans ~900 days at up to ~200k records each — retaining every slice (and
+    then flattening it into a second list) was measured at 2.7 GB RSS only 17%
+    of the way through a run, and grew superlinearly as GC pressure mounted.
+    Reading them back costs one extra decode pass, which is minutes against a
+    multi-hour fetch.
+
+    Days are emitted newest-first, matching the order the in-memory version
+    produced — record order is part of this module's output contract, since the
+    caller's ticker dedup is first-wins.
+
+    Args:
+        store (str): Store subdirectory name ("archive_days" or "live_days").
+        day_los (list[int]): UTC-midnight lower bounds of every day known to
+            have a valid slice on disk (reused or just written).
+        expect_meta (dict): Reuse-gating keys the slices must still match.
+
+    Returns:
+        list[dict]: Compact market dicts, newest day first.
+
+    Raises:
+        _ShardedFetchUnsupported: If a slice that was just verified or written
+            no longer loads — the caller then takes the sequential fallback
+            rather than silently returning a short result set.
+    """
+    records: list[dict] = []
+    for lo in sorted(day_los, reverse=True):
+        path = _day_store_path(store, lo)
+        slice_records = _day_store_load(path, expect_meta)
+        if slice_records is None:
+            raise _ShardedFetchUnsupported(f"day slice disappeared or corrupted: {path}")
+        records.extend(slice_records)
+    return records
+
+
 # ─── Archive (pre-cutoff) fetching ────────────────────────────────────────────
 
 def _archive_cursor_synthesis_ok(hist_client: Any, hist_kwargs: dict) -> bool:
@@ -971,6 +1029,49 @@ def _fetch_archive_sequential(
     return selected
 
 
+def _fetch_and_store_archive_day(
+    hist_client: Any,
+    day_lo: int,
+    hist_kwargs: dict,
+    progress: _FetchProgress,
+    expect_meta: dict,
+) -> int:
+    """
+    Worker task: fetch one archive created-day slice and persist it.
+
+    Runs entirely inside the pool thread and returns only a count, so the
+    slice's records are freed as soon as the file is written and never cross
+    back to the main thread. This also moves gzip compression and JSON
+    serialization off the main thread — zlib releases the GIL, so that work
+    genuinely overlaps other workers.
+
+    Args:
+        hist_client (Any): Authenticated KalshiClient.
+        day_lo (int): UTC-midnight lower bound of the created-day to fetch.
+        hist_kwargs (dict): Base query params (limit, optional mve_filter).
+        progress (_FetchProgress): Shared page counter for log output.
+        expect_meta (dict): Reuse-gating keys to stamp into the slice file.
+
+    Returns:
+        int: Number of records persisted for this day.
+
+    Raises:
+        _ShardedFetchUnsupported: Propagated from _fetch_archive_day when the
+            server ignores a synthesized cursor or omits created_time.
+    """
+    day_markets = _fetch_archive_day(
+        hist_client, day_lo, day_lo + _DAY_SECONDS, hist_kwargs, progress
+    )
+    # Persist as soon as the day completes so an interrupted run resumes here
+    # instead of refetching, then drop the records — assembly re-reads them.
+    _day_store_save(
+        _day_store_path("archive_days", day_lo),
+        _day_store_meta(day_lo, expect_meta),
+        day_markets,
+    )
+    return len(day_markets)
+
+
 def _fetch_archive_phase(
     hist_client: Any,
     start_ts: int,
@@ -983,9 +1084,13 @@ def _fetch_archive_phase(
     Sharded path (preferred): verify cursor synthesis, then fetch one slice
     per UTC created-day in [start_ts, cutoff_ts) — reusing any slice already
     on disk from a previous run — with SETTLED_FETCH_MAX_WORKERS parallel
-    workers, then walk the tail below start_ts. Each completed slice is
-    persisted immediately, so an interrupted fetch resumes at day granularity
-    instead of restarting the multi-hour walk.
+    workers, then walk the tail below start_ts. Each worker persists its own
+    slice as soon as the day completes, so an interrupted fetch resumes at day
+    granularity instead of restarting the multi-hour walk.
+
+    Slice records are never accumulated in memory: workers return only counts
+    and the final list is streamed back off disk by _assemble_day_slices (see
+    there for why — a ~900-day window otherwise runs to tens of GB).
 
     Slice files are stamped with the cutoff_ts they were fetched under and are
     ONLY reused while the stamp matches the current cutoff: when Kalshi
@@ -1021,16 +1126,19 @@ def _fetch_archive_phase(
             "include_mve": INCLUDE_MVE_MARKETS,
             "complete": True,
         }
-        results: dict[int, list[dict]] = {}
+        # Only day identities are tracked here, never their records: the
+        # prescan's loaded slices are discarded and re-read at assembly. That
+        # costs one extra decode of the reused days but keeps peak memory
+        # independent of how many days the window spans.
+        on_disk: list[int] = []
         to_fetch: list[int] = []
         for lo in day_los:
-            cached = _day_store_load(_day_store_path("archive_days", lo), expect_meta)
-            if cached is not None:
-                results[lo] = cached
+            if _day_store_load(_day_store_path("archive_days", lo), expect_meta) is not None:
+                on_disk.append(lo)
             else:
                 to_fetch.append(lo)
         logging.info("Archive day slices: %d reused from disk, %d to fetch",
-                     len(results), len(to_fetch))
+                     len(on_disk), len(to_fetch))
 
         progress = _FetchProgress("Historical archive")
         if to_fetch:
@@ -1039,30 +1147,22 @@ def _fetch_archive_phase(
             to_fetch.sort(reverse=True)
             with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
                 futures = {
-                    pool.submit(_fetch_archive_day, hist_client, lo, lo + _DAY_SECONDS,
-                                hist_kwargs, progress): lo
+                    pool.submit(_fetch_and_store_archive_day, hist_client, lo,
+                                hist_kwargs, progress, expect_meta): lo
                     for lo in to_fetch
                 }
                 for future in as_completed(futures):
                     lo = futures[future]
-                    day_markets = future.result()
-                    # Persist each slice as soon as it completes so an
-                    # interrupted run resumes here instead of refetching.
-                    _day_store_save(
-                        _day_store_path("archive_days", lo),
-                        {**expect_meta,
-                         "day": datetime.fromtimestamp(lo, tz=UTC).date().isoformat(),
-                         "fetched_at": datetime.now(UTC).isoformat()},
-                        day_markets,
-                    )
-                    results[lo] = day_markets
+                    # The worker already persisted this slice; only its identity
+                    # is needed, so nothing large is retained here.
+                    future.result()
+                    on_disk.append(lo)
 
         # Long-lived markets created before start_date but settling inside the
         # window — same records the sequential walk picked up past start_ts.
         tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
 
-        day_records = [m for lo in sorted(results, reverse=True) for m in results[lo]]
-        return day_records, tail
+        return _assemble_day_slices("archive_days", on_disk, expect_meta), tail
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Archive fetch: sharded path unavailable (%s) — falling back to the "
@@ -1180,6 +1280,44 @@ def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
             return kept
 
 
+def _fetch_and_store_live_window(
+    live_client,
+    day_lo: int,
+    progress: _FetchProgress,
+    expect_meta: dict,
+) -> int:
+    """
+    Worker task: fetch one fully-elapsed live settled-day window and persist it.
+
+    The archive-side counterpart is _fetch_and_store_archive_day; same
+    rationale (records freed in-thread, serialization off the main thread).
+    Only past days go through here — the frontier day is fetched directly and
+    deliberately never persisted, since it was captured mid-day.
+
+    Args:
+        live_client: KalshiClient from build_prod_live_client().
+        day_lo (int): UTC-midnight lower bound of the settled-day window.
+        progress (_FetchProgress): Shared page counter for log output.
+        expect_meta (dict): Reuse-gating keys to stamp into the slice file.
+
+    Returns:
+        int: Number of records persisted for this day.
+
+    Raises:
+        _ShardedFetchUnsupported: Propagated from _fetch_live_window when the
+            server stops honoring max_settled_ts.
+    """
+    day_markets = _fetch_live_window(live_client, day_lo, day_lo + _DAY_SECONDS, progress)
+    # Fully-elapsed days are immutable, so persisting here lets later runs and
+    # interrupted-run resumes skip the day entirely.
+    _day_store_save(
+        _day_store_path("live_days", day_lo),
+        _day_store_meta(day_lo, expect_meta),
+        day_markets,
+    )
+    return len(day_markets)
+
+
 def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
     """
     Fetch the live endpoint's contribution: per-settled-day windows in parallel.
@@ -1191,6 +1329,9 @@ def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
     the frontier day and any never-fetched days hit the API. The frontier
     window is deliberately never persisted: it was fetched mid-day and would
     otherwise be reused as if complete.
+
+    As on the archive side, past-day records are persisted in the worker and
+    streamed back off disk at assembly rather than accumulated in memory.
 
     Falls back to _fetch_live_sequential if the server stops honoring
     max_settled_ts (detected per window by _fetch_live_window).
@@ -1219,45 +1360,41 @@ def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
         "complete": True,
     }
     try:
-        results: dict[int, list[dict]] = {}
+        # As in _fetch_archive_phase: track day identities only, and re-read
+        # the slices at assembly so peak memory doesn't scale with the number
+        # of days in the sweep.
+        on_disk: list[int] = []
         to_fetch: list[int] = []
         for lo in past_day_los:
-            cached = _day_store_load(_day_store_path("live_days", lo), expect_meta)
-            if cached is not None:
-                results[lo] = cached
+            if _day_store_load(_day_store_path("live_days", lo), expect_meta) is not None:
+                on_disk.append(lo)
             else:
                 to_fetch.append(lo)
         logging.info("Live settled-day windows: %d reused from disk, %d to fetch "
-                     "(plus the frontier day)", len(results), len(to_fetch))
+                     "(plus the frontier day)", len(on_disk), len(to_fetch))
 
         progress = _FetchProgress("Live settled sweep")
         to_fetch.sort(reverse=True)
         frontier: list[dict] = []
         with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
+            # The frontier day is returned in full rather than persisted — it
+            # was captured mid-day and must never be reused as a complete day.
             frontier_future = pool.submit(
                 _fetch_live_window, live_client, frontier_lo, None, progress
             )
             futures = {
-                pool.submit(_fetch_live_window, live_client, lo, lo + _DAY_SECONDS,
-                            progress): lo
+                pool.submit(_fetch_and_store_live_window, live_client, lo,
+                            progress, expect_meta): lo
                 for lo in to_fetch
             }
             for future in as_completed(futures):
                 lo = futures[future]
-                day_markets = future.result()
-                # Persist each completed (fully-elapsed, hence immutable) day
-                # so later runs and interrupted-run resumes skip it entirely.
-                _day_store_save(
-                    _day_store_path("live_days", lo),
-                    {**expect_meta,
-                     "day": datetime.fromtimestamp(lo, tz=UTC).date().isoformat(),
-                     "fetched_at": datetime.now(UTC).isoformat()},
-                    day_markets,
-                )
-                results[lo] = day_markets
+                # Persisted in the worker; only the day identity is kept here.
+                future.result()
+                on_disk.append(lo)
             frontier = frontier_future.result()
 
-        return frontier + [m for lo in sorted(results, reverse=True) for m in results[lo]]
+        return frontier + _assemble_day_slices("live_days", on_disk, expect_meta)
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Live fetch: windowed path unavailable (%s) — falling back to the "

@@ -652,6 +652,34 @@ class TestShardedFetch:
         # The migrated markets must come from the refetched archive slices
         assert {"L1", "L2", "L3"} <= {m["ticker"] for m in out2}
 
+    def test_assembly_streams_slices_from_disk(self, tmp_path, monkeypatch):
+        # Peak memory must not scale with the number of days fetched, so no
+        # phase may retain slice records: every day — including ones fetched
+        # moments earlier in this same run — is re-read from its file at
+        # assembly. Verified by counting _day_store_load calls per path.
+        archive_markets, live_markets = self._fixture_markets()
+        real_load = historical._day_store_load
+        loads: list[str] = []
+
+        def counting_load(path, expect_meta):
+            result = real_load(path, expect_meta)
+            if result is not None:
+                loads.append(str(path))
+            return result
+
+        monkeypatch.setattr(historical, "_day_store_load", counting_load)
+        out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                        _FakeLive(live_markets))
+        assert out  # sanity: the run actually produced records
+
+        # Cold run: every successful load is an assembly read (the prescan
+        # found nothing on disk), so each written slice is read exactly once.
+        written = {str(p) for p in
+                   (tmp_path / "cache").glob("*_days/*.json.gz")}
+        assert written, "expected day slices to have been persisted"
+        assert set(loads) == written
+        assert len(loads) == len(written)
+
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
         # would silently re-walk the whole range; the first window detects it

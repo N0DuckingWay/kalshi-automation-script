@@ -227,11 +227,13 @@ given number of days of the *simulated* entry checkpoint (each Monday evaluated
 during the replay), not today's real date. Optional; omit for no limit.
 
 The settled-market fetch is sharded into one slice per UTC day and fetched with
-`SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each completed slice
-is cached in `backtest_cache/archive_days/` / `backtest_cache/live_days/`. An
-interrupted fetch resumes at day granularity, and `--no-cache` reuses the day
-slices (they cannot go stale — see CLAUDE.md), so a refresh only fetches the
-current day plus any days not yet on disk.
+`SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each worker writes its
+own completed slice to `backtest_cache/archive_days/` / `backtest_cache/live_days/`
+and then releases it, so memory use stays flat no matter how many days the run
+spans — the final record list is streamed back off disk once every slice is
+present. An interrupted fetch resumes at day granularity, and `--no-cache`
+reuses the day slices (they cannot go stale — see CLAUDE.md), so a refresh only
+fetches the current day plus any days not yet on disk.
 
 ### Weekly scheduler daemon
 
