@@ -174,6 +174,20 @@ EVENT_TITLE_FALLBACK_MAX_LOOKUPS = 5_000
 # (and the same retry-per-worker behaviour) as SETTLED_FETCH_MAX_WORKERS.
 EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
 
+# Abandon a bulk event listing after this many CONSECUTIVE pages that resolve
+# no new titles. Same "productivity bail-out" idiom as MVE_MAX_EMPTY_PAGES.
+#
+# The bulk listings are an O(all events) scan looking for a specific ticker
+# set, so they only pay off while they keep hitting wanted tickers. Live-
+# measured 2026-08-03 on a 21-day window: the `settled` listing resolved 8,696
+# of 289,235 tickers in its first ~500 pages, then just 9 more over the next
+# 400 pages — because the overwhelming majority of those tickers are
+# auto-generated MVE collection events, which get_events EXCLUDES by API
+# design and therefore can never return. Without this bail-out the phase keeps
+# paging a listing that structurally cannot contain what it is looking for,
+# for all three statuses, before the MVE listing is even reached.
+EVENT_TITLE_LISTING_MAX_BARREN_PAGES = 50
+
 # Stop the multivariate-events pull after this many CONSECUTIVE pages that
 # contain no nested markets. The MVE listing is effectively unbounded (Kalshi
 # auto-generates hundreds of thousands of collection events) and as of 2026-07

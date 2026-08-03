@@ -130,11 +130,17 @@ class TestEventTitlesCache:
         result = historical._load_or_build_event_titles(client, {"BAD-1"})
         assert result == {"BAD-1": ""}
 
-    def test_mve_bulk_scan_is_page_capped(self, isolated_cache, monkeypatch):
+    def test_mve_bulk_scan_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
         # The MVE listing is effectively unbounded — a ticker that never
-        # appears must not page forever. The bulk scan stops after
-        # MVE_TITLE_LOOKUP_MAX_PAGES and the per-ticker fallback resolves it.
-        from kalshi_betting.config import MVE_TITLE_LOOKUP_MAX_PAGES
+        # appears must not page forever. Two bounds apply: the productivity
+        # bail-out (stop once N consecutive pages resolve nothing) and the hard
+        # MVE_TITLE_LOOKUP_MAX_PAGES backstop. The bail-out fires first, which
+        # matters because live-measured 2026-08-03 the listings kept scanning
+        # long after they had stopped resolving anything.
+        from kalshi_betting.config import (
+            EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
+            MVE_TITLE_LOOKUP_MAX_PAGES,
+        )
 
         client = _make_client_with_event_pages(non_mve_pages=[])
 
@@ -151,8 +157,36 @@ class TestEventTitlesCache:
         )
         result = historical._load_or_build_event_titles(client, {"DEEP-1"})
         assert result == {"DEEP-1": "Deep Title"}
-        assert (client.get_multivariate_events_without_preload_content.call_count
-                == MVE_TITLE_LOOKUP_MAX_PAGES)
+        pages = client.get_multivariate_events_without_preload_content.call_count
+        assert pages == EVENT_TITLE_LISTING_MAX_BARREN_PAGES
+        assert pages < MVE_TITLE_LOOKUP_MAX_PAGES  # backstop never needed here
+        # Still resolved, via the per-ticker fallback.
+        assert fallback.call_count == 1
+
+    def test_status_listing_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
+        # Same bail-out on the settled/closed/open listings. These are an
+        # O(all events) scan for a specific ticker set, and get_events EXCLUDES
+        # MVE events by API design — so for an MVE-heavy miss set they can
+        # never resolve anything and must not page indefinitely (live-measured
+        # 2026-08-03: 80,000 events scanned resolved 9 tickers).
+        from kalshi_betting.config import EVENT_TITLE_LISTING_MAX_BARREN_PAGES
+
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+
+        def endless_events(status=None, limit=None, cursor=None):
+            return _raw_resp({
+                "events": [{"event_ticker": "OTHER", "title": "x", "category": None}],
+                "cursor": "NEXT",
+            })
+        client.get_events_without_preload_content = MagicMock(side_effect=endless_events)
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={"DEEP-1": "Deep Title"},
+        )
+        result = historical._load_or_build_event_titles(client, {"DEEP-1"})
+        assert result == {"DEEP-1": "Deep Title"}
+        # One bail-out per status (settled, closed, open) — bounded, not endless.
+        assert (client.get_events_without_preload_content.call_count
+                == 3 * EVENT_TITLE_LISTING_MAX_BARREN_PAGES)
         assert fallback.call_count == 1
 
     def test_bulk_listings_use_raw_variants_not_modeled_calls(self, isolated_cache,

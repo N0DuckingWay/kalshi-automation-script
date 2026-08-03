@@ -70,6 +70,7 @@ from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
+    EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
     INCLUDE_MVE_MARKETS,
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
@@ -371,6 +372,7 @@ def _load_or_build_event_titles(
             break
         cursor = None
         pages = 0
+        barren = 0  # consecutive pages that resolved nothing
         while True:
             kwargs: dict = {"status": status, "limit": 200}
             if cursor:
@@ -378,11 +380,13 @@ def _load_or_build_event_titles(
             data = api_call_with_retry(
                 fetch_json_page, live_client.get_events_without_preload_content, **kwargs
             )
+            resolved_here = 0
             for ev in data.get("events") or []:
                 tkr = ev.get("event_ticker")
                 if tkr in missing:
                     cached[tkr] = ev.get("title") or ""
                     missing.discard(tkr)
+                    resolved_here += 1
             pages += 1
             # Without this the whole phase is silent for however long it runs —
             # which at current volumes is long enough to look like a hang.
@@ -390,6 +394,18 @@ def _load_or_build_event_titles(
                 logging.info("Event titles [%s listing]: %d pages scanned, "
                              "%d/%d still unresolved",
                              status, pages, len(missing), total_missing)
+            # Productivity bail-out: this listing is a full scan looking for a
+            # specific ticker set, so once it stops hitting wanted tickers it
+            # will not start again — keep paging and it burns minutes finding
+            # nothing (see EVENT_TITLE_LISTING_MAX_BARREN_PAGES).
+            barren = 0 if resolved_here else barren + 1
+            if barren >= EVENT_TITLE_LISTING_MAX_BARREN_PAGES:
+                logging.info(
+                    "Event titles [%s listing]: no new titles in %d consecutive "
+                    "pages after %d scanned — moving on with %d/%d unresolved",
+                    status, barren, pages, len(missing), total_missing,
+                )
+                break
             cursor = data.get("cursor")
             if not cursor or not missing:
                 break
@@ -402,6 +418,7 @@ def _load_or_build_event_titles(
     # Raw-response for the same nullable-category reason as above.
     if missing:
         cursor = None
+        barren = 0
         for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
             kwargs = {"limit": 200}
             if cursor:
@@ -411,15 +428,27 @@ def _load_or_build_event_titles(
                 live_client.get_multivariate_events_without_preload_content,
                 **kwargs,
             )
+            resolved_here = 0
             for ev in data.get("events") or []:
                 tkr = ev.get("event_ticker")
                 if tkr in missing:
                     cached[tkr] = ev.get("title") or ""
                     missing.discard(tkr)
+                    resolved_here += 1
             if page_no % 100 == 0:
                 logging.info("Event titles [MVE listing]: %d/%d pages scanned, "
                              "%d/%d still unresolved", page_no,
                              MVE_TITLE_LOOKUP_MAX_PAGES, len(missing), total_missing)
+            # Same productivity bail-out as the status listings above; the MVE
+            # listing is the most unbounded of the three.
+            barren = 0 if resolved_here else barren + 1
+            if barren >= EVENT_TITLE_LISTING_MAX_BARREN_PAGES:
+                logging.info(
+                    "Event titles [MVE listing]: no new titles in %d consecutive "
+                    "pages after %d scanned — moving on with %d/%d unresolved",
+                    barren, page_no, len(missing), total_missing,
+                )
+                break
             cursor = data.get("cursor")
             if not cursor or not missing:
                 break
