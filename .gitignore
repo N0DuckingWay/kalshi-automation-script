@@ -13,6 +13,9 @@ secrets.json
 
 # Bot output
 *.log
+# Rotated/suffixed logs (kalshi_backtest.log.prev, .1, .2026-08-03 …) — these do
+# NOT match *.log, so without this a `git add -A` sweeps them into a commit.
+*.log.*
 backtest_cache/
 dashboard.html
 backtest_dashboard*.html
