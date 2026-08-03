@@ -39,6 +39,17 @@ from typing import Any
 
 from kalshi_python_sync.exceptions import ApiException
 
+# Optional acceleration: the backtest's settled-market fetch parses tens of
+# millions of JSON records and is CPU-bound on exactly this call. orjson is an
+# optional extra (`pip install -e ".[perf]"`); the stdlib fallback is fully
+# equivalent, just slower. Both accept bytes or str.
+try:
+    import orjson
+
+    _json_loads: Callable[[Any], Any] = orjson.loads
+except ImportError:
+    _json_loads = json.loads
+
 # HTTP status codes worth retrying: 429 (rate limit) plus common transient 5xx errors.
 # 500 / 502 / 503 / 504 sometimes appear during Kalshi maintenance or upstream blips.
 _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
@@ -173,7 +184,7 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
             body=body.decode("utf-8") if isinstance(body, bytes) else body,
             data=None,
         )
-    return json.loads(body)
+    return _json_loads(body)
 
 
 def api_call_with_retry(fn: Callable, *args, **kwargs):

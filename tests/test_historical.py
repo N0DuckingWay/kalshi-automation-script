@@ -1,4 +1,5 @@
 """Tests for historical.py — event-title cache and dict serialization."""
+import gzip
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -722,6 +723,28 @@ class TestDayStore:
         assert historical._day_store_load(path, {}) is None
         path.write_bytes(b"not gzip")
         assert historical._day_store_load(path, {}) is None
+
+    def test_day_store_roundtrip_interoperates_with_stdlib_json(self, tmp_path):
+        # The store may be written by orjson (optional `perf` extra) or the
+        # stdlib. Both must produce files the other can read, or installing /
+        # removing orjson would silently invalidate every cached day slice.
+        meta = {"kind": "archive_created_day", "cutoff_ts": 100,
+                "include_mve": True, "complete": True}
+        markets = [{"ticker": "T1", "result": "yes", "settlement_ts": "2026-06-09T00:00:00Z"},
+                   {"ticker": "T2", "result": "no", "open_time": None}]
+
+        # Whatever _day_store_save used, plain stdlib json must read it back.
+        written = tmp_path / "written.json.gz"
+        historical._day_store_save(written, meta, markets)
+        with gzip.open(written, "rt", encoding="utf-8") as fh:
+            assert json.load(fh) == {"meta": meta, "markets": markets}
+
+        # And a slice hand-written by the stdlib must load through the shim —
+        # this is the contract that keeps pre-existing caches on disk usable.
+        legacy = tmp_path / "legacy.json.gz"
+        with gzip.open(legacy, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "markets": markets}, fh)
+        assert historical._day_store_load(legacy, meta) == markets
 
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",

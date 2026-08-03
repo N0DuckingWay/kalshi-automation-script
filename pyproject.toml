@@ -21,6 +21,14 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
 ]
+# Optional speedup for the backtest's settled-market fetch, which parses tens
+# of millions of JSON records. Never required: _http.py and historical.py fall
+# back to the stdlib json module, and the on-disk cache format is byte-for-byte
+# the same either way (orjson emits plain JSON), so caches written with or
+# without it stay interchangeable.
+perf = [
+    "orjson>=3.9",
+]
 
 [tool.ruff]
 target-version = "py311"

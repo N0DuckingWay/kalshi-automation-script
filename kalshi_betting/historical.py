@@ -43,6 +43,12 @@ Notes:
     params. Both sharded paths runtime-verify their assumptions and fall back
     to the original sequential walks if the API drifts. See
     fetch_all_settled_markets for the full contract.
+
+    JSON parsing dominates the fetch's CPU time at current Kalshi volumes, so
+    orjson is used when installed (optional `perf` extra) and the stdlib json
+    module otherwise. This is purely a speed knob: orjson emits plain JSON, so
+    day-slice files written under either parser are interchangeable and no
+    cache is invalidated by installing or removing it.
 """
 import base64
 import gzip
@@ -67,6 +73,19 @@ from .config import (
     PROJECT_ROOT,
     SETTLED_FETCH_MAX_WORKERS,
 )
+
+# Optional acceleration for the day-slice store, which serializes and re-parses
+# tens of millions of compact market dicts per full-history fetch. orjson is an
+# optional extra (`pip install -e ".[perf]"`) and emits plain JSON, so slices
+# written with it are readable by the stdlib fallback and vice versa — existing
+# caches never need refetching over this. See _day_store_save/_day_store_load.
+try:
+    import orjson
+
+    _HAVE_ORJSON = True
+except ImportError:
+    orjson = None  # type: ignore[assignment]
+    _HAVE_ORJSON = False
 
 # Host and path prefix split out of PROD_URL ("https://host/trade-api/v2") so
 # _signed_raw_get can sign the path component and hit arbitrary API routes.
@@ -657,8 +676,11 @@ def _day_store_load(path: Path, expect_meta: dict) -> list[dict] | None:
     if not path.exists():
         return None
     try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        # Read as bytes so the orjson and stdlib parsers take the same input.
+        # Both accept UTF-8 bytes, and slices are plain JSON either way.
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        payload = orjson.loads(raw) if _HAVE_ORJSON else json.loads(raw)
     except (OSError, ValueError):
         return None
     meta = payload.get("meta") or {}
@@ -676,6 +698,11 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
     interrupted run can never leave a truncated file that a later run would
     trust.
 
+    Serialized with orjson when available (this runs once per day slice over
+    ~200k records, so it is a hot path), otherwise the stdlib json module. Both
+    produce plain JSON, so a slice written by one is readable by the other —
+    existing caches stay valid regardless of which is installed.
+
     Args:
         path (Path): Destination path from _day_store_path().
         meta (dict): Metadata block checked by _day_store_load on reuse.
@@ -683,8 +710,13 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as fh:
-        json.dump({"meta": meta, "markets": markets}, fh)
+    payload = {"meta": meta, "markets": markets}
+    if _HAVE_ORJSON:
+        with gzip.open(tmp, "wb", compresslevel=1) as fh:
+            fh.write(orjson.dumps(payload))
+    else:
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as fh:
+            json.dump(payload, fh)
     tmp.replace(path)
 
 
