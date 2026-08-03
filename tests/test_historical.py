@@ -17,19 +17,24 @@ def _raw_resp(payload: dict) -> SimpleNamespace:
 
 def _make_client_with_event_pages(non_mve_pages: list[list[tuple[str, str]]],
                                   mve_pages: list[list[tuple[str, str]]] | None = None):
-    """Build a MagicMock client whose get_events / get_multivariate_events
-    return paginated event listings as configured.
+    """Build a MagicMock client whose raw get_events /
+    get_multivariate_events variants return paginated event listings.
 
     Each page is a list of (event_ticker, title) tuples. The mock walks the pages
     in order until exhausted, then returns an empty page with cursor=None.
-    (These two bulk listings still use the modeled SDK calls — Event models
-    without nested markets deserialize fine.)
+
+    Both listings go through the `*_without_preload_content` raw variants: the
+    live API sends `category: null` on some events, which the pinned SDK's
+    EventData model (category typed as a required str) rejects with a pydantic
+    ValidationError. The `category` key below is deliberately null so these
+    fixtures carry the shape that broke the modeled calls.
     """
     mve_pages = mve_pages or []
 
     def _build_resp(page):
-        events = [SimpleNamespace(event_ticker=tkr, title=title) for tkr, title in page]
-        return SimpleNamespace(events=events, cursor=None)
+        events = [{"event_ticker": tkr, "title": title, "category": None}
+                  for tkr, title in page]
+        return _raw_resp({"events": events, "cursor": None})
 
     client = MagicMock()
     # Each call returns the next page; pad with empty page when exhausted.
@@ -48,8 +53,9 @@ def _make_client_with_event_pages(non_mve_pages: list[list[tuple[str, str]]],
         except StopIteration:
             return _build_resp([])
 
-    client.get_events = MagicMock(side_effect=get_events)
-    client.get_multivariate_events = MagicMock(side_effect=get_multivariate_events)
+    client.get_events_without_preload_content = MagicMock(side_effect=get_events)
+    client.get_multivariate_events_without_preload_content = MagicMock(
+        side_effect=get_multivariate_events)
     return client
 
 
@@ -134,18 +140,45 @@ class TestEventTitlesCache:
 
         def endless_mve(limit=None, cursor=None):
             # Cursor always set, ticker never found — an unbounded listing
-            return SimpleNamespace(
-                events=[SimpleNamespace(event_ticker="OTHER", title="x")],
-                cursor="NEXT",
-            )
-        client.get_multivariate_events = MagicMock(side_effect=endless_mve)
+            return _raw_resp({
+                "events": [{"event_ticker": "OTHER", "title": "x", "category": None}],
+                "cursor": "NEXT",
+            })
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=endless_mve)
         fallback = _patch_single_event_lookups(
             monkeypatch, single_lookups={"DEEP-1": "Deep Title"},
         )
         result = historical._load_or_build_event_titles(client, {"DEEP-1"})
         assert result == {"DEEP-1": "Deep Title"}
-        assert client.get_multivariate_events.call_count == MVE_TITLE_LOOKUP_MAX_PAGES
+        assert (client.get_multivariate_events_without_preload_content.call_count
+                == MVE_TITLE_LOOKUP_MAX_PAGES)
         assert fallback.call_count == 1
+
+    def test_bulk_listings_use_raw_variants_not_modeled_calls(self, isolated_cache,
+                                                              monkeypatch):
+        # Regression: the bulk event listings used the MODELED get_events /
+        # get_multivariate_events. The live API now sends `category: null`,
+        # which the pinned SDK's EventData model (category: required str)
+        # rejects with a pydantic ValidationError — observed 2026-08-03 killing
+        # a backtest after a 28-minute fetch had already succeeded. Both must
+        # go through the raw *_without_preload_content variants, which never
+        # touch the response models.
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("E1", "Event One")]], mve_pages=[[("E2", "MVE Two")]],
+        )
+        # Modeled calls are booby-trapped: touching either is the bug.
+        def _modeled_is_broken(*_a, **_k):
+            raise AssertionError("modeled SDK call used; it cannot parse live events")
+
+        client.get_events = MagicMock(side_effect=_modeled_is_broken)
+        client.get_multivariate_events = MagicMock(side_effect=_modeled_is_broken)
+        _patch_single_event_lookups(monkeypatch)
+
+        result = historical._load_or_build_event_titles(client, {"E1", "E2"})
+        assert result == {"E1": "Event One", "E2": "MVE Two"}
+        assert client.get_events_without_preload_content.call_count >= 1
+        assert client.get_multivariate_events_without_preload_content.call_count >= 1
 
     def test_cache_hit_skips_api(self, isolated_cache):
         # First call populates the cache; second call should not touch the API
@@ -156,8 +189,8 @@ class TestEventTitlesCache:
         result = historical._load_or_build_event_titles(client2, {"E1"})
         assert result == {"E1": "Title One"}
         # No API calls on the cache hit
-        assert client2.get_events.call_count == 0
-        assert client2.get_multivariate_events.call_count == 0
+        assert client2.get_events_without_preload_content.call_count == 0
+        assert client2.get_multivariate_events_without_preload_content.call_count == 0
 
     def test_use_cache_false_bypasses_disk(self, isolated_cache):
         # Pre-populate disk cache with a stale value
@@ -168,7 +201,7 @@ class TestEventTitlesCache:
         client2 = _make_client_with_event_pages(non_mve_pages=[[("E1", "Fresh Title")]])
         result = historical._load_or_build_event_titles(client2, {"E1"}, use_cache=False)
         assert result["E1"] == "Fresh Title"
-        assert client2.get_events.call_count >= 1
+        assert client2.get_events_without_preload_content.call_count >= 1
 
 
 def _raw_market_dict(**overrides) -> dict:

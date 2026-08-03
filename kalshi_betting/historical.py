@@ -348,22 +348,29 @@ def _load_or_build_event_titles(
     # Bulk pull non-MVE events across all statuses. Each get_events call returns
     # up to 200 events; pagination continues until cursor is empty or all misses
     # are resolved (whichever comes first).
+    #
+    # Raw-response call: the modeled get_events deserializes into EventData,
+    # whose `category` field the pinned SDK types as a REQUIRED string. The live
+    # API now sends `category: null` on some events (observed 2026-08-03), so
+    # the modeled call raises pydantic ValidationError mid-listing. Same drift,
+    # and same fix, as the market/order/orderbook endpoints — see module Notes.
     for status in ("settled", "closed", "open"):
         if not missing:
             break
         cursor = None
         while True:
-            resp = api_call_with_retry(
-                live_client.get_events,
-                status=status,
-                limit=200,
-                cursor=cursor,
+            kwargs: dict = {"status": status, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            data = api_call_with_retry(
+                fetch_json_page, live_client.get_events_without_preload_content, **kwargs
             )
-            for ev in resp.events or []:
-                if ev.event_ticker in missing:
-                    cached[ev.event_ticker] = ev.title or ""
-                    missing.discard(ev.event_ticker)
-            cursor = resp.cursor
+            for ev in data.get("events") or []:
+                tkr = ev.get("event_ticker")
+                if tkr in missing:
+                    cached[tkr] = ev.get("title") or ""
+                    missing.discard(tkr)
+            cursor = data.get("cursor")
             if not cursor or not missing:
                 break
 
@@ -372,19 +379,24 @@ def _load_or_build_event_titles(
     # auto-generated collection events), so this loop is capped at
     # MVE_TITLE_LOOKUP_MAX_PAGES; tickers not found by then fall through to the
     # bounded per-ticker lookup below instead of paging for hours.
+    # Raw-response for the same nullable-category reason as above.
     if missing:
         cursor = None
         for _ in range(MVE_TITLE_LOOKUP_MAX_PAGES):
-            resp = api_call_with_retry(
-                live_client.get_multivariate_events,
-                limit=200,
-                cursor=cursor,
+            kwargs = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            data = api_call_with_retry(
+                fetch_json_page,
+                live_client.get_multivariate_events_without_preload_content,
+                **kwargs,
             )
-            for ev in resp.events or []:
-                if ev.event_ticker in missing:
-                    cached[ev.event_ticker] = ev.title or ""
-                    missing.discard(ev.event_ticker)
-            cursor = resp.cursor
+            for ev in data.get("events") or []:
+                tkr = ev.get("event_ticker")
+                if tkr in missing:
+                    cached[tkr] = ev.get("title") or ""
+                    missing.discard(tkr)
+            cursor = data.get("cursor")
             if not cursor or not missing:
                 break
 
