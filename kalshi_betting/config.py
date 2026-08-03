@@ -143,6 +143,18 @@ MVE_TITLE_LOOKUP_MAX_PAGES = 500
 # exponential backoff applies per worker. Raise cautiously.
 SETTLED_FETCH_MAX_WORKERS = 8
 
+# Number of worker threads used by the backtester's per-ticker candlestick
+# fetch (backtester._fetch_candles_parallel). Each fetch is an independent
+# read-only GET routed through api_call_with_retry, so a 429 degrades to that
+# worker's own exponential backoff rather than failing the run — live-verified
+# 2026-08-03 at ~20 req/s with 12 workers and zero HTTP 429s. Fetching
+# sequentially was live-measured the same day at ~4.3 tickers/sec, i.e. ~34
+# hours for a 3-month window, which makes this loop the dominant cost of a
+# backtest. Cache files are keyed per ticker, so two workers can never target
+# the same path (_save_json_cache writes non-atomically). Each worker keeps
+# fetch_candlesticks' own rate_limit_sleep default (0.15s) between its pages.
+CANDLESTICK_FETCH_MAX_WORKERS = 8
+
 # Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
 # markets are dropped during assembly instead of being held in memory and
