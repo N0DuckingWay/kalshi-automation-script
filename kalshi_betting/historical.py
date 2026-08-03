@@ -619,7 +619,10 @@ class _FetchProgress:
     def __init__(self, label: str):
         """
         Args:
-            label (str): Log-line prefix, e.g. "Historical archive".
+            label (str): Log-line prefix. MUST distinguish the sharded path
+                from the sequential fallback — they emit otherwise identical
+                progress lines, and on 2026-08-03 that ambiguity led to a live
+                run being misdiagnosed as having fallen back when it had not.
         """
         self._label = label
         self._lock = threading.Lock()
@@ -639,6 +642,54 @@ class _FetchProgress:
             if self.pages % 100 == 0:
                 logging.info("%s: %d pages scanned, %d markets kept so far",
                              self._label, self.pages, self.kept)
+
+
+def _log_slice_progress(label: str, done: int, total: int, day_lo: int,
+                        markets: int, started: float) -> None:
+    """
+    Log completion of one day slice with a running rate and ETA.
+
+    A full-history fetch runs for hours across hundreds of slices; without a
+    per-slice line the only feedback is a page counter that says nothing about
+    how far along the run actually is.
+
+    Args:
+        label (str): Phase name, e.g. "Archive day slices".
+        done (int): Slices completed so far, including this one.
+        total (int): Total slices this run must fetch.
+        day_lo (int): UTC-midnight lower bound of the completed slice.
+        markets (int): Records persisted for this slice.
+        started (float): time.monotonic() when the pool started.
+    """
+    elapsed = max(time.monotonic() - started, 1e-9)
+    rate = done / elapsed  # slices per second
+    eta = (total - done) / rate if rate > 0 else 0.0
+    logging.info(
+        "%s: %d/%d complete (%s: %d markets, %.1f slices/min, ETA %s)",
+        label, done, total,
+        datetime.fromtimestamp(day_lo, tz=UTC).date().isoformat(),
+        markets, rate * 60, _format_duration(eta),
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    """
+    Render a duration as a compact human-readable string.
+
+    Args:
+        seconds (float): Non-negative duration in seconds.
+
+    Returns:
+        str: e.g. "45s", "12m", "3h41m".
+    """
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 # ─── Day-slice disk store ─────────────────────────────────────────────────────
@@ -1021,8 +1072,8 @@ def _fetch_archive_sequential(
             selected.append(_market_to_dict(m))
         page_no += 1
         if page_no % 100 == 0:
-            logging.info("Historical archive: %d pages scanned, %d markets kept so far",
-                         page_no, len(selected))
+            logging.info("Historical archive [sequential]: %d pages scanned, "
+                         "%d markets kept so far", page_no, len(selected))
         cursor = data.get("cursor")
         # A None or empty cursor signals the last page
         if not cursor:
@@ -1171,10 +1222,11 @@ def _fetch_archive_phase(
                 on_disk.append(lo)
             else:
                 to_fetch.append(lo)
+        reused = len(on_disk)
         logging.info("Archive day slices: %d reused from disk, %d to fetch",
-                     len(on_disk), len(to_fetch))
+                     reused, len(to_fetch))
 
-        progress = _FetchProgress("Historical archive")
+        progress = _FetchProgress("Historical archive [sharded]")
         if to_fetch:
             # Newest days first so the biggest slices (recent volume is far
             # higher) start immediately and the pool drains evenly.
@@ -1185,13 +1237,17 @@ def _fetch_archive_phase(
                                 hist_kwargs, progress, expect_meta): lo
                     for lo in to_fetch
                 }
+                started = time.monotonic()
                 try:
                     for future in as_completed(futures):
                         lo = futures[future]
-                        # The worker already persisted this slice; only its
-                        # identity is needed, so nothing large is retained.
-                        future.result()
+                        # The worker already persisted this slice and returns
+                        # only its record count, so nothing large is retained.
+                        count = future.result()
                         on_disk.append(lo)
+                        _log_slice_progress("Archive day slices",
+                                            len(on_disk) - reused, len(to_fetch),
+                                            lo, count, started)
                 except BaseException:
                     # Without this, the executor's __exit__ waits for every
                     # still-queued day (hundreds of them, hours of work) before
@@ -1315,8 +1371,8 @@ def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
             kept.append(_market_to_dict(m))
         page_no += 1
         if page_no % 100 == 0:
-            logging.info("Live settled sweep: %d pages scanned, %d markets kept so far",
-                         page_no, len(kept))
+            logging.info("Live settled sweep [sequential]: %d pages scanned, "
+                         "%d markets kept so far", page_no, len(kept))
         cursor = data.get("cursor")
         if not cursor:
             return kept
@@ -1420,10 +1476,11 @@ def _fetch_live_phase(
                 on_disk.append(lo)
             else:
                 to_fetch.append(lo)
+        reused = len(on_disk)
         logging.info("Live settled-day windows: %d reused from disk, %d to fetch "
-                     "(plus the frontier day)", len(on_disk), len(to_fetch))
+                     "(plus the frontier day)", reused, len(to_fetch))
 
-        progress = _FetchProgress("Live settled sweep")
+        progress = _FetchProgress("Live settled sweep [windowed]")
         to_fetch.sort(reverse=True)
         frontier: list[dict] = []
         with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
@@ -1437,12 +1494,16 @@ def _fetch_live_phase(
                             progress, expect_meta): lo
                 for lo in to_fetch
             }
+            started = time.monotonic()
             try:
                 for future in as_completed(futures):
                     lo = futures[future]
                     # Persisted in the worker; only the day identity is kept.
-                    future.result()
+                    count = future.result()
                     on_disk.append(lo)
+                    _log_slice_progress("Live settled-day windows",
+                                        len(on_disk) - reused, len(to_fetch),
+                                        lo, count, started)
                 frontier = frontier_future.result()
             except BaseException:
                 # Abandon queued windows immediately rather than draining them

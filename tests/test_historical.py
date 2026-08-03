@@ -831,6 +831,21 @@ class TestShardedFetch:
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
 
+    def test_slice_progress_reports_position_and_eta(self, tmp_path, monkeypatch, caplog):
+        # Each completed slice logs N/M plus a rate and ETA, so a multi-hour
+        # fetch reports how far along it actually is.
+        archive_markets, live_markets = self._fixture_markets()
+        with caplog.at_level(logging.INFO):
+            self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                      _FakeLive(live_markets))
+        slice_lines = [r.getMessage() for r in caplog.records
+                       if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
+        assert slice_lines
+        assert all("ETA" in line and "slices/min" in line for line in slice_lines)
+        # Counter runs 1..N over the days actually fetched, never exceeding N.
+        total = len(slice_lines)
+        assert slice_lines[-1].split("complete")[0].strip().endswith(f"{total}/{total}")
+
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
         # would silently re-walk the whole range; the first window detects it
@@ -884,6 +899,48 @@ class TestArchiveCursorCodec:
         assert nanos == 165186000
         from datetime import UTC, datetime
         assert seconds == int(datetime(2026, 5, 13, 23, 9, 56, tzinfo=UTC).timestamp())
+
+
+class TestProgressLabels:
+    """The sharded and sequential paths emit the same progress-line SHAPE, so
+    their labels are the only thing telling them apart in a log. When the
+    labels were identical, a live run on the sharded path was misdiagnosed as
+    having fallen back to the sequential walk."""
+
+    def test_fetch_progress_logs_its_label_every_100_pages(self, caplog):
+        progress = historical._FetchProgress("Historical archive [sharded]")
+        with caplog.at_level(logging.INFO):
+            for _ in range(100):
+                progress.tick(2)
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == [
+            "Historical archive [sharded]: 100 pages scanned, 200 markets kept so far"
+        ]
+
+    def test_sharded_and_sequential_labels_differ(self):
+        # Guards against a future edit re-converging the two labels.
+        import inspect
+
+        source = inspect.getsource(historical)
+        assert 'Historical archive [sharded]' in source
+        assert 'Historical archive [sequential]' in source
+        assert 'Live settled sweep [windowed]' in source
+        assert 'Live settled sweep [sequential]' in source
+        # No un-suffixed variant left behind.
+        assert '"Historical archive: %d pages' not in source
+        assert '"Live settled sweep: %d pages' not in source
+
+
+class TestFormatDuration:
+    def test_renders_compact_units(self):
+        assert historical._format_duration(0) == "0s"
+        assert historical._format_duration(45.4) == "45s"
+        assert historical._format_duration(90) == "1m30s"
+        assert historical._format_duration(3600) == "1h00m"
+        assert historical._format_duration(13_260) == "3h41m"
+
+    def test_negative_clamps_to_zero(self):
+        assert historical._format_duration(-5) == "0s"
 
 
 class TestDayStore:
