@@ -76,6 +76,7 @@ backtest.py (CLI)
   ├─ historical.build_prod_live_client()     — prod API client for recent data
   ├─ backtester.run_backtest()
   │    ├─ historical.fetch_all_settled_markets() — market metadata
+  │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
   │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker
   │    ├─ _find_entry()                          — first tradeable Monday per pair
   │    ├─ Kelly sizing + P&L from outcomes
@@ -156,7 +157,9 @@ kalshi_private_key.pem
   kalshi_arb.log            ← Live bot log file (auto-created)
   kalshi_backtest.log       ← Backtest log file (auto-created)
   backtest_cache/           ← Disk cache for historical data
-    settled_markets_*.json  ← Assembled per-start-date market list
+    settled_markets_*.json  ← Assembled market list, keyed by start date (and by
+                              eligibility-filter tag when the backtester filters
+                              during assembly, so subsets never mix with full lists)
     archive_days/           ← Per-created-day archive slices (incremental/resumable)
     live_days/              ← Per-settled-day recent-market slices (incremental/resumable)
     candlesticks/           ← Per-ticker hourly price series

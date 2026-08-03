@@ -143,6 +143,18 @@ MVE_TITLE_LOOKUP_MAX_PAGES = 500
 # exponential backoff applies per worker. Raise cautiously.
 SETTLED_FETCH_MAX_WORKERS = 8
 
+# Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
+# passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
+# markets are dropped during assembly instead of being held in memory and
+# written to the assembled cache. The tag is part of that cache's filename
+# (settled_markets_<start_date>_<tag>.json), so a cache built under one filter
+# can never be served to code expecting another.
+#
+# MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
+# stale prefiltered cache is silently reused and the backtest sees a market set
+# the current predicate would not have produced.
+SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
+
 # Stop the multivariate-events pull after this many CONSECUTIVE pages that
 # contain no nested markets. The MVE listing is effectively unbounded (Kalshi
 # auto-generates hundreds of thousands of collection events) and as of 2026-07

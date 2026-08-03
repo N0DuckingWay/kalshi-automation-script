@@ -56,6 +56,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from functools import partial
@@ -739,7 +740,12 @@ def _day_store_meta(lo: int, expect_meta: dict) -> dict:
     }
 
 
-def _assemble_day_slices(store: str, day_los: list[int], expect_meta: dict) -> list[dict]:
+def _assemble_day_slices(
+    store: str,
+    day_los: list[int],
+    expect_meta: dict,
+    keep: Callable[[dict], bool] | None = None,
+) -> list[dict]:
     """
     Rebuild a phase's record list by streaming completed day slices off disk.
 
@@ -759,6 +765,11 @@ def _assemble_day_slices(store: str, day_los: list[int], expect_meta: dict) -> l
         day_los (list[int]): UTC-midnight lower bounds of every day known to
             have a valid slice on disk (reused or just written).
         expect_meta (dict): Reuse-gating keys the slices must still match.
+        keep (Callable[[dict], bool] | None): Optional predicate applied per
+            record as slices are read, so records the caller would discard
+            anyway are never retained. Purely a memory optimization — the
+            caller re-applies the same predicate during merge. The slice FILES
+            are never filtered; they stay complete for other start dates.
 
     Returns:
         list[dict]: Compact market dicts, newest day first.
@@ -774,7 +785,10 @@ def _assemble_day_slices(store: str, day_los: list[int], expect_meta: dict) -> l
         slice_records = _day_store_load(path, expect_meta)
         if slice_records is None:
             raise _ShardedFetchUnsupported(f"day slice disappeared or corrupted: {path}")
-        records.extend(slice_records)
+        if keep is None:
+            records.extend(slice_records)
+        else:
+            records.extend(m for m in slice_records if keep(m))
     return records
 
 
@@ -1077,6 +1091,7 @@ def _fetch_archive_phase(
     start_ts: int,
     cutoff_ts: int,
     hist_kwargs: dict,
+    keep: Callable[[dict], bool] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Fetch the archive's contribution: created-day slices plus the below-start tail.
@@ -1105,6 +1120,9 @@ def _fetch_archive_phase(
         start_ts (int): Backtest window start, epoch seconds (UTC midnight).
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
+        keep (Callable[[dict], bool] | None): Optional per-record predicate
+            applied while slices are read back, so records the caller will
+            discard anyway never accumulate. Slice FILES stay unfiltered.
 
     Returns:
         tuple[list[dict], list[dict]]: (day-slice records newest-day first,
@@ -1162,7 +1180,7 @@ def _fetch_archive_phase(
         # window — same records the sequential walk picked up past start_ts.
         tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
 
-        return _assemble_day_slices("archive_days", on_disk, expect_meta), tail
+        return _assemble_day_slices("archive_days", on_disk, expect_meta, keep), tail
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Archive fetch: sharded path unavailable (%s) — falling back to the "
@@ -1318,7 +1336,12 @@ def _fetch_and_store_live_window(
     return len(day_markets)
 
 
-def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
+def _fetch_live_phase(
+    live_client,
+    live_min_ts: int,
+    now_ts: int,
+    keep: Callable[[dict], bool] | None = None,
+) -> list[dict]:
     """
     Fetch the live endpoint's contribution: per-settled-day windows in parallel.
 
@@ -1343,6 +1366,9 @@ def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
             the server to walk the entire [cutoff_ts, now) range for a narrow
             recent start_date (observed 20k+ pages discarded client-side).
         now_ts (int): Current epoch seconds; determines the frontier day.
+        keep (Callable[[dict], bool] | None): Optional per-record predicate
+            applied while past-day slices are read back and to the frontier
+            window's records. Slice FILES stay unfiltered.
 
     Returns:
         list[dict]: Compact market dicts, frontier first then past days
@@ -1394,7 +1420,9 @@ def _fetch_live_phase(live_client, live_min_ts: int, now_ts: int) -> list[dict]:
                 on_disk.append(lo)
             frontier = frontier_future.result()
 
-        return frontier + _assemble_day_slices("live_days", on_disk, expect_meta)
+        if keep is not None:
+            frontier = [m for m in frontier if keep(m)]
+        return frontier + _assemble_day_slices("live_days", on_disk, expect_meta, keep)
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Live fetch: windowed path unavailable (%s) — falling back to the "
@@ -1408,6 +1436,8 @@ def fetch_all_settled_markets(
     live_client,
     start_date: date,
     use_cache: bool = True,
+    prefilter: Callable[[dict], bool] | None = None,
+    prefilter_tag: str | None = None,
 ) -> list[dict]:
     """
     Fetch all settled Kalshi markets from start_date onward and return them as plain dicts.
@@ -1450,6 +1480,22 @@ def fetch_all_settled_markets(
             cache if available and skip fetching entirely. If False, always
             re-assemble from the API + day stores. Either way the result is
             saved to disk.
+        prefilter (Callable[[dict], bool] | None): Optional per-record
+            predicate; records failing it are dropped during assembly and
+            never reach the returned list or the assembled cache. Intended for
+            a filter the caller would apply immediately anyway (the backtester
+            passes _can_ever_enter), which makes it result-neutral while
+            keeping peak memory and cache size proportional to the markets
+            actually usable rather than to everything Kalshi ever settled. The
+            per-day slice FILES are never filtered — they are shared across
+            start dates and must stay complete.
+        prefilter_tag (str | None): Short name for prefilter's semantics; becomes
+            part of the assembled cache's filename so a cache built under one
+            predicate is never served to a caller expecting another. Required
+            when prefilter is given, and forbidden otherwise.
+
+    Raises:
+        ValueError: If exactly one of prefilter / prefilter_tag is provided.
 
     Returns:
         list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
@@ -1458,7 +1504,17 @@ def fetch_all_settled_markets(
             settlement_ts (ISO str), status. Only includes markets with a
             non-null settlement_ts and a binary result; tickers are unique.
     """
-    cache_path = CACHE_DIR / f"settled_markets_{start_date.isoformat()}.json"
+    if (prefilter is None) != (prefilter_tag is None):
+        raise ValueError(
+            "prefilter and prefilter_tag must be provided together — the tag "
+            "keys the assembled cache to the predicate that produced it"
+        )
+
+    # A prefiltered result is a strict subset, so it gets its own cache file;
+    # otherwise a filtered cache could be served to an unfiltered caller (or a
+    # cache built under different filter semantics silently reused).
+    suffix = f"_{prefilter_tag}" if prefilter_tag else ""
+    cache_path = CACHE_DIR / f"settled_markets_{start_date.isoformat()}{suffix}.json"
     if use_cache:
         cached = _load_json_cache(cache_path)
         if cached is not None:
@@ -1484,7 +1540,7 @@ def fetch_all_settled_markets(
     logging.info("Fetching historical settled markets (settled before API cutoff)...")
     # Sharded parallel fetch with day-level disk reuse; sequential on fallback
     day_records, tail_records = _fetch_archive_phase(
-        hist_client, start_ts, cutoff_ts, hist_kwargs
+        hist_client, start_ts, cutoff_ts, hist_kwargs, prefilter
     )
 
     # Assembly: settlement-window filter + first-wins ticker dedup. Adjacent
@@ -1502,6 +1558,12 @@ def fetch_all_settled_markets(
                 continue
             if max_settle is not None and settle >= max_settle:
                 continue
+            # Single point where the caller's prefilter is enforced, so it
+            # covers day slices, the tail, live windows, and BOTH sequential
+            # fallbacks (which don't take the `keep` fast path). Re-checking
+            # records the phases already filtered is idempotent and cheap.
+            if prefilter is not None and not prefilter(m):
+                continue
             ticker = m.get("ticker")
             if ticker and ticker not in selected:
                 selected[ticker] = m
@@ -1518,7 +1580,7 @@ def fetch_all_settled_markets(
     logging.info("Fetching recently settled markets (after API cutoff)...")
     live_min_ts = max(cutoff_ts, start_ts)
     # Windowed parallel fetch with settled-day disk reuse; sequential on fallback
-    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()))
+    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()), prefilter)
     _merge(live_records, None)
     logging.info("Live endpoint: %d recently settled markets", len(selected) - archive_count)
 

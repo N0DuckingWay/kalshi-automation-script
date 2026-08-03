@@ -57,6 +57,7 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SETTLED_PREFILTER_CACHE_TAG,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -653,8 +654,19 @@ def run_backtest(
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
-    # Fetch all settled markets from start_date onward (uses disk cache if available)
-    markets = fetch_all_settled_markets(hist_client, live_client, start_date, use_cache)
+    # Fetch all settled markets from start_date onward (uses disk cache if
+    # available). The eligibility predicate below is handed to the fetch so
+    # ineligible markets are dropped during assembly rather than materialized
+    # and cached first — result-neutral, since the very next statement would
+    # discard exactly those records anyway, but it keeps peak memory and the
+    # assembled cache proportional to what the backtest can actually use.
+    # SETTLED_PREFILTER_CACHE_TAG keys that cache to _can_ever_enter's current
+    # semantics and MUST be bumped if this predicate changes.
+    markets = fetch_all_settled_markets(
+        hist_client, live_client, start_date, use_cache,
+        prefilter=lambda m: _can_ever_enter(m, start_date),
+        prefilter_tag=SETTLED_PREFILTER_CACHE_TAG,
+    )
     logging.info("Total settled markets to analyze: %d", len(markets))
 
     # Necessary-condition prefilter: drop markets whose [open_time, close_time
@@ -663,6 +675,12 @@ def run_backtest(
     # type. This is what makes grouping/pairing tractable at current Kalshi
     # volumes (hourly/intraday ladders are the overwhelming majority of
     # settled markets and almost never span a scannable Monday).
+    #
+    # Retained even though the same predicate was passed into the fetch above:
+    # it is idempotent, it costs one pass, and it keeps this guarantee local to
+    # the code that depends on it (a cached unfiltered list, a caller that
+    # skips the prefilter argument, or a future fetch path would otherwise
+    # reach the O(n^2) pairing unfiltered).
     eligible_markets = [m for m in markets if _can_ever_enter(m, start_date)]
     logging.info(
         "Eligibility prefilter: skipping %d/%d markets that cannot appear in any tradeable pair",

@@ -680,6 +680,99 @@ class TestShardedFetch:
         assert set(loads) == written
         assert len(loads) == len(written)
 
+    def test_prefilter_assembly_equals_postfilter(self, tmp_path, monkeypatch):
+        # The result-neutrality proof for pushing the backtester's eligibility
+        # filter into the fetch: filtering DURING assembly must produce exactly
+        # what filtering the unfiltered result afterwards would — same records,
+        # same order. run_backtest still applies the predicate itself, so this
+        # equality is what makes the optimization invisible to backtest output.
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+
+        def pred(m):
+            # Discriminating on purpose: keeps a mix of archive-day, tail, and
+            # live records so every code path is exercised, not just one.
+            return not m["ticker"].endswith("1")
+
+        _install_sharded_fakes(monkeypatch, tmp_path / "full",
+                               _FakeArchive(archive_markets), self.CUTOFF)
+        out_full = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets),
+            start_date=date(2026, 6, 5), use_cache=False,
+        )
+
+        _install_sharded_fakes(monkeypatch, tmp_path / "pref",
+                               _FakeArchive(archive_markets), self.CUTOFF)
+        out_pref = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets),
+            start_date=date(2026, 6, 5), use_cache=False,
+            prefilter=pred, prefilter_tag="testpred",
+        )
+
+        assert out_pref == [m for m in out_full if pred(m)]
+        # Sanity: the predicate actually removed something, and kept something.
+        assert 0 < len(out_pref) < len(out_full)
+
+        # The day-slice FILES must stay complete — they are shared across start
+        # dates and other callers, so filtering them would corrupt the cache.
+        slices = sorted((tmp_path / "pref" / "cache" / "archive_days").glob("*.json.gz"))
+        assert slices
+        stored = set()
+        for path in slices:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                stored |= {m["ticker"] for m in json.load(fh)["markets"]}
+        dropped = {m["ticker"] for m in out_full if not pred(m)}
+        assert dropped & stored, "filtered-out records must still be on disk"
+
+    def test_prefiltered_cache_filename_and_isolation(self, tmp_path, monkeypatch):
+        # A prefiltered result is a strict subset, so it must never be served
+        # to an unfiltered caller (or to one using different filter semantics).
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+
+        def pred(m):
+            return not m["ticker"].endswith("1")
+
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, self.CUTOFF)
+        out1 = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=False, prefilter=pred, prefilter_tag="testpred",
+        )
+        cache_dir = tmp_path / "cache"
+        assert (cache_dir / "settled_markets_2026-06-05_testpred.json").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05.json").exists()
+
+        # Second prefiltered run hits the tagged cache: zero API calls.
+        archive.calls = 0
+        out2 = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True, prefilter=pred, prefilter_tag="testpred",
+        )
+        assert out2 == out1
+        assert archive.calls == 0
+
+        # An unfiltered caller must NOT read the prefiltered cache.
+        out_full = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True,
+        )
+        assert len(out_full) > len(out1)
+
+        # The tag is what keys the cache, so it can't be omitted.
+        with pytest.raises(ValueError):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False, prefilter=pred,
+            )
+        with pytest.raises(ValueError):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False, prefilter_tag="testpred",
+            )
+
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
         # would silently re-walk the whole range; the first window detects it
