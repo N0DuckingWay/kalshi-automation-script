@@ -1113,7 +1113,10 @@ def _fetch_archive_phase(
     endpoint into the archive (and disappear from the live endpoint —
     verified 2026-07-13), so pre-advance slice files would silently miss them.
 
-    Falls back to _fetch_archive_sequential on any _ShardedFetchUnsupported.
+    Falls back to _fetch_archive_sequential on any _ShardedFetchUnsupported —
+    including one synthesized from an unexpected error in the cursor-synthesis
+    probe, so a failure there degrades loudly instead of killing the run. A
+    worker failure cancels the remaining queued days rather than draining them.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
@@ -1132,7 +1135,20 @@ def _fetch_archive_phase(
             returned fully filtered in the first list and the second is empty.
     """
     try:
-        if not _archive_cursor_synthesis_ok(hist_client, hist_kwargs):
+        # The probe issues a real request, so it can fail for reasons that have
+        # nothing to do with cursor format (auth, outage, a body that won't
+        # parse). Any such failure is funnelled into the same fail-closed
+        # fallback rather than killing the run: an unexpected exception here
+        # used to escape the whole phase with no warning logged at all.
+        try:
+            synthesis_ok = _archive_cursor_synthesis_ok(hist_client, hist_kwargs)
+        except _ShardedFetchUnsupported:
+            raise
+        except Exception as exc:
+            raise _ShardedFetchUnsupported(
+                f"cursor-synthesis probe failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not synthesis_ok:
             raise _ShardedFetchUnsupported("archive cursor re-encoding mismatch")
 
         # One slice per UTC day of created_time. All archive records satisfy
@@ -1169,12 +1185,19 @@ def _fetch_archive_phase(
                                 hist_kwargs, progress, expect_meta): lo
                     for lo in to_fetch
                 }
-                for future in as_completed(futures):
-                    lo = futures[future]
-                    # The worker already persisted this slice; only its identity
-                    # is needed, so nothing large is retained here.
-                    future.result()
-                    on_disk.append(lo)
+                try:
+                    for future in as_completed(futures):
+                        lo = futures[future]
+                        # The worker already persisted this slice; only its
+                        # identity is needed, so nothing large is retained.
+                        future.result()
+                        on_disk.append(lo)
+                except BaseException:
+                    # Without this, the executor's __exit__ waits for every
+                    # still-queued day (hundreds of them, hours of work) before
+                    # the fallback below is even reached.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
 
         # Long-lived markets created before start_date but settling inside the
         # window — same records the sequential walk picked up past start_ts.
@@ -1184,7 +1207,8 @@ def _fetch_archive_phase(
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Archive fetch: sharded path unavailable (%s) — falling back to the "
-            "sequential walk", exc,
+            "sequential walk. Any day slices already completed remain on disk "
+            "and will be reused by the next run.", exc,
         )
         return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts, hist_kwargs), []
 
@@ -1413,12 +1437,18 @@ def _fetch_live_phase(
                             progress, expect_meta): lo
                 for lo in to_fetch
             }
-            for future in as_completed(futures):
-                lo = futures[future]
-                # Persisted in the worker; only the day identity is kept here.
-                future.result()
-                on_disk.append(lo)
-            frontier = frontier_future.result()
+            try:
+                for future in as_completed(futures):
+                    lo = futures[future]
+                    # Persisted in the worker; only the day identity is kept.
+                    future.result()
+                    on_disk.append(lo)
+                frontier = frontier_future.result()
+            except BaseException:
+                # Abandon queued windows immediately rather than draining them
+                # on the way out to the sequential fallback.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
 
         if keep is not None:
             frontier = [m for m in frontier if keep(m)]
@@ -1426,7 +1456,8 @@ def _fetch_live_phase(
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Live fetch: windowed path unavailable (%s) — falling back to the "
-            "sequential sweep", exc,
+            "sequential sweep. Any settled-day windows already completed remain "
+            "on disk and will be reused by the next run.", exc,
         )
         return _fetch_live_sequential(live_client, live_min_ts)
 

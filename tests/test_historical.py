@@ -1,6 +1,7 @@
 """Tests for historical.py — event-title cache and dict serialization."""
 import gzip
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -772,6 +773,63 @@ class TestShardedFetch:
                 MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
                 use_cache=False, prefilter_tag="testpred",
             )
+
+    def test_probe_exception_falls_back_to_sequential(self, tmp_path, monkeypatch, caplog):
+        # The cursor-synthesis probe issues a real request, so it can fail for
+        # reasons unrelated to cursor format. Such a failure used to escape the
+        # phase and kill the run with no warning; it must degrade to the
+        # sequential walk exactly like a format mismatch does.
+        archive_markets, live_markets = self._fixture_markets()
+
+        def exploding_probe(*_a, **_k):
+            raise RuntimeError("probe blew up")
+
+        monkeypatch.setattr(historical, "_archive_cursor_synthesis_ok", exploding_probe)
+        with caplog.at_level(logging.WARNING):
+            out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                            _FakeLive(live_markets))
+
+        assert {m["ticker"] for m in out} == _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert any("probe blew up" in r.getMessage() for r in caplog.records)
+        # Fail closed: the sequential path must not fabricate day-slice files.
+        assert not (tmp_path / "cache" / "archive_days").exists()
+
+    def test_worker_failure_cancels_queued_days(self, tmp_path, monkeypatch):
+        # A failing worker must abandon the remaining queued days instead of
+        # letting the executor drain them (hundreds of days = hours) before the
+        # fallback is reached.
+        recorded: list[dict] = []
+        real_pool_cls = historical.ThreadPoolExecutor
+
+        class RecordingPool(real_pool_cls):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                recorded.append({"wait": wait, "cancel_futures": cancel_futures})
+                return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        monkeypatch.setattr(historical, "ThreadPoolExecutor", RecordingPool)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_MAX_WORKERS", 1)
+        archive_markets, live_markets = self._fixture_markets()
+
+        # Fail the first day worker, the way a server that ignores a
+        # synthesized cursor would. Patched at the worker seam so the
+        # sequential fallback (which pages normally) still works.
+        def failing_worker(*_a, **_k):
+            raise historical._ShardedFetchUnsupported("synthesized cursor rejected")
+
+        monkeypatch.setattr(historical, "_fetch_and_store_archive_day", failing_worker)
+        out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                        _FakeLive(live_markets))
+
+        # The pool was torn down with cancel_futures, not drained.
+        assert any(c["cancel_futures"] and not c["wait"] for c in recorded), recorded
+        # And the fallback still produced the correct, complete result.
+        assert {m["ticker"] for m in out} == _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
 
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
