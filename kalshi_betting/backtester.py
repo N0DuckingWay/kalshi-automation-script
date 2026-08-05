@@ -45,6 +45,7 @@ Notes:
 """
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -53,10 +54,12 @@ import pandas as pd
 
 from .config import (
     BUDGET_FRACTION,
+    CANDLESTICK_FETCH_MAX_WORKERS,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SETTLED_PREFILTER_CACHE_TAG,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -609,6 +612,101 @@ def _find_entry(
     return None
 
 
+# ─── Candlestick fetching ─────────────────────────────────────────────────────
+
+def _fetch_candles_parallel(
+    hist_client: Any,
+    needed_tickers: dict[str, dict],
+    start_date: date,
+    use_cache: bool,
+) -> dict[str, list[dict]]:
+    """
+    Fetch the hourly candlestick series for every needed ticker, in parallel.
+
+    One HTTP fetch per ticker, spread across CANDLESTICK_FETCH_MAX_WORKERS
+    threads. Parallelism is result-neutral here for three reasons: the returned
+    mapping is only ever read by key (never iterated), so completion order
+    cannot matter; each ticker's disk cache path is derived from its ticker, so
+    two workers can never write the same file (historical._save_json_cache is a
+    plain non-atomic write, so a shared path WOULD corrupt); and each fetch is
+    an independent read-only GET whose retry/backoff already lives per-call
+    inside api_call_with_retry.
+
+    Markets with no close_time get an empty series without any HTTP call, which
+    is what the sequential version did — there is no window to request.
+
+    Worker exceptions are deliberately NOT caught: fetch_candlesticks already
+    fail-softs network errors to an empty list internally, so anything that
+    still escapes is a real defect (e.g. a market that should have been
+    prefiltered out) and must surface rather than be silently degraded into
+    "this ticker has no prices".
+
+    Args:
+        hist_client (Any): Historical KalshiClient, shared across worker
+            threads (the same pattern historical.py's fetch pools use).
+        needed_tickers (dict[str, dict]): Ticker -> market dict, for exactly
+            the markets appearing in at least one candidate pair.
+        start_date (date): Start of the backtest window; the fetch window's
+            lower bound, identical for every ticker.
+        use_cache (bool): Passed through to fetch_candlesticks — whether the
+            per-ticker disk cache may be reused.
+
+    Returns:
+        dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
+        no_ask_close). Every key of needed_tickers is present; the value is an
+        empty list for markets with no usable close_time.
+
+    Raises:
+        Exception: Whatever a worker's fetch_candlesticks call raises, after
+            the pool has been torn down without draining its queue.
+    """
+    candles_by_ticker: dict[str, list[dict]] = {}
+
+    # open_ts: start of the backtest window. Depends only on start_date, so it
+    # is identical for every ticker and computed once.
+    open_ts = int(datetime(start_date.year, start_date.month, start_date.day,
+                           tzinfo=UTC).timestamp())
+
+    # Split the work first: no-close_time markets resolve without any HTTP, so
+    # they never occupy a worker slot.
+    work: list[tuple[str, int]] = []
+    for ticker, m in needed_tickers.items():
+        close_time = m.get("close_time")
+        if not close_time:
+            candles_by_ticker[ticker] = []
+            continue
+        close_dt = datetime.fromisoformat(close_time)
+        # close_ts: one day past market close to include the final candle
+        close_ts = int(close_dt.timestamp()) + 86400
+        work.append((ticker, close_ts))
+
+    if work:
+        with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
+            # Returns list[dict] with keys: ts (unix int), yes_ask_close (float),
+            # no_ask_close (float) — cached per ticker, so a second run is much faster
+            futures = {
+                pool.submit(fetch_candlesticks, hist_client, ticker,
+                            open_ts, close_ts, use_cache): ticker
+                for ticker, close_ts in work
+            }
+            done = 0
+            try:
+                for future in as_completed(futures):
+                    candles_by_ticker[futures[future]] = future.result()
+                    done += 1
+                    if done % 50 == 0:
+                        logging.info("  Candlestick progress: %d / %d",
+                                     done, len(needed_tickers))
+            except BaseException:
+                # Same tear-down as historical.py's fetch pools: without it the
+                # executor's __exit__ drains every still-queued ticker (hours of
+                # work) before the error ever reaches the caller.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    return candles_by_ticker
+
+
 # ─── Main backtest loop ───────────────────────────────────────────────────────
 
 def run_backtest(
@@ -626,7 +724,8 @@ def run_backtest(
       1. Fetch all settled markets since start_date.
       2. Drop markets that provably can never enter any pair (_can_ever_enter).
       3. Group into potential time-series and same-title pairs (metadata only).
-      4. For each potential pair, fetch hourly candlesticks for both legs.
+      4. Fetch hourly candlesticks for every ticker appearing in a potential
+         pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS threads.
       5. Find the first Monday where the pair was tradeable at the threshold;
          keep only the best entry per title group (live one-pair-per-group rule).
       6. Walk entries chronologically with a running cash balance: Kelly-size
@@ -653,8 +752,19 @@ def run_backtest(
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
-    # Fetch all settled markets from start_date onward (uses disk cache if available)
-    markets = fetch_all_settled_markets(hist_client, live_client, start_date, use_cache)
+    # Fetch all settled markets from start_date onward (uses disk cache if
+    # available). The eligibility predicate below is handed to the fetch so
+    # ineligible markets are dropped during assembly rather than materialized
+    # and cached first — result-neutral, since the very next statement would
+    # discard exactly those records anyway, but it keeps peak memory and the
+    # assembled cache proportional to what the backtest can actually use.
+    # SETTLED_PREFILTER_CACHE_TAG keys that cache to _can_ever_enter's current
+    # semantics and MUST be bumped if this predicate changes.
+    markets = fetch_all_settled_markets(
+        hist_client, live_client, start_date, use_cache,
+        prefilter=lambda m: _can_ever_enter(m, start_date),
+        prefilter_tag=SETTLED_PREFILTER_CACHE_TAG,
+    )
     logging.info("Total settled markets to analyze: %d", len(markets))
 
     # Necessary-condition prefilter: drop markets whose [open_time, close_time
@@ -663,6 +773,12 @@ def run_backtest(
     # type. This is what makes grouping/pairing tractable at current Kalshi
     # volumes (hourly/intraday ladders are the overwhelming majority of
     # settled markets and almost never span a scannable Monday).
+    #
+    # Retained even though the same predicate was passed into the fetch above:
+    # it is idempotent, it costs one pass, and it keeps this guarantee local to
+    # the code that depends on it (a cached unfiltered list, a caller that
+    # skips the prefilter argument, or a future fetch path would otherwise
+    # reach the O(n^2) pairing unfiltered).
     eligible_markets = [m for m in markets if _can_ever_enter(m, start_date)]
     logging.info(
         "Eligibility prefilter: skipping %d/%d markets that cannot appear in any tradeable pair",
@@ -687,26 +803,13 @@ def run_backtest(
 
     logging.info("Fetching candlesticks for %d markets (cached per ticker)...", len(needed_tickers))
 
-    # Fetch hourly candlestick price series for all needed tickers.
-    # Results are cached per ticker so a second run is much faster.
-    candles_by_ticker: dict[str, list[dict]] = {}
-    for i, (ticker, m) in enumerate(needed_tickers.items()):
-        if i % 50 == 0 and i > 0:
-            logging.info("  Candlestick progress: %d / %d", i, len(needed_tickers))
-        close_time = m.get("close_time")
-        if not close_time:
-            candles_by_ticker[ticker] = []
-            continue
-        close_dt  = datetime.fromisoformat(close_time)
-        # open_ts: start of the backtest window
-        open_ts   = int(datetime(start_date.year, start_date.month, start_date.day,
-                                 tzinfo=UTC).timestamp())
-        # close_ts: one day past market close to include the final candle
-        close_ts  = int(close_dt.timestamp()) + 86400
-        # Returns list[dict] with keys: ts (unix int), yes_ask_close (float), no_ask_close (float)
-        candles_by_ticker[ticker] = fetch_candlesticks(
-            hist_client, ticker, open_ts, close_ts, use_cache
-        )
+    # Fetch hourly candlestick price series for all needed tickers, in parallel
+    # across tickers — one independent read-only GET each, cached per ticker so
+    # a second run is much faster. Sequentially this loop dominated the whole
+    # backtest (~4.3 tickers/sec live-measured).
+    candles_by_ticker = _fetch_candles_parallel(
+        hist_client, needed_tickers, start_date, use_cache
+    )
 
     logging.info("Candlestick fetch complete.")
 

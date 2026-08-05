@@ -12,6 +12,7 @@ from kalshi_betting import backtester
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
+    _fetch_candles_parallel,
     _find_entry,
     _group_by_exact_title,
     _group_by_normalized_title,
@@ -725,3 +726,128 @@ class TestExtractPairsPerformanceSmoke:
             da = datetime.fromisoformat(mA["close_time"]).date()
             db = datetime.fromisoformat(mB["close_time"]).date()
             assert abs((db - da).days) <= margin_days
+
+
+class TestFetchCandlesParallel:
+    """The per-ticker candlestick fetch is the dominant cost of a backtest
+    (~4.3 tickers/sec sequentially, live-measured 2026-08-03). It must overlap
+    across tickers, stay result-identical to the sequential version, and never
+    swallow a worker error.
+    """
+
+    @staticmethod
+    def _needed(n):
+        # Ticker -> market dict, shaped like historical._market_to_dict output.
+        return {
+            f"T{i:02d}": {"ticker": f"T{i:02d}",
+                          "close_time": "2026-02-01T00:00:00+00:00"}
+            for i in range(n)
+        }
+
+    def test_runs_in_parallel_and_matches_sequential(self, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(backtester, "CANDLESTICK_FETCH_MAX_WORKERS", 4)
+        needed = self._needed(8)
+        expected = {t: [_candle(_MONDAY_TS, 0.70, 0.32)] for t in needed}
+
+        concurrent = 0
+        peak = 0
+        lock = threading.Lock()
+        barrier_wait = threading.Event()
+
+        def slow_fetch(_c, ticker, *_a, **_k):
+            nonlocal concurrent, peak
+            with lock:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            # Hold the "connection" until enough workers pile up (or we give
+            # up), so peak concurrency is observable without a fixed sleep.
+            barrier_wait.wait(timeout=2.0)
+            with lock:
+                if peak >= 4:
+                    barrier_wait.set()
+                concurrent -= 1
+            return expected[ticker]
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", slow_fetch)
+        result = _fetch_candles_parallel(MagicMock(), needed,
+                                         date(2026, 1, 1), True)
+
+        assert peak > 1, f"candlestick fetches ran sequentially (peak {peak})"
+        # Completion order is arbitrary, but the mapping must be byte-identical
+        # to what the old sequential loop produced.
+        assert result == expected
+
+    def test_window_bounds_match_sequential_formula(self, monkeypatch):
+        # open_ts is hoisted out of the loop now (it only depends on
+        # start_date); close_ts is still per-ticker close + one day.
+        seen = {}
+
+        def _record(_c, ticker, open_ts, close_ts, use_cache):
+            seen[ticker] = (open_ts, close_ts, use_cache)
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _record)
+        needed = {
+            "EARLY": {"ticker": "EARLY", "close_time": "2026-02-01T00:00:00+00:00"},
+            "LATE":  {"ticker": "LATE",  "close_time": "2026-03-01T00:00:00+00:00"},
+        }
+        _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        expected_open = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+        for ticker, close_time in (("EARLY", "2026-02-01T00:00:00+00:00"),
+                                   ("LATE", "2026-03-01T00:00:00+00:00")):
+            open_ts, close_ts, use_cache = seen[ticker]
+            assert open_ts == expected_open
+            assert close_ts == int(datetime.fromisoformat(close_time).timestamp()) + 86400
+            assert use_cache is False
+
+    def test_missing_close_time_skips_the_api(self, monkeypatch):
+        # No close window to request, so the old loop short-circuited to [] —
+        # the parallel version must not hand it to a worker either.
+        def _never(*_a, **_k):
+            raise AssertionError("fetch_candlesticks called for a market with no close_time")
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _never)
+        needed = {"NOCLOSE": {"ticker": "NOCLOSE", "close_time": None}}
+        assert _fetch_candles_parallel(MagicMock(), needed,
+                                       date(2026, 1, 1), True) == {"NOCLOSE": []}
+
+    def test_worker_exception_propagates(self, monkeypatch):
+        # fetch_candlesticks already fail-softs network errors to [] on its
+        # own, so anything that still raises is a real defect (e.g. a ticker
+        # that should have been prefiltered out). The pool must not turn it
+        # into "this ticker has no prices".
+        def _boom(_c, ticker, *_a, **_k):
+            if ticker == "T03":
+                raise KeyError(ticker)
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _boom)
+        with pytest.raises(KeyError):
+            _fetch_candles_parallel(MagicMock(), self._needed(8),
+                                    date(2026, 1, 1), True)
+
+    def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
+        # Same guarantee end-to-end: the three existing run_backtest fixtures
+        # rely on an unknown ticker raising KeyError out of the whole run as a
+        # prefilter regression guard, so the pool must stay transparent there.
+        markets = [
+            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+             "title": "Q", "subtitle": "", "result": "yes",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        ]
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: {}[ticker])
+
+        with pytest.raises(KeyError):
+            run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                         start_date=date(2026, 1, 1), initial_balance=1000.0)

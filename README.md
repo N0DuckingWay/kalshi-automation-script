@@ -76,7 +76,8 @@ backtest.py (CLI)
   ├─ historical.build_prod_live_client()     — prod API client for recent data
   ├─ backtester.run_backtest()
   │    ├─ historical.fetch_all_settled_markets() — market metadata
-  │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker
+  │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
+  │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers)
   │    ├─ _find_entry()                          — first tradeable Monday per pair
   │    ├─ Kelly sizing + P&L from outcomes
   │    └─ _build_equity_curve()                 — daily portfolio value
@@ -99,7 +100,7 @@ backtest.py (CLI)
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
-| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester. |
+| `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester (candlesticks are fetched in parallel across tickers and cached per ticker, so workers never share a cache file and a repeat run re-reads them from disk). |
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments, builds the historical API clients, calls `backtester.run_backtest()` then `dashboard.generate_dashboard()`, and logs a summary. |
@@ -116,7 +117,13 @@ Requires Python >= 3.11.
 pip install -e ".[dev]"
 ```
 
-Dependencies are declared in `pyproject.toml`: `kalshi-python-sync` (pinned to `3.2.0` — do not bump, see `CLAUDE.md`), `schedule`, `tabulate`, `cryptography`, `python-dateutil`, `openpyxl`, `plotly`, `pandas`, `numpy`, `scipy`, `yfinance`. The `[dev]` extra adds `pytest` and `ruff`.
+If you plan to run backtests, install the optional `perf` extra as well:
+
+```bash
+pip install -e ".[dev,perf]"
+```
+
+Dependencies are declared in `pyproject.toml`: `kalshi-python-sync` (pinned to `3.2.0` — do not bump, see `CLAUDE.md`), `schedule`, `tabulate`, `cryptography`, `python-dateutil`, `openpyxl`, `plotly`, `pandas`, `numpy`, `scipy`, `yfinance`. The `[dev]` extra adds `pytest` and `ruff`. The `[perf]` extra adds `orjson`, which speeds up the backtest's settled-market fetch — that fetch parses tens of millions of JSON records and is CPU-bound on JSON decoding. It is entirely optional: without it the code falls back to the stdlib `json` module, and because `orjson` emits plain JSON the on-disk cache format is identical either way, so installing or removing it never invalidates a cache.
 
 ### Credentials
 
@@ -150,7 +157,9 @@ kalshi_private_key.pem
   kalshi_arb.log            ← Live bot log file (auto-created)
   kalshi_backtest.log       ← Backtest log file (auto-created)
   backtest_cache/           ← Disk cache for historical data
-    settled_markets_*.json  ← Assembled per-start-date market list
+    settled_markets_*.json  ← Assembled market list, keyed by start date (and by
+                              eligibility-filter tag when the backtester filters
+                              during assembly, so subsets never mix with full lists)
     archive_days/           ← Per-created-day archive slices (incremental/resumable)
     live_days/              ← Per-settled-day recent-market slices (incremental/resumable)
     candlesticks/           ← Per-ticker hourly price series
@@ -216,16 +225,32 @@ python3 -m kalshi_betting.backtest --no-cache   # rebuild the assembled market l
 python3 -m kalshi_betting.backtest --max-horizon-days 14
 ```
 
+`--start-date` should predate the Kalshi archive cutoff. Markets that settled
+after the cutoff have no historical candlestick data, so a window starting after
+it produces no trades regardless of how many pairs it finds.
+
 `--max-horizon-days` only enters trades where the later-closing leg is within the
 given number of days of the *simulated* entry checkpoint (each Monday evaluated
 during the replay), not today's real date. Optional; omit for no limit.
 
 The settled-market fetch is sharded into one slice per UTC day and fetched with
-`SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each completed slice
-is cached in `backtest_cache/archive_days/` / `backtest_cache/live_days/`. An
-interrupted fetch resumes at day granularity, and `--no-cache` reuses the day
-slices (they cannot go stale — see CLAUDE.md), so a refresh only fetches the
-current day plus any days not yet on disk.
+`SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each worker writes its
+own completed slice to `backtest_cache/archive_days/` / `backtest_cache/live_days/`
+and then releases it, so memory use stays flat no matter how many days the run
+spans — the final record list is streamed back off disk once every slice is
+present. An interrupted fetch resumes at day granularity, and `--no-cache`
+reuses the day slices (they cannot go stale — see CLAUDE.md), so a refresh only
+fetches the current day plus any days not yet on disk.
+
+Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
+parallel workers, one independent request per ticker. Cache files are keyed per
+ticker, so workers never contend for a path and any ticker already on disk is
+skipped. Fetched sequentially this step ran at roughly 4 tickers/sec, which made
+it the single largest cost of a backtest.
+
+Note that `--start-date` must fall before the Kalshi archive cutoff: candlestick
+history only exists for archived markets, so a window that starts after the
+cutoff has no price data for any of its tickers and produces no trades.
 
 ### Weekly scheduler daemon
 

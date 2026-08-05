@@ -1,5 +1,7 @@
 """Tests for historical.py — event-title cache and dict serialization."""
+import gzip
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,19 +17,24 @@ def _raw_resp(payload: dict) -> SimpleNamespace:
 
 def _make_client_with_event_pages(non_mve_pages: list[list[tuple[str, str]]],
                                   mve_pages: list[list[tuple[str, str]]] | None = None):
-    """Build a MagicMock client whose get_events / get_multivariate_events
-    return paginated event listings as configured.
+    """Build a MagicMock client whose raw get_events /
+    get_multivariate_events variants return paginated event listings.
 
     Each page is a list of (event_ticker, title) tuples. The mock walks the pages
     in order until exhausted, then returns an empty page with cursor=None.
-    (These two bulk listings still use the modeled SDK calls — Event models
-    without nested markets deserialize fine.)
+
+    Both listings go through the `*_without_preload_content` raw variants: the
+    live API sends `category: null` on some events, which the pinned SDK's
+    EventData model (category typed as a required str) rejects with a pydantic
+    ValidationError. The `category` key below is deliberately null so these
+    fixtures carry the shape that broke the modeled calls.
     """
     mve_pages = mve_pages or []
 
     def _build_resp(page):
-        events = [SimpleNamespace(event_ticker=tkr, title=title) for tkr, title in page]
-        return SimpleNamespace(events=events, cursor=None)
+        events = [{"event_ticker": tkr, "title": title, "category": None}
+                  for tkr, title in page]
+        return _raw_resp({"events": events, "cursor": None})
 
     client = MagicMock()
     # Each call returns the next page; pad with empty page when exhausted.
@@ -46,8 +53,9 @@ def _make_client_with_event_pages(non_mve_pages: list[list[tuple[str, str]]],
         except StopIteration:
             return _build_resp([])
 
-    client.get_events = MagicMock(side_effect=get_events)
-    client.get_multivariate_events = MagicMock(side_effect=get_multivariate_events)
+    client.get_events_without_preload_content = MagicMock(side_effect=get_events)
+    client.get_multivariate_events_without_preload_content = MagicMock(
+        side_effect=get_multivariate_events)
     return client
 
 
@@ -122,28 +130,153 @@ class TestEventTitlesCache:
         result = historical._load_or_build_event_titles(client, {"BAD-1"})
         assert result == {"BAD-1": ""}
 
-    def test_mve_bulk_scan_is_page_capped(self, isolated_cache, monkeypatch):
+    def test_mve_bulk_scan_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
         # The MVE listing is effectively unbounded — a ticker that never
-        # appears must not page forever. The bulk scan stops after
-        # MVE_TITLE_LOOKUP_MAX_PAGES and the per-ticker fallback resolves it.
-        from kalshi_betting.config import MVE_TITLE_LOOKUP_MAX_PAGES
+        # appears must not page forever. Two bounds apply: the productivity
+        # bail-out (stop once N consecutive pages resolve nothing) and the hard
+        # MVE_TITLE_LOOKUP_MAX_PAGES backstop. The bail-out fires first, which
+        # matters because live-measured 2026-08-03 the listings kept scanning
+        # long after they had stopped resolving anything.
+        from kalshi_betting.config import (
+            EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
+            MVE_TITLE_LOOKUP_MAX_PAGES,
+        )
 
         client = _make_client_with_event_pages(non_mve_pages=[])
 
         def endless_mve(limit=None, cursor=None):
             # Cursor always set, ticker never found — an unbounded listing
-            return SimpleNamespace(
-                events=[SimpleNamespace(event_ticker="OTHER", title="x")],
-                cursor="NEXT",
-            )
-        client.get_multivariate_events = MagicMock(side_effect=endless_mve)
+            return _raw_resp({
+                "events": [{"event_ticker": "OTHER", "title": "x", "category": None}],
+                "cursor": "NEXT",
+            })
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=endless_mve)
         fallback = _patch_single_event_lookups(
             monkeypatch, single_lookups={"DEEP-1": "Deep Title"},
         )
         result = historical._load_or_build_event_titles(client, {"DEEP-1"})
         assert result == {"DEEP-1": "Deep Title"}
-        assert client.get_multivariate_events.call_count == MVE_TITLE_LOOKUP_MAX_PAGES
+        pages = client.get_multivariate_events_without_preload_content.call_count
+        assert pages == EVENT_TITLE_LISTING_MAX_BARREN_PAGES
+        assert pages < MVE_TITLE_LOOKUP_MAX_PAGES  # backstop never needed here
+        # Still resolved, via the per-ticker fallback.
         assert fallback.call_count == 1
+
+    def test_status_listing_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
+        # Same bail-out on the settled/closed/open listings. These are an
+        # O(all events) scan for a specific ticker set, and get_events EXCLUDES
+        # MVE events by API design — so for an MVE-heavy miss set they can
+        # never resolve anything and must not page indefinitely (live-measured
+        # 2026-08-03: 80,000 events scanned resolved 9 tickers).
+        from kalshi_betting.config import EVENT_TITLE_LISTING_MAX_BARREN_PAGES
+
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+
+        def endless_events(status=None, limit=None, cursor=None):
+            return _raw_resp({
+                "events": [{"event_ticker": "OTHER", "title": "x", "category": None}],
+                "cursor": "NEXT",
+            })
+        client.get_events_without_preload_content = MagicMock(side_effect=endless_events)
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={"DEEP-1": "Deep Title"},
+        )
+        result = historical._load_or_build_event_titles(client, {"DEEP-1"})
+        assert result == {"DEEP-1": "Deep Title"}
+        # One bail-out per status (settled, closed, open) — bounded, not endless.
+        assert (client.get_events_without_preload_content.call_count
+                == 3 * EVENT_TITLE_LISTING_MAX_BARREN_PAGES)
+        assert fallback.call_count == 1
+
+    def test_bulk_listings_use_raw_variants_not_modeled_calls(self, isolated_cache,
+                                                              monkeypatch):
+        # Regression: the bulk event listings used the MODELED get_events /
+        # get_multivariate_events. The live API now sends `category: null`,
+        # which the pinned SDK's EventData model (category: required str)
+        # rejects with a pydantic ValidationError — observed 2026-08-03 killing
+        # a backtest after a 28-minute fetch had already succeeded. Both must
+        # go through the raw *_without_preload_content variants, which never
+        # touch the response models.
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("E1", "Event One")]], mve_pages=[[("E2", "MVE Two")]],
+        )
+        # Modeled calls are booby-trapped: touching either is the bug.
+        def _modeled_is_broken(*_a, **_k):
+            raise AssertionError("modeled SDK call used; it cannot parse live events")
+
+        client.get_events = MagicMock(side_effect=_modeled_is_broken)
+        client.get_multivariate_events = MagicMock(side_effect=_modeled_is_broken)
+        _patch_single_event_lookups(monkeypatch)
+
+        result = historical._load_or_build_event_titles(client, {"E1", "E2"})
+        assert result == {"E1": "Event One", "E2": "MVE Two"}
+        assert client.get_events_without_preload_content.call_count >= 1
+        assert client.get_multivariate_events_without_preload_content.call_count >= 1
+
+    def test_per_ticker_fallback_is_capped(self, isolated_cache, monkeypatch, caplog):
+        # The per-ticker fallback costs one HTTP round trip each. It was
+        # written for a handful of stragglers, but a 21-day window measured
+        # 289,235 unresolved tickers live (2026-08-03) — uncapped and
+        # sequential that is hours of silent grinding. Past the cap, tickers
+        # are poison-pilled to "" exactly as a failed lookup already did.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(10)}
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, wanted)
+
+        # Every requested ticker is present — capped ones as the "" poison pill.
+        assert set(result) == wanted
+        assert fallback.call_count == 3
+        resolved = {t for t, v in result.items() if v}
+        assert len(resolved) == 3
+        assert all(result[t] == "" for t in wanted - resolved)
+        # The cap is deterministic (sorted), so a re-run can't shuffle coverage.
+        assert resolved == {"E00", "E01", "E02"}
+        # And it must never be silent about what it skipped.
+        assert any("marking the remaining 7 as untitled" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_per_ticker_fallback_runs_in_parallel(self, isolated_cache, monkeypatch):
+        # Each lookup is an independent read-only GET, so they must overlap
+        # rather than run one-at-a-time.
+        import threading
+
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_WORKERS", 4)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(8)}
+
+        concurrent = 0
+        peak = 0
+        lock = threading.Lock()
+        barrier_wait = threading.Event()
+
+        def slow_get(_client, path, **_params):
+            nonlocal concurrent, peak
+            with lock:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            # Hold the "connection" until enough workers pile up (or we give
+            # up), so peak concurrency is observable without a fixed sleep.
+            barrier_wait.wait(timeout=2.0)
+            with lock:
+                if peak >= 4:
+                    barrier_wait.set()
+                concurrent -= 1
+            tkr = path.rsplit("/", 1)[-1]
+            return _raw_resp({"event": {"title": f"Title {tkr}"}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", MagicMock(side_effect=slow_get))
+        result = historical._load_or_build_event_titles(client, wanted)
+
+        assert set(result) == wanted
+        assert all(v.startswith("Title ") for v in result.values())
+        assert peak > 1, f"lookups ran sequentially (peak concurrency {peak})"
 
     def test_cache_hit_skips_api(self, isolated_cache):
         # First call populates the cache; second call should not touch the API
@@ -154,8 +287,8 @@ class TestEventTitlesCache:
         result = historical._load_or_build_event_titles(client2, {"E1"})
         assert result == {"E1": "Title One"}
         # No API calls on the cache hit
-        assert client2.get_events.call_count == 0
-        assert client2.get_multivariate_events.call_count == 0
+        assert client2.get_events_without_preload_content.call_count == 0
+        assert client2.get_multivariate_events_without_preload_content.call_count == 0
 
     def test_use_cache_false_bypasses_disk(self, isolated_cache):
         # Pre-populate disk cache with a stale value
@@ -166,7 +299,7 @@ class TestEventTitlesCache:
         client2 = _make_client_with_event_pages(non_mve_pages=[[("E1", "Fresh Title")]])
         result = historical._load_or_build_event_titles(client2, {"E1"}, use_cache=False)
         assert result["E1"] == "Fresh Title"
-        assert client2.get_events.call_count >= 1
+        assert client2.get_events_without_preload_content.call_count >= 1
 
 
 def _raw_market_dict(**overrides) -> dict:
@@ -651,6 +784,199 @@ class TestShardedFetch:
         # The migrated markets must come from the refetched archive slices
         assert {"L1", "L2", "L3"} <= {m["ticker"] for m in out2}
 
+    def test_assembly_streams_slices_from_disk(self, tmp_path, monkeypatch):
+        # Peak memory must not scale with the number of days fetched, so no
+        # phase may retain slice records: every day — including ones fetched
+        # moments earlier in this same run — is re-read from its file at
+        # assembly. Verified by counting _day_store_load calls per path.
+        archive_markets, live_markets = self._fixture_markets()
+        real_load = historical._day_store_load
+        loads: list[str] = []
+
+        def counting_load(path, expect_meta):
+            result = real_load(path, expect_meta)
+            if result is not None:
+                loads.append(str(path))
+            return result
+
+        monkeypatch.setattr(historical, "_day_store_load", counting_load)
+        out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                        _FakeLive(live_markets))
+        assert out  # sanity: the run actually produced records
+
+        # Cold run: every successful load is an assembly read (the prescan
+        # found nothing on disk), so each written slice is read exactly once.
+        written = {str(p) for p in
+                   (tmp_path / "cache").glob("*_days/*.json.gz")}
+        assert written, "expected day slices to have been persisted"
+        assert set(loads) == written
+        assert len(loads) == len(written)
+
+    def test_prefilter_assembly_equals_postfilter(self, tmp_path, monkeypatch):
+        # The result-neutrality proof for pushing the backtester's eligibility
+        # filter into the fetch: filtering DURING assembly must produce exactly
+        # what filtering the unfiltered result afterwards would — same records,
+        # same order. run_backtest still applies the predicate itself, so this
+        # equality is what makes the optimization invisible to backtest output.
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+
+        def pred(m):
+            # Discriminating on purpose: keeps a mix of archive-day, tail, and
+            # live records so every code path is exercised, not just one.
+            return not m["ticker"].endswith("1")
+
+        _install_sharded_fakes(monkeypatch, tmp_path / "full",
+                               _FakeArchive(archive_markets), self.CUTOFF)
+        out_full = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets),
+            start_date=date(2026, 6, 5), use_cache=False,
+        )
+
+        _install_sharded_fakes(monkeypatch, tmp_path / "pref",
+                               _FakeArchive(archive_markets), self.CUTOFF)
+        out_pref = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets),
+            start_date=date(2026, 6, 5), use_cache=False,
+            prefilter=pred, prefilter_tag="testpred",
+        )
+
+        assert out_pref == [m for m in out_full if pred(m)]
+        # Sanity: the predicate actually removed something, and kept something.
+        assert 0 < len(out_pref) < len(out_full)
+
+        # The day-slice FILES must stay complete — they are shared across start
+        # dates and other callers, so filtering them would corrupt the cache.
+        slices = sorted((tmp_path / "pref" / "cache" / "archive_days").glob("*.json.gz"))
+        assert slices
+        stored = set()
+        for path in slices:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                stored |= {m["ticker"] for m in json.load(fh)["markets"]}
+        dropped = {m["ticker"] for m in out_full if not pred(m)}
+        assert dropped & stored, "filtered-out records must still be on disk"
+
+    def test_prefiltered_cache_filename_and_isolation(self, tmp_path, monkeypatch):
+        # A prefiltered result is a strict subset, so it must never be served
+        # to an unfiltered caller (or to one using different filter semantics).
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+
+        def pred(m):
+            return not m["ticker"].endswith("1")
+
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, self.CUTOFF)
+        out1 = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=False, prefilter=pred, prefilter_tag="testpred",
+        )
+        cache_dir = tmp_path / "cache"
+        assert (cache_dir / "settled_markets_2026-06-05_testpred.json").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05.json").exists()
+
+        # Second prefiltered run hits the tagged cache: zero API calls.
+        archive.calls = 0
+        out2 = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True, prefilter=pred, prefilter_tag="testpred",
+        )
+        assert out2 == out1
+        assert archive.calls == 0
+
+        # An unfiltered caller must NOT read the prefiltered cache.
+        out_full = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True,
+        )
+        assert len(out_full) > len(out1)
+
+        # The tag is what keys the cache, so it can't be omitted.
+        with pytest.raises(ValueError):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False, prefilter=pred,
+            )
+        with pytest.raises(ValueError):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False, prefilter_tag="testpred",
+            )
+
+    def test_probe_exception_falls_back_to_sequential(self, tmp_path, monkeypatch, caplog):
+        # The cursor-synthesis probe issues a real request, so it can fail for
+        # reasons unrelated to cursor format. Such a failure used to escape the
+        # phase and kill the run with no warning; it must degrade to the
+        # sequential walk exactly like a format mismatch does.
+        archive_markets, live_markets = self._fixture_markets()
+
+        def exploding_probe(*_a, **_k):
+            raise RuntimeError("probe blew up")
+
+        monkeypatch.setattr(historical, "_archive_cursor_synthesis_ok", exploding_probe)
+        with caplog.at_level(logging.WARNING):
+            out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                            _FakeLive(live_markets))
+
+        assert {m["ticker"] for m in out} == _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+        assert any("probe blew up" in r.getMessage() for r in caplog.records)
+        # Fail closed: the sequential path must not fabricate day-slice files.
+        assert not (tmp_path / "cache" / "archive_days").exists()
+
+    def test_worker_failure_cancels_queued_days(self, tmp_path, monkeypatch):
+        # A failing worker must abandon the remaining queued days instead of
+        # letting the executor drain them (hundreds of days = hours) before the
+        # fallback is reached.
+        recorded: list[dict] = []
+        real_pool_cls = historical.ThreadPoolExecutor
+
+        class RecordingPool(real_pool_cls):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                recorded.append({"wait": wait, "cancel_futures": cancel_futures})
+                return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        monkeypatch.setattr(historical, "ThreadPoolExecutor", RecordingPool)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_MAX_WORKERS", 1)
+        archive_markets, live_markets = self._fixture_markets()
+
+        # Fail the first day worker, the way a server that ignores a
+        # synthesized cursor would. Patched at the worker seam so the
+        # sequential fallback (which pages normally) still works.
+        def failing_worker(*_a, **_k):
+            raise historical._ShardedFetchUnsupported("synthesized cursor rejected")
+
+        monkeypatch.setattr(historical, "_fetch_and_store_archive_day", failing_worker)
+        out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                        _FakeLive(live_markets))
+
+        # The pool was torn down with cancel_futures, not drained.
+        assert any(c["cancel_futures"] and not c["wait"] for c in recorded), recorded
+        # And the fallback still produced the correct, complete result.
+        assert {m["ticker"] for m in out} == _old_semantics_expected(
+            archive_markets, live_markets,
+            self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
+        )
+
+    def test_slice_progress_reports_position_and_eta(self, tmp_path, monkeypatch, caplog):
+        # Each completed slice logs N/M plus a rate and ETA, so a multi-hour
+        # fetch reports how far along it actually is.
+        archive_markets, live_markets = self._fixture_markets()
+        with caplog.at_level(logging.INFO):
+            self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                      _FakeLive(live_markets))
+        slice_lines = [r.getMessage() for r in caplog.records
+                       if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
+        assert slice_lines
+        assert all("ETA" in line and "slices/min" in line for line in slice_lines)
+        # Counter runs 1..N over the days actually fetched, never exceeding N.
+        total = len(slice_lines)
+        assert slice_lines[-1].split("complete")[0].strip().endswith(f"{total}/{total}")
+
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
         # would silently re-walk the whole range; the first window detects it
@@ -706,6 +1032,48 @@ class TestArchiveCursorCodec:
         assert seconds == int(datetime(2026, 5, 13, 23, 9, 56, tzinfo=UTC).timestamp())
 
 
+class TestProgressLabels:
+    """The sharded and sequential paths emit the same progress-line SHAPE, so
+    their labels are the only thing telling them apart in a log. When the
+    labels were identical, a live run on the sharded path was misdiagnosed as
+    having fallen back to the sequential walk."""
+
+    def test_fetch_progress_logs_its_label_every_100_pages(self, caplog):
+        progress = historical._FetchProgress("Historical archive [sharded]")
+        with caplog.at_level(logging.INFO):
+            for _ in range(100):
+                progress.tick(2)
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == [
+            "Historical archive [sharded]: 100 pages scanned, 200 markets kept so far"
+        ]
+
+    def test_sharded_and_sequential_labels_differ(self):
+        # Guards against a future edit re-converging the two labels.
+        import inspect
+
+        source = inspect.getsource(historical)
+        assert 'Historical archive [sharded]' in source
+        assert 'Historical archive [sequential]' in source
+        assert 'Live settled sweep [windowed]' in source
+        assert 'Live settled sweep [sequential]' in source
+        # No un-suffixed variant left behind.
+        assert '"Historical archive: %d pages' not in source
+        assert '"Live settled sweep: %d pages' not in source
+
+
+class TestFormatDuration:
+    def test_renders_compact_units(self):
+        assert historical._format_duration(0) == "0s"
+        assert historical._format_duration(45.4) == "45s"
+        assert historical._format_duration(90) == "1m30s"
+        assert historical._format_duration(3600) == "1h00m"
+        assert historical._format_duration(13_260) == "3h41m"
+
+    def test_negative_clamps_to_zero(self):
+        assert historical._format_duration(-5) == "0s"
+
+
 class TestDayStore:
     def test_meta_mismatch_rejects_file(self, tmp_path):
         path = tmp_path / "2026-06-09.json.gz"
@@ -722,6 +1090,28 @@ class TestDayStore:
         assert historical._day_store_load(path, {}) is None
         path.write_bytes(b"not gzip")
         assert historical._day_store_load(path, {}) is None
+
+    def test_day_store_roundtrip_interoperates_with_stdlib_json(self, tmp_path):
+        # The store may be written by orjson (optional `perf` extra) or the
+        # stdlib. Both must produce files the other can read, or installing /
+        # removing orjson would silently invalidate every cached day slice.
+        meta = {"kind": "archive_created_day", "cutoff_ts": 100,
+                "include_mve": True, "complete": True}
+        markets = [{"ticker": "T1", "result": "yes", "settlement_ts": "2026-06-09T00:00:00Z"},
+                   {"ticker": "T2", "result": "no", "open_time": None}]
+
+        # Whatever _day_store_save used, plain stdlib json must read it back.
+        written = tmp_path / "written.json.gz"
+        historical._day_store_save(written, meta, markets)
+        with gzip.open(written, "rt", encoding="utf-8") as fh:
+            assert json.load(fh) == {"meta": meta, "markets": markets}
+
+        # And a slice hand-written by the stdlib must load through the shim —
+        # this is the contract that keeps pre-existing caches on disk usable.
+        legacy = tmp_path / "legacy.json.gz"
+        with gzip.open(legacy, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "markets": markets}, fh)
+        assert historical._day_store_load(legacy, meta) == markets
 
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
