@@ -55,7 +55,7 @@ secrets.json + PEM key
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
   ├─ scanner.get_held_tickers()    — fetch currently-held positions (prod only) so we skip re-entering them
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping; drops markets on non-routable exchange shards)
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection

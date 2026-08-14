@@ -47,6 +47,7 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
+    ROUTABLE_EXCHANGE_INDEX,
     SAME_TITLE_MIN_PRICE_DIFF,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -423,6 +424,28 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
     )
 
 
+def _on_routable_shard(m: dict) -> bool:
+    """
+    Return True when a raw market dict lives on the shard our orders reach.
+
+    Markets on other exchange shards must never become candidates: the legacy
+    create-order endpoint has no shard routing, so an order for a shard-1
+    market would fail or misroute at submission time. A missing, null, or
+    unparseable exchange_index is treated as shard 0 (fail-safe — absence of
+    the field must not empty the market list).
+
+    Args:
+        m (dict): One raw market JSON dict from an events-endpoint payload.
+
+    Returns:
+        bool: True if the market is tradeable by our order path.
+    """
+    try:
+        return int(m.get("exchange_index") or ROUTABLE_EXCHANGE_INDEX) == ROUTABLE_EXCHANGE_INDEX
+    except (TypeError, ValueError):
+        return True
+
+
 def fetch_open_events_with_markets(client: Any) -> list:
     """
     Fetch all open Kalshi markets via the events endpoint (with nested markets).
@@ -445,6 +468,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
+    Both loops also drop any market not on ROUTABLE_EXCHANGE_INDEX (see
+    _on_routable_shard) — the legacy create-order endpoint has no shard
+    routing, so a market on another exchange shard must never reach the
+    pair-detection pipeline. A non-zero skip count is logged as a warning.
+
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
@@ -454,6 +482,10 @@ def fetch_open_events_with_markets(client: Any) -> list:
             string if the event had no title). May contain thousands of items.
     """
     markets: list = []
+    # Counts markets dropped for living on a non-routable exchange shard (see
+    # _on_routable_shard) — shared across both the standard and MVE loops below
+    # so the summary warning reflects the whole fetch.
+    skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
     while True:
@@ -480,6 +512,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # most stale markets too, but this stops them from being paired
                 # (and shown as tradeable candidates) in the first place.
                 if (m.get("status") or "") != "active":
+                    continue
+                # Markets on other exchange shards can't be traded through the
+                # legacy order endpoint — drop them before they become candidates
+                if not _on_routable_shard(m):
+                    skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it
@@ -519,6 +556,12 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     # (allowed values: initialized/active/closed/settled/determined
                     # — there is no "open" status).
                     if (m.get("status") or "") == "active":
+                        # Markets on other exchange shards can't be traded through
+                        # the legacy order endpoint — drop them before they become
+                        # candidates
+                        if not _on_routable_shard(m):
+                            skipped_shard += 1
+                            continue
                         markets.append(_market_from_dict(m, ev_title))
             if page_market_count == 0:
                 empty_pages += 1
@@ -536,6 +579,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
             if not cursor:
                 break
 
+    if skipped_shard:
+        logging.warning(
+            "Skipped %d markets on non-routable exchange shards (exchange_index != %d)",
+            skipped_shard, ROUTABLE_EXCHANGE_INDEX,
+        )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 

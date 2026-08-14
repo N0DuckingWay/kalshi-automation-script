@@ -112,6 +112,14 @@ TAKER_FEE_RATE                = 0.07
 # submission: the order fills at or below (scanned price + allowance) or not at all.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
+# The only exchange shard our order path can reach. Kalshi now partitions the
+# exchange into parallel instances keyed by `exchange_index` (on markets and
+# in the balance breakdown; index 1 observed live 2026-08-14). The legacy
+# create-order endpoint the bot submits through has no shard routing, so the
+# scanner drops markets on other shards at ingest and verify_auth reads the
+# shard-0 balance entry. Currently every Kalshi market is on shard 0.
+ROUTABLE_EXCHANGE_INDEX       = 0
+
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
 # weekly scheduler daemon forever.
