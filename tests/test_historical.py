@@ -376,6 +376,38 @@ class TestMarketToDict:
         d = historical._market_to_dict(raw)
         assert d["open_time"] is None
 
+    def test_tick_structure_fields_pass_through_raw(self):
+        # price_level_structure/price_ranges (2026-08 groundwork) must be
+        # stored RAW — not parsed into scanner.PriceRange objects — since this
+        # dict is JSON-serialized straight into the backtest cache.
+        raw = _raw_market_dict(
+            price_level_structure="deci_cent",
+            price_ranges=[{"start": "0.0000", "end": "1.0000", "step": "0.0010"}],
+        )
+        d = historical._market_to_dict(raw)
+        assert d["price_level_structure"] == "deci_cent"
+        assert d["price_ranges"] == [{"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+
+    def test_missing_tick_structure_fields_map_to_none(self):
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["price_level_structure"] is None
+        assert d["price_ranges"] is None
+
+    def test_stored_record_is_json_serializable(self):
+        # The produced dict is gzip+json-dumped straight into the cache — a
+        # non-JSON-native value here (e.g. an accidentally-parsed PriceRange
+        # dataclass) would blow up at cache-write time, not at read time.
+        raw = _raw_market_dict(
+            price_level_structure="tapered_deci_cent",
+            price_ranges=[
+                {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            ],
+        )
+        d = historical._market_to_dict(raw, "Some Event Title")
+        round_tripped = json.loads(json.dumps(d))
+        assert round_tripped == d
+
 
 class TestFetchAllSettledMarkets:
     def test_archive_early_stop_and_dict_output(self, tmp_path, monkeypatch):

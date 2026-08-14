@@ -1,4 +1,5 @@
 """Tests for scanner.py normalize_title() — the core pair-detection function."""
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -10,8 +11,10 @@ import pytest
 from kalshi_betting.config import INCLUDE_MVE_MARKETS, ROUTABLE_EXCHANGE_INDEX
 from kalshi_betting.scanner import (
     CandidatePair,
+    PriceRange,
     _fetch_orderbook,
     _on_routable_shard,
+    _parse_price_ranges,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -980,3 +983,98 @@ class TestFilterMarketsWithinHorizon:
         m = _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 12, 1))
         result = filter_markets_within_horizon([m], 7)
         assert result == []
+
+
+class TestParsePriceRanges:
+    """_parse_price_ranges: groundwork ingest for the price_ranges tick-band
+    array (2026-08). Nothing consumes the parsed bands yet — these tests only
+    cover the parse itself."""
+
+    def test_single_band_deci_cent(self):
+        bands = _parse_price_ranges(
+            [{"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+        )
+        assert bands == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_multi_band_tapered_market(self):
+        raw = [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [
+            PriceRange(start=0.0, end=0.1, step=0.001),
+            PriceRange(start=0.1, end=0.9, step=0.01),
+            PriceRange(start=0.9, end=1.0, step=0.001),
+        ]
+
+    def test_none_returns_none(self):
+        assert _parse_price_ranges(None) is None
+
+    def test_not_a_list_returns_none(self):
+        assert _parse_price_ranges({"start": "0", "end": "1", "step": "0.01"}) is None
+
+    def test_empty_list_returns_none(self):
+        assert _parse_price_ranges([]) is None
+
+    def test_all_bands_missing_keys_returns_none(self):
+        # Every band fails to parse -> the result must be None, not [].
+        assert _parse_price_ranges([{"foo": "bar"}, {"start": "0"}]) is None
+
+    def test_one_good_one_malformed_band_keeps_only_the_good_one(self):
+        raw = [
+            {"start": "0.0000", "end": "0.5000", "step": "0.0100"},
+            {"start": "0.5000", "end": "1.0000"},  # missing "step"
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [PriceRange(start=0.0, end=0.5, step=0.01)]
+
+    def test_price_range_is_frozen(self):
+        band = PriceRange(start=0.0, end=1.0, step=0.01)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            band.start = 0.5
+
+
+class TestTickStructureIngest:
+    """Tick-structure fields flow through the real raw-JSON parse path
+    (fetch_open_events_with_markets -> _market_from_dict), matching how the
+    subtitle-fallback tests above exercise ingest."""
+
+    def _parse_one(self, **extra):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("TICK-1", "Rain tomorrow", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_deci_cent_single_band(self):
+        m = self._parse_one(
+            price_level_structure="deci_cent",
+            price_ranges=[{"start": "0.0000", "end": "1.0000", "step": "0.0010"}],
+        )
+        assert m.price_level_structure == "deci_cent"
+        assert m.price_ranges == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_tapered_multi_band(self):
+        m = self._parse_one(
+            price_level_structure="tapered_deci_cent",
+            price_ranges=[
+                {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+                {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+            ],
+        )
+        assert m.price_level_structure == "tapered_deci_cent"
+        assert len(m.price_ranges) == 3
+        assert [b.step for b in m.price_ranges] == [0.001, 0.01, 0.001]
+
+    def test_absent_fields_default_to_empty_and_none(self):
+        m = self._parse_one()
+        assert m.price_level_structure == ""
+        assert m.price_ranges is None

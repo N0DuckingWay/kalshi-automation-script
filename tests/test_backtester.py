@@ -148,6 +148,61 @@ class TestExtractPairsCanonHandling:
         assert len(group_keys) == 2, "distinct events must yield distinct group_keys"
 
 
+class TestOldCacheToleranceMissingTickAndSubtitleFields:
+    """Cache records written before the tick-structure groundwork (2026-08)
+    have no price_level_structure/price_ranges keys at all — and pre-2026-08
+    records may also lack subtitle entirely, not just carry it as "". None of
+    the grouping/extraction helpers should ever KeyError on that; they only
+    ever read via .get()."""
+
+    @staticmethod
+    def _old_style_dict(ticker, event_ticker, title, close_time, event_title=""):
+        # Deliberately omits price_level_structure, price_ranges, AND subtitle
+        # — the exact shape of a pre-2026-08 cache record.
+        return {
+            "ticker": ticker,
+            "event_ticker": event_ticker,
+            "event_title": event_title,
+            "title": title,
+            "close_time": close_time,
+        }
+
+    def test_pair_key_handles_missing_fields(self):
+        m = self._old_style_dict("T1", "E1", "Will BTC exceed $80k",
+                                  "2026-01-01T00:00:00Z")
+        assert _pair_key(m) == "Will BTC exceed $80k"
+
+    def test_group_by_exact_title_handles_missing_fields(self):
+        mA = self._old_style_dict("A1", "EVT-A", "Republicans win majority",
+                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
+        mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
+                                   "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
+        groups = _group_by_exact_title([mA, mB])
+        assert len(groups) == 1
+
+    def test_extract_pairs_same_title_handles_missing_fields(self):
+        mA = self._old_style_dict("A1", "EVT-A", "Republicans win majority",
+                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
+        mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
+                                   "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
+        groups = _group_by_exact_title([mA, mB])
+        pairs = _extract_pairs(groups, "same_title")
+        assert len(pairs) == 1
+
+    def test_extract_pairs_time_series_handles_missing_fields(self):
+        # Deadline gap kept within MAX_DEADLINE_GAP_DAYS + 1 margin so the
+        # windowed sweep actually materializes a pair (not a windowing edge case).
+        # "Month day, year" is stripped by normalize_title regardless of day,
+        # so both titles normalize to the same key.
+        mA = self._old_style_dict("A1", "EVT-A", "Will BTC exceed $80k by March 1, 2026",
+                                   "2026-03-01T00:00:00Z")
+        mB = self._old_style_dict("B1", "EVT-B", "Will BTC exceed $80k by March 20, 2026",
+                                   "2026-03-20T00:00:00Z")
+        groups = _group_by_normalized_title([mA, mB])
+        pairs = _extract_pairs(groups, "time_series")
+        assert len(pairs) == 1
+
+
 class TestSettlementReceipt:
     def test_payoff_table(self):
         # n NO contracts on A + n YES contracts on B; each winning contract

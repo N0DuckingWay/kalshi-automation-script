@@ -248,7 +248,8 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
     Returns:
         dict: A flat dictionary with keys: ticker, event_ticker, event_title,
             title, subtitle, result, yes_ask_dollars, no_ask_dollars,
-            yes_bid_dollars, open_time, close_time, settlement_ts, status.
+            yes_bid_dollars, open_time, close_time, settlement_ts, status,
+            price_level_structure, price_ranges.
             Note: open_time is a new field (added alongside the backtester's
             eligibility prefilter) — cache files written before this change
             don't have it and will read back as None until refreshed with
@@ -264,6 +265,18 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
             grouping; `--no-cache` does NOT refresh them, since day slices
             can't go stale by construction — a full refresh requires deleting
             backtest_cache/archive_days/ and backtest_cache/live_days/.
+            Note: price_level_structure/price_ranges are new, raw pass-through
+            groundwork fields (2026-08) for a future tick-aware order cap —
+            nothing in the backtester reads them yet. Cache records written
+            before this change lack both and read back as None. They are
+            stored raw (not parsed into scanner.PriceRange objects) because
+            this dict is JSON-serialized straight into the cache file, and
+            parsed dataclasses wouldn't round-trip through json.dump. Size
+            impact is negligible (a short string plus a handful of small
+            dicts per market) relative to the fields already kept here —
+            deliberately considered against the OOM history documented in
+            CLAUDE.md, which was caused by caching whole raw payloads, not by
+            small additions to this already-compact record.
     """
     return {
         "ticker": m.get("ticker"),
@@ -287,6 +300,10 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         "close_time": m.get("close_time"),
         "settlement_ts": m.get("settlement_ts"),
         "status": m.get("status"),
+        # Tick-structure groundwork (2026-08): raw pass-through for cache
+        # fidelity; no reader yet. Pre-existing cache records read back None.
+        "price_level_structure": m.get("price_level_structure"),
+        "price_ranges": m.get("price_ranges"),
     }
 
 

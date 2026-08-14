@@ -95,6 +95,60 @@ _MIN_ACTIVE_PRICE = 0.01
 _MAX_ACTIVE_PRICE = 0.99
 
 
+@dataclass(frozen=True)
+class PriceRange:
+    """
+    One tick-size band from a market's price_ranges array, in dollars.
+
+    Kalshi markets can have a non-uniform tick grid across their price range
+    (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
+    structure). Each band names its own step size; a market's full grid is
+    the ordered list of bands covering [0, 1]. Nothing consumes these bands
+    yet — see _parse_price_ranges.
+
+    Attributes:
+        start (float): Lower bound of this band, in dollars (e.g. 0.0).
+        end (float): Upper bound of this band, in dollars (e.g. 1.0).
+        step (float): Tick size within this band, in dollars (e.g. 0.001).
+    """
+    start: float
+    end: float
+    step: float
+
+
+def _parse_price_ranges(raw: Any) -> list | None:
+    """
+    Parse a raw price_ranges array into PriceRange bands, or None if unknown.
+
+    Fail-soft per the return-None convention: a missing, empty, or malformed
+    array means "tick structure unknown", never an error — nothing consumes
+    these bands yet (groundwork for tick-aware order caps after the V2 order
+    migration; combo markets move to $0.0001 ticks on 2026-08-17).
+
+    Args:
+        raw (Any): The raw `price_ranges` value from a market JSON dict —
+            expected to be a list of {"start": str, "end": str, "step": str}
+            dollar-string dicts, but may be missing, empty, or malformed.
+
+    Returns:
+        list[PriceRange] | None: Parsed bands in their original order, or
+            None when raw is not a non-empty list, or when every band in it
+            fails to parse. Individual malformed bands within an otherwise
+            valid list are skipped rather than failing the whole array.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    bands = []
+    for band in raw:
+        try:
+            bands.append(PriceRange(
+                start=float(band["start"]), end=float(band["end"]), step=float(band["step"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return bands or None
+
+
 @dataclass
 class CandidatePair:
     """
@@ -369,6 +423,12 @@ class ApiMarket:
         yes_ask_dollars: YES ask as a dollar string (e.g. "0.35") or None.
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
+        price_level_structure (str): Tick regime name, e.g. "linear_cent",
+            "tapered_deci_cent", "deci_cent". "" if absent — nothing reads
+            this field yet (groundwork for a future tick-aware order cap).
+        price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
+            _parse_price_ranges), or None when unknown/unparseable/absent.
+            Nothing reads this field yet either.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -380,6 +440,8 @@ class ApiMarket:
     yes_ask_dollars: Any = None
     no_ask_dollars: Any = None
     yes_bid_dollars: Any = None
+    price_level_structure: str = ""
+    price_ranges: Any = None  # list[PriceRange] | None — None = unknown
     _event_title: str = field(default="")
 
 
@@ -420,6 +482,8 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         yes_ask_dollars=m.get("yes_ask_dollars"),
         no_ask_dollars=m.get("no_ask_dollars"),
         yes_bid_dollars=m.get("yes_bid_dollars"),
+        price_level_structure=m.get("price_level_structure") or "",
+        price_ranges=_parse_price_ranges(m.get("price_ranges")),
         _event_title=event_title,
     )
 
