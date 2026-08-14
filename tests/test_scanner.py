@@ -737,6 +737,106 @@ class TestFetchOpenEventsMveStatusFilter:
             fetch_open_events_with_markets(client)
 
 
+class TestSubtitleFallback:
+    """The API dropped `subtitle` (2026-08 drift) — ingest must read yes_sub_title."""
+
+    def _parse_one(self, **extra):
+        # Route through the real raw-JSON parse path (fetch_open_events_with_markets
+        # → _market_from_dict), not the dataclass constructor, so the test covers
+        # the actual ingest the live scanner uses.
+        event = {"title": "Papal Conclave", "markets": [
+            _raw_market("SUB-1", "Who will the next Pope be?", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_explicit_subtitle_wins_over_yes_sub_title(self):
+        m = self._parse_one(subtitle="Legacy Label", yes_sub_title="New Label")
+        assert m.subtitle == "Legacy Label"
+
+    def test_yes_sub_title_used_when_subtitle_absent(self):
+        m = self._parse_one(yes_sub_title="Pierbattista Pizzaballa")
+        assert m.subtitle == "Pierbattista Pizzaballa"
+
+    def test_null_subtitle_falls_back_to_yes_sub_title(self):
+        # The archive/live payloads sometimes carry an explicit null rather than
+        # omitting the key — that must still fall through to yes_sub_title.
+        m = self._parse_one(subtitle=None, yes_sub_title="Peter Turkson")
+        assert m.subtitle == "Peter Turkson"
+
+    def test_both_absent_yields_empty_string(self):
+        m = self._parse_one()
+        assert m.subtitle == ""
+
+    def test_no_sub_title_is_not_used(self):
+        # no_sub_title is the negated phrasing; using it would make the grouping
+        # key asymmetric between the YES and NO framings of the same outcome.
+        m = self._parse_one(no_sub_title="Someone else")
+        assert m.subtitle == ""
+
+
+class TestSameTitleSubtitleDiscriminator:
+    """Regression: distinct outcomes sharing one title must not be paired.
+
+    Before the yes_sub_title fallback, every market parsed with subtitle="",
+    so the (event_title, title, subtitle) grouping key collapsed to
+    (event_title, title) — two DIFFERENT outcomes under one shared question
+    title on different event tickers would group together and be traded under
+    the 95% co-resolution assumption. Real money, wrong contract.
+    """
+
+    @staticmethod
+    def _pope_event(event_ticker, ticker, sub, yes_ask, no_ask):
+        # Same event *title* on both sides so the event_title component of the
+        # grouping key matches — the subtitle is the only discriminator left.
+        return {"title": "Papal Conclave", "markets": [
+            _raw_market(
+                ticker, "Who will the next Pope be?",
+                event_ticker=event_ticker,
+                yes_sub_title=sub,
+                yes_ask_dollars=str(yes_ask), no_ask_dollars=str(no_ask),
+            ),
+        ]}
+
+    @staticmethod
+    def _markets(events):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(events))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        return fetch_open_events_with_markets(client)
+
+    def test_distinct_outcomes_under_shared_title_do_not_pair(self):
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-PIZZABALLA", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-TURKSON", "Peter Turkson", 0.30, 0.70),
+        ])
+        # Both parsed subtitles must be populated — otherwise the assertion
+        # below would pass for the wrong reason (e.g. a parse failure).
+        assert {m.subtitle for m in markets} == {"Pierbattista Pizzaballa", "Peter Turkson"}
+        pairs = find_same_title_pairs(markets)
+        assert pairs == [], f"Different outcomes must not be same-title paired; got {pairs}"
+
+    def test_identical_outcome_across_events_still_pairs(self):
+        # Positive control: same outcome label, different event tickers, price
+        # gap well above SAME_TITLE_MIN_PRICE_DIFF — the legitimate arbitrage.
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-A", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-B", "Pierbattista Pizzaballa", 0.30, 0.70),
+        ])
+        pairs = find_same_title_pairs(markets)
+        assert len(pairs) == 1
+        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"POPE-A", "POPE-B"}
+        # market_a is canonicalized to the more expensive side
+        assert pairs[0].market_a.ticker == "POPE-A"
+
+
 class TestFilterMarketsWithinHorizon:
     def test_none_horizon_returns_markets_unchanged(self):
         markets = [

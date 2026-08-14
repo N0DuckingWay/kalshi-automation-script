@@ -152,6 +152,11 @@ def market_title(market: Any) -> str:
 
     Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
 
+    Since the 2026-08 API drift, `.subtitle` is sourced from `yes_sub_title`
+    (see `_market_from_dict`), so a title-less market now falls back to its
+    outcome label (e.g. a candidate name) rather than dropping through to the
+    opaque ticker as it did while subtitle was always "".
+
     Args:
         market (Any): A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
 
@@ -354,8 +359,9 @@ class ApiMarket:
         ticker (str): Market ticker, e.g. "KXBTC-24MAR-T80".
         event_ticker (str): Parent event ticker.
         title (str): Market question text.
-        subtitle (str): Market subtitle ("" when the API omits it, as it
-            currently does — matches the SDK model's empty default).
+        subtitle (str): Market subtitle, from the legacy `subtitle` key with a
+            fallback to `yes_sub_title` (the API dropped `subtitle` in the
+            2026-08 drift). "" when both are absent.
         status (str): SDK-style status string; open markets are "active".
         close_time (datetime | None): Parsed tz-aware close time, or None if
             missing/unparseable.
@@ -402,7 +408,12 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         ticker=m.get("ticker") or "",
         event_ticker=m.get("event_ticker") or "",
         title=m.get("title") or "",
-        subtitle=m.get("subtitle") or "",
+        # The API dropped `subtitle` from market payloads (2026-08 drift);
+        # yes_sub_title carries the same intra-title outcome label (e.g. the
+        # option name in a multi-choice event) and is the discriminator
+        # same-title grouping depends on. no_sub_title is deliberately NOT
+        # used — it is the negated phrasing and would yield asymmetric keys.
+        subtitle=m.get("subtitle") or m.get("yes_sub_title") or "",
         status=m.get("status") or "",
         close_time=close_dt,
         yes_ask_dollars=m.get("yes_ask_dollars"),
@@ -685,7 +696,12 @@ def find_same_title_pairs(
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
-    titles and therefore won't be grouped together.
+    titles and therefore won't be grouped together. The subtitle component is
+    sourced from the API's `yes_sub_title` field post-2026-08 drift (see
+    `_market_from_dict`) — it is the only intra-title discriminator, so without
+    it two DIFFERENT outcomes sharing one question title (e.g. two candidates
+    under "Who will the next Pope be?") on different event tickers would be
+    falsely paired as the same contract under the 95% co-resolution assumption.
 
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.

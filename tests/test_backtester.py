@@ -69,6 +69,30 @@ class TestExactTitleGrouping:
         assert key[0] == "2026 Senate Control"
         assert key[1] == "Republicans win majority"
 
+    def test_distinct_subtitles_separate_groups(self):
+        # The subtitle is the only intra-title discriminator: two DIFFERENT
+        # outcomes sharing one question title must never land in one group,
+        # or the backtester pairs them as the same contract. Cache records now
+        # populate subtitle from the API's yes_sub_title (2026-08 drift).
+        mA = _md("A1", "EVT-A", title="Who will the next Pope be?",
+                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
+        mB = _md("B1", "EVT-B", title="Who will the next Pope be?",
+                 subtitle="Peter Turkson", event_title="Papal Conclave")
+        # Each lands alone, then the len>=2 filter drops both.
+        assert _group_by_exact_title([mA, mB]) == {}
+
+    def test_identical_subtitles_group_together(self):
+        mA = _md("A1", "EVT-A", title="Who will the next Pope be?",
+                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
+        mB = _md("B1", "EVT-B", title="Who will the next Pope be?",
+                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
+        groups = _group_by_exact_title([mA, mB])
+        assert len(groups) == 1
+        key = next(iter(groups))
+        assert key == ("Papal Conclave", "Who will the next Pope be?",
+                       "Pierbattista Pizzaballa")
+        assert len(groups[key]) == 2
+
 
 class TestNormalizedTitleGrouping:
     def test_same_event_different_deadlines_groups(self):

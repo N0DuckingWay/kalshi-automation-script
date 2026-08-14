@@ -255,6 +255,15 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
             --no-cache; backtester._can_ever_enter() treats that as "can't
             prove ineligibility" and keeps the market (no speedup, no
             incorrect drop).
+            Note: subtitle is sourced from the legacy `subtitle` key with a
+            fallback to `yes_sub_title`, which is where the archive now puts
+            the outcome label (2026-08 drift). The cache key name is unchanged
+            so backtester._group_by_exact_title and the display labels read it
+            as before. Day-slice files written before this change carry
+            subtitle=None and reproduce the pre-fix (weakened) same-title
+            grouping; `--no-cache` does NOT refresh them, since day slices
+            can't go stale by construction — a full refresh requires deleting
+            backtest_cache/archive_days/ and backtest_cache/live_days/.
     """
     return {
         "ticker": m.get("ticker"),
@@ -262,7 +271,12 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # Resolved by fetch_all_settled_markets via _load_or_build_event_titles
         "event_title": event_title or "",
         "title": m.get("title"),
-        "subtitle": m.get("subtitle"),
+        # `subtitle` was dropped from API payloads (2026-08 drift);
+        # yes_sub_title carries the same outcome discriminator. Cache records
+        # written before this fix keep subtitle=None — that reproduces the
+        # pre-fix (weakened) grouping, and day slices are only refreshed by
+        # deleting backtest_cache/{archive_days,live_days}/, not by --no-cache.
+        "subtitle": m.get("subtitle") or m.get("yes_sub_title"),
         "result": m.get("result"),
         "yes_ask_dollars": m.get("yes_ask_dollars"),
         "no_ask_dollars": m.get("no_ask_dollars"),

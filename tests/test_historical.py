@@ -341,6 +341,28 @@ class TestMarketToDict:
         d = historical._market_to_dict(_raw_market_dict())
         assert d["subtitle"] is None
 
+    def test_yes_sub_title_maps_to_subtitle_key(self):
+        # 2026-08 drift: the archive now carries the outcome label in
+        # yes_sub_title. It must land on the `subtitle` cache key so the
+        # backtester's (event_title, title, subtitle) grouping keeps its
+        # intra-title discriminator without a cache-shape change.
+        d = historical._market_to_dict(
+            _raw_market_dict(yes_sub_title="Pierbattista Pizzaballa")
+        )
+        assert d["subtitle"] == "Pierbattista Pizzaballa"
+
+    def test_explicit_subtitle_wins_over_yes_sub_title(self):
+        d = historical._market_to_dict(
+            _raw_market_dict(subtitle="Legacy Label", yes_sub_title="New Label")
+        )
+        assert d["subtitle"] == "Legacy Label"
+
+    def test_no_sub_title_is_not_used_as_subtitle(self):
+        # no_sub_title is the negated phrasing — using it would produce a
+        # grouping key that differs between the YES and NO framings.
+        d = historical._market_to_dict(_raw_market_dict(no_sub_title="Someone else"))
+        assert d["subtitle"] is None
+
     def test_carries_open_time(self):
         # open_time feeds backtester._can_ever_enter()'s eligibility prefilter
         d = historical._market_to_dict(_raw_market_dict())
