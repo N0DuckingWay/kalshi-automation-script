@@ -262,9 +262,12 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
             so backtester._group_by_exact_title and the display labels read it
             as before. Day-slice files written before this change carry
             subtitle=None and reproduce the pre-fix (weakened) same-title
-            grouping; `--no-cache` does NOT refresh them, since day slices
-            can't go stale by construction — a full refresh requires deleting
-            backtest_cache/archive_days/ and backtest_cache/live_days/.
+            grouping; `--no-cache` alone does NOT refresh them, since day
+            slices can't go stale by construction — a full refresh requires
+            deleting backtest_cache/archive_days/ and backtest_cache/live_days/
+            AND re-running with --no-cache, because a default run loads the
+            assembled backtest_cache/settled_markets_*.json first and returns
+            before the day slices are consulted at all.
             Note: price_level_structure/price_ranges are new, raw pass-through
             groundwork fields (2026-08) for a future tick-aware order cap —
             nothing in the backtester reads them yet. Cache records written
@@ -287,8 +290,10 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # `subtitle` was dropped from API payloads (2026-08 drift);
         # yes_sub_title carries the same outcome discriminator. Cache records
         # written before this fix keep subtitle=None — that reproduces the
-        # pre-fix (weakened) grouping, and day slices are only refreshed by
-        # deleting backtest_cache/{archive_days,live_days}/, not by --no-cache.
+        # pre-fix (weakened) grouping. Refreshing needs BOTH deleting
+        # backtest_cache/{archive_days,live_days}/ and a --no-cache run (which
+        # bypasses the assembled settled_markets_*.json that would otherwise
+        # short-circuit the fetch before any slice is read).
         "subtitle": m.get("subtitle") or m.get("yes_sub_title"),
         "result": m.get("result"),
         "yes_ask_dollars": m.get("yes_ask_dollars"),
@@ -1732,8 +1737,12 @@ def fetch_all_settled_markets(
         list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
             event_title, title, subtitle, result ("yes" | "no"), yes_ask_dollars,
             no_ask_dollars, yes_bid_dollars, open_time, close_time (ISO str),
-            settlement_ts (ISO str), status. Only includes markets with a
-            non-null settlement_ts and a binary result; tickers are unique.
+            settlement_ts (ISO str), status, price_level_structure,
+            price_ranges. Only includes markets with a non-null settlement_ts
+            and a binary result; tickers are unique. See _market_to_dict for
+            the per-key notes (subtitle now falls back to yes_sub_title;
+            price_level_structure/price_ranges are unread groundwork that older
+            cache records lack entirely).
     """
     if (prefilter is None) != (prefilter_tag is None):
         raise ValueError(
