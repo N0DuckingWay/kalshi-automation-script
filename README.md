@@ -55,7 +55,8 @@ secrets.json + PEM key
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
   ├─ scanner.get_held_tickers()    — fetch currently-held positions (prod only) so we skip re-entering them
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping; drops markets on non-routable exchange shards)
+  ├─ scanner.fetch_shard_statuses() — read per-exchange-shard status (None ⇒ single-shard semantics)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping; tags each market with its exchange shard, dropping only trading-inactive shards)
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection
@@ -64,7 +65,7 @@ main.py
   ├─ strategy.compute_trade()      — Kelly sizing per pair
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
-  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg (parallel across pairs, rollback on partial fill)
+  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg (parallel across pairs, rollback on partial fill; pairs with a leg off shard 0 are refused unsubmitted until the V2 order migration)
   └─ reporter.append_to_prod_log() — write results to trade_log.xlsx
 ```
 

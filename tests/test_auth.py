@@ -13,7 +13,7 @@ Purpose:
 
 Dependencies:
     Imports _balance_cents_from_payload, _dollar_str_to_cents, and verify_auth
-    from kalshi_betting.auth, and ROUTABLE_EXCHANGE_INDEX from
+    from kalshi_betting.auth, and DEFAULT_EXCHANGE_INDEX from
     kalshi_betting.config. Uses unittest.mock / SimpleNamespace to stand in for
     the SDK client and its RESTResponse — no network access.
 
@@ -35,7 +35,7 @@ from kalshi_betting.auth import (
     _dollar_str_to_cents,
     verify_auth,
 )
-from kalshi_betting.config import ROUTABLE_EXCHANGE_INDEX
+from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX
 
 # The exact live body observed on this account 2026-08-14. Top-level "balance"
 # is integer cents; the breakdown entries carry dollar strings under "balance".
@@ -137,7 +137,7 @@ class TestBalanceCentsFromPayload:
                 {"exchange_index": None, "balance": "9.99"},
                 {"exchange_index": "abc", "balance": "8.88"},
                 {"balance": "7.77"},
-                {"balance": "3.50", "exchange_index": ROUTABLE_EXCHANGE_INDEX},
+                {"balance": "3.50", "exchange_index": DEFAULT_EXCHANGE_INDEX},
             ],
             "balance_dollars": "999.00",
         }

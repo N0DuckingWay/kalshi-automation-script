@@ -18,6 +18,14 @@ Dependencies:
     (market fetching and pair detection), strategy.py (trade sizing and portfolio
     selection), and trader.py (order execution). Entry point for
     `python3 -m kalshi_betting.main`.
+
+Notes:
+    Both run modes read the exchange's per-shard status breakdown
+    (scanner.fetch_shard_statuses) before fetching markets and pass the set of
+    trading-inactive shards into the fetch. Markets on every other shard are
+    ingested and tagged with their exchange_index — market data is cross-shard.
+    The full parsed status dict is kept in a local (`shard_statuses`) because
+    upcoming shard work reads more than trading_active from it.
 """
 import argparse
 import logging
@@ -31,6 +39,7 @@ from .scanner import (
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    fetch_shard_statuses,
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
@@ -157,9 +166,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     """
     Log a formatted table of all qualifying candidate pairs to the log file.
 
-    Displays market titles, deadlines, prices, tradeability, and — for pairs
-    selected in the portfolio — the computed trade size, minimum profit, monthly
-    return, and Kelly fraction.
+    Displays market titles, each leg's exchange shard, deadlines, prices,
+    tradeability, and — for pairs selected in the portfolio — the computed
+    trade size, minimum profit, monthly return, and Kelly fraction.
 
     Args:
         candidate_pairs (list): All CandidatePair objects returned by the
@@ -191,6 +200,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # option labels (e.g. "Trump", "Above $80k") carry their event context
             _truncate(display_title(pair.market_a)),
             _truncate(display_title(pair.market_b)),
+            # Which exchange shard each leg lives on — a pair spanning shards
+            # is currently unexecutable (see trader._legacy_routable), so this
+            # explains an otherwise-puzzling "failed" result at a glance
+            f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
             f"{pair.pA:.2%}",
@@ -205,6 +218,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     headers = [
         "Type",
         "Market A", "Market B",
+        "Shards",
         "A Deadline", "B Deadline",
         "pA (YES)", "pB (YES)",
         "Tradeable?", "Recommended Trade", "Min Profit", "Monthly Return", "Kelly",
@@ -236,9 +250,20 @@ def _run_dev(client, args) -> None:
         args.sandbox_balance,
     )
 
+    # Read the exchange's per-shard status breakdown so ingest can drop shards
+    # that aren't trading. Returns None on the sandbox / pre-sharding shape,
+    # which degrades to single-shard semantics (keep everything).
+    shard_statuses = fetch_shard_statuses(client)
+    inactive_shards = (
+        {i for i, s in shard_statuses.items() if not s["trading_active"]}
+        if shard_statuses else set()
+    )
+
     # Fetch all open sandbox markets — the sandbox public endpoint does not require
-    # valid authentication for read operations, so this works with the prod key too
-    markets = fetch_open_events_with_markets(client)
+    # valid authentication for read operations, so this works with the prod key too.
+    # Markets from every shard are ingested and tagged; only trading-inactive
+    # shards are dropped.
+    markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
     logging.info("Sandbox markets fetched: %d", len(markets))
 
     # Optional opt-in cap so both bet types only see markets closing within
@@ -322,8 +347,19 @@ def _run_prod(client, args) -> None:
 
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
-    # Fetch all open markets and pre-filter held tickers for downstream efficiency
-    markets           = fetch_open_events_with_markets(client)
+
+    # Read the exchange's per-shard status breakdown so ingest can drop shards
+    # that aren't trading. Returns None on the pre-sharding shape, which
+    # degrades to single-shard semantics (keep everything).
+    shard_statuses    = fetch_shard_statuses(client)
+    inactive_shards   = (
+        {i for i, s in shard_statuses.items() if not s["trading_active"]}
+        if shard_statuses else set()
+    )
+
+    # Fetch all open markets (every shard, tagged — only trading-inactive
+    # shards are dropped) and pre-filter held tickers for downstream efficiency
+    markets           = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within

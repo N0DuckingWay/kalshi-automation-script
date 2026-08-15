@@ -249,7 +249,7 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         dict: A flat dictionary with keys: ticker, event_ticker, event_title,
             title, subtitle, result, yes_ask_dollars, no_ask_dollars,
             yes_bid_dollars, open_time, close_time, settlement_ts, status,
-            price_level_structure, price_ranges.
+            price_level_structure, price_ranges, exchange_index.
             Note: open_time is a new field (added alongside the backtester's
             eligibility prefilter) — cache files written before this change
             don't have it and will read back as None until refreshed with
@@ -280,6 +280,12 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
             deliberately considered against the OOM history documented in
             CLAUDE.md, which was caused by caching whole raw payloads, not by
             small additions to this already-compact record.
+            Note: exchange_index is likewise a raw pass-through (2026-08
+            sharding) kept for parity with live ingest, which tags every
+            ApiMarket with its shard (scanner._shard_index). Nothing in the
+            backtester reads it yet, and cache records written before this
+            change lack the key and read back as None — every reader must
+            tolerate that.
     """
     return {
         "ticker": m.get("ticker"),
@@ -309,6 +315,9 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # fidelity; no reader yet. Pre-existing cache records read back None.
         "price_level_structure": m.get("price_level_structure"),
         "price_ranges": m.get("price_ranges"),
+        # Exchange shard the market lived on. Raw pass-through for parity with
+        # live ingest (scanner._shard_index); no backtester reader yet.
+        "exchange_index": m.get("exchange_index"),
     }
 
 

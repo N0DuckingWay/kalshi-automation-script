@@ -393,6 +393,18 @@ class TestMarketToDict:
         assert d["price_level_structure"] is None
         assert d["price_ranges"] is None
 
+    def test_exchange_index_passes_through_raw(self):
+        # 2026-08 sharding: stored raw for parity with live ingest, which tags
+        # every ApiMarket with its shard. No backtester reader yet.
+        d = historical._market_to_dict(_raw_market_dict(exchange_index=1))
+        assert d["exchange_index"] == 1
+
+    def test_missing_exchange_index_maps_to_none(self):
+        # Cache records written before this change lack the key entirely —
+        # every future reader must tolerate None (NOT assume shard 0).
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["exchange_index"] is None
+
     def test_stored_record_is_json_serializable(self):
         # The produced dict is gzip+json-dumped straight into the cache — a
         # non-JSON-native value here (e.g. an accidentally-parsed PriceRange

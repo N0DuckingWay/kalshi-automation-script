@@ -28,9 +28,9 @@ Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
     CreateOrderRequest from the kalshi_python_sync SDK and fetch_json_page from
     _http.py. Imports validate_pair_price from scanner.py and
-    BUY_MAX_COST_SLIPPAGE_CENTS from config.py. Called by main.py after
-    select_portfolio() selects the final trade list. Depends on the
-    KalshiClient produced by auth.py.
+    BUY_MAX_COST_SLIPPAGE_CENTS / DEFAULT_EXCHANGE_INDEX from config.py. Called
+    by main.py after select_portfolio() selects the final trade list. Depends
+    on the KalshiClient produced by auth.py.
 
 Notes:
     Do NOT add retry logic to order submission. A failed leg indicates the market
@@ -43,6 +43,14 @@ Notes:
     raise ValidationError AFTER submission, misclassifying real fills. The
     request side still uses the modeled CreateOrderRequest and serializes
     through the same SDK code path, so the wire format is unchanged.
+
+    _legacy_routable() is a TEMPORARY shard guard. The scanner ingests markets
+    from every exchange shard (market data is cross-shard) and tags each with
+    its exchange_index, but the legacy /portfolio/orders endpoint this module
+    submits through has no shard-routing parameter — so a pair with a leg off
+    DEFAULT_EXCHANGE_INDEX is refused at the top of _execute_one rather than
+    misrouted. It goes away when order submission migrates to the V2 endpoint
+    (/portfolio/events/orders), which routes per shard.
 """
 import logging
 import math
@@ -52,7 +60,7 @@ from typing import Any
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import fetch_json_page
-from .config import BUY_MAX_COST_SLIPPAGE_CENTS
+from .config import BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX
 from .reporter import TradeResult
 from .scanner import validate_pair_price
 from .strategy import TradeSpec
@@ -75,6 +83,32 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
         int: Maximum total cost in cents for the order.
     """
     return math.ceil(count * price_dollars * 100) + count * BUY_MAX_COST_SLIPPAGE_CENTS
+
+
+def _legacy_routable(spec: TradeSpec) -> bool:
+    """
+    Return True only when BOTH of a pair's legs are on DEFAULT_EXCHANGE_INDEX.
+
+    TEMPORARY until the V2 order migration: the legacy /portfolio/orders
+    endpoint has no shard routing, so an order for a non-shard-0 market would
+    fail or misroute. Remove when order submission moves to the V2 endpoint
+    (/portfolio/events/orders), which routes per shard.
+
+    The scanner deliberately ingests and tags markets from every shard — the
+    market-data endpoints are cross-shard — so this is the single point where
+    a shard we cannot reach is turned away, after sizing and immediately
+    before anything is submitted.
+
+    Args:
+        spec (TradeSpec): The trade specification about to be executed.
+
+    Returns:
+        bool: True if both legs can be reached by the legacy order endpoint.
+    """
+    return (
+        spec.pair.market_a.exchange_index == DEFAULT_EXCHANGE_INDEX
+        and spec.pair.market_b.exchange_index == DEFAULT_EXCHANGE_INDEX
+    )
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
@@ -343,6 +377,10 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     that we simply couldn't confirm — and is instead surfaced as
     status="manual_review" for a human to check the account.
 
+    A pair with a leg on a shard the legacy order endpoint cannot route to is
+    refused before anything is submitted (see _legacy_routable) — status
+    "failed", since nothing was sent and there is nothing to unwind.
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade specification to execute.
@@ -353,6 +391,26 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             manual review), or "manual_review" (leg B's fill state could not
             be determined and no automated action was taken).
     """
+    # TEMPORARY shard guard — must run before ANY submission. The scanner now
+    # ingests markets from every shard, but the legacy order endpoint can only
+    # reach DEFAULT_EXCHANGE_INDEX; dies with the V2 order migration.
+    if not _legacy_routable(spec):
+        shards = (
+            f"{spec.pair.market_a.exchange_index}/{spec.pair.market_b.exchange_index}"
+        )
+        logging.warning(
+            "Skipping '%s' — legs on exchange shards %s; the legacy order "
+            "endpoint cannot route off shard %d (V2 migration pending)",
+            spec.pair.canonical_title, shards, DEFAULT_EXCHANGE_INDEX,
+        )
+        return TradeResult(
+            spec=spec, status="failed",
+            error=(
+                f"leg on exchange shard {shards} — legacy order endpoint "
+                f"cannot route; V2 migration pending"
+            ),
+        )
+
     order_a  = _build_no_order(spec)
     order_b  = _build_yes_order(spec)
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker

@@ -6,17 +6,36 @@ import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from kalshi_betting.config import BUY_MAX_COST_SLIPPAGE_CENTS
-from kalshi_betting.trader import _build_no_order, _build_yes_order, _execute_one
+from kalshi_betting.config import BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX
+from kalshi_betting.trader import (
+    _build_no_order,
+    _build_yes_order,
+    _execute_one,
+    _legacy_routable,
+)
 
 
-def make_spec(x: int = 5, nA: float = 0.40, pB: float = 0.35) -> MagicMock:
-    """Factory for a TradeSpec-like mock with the fields trader.py reads."""
+def make_spec(
+    x: int = 5,
+    nA: float = 0.40,
+    pB: float = 0.35,
+    shards: tuple[int, int] = (0, 0),
+) -> MagicMock:
+    """Factory for a TradeSpec-like mock with the fields trader.py reads.
+
+    `shards` pins REAL ints on both legs' exchange_index. This must never be
+    left to MagicMock's auto-attributes: an auto-attr is a truthy Mock object
+    that compares unequal to DEFAULT_EXCHANGE_INDEX, which would make every
+    spec look non-routable (or, with a different comparison, silently defeat
+    the shard check entirely).
+    """
     pair = MagicMock()
     pair.market_a.ticker = "TICK-A"
     pair.market_a.title = "Market A"
+    pair.market_a.exchange_index = shards[0]
     pair.market_b.ticker = "TICK-B"
     pair.market_b.title = "Market B"
+    pair.market_b.exchange_index = shards[1]
     pair.nA = nA
     pair.pB = pB
     pair.canonical_title = "test pair"
@@ -171,4 +190,59 @@ class TestExceptionDisambiguation:
         result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         # No rollback order was submitted — only leg A and leg B's attempt
+        assert client.create_order_without_preload_content.call_count == 2
+
+
+class TestLegacyShardRouting:
+    """TEMPORARY guard, dies with the V2 order migration: the legacy
+    /portfolio/orders endpoint has no shard routing, so a pair with a leg off
+    DEFAULT_EXCHANGE_INDEX must be refused BEFORE anything is submitted.
+    The scanner deliberately ingests such markets (market data is cross-shard),
+    so this is the only thing standing between them and a misrouted order."""
+
+    def test_both_legs_shard_zero_is_routable(self):
+        assert _legacy_routable(make_spec(shards=(0, 0))) is True
+
+    def test_leg_a_off_shard_zero_is_not_routable(self):
+        assert _legacy_routable(make_spec(shards=(1, 0))) is False
+
+    def test_leg_b_off_shard_zero_is_not_routable(self):
+        assert _legacy_routable(make_spec(shards=(0, 1))) is False
+
+    def test_both_legs_off_shard_zero_is_not_routable(self):
+        assert _legacy_routable(make_spec(shards=(2, 2))) is False
+
+    def test_routable_check_is_gated_on_config_constant(self):
+        # Not a hardcoded 0 that would silently diverge from config.py.
+        assert _legacy_routable(
+            make_spec(shards=(DEFAULT_EXCHANGE_INDEX, DEFAULT_EXCHANGE_INDEX))
+        ) is True
+
+    def test_non_routable_spec_submits_nothing_and_fails(self):
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shards=(0, 1)))
+        assert result.status == "failed", (
+            'nothing was submitted, so there is nothing to unwind — "failed" '
+            "is the correct status vocabulary, not manual_review"
+        )
+        assert "exchange shard" in result.error
+        assert "V2 migration pending" in result.error
+        # The guard must run BEFORE any order goes out
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_non_routable_leg_a_also_submits_nothing(self):
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shards=(3, 0)))
+        assert result.status == "failed"
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_shard_zero_pair_proceeds_to_submission(self):
+        # Sanity: the guard must not block the ordinary single-shard case.
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            order_resp("executed"),   # leg B
+        ])
+        result = _execute_one(client, make_spec(shards=(0, 0)))
+        assert result.status == "executed"
         assert client.create_order_without_preload_content.call_count == 2
