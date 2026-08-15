@@ -53,6 +53,16 @@ class TradeSpec:
             SAME_TITLE_CO_RESOLVE_PROB prior. Range: (0, 1).
         kelly_fraction (float): Kelly fraction capped at BUDGET_FRACTION (20%). This is the
             fraction of account balance allocated to this trade.
+        cost_with_fees_a (float): Leg A's own cash requirement: x * nA + that leg's
+            exact ceiling-rounded taker fee (fee_leg_exact(x, nA)). Used by the collateral
+            transfer planner to fund leg A's exchange shard. Invariant:
+            cost_with_fees_a + cost_with_fees_b == total_cost_with_fees (same terms, same
+            fee calls). Defaults to 0.0 for TradeSpec constructions that don't populate it.
+        cost_with_fees_b (float): Leg B's own cash requirement: y * pB + that leg's
+            exact ceiling-rounded taker fee (fee_leg_exact(y, pB)). Used by the collateral
+            transfer planner to fund leg B's exchange shard. Invariant:
+            cost_with_fees_a + cost_with_fees_b == total_cost_with_fees (same terms, same
+            fee calls). Defaults to 0.0 for TradeSpec constructions that don't populate it.
     """
     pair: CandidatePair
     x: int
@@ -65,6 +75,11 @@ class TradeSpec:
     monthly_profit_ratio: float
     kelly_p: float            # probability of profit used in Kelly formula
     kelly_fraction: float     # capped Kelly fraction used for sizing
+    # Per-leg cash requirements, used by the collateral transfer planner to fund each
+    # leg's shard; invariant: cost_with_fees_a + cost_with_fees_b == total_cost_with_fees
+    # (same terms, same fee calls). Defaulted so existing constructions don't break.
+    cost_with_fees_a: float = 0.0
+    cost_with_fees_b: float = 0.0
 
 
 def _kelly_p(pair: CandidatePair) -> float:
@@ -113,7 +128,9 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     Returns:
         Optional[TradeSpec]: A fully specified trade including contract count n,
             total cost, minimum guaranteed payoff, time-normalized monthly return,
-            and Kelly metadata. Returns None if:
+            Kelly metadata, and each leg's own fee-inclusive cash requirement
+            (cost_with_fees_a, cost_with_fees_b — used by the collateral transfer
+            planner to fund each leg's exchange shard). Returns None if:
             - The pair is not tradeable.
             - The prices are out of the valid (0, 1) range.
             - The net spread is zero or negative after fees.
@@ -196,6 +213,12 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     # Fees are cash out the door at execution — the portfolio budget must cover them
     total_cost_with_fees = total_cost + fee_no + fee_yes
 
+    # Per-leg cash requirements — same terms and fee calls as total_cost_with_fees,
+    # just not summed together. The collateral transfer planner (next commit) uses
+    # these to fund each leg's own exchange shard rather than the pair total.
+    cost_with_fees_a = n * nA + fee_no
+    cost_with_fees_b = n * pB + fee_yes
+
     # Compute the number of calendar days until the later-closing market resolves.
     # This is used to normalize the profit ratio to a monthly (30-day) figure for ranking.
     now = datetime.now(UTC)
@@ -235,6 +258,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         monthly_profit_ratio=monthly_profit_ratio,
         kelly_p=p,
         kelly_fraction=kelly_fraction_capped,
+        cost_with_fees_a=cost_with_fees_a,
+        cost_with_fees_b=cost_with_fees_b,
     )
 
 
