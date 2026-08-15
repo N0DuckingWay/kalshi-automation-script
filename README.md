@@ -65,6 +65,7 @@ main.py
   ├─ strategy.compute_trade()      — Kelly sizing per pair
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
+  ├─ trader.ensure_shard_collateral() — (prod only) transfer cash onto each leg's exchange shard and wait for it to land; trades whose shard can't be funded are dropped
   ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg (parallel across pairs, rollback on partial fill; pairs with a leg off shard 0 are refused unsubmitted until the V2 order migration)
   └─ reporter.append_to_prod_log() — write results to trade_log.xlsx
 ```
@@ -97,7 +98,7 @@ backtest.py (CLI)
 | `_http.py` | Shared HTTP helpers used across the package: `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`). |
 | `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. |
 | `strategy.py` | Applies the Kelly criterion to size each trade, computes minimum guaranteed profit and monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
-| `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg) via the Kalshi API, with automatic rollback of a filled leg A if leg B doesn't fill. Multiple pairs execute concurrently. |
+| `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg) via the Kalshi API, with automatic rollback of a filled leg A if leg B doesn't fill. Multiple pairs execute concurrently. Also funds the trade: `ensure_shard_collateral()` moves collateral between exchange shards (amounts in centicents, transfers are asynchronous and never retried) so each leg's own shard holds the cash its order settles against. |
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |

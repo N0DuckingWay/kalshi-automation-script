@@ -25,7 +25,9 @@ Notes:
     trading-inactive shards into the fetch. Markets on every other shard are
     ingested and tagged with their exchange_index — market data is cross-shard.
     The full parsed status dict is kept in a local (`shard_statuses`) because
-    upcoming shard work reads more than trading_active from it. Immediately
+    prod reads more than trading_active from it: it is handed to
+    trader.ensure_shard_collateral(), which refuses to move collateral to or
+    from a shard whose intra_exchange_transfers_active is false. Immediately
     after the fetch, `_log_shard_coverage` (wrapping
     scanner.check_shard_coverage) compares that advertised breakdown against
     the shards actually observed in ingested markets (and, in prod, the
@@ -54,7 +56,7 @@ from .scanner import (
     get_held_tickers,
 )
 from .strategy import compute_trade, select_portfolio
-from .trader import execute_trades, pre_execution_check
+from .trader import ensure_shard_collateral, execute_trades, pre_execution_check
 
 
 def _truncate(text: str, n: int = 40) -> str:
@@ -458,6 +460,19 @@ def _run_prod(client, args) -> None:
     portfolio = pre_execution_check(client, portfolio)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
+        return
+
+    # Move collateral to the shards the selected trades draw from — sizing is
+    # portfolio-wide, but each order settles against its own shard's balance.
+    # Trades whose shard could not be funded (transfer blocked, failed, or not
+    # settled in time) are dropped here rather than submitted underfunded.
+    portfolio = ensure_shard_collateral(
+        client, portfolio, shard_balances, shard_statuses, dry_run=args.dry_run,
+    )
+    if not portfolio:
+        logging.info(
+            "No selected pair could be funded on its exchange shard — no trades submitted."
+        )
         return
 
     # Submit orders sequentially per leg, concurrently across pairs
