@@ -112,8 +112,9 @@ class PriceRange:
     Kalshi markets can have a non-uniform tick grid across their price range
     (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
     structure). Each band names its own step size; a market's full grid is
-    the ordered list of bands covering [0, 1]. Nothing consumes these bands
-    yet — see _parse_price_ranges.
+    the ordered list of bands covering [0, 1]. Consumed by
+    trader._quantize_to_tick(), which snaps a V2 limit price onto the grid —
+    see _parse_price_ranges.
 
     Attributes:
         start (float): Lower bound of this band, in dollars (e.g. 0.0).
@@ -130,9 +131,10 @@ def _parse_price_ranges(raw: Any) -> list | None:
     Parse a raw price_ranges array into PriceRange bands, or None if unknown.
 
     Fail-soft per the return-None convention: a missing, empty, or malformed
-    array means "tick structure unknown", never an error — nothing consumes
-    these bands yet (groundwork for tick-aware order caps after the V2 order
-    migration; combo markets move to $0.0001 ticks on 2026-08-17).
+    array means "tick structure unknown", never an error — trader._tick_bands()
+    degrades an unusable grid to whole cents rather than raising (combo markets
+    move to $0.0001 ticks on 2026-08-17). The bands are read only on the V2
+    order path, which is gated on config.V2_ORDERS_ENABLED.
 
     Args:
         raw (Any): The raw `price_ranges` value from a market JSON dict —
@@ -433,11 +435,14 @@ class ApiMarket:
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
         price_level_structure (str): Tick regime name, e.g. "linear_cent",
-            "tapered_deci_cent", "deci_cent". "" if absent — nothing reads
-            this field yet (groundwork for a future tick-aware order cap).
+            "tapered_deci_cent", "deci_cent". "" if absent. Informational
+            only — the band boundaries the order path actually needs live in
+            price_ranges, so nothing reads this string.
         price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
             _parse_price_ranges), or None when unknown/unparseable/absent.
-            Nothing reads this field yet either.
+            Read by trader._tick_bands() to quantize V2 limit prices onto the
+            market's own grid (V2 order path only — see
+            config.V2_ORDERS_ENABLED).
         exchange_index (int): The exchange shard this market lives on (see
             _shard_index). Market data is cross-shard, so every shard's
             markets are ingested and simply tagged with this; it is

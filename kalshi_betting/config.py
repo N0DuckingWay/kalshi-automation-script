@@ -111,15 +111,54 @@ TAKER_FEE_RATE                = 0.07
 # protects against the order book moving between the pre-execution check and
 # submission: the order fills at or below (scanned price + allowance) or not at all.
 # This stays a whole-cent value because `buy_max_cost` is an integer-cents field
-# on the legacy /portfolio/orders create-order endpoint the bot still submits
-# through — a sub-cent-aware cap can't be expressed there no matter how finely
-# a market's own tick grid is subdivided (see ApiMarket.price_level_structure /
-# price_ranges in scanner.py, ingested but not yet read). On the $0.0001 tick
-# grid all MVE/combo markets move to on 2026-08-17, this 1c tolerance permits
-# ~100 ticks of price drift rather than the intended ~1. Fixing this requires
-# migrating order submission to the V2 endpoint (dollar-string prices), which
-# is a deliberately deferred follow-up — see CLAUDE.md.
+# on the legacy /portfolio/orders create-order endpoint — a sub-cent-aware cap
+# can't be expressed there no matter how finely a market's own tick grid is
+# subdivided. On the $0.0001 tick grid all MVE/combo markets move to on
+# 2026-08-17, this 1c tolerance permits ~100 ticks of price drift rather than
+# the intended ~1.
+#
+# STILL LIVE, DO NOT REMOVE: the legacy path is what runs while
+# V2_ORDERS_ENABLED is False. Its dollar-denominated V2 replacement is
+# BUY_PRICE_SLIPPAGE_DOLLARS below, which IS tick-aware (it is quantized onto
+# the market's real grid from ApiMarket.price_level_structure / price_ranges).
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
+
+# ── V2 order endpoint (/portfolio/events/orders) ──────────────────────────────
+
+# Full API path of the V2 create-order endpoint, signed VERBATIM by
+# _http.signed_raw_request (hence the /trade-api/v2 prefix, not a suffix
+# appended to PROD_URL). V2 replaces the legacy /portfolio/orders route
+# (deprecated June 2026, 5x rate-limit token cost, integer-cent buy_max_cost,
+# and — decisively — no shard routing) with dollar-string limit prices,
+# fixed-point counts, bid/ask sides, and an explicit per-order exchange_index.
+V2_CREATE_ORDER_PATH = "/trade-api/v2/portfolio/events/orders"
+
+# Per-contract price slippage allowance, in DOLLARS, for the V2 FoK limit cap.
+# Replaces-in-spirit BUY_MAX_COST_SLIPPAGE_CENTS on the V2 path (the legacy
+# constant above stays in use until V2_ORDERS_ENABLED is flipped). 0.01
+# preserves exactly the legacy one-cent tolerance on linear_cent markets, but
+# unlike the legacy cap it is a TRUE per-contract price cap: trader
+# _quantize_to_tick() snaps (scanned price + this) onto the market's own tick
+# grid, so on a sub-cent grid the cap lands on a real tick instead of granting
+# ~100 ticks of drift.
+BUY_PRICE_SLIPPAGE_DOLLARS = 0.01
+
+# Required `self_trade_prevention_type` on every V2 order body. "taker_at_cross"
+# cancels OUR resting maker order if an incoming order of ours would cross it,
+# which is the right choice for a taker-only bot: our FoK order is always the
+# taker, so this can never cancel the order we are submitting.
+V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
+
+# Master switch for the V2 order path in trader._submit_leg(). While False (the
+# default) every leg is submitted through the legacy /portfolio/orders path
+# exactly as before, and the V2 code is dead weight on disk.
+#
+# Flipped only after the live NO-leg mapping probe passes (see v2_probe): the
+# mapping of "buy NO" onto V2's bid/ask vocabulary (hypothesis: buy NO at p ==
+# ask on the YES book at 1-p; unwind == bid + reduce_only) is UNVERIFIED
+# against the real API, and it is the one thing in the V2 path that cannot be
+# proven offline. Do not flip this from a code change alone.
+V2_ORDERS_ENABLED = False
 
 # The default exchange shard. Kalshi partitions the exchange into parallel
 # instances keyed by `exchange_index` (on market payloads and in the balance
