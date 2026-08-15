@@ -16,6 +16,7 @@ from kalshi_betting.scanner import (
     _market_from_dict,
     _parse_price_ranges,
     _shard_index,
+    check_shard_coverage,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -1252,3 +1253,90 @@ class TestExchangeIndexIngest:
             _raw_market("SHARD-BAD", "Rain tomorrow", exchange_index="not-a-number"), ""
         )
         assert m.exchange_index == DEFAULT_EXCHANGE_INDEX
+
+
+class TestCheckShardCoverage:
+    """Pure comparison of what /exchange/status advertises against what a run
+    actually observed. Severity is deliberately empty-vs-funded: an active
+    advertised shard with zero markets is only CRITICAL when money is parked
+    there (a real blind spot); otherwise it's a WARNING, since an advertised
+    shard being legitimately empty is expected during the shard rollout and
+    must not cry wolf at critical severity every week."""
+
+    @staticmethod
+    def _status(trading_active=True, description="Main"):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": description,
+        }
+
+    def test_full_coverage_is_silent(self):
+        advertised = {0: self._status(description="Main"), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0, 1}, {0})
+        assert critical == []
+        assert warnings == []
+
+    def test_active_shard_zero_markets_zero_funds_is_warning_only(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 1" in warnings[0]
+        assert "Combos" in warnings[0]
+        assert "may be legitimately empty" in warnings[0]
+
+    def test_active_shard_zero_markets_with_funds_is_critical(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, {1})
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 1" in critical[0]
+        assert "Combos" in critical[0]
+        assert "holds account funds" in critical[0]
+
+    def test_inactive_advertised_shard_with_zero_markets_is_not_a_problem(self):
+        advertised = {0: self._status(), 1: self._status(trading_active=False, description="Crypto")}
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert warnings == []
+
+    def test_market_shard_not_advertised_is_critical(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0, 7}, set())
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 7" in critical[0]
+        assert "does not advertise" in critical[0]
+
+    def test_balance_shard_not_advertised_is_warning(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0}, {0, 9})
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]
+
+    def test_advertised_none_is_unknowable_even_with_weird_observed_sets(self):
+        critical, warnings = check_shard_coverage(None, {0, 1, 2, 99}, {0, 5})
+        assert critical == []
+        assert warnings == []
+
+    def test_multiple_simultaneous_problems_all_reported_correctly(self):
+        advertised = {
+            0: self._status(description="Main"),
+            1: self._status(description="Combos"),  # active, zero markets, funds -> critical
+            2: self._status(trading_active=False, description="Crypto"),  # never a problem
+        }
+        market_shards = {0, 7}  # 7 unadvertised -> critical
+        balance_shards = {1, 9}  # 1 funds shard 1 -> critical; 9 unadvertised -> warning
+        critical, warnings = check_shard_coverage(advertised, market_shards, balance_shards)
+
+        assert len(critical) == 2
+        assert any("shard 1" in p and "holds account funds" in p for p in critical)
+        assert any("shard 7" in p and "does not advertise" in p for p in critical)
+
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]

@@ -605,6 +605,102 @@ def fetch_shard_statuses(client: Any) -> dict | None:
         return None
 
 
+def check_shard_coverage(
+    advertised: dict | None, market_shards: set, balance_shards: set
+) -> tuple:
+    """
+    Compare the shards /exchange/status advertises against what a run actually
+    saw, and classify any mismatch as a real blind spot or an expected gap.
+
+    This is a pure function — no I/O, no logging — so the caller decides how
+    loudly to report each problem string; see main._run_prod/_run_dev for the
+    logging split (critical vs warning) this function's two return lists map
+    onto directly.
+
+    Severity rationale:
+        A shard the exchange advertises as `trading_active=True` but that
+        produced zero ingested markets is a genuine coverage gap ONLY when it
+        also holds account funds — money sitting on a shard whose order book
+        we never scanned is a real blind spot, because a same-title or
+        time-series pair on that shard could exist and go undetected. When no
+        funds are parked there, an empty active shard is business-as-usual
+        during the shard rollout (shard 1 is near-empty today; shards 2/3 are
+        advertised-but-empty until the 2026-08-24 migrations) — it would be
+        wrong to CRITICAL-alert every single week on an expected transient
+        state, so that case is a warning instead. The same empty-vs-funded
+        split applies to a market or balance shard the exchange doesn't even
+        advertise: markets ingested from an unadvertised shard mean the
+        payloads and /exchange/status disagree with each other, which is
+        always treated as critical (it signals the two data sources are out
+        of sync, independent of money); account funds sitting on an
+        unadvertised shard are logged as a warning, since funds alone (with
+        no market activity to miss) are an accounting curiosity, not a missed
+        arbitrage opportunity. A `trading_active=False` advertised shard is
+        never flagged at all — fetch_open_events_with_markets() drops its
+        markets deliberately, and that drop already logs its own warning.
+
+    Args:
+        advertised (dict | None): The per-shard status breakdown from
+            fetch_shard_statuses(), or None when the breakdown was
+            unavailable (sandbox / pre-sharding shape). None makes coverage
+            unknowable — this function returns ([], []) unconditionally in
+            that case, regardless of what market_shards/balance_shards show,
+            because an observed shard with no status data to compare against
+            is not actionable.
+        market_shards (set): The set of exchange_index values actually seen
+            among ingested ApiMarket objects for this run.
+        balance_shards (set): The set of exchange_index values holding a
+            NONZERO balance. Contract: the caller is responsible for this
+            filtering — pass `{s for s, c in shard_balances.items() if c > 0}`
+            so a shard with a zero-cent breakdown entry (still "present" in
+            the raw balance dict) does not count as fund presence here. This
+            function only checks set membership; it has no concept of an
+            amount.
+
+    Returns:
+        tuple[list, list]: (critical, warnings) — human-readable problem
+            strings. ([], []) means full coverage (or status unavailable).
+    """
+    if advertised is None:
+        return [], []
+
+    critical: list = []
+    warnings: list = []
+
+    for idx, status in advertised.items():
+        if not status.get("trading_active"):
+            # Deliberately dropped at ingest; fetch_open_events_with_markets
+            # already warns about this — not this function's job to repeat it.
+            continue
+        if idx in market_shards:
+            continue
+        description = status.get("description") or ""
+        if idx in balance_shards:
+            critical.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets but holds account funds"
+            )
+        else:
+            warnings.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets (may be legitimately empty)"
+            )
+
+    for idx in market_shards - set(advertised):
+        critical.append(
+            f"markets ingested from shard {idx} which /exchange/status does "
+            "not advertise — payloads and status disagree"
+        )
+
+    for idx in balance_shards - set(advertised):
+        warnings.append(
+            f"account funds on shard {idx} which /exchange/status does not "
+            "advertise"
+        )
+
+    return critical, warnings
+
+
 def fetch_open_events_with_markets(
     client: Any, inactive_shards: set | None = None
 ) -> list:

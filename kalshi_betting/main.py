@@ -25,7 +25,14 @@ Notes:
     trading-inactive shards into the fetch. Markets on every other shard are
     ingested and tagged with their exchange_index — market data is cross-shard.
     The full parsed status dict is kept in a local (`shard_statuses`) because
-    upcoming shard work reads more than trading_active from it.
+    upcoming shard work reads more than trading_active from it. Immediately
+    after the fetch, `_log_shard_coverage` (wrapping
+    scanner.check_shard_coverage) compares that advertised breakdown against
+    the shards actually observed in ingested markets (and, in prod, the
+    balance breakdown) and logs any gap at CRITICAL or WARNING — see the
+    function docstring for the empty-vs-funded severity split. A run only
+    claims "Full shard coverage" when the breakdown exists and nothing was
+    wrong; the run always continues regardless of what the check finds.
 """
 import argparse
 import logging
@@ -36,6 +43,7 @@ from .auth import build_client, verify_auth
 from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
+    check_shard_coverage,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -228,6 +236,37 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
         logging.info(line)
 
 
+def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set) -> None:
+    """
+    Run scanner.check_shard_coverage() and emit its findings at the right
+    severity, shared by both _run_dev and _run_prod so the logging split
+    (critical vs warning vs "full coverage" vs "unassessable") lives in one
+    place.
+
+    A run must only ever CLAIM full coverage when every shard the exchange
+    advertises was actually scanned; a missing shard is reported loudly but
+    never aborts the run — trading continues on whatever was covered.
+
+    Args:
+        shard_statuses (dict | None): Return value of scanner.fetch_shard_statuses().
+        market_shards (set): exchange_index values seen among ingested markets.
+        balance_shards (set): exchange_index values holding a nonzero balance.
+    """
+    if shard_statuses is None:
+        logging.info("Per-shard exchange status unavailable — coverage not assessable.")
+        return
+    # Pure comparison of advertised vs. observed shards; this function only
+    # decides how loudly to log what check_shard_coverage found.
+    critical, warnings = check_shard_coverage(shard_statuses, market_shards, balance_shards)
+    for p in critical:
+        # Same severity channel as orphaned positions — this must never be missable.
+        logging.critical("SHARD COVERAGE FAILURE: %s", p)
+    for p in warnings:
+        logging.warning("Shard coverage: %s", p)
+    if not critical and not warnings:
+        logging.info("Full shard coverage: shards %s scanned", sorted(shard_statuses))
+
+
 def _run_dev(client, args) -> None:
     """
     Execute a full dev/sandbox mode scan and simulation.
@@ -265,6 +304,11 @@ def _run_dev(client, args) -> None:
     # shards are dropped.
     markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
     logging.info("Sandbox markets fetched: %d", len(markets))
+
+    # Dev mode has one virtual balance, not a real per-shard breakdown, so
+    # there is no balance-shard set to compare against — pass empty and let
+    # the market-coverage half of the check still catch a missing shard.
+    _log_shard_coverage(shard_statuses, {m.exchange_index for m in markets}, set())
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
@@ -365,6 +409,17 @@ def _run_prod(client, args) -> None:
     # Fetch all open markets (every shard, tagged — only trading-inactive
     # shards are dropped) and pre-filter held tickers for downstream efficiency
     markets           = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
+
+    # Verify the exchange's advertised shards were actually covered by this
+    # fetch before any held-ticker/horizon filtering trims the market list —
+    # a blind spot must be measured against what ingest actually saw, not a
+    # subsequently-filtered view of it.
+    _log_shard_coverage(
+        shard_statuses,
+        {m.exchange_index for m in markets},
+        {s for s, c in shard_balances.items() if c > 0},
+    )
+
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
