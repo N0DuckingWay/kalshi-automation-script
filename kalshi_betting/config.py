@@ -130,7 +130,7 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 #      (see scanner._shard_index).
 #   2. The shard the legacy / sandbox balance shapes map to — a body with no
 #      per-shard balance_breakdown is a single-shard body
-#      (see auth._balance_cents_from_payload).
+#      (see auth._balance_cents_by_shard).
 #   3. Until the V2 order migration lands, the ONLY shard the legacy
 #      /portfolio/orders endpoint can reach: it has no shard-routing
 #      parameter, so an order for a market on another shard would fail or
