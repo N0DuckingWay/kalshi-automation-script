@@ -14,7 +14,7 @@ Kalshi markets are binary contracts that pay $1 if a question resolves YES and $
 - Both resolve YES: YES on B pays out, covering the NO on A cost
 - Both resolve NO: NO on A pays out, covering the YES on B cost
 
-**Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by more than 5%, the bot buys NO on the expensive one and YES on the cheap one. Since both contracts should co-resolve, the trade is essentially risk-free.
+**Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by more than 5%, the bot buys NO on the expensive one and YES on the cheap one. Since both contracts should co-resolve, the trade is essentially risk-free. The subtitle here is the outcome label that distinguishes markets sharing one question title (e.g. two candidate names under "Who will the next Pope be?"); the API stopped sending a `subtitle` field in 2026-08, so ingest now sources it from `yes_sub_title` — without that discriminator, two *different* outcomes would be paired as if they were the same contract.
 
 The required price gap for time-series pairs is tiered by how far apart the two deadlines are: 15% for deadlines ≤ 15 days apart, 30% for 16–30 days — wider gaps need a bigger edge because the correlation between the two dates is weaker. Deadlines more than 30 days apart are never considered. See `min_price_diff_for_gap()` in `config.py` for the exact thresholds.
 
@@ -55,7 +55,7 @@ secrets.json + PEM key
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
   ├─ scanner.get_held_tickers()    — fetch currently-held positions (prod only) so we skip re-entering them
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping; drops markets on non-routable exchange shards)
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection

@@ -47,6 +47,7 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
+    ROUTABLE_EXCHANGE_INDEX,
     SAME_TITLE_MIN_PRICE_DIFF,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -92,6 +93,60 @@ _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
 # Minimum ask price to consider a market actively priced (not settled/illiquid)
 _MIN_ACTIVE_PRICE = 0.01
 _MAX_ACTIVE_PRICE = 0.99
+
+
+@dataclass(frozen=True)
+class PriceRange:
+    """
+    One tick-size band from a market's price_ranges array, in dollars.
+
+    Kalshi markets can have a non-uniform tick grid across their price range
+    (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
+    structure). Each band names its own step size; a market's full grid is
+    the ordered list of bands covering [0, 1]. Nothing consumes these bands
+    yet — see _parse_price_ranges.
+
+    Attributes:
+        start (float): Lower bound of this band, in dollars (e.g. 0.0).
+        end (float): Upper bound of this band, in dollars (e.g. 1.0).
+        step (float): Tick size within this band, in dollars (e.g. 0.001).
+    """
+    start: float
+    end: float
+    step: float
+
+
+def _parse_price_ranges(raw: Any) -> list | None:
+    """
+    Parse a raw price_ranges array into PriceRange bands, or None if unknown.
+
+    Fail-soft per the return-None convention: a missing, empty, or malformed
+    array means "tick structure unknown", never an error — nothing consumes
+    these bands yet (groundwork for tick-aware order caps after the V2 order
+    migration; combo markets move to $0.0001 ticks on 2026-08-17).
+
+    Args:
+        raw (Any): The raw `price_ranges` value from a market JSON dict —
+            expected to be a list of {"start": str, "end": str, "step": str}
+            dollar-string dicts, but may be missing, empty, or malformed.
+
+    Returns:
+        list[PriceRange] | None: Parsed bands in their original order, or
+            None when raw is not a non-empty list, or when every band in it
+            fails to parse. Individual malformed bands within an otherwise
+            valid list are skipped rather than failing the whole array.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    bands = []
+    for band in raw:
+        try:
+            bands.append(PriceRange(
+                start=float(band["start"]), end=float(band["end"]), step=float(band["step"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return bands or None
 
 
 @dataclass
@@ -151,6 +206,11 @@ def market_title(market: Any) -> str:
     Return the best available display title for a market object.
 
     Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
+
+    Since the 2026-08 API drift, `.subtitle` is sourced from `yes_sub_title`
+    (see `_market_from_dict`), so a title-less market now falls back to its
+    outcome label (e.g. a candidate name) rather than dropping through to the
+    opaque ticker as it did while subtitle was always "".
 
     Args:
         market (Any): A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
@@ -354,14 +414,21 @@ class ApiMarket:
         ticker (str): Market ticker, e.g. "KXBTC-24MAR-T80".
         event_ticker (str): Parent event ticker.
         title (str): Market question text.
-        subtitle (str): Market subtitle ("" when the API omits it, as it
-            currently does — matches the SDK model's empty default).
+        subtitle (str): Market subtitle, from the legacy `subtitle` key with a
+            fallback to `yes_sub_title` (the API dropped `subtitle` in the
+            2026-08 drift). "" when both are absent.
         status (str): SDK-style status string; open markets are "active".
         close_time (datetime | None): Parsed tz-aware close time, or None if
             missing/unparseable.
         yes_ask_dollars: YES ask as a dollar string (e.g. "0.35") or None.
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
+        price_level_structure (str): Tick regime name, e.g. "linear_cent",
+            "tapered_deci_cent", "deci_cent". "" if absent — nothing reads
+            this field yet (groundwork for a future tick-aware order cap).
+        price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
+            _parse_price_ranges), or None when unknown/unparseable/absent.
+            Nothing reads this field yet either.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -373,6 +440,8 @@ class ApiMarket:
     yes_ask_dollars: Any = None
     no_ask_dollars: Any = None
     yes_bid_dollars: Any = None
+    price_level_structure: str = ""
+    price_ranges: Any = None  # list[PriceRange] | None — None = unknown
     _event_title: str = field(default="")
 
 
@@ -402,14 +471,43 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         ticker=m.get("ticker") or "",
         event_ticker=m.get("event_ticker") or "",
         title=m.get("title") or "",
-        subtitle=m.get("subtitle") or "",
+        # The API dropped `subtitle` from market payloads (2026-08 drift);
+        # yes_sub_title carries the same intra-title outcome label (e.g. the
+        # option name in a multi-choice event) and is the discriminator
+        # same-title grouping depends on. no_sub_title is deliberately NOT
+        # used — it is the negated phrasing and would yield asymmetric keys.
+        subtitle=m.get("subtitle") or m.get("yes_sub_title") or "",
         status=m.get("status") or "",
         close_time=close_dt,
         yes_ask_dollars=m.get("yes_ask_dollars"),
         no_ask_dollars=m.get("no_ask_dollars"),
         yes_bid_dollars=m.get("yes_bid_dollars"),
+        price_level_structure=m.get("price_level_structure") or "",
+        price_ranges=_parse_price_ranges(m.get("price_ranges")),
         _event_title=event_title,
     )
+
+
+def _on_routable_shard(m: dict) -> bool:
+    """
+    Return True when a raw market dict lives on the shard our orders reach.
+
+    Markets on other exchange shards must never become candidates: the legacy
+    create-order endpoint has no shard routing, so an order for a shard-1
+    market would fail or misroute at submission time. A missing, null, or
+    unparseable exchange_index is treated as shard 0 (fail-safe — absence of
+    the field must not empty the market list).
+
+    Args:
+        m (dict): One raw market JSON dict from an events-endpoint payload.
+
+    Returns:
+        bool: True if the market is tradeable by our order path.
+    """
+    try:
+        return int(m.get("exchange_index") or ROUTABLE_EXCHANGE_INDEX) == ROUTABLE_EXCHANGE_INDEX
+    except (TypeError, ValueError):
+        return True
 
 
 def fetch_open_events_with_markets(client: Any) -> list:
@@ -434,6 +532,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
+    Both loops also drop any market not on ROUTABLE_EXCHANGE_INDEX (see
+    _on_routable_shard) — the legacy create-order endpoint has no shard
+    routing, so a market on another exchange shard must never reach the
+    pair-detection pipeline. A non-zero skip count is logged as a warning.
+
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
@@ -443,6 +546,10 @@ def fetch_open_events_with_markets(client: Any) -> list:
             string if the event had no title). May contain thousands of items.
     """
     markets: list = []
+    # Counts markets dropped for living on a non-routable exchange shard (see
+    # _on_routable_shard) — shared across both the standard and MVE loops below
+    # so the summary warning reflects the whole fetch.
+    skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
     while True:
@@ -469,6 +576,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # most stale markets too, but this stops them from being paired
                 # (and shown as tradeable candidates) in the first place.
                 if (m.get("status") or "") != "active":
+                    continue
+                # Markets on other exchange shards can't be traded through the
+                # legacy order endpoint — drop them before they become candidates
+                if not _on_routable_shard(m):
+                    skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it
@@ -508,6 +620,12 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     # (allowed values: initialized/active/closed/settled/determined
                     # — there is no "open" status).
                     if (m.get("status") or "") == "active":
+                        # Markets on other exchange shards can't be traded through
+                        # the legacy order endpoint — drop them before they become
+                        # candidates
+                        if not _on_routable_shard(m):
+                            skipped_shard += 1
+                            continue
                         markets.append(_market_from_dict(m, ev_title))
             if page_market_count == 0:
                 empty_pages += 1
@@ -525,6 +643,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
             if not cursor:
                 break
 
+    if skipped_shard:
+        logging.warning(
+            "Skipped %d markets on non-routable exchange shards (exchange_index != %d)",
+            skipped_shard, ROUTABLE_EXCHANGE_INDEX,
+        )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
@@ -685,7 +808,12 @@ def find_same_title_pairs(
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
-    titles and therefore won't be grouped together.
+    titles and therefore won't be grouped together. The subtitle component is
+    sourced from the API's `yes_sub_title` field post-2026-08 drift (see
+    `_market_from_dict`) — it is the only intra-title discriminator, so without
+    it two DIFFERENT outcomes sharing one question title (e.g. two candidates
+    under "Who will the next Pope be?") on different event tickers would be
+    falsely paired as the same contract under the 95% co-resolution assumption.
 
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.

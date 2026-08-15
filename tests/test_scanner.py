@@ -1,4 +1,5 @@
 """Tests for scanner.py normalize_title() — the core pair-detection function."""
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -7,10 +8,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting.config import INCLUDE_MVE_MARKETS
+from kalshi_betting.config import INCLUDE_MVE_MARKETS, ROUTABLE_EXCHANGE_INDEX
 from kalshi_betting.scanner import (
     CandidatePair,
+    PriceRange,
     _fetch_orderbook,
+    _on_routable_shard,
+    _parse_price_ranges,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -737,6 +741,206 @@ class TestFetchOpenEventsMveStatusFilter:
             fetch_open_events_with_markets(client)
 
 
+class TestOnRoutableShard:
+    """Unit coverage for the fail-safe shard predicate itself."""
+
+    def test_missing_exchange_index_is_routable(self):
+        assert _on_routable_shard({"ticker": "T1"}) is True
+
+    def test_null_exchange_index_is_routable(self):
+        assert _on_routable_shard({"exchange_index": None}) is True
+
+    def test_unparseable_exchange_index_is_routable_fail_safe(self):
+        # Garbage input must fail open (routable) rather than empty the market
+        # list on an unrelated API shape change.
+        assert _on_routable_shard({"exchange_index": "not-a-number"}) is True
+
+    def test_int_zero_is_routable(self):
+        assert _on_routable_shard({"exchange_index": 0}) is True
+
+    def test_string_zero_is_routable(self):
+        assert _on_routable_shard({"exchange_index": "0"}) is True
+
+    def test_shard_one_is_not_routable(self):
+        assert _on_routable_shard({"exchange_index": 1}) is False
+
+    def test_routable_index_matches_config_constant(self):
+        # Sanity check that the predicate is actually gated on the config
+        # constant, not a hardcoded 0 that would silently diverge from it.
+        assert _on_routable_shard({"exchange_index": ROUTABLE_EXCHANGE_INDEX}) is True
+
+
+class TestFetchOpenEventsShardFilter:
+    """Markets on non-routable exchange shards must never become candidates —
+    the legacy create-order endpoint has no shard-routing parameter."""
+
+    def test_standard_loop_drops_non_shard_zero_keeps_missing_field(self):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-NOFIELD", "Hail tomorrow"),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        markets = fetch_open_events_with_markets(client)
+        tickers = {m.ticker for m in markets}
+        assert tickers == {"STD-SHARD0", "STD-NOFIELD"}, (
+            "only the shard-0 and field-missing markets should survive"
+        )
+
+    def test_warning_logged_with_correct_skipped_count(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-SHARD1-A", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-SHARD1-B", "Hail tomorrow", exchange_index=1),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            fetch_open_events_with_markets(client)
+        assert "Skipped 2 markets on non-routable exchange shards" in caplog.text
+
+    def test_no_warning_when_everything_is_shard_zero(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-B", "Snow tomorrow"),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+        assert {m.ticker for m in markets} == {"STD-A", "STD-B"}
+        assert "non-routable exchange shards" not in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_loop_also_drops_non_shard_zero(self):
+        mve_event = {"title": "2024 Election Winner", "markets": [
+            _raw_market("MVE-SHARD0", "Trump", status="active", exchange_index=0),
+            _raw_market("MVE-SHARD1", "Harris", status="active", exchange_index=1),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([mve_event])
+        )
+
+        markets = fetch_open_events_with_markets(client)
+        tickers = {m.ticker for m in markets}
+        assert tickers == {"MVE-SHARD0"}
+
+
+class TestSubtitleFallback:
+    """The API dropped `subtitle` (2026-08 drift) — ingest must read yes_sub_title."""
+
+    def _parse_one(self, **extra):
+        # Route through the real raw-JSON parse path (fetch_open_events_with_markets
+        # → _market_from_dict), not the dataclass constructor, so the test covers
+        # the actual ingest the live scanner uses.
+        event = {"title": "Papal Conclave", "markets": [
+            _raw_market("SUB-1", "Who will the next Pope be?", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_explicit_subtitle_wins_over_yes_sub_title(self):
+        m = self._parse_one(subtitle="Legacy Label", yes_sub_title="New Label")
+        assert m.subtitle == "Legacy Label"
+
+    def test_yes_sub_title_used_when_subtitle_absent(self):
+        m = self._parse_one(yes_sub_title="Pierbattista Pizzaballa")
+        assert m.subtitle == "Pierbattista Pizzaballa"
+
+    def test_null_subtitle_falls_back_to_yes_sub_title(self):
+        # The archive/live payloads sometimes carry an explicit null rather than
+        # omitting the key — that must still fall through to yes_sub_title.
+        m = self._parse_one(subtitle=None, yes_sub_title="Peter Turkson")
+        assert m.subtitle == "Peter Turkson"
+
+    def test_both_absent_yields_empty_string(self):
+        m = self._parse_one()
+        assert m.subtitle == ""
+
+    def test_no_sub_title_is_not_used(self):
+        # no_sub_title is the negated phrasing; using it would make the grouping
+        # key asymmetric between the YES and NO framings of the same outcome.
+        m = self._parse_one(no_sub_title="Someone else")
+        assert m.subtitle == ""
+
+
+class TestSameTitleSubtitleDiscriminator:
+    """Regression: distinct outcomes sharing one title must not be paired.
+
+    Before the yes_sub_title fallback, every market parsed with subtitle="",
+    so the (event_title, title, subtitle) grouping key collapsed to
+    (event_title, title) — two DIFFERENT outcomes under one shared question
+    title on different event tickers would group together and be traded under
+    the 95% co-resolution assumption. Real money, wrong contract.
+    """
+
+    @staticmethod
+    def _pope_event(event_ticker, ticker, sub, yes_ask, no_ask):
+        # Same event *title* on both sides so the event_title component of the
+        # grouping key matches — the subtitle is the only discriminator left.
+        return {"title": "Papal Conclave", "markets": [
+            _raw_market(
+                ticker, "Who will the next Pope be?",
+                event_ticker=event_ticker,
+                yes_sub_title=sub,
+                yes_ask_dollars=str(yes_ask), no_ask_dollars=str(no_ask),
+            ),
+        ]}
+
+    @staticmethod
+    def _markets(events):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(events))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        return fetch_open_events_with_markets(client)
+
+    def test_distinct_outcomes_under_shared_title_do_not_pair(self):
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-PIZZABALLA", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-TURKSON", "Peter Turkson", 0.30, 0.70),
+        ])
+        # Both parsed subtitles must be populated — otherwise the assertion
+        # below would pass for the wrong reason (e.g. a parse failure).
+        assert {m.subtitle for m in markets} == {"Pierbattista Pizzaballa", "Peter Turkson"}
+        pairs = find_same_title_pairs(markets)
+        assert pairs == [], f"Different outcomes must not be same-title paired; got {pairs}"
+
+    def test_identical_outcome_across_events_still_pairs(self):
+        # Positive control: same outcome label, different event tickers, price
+        # gap well above SAME_TITLE_MIN_PRICE_DIFF — the legitimate arbitrage.
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-A", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-B", "Pierbattista Pizzaballa", 0.30, 0.70),
+        ])
+        pairs = find_same_title_pairs(markets)
+        assert len(pairs) == 1
+        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"POPE-A", "POPE-B"}
+        # market_a is canonicalized to the more expensive side
+        assert pairs[0].market_a.ticker == "POPE-A"
+
+
 class TestFilterMarketsWithinHorizon:
     def test_none_horizon_returns_markets_unchanged(self):
         markets = [
@@ -779,3 +983,98 @@ class TestFilterMarketsWithinHorizon:
         m = _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 12, 1))
         result = filter_markets_within_horizon([m], 7)
         assert result == []
+
+
+class TestParsePriceRanges:
+    """_parse_price_ranges: groundwork ingest for the price_ranges tick-band
+    array (2026-08). Nothing consumes the parsed bands yet — these tests only
+    cover the parse itself."""
+
+    def test_single_band_deci_cent(self):
+        bands = _parse_price_ranges(
+            [{"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+        )
+        assert bands == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_multi_band_tapered_market(self):
+        raw = [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [
+            PriceRange(start=0.0, end=0.1, step=0.001),
+            PriceRange(start=0.1, end=0.9, step=0.01),
+            PriceRange(start=0.9, end=1.0, step=0.001),
+        ]
+
+    def test_none_returns_none(self):
+        assert _parse_price_ranges(None) is None
+
+    def test_not_a_list_returns_none(self):
+        assert _parse_price_ranges({"start": "0", "end": "1", "step": "0.01"}) is None
+
+    def test_empty_list_returns_none(self):
+        assert _parse_price_ranges([]) is None
+
+    def test_all_bands_missing_keys_returns_none(self):
+        # Every band fails to parse -> the result must be None, not [].
+        assert _parse_price_ranges([{"foo": "bar"}, {"start": "0"}]) is None
+
+    def test_one_good_one_malformed_band_keeps_only_the_good_one(self):
+        raw = [
+            {"start": "0.0000", "end": "0.5000", "step": "0.0100"},
+            {"start": "0.5000", "end": "1.0000"},  # missing "step"
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [PriceRange(start=0.0, end=0.5, step=0.01)]
+
+    def test_price_range_is_frozen(self):
+        band = PriceRange(start=0.0, end=1.0, step=0.01)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            band.start = 0.5
+
+
+class TestTickStructureIngest:
+    """Tick-structure fields flow through the real raw-JSON parse path
+    (fetch_open_events_with_markets -> _market_from_dict), matching how the
+    subtitle-fallback tests above exercise ingest."""
+
+    def _parse_one(self, **extra):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("TICK-1", "Rain tomorrow", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_deci_cent_single_band(self):
+        m = self._parse_one(
+            price_level_structure="deci_cent",
+            price_ranges=[{"start": "0.0000", "end": "1.0000", "step": "0.0010"}],
+        )
+        assert m.price_level_structure == "deci_cent"
+        assert m.price_ranges == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_tapered_multi_band(self):
+        m = self._parse_one(
+            price_level_structure="tapered_deci_cent",
+            price_ranges=[
+                {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+                {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+            ],
+        )
+        assert m.price_level_structure == "tapered_deci_cent"
+        assert len(m.price_ranges) == 3
+        assert [b.step for b in m.price_ranges] == [0.001, 0.01, 0.001]
+
+    def test_absent_fields_default_to_empty_and_none(self):
+        m = self._parse_one()
+        assert m.price_level_structure == ""
+        assert m.price_ranges is None

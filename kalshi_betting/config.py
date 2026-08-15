@@ -110,7 +110,24 @@ TAKER_FEE_RATE                = 0.07
 # when computing the buy_max_cost cap for each market FoK order leg. The cap
 # protects against the order book moving between the pre-execution check and
 # submission: the order fills at or below (scanned price + allowance) or not at all.
+# This stays a whole-cent value because `buy_max_cost` is an integer-cents field
+# on the legacy /portfolio/orders create-order endpoint the bot still submits
+# through — a sub-cent-aware cap can't be expressed there no matter how finely
+# a market's own tick grid is subdivided (see ApiMarket.price_level_structure /
+# price_ranges in scanner.py, ingested but not yet read). On the $0.0001 tick
+# grid all MVE/combo markets move to on 2026-08-17, this 1c tolerance permits
+# ~100 ticks of price drift rather than the intended ~1. Fixing this requires
+# migrating order submission to the V2 endpoint (dollar-string prices), which
+# is a deliberately deferred follow-up — see CLAUDE.md.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
+
+# The only exchange shard our order path can reach. Kalshi now partitions the
+# exchange into parallel instances keyed by `exchange_index` (on markets and
+# in the balance breakdown; index 1 observed live 2026-08-14). The legacy
+# create-order endpoint the bot submits through has no shard routing, so the
+# scanner drops markets on other shards at ingest and verify_auth reads the
+# shard-0 balance entry. Currently every Kalshi market is on shard 0.
+ROUTABLE_EXCHANGE_INDEX       = 0
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
