@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import uuid
+from datetime import date
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -190,6 +191,33 @@ def positions_resp(ticker: str | None = None, position: float = 0) -> SimpleName
     return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
 
 
+@pytest.fixture
+def force_legacy(monkeypatch):
+    """Pin the order path to legacy for a class that asserts legacy behaviour.
+
+    config.v2_orders_active() consults the real UTC clock, so on and after
+    config.V2_ORDERS_START these classes would silently start exercising the V2
+    wire format and fail on a calendar boundary. Forcing V2_ORDERS_FORCE (never
+    the date) is exactly the production kill switch, so this pins the path the
+    same way an operator would. The unforced date behaviour itself is asserted
+    in tests/test_config.py, which does NOT use this fixture.
+    """
+    monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", False)
+
+
+@pytest.fixture
+def v2_mapping_confirmed(monkeypatch):
+    """Pretend the V2 NO-leg mapping has already been confirmed this process.
+
+    _execute_one()'s backstop reads the account position after the first V2
+    leg-A fill (see TestV2NoMappingBackstop). Classes that exercise the
+    rollback / disambiguation state machine on the V2 wire format aren't
+    testing that check and must not have their position mocks consumed by it,
+    so they start from the latched state a second trade would see.
+    """
+    monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
+
+
 class TestOrderPriceProtection:
     def test_no_leg_has_buy_max_cost(self):
         spec = make_spec(x=5, nA=0.40)
@@ -208,6 +236,7 @@ class TestOrderPriceProtection:
         assert order.side == "yes"
 
 
+@pytest.mark.usefixtures("force_legacy")
 class TestRollbackVerification:
     def test_unfilled_rollback_reports_rollback_failed(self):
         # Leg A fills, leg B FoK is rejected, and the rollback FoK is ALSO
@@ -248,6 +277,7 @@ class TestRollbackVerification:
         assert rollback_req.reduce_only is True
 
 
+@pytest.mark.usefixtures("force_legacy")
 class TestExceptionDisambiguation:
     def test_leg_a_exception_with_no_position_is_failed(self):
         # Exception + confirmed zero position → clean failure, no rollback sent
@@ -318,9 +348,11 @@ class TestExceptionDisambiguation:
         assert client.create_order_without_preload_content.call_count == 2
 
 
+@pytest.mark.usefixtures("force_legacy")
 class TestLegacyShardRouting:
-    """TEMPORARY guard, dies with the V2 order migration: the legacy
-    /portfolio/orders endpoint has no shard routing, so a pair with a leg off
+    """PERMANENT legacy-mode guard: the legacy /portfolio/orders endpoint has
+    no shard routing, so while it is the active path (before V2_ORDERS_START,
+    or under V2_ORDERS_FORCE=False) a pair with a leg off
     DEFAULT_EXCHANGE_INDEX must be refused BEFORE anything is submitted.
     The scanner deliberately ingests such markets (market data is cross-shard),
     so this is the only thing standing between them and a misrouted order."""
@@ -351,7 +383,7 @@ class TestLegacyShardRouting:
             "is the correct status vocabulary, not manual_review"
         )
         assert "exchange shard" in result.error
-        assert "V2 migration pending" in result.error
+        assert "V2 order path inactive" in result.error
         # The guard must run BEFORE any order goes out
         client.create_order_without_preload_content.assert_not_called()
 
@@ -910,12 +942,12 @@ class TestV2BodyConstruction:
         assert _build_v2_order_body("TICK-A", "bid", "0.36", 12, 0)["count"] == "12.00"
 
     def test_cross_shard_legs_get_different_exchange_indices(self, monkeypatch):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()])
         monkeypatch.setattr(trader, "signed_raw_request", srr)
-        # Submitted leg-by-leg rather than through _execute_one because the
-        # TEMPORARY _legacy_routable guard still refuses cross-shard pairs; V2
-        # is what removes that guard, and the bodies must already be correct.
+        # Submitted leg-by-leg to assert the BODIES in isolation; the
+        # _legacy_routable guard no longer refuses this pair once V2 is
+        # active (TestShardGuardAppliesOnlyToLegacy covers that end to end).
         spec = make_spec(shards=(0, 1))
         _submit_leg(trader_client := MagicMock(), ticker=spec.pair.market_a.ticker,
                     leg="no_buy", count=spec.x, price=spec.pair.nA,
@@ -927,8 +959,9 @@ class TestV2BodyConstruction:
         assert [b["exchange_index"] for b in bodies] == [0, 1]
         assert [b["ticker"] for b in bodies] == ["TICK-A", "TICK-B"]
 
-    def test_v2_path_never_touches_create_order_request(self, monkeypatch):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+    def test_v2_path_never_touches_create_order_request(self, monkeypatch,
+                                                        v2_mapping_confirmed):
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         monkeypatch.setattr(
             trader, "signed_raw_request",
             MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()]),
@@ -980,7 +1013,7 @@ class TestV2SubmitPath:
     """The V2 request goes out as a signed raw POST — and exactly once."""
 
     def test_submits_a_signed_post_to_the_v2_path(self, monkeypatch):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(return_value=v2_filled_resp())
         monkeypatch.setattr(trader, "signed_raw_request", srr)
         client = MagicMock()
@@ -1000,7 +1033,7 @@ class TestV2SubmitPath:
     def test_close_leg_forces_reduce_only(self, monkeypatch):
         # A closing order that could OPEN the opposite exposure is the one
         # thing the seam must never emit, whatever the caller passed.
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(return_value=v2_filled_resp())
         monkeypatch.setattr(trader, "signed_raw_request", srr)
         _submit_leg(MagicMock(), ticker="TICK-A", leg="no_close", count=5,
@@ -1010,7 +1043,7 @@ class TestV2SubmitPath:
         assert body["side"] == "bid"
 
     def test_killed_order_returns_false(self, monkeypatch):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         monkeypatch.setattr(trader, "signed_raw_request",
                             MagicMock(return_value=v2_killed_resp()))
         assert _submit_leg(MagicMock(), ticker="TICK-A", leg="no_buy", count=5,
@@ -1019,7 +1052,7 @@ class TestV2SubmitPath:
     def test_non_2xx_raises_and_is_never_retried(self, monkeypatch):
         # A retryable 5xx: if this were wrapped in api_call_with_retry it would
         # be submitted up to 6 times — double-submitting a fill-or-kill leg.
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         # reason/getheaders are what the SDK's ApiException reads off a failed
         # response — a bare status/data namespace would blow up in the
         # exception constructor instead of in the code under test.
@@ -1036,7 +1069,7 @@ class TestV2SubmitPath:
         assert srr.call_count == 1
 
     def test_transport_error_is_never_retried(self, monkeypatch):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(side_effect=TimeoutError("timeout"))
         monkeypatch.setattr(trader, "signed_raw_request", srr)
         with pytest.raises(TimeoutError):
@@ -1050,6 +1083,7 @@ class TestV2SubmitPath:
                         price=0.40, market=make_market())
 
 
+@pytest.mark.usefixtures("force_legacy")
 class TestLegacyLegSubmissionIsUnchanged:
     """With the flag OFF (the default), the seam must put byte-identical
     CreateOrderRequests on the wire — the whole point of landing V2 disabled."""
@@ -1103,18 +1137,152 @@ class TestLegacyLegSubmissionIsUnchanged:
         assert _execute_one(client, make_spec()).status == "executed"
         srr.assert_not_called()
 
-    def test_flag_defaults_to_off(self):
-        # The live probe verifying the NO-leg mapping has not run; nothing but
-        # that probe may flip this.
-        assert trader.config.V2_ORDERS_ENABLED is False
+
+class TestOrderPathSwitch:
+    """Which wire format runs is decided by config.v2_orders_active(): the
+    date, unless V2_ORDERS_FORCE overrides it. Deliberately NOT marked with
+    force_legacy — these assertions are about the unforced production default,
+    which a pinned override would hide."""
+
+    def test_legacy_is_the_path_before_the_switchover_date(self):
+        # The day before the combo migration the bot must still be on the
+        # legacy endpoint, whose wire format this whole class file pins.
+        assert trader.config.v2_orders_active(today=date(2026, 8, 16)) is False
+
+    def test_v2_is_the_path_from_the_switchover_date(self):
+        assert trader.config.v2_orders_active(today=date(2026, 8, 17)) is True
+
+    def test_force_override_defaults_to_none(self):
+        # None = "the date decides". A committed True/False would mean the
+        # repo is shipping a manual override as the production default.
+        assert trader.config.V2_ORDERS_FORCE is None
 
 
+@pytest.mark.usefixtures("v2_mapping_confirmed")
+class TestShardGuardAppliesOnlyToLegacy:
+    """_legacy_routable protects the LEGACY endpoint, which cannot route off
+    DEFAULT_EXCHANGE_INDEX. On V2 every body carries its own market's
+    exchange_index, so the guard must not fire — that is the whole point of
+    migrating before combos move to shard 1."""
+
+    def test_v2_executes_a_cross_shard_pair_with_per_leg_routing(self, monkeypatch):
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
+        srr = MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()])
+        monkeypatch.setattr(trader, "signed_raw_request", srr)
+        result = _execute_one(MagicMock(), make_spec(shards=(0, 1)))
+        assert result.status == "executed"
+        bodies = [c.kwargs["body"] for c in srr.call_args_list]
+        assert [b["exchange_index"] for b in bodies] == [0, 1]
+
+    def test_legacy_still_refuses_the_same_pair(self, monkeypatch):
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", False)
+        srr = MagicMock()
+        monkeypatch.setattr(trader, "signed_raw_request", srr)
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shards=(0, 1)))
+        assert result.status == "failed"
+        assert "exchange shard" in result.error
+        # Nothing was sent on either wire format.
+        srr.assert_not_called()
+        client.create_order_without_preload_content.assert_not_called()
+
+
+class TestV2NoMappingBackstop:
+    """The V2 switch no longer waits for the live probe, so the first V2 NO
+    fill of a process must prove the unverified mapping: the account position
+    has to go NEGATIVE (Kalshi's signed ledger: negative = NO)."""
+
+    @pytest.fixture(autouse=True)
+    def _unconfirmed_v2(self, monkeypatch):
+        # V2 active, mapping not yet confirmed — the state a fresh process is
+        # in on its first trade after the switchover.
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+
+    def test_negative_position_confirms_the_mapping_and_completes_the_pair(
+        self, monkeypatch
+    ):
+        srr = MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()])
+        monkeypatch.setattr(trader, "signed_raw_request", srr)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=-5)
+        )
+        assert _execute_one(client, make_spec()).status == "executed"
+        # Leg B still went out — the check must not disturb the state machine.
+        assert srr.call_count == 2
+        assert trader._V2_NO_MAPPING_CONFIRMED is True
+
+    def test_confirmation_latches_for_the_process(self, monkeypatch):
+        monkeypatch.setattr(trader, "signed_raw_request",
+                            MagicMock(side_effect=[v2_filled_resp()] * 4))
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=-5)
+        )
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert _execute_one(client, make_spec()).status == "executed"
+        # One positions read across two trades: the mapping is a property of
+        # the exchange, so the backstop costs one read per PROCESS.
+        client.get_positions_without_preload_content.assert_called_once()
+
+    def test_positive_position_disproves_the_mapping_and_stops_the_pair(
+        self, monkeypatch, caplog
+    ):
+        srr = MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()])
+        monkeypatch.setattr(trader, "signed_raw_request", srr)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=5)
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "V2 NO-leg mapping disproven" in result.error
+        # Only leg A went out: leg B is not submitted (it would hedge a
+        # position we don't hold) and NO unwind is attempted (the unwind rests
+        # on the same disproven mapping).
+        assert srr.call_count == 1
+        assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+    def test_failed_position_lookup_proceeds_without_latching(
+        self, monkeypatch, caplog
+    ):
+        srr = MagicMock(side_effect=[v2_filled_resp(), v2_filled_resp()])
+        monkeypatch.setattr(trader, "signed_raw_request", srr)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            side_effect=RuntimeError("lookup failed")
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            assert _execute_one(client, make_spec()).status == "executed"
+        # Unknown is not disproven — the fill itself was confirmed by the FoK
+        # response, so the pair proceeds and the check retries next time.
+        assert srr.call_count == 2
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+    def test_legacy_path_never_reads_the_position_on_a_fill(self, monkeypatch):
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", False)
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"), order_resp("executed"),
+        ])
+        assert _execute_one(client, make_spec()).status == "executed"
+        # The backstop verifies the V2 mapping; on legacy there is nothing to
+        # verify, and an extra positions read per run would be pure cost.
+        client.get_positions_without_preload_content.assert_not_called()
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+
+@pytest.mark.usefixtures("v2_mapping_confirmed")
 class TestV2RollbackVerification:
     """Flag-flipped duplicate of TestRollbackVerification: the rollback state
     machine must behave IDENTICALLY on the V2 wire format."""
 
     def _patch(self, monkeypatch, responses):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(side_effect=responses)
         monkeypatch.setattr(trader, "signed_raw_request", srr)
         return srr
@@ -1169,13 +1337,14 @@ class TestV2RollbackVerification:
         assert bodies[1]["side"] == "bid" and bodies[1]["price"] == "0.36"
 
 
+@pytest.mark.usefixtures("v2_mapping_confirmed")
 class TestV2ExceptionDisambiguation:
     """Flag-flipped duplicate of TestExceptionDisambiguation. Ambiguity is
     still resolved by the account position, and an unknown leg-B fill state
     still refuses to auto-roll-back."""
 
     def _patch(self, monkeypatch, responses):
-        monkeypatch.setattr(trader.config, "V2_ORDERS_ENABLED", True)
+        monkeypatch.setattr(trader.config, "V2_ORDERS_FORCE", True)
         srr = MagicMock(side_effect=responses)
         monkeypatch.setattr(trader, "signed_raw_request", srr)
         return srr

@@ -17,13 +17,15 @@ Purpose:
     waits for another to complete.
 
     Every leg submission goes through the ONE seam _submit_leg(), which dispatches
-    on config.V2_ORDERS_ENABLED between two wire formats: the legacy
+    on config.v2_orders_active() between two wire formats: the legacy
     /portfolio/orders create-order request (integer-cent buy_max_cost, side
     yes/no + action buy/sell, no shard routing) and the V2
     /portfolio/events/orders body (dollar-string limit price quantized onto the
     market's own tick grid, fixed-point count strings, bid/ask sides, explicit
-    per-order exchange_index). The flag is False today, so the legacy path is
-    what actually runs; the surrounding rollback / manual_review state machine
+    per-order exchange_index). That switch is AUTOMATIC on config.V2_ORDERS_START
+    (the combo-migration date), overridable in both directions by
+    config.V2_ORDERS_FORCE; the legacy path is kept permanently as the
+    FORCE=False fallback. The surrounding rollback / manual_review state machine
     is identical on both branches.
 
     An exception from create_order does NOT prove the order was rejected (a
@@ -53,10 +55,12 @@ Dependencies:
     DEFAULT_EXCHANGE_INDEX / TRANSFER_PATH / TRANSFER_SETTLE_TIMEOUT_SECONDS /
     TRANSFER_POLL_INTERVAL_SECONDS / V2_CREATE_ORDER_PATH /
     V2_SELF_TRADE_PREVENTION_TYPE from config.py. It ALSO imports the config
-    MODULE itself, purely so the V2_ORDERS_ENABLED flag is read as
-    config.V2_ORDERS_ENABLED at call time — a `from .config import` of a bool
-    freezes its value at import and could not be flipped (by tests or by a
-    future runtime switch) without reloading this module. Reads
+    MODULE itself, purely so the order-path switch is read as
+    config.v2_orders_active() at call time — that helper re-reads
+    config.V2_ORDERS_FORCE and the UTC clock on every call, whereas a
+    `from .config import` of its result (or of the override) would freeze the
+    decision at import time and could not be flipped by tests, by the date
+    rolling over inside a long-lived process, or by the FORCE kill switch. Reads
     ApiMarket.price_level_structure / price_ranges (scanner.py) via the market
     objects hanging off each TradeSpec — no scanner import is needed for that.
     Called by main.py after select_portfolio() selects the final trade list.
@@ -74,9 +78,24 @@ Notes:
     _no_close_as_v2(), and nowhere else — is that selling YES you do not hold
     OPENS a NO position (Kalshi's unified ledger: negative position_fp = NO),
     so "buy NO at <= p" maps to "ask at >= 1 - p", and closing that NO position
-    maps to a `bid` with reduce_only=True. This cannot be proven offline, which
-    is exactly why config.V2_ORDERS_ENABLED stays False until the live probe
-    (v2_probe) confirms both halves against the real API.
+    maps to a `bid` with reduce_only=True. This cannot be proven offline, and
+    the switch to V2 no longer waits for the live probe (v2_probe, still the
+    cheapest way to check it — ~1c of exposure), so _execute_one() carries a
+    RUNTIME BACKSTOP: on the first V2 "no_buy" that fills in a process, the
+    account position for that ticker is read and its sign checked. Negative
+    confirms the hypothesis and latches _V2_NO_MAPPING_CONFIRMED for the rest
+    of the process; non-negative DISPROVES it live, which logs CRITICAL and
+    returns status="manual_review" WITHOUT submitting leg B and WITHOUT
+    auto-unwinding — the unwind rests on the same disproven hypothesis, so a
+    human flattens the account (this is the probe's own "don't compound" rule).
+
+    The un-probed UNWIND half is fail-safe by construction and needs no
+    backstop: _no_close_as_v2()'s order carries reduce_only=True, which caps it
+    at the position actually held, so even a wrong mapping cannot open new
+    exposure — worst case it no-ops, the FoK goes unfilled, and the existing
+    "rollback_failed" CRITICAL path reports the orphaned position. It is the
+    un-probed OPEN that could take the wrong side of the market outright, which
+    is exactly what the backstop covers.
 
     Order submission and position lookups use the SDK's raw-response variants
     (via _submit_order / _position_count) because 2026-07 API drift broke the
@@ -85,16 +104,17 @@ Notes:
     request side still uses the modeled CreateOrderRequest and serializes
     through the same SDK code path, so the wire format is unchanged.
 
-    _legacy_routable() is a TEMPORARY shard guard. The scanner ingests markets
-    from every exchange shard (market data is cross-shard) and tags each with
-    its exchange_index, but the legacy /portfolio/orders endpoint this module
-    submits through has no shard-routing parameter — so a pair with a leg off
-    DEFAULT_EXCHANGE_INDEX is refused at the top of _execute_one rather than
-    misrouted. It goes away when order submission migrates to the V2 endpoint
-    (/portfolio/events/orders), which routes per shard. While that guard is in
-    place the collateral planner below is a pure no-op in practice (all funds
-    and all tradeable markets are on shard 0 today); it lands early so the
-    funding path is already proven when the V2 flip removes the guard.
+    _legacy_routable() is the PERMANENT legacy-mode shard guard — not a
+    temporary one. The scanner ingests markets from every exchange shard
+    (market data is cross-shard) and tags each with its exchange_index, but the
+    legacy /portfolio/orders endpoint has no shard-routing parameter, so a pair
+    with a leg off DEFAULT_EXCHANGE_INDEX is refused at the top of
+    _execute_one rather than misrouted. It applies whenever
+    config.v2_orders_active() is False — before V2_ORDERS_START, and for as
+    long as the V2_ORDERS_FORCE=False kill switch is engaged — and stays in the
+    codebase for exactly as long as the legacy path does, i.e. permanently.
+    When V2 is active the guard is bypassed, because every V2 body carries its
+    own market's exchange_index and routes to that shard.
 
     CENTICENTS TRAP. The transfer endpoint's `amount` is int64 CENTICENTS —
     1/100 of a cent, i.e. cents × 100. That is the THIRD money unit in this
@@ -171,10 +191,15 @@ def _legacy_routable(spec: TradeSpec) -> bool:
     """
     Return True only when BOTH of a pair's legs are on DEFAULT_EXCHANGE_INDEX.
 
-    TEMPORARY until the V2 order migration: the legacy /portfolio/orders
-    endpoint has no shard routing, so an order for a non-shard-0 market would
-    fail or misroute. Remove when order submission moves to the V2 endpoint
-    (/portfolio/events/orders), which routes per shard.
+    This is the PERMANENT protection for legacy mode, not a temporary
+    migration artifact. The legacy /portfolio/orders endpoint has no
+    shard-routing parameter, so an order for a non-shard-0 market would fail or
+    misroute — and the legacy path is kept alive indefinitely as the
+    config.V2_ORDERS_FORCE=False fallback, so this guard has to outlive the
+    migration too. _execute_one() consults it only while
+    config.v2_orders_active() is False (before config.V2_ORDERS_START, or under
+    the kill switch); on the V2 path it is bypassed, because every V2 body
+    routes itself via its market's own exchange_index.
 
     The scanner deliberately ingests and tags markets from every shard — the
     market-data endpoints are cross-shard — so this is the single point where
@@ -207,6 +232,16 @@ _FALLBACK_TICK_BANDS: list[tuple[Decimal, Decimal, Decimal]] = [
 # a NO position on market A), "yes_buy" = leg B (open a YES position on market
 # B), "no_close" = the rollback that unwinds a filled leg A.
 _LEG_KINDS = ("no_buy", "yes_buy", "no_close")
+
+# Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one():
+# False until a V2 "no_buy" fill has been observed to produce a NEGATIVE
+# account position (i.e. an `ask` really did open a NO position, as
+# _no_buy_as_v2 hypothesises). Once confirmed the check is skipped, so the
+# backstop costs ONE extra positions read per process, not one per trade — the
+# mapping is a property of the exchange, so verifying it once is enough.
+# Deliberately not persisted anywhere: a fresh process re-verifies, which is
+# cheap and keeps the check honest across restarts and API changes.
+_V2_NO_MAPPING_CONFIRMED = False
 
 
 def _tick_bands(market: Any) -> list[tuple[Decimal, Decimal, Decimal]]:
@@ -379,9 +414,10 @@ def _no_buy_as_v2(no_price: float, market: Any) -> tuple[str, str]:
     """
     Map "buy NO at <= no_price + slippage" onto a V2 (side, limit price) pair.
 
-    *** THIS IS THE UNVERIFIED MAPPING — the reason config.V2_ORDERS_ENABLED
-    is still False. *** V2 has no side="no"/action="buy" vocabulary: every
-    order is a bid or an ask on the YES book. The hypothesis, drawn from
+    *** THIS IS THE UNVERIFIED MAPPING — the reason _execute_one() carries the
+    _confirm_v2_no_mapping backstop. *** V2 has no side="no"/action="buy"
+    vocabulary: every order is a bid or an ask on the YES book. The hypothesis,
+    drawn from
     Kalshi's unified-ledger convention (a negative position_fp IS a NO
     position), is that selling YES you do not hold OPENS a NO position, so:
 
@@ -391,9 +427,11 @@ def _no_buy_as_v2(no_price: float, market: Any) -> tuple[str, str]:
     per contract, so CEILING onto the tick grid raises the minimum, which
     tightens the implied NO cost cap — the same direction of conservatism the
     bid leg gets from flooring. If the hypothesis is wrong the order does not
-    merely mis-price, it takes the wrong side of the market entirely, which is
-    why the live probe (v2_probe) must confirm "ask opens NO" before the flag
-    is flipped. Nothing else in this module encodes the assumption.
+    merely mis-price, it takes the wrong side of the market entirely — which is
+    why v2_probe exists (confirm "ask opens NO" for ~1c before the switchover
+    date) and why _confirm_v2_no_mapping() re-checks the same position sign on
+    the first live V2 NO fill. Nothing else in this module encodes the
+    assumption.
 
     Args:
         no_price (float): Scanned depth-weighted NO price in dollars, (0, 1).
@@ -761,11 +799,12 @@ def _submit_leg(
     This is the single seam between the trading state machine and the wire
     format. _execute_one() and _rollback_leg_a() call nothing else to submit an
     order, so the legacy and V2 paths cannot drift in when they submit, only in
-    what they put on the wire:
+    what they put on the wire. config.v2_orders_active() picks the branch — by
+    date at config.V2_ORDERS_START, or by the config.V2_ORDERS_FORCE override:
 
-      * legacy (config.V2_ORDERS_ENABLED False — today): the same
-        CreateOrderRequest this module has always built, filled = status is
-        "executed".
+      * legacy (v2_orders_active() False): the same CreateOrderRequest this
+        module has always built, filled = status is "executed". Kept
+        permanently, since FORCE=False is the fallback if V2 misbehaves.
       * V2: leg kind mapped to a (side, tick-quantized limit price) pair, a
         plain-dict body carrying the market's own exchange_index, filled =
         remaining_count 0 and fill_count == count.
@@ -804,11 +843,12 @@ def _submit_leg(
     # A close must never be able to open a position, on either path.
     reduce_only = reduce_only or leg == "no_close"
 
-    # Attribute access on the config MODULE, not a from-import: the flag has to
-    # be read at call time so it can be flipped (tests monkeypatch it) without
-    # re-importing this module. Every other config value here is a from-import
-    # because none of them is a switch.
-    if not config.V2_ORDERS_ENABLED:
+    # Called on the config MODULE, not from-imported: the decision has to be
+    # made at call time, because it depends on the current UTC date and on
+    # config.V2_ORDERS_FORCE (which tests monkeypatch and which is the live
+    # kill switch). Every other config value here is a from-import because none
+    # of them is a switch.
+    if not config.v2_orders_active():
         status = _submit_order(client, _build_legacy_order(leg, ticker, count, price))
         if status != "executed":
             logging.info("FoK not filled: leg=%s ticker=%s status=%s", leg, ticker, status)
@@ -1268,10 +1308,11 @@ def ensure_shard_collateral(
         transfer ids ("money is in flight"), and only the trades needing a
         still-unfunded shard are dropped.
 
-    Today this is a pure no-op in practice: all funds and all tradeable markets
-    are on DEFAULT_EXCHANGE_INDEX, so no shard is ever short. It exists so the
-    funding path is already in place — and already exercised by the zero-deficit
-    fast path — when the V2 order migration lets trades route off shard 0.
+    Until the V2 switchover (config.V2_ORDERS_START) this is a pure no-op in
+    practice: all funds and all tradeable markets are on DEFAULT_EXCHANGE_INDEX,
+    so no shard is ever short. It exists so the funding path is already in place
+    — and already exercised by the zero-deficit fast path — from the first run
+    on which V2 lets trades route off shard 0.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1382,6 +1423,91 @@ def ensure_shard_collateral(
     return kept
 
 
+def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
+    """
+    Verify, once per process, that a filled V2 NO buy really opened a NO position.
+
+    The V2 switch is automatic on config.V2_ORDERS_START and no longer waits
+    for the live probe (v2_probe), so this is the runtime backstop on the one
+    thing about the V2 path that cannot be proven offline: _no_buy_as_v2()'s
+    hypothesis that an `ask` on the YES book OPENS a NO position. Kalshi's
+    convention is a signed ledger, so the evidence is simply the sign of the
+    position after the fill — negative is NO, positive is YES.
+
+    Called by _execute_one() immediately after a leg-A ("no_buy") FoK reports
+    filled and BEFORE leg B is submitted, so a disproven mapping is caught with
+    exactly one wrong-side position outstanding rather than a completed pair.
+    No-ops entirely on the legacy path and after the first confirmation
+    (_V2_NO_MAPPING_CONFIRMED), so the cost is one extra positions read per
+    process — not per trade.
+
+    Three outcomes:
+      * position < 0  -> hypothesis holds; latch it and proceed.
+      * position >= 0 -> hypothesis DISPROVEN live. Return a manual_review
+        result: leg B is not submitted (it would hedge a position we do not
+        actually hold) and leg A is deliberately NOT auto-unwound, because the
+        unwind mapping (_no_close_as_v2) rests on the same disproven
+        hypothesis and could add to the wrong exposure. This is the probe's
+        own "don't compound" rule and the module's standing manual_review
+        philosophy: never act automatically on a state we cannot model.
+      * lookup failed (None) -> unknown, not disproven. Warn and proceed
+        WITHOUT latching, so the next V2 NO fill retries the check. The fill
+        itself was already confirmed by the FoK response, so this does not
+        make the trade any more ambiguous than it already was.
+
+    Concurrency: execute_trades() runs pairs in parallel, so two trades can
+    reach this before either latches — that costs a duplicate positions read
+    and, in the disproven case, sends both to manual_review. Both outcomes are
+    harmless; a bool assignment is atomic under the GIL.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        spec (TradeSpec): The trade whose leg A just filled; its market_a
+            ticker is the one looked up.
+
+    Returns:
+        TradeResult | None: None when the caller should proceed to leg B
+            (mapping confirmed, or unverifiable); a status="manual_review"
+            TradeResult when the mapping was disproven and the pair must stop.
+    """
+    global _V2_NO_MAPPING_CONFIRMED
+    if not config.v2_orders_active() or _V2_NO_MAPPING_CONFIRMED:
+        return None
+    ticker = spec.pair.market_a.ticker
+    # Ground truth for the mapping: the account's own signed position.
+    pos = _position_count(client, ticker)
+    if pos is None:
+        logging.warning(
+            "Could not verify the V2 NO-leg position sign on %s — proceeding;"
+            " the leg-A fill itself was confirmed by the order response, and"
+            " the check retries on the next V2 NO fill",
+            ticker,
+        )
+        return None
+    if pos < 0:
+        _V2_NO_MAPPING_CONFIRMED = True
+        logging.info(
+            "V2 NO-leg mapping confirmed live: position %s on %s", pos, ticker,
+        )
+        return None
+    logging.critical(
+        "V2 NO-LEG MAPPING DISPROVEN on %s — position sign is WRONG after a"
+        " filled NO buy: expected negative NO exposure, got %s. NOT submitting"
+        " leg B and NOT auto-unwinding (the unwind rests on the same"
+        " hypothesis). A human must flatten this account position, and"
+        " config.V2_ORDERS_FORCE=False reverts to the legacy order path.",
+        ticker, pos,
+    )
+    return TradeResult(
+        spec=spec, status="manual_review",
+        error=(
+            f"V2 NO-leg mapping disproven: position sign {pos} on {ticker}"
+            f" after a filled NO buy (expected negative); leg B not submitted"
+            f" and leg A not unwound"
+        ),
+    )
+
+
 def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     """
     Execute one arbitrage pair with sequential leg submission and rollback.
@@ -1401,9 +1527,16 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     that we simply couldn't confirm — and is instead surfaced as
     status="manual_review" for a human to check the account.
 
-    A pair with a leg on a shard the legacy order endpoint cannot route to is
-    refused before anything is submitted (see _legacy_routable) — status
-    "failed", since nothing was sent and there is nothing to unwind.
+    While the LEGACY order path is in use, a pair with a leg on a shard that
+    endpoint cannot route to is refused before anything is submitted (see
+    _legacy_routable) — status "failed", since nothing was sent and there is
+    nothing to unwind. On the V2 path the guard does not apply: every order
+    body routes itself via its market's own exchange_index.
+
+    On the V2 path the first leg-A fill of the process is also checked against
+    the account's position sign (see _confirm_v2_no_mapping) — a wrong sign
+    disproves the unverified NO-leg mapping and stops the pair at
+    "manual_review" before leg B is submitted.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1413,25 +1546,27 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
         TradeResult: With status "executed", "failed", "rolled_back",
             "rollback_failed" (unwind did not fill — orphaned position needing
             manual review), or "manual_review" (leg B's fill state could not
-            be determined and no automated action was taken).
+            be determined, or the V2 NO-leg mapping was disproven — in both
+            cases no automated action was taken).
     """
-    # TEMPORARY shard guard — must run before ANY submission. The scanner now
+    # Legacy-mode shard guard — must run before ANY submission. The scanner
     # ingests markets from every shard, but the legacy order endpoint can only
-    # reach DEFAULT_EXCHANGE_INDEX; dies with the V2 order migration.
-    if not _legacy_routable(spec):
+    # reach DEFAULT_EXCHANGE_INDEX. Bypassed once V2 is active (by date or by
+    # config.V2_ORDERS_FORCE), because V2 bodies route per shard.
+    if not config.v2_orders_active() and not _legacy_routable(spec):
         shards = (
             f"{spec.pair.market_a.exchange_index}/{spec.pair.market_b.exchange_index}"
         )
         logging.warning(
             "Skipping '%s' — legs on exchange shards %s; the legacy order "
-            "endpoint cannot route off shard %d (V2 migration pending)",
+            "endpoint in use cannot route off shard %d (V2 order path inactive)",
             spec.pair.canonical_title, shards, DEFAULT_EXCHANGE_INDEX,
         )
         return TradeResult(
             spec=spec, status="failed",
             error=(
                 f"leg on exchange shard {shards} — legacy order endpoint "
-                f"cannot route; V2 migration pending"
+                f"cannot route; V2 order path inactive"
             ),
         )
 
@@ -1472,6 +1607,14 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             mA_title[:60], held_a, e,
         )
         return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
+
+    # Leg A filled. On the V2 path only, and only until it has been confirmed
+    # once in this process, check that the fill really opened a NO position —
+    # a wrong sign disproves the unverified mapping, and the pair must stop
+    # here rather than hedge (or unwind) a position we do not hold.
+    mapping_failure = _confirm_v2_no_mapping(client, spec)
+    if mapping_failure is not None:
+        return mapping_failure
 
     # Leg A filled — submit leg B — YES on market B (same submission seam)
     leg_b_error: str | None = None

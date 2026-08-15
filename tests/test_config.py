@@ -1,6 +1,7 @@
-"""Tests for config.py fee helpers and PROJECT_ROOT."""
+"""Tests for config.py fee helpers, the V2 order-path switch, and PROJECT_ROOT."""
 import math
 import pathlib
+from datetime import date
 
 import pytest
 
@@ -12,9 +13,11 @@ from kalshi_betting.config import (
     PROJECT_ROOT,
     SHORT_DEADLINE_GAP_DAYS,
     TAKER_FEE_RATE,
+    V2_ORDERS_START,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
+    v2_orders_active,
 )
 
 
@@ -98,3 +101,46 @@ class TestMinPriceDiffForGap:
         # The tiers the strategy is specified against: 15% short, 30% long
         assert MIN_PRICE_DIFF_SHORT_GAP == 0.15
         assert MIN_PRICE_DIFF_LONG_GAP == 0.30
+
+
+class TestV2OrdersActive:
+    """The order-path switch: automatic on V2_ORDERS_START (the combo
+    migration), with V2_ORDERS_FORCE as a two-way manual override."""
+
+    def test_start_date_is_the_combo_migration(self):
+        # Changing this changes when real orders switch wire format.
+        assert V2_ORDERS_START == date(2026, 8, 17)
+
+    def test_day_before_start_is_legacy(self):
+        assert v2_orders_active(today=date(2026, 8, 16)) is False
+
+    def test_start_date_itself_is_v2(self):
+        # Inclusive: the switch happens ON the migration date, not the day after.
+        assert v2_orders_active(today=date(2026, 8, 17)) is True
+
+    def test_after_start_is_v2(self):
+        assert v2_orders_active(today=date(2026, 8, 18)) is True
+
+    def test_force_true_overrides_an_early_date(self, monkeypatch):
+        monkeypatch.setattr(config, "V2_ORDERS_FORCE", True)
+        assert v2_orders_active(today=date(2026, 1, 1)) is True
+
+    def test_force_false_overrides_a_late_date(self, monkeypatch):
+        # The emergency fallback: legacy stays reachable forever, which is why
+        # the legacy order path is kept rather than deleted at the migration.
+        monkeypatch.setattr(config, "V2_ORDERS_FORCE", False)
+        assert v2_orders_active(today=date(2030, 1, 1)) is False
+
+    def test_force_defaults_to_none(self):
+        # None = "the date decides"; a committed bool would mean the repo ships
+        # a manual override as its production default.
+        assert config.V2_ORDERS_FORCE is None
+
+    def test_omitted_today_uses_the_current_utc_date(self, monkeypatch):
+        # Production passes no date. Verified by moving the START date rather
+        # than faking the clock: with a start far in the past the live call
+        # must be True, and far in the future it must be False.
+        monkeypatch.setattr(config, "V2_ORDERS_START", date(2000, 1, 1))
+        assert v2_orders_active() is True
+        monkeypatch.setattr(config, "V2_ORDERS_START", date(2100, 1, 1))
+        assert v2_orders_active() is False

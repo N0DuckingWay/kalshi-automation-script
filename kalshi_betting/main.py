@@ -210,9 +210,11 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # option labels (e.g. "Trump", "Above $80k") carry their event context
             _truncate(display_title(pair.market_a)),
             _truncate(display_title(pair.market_b)),
-            # Which exchange shard each leg lives on — a pair spanning shards
-            # is currently unexecutable (see trader._legacy_routable), so this
-            # explains an otherwise-puzzling "failed" result at a glance
+            # Which exchange shard each leg lives on — while the legacy order
+            # path is in use (before config.V2_ORDERS_START, or under
+            # V2_ORDERS_FORCE=False) a pair spanning shards is unexecutable
+            # (see trader._legacy_routable), so this explains an otherwise-
+            # puzzling "failed" result at a glance
             f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),

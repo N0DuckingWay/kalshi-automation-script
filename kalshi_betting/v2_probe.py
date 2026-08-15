@@ -10,7 +10,8 @@ Purpose:
 
         python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step <name>] [--yes]
 
-    It exists to satisfy the one gate on config.V2_ORDERS_ENABLED. The V2 order
+    It exists to verify, for about one cent, the one thing about the V2 order
+    path that cannot be proven offline. The V2 order
     path in trader.py is complete and unit-tested, but its NO-leg mapping is an
     unverified HYPOTHESIS that cannot be proven offline: V2 has no
     side="no"/action="buy" vocabulary, so "buy NO at <= p" is mapped onto an
@@ -22,13 +23,23 @@ Purpose:
     _build_v2_order_body, _submit_order_v2) and reports whether the account
     position moved the way the hypothesis predicts.
 
+    STRONGLY RECOMMENDED, NO LONGER A HARD GATE. The switch to V2 is automatic
+    on config.V2_ORDERS_START and does not wait for this probe. What backstops
+    it instead is trader._confirm_v2_no_mapping(), which checks the very same
+    position sign on the first live V2 NO fill of a process — but that check
+    pays for its evidence with a REAL trade-sized position, while this probe
+    buys the identical evidence for ~1c. Run it before the switchover date if
+    at all possible. If either mapping step FAILS, set
+    config.V2_ORDERS_FORCE = False to hold the bot on the legacy order path.
+
     *** REAL MONEY. *** Every step here submits live orders (or moves live
     collateral) against the PRODUCTION account. Worst-case exposure is the V2
     minimum fractional count of 0.01 contracts — roughly one cent — but it is
     real, it is not a simulation, and there is no dry-run mode: a probe that
     doesn't submit proves nothing. Every request body and every raw response is
-    printed verbatim, and that printed output IS the evidence log that gates
-    the V2_ORDERS_ENABLED flip.
+    printed verbatim, and that printed output IS the evidence log behind the
+    decision to let the V2 switchover proceed (or to hold it with
+    config.V2_ORDERS_FORCE = False).
 
 Dependencies:
     Imports the auth, config, scanner and trader MODULES (module-style, so the
@@ -65,8 +76,8 @@ Notes:
     EXIT CODES: 0 = every executed step PASSED, 1 = something FAILED, 2 =
     NEUTRAL (the step could not be run to a conclusion — no fill, no liquidity,
     aborted at the prompt, or a skipped transfer step). Only a 0 from BOTH
-    mapping steps (--step no-mapping and --step unfillable-ask) may be used to
-    justify flipping config.V2_ORDERS_ENABLED.
+    mapping steps (--step no-mapping and --step unfillable-ask) is evidence
+    that the V2 switchover may be allowed to proceed unattended.
 """
 import argparse
 import json
@@ -108,7 +119,7 @@ def _emit(label: str, payload: Any) -> None:
 
     Every request body and every raw response goes through here, pretty-printed
     with indent=2, because this output is the artifact a human reads when
-    deciding whether to flip config.V2_ORDERS_ENABLED.
+    deciding whether to let the V2 switchover proceed.
 
     Args:
         label (str): Short human-readable name for the block, e.g.
@@ -454,7 +465,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool) -> str:
             "trader._no_buy_as_v2 takes the wrong side of the market. The reduce_only "
             "unwind is NOT being submitted — it rests on the same disproven mapping and "
             "would add to this exposure. *** FLATTEN THE POSITION MANUALLY. *** "
-            "config.V2_ORDERS_ENABLED must stay False."
+            "Set config.V2_ORDERS_FORCE = False to hold the bot on the legacy order path."
         )
         return _FAIL
     if after == 0:
@@ -503,7 +514,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool) -> str:
         print(
             f"{_FAIL}: the reduce_only bid did NOT return the position to flat (position="
             f"{final}; None means the lookup failed). *** CHECK THE ACCOUNT MANUALLY. *** "
-            "config.V2_ORDERS_ENABLED must stay False."
+            "Set config.V2_ORDERS_FORCE = False to hold the bot on the legacy order path."
         )
         return _FAIL
 
@@ -794,8 +805,8 @@ def main(argv: list | None = None) -> int:
         int: 0 when the step PASSED, 1 when it FAILED, 2 when it was NEUTRAL
             (no verdict reached — no fill, no liquidity, skipped, or aborted at
             the confirmation prompt). Only a 0 from BOTH no-mapping and
-            unfillable-ask may be used to justify flipping
-            config.V2_ORDERS_ENABLED.
+            unfillable-ask is evidence that the V2 switchover may be allowed
+            to proceed unattended.
     """
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.v2_probe",
@@ -832,7 +843,7 @@ def main(argv: list | None = None) -> int:
     print(f"step={args.step}  ticker={args.ticker}  worst-case exposure per order: "
           f"{PROBE_COUNT_STR} contracts (about one cent)")
     print("Every request body and raw response below is the evidence log for the "
-          "config.V2_ORDERS_ENABLED decision — keep it.")
+          "V2 switchover decision — keep it.")
     print("=" * 78)
 
     if args.step in _TICKER_STEPS and not args.ticker:
@@ -854,13 +865,15 @@ def main(argv: list | None = None) -> int:
     print(f"\n================ RESULT: {args.step} -> {outcome} ================")
     if outcome != _PASS:
         print(
-            "config.V2_ORDERS_ENABLED must stay False. Both --step no-mapping and --step "
-            "unfillable-ask have to PASS before it may be flipped."
+            "Set config.V2_ORDERS_FORCE = False to hold the bot on the legacy order path. "
+            "Both --step no-mapping and --step unfillable-ask have to PASS before the "
+            "automatic V2 switchover should be trusted to run unsupervised."
         )
     else:
         print(
-            "Record this output. config.V2_ORDERS_ENABLED may only be flipped once BOTH "
-            "--step no-mapping and --step unfillable-ask have PASSED."
+            "Record this output. The automatic V2 switchover (config.V2_ORDERS_START) is "
+            "only known-good once BOTH --step no-mapping and --step unfillable-ask "
+            "have PASSED."
         )
     return _EXIT_CODES[outcome]
 

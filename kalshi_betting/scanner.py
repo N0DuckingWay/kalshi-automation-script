@@ -134,7 +134,7 @@ def _parse_price_ranges(raw: Any) -> list | None:
     array means "tick structure unknown", never an error — trader._tick_bands()
     degrades an unusable grid to whole cents rather than raising (combo markets
     move to $0.0001 ticks on 2026-08-17). The bands are read only on the V2
-    order path, which is gated on config.V2_ORDERS_ENABLED.
+    order path, which activates per config.v2_orders_active().
 
     Args:
         raw (Any): The raw `price_ranges` value from a market JSON dict —
@@ -442,14 +442,14 @@ class ApiMarket:
             _parse_price_ranges), or None when unknown/unparseable/absent.
             Read by trader._tick_bands() to quantize V2 limit prices onto the
             market's own grid (V2 order path only — see
-            config.V2_ORDERS_ENABLED).
+            config.v2_orders_active).
         exchange_index (int): The exchange shard this market lives on (see
             _shard_index). Market data is cross-shard, so every shard's
-            markets are ingested and simply tagged with this; it is
-            trader._legacy_routable that refuses to submit an order for a
-            non-DEFAULT_EXCHANGE_INDEX market until the V2 migration lands.
-            Defaults to DEFAULT_EXCHANGE_INDEX's value when the payload omits
-            the field.
+            markets are ingested and simply tagged with this; on the V2 order
+            path it routes the order, and while the legacy path is in use it
+            is trader._legacy_routable that refuses to submit an order for a
+            non-DEFAULT_EXCHANGE_INDEX market. Defaults to
+            DEFAULT_EXCHANGE_INDEX's value when the payload omits the field.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str

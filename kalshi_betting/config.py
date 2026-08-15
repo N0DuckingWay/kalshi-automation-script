@@ -21,9 +21,14 @@ Notes:
     machine regardless of where the repo is cloned.
     The sandbox URL (demo-api.kalshi.co) requires a completely separate account
     registered at demo.kalshi.co — the production API key will return 401 there.
+    v2_orders_active() is the one value here that is NOT a constant: it reads
+    the UTC clock (and the V2_ORDERS_FORCE override) so the order path can
+    switch wire formats by date without a code change. Callers must call it
+    rather than caching its result.
 """
 import math
 import pathlib
+from datetime import UTC, date, datetime
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
 
@@ -117,10 +122,12 @@ TAKER_FEE_RATE                = 0.07
 # 2026-08-17, this 1c tolerance permits ~100 ticks of price drift rather than
 # the intended ~1.
 #
-# STILL LIVE, DO NOT REMOVE: the legacy path is what runs while
-# V2_ORDERS_ENABLED is False. Its dollar-denominated V2 replacement is
-# BUY_PRICE_SLIPPAGE_DOLLARS below, which IS tick-aware (it is quantized onto
-# the market's real grid from ApiMarket.price_level_structure / price_ranges).
+# STILL LIVE, DO NOT REMOVE: the legacy path is what runs whenever
+# v2_orders_active() is False — before V2_ORDERS_START, or permanently under
+# the V2_ORDERS_FORCE=False kill switch. Its dollar-denominated V2 replacement
+# is BUY_PRICE_SLIPPAGE_DOLLARS below, which IS tick-aware (it is quantized
+# onto the market's real grid from ApiMarket.price_level_structure /
+# price_ranges).
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
 # ── V2 order endpoint (/portfolio/events/orders) ──────────────────────────────
@@ -135,7 +142,7 @@ V2_CREATE_ORDER_PATH = "/trade-api/v2/portfolio/events/orders"
 
 # Per-contract price slippage allowance, in DOLLARS, for the V2 FoK limit cap.
 # Replaces-in-spirit BUY_MAX_COST_SLIPPAGE_CENTS on the V2 path (the legacy
-# constant above stays in use until V2_ORDERS_ENABLED is flipped). 0.01
+# constant above stays in use whenever v2_orders_active() is False). 0.01
 # preserves exactly the legacy one-cent tolerance on linear_cent markets, but
 # unlike the legacy cap it is a TRUE per-contract price cap: trader
 # _quantize_to_tick() snaps (scanned price + this) onto the market's own tick
@@ -149,16 +156,36 @@ BUY_PRICE_SLIPPAGE_DOLLARS = 0.01
 # taker, so this can never cancel the order we are submitting.
 V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
-# Master switch for the V2 order path in trader._submit_leg(). While False (the
-# default) every leg is submitted through the legacy /portfolio/orders path
-# exactly as before, and the V2 code is dead weight on disk.
+# The date on which trader._submit_leg() starts putting V2 bodies on the wire
+# (see v2_orders_active() at the bottom of this file, the ONLY reader).
 #
-# Flipped only after the live NO-leg mapping probe passes (see v2_probe): the
-# mapping of "buy NO" onto V2's bid/ask vocabulary (hypothesis: buy NO at p ==
-# ask on the YES book at 1-p; unwind == bid + reduce_only) is UNVERIFIED
-# against the real API, and it is the one thing in the V2 path that cannot be
-# proven offline. Do not flip this from a code change alone.
-V2_ORDERS_ENABLED = False
+# 2026-08-17 is the combo-migration date: the first day markets exist off
+# DEFAULT_EXCHANGE_INDEX, after which the legacy /portfolio/orders endpoint —
+# which has no shard-routing parameter — structurally cannot serve the full
+# market universe. From that day the bot must be on V2 or it silently stops
+# being able to trade a growing slice of the exchange.
+#
+# Compared in UTC deliberately, even though the exchange's calendar is
+# US/Eastern: a UTC date rolls over 4-5 hours BEFORE the Eastern one, so the
+# switch flips EARLY rather than late. That is the safe direction — V2 already
+# works for shard-0 markets today (it is a strictly richer wire format for the
+# same orders), whereas switching late would leave the newly-migrated shard-1
+# markets unroutable through the legacy endpoint while the bot still tried.
+V2_ORDERS_START = date(2026, 8, 17)
+
+# Manual override for the date-based switch above, and the emergency kill
+# switch for the V2 path:
+#   None  -> the date decides (V2_ORDERS_START, in UTC). The normal setting.
+#   True  -> force V2 on regardless of the date. For testing, or for flipping
+#            early once the live probe (v2_probe) has raised confidence.
+#   False -> force the legacy /portfolio/orders path on regardless of the date.
+#            This is why the legacy path is kept alive permanently rather than
+#            deleted at the migration: if V2 misbehaves after the switch, this
+#            is the one-line fallback, and trader._legacy_routable() then goes
+#            back to refusing the non-shard-0 markets legacy cannot route.
+# Tests monkeypatch THIS, never the date — a test that pinned the date would
+# start lying about which path production actually takes.
+V2_ORDERS_FORCE: bool | None = None
 
 # The default exchange shard. Kalshi partitions the exchange into parallel
 # instances keyed by `exchange_index` (on market payloads and in the balance
@@ -170,10 +197,12 @@ V2_ORDERS_ENABLED = False
 #   2. The shard the legacy / sandbox balance shapes map to — a body with no
 #      per-shard balance_breakdown is a single-shard body
 #      (see auth._balance_cents_by_shard).
-#   3. Until the V2 order migration lands, the ONLY shard the legacy
-#      /portfolio/orders endpoint can reach: it has no shard-routing
-#      parameter, so an order for a market on another shard would fail or
-#      misroute (see trader._legacy_routable, which dies with that migration).
+#   3. The ONLY shard the legacy /portfolio/orders endpoint can reach: it has
+#      no shard-routing parameter, so an order for a market on another shard
+#      would fail or misroute (see trader._legacy_routable, which refuses such
+#      pairs whenever v2_orders_active() is False — before V2_ORDERS_START, or
+#      under the V2_ORDERS_FORCE=False kill switch. V2 routes per shard and
+#      needs no such guard).
 # Market DATA is cross-shard — every shard's markets are ingested and tagged;
 # only order submission is shard-limited.
 DEFAULT_EXCHANGE_INDEX        = 0
@@ -319,6 +348,49 @@ MVE_MAX_EMPTY_PAGES = 25
 # 60 (hourly) is the finest granularity actually available — period_interval=1
 # (minute) returns HTTP 400.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
+
+
+def v2_orders_active(today: date | None = None) -> bool:
+    """
+    Return True when order submission should use the V2 wire format.
+
+    The single source of truth for which order path runs — trader._submit_leg()
+    calls this once per leg, and trader._execute_one() calls it to decide
+    whether the legacy-only shard guard applies. Precedence:
+
+      1. V2_ORDERS_FORCE, when it is not None, wins outright in BOTH
+         directions: True forces V2 on before the date, False forces the legacy
+         path on after it (the emergency fallback, which is why the legacy path
+         is kept permanently rather than deleted).
+      2. Otherwise the date decides: V2 is active on and after V2_ORDERS_START.
+
+    The date comparison is made against the UTC calendar day even though the
+    exchange runs on US/Eastern, so the switch flips a few hours EARLY. That is
+    the safe direction: V2 already handles shard-0 markets correctly today,
+    while flipping late would leave the just-migrated non-shard-0 markets
+    unroutable through the legacy endpoint (see V2_ORDERS_START).
+
+    V2_ORDERS_FORCE is read as a module global at call time, so monkeypatching
+    config.V2_ORDERS_FORCE (which every V2 test does) takes effect immediately
+    without reloading this module or the modules that import it.
+
+    Args:
+        today (date | None): Calendar date to evaluate the switch against,
+            injected by tests so they never have to pin the real clock. None
+            (the production case) means "the current UTC date".
+
+    Returns:
+        bool: True if the V2 order path should be used, False for the legacy
+            /portfolio/orders path.
+    """
+    if V2_ORDERS_FORCE is not None:
+        return V2_ORDERS_FORCE
+    # Explicit None check, not `today or ...`: a date is always truthy, but
+    # being explicit keeps the intent obvious next to the falsy-bool override
+    # handling above.
+    if today is None:
+        today = datetime.now(UTC).date()
+    return today >= V2_ORDERS_START
 
 
 def min_price_diff_for_gap(gap_days: int) -> float:

@@ -70,7 +70,7 @@ main.py
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
   ├─ trader.ensure_shard_collateral() — (prod only) transfer cash onto each leg's exchange shard and wait for it to land; trades whose shard can't be funded are dropped
-  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg (parallel across pairs, rollback on partial fill; pairs with a leg off shard 0 are refused unsubmitted until the V2 order migration)
+  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg (parallel across pairs, rollback on partial fill; while the legacy order path is active — before `config.V2_ORDERS_START` (2026-08-17) or under `V2_ORDERS_FORCE=False` — pairs with a leg off shard 0 are refused unsubmitted, since only V2 routes per shard)
   └─ reporter.append_to_prod_log() — write results to trade_log.xlsx
 ```
 
@@ -110,7 +110,7 @@ backtest.py (CLI)
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments, builds the historical API clients, calls `backtester.run_backtest()` then `dashboard.generate_dashboard()`, and logs a summary. |
-| `v2_probe.py` | **User-run live verification gate for the V2 order mapping — never imported by the pipeline.** Submits 0.01-contract (≈1c) real orders through the exact `trader` functions the V2 path would use, to prove that an `ask` opens a NO position and a `reduce_only` `bid` closes it. `config.V2_ORDERS_ENABLED` stays `False` until it passes. Must be run by a human; see Run Commands. |
+| `v2_probe.py` | **User-run live verification of the V2 order mapping — never imported by the pipeline.** Submits 0.01-contract (≈1c) real orders through the exact `trader` functions the V2 path would use, to prove that an `ask` opens a NO position and a `reduce_only` `bid` closes it. Strongly recommended before the automatic V2 switchover on `config.V2_ORDERS_START` (2026-08-17); if it fails, `config.V2_ORDERS_FORCE = False` holds the bot on the legacy order path. Must be run by a human; see Run Commands. |
 
 ---
 
@@ -285,8 +285,13 @@ step reports `PASS` / `FAIL` / `NEUTRAL` (exit code `0` / `1` / `2`).
 Its purpose is to verify the one thing about the V2 order path that cannot be
 tested offline: that a V2 `ask` on the YES book **opens a NO position** (the
 account's `position_fp` goes negative) and that a `reduce_only` `bid` nets it
-back to flat. `config.V2_ORDERS_ENABLED` stays `False` until both `--step
-no-mapping` and `--step unfillable-ask` PASS; the printed bodies and raw
+back to flat. The switch to V2 happens automatically on
+`config.V2_ORDERS_START` (2026-08-17) whether or not this has been run — a
+runtime backstop in `trader._execute_one()` checks the same position sign on the
+first live V2 NO fill — so run the probe first if you can: it buys the same
+evidence for about a cent instead of a real position. If either `--step
+no-mapping` or `--step unfillable-ask` fails, set `config.V2_ORDERS_FORCE =
+False` to hold the bot on the legacy order path. The printed bodies and raw
 responses are the evidence for that decision, so keep the output. Pick a
 **liquid, cheap** market for `--ticker` — there is deliberately no default, and
 the account must be flat on that ticker before the probe starts.
