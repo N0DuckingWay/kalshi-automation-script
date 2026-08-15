@@ -13,9 +13,11 @@ Purpose:
     files on disk so re-runs do not re-fetch from the API.
 
 Dependencies:
-    Imports build_client from auth.py and PROJECT_ROOT from config.py. Exports
-    build_historical_client(), build_prod_live_client(), fetch_all_settled_markets(),
-    fetch_candlesticks(), and infer_category() — all called by backtester.py.
+    Imports build_client from auth.py, PROJECT_ROOT from config.py, and
+    api_call_with_retry / fetch_json_page / signed_raw_request from _http.py
+    (the leaf module — see _http.py for why). Exports build_historical_client(),
+    build_prod_live_client(), fetch_all_settled_markets(), fetch_candlesticks(),
+    and infer_category() — all called by backtester.py.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -29,9 +31,10 @@ Notes:
     The pinned SDK (kalshi-python-sync==3.2.0) ships no historical_api module,
     and 2026-07 API drift broke its Market response model anyway (legacy
     integer-cent fields are no longer sent). All /historical endpoints are
-    therefore reached with direct signed GETs (_signed_raw_get) through the
-    SDK's own KalshiAuth + rest client, and responses are parsed as raw JSON —
-    same pattern as scanner.py/trader.py (see _http.fetch_json_page).
+    therefore reached with direct signed GETs (_signed_raw_get, now a thin
+    delegate onto the generalized _http.signed_raw_request) through the SDK's
+    own KalshiAuth + rest client, and responses are parsed as raw JSON — same
+    pattern as scanner.py/trader.py (see _http.fetch_json_page).
 
     fetch_all_settled_markets is sharded and incremental (2026-07 rewrite):
     the /historical/markets archive is paged by (created_time DESC, ticker
@@ -62,9 +65,9 @@ from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
-from ._http import api_call_with_retry, fetch_json_page
+from ._http import api_call_with_retry, fetch_json_page, signed_raw_request
 from .auth import build_client
 from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -91,10 +94,13 @@ except ImportError:
     orjson = None  # type: ignore[assignment]
     _HAVE_ORJSON = False
 
-# Host and path prefix split out of PROD_URL ("https://host/trade-api/v2") so
-# _signed_raw_get can sign the path component and hit arbitrary API routes.
+# Path prefix split out of PROD_URL ("https://host/trade-api/v2") so callers
+# can build full /historical/* paths for _signed_raw_get / signed_raw_request.
+# The host component used to be split out here too (_API_HOST), but that was
+# hardcoded to prod; host derivation now lives in _http.signed_raw_request,
+# read per-call off the client's own configuration.host, so the same helper
+# also works against a sandbox client.
 _PROD_PARSED = urlparse(PROD_URL)
-_API_HOST = f"{_PROD_PARSED.scheme}://{_PROD_PARSED.netloc}"
 _API_PREFIX = _PROD_PARSED.path  # "/trade-api/v2"
 
 CACHE_DIR = PROJECT_ROOT / "backtest_cache"
@@ -149,11 +155,11 @@ def _signed_raw_get(client: Any, path: str, **params):
     Perform a signed GET against an arbitrary API path via the SDK's transport.
 
     The pinned SDK has no historical_api module, so /historical routes cannot
-    be reached through generated methods. This helper signs the request the
-    same way every SDK call is signed (KalshiAuth: RSA-PSS over
-    timestamp+method+path) and executes it with the client's own rest client,
-    returning the RESTResponse so fetch_json_page can apply the shared
-    status-check + JSON-parse contract.
+    be reached through generated methods. This is now a thin delegate onto
+    _http.signed_raw_request (the generalized helper, which also covers other
+    verbs and JSON bodies) — kept as its own name/signature here since every
+    call site in this module already spells it this way and it reads more
+    naturally as a GET-only helper at each of those sites.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -164,13 +170,7 @@ def _signed_raw_get(client: Any, path: str, **params):
     Returns:
         RESTResponse: The raw response (status + body bytes), unparsed.
     """
-    query = urlencode({k: v for k, v in params.items() if v is not None})
-    url = f"{_API_HOST}{path}" + (f"?{query}" if query else "")
-    # Query strings are excluded from the signature by Kalshi's auth scheme —
-    # only timestamp + method + path are signed
-    headers = {"accept": "application/json"}
-    headers.update(client.kalshi_auth.create_auth_headers("GET", path))
-    return client.rest_client.request("GET", url, headers=headers)
+    return signed_raw_request(client, "GET", path, params=params)
 
 
 def _historical_get(client: Any, path: str, **params) -> dict:

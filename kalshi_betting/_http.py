@@ -5,8 +5,10 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Shared HTTP helpers for Kalshi SDK calls: a retry wrapper (429/5xx plus
-    transient connection failures, with exponential backoff) and a raw-response
-    JSON fetcher for the SDK's `*_without_preload_content` endpoint variants.
+    transient connection failures, with exponential backoff), a raw-response
+    JSON fetcher for the SDK's `*_without_preload_content` endpoint variants,
+    and a generic signed raw HTTP request builder for routes (or HTTP verbs,
+    or JSON bodies) the pinned SDK's generated methods cannot express at all.
     Both the live scanner and the historical fetch pipeline import from here so
     backoff behavior stays consistent and there is no scanner → historical
     reverse import.
@@ -17,6 +19,9 @@ Dependencies:
     ApiException from the kalshi_python_sync SDK to re-raise raw-response
     HTTP errors with the same exception types the modeled calls used, and
     (optionally) urllib3's exception types to recognize transport-level drops.
+    signed_raw_request() additionally uses stdlib urllib.parse (urlencode,
+    urlsplit) to build the request URL and derive the host from whichever
+    client (prod or sandbox) is passed in — still no project imports.
 
 Notes:
     The Kalshi SDK's ApiException exposes .status; requests-based errors expose
@@ -29,6 +34,13 @@ Notes:
     models type as required, so modeled calls raise pydantic ValidationError.
     Raw-response variants bypass the models — but they also skip the SDK's
     status check, which fetch_json_page restores.
+
+    signed_raw_request() exists for routes the SDK has no generated method for
+    at all (e.g. /historical/*) and for request shapes the SDK's pydantic
+    request models would mangle (e.g. a POST body with extra fields a strict
+    model silently drops). It signs and executes the request directly through
+    the SDK's own KalshiAuth + rest client, so it inherits the SDK's TLS/retry
+    plumbing without going through any generated method.
 """
 import json
 import logging
@@ -36,6 +48,7 @@ import time
 from collections.abc import Callable
 from http.client import IncompleteRead
 from typing import Any
+from urllib.parse import urlencode, urlsplit
 
 from kalshi_python_sync.exceptions import ApiException
 
@@ -233,3 +246,77 @@ def api_call_with_retry(fn: Callable, *args, **kwargs):
             )
             time.sleep(delay)
             delay = min(delay * 2, _MAX_DELAY)
+
+
+def signed_raw_request(
+    client: Any,
+    method: str,
+    path: str,
+    params: dict | None = None,
+    body: dict | None = None,
+):
+    """
+    Perform a signed HTTP request against an arbitrary API path and method.
+
+    Generalizes historical._signed_raw_get (which proved this pattern for
+    GET-only /historical routes) into a leaf-module helper any caller can use
+    for any verb, including a POST with an arbitrary JSON body. This exists
+    because the pinned SDK's generated methods either don't cover a route at
+    all (e.g. /historical/*) or use pydantic request models that silently
+    DROP unknown fields (e.g. CreateOrderRequest has no slot for
+    exchange_index) — a signed raw request bypasses the model entirely and
+    sends exactly the dict the caller builds.
+
+    Kalshi's signature scheme (KalshiAuth: RSA-PSS over
+    timestamp + METHOD + path) covers ONLY the method and path — the query
+    string is never part of the signed material, and the body is never
+    hashed into it either. So arbitrary query params and JSON bodies are
+    signature-safe: appending or changing them cannot invalidate
+    create_auth_headers' signature, which is why `params` and `body` are
+    plain passthroughs below rather than something that needs to feed back
+    into the signing step.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+            Only two SDK primitives are used: client.kalshi_auth
+            (signing) and client.rest_client (transport) — no generated
+            endpoint method is called, so this works for routes the SDK
+            doesn't model at all.
+        method (str): HTTP method, e.g. "GET" or "POST".
+        path (str): Full API path INCLUDING the /trade-api/v2 prefix (e.g.
+            "/trade-api/v2/portfolio/events/orders"). This exact string,
+            without the query string, is what gets signed.
+        params (dict | None): Query parameters; None-valued entries are
+            dropped before URL-encoding, same convention as the old
+            historical._signed_raw_get. Ignored (no "?") if empty/None.
+        body (dict | None): JSON request body as a plain dict. Passed straight
+            through to the SDK's rest client, which json.dumps() it verbatim
+            — so any extra keys the caller adds (e.g. exchange_index) survive
+            onto the wire even though a pydantic request model would have
+            silently discarded them. Content-Type is only set to
+            application/json when a body is supplied. None means no body is
+            sent at all (not even "null").
+
+    Returns:
+        RESTResponse: The raw response (status + body bytes), unparsed. Pass
+            it (or rather, call this via a fetch_fn wrapper) through
+            fetch_json_page for the shared status-check + JSON-parse
+            contract; this function deliberately does not parse or raise.
+    """
+    # Host is derived per-call from the client's own configuration, not a
+    # module-level prod constant — this is what makes the helper usable
+    # against both prod and sandbox clients (unlike the old
+    # historical._API_HOST, which was hardcoded to PROD_URL).
+    parsed_host = urlsplit(client.configuration.host)
+    api_host = f"{parsed_host.scheme}://{parsed_host.netloc}"
+    # Query strings are excluded from the signature by Kalshi's auth scheme —
+    # only timestamp + method + path are signed, so building the query string
+    # after signing is safe.
+    query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
+    url = f"{api_host}{path}" + (f"?{query}" if query else "")
+    headers = {"accept": "application/json"}
+    headers.update(client.kalshi_auth.create_auth_headers(method, path))
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        return client.rest_client.request(method, url, headers=headers, body=body)
+    return client.rest_client.request(method, url, headers=headers)

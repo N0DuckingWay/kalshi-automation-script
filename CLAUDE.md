@@ -22,7 +22,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 |--------|------|-------------|
 | `config.py` | All constants and fee/threshold helpers — imported by everyone | `PROJECT_ROOT`, `BUDGET_FRACTION`, `fee_per_pair_approx()`, `fee_leg_exact()`, `min_price_diff_for_gap()` |
 | `auth.py` | Builds authenticated `KalshiClient` | `build_client(mode)`, `verify_auth(client)` |
-| `_http.py` | Shared HTTP retry + raw-response JSON fetch helpers | `api_call_with_retry()`, `fetch_json_page()` |
+| `_http.py` | Shared HTTP retry + raw-response JSON fetch helpers | `api_call_with_retry()`, `fetch_json_page()`, `signed_raw_request()` |
 | `scanner.py` | Fetches markets, detects pairs, validates orderbook depth | `CandidatePair`, `ApiMarket`, `normalize_title()`, `pair_key()`, `display_title()`, `fetch_open_events_with_markets()`, `find_time_series_pairs()`, `find_same_title_pairs()`, `enrich_with_orderbook_prices()`, `filter_markets_within_horizon()`, `get_held_tickers()` |
 | `strategy.py` | Kelly sizing, portfolio selection | `TradeSpec`, `compute_trade()`, `select_portfolio()` |
 | `trader.py` | Order submission with atomic rollback | `execute_trades()`, `pre_execution_check()` |

@@ -4,16 +4,21 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Offline unit tests for kalshi_betting._http — the shared retry wrapper and
-    the raw-response JSON fetcher. Covers the retry classification rules that
-    every market-data call depends on: HTTP 429/5xx back off, transient
-    transport failures (connection reset, truncated body, read timeout) back
-    off, and everything else fails fast.
+    Offline unit tests for kalshi_betting._http — the shared retry wrapper,
+    the raw-response JSON fetcher, and the generic signed raw HTTP request
+    builder. Covers the retry classification rules that every market-data
+    call depends on: HTTP 429/5xx back off, transient transport failures
+    (connection reset, truncated body, read timeout) back off, and everything
+    else fails fast. Also covers signed_raw_request's URL/header/body
+    construction — the mechanism the upcoming V2 order-submission migration
+    depends on to send fields (e.g. exchange_index) the pinned SDK's pydantic
+    request models would silently drop.
 
 Dependencies:
-    Imports api_call_with_retry, fetch_json_page, and _is_transient_network_error
-    from kalshi_betting._http. Uses unittest.mock to stand in for SDK calls —
-    no network access.
+    Imports api_call_with_retry, fetch_json_page, signed_raw_request, and
+    _is_transient_network_error from kalshi_betting._http, and historical
+    (to test _signed_raw_get's delegation onto signed_raw_request).
+    Uses unittest.mock to stand in for SDK calls — no network access.
 
 Notes:
     time.sleep is patched out in every retry test so the suite doesn't actually
@@ -26,11 +31,12 @@ import pytest
 from kalshi_python_sync.exceptions import ApiException
 from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
-from kalshi_betting import _http
+from kalshi_betting import _http, historical
 from kalshi_betting._http import (
     _is_transient_network_error,
     api_call_with_retry,
     fetch_json_page,
+    signed_raw_request,
 )
 
 
@@ -174,3 +180,98 @@ class TestFetchJsonPage:
         fetch_fn = MagicMock(return_value=self._response(429, b'{"error": "slow down"}'))
         with pytest.raises(ApiException):
             fetch_json_page(fetch_fn)
+
+
+def _mock_client(host: str = "https://api.elections.kalshi.com/trade-api/v2") -> MagicMock:
+    """
+    Minimal KalshiClient stand-in exposing only the two SDK primitives
+    signed_raw_request touches: client.configuration.host (for host
+    derivation) and client.kalshi_auth / client.rest_client (for signing and
+    transport). No generated endpoint method is ever called.
+    """
+    client = MagicMock()
+    client.configuration.host = host
+    client.kalshi_auth.create_auth_headers = MagicMock(
+        return_value={"KALSHI-ACCESS-SIGNATURE": "sig", "KALSHI-ACCESS-TIMESTAMP": "123"}
+    )
+    client.rest_client.request = MagicMock(return_value=MagicMock(status=200, data=b"{}"))
+    return client
+
+
+class TestSignedRawRequest:
+    """URL/header/body construction for the generic signed raw HTTP helper."""
+
+    def test_get_with_params_builds_query_and_signs_bare_path(self):
+        client = _mock_client()
+        path = "/trade-api/v2/historical/markets"
+        signed_raw_request(client, "GET", path, params={"limit": 1000, "cursor": None})
+
+        # Query string carries only the non-None param; None-valued params
+        # are omitted entirely (same convention the old _signed_raw_get had).
+        called_url = client.rest_client.request.call_args.args[1]
+        assert called_url == f"https://api.elections.kalshi.com{path}?limit=1000"
+
+        # Kalshi's signature covers only timestamp+METHOD+path — the query
+        # string must NOT be part of what gets signed.
+        client.kalshi_auth.create_auth_headers.assert_called_once_with("GET", path)
+
+    def test_post_with_body_sets_content_type_and_forwards_dict_verbatim(self):
+        client = _mock_client()
+        path = "/trade-api/v2/portfolio/events/orders"
+        body = {"ticker": "ABC", "side": "yes", "exchange_index": 1}
+        signed_raw_request(client, "POST", path, body=body)
+
+        call = client.rest_client.request.call_args
+        assert call.args[0] == "POST"
+        assert call.args[1] == f"https://api.elections.kalshi.com{path}"
+        assert call.kwargs["headers"]["Content-Type"] == "application/json"
+        # The exact dict is passed through — this is the mechanism that lets
+        # a field like exchange_index (which a pydantic request model would
+        # silently drop) actually reach the wire.
+        assert call.kwargs["body"] is body
+        assert call.kwargs["body"]["exchange_index"] == 1
+
+    def test_sandbox_host_produces_sandbox_origin_url(self):
+        client = _mock_client(host="https://demo-api.kalshi.co/trade-api/v2")
+        path = "/trade-api/v2/portfolio/balance"
+        signed_raw_request(client, "GET", path)
+
+        called_url = client.rest_client.request.call_args.args[1]
+        assert called_url.startswith("https://demo-api.kalshi.co")
+        assert "api.elections.kalshi.com" not in called_url
+
+    def test_no_params_no_body_produces_bare_url_no_content_type(self):
+        client = _mock_client()
+        path = "/trade-api/v2/historical/cutoff"
+        signed_raw_request(client, "GET", path)
+
+        call = client.rest_client.request.call_args
+        called_url = call.args[1]
+        assert called_url == f"https://api.elections.kalshi.com{path}"
+        assert "?" not in called_url
+        assert "Content-Type" not in call.kwargs["headers"]
+        # No body kwarg at all when body is None — matches the pre-existing
+        # GET-only call shape (_signed_raw_get never passed body=).
+        assert "body" not in call.kwargs
+
+    def test_empty_params_dict_produces_bare_url(self):
+        client = _mock_client()
+        path = "/trade-api/v2/historical/markets"
+        signed_raw_request(client, "GET", path, params={})
+
+        called_url = client.rest_client.request.call_args.args[1]
+        assert called_url == f"https://api.elections.kalshi.com{path}"
+
+
+class TestSignedRawGetDelegation:
+    """historical._signed_raw_get must forward onto the generalized helper."""
+
+    def test_delegates_to_signed_raw_request(self, monkeypatch):
+        mock = MagicMock(return_value=MagicMock(status=200, data=b"{}"))
+        monkeypatch.setattr(historical, "signed_raw_request", mock)
+
+        client = MagicMock()
+        path = "/trade-api/v2/historical/markets"
+        historical._signed_raw_get(client, path, limit=1000, cursor="abc")
+
+        mock.assert_called_once_with(client, "GET", path, params={"limit": 1000, "cursor": "abc"})
