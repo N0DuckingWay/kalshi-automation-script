@@ -33,6 +33,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 | `backtester.py` | Replays strategy on settled market history | `run_backtest()` |
 | `dashboard.py` | Generates self-contained HTML performance report | `generate_dashboard()` |
 | `backtest.py` | CLI entry point for the backtest pipeline | — |
+| `v2_probe.py` | User-run live verification gate for the V2 order mapping — never imported by the pipeline | `main()` (CLI only) |
 
 **Dependency order (no circular imports):**
 ```
@@ -43,6 +44,8 @@ config.py, _http.py
                   └─ main.py, scheduler.py
 
 historical.py → backtester.py → dashboard.py → backtest.py
+
+v2_probe.py  (DETACHED: imports auth/config/scanner/trader; NOTHING imports it)
 ```
 
 ---
@@ -81,6 +84,14 @@ python3 -m kalshi_betting.backtest --max-horizon-days 14
 
 # Weekly scheduler daemon (runs prod every Monday 09:00)
 python3 -m kalshi_betting.scheduler
+
+# V2 order-path live probe — REAL MONEY, run BY HAND ONLY, never from code.
+# Submits 0.01-contract (~1c) orders on the production account to verify the
+# V2 NO-leg mapping. Exit 0 = PASS, 1 = FAIL, 2 = NEUTRAL (no verdict).
+python3 -m kalshi_betting.v2_probe --ticker <TICKER>                     # mapping gate (default step)
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> --step unfillable-ask
+python3 -m kalshi_betting.v2_probe --step transfer                       # 1c inter-shard round trip
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> --yes               # skip the confirm prompts
 
 # Run tests
 python3 -m pytest tests/ -v
@@ -227,6 +238,8 @@ Check `pair.tradeable` to distinguish.
 - **Plain-dict bodies with an EXPLICIT `exchange_index`.** `_build_v2_order_body()` returns a plain dict, never the SDK's `CreateOrderRequest` — that pydantic model has no slot for `exchange_index` and would silently DROP it, sending an unrouted order. The shard is the market's own `ApiMarket.exchange_index`, deliberately **not** the `-1` auto-route sentinel: a wrong shard tag must be rejected loudly rather than silently settled against a shard the collateral planner never funded. `client_order_id` is a fresh uuid4 per order (it's the exchange's dedupe handle), `time_in_force="fill_or_kill"`, `post_only=False`, `cancel_order_on_pause=True`, and `self_trade_prevention_type` is REQUIRED (`config.V2_SELF_TRADE_PREVENTION_TYPE`).
 - **No retry, same as legacy.** `_submit_order_v2()` goes through `_http.signed_raw_request` composed with `fetch_json_page` (so non-2xx still raises `ApiException` and callers' exception handling is unchanged) and is deliberately NOT wrapped in `api_call_with_retry` — retrying a FoK order can double-submit a leg at a different price.
 - `trader._legacy_routable()` still refuses cross-shard pairs at the top of `_execute_one()`. It is the V2 flip that retires that guard, not this commit.
+
+**How the V2 gate is satisfied: `kalshi_betting/v2_probe.py`, run BY A HUMAN.** The flag may only be flipped on live evidence, and the probe is the only sanctioned way to produce it: `python3 -m kalshi_betting.v2_probe --ticker <TICKER>` (plus `--step unfillable-ask`; `--step transfer` is optional). Both mapping steps must print **PASS** — `no-mapping` (an `ask` FoK fills and the account's `position_fp` goes NEGATIVE, then a `reduce_only` `bid` returns it to 0) and `unfillable-ask` (an ask one tick below 1 comes back with `fill_count` 0 and `remaining_count == count`, confirming FoK kill semantics and that an ask's limit is a FLOOR on proceeds — the direction `_no_buy_as_v2`'s `ROUND_CEILING` assumes). The evidence is the probe's stdout: every request body and every raw response is printed verbatim with `json.dumps(indent=2)`. Exit codes are 0/1/2 = PASS/FAIL/NEUTRAL, and **NEUTRAL is not a pass** — a killed order or an illiquid book proves nothing, so re-run on a more liquid ticker. Load-bearing properties of the probe, don't erode them: (1) it calls the REAL `trader._no_buy_as_v2` / `_no_close_as_v2` / `_build_v2_order_body` / `_submit_order_v2`, never a reimplementation — verifying a copy verifies nothing; (2) it submits `count` `"0.01"` (the V2 fractional minimum, ≈1c of exposure) by building the body through `_build_v2_order_body` and overriding that one field, because the builder takes `count: int` — **trader.py is not modified for the probe's benefit**, the code under test must stay byte-identical to the code that will run; (3) nothing is submitted until the body is printed and the operator types "yes" (`--yes` skips it for repeat runs); (4) a POSITIVE position after the ask is a hard FAIL that deliberately does **not** submit the unwind — the unwind rests on the same disproven mapping and would add to the wrong exposure, so the operator flattens manually; (5) it is PROD-only (`build_client("prod")`) since the sandbox has neither V2 orders nor shards; (6) **nothing imports it** — `tests/test_v2_probe.py` asserts via AST that no pipeline module carries an import edge to it (prose mentions in trader.py's docstring are fine), because one import away from the scheduler is one too many for a module that places real orders. There is no dry-run mode and there must never be one: a probe that doesn't submit proves nothing.
 
 ---
 

@@ -47,6 +47,10 @@ secrets.json + PEM key
     historical.py ──→ backtester.py ──→ dashboard.py
                             |
                     backtest.py (CLI entry)
+
+
+    v2_probe.py (DETACHED — user-run live verification CLI)
+        imports auth/config/scanner/trader; NOTHING imports it
 ```
 
 ### Live Trading Data Flow
@@ -106,6 +110,7 @@ backtest.py (CLI)
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments, builds the historical API clients, calls `backtester.run_backtest()` then `dashboard.generate_dashboard()`, and logs a summary. |
+| `v2_probe.py` | **User-run live verification gate for the V2 order mapping — never imported by the pipeline.** Submits 0.01-contract (≈1c) real orders through the exact `trader` functions the V2 path would use, to prove that an `ask` opens a NO position and a `reduce_only` `bid` closes it. `config.V2_ORDERS_ENABLED` stays `False` until it passes. Must be run by a human; see Run Commands. |
 
 ---
 
@@ -261,6 +266,35 @@ python3 -m kalshi_betting.scheduler
 ```
 
 Runs the production bot every Monday at 09:00 in a blocking loop. The log also prints the equivalent `crontab` entry if you prefer cron.
+
+### V2 order-path live probe (⚠️ REAL MONEY — run by hand, never automate)
+
+```bash
+python3 -m kalshi_betting.v2_probe --ticker <TICKER>                    # the mapping gate
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> --step unfillable-ask
+python3 -m kalshi_betting.v2_probe --step transfer
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> --yes              # skip the prompts
+```
+
+**This submits real orders against your production account.** There is no
+dry-run mode — a probe that doesn't submit proves nothing. Exposure is capped at
+the V2 minimum of `0.01` contracts (about one cent) per order, every request
+body is printed and must be confirmed interactively before it is sent, and each
+step reports `PASS` / `FAIL` / `NEUTRAL` (exit code `0` / `1` / `2`).
+
+Its purpose is to verify the one thing about the V2 order path that cannot be
+tested offline: that a V2 `ask` on the YES book **opens a NO position** (the
+account's `position_fp` goes negative) and that a `reduce_only` `bid` nets it
+back to flat. `config.V2_ORDERS_ENABLED` stays `False` until both `--step
+no-mapping` and `--step unfillable-ask` PASS; the printed bodies and raw
+responses are the evidence for that decision, so keep the output. Pick a
+**liquid, cheap** market for `--ticker` — there is deliberately no default, and
+the account must be flat on that ticker before the probe starts.
+
+`--step transfer` round-trips one cent between shard 0 and shard 1 to confirm
+the transfer endpoint's centicent unit and its asynchronous settle timing; it
+skips itself with a message when the exchange reports no second shard or
+inactive transfers.
 
 ---
 
