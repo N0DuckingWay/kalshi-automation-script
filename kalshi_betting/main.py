@@ -21,11 +21,18 @@ Dependencies:
 """
 import argparse
 import logging
+import pathlib
 
 from tabulate import tabulate
 
 from .auth import build_client, verify_auth
-from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
+from .config import (
+    MIN_BALANCE_CENTS,
+    MIN_PRICE_DIFF_LONG_GAP,
+    MIN_PRICE_DIFF_SHORT_GAP,
+    PROJECT_ROOT,
+    SAME_TITLE_MIN_PRICE_DIFF,
+)
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     display_title,
@@ -114,6 +121,33 @@ def _print_portfolio(portfolio: list, label: str) -> None:
             spec.total_cost, spec.min_payoff,
             spec.profit_ratio * 100,
         )
+
+
+def _no_pairs_msg(sandbox: bool = False) -> str:
+    """
+    Build the "no qualifying pairs found" log message with live threshold values.
+
+    Formats the deadline-gap-tiered time-series thresholds and the same-title
+    threshold straight from config.py so this message can never drift out of
+    sync with the values `min_price_diff_for_gap()` and the pair-finders
+    actually enforce.
+
+    Args:
+        sandbox (bool): True to phrase the message for a dev/sandbox run
+            ("... found in sandbox ..."), False for a production run.
+            Defaults to False.
+
+    Returns:
+        str: The fully formatted log message, ready to pass to logging.info().
+    """
+    thresholds = (
+        f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} "
+        f"deadline-gap-tiered time-series or ≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} "
+        "same-title price diff"
+    )
+    if sandbox:
+        return f"No qualifying pairs found in sandbox ({thresholds})."
+    return f"No qualifying pairs found ({thresholds})."
 
 
 def _dedup_pairs(primary: list, secondary: list) -> list:
@@ -256,7 +290,7 @@ def _run_dev(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info("No qualifying pairs found in sandbox (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
+        logging.info(_no_pairs_msg(sandbox=True))
         # Write an empty simulation file so the run is still recorded
         out = write_dev_simulation([], [], sandbox_balance_cents)
         logging.info("Dev simulation written (empty): %s", out)
@@ -339,7 +373,7 @@ def _run_prod(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info("No qualifying pairs found (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
+        logging.info(_no_pairs_msg())
         return
 
     # Apply Kelly sizing to each candidate pair using the real account balance
@@ -422,6 +456,34 @@ def _run_prod(client, args) -> None:
             )
 
 
+def _setup_logging(log_path: pathlib.Path) -> None:
+    """
+    Configure root logging with both a console handler and a file handler.
+
+    Uses logging.basicConfig() with two handlers so every log line reaches
+    both the terminal (for interactive/foreground runs) and the persistent
+    log file (for later inspection, e.g. by the scheduler daemon). The file
+    handler is opened with delay=True so merely calling this function — e.g.
+    from a test or an import that doesn't go on to log anything — does not
+    touch disk; the file is only created on the first emitted record.
+
+    Args:
+        log_path (pathlib.Path): Path to the log file to append to.
+
+    Returns:
+        None
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, delay=True),
+        ],
+    )
+
+
 def main() -> None:
     """
     CLI entry point for the Kalshi arbitrage bot.
@@ -452,14 +514,9 @@ def main() -> None:
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
-        ],
-    )
+    # Echo to the console (foreground/interactive runs) as well as the
+    # persistent log file (later inspection, scheduler-spawned runs)
+    _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
 
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 

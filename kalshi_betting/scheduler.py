@@ -21,8 +21,12 @@ Notes:
     trade, valid prod credentials must be present in secrets.json and the PEM key
     file. If you want the scheduler to run at a different time or interval, edit
     the `schedule.every().monday.at("09:00")` call in main().
+    The Monday 09:00 schedule fires in HOST-LOCAL time (the `schedule` library
+    reads the system clock, no timezone conversion) — this is deliberate,
+    existing behavior, not a bug to "fix" by adding UTC conversion.
 """
 import logging
+import pathlib
 import subprocess
 import sys
 import time
@@ -55,7 +59,7 @@ def run_job() -> None:
             capture_output=True,
             text=True,
             # Run from the project root so relative paths in main.py resolve correctly
-            cwd=str(__import__("pathlib").Path(__file__).parent.parent),
+            cwd=str(PROJECT_ROOT),
             # Kill a hung run rather than blocking the daemon forever
             timeout=SCHEDULER_JOB_TIMEOUT_SECONDS,
         )
@@ -73,6 +77,33 @@ def run_job() -> None:
         logging.info("Job completed successfully.")
 
 
+def _setup_logging(log_path: pathlib.Path) -> None:
+    """
+    Configure root logging with both a console handler and a file handler.
+
+    main.py has a twin of this helper (kalshi_betting.main._setup_logging).
+    The two are deliberately duplicated rather than shared: scheduler.py must
+    not import main.py (scheduler spawns main as an isolated subprocess so a
+    crash in one run can't take down the daemon — importing main directly
+    would defeat that isolation and create a needless coupling).
+
+    Args:
+        log_path (pathlib.Path): Path to the log file to append to.
+
+    Returns:
+        None
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, delay=True),
+        ],
+    )
+
+
 def main() -> None:
     """
     Entry point for the weekly scheduler daemon.
@@ -81,20 +112,13 @@ def main() -> None:
     prints cron job instructions as an alternative, then enters an infinite
     polling loop checking for pending jobs every 60 seconds.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
-        ],
-    )
+    _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
 
     # Register run_job() to fire every Monday at 09:00 local time
     schedule.every().monday.at("09:00").do(run_job)
 
     python_path  = sys.executable
-    project_path = str(__import__("pathlib").Path(__file__).parent.parent)
+    project_path = str(PROJECT_ROOT)
 
     logging.info("Scheduler started. Runs every Monday at 09:00.")
     logging.info(

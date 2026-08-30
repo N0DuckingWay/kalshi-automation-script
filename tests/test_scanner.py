@@ -3,11 +3,13 @@ import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from kalshi_betting import scanner
 from kalshi_betting.config import INCLUDE_MVE_MARKETS, ROUTABLE_EXCHANGE_INDEX
 from kalshi_betting.scanner import (
     CandidatePair,
@@ -23,6 +25,7 @@ from kalshi_betting.scanner import (
     find_time_series_pairs,
     normalize_title,
     pair_key,
+    tick_size_for_price,
     validate_pair_price,
 )
 
@@ -501,10 +504,12 @@ def _orderbook_payload_client(payload: dict):
 
 
 class TestFetchOrderbookKeyMapping:
-    """_fetch_orderbook must couple the container key to its matched side keys:
-    orderbook_fp -> yes_dollars/no_dollars, orderbook -> yes/no. A container whose
-    matched side keys are missing is a potential API-shape mismatch — logged and
-    treated as unavailable (None), never cross-read against the other generation."""
+    """_fetch_orderbook supports exactly one matched key generation:
+    orderbook_fp -> yes_dollars/no_dollars. A container whose matched side keys
+    are missing is a potential API-shape mismatch — logged and treated as
+    unavailable (None), never read through whatever side keys happen to be there.
+    The legacy `orderbook` container (integer-cent yes/no arrays, removed from the
+    API 2026-03-12) is unsupported and must fail closed loudly."""
 
     def test_current_format_parses(self):
         # orderbook_fp container with dollar-string side arrays (the live shape)
@@ -513,15 +518,35 @@ class TestFetchOrderbookKeyMapping:
         ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CURRENT")
         assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
 
-    def test_legacy_format_parses(self):
-        # orderbook container with legacy yes/no side arrays still routes correctly
-        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
-        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
-        assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+    def test_legacy_orderbook_container_fails_closed(self, caplog):
+        # The legacy `orderbook` container is no longer a recognized generation:
+        # it must return None and name the response keys, not parse its
+        # integer-cent arrays as dollars.
+        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
+        assert ob is None
+        assert "No usable orderbook" in caplog.text
+        assert "MKT-LEGACY" in caplog.text
+        assert "orderbook" in caplog.text
+
+    def test_legacy_cents_never_reach_dollar_parser(self):
+        # A legacy cents bid of 35 would parse as an ask of 1.0 - 35 = -34.0 and
+        # be dropped by the price-range check, yielding a silently EMPTY book.
+        # Fail-closed (None) is the required outcome — never a parsed book, and
+        # never an empty-but-successful one.
+        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTS")
+        assert ob is None
+        # Guard the same thing end-to-end: no ask levels are derivable, so the
+        # pair is marked non-tradeable rather than sized off a phantom book.
+        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
+        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
+        assert enriched.tradeable is False
 
     def test_mixed_generation_keys_return_none_and_warn(self, caplog):
-        # orderbook_fp container but with the OTHER generation's side keys —
-        # must not cross-read; returns None and logs a key-mismatch warning.
+        # orderbook_fp container but with the legacy generation's side keys —
+        # must not be read; returns None and logs a key-mismatch warning.
         payload = {"orderbook_fp": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-MIXED")
@@ -769,6 +794,23 @@ class TestOnRoutableShard:
         # constant, not a hardcoded 0 that would silently diverge from it.
         assert _on_routable_shard({"exchange_index": ROUTABLE_EXCHANGE_INDEX}) is True
 
+    def test_explicit_zero_index_is_not_treated_as_missing(self, monkeypatch):
+        # A declared exchange_index of 0 is a data statement, not an absent
+        # field. With a falsy-conflating `or` fallback, `0 or 1 == 1` would
+        # judge a shard-0 market routable the day the routable shard moves to
+        # 1 — the exact misroute this guard exists to prevent.
+        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
+        assert scanner._on_routable_shard({"exchange_index": 0}) is False
+        assert scanner._on_routable_shard({"exchange_index": 1}) is True
+
+    def test_missing_null_and_garbage_index_fail_safe(self, monkeypatch):
+        # The fail-safe (absence must never empty the market list) holds
+        # regardless of which shard is configured routable.
+        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
+        assert scanner._on_routable_shard({}) is True
+        assert scanner._on_routable_shard({"exchange_index": None}) is True
+        assert scanner._on_routable_shard({"exchange_index": "garbage"}) is True
+
 
 class TestFetchOpenEventsShardFilter:
     """Markets on non-routable exchange shards must never become candidates —
@@ -986,9 +1028,9 @@ class TestFilterMarketsWithinHorizon:
 
 
 class TestParsePriceRanges:
-    """_parse_price_ranges: groundwork ingest for the price_ranges tick-band
-    array (2026-08). Nothing consumes the parsed bands yet — these tests only
-    cover the parse itself."""
+    """_parse_price_ranges: ingest for the price_ranges tick-band array
+    (2026-08). These tests cover the parse itself; tick_size_for_price's
+    reading of the parsed bands is covered by TestTickSizeForPrice below."""
 
     def test_single_band_deci_cent(self):
         bands = _parse_price_ranges(
@@ -1078,3 +1120,68 @@ class TestTickStructureIngest:
         m = self._parse_one()
         assert m.price_level_structure == ""
         assert m.price_ranges is None
+
+
+class TestTickSizeForPrice:
+    """tick_size_for_price: maps a price onto the market's own tick grid,
+    falling back to the coarse $0.01 grid (valid on every regime, since the
+    grids are nested) whenever the structure is uniform-cent or unusable."""
+
+    # center_deci_edge_centi_cent: $0.0001 below $0.01 and above $0.99,
+    # $0.001 in between — the regime MVE/combo markets moved to on 2026-08-17.
+    _CENTI_BANDS = [
+        PriceRange(start=0.0, end=0.01, step=0.0001),
+        PriceRange(start=0.01, end=0.99, step=0.001),
+        PriceRange(start=0.99, end=1.0, step=0.0001),
+    ]
+
+    @staticmethod
+    def _market(structure: str, ranges) -> SimpleNamespace:
+        """SimpleNamespace market stand-in carrying only the tick fields read."""
+        return SimpleNamespace(
+            ticker="KXTEST-1", price_level_structure=structure, price_ranges=ranges,
+        )
+
+    def test_linear_cent_returns_one_cent(self):
+        m = self._market("linear_cent", [PriceRange(start=0.0, end=1.0, step=0.01)])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_empty_structure_returns_one_cent(self):
+        m = self._market("", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_deci_cent_uniform_band(self):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.001)])
+        assert tick_size_for_price(m, 0.42) == Decimal("0.001")
+
+    def test_centi_cent_middle_band_is_deci_cent(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.50) == Decimal("0.001")
+
+    def test_centi_cent_edge_bands(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.005) == Decimal("0.0001")
+        assert tick_size_for_price(m, 0.995) == Decimal("0.0001")
+
+    def test_band_boundary_price_uses_first_containing_band(self):
+        # 0.01 is the end of band 1 and the start of band 2; first match wins.
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.01) == Decimal("0.0001")
+
+    def test_none_ranges_falls_back(self):
+        # Structure names a fine grid but the bands failed to parse — the
+        # coarse default is still a valid grid point on every regime.
+        m = self._market("deci_cent", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_no_containing_band_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=0.4, step=0.001)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.9) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text
+
+    def test_nonpositive_step_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.0)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text

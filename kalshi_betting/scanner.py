@@ -38,10 +38,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    DEFAULT_TICK_SIZE_DOLLARS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
@@ -103,8 +105,7 @@ class PriceRange:
     Kalshi markets can have a non-uniform tick grid across their price range
     (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
     structure). Each band names its own step size; a market's full grid is
-    the ordered list of bands covering [0, 1]. Nothing consumes these bands
-    yet — see _parse_price_ranges.
+    the ordered list of bands covering [0, 1]. Read by tick_size_for_price().
 
     Attributes:
         start (float): Lower bound of this band, in dollars (e.g. 0.0).
@@ -121,9 +122,10 @@ def _parse_price_ranges(raw: Any) -> list | None:
     Parse a raw price_ranges array into PriceRange bands, or None if unknown.
 
     Fail-soft per the return-None convention: a missing, empty, or malformed
-    array means "tick structure unknown", never an error — nothing consumes
-    these bands yet (groundwork for tick-aware order caps after the V2 order
-    migration; combo markets move to $0.0001 ticks on 2026-08-17).
+    array means "tick structure unknown", never an error — tick_size_for_price()
+    then falls back to the default $0.01 grid, which is valid on every regime
+    because Kalshi's grids are nested (combo markets moved to the
+    center_deci_edge_centi_cent tick regime on 2026-08-17).
 
     Args:
         raw (Any): The raw `price_ranges` value from a market JSON dict —
@@ -147,6 +149,75 @@ def _parse_price_ranges(raw: Any) -> list | None:
         except (KeyError, TypeError, ValueError):
             continue
     return bands or None
+
+
+def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
+    """
+    Return the tick size, in dollars, that applies at a given price on a market.
+
+    Kalshi markets no longer share one uniform price grid. Known regimes, named
+    by `price_level_structure`: "linear_cent" (uniform $0.01), "deci_cent"
+    (uniform $0.001), "tapered_deci_cent" (banded), and
+    "center_deci_edge_centi_cent" ($0.0001 below $0.01 and above $0.99, $0.001
+    in between). The authoritative grid is the market's own `price_ranges`
+    bands; the structure name is only used to short-circuit the uniform-cent
+    case. The first band containing the price wins, so a price sitting exactly
+    on a band boundary resolves to the earlier (by convention finer) band.
+
+    These grids are NESTED: $0.01 ⊂ $0.001 ⊂ $0.0001, so every point of a
+    coarser grid is also a point of any finer one. Later price math relies on
+    that — a cap computed as price + n × tick that crosses into a neighbouring
+    band still lands on a valid grid point of that band, and the $0.01 fallback
+    below is valid on every regime — so this function does not need to
+    re-quantize across band edges.
+
+    Returns a Decimal (never a float) because the V2 order endpoint takes
+    dollar-string prices: binary float noise in a tick size would propagate
+    into a price string the exchange rejects as off-grid.
+
+    Args:
+        market (Any): A market object — ApiMarket or any object with
+            `price_level_structure` (str) and `price_ranges`
+            (list[PriceRange] | None) attributes. Missing attributes are
+            treated as unknown, not as an error.
+        price_dollars (float): The price at which the tick size is needed, in
+            dollars. Range: [0, 1].
+
+    Returns:
+        Decimal: The tick size in dollars for that price. Falls back to
+            Decimal(config.DEFAULT_TICK_SIZE_DOLLARS) when the structure is
+            uniform-cent or unknown, when no band contains the price, or when
+            the matching band's step is nonpositive — logging a warning in the
+            latter two cases, which indicate a payload that drifted from the
+            shapes above.
+    """
+    default = Decimal(DEFAULT_TICK_SIZE_DOLLARS)
+    structure = getattr(market, "price_level_structure", "") or ""
+    bands = getattr(market, "price_ranges", None)
+    # Uniform-cent markets (and any market whose bands failed to parse — see
+    # _parse_price_ranges' fail-soft contract) use the coarse default grid.
+    if structure in ("", "linear_cent") or not bands:
+        return default
+
+    for band in bands:
+        try:
+            if band.start <= price_dollars <= band.end:
+                # Decimal(str(...)), never Decimal(float): the float came from
+                # parsing a dollar string and str() round-trips it back exactly.
+                step = Decimal(str(band.step))
+                if step > 0:
+                    return step
+                break
+        except (AttributeError, TypeError, InvalidOperation):
+            break
+
+    # Only reached on a malformed or non-covering band list; called once per
+    # order leg at build time, so a warning here cannot spam the log.
+    logging.warning(
+        "No usable tick band for %s at price %.4f (structure=%r) — falling back to $%s",
+        getattr(market, "ticker", "<unknown>"), price_dollars, structure, DEFAULT_TICK_SIZE_DOLLARS,
+    )
+    return default
 
 
 @dataclass
@@ -424,11 +495,11 @@ class ApiMarket:
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
         price_level_structure (str): Tick regime name, e.g. "linear_cent",
-            "tapered_deci_cent", "deci_cent". "" if absent — nothing reads
-            this field yet (groundwork for a future tick-aware order cap).
+            "tapered_deci_cent", "deci_cent". "" if absent. Read by
+            tick_size_for_price(), which trader.py uses to cap V2 order prices.
         price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
             _parse_price_ranges), or None when unknown/unparseable/absent.
-            Nothing reads this field yet either.
+            Also read by tick_size_for_price() — the authoritative grid.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -495,8 +566,11 @@ def _on_routable_shard(m: dict) -> bool:
     Markets on other exchange shards must never become candidates: the legacy
     create-order endpoint has no shard routing, so an order for a shard-1
     market would fail or misroute at submission time. A missing, null, or
-    unparseable exchange_index is treated as shard 0 (fail-safe — absence of
-    the field must not empty the market list).
+    unparseable exchange_index is treated as routable (fail-safe — absence of
+    the field must not empty the market list). An explicitly declared index is
+    always compared against ROUTABLE_EXCHANGE_INDEX — an `or`-style fallback
+    would conflate a declared 0 with a missing field, which silently inverts
+    the guard the day ROUTABLE_EXCHANGE_INDEX is changed to a non-zero shard.
 
     Args:
         m (dict): One raw market JSON dict from an events-endpoint payload.
@@ -504,8 +578,12 @@ def _on_routable_shard(m: dict) -> bool:
     Returns:
         bool: True if the market is tradeable by our order path.
     """
+    raw = m.get("exchange_index")
+    if raw is None:
+        # Field absent or null — fail-safe: treat as routable
+        return True
     try:
-        return int(m.get("exchange_index") or ROUTABLE_EXCHANGE_INDEX) == ROUTABLE_EXCHANGE_INDEX
+        return int(raw) == ROUTABLE_EXCHANGE_INDEX
     except (TypeError, ValueError):
         return True
 
@@ -968,17 +1046,22 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     return levels
 
 
-# Matched wire-format generations for the orderbook response: each container key
-# pairs with its OWN side keys and units, and the two must never be mixed. The
-# current live API returns the book under `orderbook_fp` with dollar-string bid
-# arrays; the legacy `orderbook` container carried integer-cent arrays. Resolving
-# container and side keys independently (a plain `or` across both generations)
-# risked cross-reading a cents array through the dollars parser, so the pairing is
-# enforced explicitly in _fetch_orderbook. Order matters: orderbook_fp (current)
-# is tried before orderbook (legacy).
+# Supported wire format for the orderbook response: the container key pairs with
+# its OWN side keys and units. Only the current generation is supported — the live
+# API returns the book under `orderbook_fp` with dollar-string bid arrays.
+#
+# The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays) is
+# deliberately NOT listed: Kalshi removed every legacy integer price field from
+# its REST/WS payloads on 2026-03-12, and _bids_to_ask_levels parses entries as
+# dollars unconditionally, so a cents bid of 35 would become an ask of -34.0 and
+# be silently dropped by the price-range check — an empty book with no warning.
+# Omitting it routes any legacy-shaped (or otherwise unknown) container to the
+# loud no-usable-orderbook path in _fetch_orderbook, which fails closed and names
+# the response keys. The container-key-presence selection and matched-side-key
+# enforcement below stay in place: they still guard against a future unknown
+# generation being cross-read through this generation's dollar parser.
 _ORDERBOOK_SIDE_KEYS: dict[str, tuple[str, str]] = {
     "orderbook_fp": ("yes_dollars", "no_dollars"),
-    "orderbook": ("yes", "no"),
 }
 
 
@@ -986,15 +1069,21 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     """
     Fetch the order book for a market.
 
-    The live Kalshi API returns the book under one of two matched key generations
-    (see _ORDERBOOK_SIDE_KEYS): the current `orderbook_fp` container with
-    `yes_dollars`/`no_dollars` dollar-string bid arrays, or the legacy `orderbook`
-    container with `yes`/`no` arrays. The container key selects which side keys are
-    expected — the two generations are never mixed. Once a container is found, its
-    matched side keys MUST be present (either may be empty or null for a side with
-    no resting bids); a container whose matched side keys are absent, or which is
-    not even a dict, signals a Kalshi API shape change and is treated as a hard
-    failure rather than silently cross-reading the other generation's keys.
+    Only the current matched key generation is supported (see
+    _ORDERBOOK_SIDE_KEYS): the `orderbook_fp` container with
+    `yes_dollars`/`no_dollars` dollar-string bid arrays. The container key selects
+    which side keys are expected, and once a container is found its matched side
+    keys MUST be present (either may be empty or null for a side with no resting
+    bids); a container whose matched side keys are absent, or which is not even a
+    dict, signals a Kalshi API shape change and is treated as a hard failure
+    rather than silently reading some other generation's keys.
+
+    The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays, removed
+    from the API on 2026-03-12) is deliberately unsupported: it is not a
+    recognized container key, so it falls through to the no-usable-orderbook
+    warning and returns None. That is intentional — the dollars parser would
+    misread cent bids as out-of-range asks and hand back an empty book with no
+    warning at all.
 
     Args:
         client (Any): Authenticated KalshiClient exposing the raw-response
@@ -1033,14 +1122,12 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             return None
         ob = data[container_key]
         yes_key, no_key = _ORDERBOOK_SIDE_KEYS[container_key]
-        # TODO: validate this strict container->side-key mapping against captured
-        # test data from Kalshi's live API.
         if not isinstance(ob, dict) or yes_key not in ob or no_key not in ob:
             # Container present but its matched side keys are absent (or it is not
             # even a dict). This is a potential key mismatch — the container and
             # side keys have drifted out of sync, or Kalshi changed the response
-            # shape. Fail closed instead of cross-reading the other generation's
-            # keys (which could feed a cents array through the dollars parser).
+            # shape. Fail closed instead of guessing at whatever side keys ARE
+            # present (which could feed a cents array through the dollars parser).
             logging.warning(
                 "Potential orderbook key mismatch for %s: container '%s' present but its "
                 "expected side keys %s are missing (got %s) — check for bugs or changes to "
