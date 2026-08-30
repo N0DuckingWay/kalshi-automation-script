@@ -495,8 +495,11 @@ def _on_routable_shard(m: dict) -> bool:
     Markets on other exchange shards must never become candidates: the legacy
     create-order endpoint has no shard routing, so an order for a shard-1
     market would fail or misroute at submission time. A missing, null, or
-    unparseable exchange_index is treated as shard 0 (fail-safe — absence of
-    the field must not empty the market list).
+    unparseable exchange_index is treated as routable (fail-safe — absence of
+    the field must not empty the market list). An explicitly declared index is
+    always compared against ROUTABLE_EXCHANGE_INDEX — an `or`-style fallback
+    would conflate a declared 0 with a missing field, which silently inverts
+    the guard the day ROUTABLE_EXCHANGE_INDEX is changed to a non-zero shard.
 
     Args:
         m (dict): One raw market JSON dict from an events-endpoint payload.
@@ -504,8 +507,12 @@ def _on_routable_shard(m: dict) -> bool:
     Returns:
         bool: True if the market is tradeable by our order path.
     """
+    raw = m.get("exchange_index")
+    if raw is None:
+        # Field absent or null — fail-safe: treat as routable
+        return True
     try:
-        return int(m.get("exchange_index") or ROUTABLE_EXCHANGE_INDEX) == ROUTABLE_EXCHANGE_INDEX
+        return int(raw) == ROUTABLE_EXCHANGE_INDEX
     except (TypeError, ValueError):
         return True
 
