@@ -495,11 +495,11 @@ class ApiMarket:
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
         price_level_structure (str): Tick regime name, e.g. "linear_cent",
-            "tapered_deci_cent", "deci_cent". "" if absent — nothing reads
-            this field yet (groundwork for a future tick-aware order cap).
+            "tapered_deci_cent", "deci_cent". "" if absent. Read by
+            tick_size_for_price(), which trader.py uses to cap V2 order prices.
         price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
             _parse_price_ranges), or None when unknown/unparseable/absent.
-            Nothing reads this field yet either.
+            Also read by tick_size_for_price() — the authoritative grid.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str

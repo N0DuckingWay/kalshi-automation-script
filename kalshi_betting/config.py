@@ -112,17 +112,17 @@ TAKER_FEE_RATE                = 0.07
 # protects against the order book moving between the pre-execution check and
 # submission: the order fills at or below (scanned price + allowance) or not at all.
 # This stays a whole-cent value because `buy_max_cost` is an integer-cents field
-# on the legacy /portfolio/orders create-order endpoint the bot still submits
-# through — a sub-cent-aware cap can't be expressed there no matter how finely
-# a market's own tick grid is subdivided (see ApiMarket.price_level_structure /
-# price_ranges in scanner.py, ingested but not yet read). On 2026-08-17, all
-# MVE/combo markets migrated to the `center_deci_edge_centi_cent` tick regime —
-# $0.0001 ticks below $0.01 and above $0.99, $0.001 ticks in between — so this
-# 1c tolerance now permits roughly 10-100 ticks of price drift on those
-# markets, depending on where in the band the price sits, rather than the
-# intended ~1. Fixing this requires migrating order submission to the V2
-# endpoint (dollar-string prices), which is a deliberately deferred follow-up
-# — see CLAUDE.md.
+# on the legacy /portfolio/orders create-order endpoint — a sub-cent-aware cap
+# can't be expressed there no matter how finely a market's own tick grid is
+# subdivided (see ApiMarket.price_level_structure / price_ranges in scanner.py).
+# On 2026-08-17, all MVE/combo markets migrated to the
+# `center_deci_edge_centi_cent` tick regime — $0.0001 ticks below $0.01 and
+# above $0.99, $0.001 ticks in between — so this 1c tolerance permits roughly
+# 10-100 ticks of price drift on those markets, depending on where in the band
+# the price sits, rather than the intended ~1. That is precisely why the
+# default order path is now ORDER_API_VERSION = "v2" (below), whose dollar-
+# string limit price is capped in ticks; this constant only still applies when
+# that switch is flipped back to "legacy" as a rollback.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
 # Slippage allowance for the V2 order path, denominated in TICKS of the market's
@@ -145,12 +145,50 @@ BUY_SLIPPAGE_TICKS            = 1
 # the API's dollar-string fields exist to avoid.
 DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 
+# Which create-order endpoint trader.py submits through. Allowed values:
+#   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
+#              (the limit price IS the price protection), fixed-point counts,
+#              bid/ask sides on the single YES book, explicit exchange_index.
+#              Only this path can express a cap at the market's real tick
+#              resolution (see BUY_SLIPPAGE_TICKS above).
+#   "legacy" — the original /portfolio/orders create-order call
+#              (CreateOrderRequest, type="market", integer-cents buy_max_cost
+#              via BUY_MAX_COST_SLIPPAGE_CENTS).
+# The legacy path is retained UNMODIFIED in trader.py purely so flipping this
+# constant to "legacy" is the instant rollback procedure if the first live or
+# sandbox V2 submission misbehaves — no code change, no redeploy of logic.
+# Default is "v2" because the legacy endpoint is past its "no earlier than
+# 2026-05-06" deprecation window and costs 5x rate-limit tokens per request.
+# Note that dev/sandbox V2 support is UNVERIFIED (dev mode never submits
+# orders), so the first real production submission is the true verification of
+# the V2 request/response mapping — see the V2 gotcha in CLAUDE.md.
+ORDER_API_VERSION             = "v2"
+
+# Full API path of the V2 create-order endpoint, including the /trade-api/v2
+# prefix. A constant (not an inline literal) because the path is signed as part
+# of every request — _http.signed_request_json signs timestamp + method + path,
+# so the string used to build the URL and the string that is signed must be one
+# and the same value.
+V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
+
+# Limit price, as a dollar string, for the V2 reduce-only rollback bid that
+# unwinds a filled leg A. On the single-YES-book model a held NO position is a
+# short YES, so closing it is a YES BUY (bid). The legacy rollback was a
+# type="market" sell with no price at all; V2 has no market type, so an
+# aggressive limit is what emulates it: $0.99 crosses any resting ask on the
+# grid, making the fill-or-kill unwind as likely to fill as the old market
+# order. Deliberately not $1.00 — that is not a tradeable price level.
+V2_ROLLBACK_BID_PRICE_DOLLARS = "0.99"
+
 # The only exchange shard our order path can reach. Kalshi now partitions the
 # exchange into parallel instances keyed by `exchange_index` (on markets and
 # in the balance breakdown; index 1 observed live 2026-08-14). The legacy
-# create-order endpoint the bot submits through has no shard routing, so the
-# scanner drops markets on other shards at ingest and verify_auth reads the
-# shard-0 balance entry. Currently every Kalshi market is on shard 0.
+# create-order endpoint has no shard routing at all, so the scanner drops
+# markets on other shards at ingest and verify_auth reads the shard-0 balance
+# entry. The V2 order path DOES take an exchange_index, and trader.py sends
+# this value explicitly (never -1 "auto-route") so the shard an order is routed
+# to always agrees with the shard the ingest guard admitted the market on.
+# Currently every Kalshi market is on shard 0.
 ROUTABLE_EXCHANGE_INDEX       = 0
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.

@@ -32,14 +32,14 @@ Notes:
     Raw-response variants bypass the models — but they also skip the SDK's
     status check, which fetch_json_page restores.
 
-    signed_request_json() generalizes that to routes with no SDK method at all
-    (the V2 order endpoint /portfolio/events/orders, whose migration this is
-    groundwork for). It shares fetch_json_page's status-check + parse tail via
-    _check_and_parse, so the non-2xx → ApiException contract is single-sourced.
-    It contains NO retry logic on purpose: order submission will call it
-    directly and retry-free, because a retried fill-or-kill leg can double-fill
-    (see trader._submit_order and the CLAUDE.md rule). Read-only callers wrap it
-    in api_call_with_retry themselves.
+    signed_request_json() generalizes that to routes with no SDK method at all —
+    notably the V2 order endpoint /portfolio/events/orders, which trader.py now
+    submits through by default. It shares fetch_json_page's status-check + parse
+    tail via _check_and_parse, so the non-2xx → ApiException contract is
+    single-sourced. It contains NO retry logic on purpose: order submission
+    calls it directly and retry-free, because a retried fill-or-kill leg can
+    double-fill (see trader._submit_order_v2 and the CLAUDE.md rule). Read-only
+    callers wrap it in api_call_with_retry themselves.
 """
 import json
 import logging
@@ -73,7 +73,8 @@ _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 # from resp.read() inside fetch_json_page, because the retry wrapper only knew
 # how to recognize status-carrying errors. Retrying is safe here: every caller
 # of api_call_with_retry is a read-only market-data GET (order submission
-# deliberately bypasses this wrapper — see trader._submit_order).
+# deliberately bypasses this wrapper on both paths — see trader._submit_order
+# and trader._submit_order_v2).
 _urllib3_transient: tuple[type[BaseException], ...]
 try:
     # urllib3 ships as a dependency of the Kalshi SDK's rest client, but guard
