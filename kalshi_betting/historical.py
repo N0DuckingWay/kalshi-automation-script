@@ -309,6 +309,12 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # fidelity; no reader yet. Pre-existing cache records read back None.
         "price_level_structure": m.get("price_level_structure"),
         "price_ranges": m.get("price_ranges"),
+        # Shard fidelity (2026-08): raw pass-through so backtest data can
+        # distinguish exchange shards. Stored, never filtered — all historical
+        # markets are shard 0, and filtering would silently change backtest
+        # results with no live-safety gain (the live order path is guarded at
+        # scanner ingest). Pre-existing cache records read back None.
+        "exchange_index": m.get("exchange_index"),
     }
 
 

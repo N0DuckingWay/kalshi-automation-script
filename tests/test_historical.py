@@ -393,6 +393,17 @@ class TestMarketToDict:
         assert d["price_level_structure"] is None
         assert d["price_ranges"] is None
 
+    def test_market_to_dict_passes_exchange_index_through(self):
+        # Shard fidelity (2026-08): stored raw so backtest data can
+        # distinguish exchange shards; never filtered on the backtest path.
+        d = historical._market_to_dict(_raw_market_dict(exchange_index=1))
+        assert d["exchange_index"] == 1
+
+    def test_missing_exchange_index_maps_to_none(self):
+        # Pre-existing cache records lack the key and must read back as None
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["exchange_index"] is None
+
     def test_stored_record_is_json_serializable(self):
         # The produced dict is gzip+json-dumped straight into the cache — a
         # non-JSON-native value here (e.g. an accidentally-parsed PriceRange
