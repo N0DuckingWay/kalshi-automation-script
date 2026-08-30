@@ -975,17 +975,22 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     return levels
 
 
-# Matched wire-format generations for the orderbook response: each container key
-# pairs with its OWN side keys and units, and the two must never be mixed. The
-# current live API returns the book under `orderbook_fp` with dollar-string bid
-# arrays; the legacy `orderbook` container carried integer-cent arrays. Resolving
-# container and side keys independently (a plain `or` across both generations)
-# risked cross-reading a cents array through the dollars parser, so the pairing is
-# enforced explicitly in _fetch_orderbook. Order matters: orderbook_fp (current)
-# is tried before orderbook (legacy).
+# Supported wire format for the orderbook response: the container key pairs with
+# its OWN side keys and units. Only the current generation is supported — the live
+# API returns the book under `orderbook_fp` with dollar-string bid arrays.
+#
+# The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays) is
+# deliberately NOT listed: Kalshi removed every legacy integer price field from
+# its REST/WS payloads on 2026-03-12, and _bids_to_ask_levels parses entries as
+# dollars unconditionally, so a cents bid of 35 would become an ask of -34.0 and
+# be silently dropped by the price-range check — an empty book with no warning.
+# Omitting it routes any legacy-shaped (or otherwise unknown) container to the
+# loud no-usable-orderbook path in _fetch_orderbook, which fails closed and names
+# the response keys. The container-key-presence selection and matched-side-key
+# enforcement below stay in place: they still guard against a future unknown
+# generation being cross-read through this generation's dollar parser.
 _ORDERBOOK_SIDE_KEYS: dict[str, tuple[str, str]] = {
     "orderbook_fp": ("yes_dollars", "no_dollars"),
-    "orderbook": ("yes", "no"),
 }
 
 
@@ -993,15 +998,21 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     """
     Fetch the order book for a market.
 
-    The live Kalshi API returns the book under one of two matched key generations
-    (see _ORDERBOOK_SIDE_KEYS): the current `orderbook_fp` container with
-    `yes_dollars`/`no_dollars` dollar-string bid arrays, or the legacy `orderbook`
-    container with `yes`/`no` arrays. The container key selects which side keys are
-    expected — the two generations are never mixed. Once a container is found, its
-    matched side keys MUST be present (either may be empty or null for a side with
-    no resting bids); a container whose matched side keys are absent, or which is
-    not even a dict, signals a Kalshi API shape change and is treated as a hard
-    failure rather than silently cross-reading the other generation's keys.
+    Only the current matched key generation is supported (see
+    _ORDERBOOK_SIDE_KEYS): the `orderbook_fp` container with
+    `yes_dollars`/`no_dollars` dollar-string bid arrays. The container key selects
+    which side keys are expected, and once a container is found its matched side
+    keys MUST be present (either may be empty or null for a side with no resting
+    bids); a container whose matched side keys are absent, or which is not even a
+    dict, signals a Kalshi API shape change and is treated as a hard failure
+    rather than silently reading some other generation's keys.
+
+    The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays, removed
+    from the API on 2026-03-12) is deliberately unsupported: it is not a
+    recognized container key, so it falls through to the no-usable-orderbook
+    warning and returns None. That is intentional — the dollars parser would
+    misread cent bids as out-of-range asks and hand back an empty book with no
+    warning at all.
 
     Args:
         client (Any): Authenticated KalshiClient exposing the raw-response
@@ -1040,14 +1051,12 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             return None
         ob = data[container_key]
         yes_key, no_key = _ORDERBOOK_SIDE_KEYS[container_key]
-        # TODO: validate this strict container->side-key mapping against captured
-        # test data from Kalshi's live API.
         if not isinstance(ob, dict) or yes_key not in ob or no_key not in ob:
             # Container present but its matched side keys are absent (or it is not
             # even a dict). This is a potential key mismatch — the container and
             # side keys have drifted out of sync, or Kalshi changed the response
-            # shape. Fail closed instead of cross-reading the other generation's
-            # keys (which could feed a cents array through the dollars parser).
+            # shape. Fail closed instead of guessing at whatever side keys ARE
+            # present (which could feed a cents array through the dollars parser).
             logging.warning(
                 "Potential orderbook key mismatch for %s: container '%s' present but its "
                 "expected side keys %s are missing (got %s) — check for bugs or changes to "

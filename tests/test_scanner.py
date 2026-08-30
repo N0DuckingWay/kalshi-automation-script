@@ -502,10 +502,12 @@ def _orderbook_payload_client(payload: dict):
 
 
 class TestFetchOrderbookKeyMapping:
-    """_fetch_orderbook must couple the container key to its matched side keys:
-    orderbook_fp -> yes_dollars/no_dollars, orderbook -> yes/no. A container whose
-    matched side keys are missing is a potential API-shape mismatch — logged and
-    treated as unavailable (None), never cross-read against the other generation."""
+    """_fetch_orderbook supports exactly one matched key generation:
+    orderbook_fp -> yes_dollars/no_dollars. A container whose matched side keys
+    are missing is a potential API-shape mismatch — logged and treated as
+    unavailable (None), never read through whatever side keys happen to be there.
+    The legacy `orderbook` container (integer-cent yes/no arrays, removed from the
+    API 2026-03-12) is unsupported and must fail closed loudly."""
 
     def test_current_format_parses(self):
         # orderbook_fp container with dollar-string side arrays (the live shape)
@@ -514,15 +516,35 @@ class TestFetchOrderbookKeyMapping:
         ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CURRENT")
         assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
 
-    def test_legacy_format_parses(self):
-        # orderbook container with legacy yes/no side arrays still routes correctly
-        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
-        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
-        assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+    def test_legacy_orderbook_container_fails_closed(self, caplog):
+        # The legacy `orderbook` container is no longer a recognized generation:
+        # it must return None and name the response keys, not parse its
+        # integer-cent arrays as dollars.
+        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
+        assert ob is None
+        assert "No usable orderbook" in caplog.text
+        assert "MKT-LEGACY" in caplog.text
+        assert "orderbook" in caplog.text
+
+    def test_legacy_cents_never_reach_dollar_parser(self):
+        # A legacy cents bid of 35 would parse as an ask of 1.0 - 35 = -34.0 and
+        # be dropped by the price-range check, yielding a silently EMPTY book.
+        # Fail-closed (None) is the required outcome — never a parsed book, and
+        # never an empty-but-successful one.
+        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTS")
+        assert ob is None
+        # Guard the same thing end-to-end: no ask levels are derivable, so the
+        # pair is marked non-tradeable rather than sized off a phantom book.
+        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
+        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
+        assert enriched.tradeable is False
 
     def test_mixed_generation_keys_return_none_and_warn(self, caplog):
-        # orderbook_fp container but with the OTHER generation's side keys —
-        # must not cross-read; returns None and logs a key-mismatch warning.
+        # orderbook_fp container but with the legacy generation's side keys —
+        # must not be read; returns None and logs a key-mismatch warning.
         payload = {"orderbook_fp": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-MIXED")
