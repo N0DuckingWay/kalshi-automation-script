@@ -106,6 +106,7 @@ INCLUDE_MVE_MARKETS           = True
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
+# LEGACY ORDER PATH ONLY — the V2 order path uses BUY_SLIPPAGE_TICKS below.
 # Slippage allowance, in cents per contract, added on top of the scanned price
 # when computing the buy_max_cost cap for each market FoK order leg. The cap
 # protects against the order book moving between the pre-execution check and
@@ -123,6 +124,26 @@ TAKER_FEE_RATE                = 0.07
 # endpoint (dollar-string prices), which is a deliberately deferred follow-up
 # — see CLAUDE.md.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
+
+# Slippage allowance for the V2 order path, denominated in TICKS of the market's
+# own price grid rather than in whole cents. The V2 endpoint
+# (/portfolio/events/orders) takes dollar-string limit prices, so a FoK cap can
+# finally be expressed at the market's real resolution: cap = scanned price +
+# BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
+# scanner.tick_size_for_price(). One tick restores the original intent of
+# BUY_MAX_COST_SLIPPAGE_CENTS = 1, which meant ~1 tick back when every market
+# was on a 1c grid but means roughly 10-100 ticks on the centi-cent regimes
+# MVE/combo markets migrated to on 2026-08-17.
+BUY_SLIPPAGE_TICKS            = 1
+
+# Fallback tick size, in dollars, for a market whose tick structure is unknown
+# or uniform-cent ("linear_cent", or no price_ranges bands at all). Kalshi's
+# tick grids are nested ($0.01 ⊂ $0.001 ⊂ $0.0001), so the coarsest grid is
+# always a safe, always-valid fallback. Stored as a dollar STRING and parsed
+# with Decimal at the point of use — same rule as the balance parsing in
+# auth.py: float literals reintroduce exactly the binary representation noise
+# the API's dollar-string fields exist to avoid.
+DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 
 # The only exchange shard our order path can reach. Kalshi now partitions the
 # exchange into parallel instances keyed by `exchange_index` (on markets and

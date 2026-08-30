@@ -3,6 +3,7 @@ import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -24,6 +25,7 @@ from kalshi_betting.scanner import (
     find_time_series_pairs,
     normalize_title,
     pair_key,
+    tick_size_for_price,
     validate_pair_price,
 )
 
@@ -1026,9 +1028,9 @@ class TestFilterMarketsWithinHorizon:
 
 
 class TestParsePriceRanges:
-    """_parse_price_ranges: groundwork ingest for the price_ranges tick-band
-    array (2026-08). Nothing consumes the parsed bands yet — these tests only
-    cover the parse itself."""
+    """_parse_price_ranges: ingest for the price_ranges tick-band array
+    (2026-08). These tests cover the parse itself; tick_size_for_price's
+    reading of the parsed bands is covered by TestTickSizeForPrice below."""
 
     def test_single_band_deci_cent(self):
         bands = _parse_price_ranges(
@@ -1118,3 +1120,68 @@ class TestTickStructureIngest:
         m = self._parse_one()
         assert m.price_level_structure == ""
         assert m.price_ranges is None
+
+
+class TestTickSizeForPrice:
+    """tick_size_for_price: maps a price onto the market's own tick grid,
+    falling back to the coarse $0.01 grid (valid on every regime, since the
+    grids are nested) whenever the structure is uniform-cent or unusable."""
+
+    # center_deci_edge_centi_cent: $0.0001 below $0.01 and above $0.99,
+    # $0.001 in between — the regime MVE/combo markets moved to on 2026-08-17.
+    _CENTI_BANDS = [
+        PriceRange(start=0.0, end=0.01, step=0.0001),
+        PriceRange(start=0.01, end=0.99, step=0.001),
+        PriceRange(start=0.99, end=1.0, step=0.0001),
+    ]
+
+    @staticmethod
+    def _market(structure: str, ranges) -> SimpleNamespace:
+        """SimpleNamespace market stand-in carrying only the tick fields read."""
+        return SimpleNamespace(
+            ticker="KXTEST-1", price_level_structure=structure, price_ranges=ranges,
+        )
+
+    def test_linear_cent_returns_one_cent(self):
+        m = self._market("linear_cent", [PriceRange(start=0.0, end=1.0, step=0.01)])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_empty_structure_returns_one_cent(self):
+        m = self._market("", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_deci_cent_uniform_band(self):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.001)])
+        assert tick_size_for_price(m, 0.42) == Decimal("0.001")
+
+    def test_centi_cent_middle_band_is_deci_cent(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.50) == Decimal("0.001")
+
+    def test_centi_cent_edge_bands(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.005) == Decimal("0.0001")
+        assert tick_size_for_price(m, 0.995) == Decimal("0.0001")
+
+    def test_band_boundary_price_uses_first_containing_band(self):
+        # 0.01 is the end of band 1 and the start of band 2; first match wins.
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.01) == Decimal("0.0001")
+
+    def test_none_ranges_falls_back(self):
+        # Structure names a fine grid but the bands failed to parse — the
+        # coarse default is still a valid grid point on every regime.
+        m = self._market("deci_cent", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_no_containing_band_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=0.4, step=0.001)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.9) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text
+
+    def test_nonpositive_step_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.0)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text

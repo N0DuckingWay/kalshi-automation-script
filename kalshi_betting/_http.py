@@ -5,11 +5,13 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Shared HTTP helpers for Kalshi SDK calls: a retry wrapper (429/5xx plus
-    transient connection failures, with exponential backoff) and a raw-response
-    JSON fetcher for the SDK's `*_without_preload_content` endpoint variants.
-    Both the live scanner and the historical fetch pipeline import from here so
-    backoff behavior stays consistent and there is no scanner → historical
-    reverse import.
+    transient connection failures, with exponential backoff), a raw-response
+    JSON fetcher for the SDK's `*_without_preload_content` endpoint variants,
+    and signed_request_json() — a signed arbitrary-method (GET/POST/...) raw
+    request for API routes the pinned SDK has no generated method for. Both the
+    live scanner and the historical fetch pipeline import from here so backoff
+    behavior stays consistent and there is no scanner → historical reverse
+    import.
 
 Dependencies:
     No project imports — this module is a leaf so scanner.py, trader.py, and
@@ -29,6 +31,15 @@ Notes:
     models type as required, so modeled calls raise pydantic ValidationError.
     Raw-response variants bypass the models — but they also skip the SDK's
     status check, which fetch_json_page restores.
+
+    signed_request_json() generalizes that to routes with no SDK method at all
+    (the V2 order endpoint /portfolio/events/orders, whose migration this is
+    groundwork for). It shares fetch_json_page's status-check + parse tail via
+    _check_and_parse, so the non-2xx → ApiException contract is single-sourced.
+    It contains NO retry logic on purpose: order submission will call it
+    directly and retry-free, because a retried fill-or-kill leg can double-fill
+    (see trader._submit_order and the CLAUDE.md rule). Read-only callers wrap it
+    in api_call_with_retry themselves.
 """
 import json
 import logging
@@ -36,6 +47,7 @@ import time
 from collections.abc import Callable
 from http.client import IncompleteRead
 from typing import Any
+from urllib.parse import urlencode, urlparse
 
 from kalshi_python_sync.exceptions import ApiException
 
@@ -150,6 +162,42 @@ def _is_transient_network_error(exc: BaseException) -> bool:
     return False
 
 
+def _check_and_parse(resp: Any) -> dict:
+    """
+    Apply the status check and JSON parse shared by every raw-response call.
+
+    The SDK's `*_without_preload_content` variants (and a hand-built
+    rest_client.request call) return the RESTResponse untouched: no response
+    model, and no status check either. This restores the original error
+    behavior by raising ApiException.from_response on non-2xx, which is what
+    lets api_call_with_retry keep seeing retryable 429/5xx statuses exactly as
+    it did for the modeled calls.
+
+    Args:
+        resp (Any): A RESTResponse-like object exposing .status and either a
+            .data attribute or a .read() method for the body bytes.
+
+    Returns:
+        dict: The parsed JSON response body.
+
+    Raises:
+        ApiException: (or a status-specific subclass) when the HTTP status is
+            not 2xx.
+    """
+    # RESTResponse.data may be unread until .read() is called, depending on
+    # how the underlying urllib3 response was created
+    body = getattr(resp, "data", None)
+    if body is None and hasattr(resp, "read"):
+        body = resp.read()
+    if not 200 <= resp.status < 300:
+        raise ApiException.from_response(
+            http_resp=resp,
+            body=body.decode("utf-8") if isinstance(body, bytes) else body,
+            data=None,
+        )
+    return _json_loads(body)
+
+
 def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
     """
     Call a `*_without_preload_content` SDK method and parse the JSON body.
@@ -173,18 +221,76 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
             not 2xx.
     """
     resp = fetch_fn(**kwargs)
-    # RESTResponse.data may be unread until .read() is called, depending on
-    # how the underlying urllib3 response was created
-    body = getattr(resp, "data", None)
-    if body is None and hasattr(resp, "read"):
-        body = resp.read()
-    if not 200 <= resp.status < 300:
-        raise ApiException.from_response(
-            http_resp=resp,
-            body=body.decode("utf-8") if isinstance(body, bytes) else body,
-            data=None,
-        )
-    return _json_loads(body)
+    # Shared with signed_request_json so the non-2xx → ApiException contract
+    # has exactly one definition
+    return _check_and_parse(resp)
+
+
+def signed_request_json(
+    client: Any,
+    method: str,
+    path: str,
+    *,
+    query: dict | None = None,
+    body: dict | None = None,
+) -> dict:
+    """
+    Perform a signed request of any HTTP method against an arbitrary API path.
+
+    The pinned SDK has no generated method for several routes the bot needs
+    (the /historical archive, and the V2 order endpoint
+    /portfolio/events/orders this is groundwork for), and its modeled calls
+    deserialize through response models that live API drift keeps breaking.
+    This helper signs the request the way every SDK call is signed (KalshiAuth:
+    RSA-PSS over timestamp + method + path — method-agnostic, query string
+    stripped, body NOT part of the signature), executes it with the client's own
+    rest client, and applies the shared status-check + JSON-parse contract.
+
+    Contains NO retry logic by design. Order submission calls this directly:
+    retrying a rejected fill-or-kill leg could submit it twice at different
+    prices and leave an unhedged position, so retries are the caller's decision
+    (read-only callers wrap it in api_call_with_retry).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        method (str): HTTP method, e.g. "GET" or "POST". Case-insensitive; it
+            is upper-cased before signing so the signature matches the request.
+        path (str): FULL API path including the /trade-api/v2 prefix (e.g.
+            "/trade-api/v2/portfolio/events/orders"). This is what gets signed,
+            matching how the SDK itself signs.
+        query (dict | None): Query parameters; None values are omitted. Not
+            part of the signature.
+        body (dict | None): JSON request body. When not None, a
+            Content-Type: application/json header is sent and the SDK's rest
+            client json.dumps-serializes the dict.
+
+    Returns:
+        dict: The parsed JSON response body.
+
+    Raises:
+        ApiException: (or a status-specific subclass) when the HTTP status is
+            not 2xx.
+    """
+    verb = method.upper()
+    # configuration.host already includes the /trade-api/v2 prefix, and `path`
+    # carries it too (it must, to be signed correctly) — so take only the
+    # scheme+netloc from the host to avoid emitting the prefix twice.
+    parsed_host = urlparse(client.configuration.host)
+    encoded = urlencode({k: v for k, v in (query or {}).items() if v is not None})
+    url = f"{parsed_host.scheme}://{parsed_host.netloc}{path}" + (f"?{encoded}" if encoded else "")
+
+    headers = {"accept": "application/json"}
+    if body is not None:
+        # The SDK's rest client only json.dumps a dict body when the content
+        # type is JSON (or absent); set it explicitly so intent is on the wire.
+        headers["Content-Type"] = "application/json"
+    # Query strings are excluded from the signature by Kalshi's auth scheme, and
+    # so is the body — only timestamp + method + path are signed
+    headers.update(client.kalshi_auth.create_auth_headers(verb, path))
+
+    resp = client.rest_client.request(verb, url, headers=headers, body=body)
+    # Same status-check + parse tail as fetch_json_page (see _check_and_parse)
+    return _check_and_parse(resp)
 
 
 def api_call_with_retry(fn: Callable, *args, **kwargs):

@@ -38,10 +38,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    DEFAULT_TICK_SIZE_DOLLARS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
@@ -103,8 +105,7 @@ class PriceRange:
     Kalshi markets can have a non-uniform tick grid across their price range
     (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
     structure). Each band names its own step size; a market's full grid is
-    the ordered list of bands covering [0, 1]. Nothing consumes these bands
-    yet — see _parse_price_ranges.
+    the ordered list of bands covering [0, 1]. Read by tick_size_for_price().
 
     Attributes:
         start (float): Lower bound of this band, in dollars (e.g. 0.0).
@@ -121,10 +122,10 @@ def _parse_price_ranges(raw: Any) -> list | None:
     Parse a raw price_ranges array into PriceRange bands, or None if unknown.
 
     Fail-soft per the return-None convention: a missing, empty, or malformed
-    array means "tick structure unknown", never an error — nothing consumes
-    these bands yet (groundwork for tick-aware order caps after the V2 order
-    migration; combo markets moved to the center_deci_edge_centi_cent tick
-    regime on 2026-08-17).
+    array means "tick structure unknown", never an error — tick_size_for_price()
+    then falls back to the default $0.01 grid, which is valid on every regime
+    because Kalshi's grids are nested (combo markets moved to the
+    center_deci_edge_centi_cent tick regime on 2026-08-17).
 
     Args:
         raw (Any): The raw `price_ranges` value from a market JSON dict —
@@ -148,6 +149,75 @@ def _parse_price_ranges(raw: Any) -> list | None:
         except (KeyError, TypeError, ValueError):
             continue
     return bands or None
+
+
+def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
+    """
+    Return the tick size, in dollars, that applies at a given price on a market.
+
+    Kalshi markets no longer share one uniform price grid. Known regimes, named
+    by `price_level_structure`: "linear_cent" (uniform $0.01), "deci_cent"
+    (uniform $0.001), "tapered_deci_cent" (banded), and
+    "center_deci_edge_centi_cent" ($0.0001 below $0.01 and above $0.99, $0.001
+    in between). The authoritative grid is the market's own `price_ranges`
+    bands; the structure name is only used to short-circuit the uniform-cent
+    case. The first band containing the price wins, so a price sitting exactly
+    on a band boundary resolves to the earlier (by convention finer) band.
+
+    These grids are NESTED: $0.01 ⊂ $0.001 ⊂ $0.0001, so every point of a
+    coarser grid is also a point of any finer one. Later price math relies on
+    that — a cap computed as price + n × tick that crosses into a neighbouring
+    band still lands on a valid grid point of that band, and the $0.01 fallback
+    below is valid on every regime — so this function does not need to
+    re-quantize across band edges.
+
+    Returns a Decimal (never a float) because the V2 order endpoint takes
+    dollar-string prices: binary float noise in a tick size would propagate
+    into a price string the exchange rejects as off-grid.
+
+    Args:
+        market (Any): A market object — ApiMarket or any object with
+            `price_level_structure` (str) and `price_ranges`
+            (list[PriceRange] | None) attributes. Missing attributes are
+            treated as unknown, not as an error.
+        price_dollars (float): The price at which the tick size is needed, in
+            dollars. Range: [0, 1].
+
+    Returns:
+        Decimal: The tick size in dollars for that price. Falls back to
+            Decimal(config.DEFAULT_TICK_SIZE_DOLLARS) when the structure is
+            uniform-cent or unknown, when no band contains the price, or when
+            the matching band's step is nonpositive — logging a warning in the
+            latter two cases, which indicate a payload that drifted from the
+            shapes above.
+    """
+    default = Decimal(DEFAULT_TICK_SIZE_DOLLARS)
+    structure = getattr(market, "price_level_structure", "") or ""
+    bands = getattr(market, "price_ranges", None)
+    # Uniform-cent markets (and any market whose bands failed to parse — see
+    # _parse_price_ranges' fail-soft contract) use the coarse default grid.
+    if structure in ("", "linear_cent") or not bands:
+        return default
+
+    for band in bands:
+        try:
+            if band.start <= price_dollars <= band.end:
+                # Decimal(str(...)), never Decimal(float): the float came from
+                # parsing a dollar string and str() round-trips it back exactly.
+                step = Decimal(str(band.step))
+                if step > 0:
+                    return step
+                break
+        except (AttributeError, TypeError, InvalidOperation):
+            break
+
+    # Only reached on a malformed or non-covering band list; called once per
+    # order leg at build time, so a warning here cannot spam the log.
+    logging.warning(
+        "No usable tick band for %s at price %.4f (structure=%r) — falling back to $%s",
+        getattr(market, "ticker", "<unknown>"), price_dollars, structure, DEFAULT_TICK_SIZE_DOLLARS,
+    )
+    return default
 
 
 @dataclass
