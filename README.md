@@ -170,6 +170,8 @@ kalshi_private_key.pem
 
 ## Run Commands
 
+CLI runs now echo log output to the terminal as well as `kalshi_arb.log`.
+
 ### Dev dry-run (sandbox simulation, no real orders)
 
 ```bash
