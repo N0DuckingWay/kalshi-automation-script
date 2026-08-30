@@ -114,11 +114,14 @@ TAKER_FEE_RATE                = 0.07
 # on the legacy /portfolio/orders create-order endpoint the bot still submits
 # through — a sub-cent-aware cap can't be expressed there no matter how finely
 # a market's own tick grid is subdivided (see ApiMarket.price_level_structure /
-# price_ranges in scanner.py, ingested but not yet read). On the $0.0001 tick
-# grid all MVE/combo markets move to on 2026-08-17, this 1c tolerance permits
-# ~100 ticks of price drift rather than the intended ~1. Fixing this requires
-# migrating order submission to the V2 endpoint (dollar-string prices), which
-# is a deliberately deferred follow-up — see CLAUDE.md.
+# price_ranges in scanner.py, ingested but not yet read). On 2026-08-17, all
+# MVE/combo markets migrated to the `center_deci_edge_centi_cent` tick regime —
+# $0.0001 ticks below $0.01 and above $0.99, $0.001 ticks in between — so this
+# 1c tolerance now permits roughly 10-100 ticks of price drift on those
+# markets, depending on where in the band the price sits, rather than the
+# intended ~1. Fixing this requires migrating order submission to the V2
+# endpoint (dollar-string prices), which is a deliberately deferred follow-up
+# — see CLAUDE.md.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
 # The only exchange shard our order path can reach. Kalshi now partitions the
@@ -155,16 +158,20 @@ MVE_TITLE_LOOKUP_MAX_PAGES = 500
 # settled-market history is tens of millions of records at 1000/page (the
 # API's hard page-size cap), so a sequential walk takes hours; sharding the
 # fetch across workers was live-verified 2026-07-13 at 12 workers / ~20 req/s
-# with zero HTTP 429s. Each worker's calls still go through
-# api_call_with_retry, so if Kalshi does start throttling, the normal
-# exponential backoff applies per worker. Raise cautiously.
+# with zero HTTP 429s — 12 was the verified-safe rate, but the constant is
+# deliberately held at 8 to leave headroom below that verified ceiling. Each
+# worker's calls still go through api_call_with_retry, so if Kalshi does
+# start throttling, the normal exponential backoff applies per worker. Raise
+# cautiously.
 SETTLED_FETCH_MAX_WORKERS = 8
 
 # Number of worker threads used by the backtester's per-ticker candlestick
 # fetch (backtester._fetch_candles_parallel). Each fetch is an independent
 # read-only GET routed through api_call_with_retry, so a 429 degrades to that
 # worker's own exponential backoff rather than failing the run — live-verified
-# 2026-08-03 at ~20 req/s with 12 workers and zero HTTP 429s. Fetching
+# 2026-08-03 at ~20 req/s with 12 workers and zero HTTP 429s (12 was the
+# verified-safe rate; the constant is deliberately held at 8 for headroom).
+# Fetching
 # sequentially was live-measured the same day at ~4.3 tickers/sec, i.e. ~34
 # hours for a 3-month window, which makes this loop the dominant cost of a
 # backtest. Cache files are keyed per ticker, so two workers can never target

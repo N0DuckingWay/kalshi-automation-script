@@ -123,7 +123,8 @@ def _parse_price_ranges(raw: Any) -> list | None:
     Fail-soft per the return-None convention: a missing, empty, or malformed
     array means "tick structure unknown", never an error — nothing consumes
     these bands yet (groundwork for tick-aware order caps after the V2 order
-    migration; combo markets move to $0.0001 ticks on 2026-08-17).
+    migration; combo markets moved to the center_deci_edge_centi_cent tick
+    regime on 2026-08-17).
 
     Args:
         raw (Any): The raw `price_ranges` value from a market JSON dict —
