@@ -1188,6 +1188,43 @@ def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
     return mock
 
 
+class TestCandleClose:
+    def test_candle_numeric_zero_close_dollars_is_used_not_fallthrough(self):
+        # Regression: `ya.get("close_dollars") or ya.get("close")` treated a
+        # valid falsy close_dollars (numeric 0) as absent and silently read
+        # the legacy field instead.
+        assert historical._candle_close({"close_dollars": 0, "close": "55"}) == 0.0
+
+    def test_candle_empty_string_close_dollars_falls_back_to_close(self):
+        # An empty string is absence-of-value, not a price — keep the fallback
+        assert historical._candle_close({"close_dollars": "", "close": "0.55"}) == 0.55
+
+    def test_candle_missing_both_closes_is_none(self):
+        assert historical._candle_close({}) is None
+        assert historical._candle_close({"close_dollars": None, "close": None}) is None
+
+    def test_candle_unparseable_close_dollars_is_none_not_fallthrough(self):
+        # A present-but-garbage close_dollars means the payload shape is off;
+        # don't guess from the legacy field.
+        assert historical._candle_close({"close_dollars": "n/a", "close": "0.55"}) is None
+
+    def test_candle_missing_close_skipped_in_fetch(self, tmp_path, monkeypatch):
+        # Through-path: a candle whose sides carry no close at all is skipped
+        # rather than raising or emitting a bogus price.
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        mock = MagicMock(return_value={
+            "candlesticks": [
+                {"end_period_ts": 1, "yes_ask": {}, "yes_bid": {}},
+                {"end_period_ts": 2, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}},
+            ]
+        })
+        monkeypatch.setattr(historical, "_historical_get", mock)
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
+        )
+        assert [c["ts"] for c in out] == [2]
+
+
 class TestFetchCandlesticks:
     def test_parses_current_dollar_string_close(self, tmp_path, monkeypatch):
         # Current wire format: yes_ask.close is the fixed-point DOLLAR string

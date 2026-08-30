@@ -1854,6 +1854,36 @@ def fetch_all_settled_markets(
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────
 
+def _candle_close(side: dict) -> float | None:
+    """
+    Extract the closing price in dollars from one candle side dict.
+
+    The API sends fixed-point DOLLAR strings (e.g. "0.5500"). Older payloads
+    named the field close_dollars alongside an integer-cent close; the current
+    format sends the dollar string AS close — prefer close_dollars whenever it
+    is actually present so both formats parse to dollars, never cents. The
+    presence check is explicit (None / empty string = absent) rather than
+    truthiness: a valid falsy close_dollars of numeric 0 must be used, not
+    silently fall through to the legacy field.
+
+    Args:
+        side (dict): A candle's "yes_ask" or "yes_bid" sub-dict.
+
+    Returns:
+        float | None: Closing price in dollars, or None when neither field is
+            present/parseable (caller skips the candle).
+    """
+    for key in ("close_dollars", "close"):
+        raw = side.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
@@ -1947,14 +1977,14 @@ def fetch_candlesticks(
             try:
                 ya = c.get("yes_ask") or {}
                 yb = c.get("yes_bid") or {}
-                # The API sends fixed-point DOLLAR strings (e.g. "0.5500").
-                # Older payloads named the field close_dollars alongside an
-                # integer-cent close; the current format sends the dollar
-                # string AS close — prefer close_dollars when present so both
-                # formats parse to dollars, never cents.
-                yes_ask = float(ya.get("close_dollars") or ya.get("close"))
+                # Dollar-string extraction with explicit presence checks —
+                # see _candle_close for why truthiness fallthrough is wrong
+                yes_ask = _candle_close(ya)
+                yes_bid = _candle_close(yb)
+                if yes_ask is None or yes_bid is None:
+                    continue
                 # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                no_ask  = 1.0 - float(yb.get("close_dollars") or yb.get("close"))
+                no_ask  = 1.0 - yes_bid
                 candles.append({
                     "ts": c["end_period_ts"],
                     "yes_ask_close": yes_ask,
