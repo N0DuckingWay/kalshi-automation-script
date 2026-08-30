@@ -1,10 +1,30 @@
-"""Tests for main.py — the live-pipeline orchestrator's pure helpers
-(_truncate, _format_deadline, _dedup_pairs, _compute_trade_specs,
-_no_pairs_msg), its logging setup (_setup_logging), and end-to-end
-"live-shape replay" runs of _run_dev/_run_prod against a MagicMock client
-wired with CURRENT-generation (2026-08+) Kalshi payload shapes — the closest
-offline substitute for a live smoke test. All Kalshi API interaction is
-mocked per project policy (tests must run offline)."""
+"""
+File: test_main.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Offline tests for kalshi_betting.main — the live-pipeline orchestrator's
+    pure helpers (_truncate, _format_deadline, _dedup_pairs,
+    _compute_trade_specs, _no_pairs_msg), its logging setup (_setup_logging),
+    and end-to-end "live-shape replay" runs of _run_dev/_run_prod against a
+    MagicMock client wired with CURRENT-generation (2026-08+) Kalshi payload
+    shapes — dollar-string prices, yes_sub_title, orderbook_fp books,
+    shard-aware balance_breakdown, position_fp positions, V2 order responses —
+    the closest offline substitute for a live smoke test.
+
+Dependencies:
+    Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
+    plus config constants asserted against. All Kalshi API interaction is
+    mocked at the HTTP boundary (raw-response mocks and rest_client.request);
+    reporter Excel writers are patched out so no files are written.
+
+Notes:
+    The V2 live-execution replays run with dry_run=False against the config
+    default ORDER_API_VERSION="v2" — deliberately not monkeypatched, so they
+    prove the default path. Order responses are generated from each request's
+    own submitted count, so the tests don't depend on exact Kelly sizing.
+"""
 import json
 import logging
 import pathlib
@@ -23,7 +43,6 @@ from kalshi_betting.config import (
     ORDER_API_VERSION,
     SAME_TITLE_MIN_PRICE_DIFF,
     V2_ORDER_PATH,
-    V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
 
 
@@ -604,9 +623,9 @@ class TestRunProdLiveV2Replay:
         rollback_body = calls[2].kwargs["body"]
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
-        assert rollback_body["price"] == str(
-            Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS).quantize(Decimal("0.0001"))
-        )
+        # Replay markets use the default $0.01 grid, so the finest-grid
+        # rollback target floors to the highest cent-grid level
+        assert rollback_body["price"] == "0.9900"
 
         assert captured["results"][0].status == "rolled_back"
         client.create_order_without_preload_content.assert_not_called()

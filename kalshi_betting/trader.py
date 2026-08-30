@@ -72,7 +72,7 @@ import logging
 import math
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
@@ -233,12 +233,23 @@ def _v2_limit_price(leg: str, scanned_price_dollars: float, market: Any) -> Deci
     BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
     pre-execution check.
 
-    Two grid facts make this safe. First, Kalshi's tick grids are NESTED
-    ($0.01 subset of $0.001 subset of $0.0001), so a cap that steps across a
-    band edge into a finer neighbouring band still lands on a valid grid point
-    of that band — no re-quantization across edges is needed. Second, 1 is a
-    grid point of every regime, so for the NO leg the complement 1 - cap of an
-    on-grid cap is itself on-grid.
+    Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
+    DIFFERENT band of the market's grid than the scanned price — stepping up
+    across a band edge, or being mirrored to the other end of the book — the
+    final price is re-quantized onto the grid of the band that actually
+    contains it, rounding UP. Ceiling is the protective direction here too: it
+    can only tighten-or-keep the cap by under one destination-band tick, so the
+    worst outcome of the re-quantization is a killed FoK (trade skipped), never
+    a worse-than-intended fill; a floor could instead round a YES cap below the
+    scanned price and make the order structurally unfillable. Kalshi's nested
+    grids ($0.01 subset of $0.001 subset of $0.0001) guarantee a price landing
+    in a FINER band than it was computed on is already on that band's grid, so
+    the snap is then a no-op.
+
+    The clamp bounds are grid-aware for the same reason: the extreme tradeable
+    levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not
+    0.9999, on a linear-cent market), so the bounds are derived from the tick
+    size at each end of the book rather than the global finest-grid constants.
 
     This mapping (which side, and the complement for the NO leg) is the single
     assumption most in need of verification at the first live submission; see
@@ -255,8 +266,9 @@ def _v2_limit_price(leg: str, scanned_price_dollars: float, market: Any) -> Deci
             tick grid. Any object exposing price_level_structure / price_ranges.
 
     Returns:
-        Decimal: The limit price in dollars, clamped into
-            [_V2_MIN_PRICE, _V2_MAX_PRICE] so it is always a tradeable level.
+        Decimal: The limit price in dollars — a valid grid point of the band
+            containing it, clamped one tick inside the open unit interval on
+            this market's grid.
     """
     scanned = Decimal(str(scanned_price_dollars))
     # Cross-module: the market's own tick grid is the only authority on what
@@ -266,7 +278,47 @@ def _v2_limit_price(leg: str, scanned_price_dollars: float, market: Any) -> Deci
     # Buying NO is selling YES on the single YES book, so the YES-side price is
     # the complement of the capped NO price
     price = Decimal("1") - cap if leg == "buy_no" else cap
-    return min(max(price, _V2_MIN_PRICE), _V2_MAX_PRICE)
+    # Re-quantize onto the grid of the band the FINAL price sits in (see
+    # docstring: ceiling is protective — worst case is a killed FoK)
+    final_tick = tick_size_for_price(market, float(price))
+    price = _ceil_to_tick(price, final_tick)
+    # Grid-aware clamp: the extreme valid levels are one tick inside 0 and 1
+    # on this market's own grid at each end of the book
+    bottom_tick = tick_size_for_price(market, float(_V2_MIN_PRICE))
+    top_tick = tick_size_for_price(market, float(Decimal("1") - _V2_MIN_PRICE))
+    return min(max(price, bottom_tick), Decimal("1") - top_tick)
+
+
+def _v2_rollback_price(market: Any) -> Decimal:
+    """
+    Compute the aggressive limit price for a V2 reduce-only unwind bid.
+
+    The legacy path unwound with a type="market" order carrying no price cap;
+    V2 has no market type, so the emulation is a fill-or-kill bid at the
+    HIGHEST TRADEABLE LEVEL of this market's own grid — it crosses any resting
+    ask the way the market order did. That level depends on the tick regime:
+    0.99 on a linear-cent grid, 0.999 on deci-cent, 0.9999 on a
+    centi-cent edge band. A flat 0.99 (valid only on the coarsest grid) would
+    fail to cross asks resting in (0.99, 1) on sub-cent regimes, turning an
+    unwind the legacy market order always filled into a structurally killed
+    FoK and an orphaned position.
+
+    config.V2_ROLLBACK_BID_PRICE_DOLLARS is the finest-grid target; it is
+    FLOORED onto the grid of the band containing it — floor, not ceiling,
+    because rounding up would leave the open unit interval (1 is a settlement
+    value, not a tradeable level).
+
+    Args:
+        market (Any): The market whose position is being unwound. Any object
+            exposing price_level_structure / price_ranges.
+
+    Returns:
+        Decimal: The highest valid bid level on this market's grid at the top
+            of the book.
+    """
+    target = Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS)
+    tick = tick_size_for_price(market, float(target))
+    return (target / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
 
 def _format_price(p: Decimal) -> str:
@@ -386,11 +438,12 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
     A held NO position is a short YES, so closing it is a YES BUY — a BID, not
     a sell. reduce_only guarantees the order can only close existing exposure,
     so it is safe to submit even when leg A's fill state is ambiguous (it cannot
-    open a new position). V2 has no "market" type, so the aggressive
-    config.V2_ROLLBACK_BID_PRICE_DOLLARS limit is what emulates the legacy
-    market unwind: it crosses any resting ask, giving the fill_or_kill order the
-    same chance of filling the old market order had. The bid/reduce-only
-    semantics here are part of the mapping to verify at the first live unwind.
+    open a new position). V2 has no "market" type, so a bid at the highest
+    tradeable level of this market's own grid (_v2_rollback_price) is what
+    emulates the legacy market unwind: it crosses any resting ask, giving the
+    fill_or_kill order the same chance of filling the old market order had. The
+    bid/reduce-only semantics here are part of the mapping to verify at the
+    first live unwind.
 
     Args:
         spec (TradeSpec): The trade whose leg A must be unwound. Uses
@@ -404,8 +457,9 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
         # Client-generated idempotency key — see _build_no_order_v2
         "client_order_id": str(uuid.uuid4()),
         "side": _V2_LEG_SIDE["close_no"],
-        # Aggressive limit, quantized exactly like every other V2 price
-        "price": _format_price(Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS)),
+        # Highest tradeable level on THIS market's grid — emulates the legacy
+        # capless market-order unwind (see _v2_rollback_price)
+        "price": _format_price(_v2_rollback_price(spec.pair.market_a)),
         "count": _format_count(spec.x),
         "time_in_force": "fill_or_kill",
         # Explicit shard, never -1 auto-route — see _build_no_order_v2

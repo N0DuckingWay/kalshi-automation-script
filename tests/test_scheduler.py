@@ -1,7 +1,24 @@
-"""Tests for scheduler.py — the weekly daemon's subprocess-spawning job and
-its logging setup. All Kalshi API interaction is mocked per project policy
-(tests must run offline); run_job() itself never touches the network, only
-subprocess.run, which is monkeypatched here."""
+"""
+File: test_scheduler.py
+Author: Zachary Hoffman
+Last edited by: Zachary Hoffman
+
+Purpose:
+    Offline tests for kalshi_betting.scheduler — the weekly daemon's
+    subprocess-spawning run_job(): the exact argv/cwd/timeout it launches
+    main.py with, and that a timeout or non-zero exit is logged rather than
+    crashing the daemon.
+
+Dependencies:
+    Imports scheduler and the PROJECT_ROOT / SCHEDULER_JOB_TIMEOUT_SECONDS
+    constants it must honor. subprocess.run is monkeypatched in every test —
+    no process is ever spawned and no network is touched.
+
+Notes:
+    run_job() itself never talks to the Kalshi API; the child process it
+    would spawn does, which is exactly why these tests stop at the
+    subprocess boundary.
+"""
 import logging
 import subprocess
 import sys

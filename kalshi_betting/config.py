@@ -171,14 +171,18 @@ ORDER_API_VERSION             = "v2"
 # and the same value.
 V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 
-# Limit price, as a dollar string, for the V2 reduce-only rollback bid that
-# unwinds a filled leg A. On the single-YES-book model a held NO position is a
-# short YES, so closing it is a YES BUY (bid). The legacy rollback was a
-# type="market" sell with no price at all; V2 has no market type, so an
-# aggressive limit is what emulates it: $0.99 crosses any resting ask on the
-# grid, making the fill-or-kill unwind as likely to fill as the old market
-# order. Deliberately not $1.00 — that is not a tradeable price level.
-V2_ROLLBACK_BID_PRICE_DOLLARS = "0.99"
+# Target limit price, as a dollar string, for the V2 reduce-only rollback bid
+# that unwinds a filled leg A. On the single-YES-book model a held NO position
+# is a short YES, so closing it is a YES BUY (bid). The legacy rollback was a
+# type="market" sell with no price at all; V2 has no market type, so a bid at
+# the HIGHEST TRADEABLE LEVEL is what emulates it. This is the finest-grid
+# target ($0.0001 ticks); trader._v2_rollback_price floors it onto the grid of
+# the market actually being unwound (0.99 on linear-cent, 0.999 on deci-cent,
+# 0.9999 on a centi-cent edge band) — a flat 0.99 would fail to cross asks
+# resting in (0.99, 1) on sub-cent regimes, structurally killing an unwind the
+# legacy market order always filled. Deliberately not "1" — that is a
+# settlement value, not a tradeable level.
+V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
 # The only exchange shard our order path can reach. Kalshi now partitions the
 # exchange into parallel instances keyed by `exchange_index` (on markets and

@@ -18,7 +18,6 @@ from kalshi_betting.config import (
     BUY_SLIPPAGE_TICKS,
     ROUTABLE_EXCHANGE_INDEX,
     V2_ORDER_PATH,
-    V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
 from kalshi_betting.scanner import PriceRange
 from kalshi_betting.trader import (
@@ -34,6 +33,7 @@ from kalshi_betting.trader import (
     _format_price,
     _v2_fill_status,
     _v2_limit_price,
+    _v2_rollback_price,
 )
 
 # Tick grids used by the V2 price-math tests, mirroring the regimes named by
@@ -319,12 +319,30 @@ class TestV2PriceMath:
         assert price == Decimal("0.991")
         assert price % Decimal("0.0001") == 0
 
-    def test_cap_clamped_inside_open_unit_interval(self):
-        # 0 and 1 are settlement values, not tradeable price levels: an extreme
-        # scanned price must not push the limit outside [0.0001, 0.9999].
+    def test_cap_clamped_inside_open_unit_interval_on_grid(self):
+        # 0 and 1 are settlement values, not tradeable price levels — and the
+        # clamp bounds must be valid levels of THIS market's grid: on a
+        # linear-cent market the extremes are 0.99/0.01, not the finest-grid
+        # 0.9999/0.0001 (which a cent-tick book would reject as off-grid).
         market = make_market("linear_cent")
-        assert _v2_limit_price("buy_yes", 0.999, market) == Decimal("0.9999")
-        assert _v2_limit_price("buy_no", 0.999, market) == Decimal("0.0001")
+        assert _v2_limit_price("buy_yes", 0.999, market) == Decimal("0.99")
+        assert _v2_limit_price("buy_no", 0.999, market) == Decimal("0.01")
+
+    def test_cap_stepping_into_coarser_band_requantizes(self):
+        # Regression (found in adversarial review): scanned 0.00995 sits in the
+        # $0.0001 edge band, but cap = ceil + 1 tick = 0.0101 lands in the
+        # $0.001 middle band, where 0.0101 is NOT a valid level. The final
+        # price must be re-quantized onto the destination band's grid
+        # (ceiling: worst case a killed FoK, never a worse fill).
+        market = make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
+        assert _v2_limit_price("buy_yes", 0.00995, market) == Decimal("0.011")
+
+    def test_no_leg_complement_requantized_onto_containing_band(self):
+        # Same regression, NO side: 1 - 0.0101 = 0.9899 is off the $0.001 grid
+        # of the middle band containing it; must snap up to 0.990 — which is
+        # still fillable at the scanned NO price (0.990 <= 1 - 0.00995).
+        market = make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
+        assert _v2_limit_price("buy_no", 0.00995, market) == Decimal("0.990")
 
     def test_format_price_always_four_decimals(self):
         assert _format_price(Decimal("0.56")) == "0.5600"
@@ -356,7 +374,22 @@ class TestV2OrderBuilders:
         assert body["ticker"] == "TICK-A"
         assert body["side"] == "bid"
         assert body["reduce_only"] is True
-        assert body["price"] == _format_price(Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS))
+        # Default-grid market: the finest-grid target floors to the $0.01
+        # grid's highest tradeable level
+        assert body["price"] == "0.9900"
+
+    def test_rollback_price_floors_to_market_grid(self):
+        # Regression (found in adversarial review): a flat $0.99 bid cannot
+        # cross asks resting in (0.99, 1) on sub-cent regimes, structurally
+        # killing an unwind the legacy market order always filled. The bid
+        # must be the highest tradeable level of THIS market's grid.
+        assert _v2_rollback_price(make_market("linear_cent")) == Decimal("0.99")
+        assert _v2_rollback_price(
+            make_market("deci_cent", DECI_CENT_BANDS)
+        ) == Decimal("0.999")
+        assert _v2_rollback_price(
+            make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
+        ) == Decimal("0.9999")
 
     def test_all_legs_fill_or_kill(self):
         spec = make_spec()
@@ -469,7 +502,8 @@ class TestV2ExecuteOne:
         assert rollback_body["ticker"] == "TICK-A"
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
-        assert rollback_body["price"] == _format_price(Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS))
+        # Default-grid spec market: finest-grid target floored to $0.99
+        assert rollback_body["price"] == "0.9900"
 
     def test_v2_unfilled_rollback_is_rollback_failed(self, post):
         post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(0)]
