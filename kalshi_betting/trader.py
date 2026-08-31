@@ -40,23 +40,43 @@ Purpose:
     concurrently and drops any whose prices have moved since the scan, reducing
     the chance of submitting orders against a stale price.
 
+    ensure_shard_collateral() closes the gap between portfolio-wide Kelly sizing
+    and per-shard settlement: an order settles against its own market's shard,
+    so before execution the per-leg cash requirements are totalled by shard,
+    greedy transfers are planned out of surplus shards, submitted one-shot to
+    config.TRANSFER_PATH, and confirmed to have SETTLED (the endpoint is
+    asynchronous) before the trades that depend on them are allowed to run. It
+    is not yet called by main.py — a later change wires it in.
+
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
     CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page plus
     signed_request_json from _http.py. Imports validate_pair_price and
-    tick_size_for_price from scanner.py, and ORDER_API_VERSION,
+    tick_size_for_price from scanner.py, verify_auth from auth.py (the shard-aware
+    balance re-read the transfer settle-poll needs), and ORDER_API_VERSION,
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
-    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by
-    main.py after select_portfolio() selects the final trade list. Depends on
-    the KalshiClient produced by auth.py.
+    TRANSFER_PATH, TRANSFER_POLL_INTERVAL_SECONDS,
+    TRANSFER_SETTLE_TIMEOUT_SECONDS, V2_ORDER_PATH and
+    V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by main.py after
+    select_portfolio() selects the final trade list. Depends on the KalshiClient
+    produced by auth.py.
 
 Notes:
-    Do NOT add retry logic to order submission, on EITHER path. A failed leg
-    indicates the market moved between scan time and execution time — retrying
-    risks buying one leg at a worse price and creating an unhedged directional
-    position. _submit_order calls fetch_json_page directly and _submit_order_v2
-    calls signed_request_json directly; neither may ever be wrapped in
-    api_call_with_retry.
+    Do NOT add retry logic to order submission, on EITHER path, NOR to the
+    collateral transfer POST. A failed leg indicates the market moved between
+    scan time and execution time — retrying risks buying one leg at a worse
+    price and creating an unhedged directional position; the transfer endpoint
+    is not idempotent, so a retried transfer moves the money twice.
+    _submit_order calls fetch_json_page directly and _submit_order_v2 /
+    _execute_transfer call signed_request_json directly; none may ever be
+    wrapped in api_call_with_retry (which this module deliberately does not even
+    import).
+
+    Money units in this module: contract prices are DOLLARS (float, or Decimal
+    on the V2 price path), balances and order costs are integer CENTS, and the
+    transfer endpoint's `amount` is CENTICENTS (1/100 of a cent). The last
+    conversion lives in exactly one place — _cents_to_centicents — and must
+    never be inlined at a call site.
 
     The V2 NO-leg mapping (an `ask` on the YES book opening a NO position) is
     doc-derived and cannot be proven offline, so the FIRST V2 leg-A fill of
@@ -91,6 +111,7 @@ Notes:
 """
 import logging
 import math
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -99,11 +120,15 @@ from typing import Any
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import fetch_json_page, signed_request_json
+from .auth import verify_auth
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
+    TRANSFER_PATH,
+    TRANSFER_POLL_INTERVAL_SECONDS,
+    TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
@@ -922,6 +947,458 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
                     spec.pair.canonical_title,
                 )
     return valid
+
+
+def _cents_to_centicents(cents: int) -> int:
+    """
+    Convert whole cents to CENTICENTS, the transfer endpoint's money unit.
+
+    A centicent is 1/100 of a cent (so $1.00 = 100 cents = 10,000 centicents).
+    This is the THIRD money unit in the codebase and it exists in exactly one
+    place — the `amount` field of POST config.TRANSFER_PATH:
+
+      * integer CENTS        — balances, buy_max_cost, MIN_BALANCE_CENTS
+      * fixed-point DOLLARS  — the *_dollars API strings (auth._dollar_str_to_cents)
+      * integer CENTICENTS   — intra-exchange transfer amounts (here, only here)
+
+    The arithmetic is trivial on purpose; the function exists so the unit
+    conversion is NAMED at the one call site that needs it. Never inline the
+    factor: a missing ×100 moves 1% of the intended collateral (an unexplained
+    insufficient-funds rejection later), and a doubled one moves 100× the
+    intended amount out of a shard.
+
+    Args:
+        cents (int): Amount in whole cents. >= 0.
+
+    Returns:
+        int: The same amount expressed in centicents (cents × 100).
+    """
+    return cents * 100
+
+
+def _required_cents_by_shard(portfolio: list) -> dict[int, int]:
+    """
+    Sum each exchange shard's cash requirement across a selected portfolio.
+
+    Every leg draws its cash from the shard its own market lives on, so leg A
+    charges spec.pair.market_a.exchange_index and leg B charges
+    spec.pair.market_b.exchange_index. A pair whose legs share a shard simply
+    adds both costs to that one shard.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution. Each must
+            carry per-leg cash requirements in cost_with_fees_a / cost_with_fees_b
+            (dollars, fee-inclusive — see strategy.TradeSpec).
+
+    Returns:
+        dict[int, int]: exchange_index -> required cash in whole cents. Shards
+            no leg touches are absent (not zero-filled).
+    """
+    required: dict[int, int] = {}
+    for spec in portfolio:
+        for market, cost_dollars in (
+            (spec.pair.market_a, spec.cost_with_fees_a),
+            (spec.pair.market_b, spec.cost_with_fees_b),
+        ):
+            # Ceiling, never floor: under-funding a shard by even a fraction of
+            # a cent gets the order rejected for insufficient collateral, while
+            # over-funding it by one cent costs nothing. The round() first
+            # mirrors config.fee_leg_exact — it stops binary float noise (e.g.
+            # 7.000000000000001) from claiming a whole extra cent.
+            cents = math.ceil(round(cost_dollars * 100, 6))
+            required[market.exchange_index] = required.get(market.exchange_index, 0) + cents
+    return required
+
+
+def _unfunded_shards(required: dict[int, int], available: dict[int, int]) -> set[int]:
+    """
+    Return the shards whose available balance does not cover their requirement.
+
+    Pure comparison — a shard missing from `available` counts as holding zero,
+    which is the safe reading (we never assume money we could not observe).
+
+    Args:
+        required (dict[int, int]): exchange_index -> required cents.
+        available (dict[int, int]): exchange_index -> observed balance in cents.
+
+    Returns:
+        set[int]: exchange_index values still short of cash. Empty when every
+            requirement is covered.
+    """
+    return {shard for shard, need in required.items() if available.get(shard, 0) < need}
+
+
+def _plan_transfers(
+    required_by_shard: dict[int, int], available_by_shard: dict[int, int]
+) -> list[tuple[int, int, int]]:
+    """
+    Plan the shard-to-shard transfers that would fund every shard's requirement.
+
+    PURE function — no I/O, no logging, no clock. Deficit per shard is
+    max(0, required - available); surplus is max(0, available - required). Each
+    deficit is filled greedily from the largest REMAINING surplus first, which
+    minimizes the number of transfers (every transfer is a non-idempotent POST,
+    so fewer is strictly better).
+
+    Ordering is fully deterministic so the same balances always produce the same
+    plan (and so tests can assert on it): deficits are processed in ascending
+    shard-index order, and candidate sources are ranked by remaining surplus
+    descending, ties broken by ascending shard index.
+
+    When total surplus is less than total deficit, this plans what IS coverable
+    and leaves the rest short rather than failing outright — the caller detects
+    the still-unfunded shard(s) from the post-transfer balances and drops only
+    the trades that depend on them.
+
+    Args:
+        required_by_shard (dict[int, int]): exchange_index -> required cents.
+        available_by_shard (dict[int, int]): exchange_index -> available cents.
+
+    Returns:
+        list[tuple[int, int, int]]: (source_shard, destination_shard, cents)
+            transfers to perform, in execution order. Empty when no shard is
+            short, and also when nothing can be moved (no surplus anywhere) —
+            so an empty plan alone must NOT be read as "everything is funded".
+    """
+    deficits = sorted(
+        (shard, need - available_by_shard.get(shard, 0))
+        for shard, need in required_by_shard.items()
+        if need - available_by_shard.get(shard, 0) > 0
+    )
+    remaining_surplus = {
+        shard: avail - required_by_shard.get(shard, 0)
+        for shard, avail in available_by_shard.items()
+        if avail - required_by_shard.get(shard, 0) > 0
+    }
+
+    plan: list[tuple[int, int, int]] = []
+    for dest, shortfall in deficits:
+        # Re-rank per deficit so "largest remaining surplus first" stays true
+        # after earlier deficits have drawn a source down.
+        for source in sorted(remaining_surplus, key=lambda s: (-remaining_surplus[s], s)):
+            if shortfall <= 0:
+                break
+            take = min(remaining_surplus[source], shortfall)
+            if take <= 0:
+                continue
+            plan.append((source, dest, take))
+            remaining_surplus[source] -= take
+            shortfall -= take
+    return plan
+
+
+def _transfers_active(shard_statuses: dict | None, shard: int) -> bool:
+    """
+    Report whether the exchange says intra-shard transfers are usable on a shard.
+
+    shard_statuses=None means the per-shard breakdown was unavailable (sandbox
+    or pre-sharding shape, see scanner.fetch_shard_statuses) — there is nothing
+    to gate on, so transfers are attempted and the POST itself is allowed to
+    fail loudly if the endpoint is unsupported.
+
+    When a breakdown IS available, a shard missing from it is treated as
+    inactive: refusing to move money to or from a shard the exchange did not
+    advertise costs us at most a dropped trade, while attempting it risks a
+    transfer into a shard whose state we cannot reason about.
+
+    Args:
+        shard_statuses (dict | None): scanner.fetch_shard_statuses() output.
+        shard (int): exchange_index to check.
+
+    Returns:
+        bool: True if a transfer touching this shard may be attempted.
+    """
+    if shard_statuses is None:
+        return True
+    return bool((shard_statuses.get(shard) or {}).get("intra_exchange_transfers_active"))
+
+
+def _spec_shards(spec: TradeSpec) -> set[int]:
+    """
+    Return the set of exchange shards a single trade's two legs settle against.
+
+    Args:
+        spec (TradeSpec): The trade specification.
+
+    Returns:
+        set[int]: One element when both legs share a shard, two otherwise.
+    """
+    return {spec.pair.market_a.exchange_index, spec.pair.market_b.exchange_index}
+
+
+def _partition_by_funding(portfolio: list, unfunded: set[int]) -> tuple[list, list]:
+    """
+    Split a portfolio into the trades that are fully funded and those that aren't.
+
+    PURE function. A trade is droppable iff ANY of its legs sits on an unfunded
+    shard — both legs must be payable, since a funded leg A with an unpayable
+    leg B is precisely the unhedged half-fill the whole rollback machinery
+    exists to avoid.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution.
+        unfunded (set[int]): exchange_index values still short of cash.
+
+    Returns:
+        tuple[list, list]: (kept, dropped), each preserving the input order.
+    """
+    kept: list = []
+    dropped: list = []
+    for spec in portfolio:
+        (dropped if _spec_shards(spec) & unfunded else kept).append(spec)
+    return kept, dropped
+
+
+def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | None:
+    """
+    Submit one intra-exchange collateral transfer and return its transfer id.
+
+    Deliberately NOT wrapped in api_call_with_retry: the transfer endpoint is
+    not idempotent, so retrying an ambiguous failure (a timeout that actually
+    landed) would move the money a second time. One attempt, and a failure is
+    reported to the caller as "this shard did not get funded".
+
+    The SDK has no generated method for this route, so the request goes through
+    _http.signed_request_json — a signed POST with a verbatim JSON body, which
+    applies the shared non-2xx -> ApiException + JSON-parse contract and, by
+    design, contains NO retry logic of its own. That is exactly the single-shot
+    contract this call site needs (the same reason _submit_order_v2 uses it).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        source (int): exchange_index the funds leave.
+        dest (int): exchange_index the funds arrive on.
+        cents (int): Amount to move, in whole CENTS (converted to the
+            endpoint's centicents here — see _cents_to_centicents).
+
+    Returns:
+        str | None: The accepted transfer's id, or None when the response
+            carried none (the transfer may still have been accepted, so the
+            caller must treat this as "in flight", not "failed").
+
+    Raises:
+        ApiException: On a non-2xx status from the transfer endpoint.
+        Exception: Any transport-level error — the transfer's fate is then
+            unknown and it is NEVER re-sent.
+    """
+    body = {
+        # Both endpoints of an intra-exchange transfer are the trading balance;
+        # "event_contract" is Kalshi's name for that collateral pool.
+        "source": "event_contract",
+        "destination": "event_contract",
+        # CENTICENTS (1/100 cent) — NOT cents. See _cents_to_centicents.
+        "amount": _cents_to_centicents(cents),
+        "source_exchange_shard": source,
+        "destination_exchange_shard": dest,
+    }
+    # Retry-free by design (see docstring): signed_request_json signs the path
+    # verbatim, raises ApiException on non-2xx, and never retries.
+    data = signed_request_json(client, "POST", TRANSFER_PATH, body=body)
+    return data.get("transfer_id")
+
+
+def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[int, int]:
+    """
+    Re-read the per-shard balance until every requirement is covered, or time out.
+
+    Transfers are asynchronous — acceptance is not settlement — so this is the
+    only thing that proves the collateral actually arrived. Polls every
+    config.TRANSFER_POLL_INTERVAL_SECONDS and gives up after
+    config.TRANSFER_SETTLE_TIMEOUT_SECONDS (a time.monotonic deadline, immune to
+    wall-clock jumps), returning whatever the last read showed so the caller can
+    decide which trades are still fundable.
+
+    The balance read is auth.verify_auth, imported at module scope rather than
+    injected as a parameter: trader.py already sits BELOW auth.py in the
+    project's dependency order (config/_http -> auth/scanner -> strategy ->
+    trader), so the import introduces no cycle and no new layer, and it keeps
+    "landed" judged against exactly the same shard-aware parse the run's opening
+    balance came from. A balance_reader parameter would add a production-unused
+    argument to every call site for no behavioural gain; tests substitute the
+    reader by monkeypatching trader.verify_auth, which is equally easy.
+
+    A balance read that raises is treated as "nothing observed" (empty dict) and
+    retried until the deadline: it is never treated as success, because
+    submitting orders against an unverifiable balance is exactly what this
+    function exists to prevent.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        required (dict[int, int]): exchange_index -> required cents; the loop
+            ends as soon as every one of these is covered.
+
+    Returns:
+        dict[int, int]: The most recent per-shard balance in cents (possibly
+            empty if every read failed).
+    """
+    deadline = time.monotonic() + TRANSFER_SETTLE_TIMEOUT_SECONDS
+    balances: dict[int, int] = {}
+    while True:
+        try:
+            # Same shard-aware balance read the run started with, so "landed"
+            # is judged against exactly the numbers sizing was based on.
+            balances = verify_auth(client)
+        except Exception as exc:
+            logging.warning("Balance re-read failed while awaiting transfers: %s", exc)
+            balances = {}
+        if not _unfunded_shards(required, balances):
+            return balances
+        if time.monotonic() >= deadline:
+            return balances
+        time.sleep(TRANSFER_POLL_INTERVAL_SECONDS)
+
+
+def ensure_shard_collateral(
+    client: Any,
+    portfolio: list,
+    shard_balances: dict[int, int],
+    shard_statuses: dict | None,
+    dry_run: bool = False,
+) -> list:
+    """
+    Move collateral onto the exchange shards the selected portfolio draws from.
+
+    Kelly sizing is portfolio-wide — it runs against the SUM of every shard's
+    balance — but an order settles against its own market's shard only. This
+    function closes that gap: it totals each shard's cash requirement from the
+    legs' cost_with_fees_* (_required_cents_by_shard), plans greedy transfers
+    out of surplus shards (_plan_transfers), executes them, and confirms the
+    asynchronous funds have actually landed before letting execution proceed.
+
+    Failure is always degradation, never an abort: a blocked, failed, or
+    unsettled transfer results in the affected trades being dropped from the
+    returned portfolio while the rest execute normally. Specifically:
+
+      * No shard is short  -> returns the portfolio unchanged, no API calls.
+      * dry_run            -> logs the planned transfers and returns the
+                              portfolio unchanged. NEVER POSTs.
+      * Transfers inactive on either endpoint shard (per shard_statuses) ->
+        that transfer is not attempted; a warning tells the operator to move
+        the funds manually in the Kalshi UI.
+      * A transfer POST raises -> logged as an error and NOT retried (the
+        endpoint is not idempotent); its shard simply stays unfunded.
+      * Transfers accepted but not settled within
+        config.TRANSFER_SETTLE_TIMEOUT_SECONDS -> logged CRITICAL with the
+        in-flight transfer ids ("money is in flight"), and only the trades
+        needing a still-unfunded shard are dropped.
+
+    In practice this is currently a no-op: while every selected market's legs
+    and all account funds sit on config.DEFAULT_EXCHANGE_INDEX, no shard is ever
+    short and the zero-deficit fast path returns immediately. It exists so the
+    funding path is already in place — and already exercised by that fast path —
+    from the first run on which a trade routes off shard 0.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        portfolio (list): TradeSpec objects selected for execution, each
+            carrying cost_with_fees_a / cost_with_fees_b.
+        shard_balances (dict[int, int]): exchange_index -> cents, as returned
+            by auth.verify_auth() before this run's orders.
+        shard_statuses (dict | None): scanner.fetch_shard_statuses() output,
+            used to skip shards whose intra_exchange_transfers_active is false.
+            None (breakdown unavailable) means transfers are attempted anyway
+            and the POST is allowed to fail loudly.
+        dry_run (bool): When True, plan and log but never POST. Defaults to False.
+
+    Returns:
+        list: The subset of `portfolio` whose every leg sits on a shard
+            confirmed to hold its required cash, in the input order. Equal to
+            `portfolio` whenever nothing needed funding or every transfer
+            settled; possibly empty when nothing could be funded.
+    """
+    if not portfolio:
+        return []
+
+    # Per-leg cash requirements totalled onto the shard each leg settles against
+    required = _required_cents_by_shard(portfolio)
+    # An empty plan is ambiguous (nothing needed vs. nothing movable), so the
+    # fast path keys off the deficit set itself, not off the plan being empty.
+    if not _unfunded_shards(required, shard_balances):
+        logging.info(
+            "All shards sufficiently funded for %d selected trade(s) — no collateral "
+            "transfers needed (required by shard: %s)", len(portfolio), required,
+        )
+        return portfolio
+
+    # Pure, deterministic greedy plan — no I/O happens until the loop below
+    plan = _plan_transfers(required, shard_balances)
+
+    if dry_run:
+        for source, dest, cents in plan:
+            logging.info(
+                "DRY RUN: would transfer $%.2f shard %d→%d", cents / 100, source, dest,
+            )
+        if not plan:
+            logging.info("DRY RUN: shard(s) %s under-funded and no surplus to draw on",
+                         sorted(_unfunded_shards(required, shard_balances)))
+        return portfolio
+
+    accepted: list[str] = []
+    attempted = False
+    for source, dest, cents in plan:
+        if not _transfers_active(shard_statuses, source) or not _transfers_active(
+            shard_statuses, dest
+        ):
+            logging.warning(
+                "Intra-exchange transfers are not active on shard %d and/or %d — NOT "
+                "moving $%.2f; trades needing shard %d will be dropped. Move the funds "
+                "manually in the Kalshi UI to enable them.",
+                source, dest, cents / 100, dest,
+            )
+            continue
+        try:
+            # Single attempt by design — see _execute_transfer (non-idempotent).
+            transfer_id = _execute_transfer(client, source, dest, cents)
+        except Exception as exc:
+            logging.error(
+                "Collateral transfer of $%.2f from shard %d to shard %d FAILED (not "
+                "retried — the endpoint is not idempotent): %s",
+                cents / 100, source, dest, exc,
+            )
+            continue
+        attempted = True
+        accepted.append(str(transfer_id))
+        logging.info(
+            "Collateral transfer accepted: $%.2f shard %d→%d (transfer_id=%s) — "
+            "asynchronous, awaiting settlement",
+            cents / 100, source, dest, transfer_id,
+        )
+
+    if attempted:
+        # Acceptance is not settlement: block (bounded) until a fresh balance
+        # read proves the money landed before any order relies on it.
+        confirmed = _await_transfer_settlement(client, required)
+    else:
+        # Nothing moved, so the opening balances are still the truth — don't
+        # burn the settle timeout waiting for transfers that were never sent.
+        confirmed = shard_balances
+
+    unfunded = _unfunded_shards(required, confirmed)
+    if not unfunded:
+        logging.info("All shard collateral requirements confirmed funded.")
+        return portfolio
+
+    if attempted:
+        logging.critical(
+            "Collateral transfer(s) did not settle within %ss — MONEY IS IN FLIGHT, "
+            "CHECK THE ACCOUNT. transfer_ids=%s; shard(s) still under-funded: %s "
+            "(required %s, confirmed %s)",
+            TRANSFER_SETTLE_TIMEOUT_SECONDS, accepted, sorted(unfunded), required, confirmed,
+        )
+
+    # Both legs must be payable — a funded leg A with an unpayable leg B is the
+    # unhedged half-fill the rollback machinery exists to avoid
+    kept, dropped = _partition_by_funding(portfolio, unfunded)
+    for spec in dropped:
+        logging.warning(
+            "Dropping '%s' — leg shard(s) %s include an under-funded shard %s",
+            spec.pair.canonical_title, sorted(_spec_shards(spec)), sorted(unfunded),
+        )
+    logging.warning(
+        "Collateral funding incomplete: %d of %d selected trade(s) dropped.",
+        len(dropped), len(portfolio),
+    )
+    return kept
 
 
 def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:

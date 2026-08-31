@@ -198,6 +198,38 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 #   3. the only shard the legacy order path may route to.
 DEFAULT_EXCHANGE_INDEX       = 0
 
+# ── Cross-shard collateral transfers ──────────────────────────────────────────
+
+# Full API path of the intra-exchange (shard-to-shard) collateral transfer
+# endpoint, used by trader.ensure_shard_collateral() to move cash onto whichever
+# shard a selected trade's legs actually settle against. The pinned SDK has no
+# generated method for this route, so it is reached through
+# _http.signed_request_json(), which signs the path VERBATIM — hence the full
+# string including the /trade-api/v2 prefix, not a suffix appended to PROD_URL.
+# WARNING: the request body's `amount` field is denominated in CENTICENTS
+# (1/100 of a cent), the codebase's THIRD money unit after integer cents and
+# fixed-point dollar strings. Convert with trader._cents_to_centicents(), never
+# by inlining a factor at the call site.
+TRANSFER_PATH = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
+
+# Seconds to keep waiting for accepted transfers to actually SETTLE. The
+# transfer endpoint is ASYNCHRONOUS: a 2xx means "accepted", not "the funds have
+# landed", so an order submitted immediately after could still be rejected for
+# insufficient collateral on its shard. ensure_shard_collateral() therefore
+# re-reads the per-shard balance until every under-funded shard is covered, and
+# this bounds that wait. 30s is long enough for an in-flight transfer to land,
+# short enough that a stuck transfer doesn't hold the run open while its scanned
+# prices go stale; on timeout the affected trades are dropped rather than
+# submitted against money that may not be there.
+TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
+
+# Seconds between per-shard balance re-reads while waiting for transfers to
+# settle. Each poll costs one GET /portfolio/balance, so 2s gives ~15 reads
+# inside TRANSFER_SETTLE_TIMEOUT_SECONDS — responsive enough to proceed promptly
+# once the funds land, infrequent enough not to spend rate-limit tokens on a hot
+# loop while money is in flight.
+TRANSFER_POLL_INTERVAL_SECONDS = 2
+
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
 # weekly scheduler daemon forever.
