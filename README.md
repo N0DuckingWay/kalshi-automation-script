@@ -182,6 +182,18 @@ kalshi_private_key.pem
 
 CLI runs now echo log output to the terminal as well as `kalshi_arb.log`.
 
+### Live V2 order-mapping probe (~1 cent of real money)
+
+```bash
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|transfer] [--yes]
+```
+
+Human-run verification of the V2 order path's NO-leg mapping (an `ask` must open a NO
+position and a reduce-only `bid` must close it), fill-or-kill kill semantics, and the
+inter-shard transfer's centicent unit — against the production account, for roughly one
+cent of worst-case exposure. Never wired into the pipeline; run it before trusting the
+V2 path unsupervised.
+
 ### Dev dry-run (sandbox simulation, no real orders)
 
 ```bash

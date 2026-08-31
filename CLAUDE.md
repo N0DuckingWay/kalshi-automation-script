@@ -33,6 +33,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 | `backtester.py` | Replays strategy on settled market history | `run_backtest()` |
 | `dashboard.py` | Generates self-contained HTML performance report | `generate_dashboard()` |
 | `backtest.py` | CLI entry point for the backtest pipeline | — |
+| `v2_probe.py` | User-run live verification CLI for the V2 order mapping and the transfer unit (~1c exposure) — never imported by the pipeline | `main()` |
 
 **Dependency order (no circular imports):**
 ```
@@ -43,6 +44,8 @@ config.py, _http.py
                   └─ main.py, scheduler.py
 
 historical.py → backtester.py → dashboard.py → backtest.py
+
+v2_probe.py — standalone, human-run; imports auth/config/scanner/trader, imported by NOTHING
 ```
 
 ---
@@ -82,6 +85,9 @@ python3 -m kalshi_betting.backtest --max-horizon-days 14
 # Weekly scheduler daemon (runs prod every Monday 09:00)
 python3 -m kalshi_betting.scheduler
 
+# Live verification of the V2 order mapping + transfer unit (~1c of real money, prod account)
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|transfer] [--yes]
+
 # Run tests
 python3 -m pytest tests/ -v
 
@@ -95,7 +101,7 @@ python3 -m ruff check kalshi_betting/
 
 - `.github/workflows/ci.yml` runs two jobs on every push/PR to `main`: **Lint (ruff)** and **Test (pytest)**. Both must pass before merging — run them locally first.
 - `pyproject.toml` declares `requires-python = ">=3.11"` and pins `kalshi-python-sync==3.2.0`. Do NOT bump the SDK pin to 3.13.0 — that version's own metadata requires Python >= 3.13 and breaks `pip install -e ".[dev]"` on 3.11 (i.e. breaks CI).
-- Tests live in `tests/` (`test_auth.py`, `test_backtester.py`, `test_config.py`, `test_historical.py`, `test_http.py`, `test_main.py`, `test_scanner.py`, `test_scheduler.py`, `test_strategy.py`, `test_trader.py`) and run fully offline against `MagicMock` clients.
+- Tests live in `tests/` (`test_auth.py`, `test_backtester.py`, `test_config.py`, `test_historical.py`, `test_http.py`, `test_main.py`, `test_scanner.py`, `test_scheduler.py`, `test_strategy.py`, `test_trader.py`, `test_v2_probe.py`) and run fully offline against `MagicMock` clients.
 
 ---
 
@@ -223,7 +229,7 @@ Check `pair.tradeable` to distinguish.
 - **Runtime backstop on the NO-leg mapping** (`trader._confirm_v2_no_mapping()`): the side mapping above cannot be proven offline, so the **first V2 leg-A fill of each process** is sign-checked against the account's own signed positions ledger (`_position_count` on market A) before leg B is submitted. A **negative** position confirms the hypothesis (an `ask` really did open a NO position) and latches the module-level `_V2_NO_MAPPING_CONFIRMED`, so the check costs one extra positions read per **process**, not per trade — the mapping is a property of the exchange, and one confirmed negative proves it for every later trade in the run; the latch is deliberately not persisted, so a fresh process re-verifies. A **non-negative** position (zero included) means the mapping is DISPROVEN live: the pair stops at `status="manual_review"` with **leg B unsubmitted** (it would hedge a position we don't hold) and **leg A deliberately left in place** — the unwind is a `bid` resting on the same disproven hypothesis, so an automated unwind could double the error rather than reverse it (`reduce_only` would make a wrong unwind fail safe into `rollback_failed`, but a human must decide); a `logging.critical` names the remedy, `ORDER_API_VERSION="legacy"`. A **failed lookup** is unknown, not disproven: it warns, proceeds to leg B, and does NOT latch, so the check re-arms on the next NO fill — one flaky positions read must never stall trading. Don't make this check unconditional per-trade (it is a per-process property) and don't turn the disproven branch into an automatic rollback.
 - **Fill classification:** a full FoK fill is assumed to report `fill_count == count` and a kill to report **2xx with `fill_count == 0`**. `_v2_fill_status()` maps only those two to the legacy `"executed"`/`"canceled"` vocabulary; a partial fill (a FoK invariant violation), a missing `fill_count`, or anything else logs `logging.critical` and **raises**. That is the design, not an oversight: raising routes into `_execute_one`'s existing ambiguous-exception path, which consults `_position_count` (the account's ground truth), so a mispredicted response shape degrades safely into `failed`/`rolled_back`/`manual_review` instead of being misread as a clean fill or a clean kill. Never "simplify" it into returning a guessed status.
 - **Response shape:** the order object may arrive wrapped under an `"order"` key or flat, and counts as either `fill_count` or the fixed-point string `fill_count_fp` — all four combinations are accepted (`_parse_fixed_point` prefers the `_fp` variant).
-- **Sandbox V2 support is unknown.** Dev mode never submits orders, so it cannot verify this; the smallest possible prod run is the real check. If it misbehaves, set `ORDER_API_VERSION="legacy"` — that is the whole reason the legacy path is retained intact.
+- **Sandbox V2 support is unknown.** Dev mode never submits orders, so it cannot verify this; the smallest possible prod run is the real check — and `python3 -m kalshi_betting.v2_probe` is the ~1-cent way to verify the NO-leg mapping, FoK kill semantics, and the transfer centicent unit before real size flows. If anything misbehaves, set `ORDER_API_VERSION="legacy"` — that is the whole reason the legacy path is retained intact.
 - **Omitted optional fields rely on server defaults:** `self_trade_prevention_type`, `subaccount`, and `cancel_order_on_pause` are deliberately not sent.
 - Other fixed choices: prices are 4-decimal dollar strings (`_format_price`, exactly representing every grid point of every regime); counts are fixed-point strings (`_format_count`); each order body's `exchange_index` is that leg's OWN market's `exchange_index` (leg A and the rollback from `market_a`, leg B from `market_b` — a pair's legs can sit on different shards) and never `-1` auto-route, so a wrong shard model is rejected loudly by the exchange instead of silently routed, and an explicit-shard write bills only that shard's rate-limit bucket where auto-route bills every nonzero shard's. The legacy endpoint has no shard-routing parameter at all, so while `ORDER_API_VERSION` is not `"v2"`, `trader._legacy_routable()` refuses any spec with a leg off `DEFAULT_EXCHANGE_INDEX` at the top of `_execute_one()` — `status="failed"`, since nothing was submitted and there is nothing to unwind; `post_only` is always `False` (we are deliberate takers) and `reduce_only` is `True` only on the rollback.
 
@@ -293,5 +299,6 @@ Single-line calls to stdlib or well-known helpers (e.g. `logging.info(...)`, `so
 - **Do not import `trader.py` from `scanner.py` or `strategy.py`** — circular dependency.
 - **Do not write output files outside `PROJECT_ROOT`**. All logs, Excel files, and HTML dashboards write relative to `PROJECT_ROOT`.
 - **Do not modify `_DATE_PATTERNS` without running `test_normalize_title`** — a regression silently causes missed pairs or false positives with no error.
+- **Do not import `v2_probe` from any pipeline module** — it is a human-run tool that submits real-money orders; a single import would put probe submissions one code path away from the weekly scheduler (a test asserts this).
 - **Do not add tests that call the real Kalshi API**. Use `unittest.mock.MagicMock` for `KalshiClient`. Tests should be runnable offline.
 - **Do not change the fee formula without updating both** `fee_per_pair_approx()` and `fee_leg_exact()` in `config.py`. The backtester also uses both.
