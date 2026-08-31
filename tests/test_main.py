@@ -43,6 +43,7 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_SHORT_GAP,
     ORDER_API_VERSION,
     SAME_TITLE_MIN_PRICE_DIFF,
+    TRANSFER_PATH,
     V2_ORDER_PATH,
 )
 
@@ -177,10 +178,16 @@ class TestSetupLogging:
 #   Tick Event / Tick Test Market -> TICK-A (0.90, sub-cent tick fields) /
 #       TICK-B (0.50) — priced to be non-tradeable (nA+pB > 1), so it always
 #       appears in scan output but never in a portfolio.
-#   Shard Event / Shard Test Market -> SHARD1-A (exchange_index=1, dropped
-#       at ingest) / SHARD1-B (left without a partner, so no pair forms).
+#   Shard Event / Shard Test Market -> SHARD1-A (exchange_index=1) /
+#       SHARD1-B (shard 0) — a cross-shard pair that IS ingested (market data
+#       is cross-shard) but is priced non-tradeable, so it only ever proves
+#       ingest tagging, never execution.
 #   Held Event / Held Question -> HELD-A (held in prod) / HELD-B — forms a
 #       tradeable pair in dev (no held-ticker filtering) but never in prod.
+#
+# The one tradeable pair's cheap leg can be moved onto another shard with
+# _live_shape_client(same_cheap_shard=...), which is what the cross-shard
+# routing and collateral-transfer replays use.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _CLOSE = "2026-12-01T00:00:00Z"
@@ -227,6 +234,74 @@ _LOW_BALANCE_PAYLOAD = {
         {"exchange_index": 1, "balance": "3.0000"},
     ],
 }
+
+# Everything on shard 0, nothing on shard 1 — the collateral-transfer replays
+# put the cheap leg on shard 1, so leg B's cash requirement is a pure deficit
+# that only an intra-exchange transfer out of shard 0's surplus can cover.
+_SHARD1_EMPTY_BALANCE = {
+    "balance": 114,
+    "balance_dollars": "10000.0000",
+    "balance_breakdown": [
+        {"exchange_index": 0, "balance": "10000.0000"},
+        {"exchange_index": 1, "balance": "0.0000"},
+    ],
+}
+
+# What the account reads back AFTER a transfer settles — trader's settlement
+# poll re-reads the balance through auth.verify_auth, so this is how the
+# replay proves the money landed before any order relies on it.
+_SHARD1_SETTLED_BALANCE = {
+    "balance": 114,
+    "balance_dollars": "10000.0000",
+    "balance_breakdown": [
+        {"exchange_index": 0, "balance": "5000.0000"},
+        {"exchange_index": 1, "balance": "5000.0000"},
+    ],
+}
+
+# Funds parked on an advertised, trading-active shard that produced ZERO
+# ingested markets — the one coverage gap check_shard_coverage calls CRITICAL.
+_SHARD2_FUNDED_BALANCE = {
+    "balance": 114,
+    "balance_dollars": "10349.0000",
+    "balance_breakdown": [
+        {"exchange_index": 0, "balance": "250.0000"},
+        {"exchange_index": 1, "balance": "9999.0000"},
+        {"exchange_index": 2, "balance": "100.0000"},
+    ],
+}
+
+
+def _status_entry(
+    idx: int, *, trading_active: bool = True, transfers_active: bool = True,
+    description: str = "Main",
+) -> dict:
+    """One entry of GET /exchange/status's exchange_index_statuses array."""
+    return {
+        "exchange_index": idx,
+        "trading_active": trading_active,
+        "exchange_active": True,
+        "intra_exchange_transfers_active": transfers_active,
+        "description": description,
+    }
+
+
+def _status_payload(*entries: dict) -> dict:
+    """A full GET /exchange/status body wrapping the given shard entries."""
+    return {
+        "exchange_active": True,
+        "trading_active": True,
+        "exchange_index_statuses": list(entries),
+    }
+
+
+# Default advertised topology: shards 0 and 1, both trading and both accepting
+# intra-exchange transfers — matching the fixed market set, which spans exactly
+# those two shards.
+_EXCHANGE_STATUS_PAYLOAD = _status_payload(
+    _status_entry(0, description="Main"),
+    _status_entry(1, description="Combos"),
+)
 
 
 def _raw_json_response(payload: dict, status: int = 200, reason: str = "OK") -> SimpleNamespace:
@@ -279,7 +354,10 @@ def _ev(title: str, market: dict) -> dict:
     return {"title": title, "markets": [market]}
 
 
-def _build_events() -> list:
+def _build_events(same_cheap_shard: int = 0) -> list:
+    """The fixed market set. `same_cheap_shard` moves the tradeable pair's
+    cheap leg (leg B) onto another exchange shard, which is what turns the
+    one selectable trade into a cross-shard one."""
     return [
         _ev("Recurring Q", _mk_market(
             _TICKER_SAME_EXP, "EVT-EXP", "Will X happen?", "Outcome Main",
@@ -288,6 +366,7 @@ def _build_events() -> list:
         _ev("Recurring Q", _mk_market(
             _TICKER_SAME_CHEAP, "EVT-CHEAP", "Will X happen?", "Outcome Main",
             "0.20", "0.75", price_level_structure="linear_cent",
+            exchange_index=same_cheap_shard,
         )),
         _ev("Tick Event", _mk_market(
             _TICKER_TICK_A, "EVT-TICK-A", "Tick Test Market", "Outcome",
@@ -351,6 +430,22 @@ def _positions_side_effect(held_payload: dict, lookup_map: dict):
     return _effect
 
 
+def _balance_side_effect(first: dict, later: dict | None):
+    """Programs get_balance_without_preload_content. The FIRST read (the one
+    _run_prod sizes on) returns `first`; every later read — trader's transfer
+    settlement poll, then the post-trade balance — returns `later`, which is
+    how a replay models funds actually landing on a shard."""
+    state = {"n": 0}
+
+    def _effect(*args, **kwargs):
+        state["n"] += 1
+        if later is None or state["n"] == 1:
+            return _raw_json_response(first)
+        return _raw_json_response(later)
+
+    return _effect
+
+
 def _order_side_effect(fill_pattern: list):
     """Programs client.rest_client.request for a sequence of V2 order POSTs.
 
@@ -376,10 +471,28 @@ def _order_side_effect(fill_pattern: list):
     return _effect
 
 
+def _transfer_and_order_side_effect(fill_pattern: list):
+    """client.rest_client.request carries BOTH signed POSTs the live path
+    makes — the collateral transfer and the V2 orders — so dispatch on the
+    URL. Transfers are accepted with a transfer_id; orders fall through to
+    _order_side_effect, whose fill_pattern therefore only counts orders."""
+    orders = _order_side_effect(fill_pattern)
+
+    def _effect(verb, url, headers=None, body=None):
+        if TRANSFER_PATH in url:
+            return _raw_json_response({"transfer_id": "xfer-1"})
+        return orders(verb, url, headers=headers, body=body)
+
+    return _effect
+
+
 def _live_shape_client(
     monkeypatch,
     *,
     balance_payload: dict,
+    balance_payload_after: dict | None = None,
+    exchange_status_payload: dict | None = _EXCHANGE_STATUS_PAYLOAD,
+    same_cheap_shard: int = 0,
     include_held_position: bool = True,
     position_lookup_responses: dict | None = None,
     order_side_effect=None,
@@ -391,7 +504,23 @@ def _live_shape_client(
     Args:
         monkeypatch: pytest's monkeypatch fixture, used to configure
             scanner.INCLUDE_MVE_MARKETS / MVE_MAX_EMPTY_PAGES.
-        balance_payload (dict): Body for get_balance_without_preload_content.
+        balance_payload (dict): Body for the FIRST get_balance_without_preload_content
+            read — the one prod sizing is based on.
+        balance_payload_after (dict | None): Body for every LATER balance read
+            (trader's transfer settlement poll, then the post-trade balance).
+            None (default) keeps returning balance_payload forever.
+        exchange_status_payload (dict | None): Body for
+            get_exchange_status_without_preload_content, defaulting to shards
+            0 and 1 both trading-active with transfers active. Pass None to
+            leave the attribute unwired, which is what every OTHER test module's
+            MagicMock client looks like: fetch_json_page then chokes on the
+            auto-created MagicMock attribute, scanner.fetch_shard_statuses'
+            broad except swallows it, and the run degrades to single-shard
+            semantics (see test_unwired_exchange_status_degrades_to_single_shard).
+        same_cheap_shard (int): exchange_index for the tradeable pair's cheap
+            leg (SAME-CHEAP / leg B). 0 (default) keeps the pair on one shard;
+            1 makes it the cross-shard pair the routing and collateral replays
+            need.
         include_held_position (bool): Whether the account holds HELD-A —
             True (default) matches every test's expectation that the held
             pair never trades in prod.
@@ -418,7 +547,7 @@ def _live_shape_client(
     client = MagicMock()
 
     client.get_events_without_preload_content = MagicMock(
-        return_value=_raw_events_page(_build_events())
+        return_value=_raw_events_page(_build_events(same_cheap_shard=same_cheap_shard))
     )
     if mve_bailout:
         # A non-None cursor on every page means only the consecutive-empty-
@@ -427,8 +556,16 @@ def _live_shape_client(
             return_value=_raw_events_page([], cursor="MVE-CURSOR-1")
         )
 
+    # Per-shard exchange status: read raw, so the run derives real
+    # trading_active/transfers_active facts rather than falling back to
+    # single-shard semantics.
+    if exchange_status_payload is not None:
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=_raw_json_response(exchange_status_payload)
+        )
+
     client.get_balance_without_preload_content = MagicMock(
-        return_value=_raw_json_response(balance_payload)
+        side_effect=_balance_side_effect(balance_payload, balance_payload_after)
     )
 
     held_payload = {
@@ -458,6 +595,28 @@ def _live_shape_client(
     return client
 
 
+def _capture_dev_simulation(monkeypatch) -> dict:
+    """Patch out the Excel writer and capture what _run_dev hands it."""
+    captured: dict = {}
+
+    def fake_write_dev_simulation(results, all_candidates, balance_cents):
+        captured["results"] = results
+        captured["all_candidates"] = all_candidates
+        captured["balance_cents"] = balance_cents
+        return pathlib.Path("/fake/dev_sim.xlsx")
+
+    monkeypatch.setattr(main, "write_dev_simulation", fake_write_dev_simulation)
+    return captured
+
+
+def _candidate_tickers(candidates) -> set:
+    tickers: set = set()
+    for pair in candidates:
+        tickers.add(pair.market_a.ticker)
+        tickers.add(pair.market_b.ticker)
+    return tickers
+
+
 class TestRunDevLiveShapeReplay:
     def test_run_dev_dry_run_end_to_end_current_payload_shapes(self, monkeypatch, caplog):
         client = _live_shape_client(
@@ -465,15 +624,7 @@ class TestRunDevLiveShapeReplay:
             balance_payload=_LIVE_BALANCE_PAYLOAD,  # unused in dev, harmless
             mve_bailout=True,
         )
-        captured: dict = {}
-
-        def fake_write_dev_simulation(results, all_candidates, balance_cents):
-            captured["results"] = results
-            captured["all_candidates"] = all_candidates
-            captured["balance_cents"] = balance_cents
-            return pathlib.Path("/fake/dev_sim.xlsx")
-
-        monkeypatch.setattr(main, "write_dev_simulation", fake_write_dev_simulation)
+        captured = _capture_dev_simulation(monkeypatch)
 
         args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
 
@@ -491,25 +642,84 @@ class TestRunDevLiveShapeReplay:
         assert main_spec.pair.nA == pytest.approx(0.45)
         assert main_spec.pair.pB == pytest.approx(0.20)
 
-        # The exchange_index=1 market was dropped at ingest — it appears in no pair.
-        all_tickers: set = set()
-        for pair in captured["all_candidates"]:
-            all_tickers.add(pair.market_a.ticker)
-            all_tickers.add(pair.market_b.ticker)
-        assert _TICKER_SHARD_A not in all_tickers
+        # Market data is cross-shard: the exchange_index=1 market is INGESTED
+        # and tagged, not dropped. (It was dropped before the multi-shard flip.)
+        all_candidates = captured["all_candidates"]
+        assert _TICKER_SHARD_A in _candidate_tickers(all_candidates)
+        shard_pair = next(
+            p for p in all_candidates if p.market_a.ticker == _TICKER_SHARD_A
+        )
+        assert shard_pair.market_a.exchange_index == 1
+        assert shard_pair.market_b.exchange_index == 0
 
         # Sub-cent tick fields flowed through ingest without breaking the run.
         tick_pair = next(
-            p for p in captured["all_candidates"] if p.market_a.ticker == _TICKER_TICK_A
+            p for p in all_candidates if p.market_a.ticker == _TICKER_TICK_A
         )
         assert tick_pair.market_a.price_level_structure == "center_deci_edge_centi_cent"
         assert tick_pair.market_a.price_ranges is not None
 
-        assert "Skipped 1 markets on non-routable exchange shards" in caplog.text
+        # The old drop-at-ingest warning is gone, and the per-shard ingest
+        # census (the only signal of which shards a run actually saw) is on.
+        assert "non-routable" not in caplog.text
+        assert "Ingested markets by shard: {0: 7, 1: 1}" in caplog.text
+        # Both advertised shards produced markets — nothing to report.
+        assert "Full shard coverage: shards [0, 1] scanned" in caplog.text
+        assert "SHARD COVERAGE FAILURE" not in caplog.text
+
         assert "MVE fetch:" in caplog.text  # proves the bail-out path actually fired
 
         client.create_order_without_preload_content.assert_not_called()
         assert client.rest_client.request.call_count == 0
+
+    def test_run_dev_drops_markets_on_trading_inactive_shard(self, monkeypatch, caplog):
+        # The ONE ingest-time shard exclusion: nothing on a halted shard can be
+        # traded, nor should it linger as a stale candidate.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, description="Main"),
+                _status_entry(1, trading_active=False, description="Combos"),
+            ),
+        )
+        captured = _capture_dev_simulation(monkeypatch)
+
+        args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, args)
+
+        assert _TICKER_SHARD_A not in _candidate_tickers(captured["all_candidates"])
+        assert "Skipped 1 markets on trading-inactive exchange shards [1]" in caplog.text
+        assert "Ingested markets by shard: {0: 7}" in caplog.text
+        # A deliberately-halted shard is never re-reported as a coverage gap —
+        # the ingest drop above already warned about it.
+        assert "SHARD COVERAGE FAILURE" not in caplog.text
+        assert "Shard coverage:" not in caplog.text
+
+    def test_unwired_exchange_status_degrades_to_single_shard(self, monkeypatch, caplog):
+        # Every other test module's MagicMock client leaves
+        # get_exchange_status_without_preload_content unwired. That must remain
+        # harmless: the auto-created MagicMock attribute makes fetch_json_page
+        # raise, scanner.fetch_shard_statuses swallows it, and the run keeps
+        # every market and simply cannot assess coverage.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=None,
+        )
+        captured = _capture_dev_simulation(monkeypatch)
+
+        args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, args)
+
+        assert _TICKER_SHARD_A in _candidate_tickers(captured["all_candidates"])
+        assert "Per-shard exchange status unavailable — coverage not assessable." in caplog.text
+        assert "trading-inactive" not in caplog.text
+        assert "SHARD COVERAGE FAILURE" not in caplog.text
 
 
 class TestRunProdDryRunLiveShapeReplay:
@@ -558,6 +768,65 @@ class TestRunProdDryRunLiveShapeReplay:
         client.create_order_without_preload_content.assert_not_called()
         assert client.rest_client.request.call_count == 0
 
+    def test_run_prod_flags_funded_advertised_shard_with_no_markets(self, monkeypatch, caplog):
+        # Shard 2 is advertised, trading-active, holds $100 — and produced zero
+        # ingested markets. That is a real blind spot (a pair could exist there
+        # and go undetected), so it is CRITICAL. The run still continues.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_SHARD2_FUNDED_BALANCE,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, description="Main"),
+                _status_entry(1, description="Combos"),
+                _status_entry(2, description="Crypto"),
+            ),
+        )
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after):
+            captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        args = SimpleNamespace(dry_run=True, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_prod(client, args)
+
+        critical = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical, "expected a CRITICAL coverage record"
+        assert any("SHARD COVERAGE FAILURE" in r.getMessage() for r in critical)
+        assert any(
+            "shard 2" in r.getMessage() and "holds account funds" in r.getMessage()
+            for r in critical
+        )
+        # Never an abort — the run trades on whatever shards WERE covered.
+        assert captured.get("results"), "coverage failure must not stop the run"
+
+    def test_run_prod_warns_when_empty_advertised_shard_holds_no_funds(self, monkeypatch, caplog):
+        # Same topology minus the money on shard 2: an advertised-but-empty
+        # shard is expected during the rollout, so it must not cry wolf.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, description="Main"),
+                _status_entry(1, description="Combos"),
+                _status_entry(2, description="Crypto"),
+            ),
+        )
+        monkeypatch.setattr(
+            main, "append_to_prod_log", lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"),
+        )
+        args = SimpleNamespace(dry_run=True, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_prod(client, args)
+
+        assert "SHARD COVERAGE FAILURE" not in caplog.text
+        assert "Shard coverage: advertised active shard 2" in caplog.text
+        assert "may be legitimately empty" in caplog.text
+
     def test_run_prod_aborts_below_min_balance(self, monkeypatch, caplog):
         client = _live_shape_client(monkeypatch, balance_payload=_LOW_BALANCE_PAYLOAD)
         args = SimpleNamespace(dry_run=True, max_horizon_days=None)
@@ -568,6 +837,9 @@ class TestRunProdDryRunLiveShapeReplay:
         assert "below minimum" in caplog.text
         client.get_events_without_preload_content.assert_not_called()
         client.get_positions_without_preload_content.assert_not_called()
+        # The shard-status read happens after the balance gate — an account
+        # that can't trade shouldn't spend an API call on exchange status.
+        client.get_exchange_status_without_preload_content.assert_not_called()
         client.create_order_without_preload_content.assert_not_called()
         assert client.rest_client.request.call_count == 0
 
@@ -589,7 +861,17 @@ class TestRunProdLiveV2Replay:
         monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", False)
 
     @staticmethod
-    def _run(monkeypatch, fill_pattern, position_lookup_responses=None):
+    def _run(
+        monkeypatch,
+        fill_pattern,
+        position_lookup_responses=None,
+        *,
+        same_cheap_shard: int = 0,
+        balance_payload: dict = _LIVE_BALANCE_PAYLOAD,
+        balance_payload_after: dict | None = None,
+        order_side_effect=None,
+        dry_run: bool = False,
+    ):
         # After a filled NO buy the exchange reports a NEGATIVE (short-YES)
         # position on the leg-A ticker — that sign is what trader's first-fill
         # backstop verifies before leg B is submitted, so the replay account
@@ -604,8 +886,13 @@ class TestRunProdLiveV2Replay:
         lookups.update(position_lookup_responses or {})
         client = _live_shape_client(
             monkeypatch,
-            balance_payload=_LIVE_BALANCE_PAYLOAD,
-            order_side_effect=_order_side_effect(fill_pattern),
+            balance_payload=balance_payload,
+            balance_payload_after=balance_payload_after,
+            same_cheap_shard=same_cheap_shard,
+            order_side_effect=(
+                order_side_effect if order_side_effect is not None
+                else _order_side_effect(fill_pattern)
+            ),
             position_lookup_responses=lookups,
         )
         captured: dict = {}
@@ -615,7 +902,7 @@ class TestRunProdLiveV2Replay:
             return pathlib.Path("/fake/trade_log.xlsx")
 
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
-        args = SimpleNamespace(dry_run=False, max_horizon_days=None)
+        args = SimpleNamespace(dry_run=dry_run, max_horizon_days=None)
         main._run_prod(client, args)
         return client, captured
 
@@ -690,4 +977,111 @@ class TestRunProdLiveV2Replay:
         result = captured["results"][0]
         assert result.status == "executed"
         assert "ambiguous" in (result.error or "").lower()
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_live_v2_routes_each_leg_to_its_own_shard(self, monkeypatch):
+        # The behavioral point of multi-shard support: a pair whose legs live
+        # on different shards is now tradeable, and each V2 body must carry
+        # ITS OWN market's exchange_index — never one shared value, never the
+        # -1 auto-route sentinel. Shard 1 is already funded here ($9,999), so
+        # no collateral transfer is involved.
+        client, captured = self._run(monkeypatch, ["full", "full"], same_cheap_shard=1)
+
+        calls = client.rest_client.request.call_args_list
+        assert len(calls) == 2
+        assert all(V2_ORDER_PATH in c.args[1] for c in calls)
+        assert all(TRANSFER_PATH not in c.args[1] for c in calls)
+
+        by_ticker = {c.kwargs["body"]["ticker"]: c.kwargs["body"] for c in calls}
+        assert by_ticker[_TICKER_SAME_EXP]["exchange_index"] == 0
+        assert by_ticker[_TICKER_SAME_CHEAP]["exchange_index"] == 1
+
+        assert len(captured["results"]) == 1
+        assert captured["results"][0].status == "executed"
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_dry_run_plans_but_never_posts_a_collateral_transfer(
+        self, monkeypatch, caplog,
+    ):
+        # Leg B sits on shard 1, which holds $0 — a genuine deficit. In dry-run
+        # the plan must be logged and NOTHING posted: not the transfer, not the
+        # orders.
+        with caplog.at_level(logging.INFO):
+            client, _ = self._run(
+                monkeypatch,
+                [],
+                same_cheap_shard=1,
+                balance_payload=_SHARD1_EMPTY_BALANCE,
+                dry_run=True,
+            )
+
+        assert "DRY RUN: would transfer" in caplog.text
+        assert "shard 0→1" in caplog.text
+        assert client.rest_client.request.call_count == 0
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_live_transfers_collateral_before_ordering(self, monkeypatch, caplog):
+        # Same deficit, live: the transfer POST must land BEFORE any order
+        # POST, and the settlement poll must see the funds actually arrive
+        # (the second balance read) before execution proceeds.
+        with caplog.at_level(logging.INFO):
+            client, captured = self._run(
+                monkeypatch,
+                ["full", "full"],
+                same_cheap_shard=1,
+                balance_payload=_SHARD1_EMPTY_BALANCE,
+                balance_payload_after=_SHARD1_SETTLED_BALANCE,
+                order_side_effect=_transfer_and_order_side_effect(["full", "full"]),
+            )
+
+        urls = [c.args[1] for c in client.rest_client.request.call_args_list]
+        assert len(urls) == 3
+        assert TRANSFER_PATH in urls[0], "collateral must move before any order"
+        assert all(V2_ORDER_PATH in u for u in urls[1:])
+
+        transfer_body = client.rest_client.request.call_args_list[0].kwargs["body"]
+        assert transfer_body["source_exchange_shard"] == 0
+        assert transfer_body["destination_exchange_shard"] == 1
+        assert transfer_body["amount"] > 0
+
+        assert "Collateral transfer accepted" in caplog.text
+        assert "All shard collateral requirements confirmed funded." in caplog.text
+
+        order_bodies = {
+            c.kwargs["body"]["ticker"]: c.kwargs["body"]
+            for c in client.rest_client.request.call_args_list[1:]
+        }
+        assert order_bodies[_TICKER_SAME_EXP]["exchange_index"] == 0
+        assert order_bodies[_TICKER_SAME_CHEAP]["exchange_index"] == 1
+
+        assert captured["results"][0].status == "executed"
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_drops_the_trade_when_its_shard_cannot_be_funded(
+        self, monkeypatch, caplog,
+    ):
+        # Transfers reported inactive on shard 1 => the transfer is never
+        # attempted, the only selected trade is dropped, and NO order is
+        # submitted underfunded.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_SHARD1_EMPTY_BALANCE,
+            same_cheap_shard=1,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, description="Main"),
+                _status_entry(1, transfers_active=False, description="Combos"),
+            ),
+            order_side_effect=_transfer_and_order_side_effect(["full", "full"]),
+        )
+        monkeypatch.setattr(
+            main, "append_to_prod_log", lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"),
+        )
+        args = SimpleNamespace(dry_run=False, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_prod(client, args)
+
+        assert "Intra-exchange transfers are not active" in caplog.text
+        assert "No selected pair could be funded on its exchange shard" in caplog.text
+        assert client.rest_client.request.call_count == 0
         client.create_order_without_preload_content.assert_not_called()

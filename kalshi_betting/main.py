@@ -18,6 +18,23 @@ Dependencies:
     (market fetching and pair detection), strategy.py (trade sizing and portfolio
     selection), and trader.py (order execution). Entry point for
     `python3 -m kalshi_betting.main`.
+
+Notes:
+    Both run modes read the exchange's per-shard status breakdown
+    (scanner.fetch_shard_statuses) before fetching markets and pass the set of
+    trading-inactive shards into the fetch. Markets on every other shard are
+    ingested and tagged with their exchange_index — market data is cross-shard.
+    The full parsed status dict is kept in a local (`shard_statuses`) because
+    prod reads more than trading_active from it: it is handed to
+    trader.ensure_shard_collateral(), which refuses to move collateral to or
+    from a shard whose intra_exchange_transfers_active is false. Immediately
+    after the fetch, `_log_shard_coverage` (wrapping
+    scanner.check_shard_coverage) compares that advertised breakdown against
+    the shards actually observed in ingested markets (and, in prod, the
+    balance breakdown) and logs any gap at CRITICAL or WARNING — see the
+    function docstring for the empty-vs-funded severity split. A run only
+    claims "Full shard coverage" when the breakdown exists and nothing was
+    wrong; the run always continues regardless of what the check finds.
 """
 import argparse
 import logging
@@ -35,16 +52,18 @@ from .config import (
 )
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
+    check_shard_coverage,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    fetch_shard_statuses,
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_tickers,
 )
 from .strategy import compute_trade, select_portfolio
-from .trader import execute_trades, pre_execution_check
+from .trader import ensure_shard_collateral, execute_trades, pre_execution_check
 
 
 def _truncate(text: str, n: int = 40) -> str:
@@ -191,9 +210,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     """
     Log a formatted table of all qualifying candidate pairs to the log file.
 
-    Displays market titles, deadlines, prices, tradeability, and — for pairs
-    selected in the portfolio — the computed trade size, minimum profit, monthly
-    return, and Kelly fraction.
+    Displays market titles, each leg's exchange shard, deadlines, prices,
+    tradeability, and — for pairs selected in the portfolio — the computed
+    trade size, minimum profit, monthly return, and Kelly fraction.
 
     Args:
         candidate_pairs (list): All CandidatePair objects returned by the
@@ -225,6 +244,12 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # option labels (e.g. "Trump", "Above $80k") carry their event context
             _truncate(display_title(pair.market_a)),
             _truncate(display_title(pair.market_b)),
+            # Which exchange shard each leg lives on — while the legacy order
+            # path is in use (ORDER_API_VERSION="legacy") a pair spanning
+            # shards is unexecutable (see trader._legacy_routable), so this
+            # explains an otherwise-puzzling "failed" result at a glance, and
+            # it is the at-a-glance view of what shard coverage looks like.
+            f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
             f"{pair.pA:.2%}",
@@ -239,6 +264,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     headers = [
         "Type",
         "Market A", "Market B",
+        "Shards",
         "A Deadline", "B Deadline",
         "pA (YES)", "pB (YES)",
         "Tradeable?", "Recommended Trade", "Min Profit", "Monthly Return", "Kelly",
@@ -246,6 +272,40 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     table = tabulate(rows, headers=headers, tablefmt="rounded_outline")
     for line in table.splitlines():
         logging.info(line)
+
+
+def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set) -> None:
+    """
+    Run scanner.check_shard_coverage() and emit its findings at the right
+    severity, shared by both _run_dev and _run_prod so the logging split
+    (critical vs warning vs "full coverage" vs "unassessable") lives in one
+    place.
+
+    A run must only ever CLAIM full coverage when every shard the exchange
+    advertises was actually scanned; a missing shard is reported loudly but
+    never aborts the run — trading continues on whatever was covered.
+
+    Args:
+        shard_statuses (dict | None): Return value of scanner.fetch_shard_statuses().
+        market_shards (set): exchange_index values seen among ingested markets.
+        balance_shards (set): exchange_index values holding a nonzero balance.
+
+    Returns:
+        None
+    """
+    if shard_statuses is None:
+        logging.info("Per-shard exchange status unavailable — coverage not assessable.")
+        return
+    # Pure comparison of advertised vs. observed shards; this function only
+    # decides how loudly to log what check_shard_coverage found.
+    critical, warnings = check_shard_coverage(shard_statuses, market_shards, balance_shards)
+    for problem in critical:
+        # Same severity channel as orphaned positions — this must never be missable.
+        logging.critical("SHARD COVERAGE FAILURE: %s", problem)
+    for problem in warnings:
+        logging.warning("Shard coverage: %s", problem)
+    if not critical and not warnings:
+        logging.info("Full shard coverage: shards %s scanned", sorted(shard_statuses))
 
 
 def _run_dev(client, args) -> None:
@@ -270,10 +330,25 @@ def _run_dev(client, args) -> None:
         args.sandbox_balance,
     )
 
+    # Read the exchange's per-shard status breakdown so ingest can drop shards
+    # that aren't trading. Returns None on the sandbox / pre-sharding shape,
+    # which degrades to single-shard semantics (keep everything).
+    shard_statuses = fetch_shard_statuses(client)
+    inactive_shards = {
+        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
+    }
+
     # Fetch all open sandbox markets — the sandbox public endpoint does not require
-    # valid authentication for read operations, so this works with the prod key too
-    markets = fetch_open_events_with_markets(client)
+    # valid authentication for read operations, so this works with the prod key too.
+    # Markets from every shard are ingested and tagged; only trading-inactive
+    # shards are dropped.
+    markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
     logging.info("Sandbox markets fetched: %d", len(markets))
+
+    # Dev mode has one virtual balance, not a real per-shard breakdown, so
+    # there is no balance-shard set to compare against — pass empty and let
+    # the market-coverage half of the check still catch a missing shard
+    _log_shard_coverage(shard_statuses, {m.exchange_index for m in markets}, set())
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
@@ -346,11 +421,10 @@ def _run_prod(client, args) -> None:
     # Confirm auth works and read the pre-trade balance broken out by shard
     shard_balances = verify_auth(client)
     # Sizing is portfolio-wide, not per-shard: collateral is made fungible
-    # across shards by pre-execution transfers (a later commit), so Kelly
-    # sizing runs on the sum here, not any single shard's balance.
-    # shard_balances itself stays a live local — it is currently only used
-    # for this sum, but a later commit wires it into shard coverage /
-    # collateral-transfer logic that needs the full per-shard picture.
+    # across shards by the pre-execution transfers in ensure_shard_collateral,
+    # so Kelly sizing runs on the sum here, not any single shard's balance.
+    # shard_balances itself stays a live local — the coverage check and the
+    # transfer planner below both consume the full per-shard picture.
     balance_cents = sum(shard_balances.values())
     if balance_cents < MIN_BALANCE_CENTS:
         # Don't waste API calls scanning when there's insufficient capital to trade
@@ -363,8 +437,32 @@ def _run_prod(client, args) -> None:
 
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
-    # Fetch all open markets and pre-filter held tickers for downstream efficiency
-    markets           = fetch_open_events_with_markets(client)
+
+    # Read the exchange's per-shard status breakdown so ingest can drop shards
+    # that aren't trading. Returns None on the pre-sharding shape, which
+    # degrades to single-shard semantics (keep everything). The full dict is
+    # kept — ensure_shard_collateral below also reads each shard's
+    # intra_exchange_transfers_active off it.
+    shard_statuses    = fetch_shard_statuses(client)
+    inactive_shards   = {
+        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
+    }
+
+    # Fetch all open markets (every shard, tagged — only trading-inactive
+    # shards are dropped) and pre-filter held tickers for downstream efficiency
+    markets           = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
+
+    # Verify the exchange's advertised shards were actually covered by this
+    # fetch BEFORE any held-ticker/horizon filtering trims the market list —
+    # a blind spot must be measured against what ingest actually saw, not a
+    # subsequently-filtered view of it. Only shards holding money count as
+    # funded, per check_shard_coverage's contract.
+    _log_shard_coverage(
+        shard_statuses,
+        {m.exchange_index for m in markets},
+        {s for s, c in shard_balances.items() if c > 0},
+    )
+
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
@@ -403,6 +501,19 @@ def _run_prod(client, args) -> None:
     portfolio = pre_execution_check(client, portfolio)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
+        return
+
+    # Move collateral to the shards the selected trades draw from — sizing is
+    # portfolio-wide, but each order settles against its own shard's balance.
+    # Trades whose shard could not be funded (transfer blocked, failed, or not
+    # settled in time) are dropped here rather than submitted underfunded.
+    portfolio = ensure_shard_collateral(
+        client, portfolio, shard_balances, shard_statuses, dry_run=args.dry_run,
+    )
+    if not portfolio:
+        logging.info(
+            "No selected pair could be funded on its exchange shard — no trades submitted."
+        )
         return
 
     # Submit orders sequentially per leg, concurrently across pairs

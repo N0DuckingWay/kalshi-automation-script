@@ -31,10 +31,18 @@ Notes:
     pinned SDK's Market model requires, so fetch_open_events_with_markets()
     uses the *_without_preload_content raw-response variants and parses JSON
     into ApiMarket itself (see fetch_json_page for the error-handling contract).
+
+    The exchange is sharded. Market data is cross-shard, so ingest TAGS every
+    market with its exchange_index (_shard_index) and keeps it; the one
+    ingest-time shard exclusion is a shard the exchange reports as not
+    trading-active (fetch_shard_statuses -> the caller's inactive_shards).
+    check_shard_coverage() is the pure audit that compares the advertised
+    shards against the ones a run actually observed, so a shard we silently
+    stopped seeing markets on cannot pass unnoticed.
 """
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
@@ -500,8 +508,12 @@ class ApiMarket:
         price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
             _parse_price_ranges), or None when unknown/unparseable/absent.
             Also read by tick_size_for_price() — the authoritative grid.
-        exchange_index (int): The exchange shard this market lives on, tagged
-            at ingest (see _shard_index). DEFAULT_EXCHANGE_INDEX when the
+        exchange_index (int): The exchange shard this market lives on (see
+            _shard_index). Market data is cross-shard, so every shard's
+            markets are ingested and simply tagged with this; on the V2 order
+            path it routes the order, and while the legacy path is in use it
+            is trader._legacy_routable that refuses to submit an order for a
+            non-DEFAULT_EXCHANGE_INDEX market. DEFAULT_EXCHANGE_INDEX when the
             payload omits the field (fail-safe).
         _event_title (str): Parent event title attached for pair_key grouping.
     """
@@ -559,9 +571,9 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         yes_bid_dollars=m.get("yes_bid_dollars"),
         price_level_structure=m.get("price_level_structure") or "",
         price_ranges=_parse_price_ranges(m.get("price_ranges")),
-        # Tag (never filter) the shard so downstream code — today only
-        # _on_routable_shard and, on the V2 order path, order submission —
-        # can decide what to do with it.
+        # Tag (never filter) the shard so downstream code — V2 order routing,
+        # trader._legacy_routable, the collateral planner — can decide what
+        # to do with it.
         exchange_index=_shard_index(m),
         _event_title=event_title,
     )
@@ -574,8 +586,7 @@ def _shard_index(m: dict) -> int:
     Kalshi partitions the exchange into parallel instances keyed by an integer
     `exchange_index` on every market payload. Market-data endpoints are
     cross-shard (they return every shard's markets, tagged), so this is purely
-    a labelling read — it never decides whether a market is kept; that policy
-    lives in _on_routable_shard.
+    a labelling read — it never decides whether a market is kept.
 
     A missing, null, or unparseable value is reported as DEFAULT_EXCHANGE_INDEX
     rather than raising: absence of the field is the pre-sharding / sandbox
@@ -670,36 +681,103 @@ def fetch_shard_statuses(client: Any) -> dict | None:
         return None
 
 
-def _on_routable_shard(m: dict) -> bool:
+def check_shard_coverage(
+    advertised: dict | None, market_shards: set, balance_shards: set
+) -> tuple:
     """
-    Return True when a raw market dict lives on the shard our orders reach.
+    Compare the shards /exchange/status advertises against what a run actually
+    saw, and classify any mismatch as a real blind spot or an expected gap.
 
-    Markets on other exchange shards must never become candidates: the legacy
-    create-order endpoint has no shard routing, so an order for a shard-1
-    market would fail or misroute at submission time. A missing, null, or
-    unparseable exchange_index is treated as routable (fail-safe — absence of
-    the field must not empty the market list). An explicitly declared index is
-    always compared against DEFAULT_EXCHANGE_INDEX — an `or`-style fallback
-    would conflate a declared 0 with a missing field, which silently inverts
-    the guard the day DEFAULT_EXCHANGE_INDEX is changed to a non-zero shard.
+    This is a pure function — no I/O, no logging — so the caller decides how
+    loudly to report each problem string; see main._log_shard_coverage for the
+    logging split (critical vs warning) this function's two return lists map
+    onto directly.
+
+    Severity rationale:
+        A shard the exchange advertises as `trading_active=True` but that
+        produced zero ingested markets is a genuine coverage gap ONLY when it
+        also holds account funds — money sitting on a shard whose order book
+        we never scanned is a real blind spot, because a same-title or
+        time-series pair on that shard could exist and go undetected. When no
+        funds are parked there, an empty active shard is business-as-usual
+        during the shard rollout — it would be wrong to CRITICAL-alert every
+        single week on an expected transient state, so that case is a warning
+        instead. The same empty-vs-funded split applies to a market or balance
+        shard the exchange doesn't even advertise: markets ingested from an
+        unadvertised shard mean the payloads and /exchange/status disagree with
+        each other, which is always treated as critical (it signals the two
+        data sources are out of sync, independent of money); account funds
+        sitting on an unadvertised shard are logged as a warning, since funds
+        alone (with no market activity to miss) are an accounting curiosity,
+        not a missed arbitrage opportunity. A `trading_active=False` advertised
+        shard is never flagged at all — fetch_open_events_with_markets() drops
+        its markets deliberately, and that drop already logs its own warning.
 
     Args:
-        m (dict): One raw market JSON dict from an events-endpoint payload.
+        advertised (dict | None): The per-shard status breakdown from
+            fetch_shard_statuses(), or None when the breakdown was
+            unavailable (sandbox / pre-sharding shape). None makes coverage
+            unknowable — this function returns ([], []) unconditionally in
+            that case, regardless of what market_shards/balance_shards show,
+            because an observed shard with no status data to compare against
+            is not actionable.
+        market_shards (set): The set of exchange_index values actually seen
+            among ingested ApiMarket objects for this run.
+        balance_shards (set): The set of exchange_index values holding a
+            NONZERO balance. Contract: the caller is responsible for this
+            filtering — pass `{s for s, c in shard_balances.items() if c > 0}`
+            so a shard with a zero-cent breakdown entry (still "present" in
+            the raw balance dict) does not count as fund presence here. This
+            function only checks set membership; it has no concept of an
+            amount.
 
     Returns:
-        bool: True if the market is tradeable by our order path.
+        tuple[list, list]: (critical, warnings) — human-readable problem
+            strings. ([], []) means full coverage (or status unavailable).
     """
-    raw = m.get("exchange_index")
-    if raw is None:
-        # Field absent or null — fail-safe: treat as routable
-        return True
-    try:
-        return int(raw) == DEFAULT_EXCHANGE_INDEX
-    except (TypeError, ValueError):
-        return True
+    if advertised is None:
+        return [], []
+
+    critical: list = []
+    warnings: list = []
+
+    for idx, status in advertised.items():
+        if not status.get("trading_active"):
+            # Deliberately dropped at ingest; fetch_open_events_with_markets
+            # already warns about this — not this function's job to repeat it.
+            continue
+        if idx in market_shards:
+            continue
+        description = status.get("description") or ""
+        if idx in balance_shards:
+            critical.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets but holds account funds"
+            )
+        else:
+            warnings.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets (may be legitimately empty)"
+            )
+
+    for idx in market_shards - set(advertised):
+        critical.append(
+            f"markets ingested from shard {idx} which /exchange/status does "
+            "not advertise — payloads and status disagree"
+        )
+
+    for idx in balance_shards - set(advertised):
+        warnings.append(
+            f"account funds on shard {idx} which /exchange/status does not "
+            "advertise"
+        )
+
+    return critical, warnings
 
 
-def fetch_open_events_with_markets(client: Any) -> list:
+def fetch_open_events_with_markets(
+    client: Any, inactive_shards: set | None = None
+) -> list:
     """
     Fetch all open Kalshi markets via the events endpoint (with nested markets).
 
@@ -721,23 +799,36 @@ def fetch_open_events_with_markets(client: Any) -> list:
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
-    Both loops also drop any market not on DEFAULT_EXCHANGE_INDEX (see
-    _on_routable_shard) — the legacy create-order endpoint has no shard
-    routing, so a market on another exchange shard must never reach the
-    pair-detection pipeline. A non-zero skip count is logged as a warning.
+    Markets are TAGGED with their exchange shard, not filtered by it. The
+    market-data endpoints are cross-shard, so every shard's bids and asks
+    reach the pair pipeline and each ApiMarket carries its own
+    `exchange_index` (see _shard_index). The ONLY ingest-time shard exclusion
+    is `inactive_shards`: nothing on a shard the exchange itself reports as
+    not trading-active can be traded, nor should it be left to linger as a
+    stale candidate, so those markets are dropped here. Whether a
+    trading-active shard's market can actually be ordered is decided at
+    submission time (per-leg routing on the V2 path, trader._legacy_routable
+    on the legacy one), not here.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
+        inactive_shards (set | None): Exchange shard indexes to drop at ingest
+            because the exchange reports trading_active=false for them.
+            None/empty (the default, and what a single-shard exchange yields)
+            keeps every market.
 
     Returns:
         list: Flat list of ApiMarket objects for all open markets, each with
             `_event_title` set to its parent event's full title (may be empty
-            string if the event had no title). May contain thousands of items.
+            string if the event had no title) and `exchange_index` set to its
+            shard. May contain thousands of items.
     """
     markets: list = []
-    # Counts markets dropped for living on a non-routable exchange shard (see
-    # _on_routable_shard) — shared across both the standard and MVE loops below
-    # so the summary warning reflects the whole fetch.
+    # Normalize once so both loops below do a plain set membership test
+    inactive = inactive_shards or set()
+    # Counts markets dropped for living on a trading-inactive shard — shared
+    # across both the standard and MVE loops below so the summary warning
+    # reflects the whole fetch.
     skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
@@ -766,9 +857,9 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # (and shown as tradeable candidates) in the first place.
                 if (m.get("status") or "") != "active":
                     continue
-                # Markets on other exchange shards can't be traded through the
-                # legacy order endpoint — drop them before they become candidates
-                if not _on_routable_shard(m):
+                # A shard the exchange reports as not trading-active has no
+                # live book worth pairing — drop before it becomes a candidate
+                if _shard_index(m) in inactive:
                     skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
@@ -809,10 +900,9 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     # (allowed values: initialized/active/closed/settled/determined
                     # — there is no "open" status).
                     if (m.get("status") or "") == "active":
-                        # Markets on other exchange shards can't be traded through
-                        # the legacy order endpoint — drop them before they become
-                        # candidates
-                        if not _on_routable_shard(m):
+                        # Same trading-inactive shard drop as the standard loop
+                        # above — the two share one skip counter
+                        if _shard_index(m) in inactive:
                             skipped_shard += 1
                             continue
                         markets.append(_market_from_dict(m, ev_title))
@@ -834,9 +924,16 @@ def fetch_open_events_with_markets(client: Any) -> list:
 
     if skipped_shard:
         logging.warning(
-            "Skipped %d markets on non-routable exchange shards (exchange_index != %d)",
-            skipped_shard, DEFAULT_EXCHANGE_INDEX,
+            "Skipped %d markets on trading-inactive exchange shards %s",
+            skipped_shard, sorted(inactive),
         )
+    # Per-shard ingest counts are the only signal of which shards we actually
+    # saw markets on — load-bearing for diagnosing a coverage gap after a
+    # market category migrates to a new shard. Always logged, even single-shard.
+    logging.info(
+        "Ingested markets by shard: %s",
+        dict(sorted(Counter(m.exchange_index for m in markets).items())),
+    )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
