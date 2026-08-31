@@ -19,15 +19,18 @@ Purpose:
       "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
         a JSON body: bid/ask side on the single YES book, a dollar-string
         fill_or_kill LIMIT price, a fixed-point count, and an explicit
-        exchange_index. There is no "market" order type in V2, so a taker order
-        IS a marketable FoK limit and the LIMIT PRICE IS THE PRICE PROTECTION:
-        scanned price ceiled to the market's own tick grid plus
-        config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price).
+        exchange_index taken from THAT LEG'S OWN market, so each order routes to
+        the shard its market actually lives on. There is no "market" order type
+        in V2, so a taker order IS a marketable FoK limit and the LIMIT PRICE IS
+        THE PRICE PROTECTION: scanned price ceiled to the market's own tick grid
+        plus config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price).
       "legacy" — the original /portfolio/orders create-order call
         (CreateOrderRequest, type="market", integer-cents buy_max_cost). Kept
         fully intact and unmodified so flipping ORDER_API_VERSION back to
         "legacy" is an instant, code-free rollback if the V2 mapping misbehaves
-        on its first real submission.
+        on its first real submission. That endpoint has NO shard-routing
+        parameter, so while it is selected a pair with a leg off
+        config.DEFAULT_EXCHANGE_INDEX is refused outright (see _legacy_routable).
 
     An exception from either submission path does NOT prove the order was
     rejected (a timeout can land after the fill), so exception paths consult the
@@ -54,6 +57,15 @@ Notes:
     position. _submit_order calls fetch_json_page directly and _submit_order_v2
     calls signed_request_json directly; neither may ever be wrapped in
     api_call_with_retry.
+
+    Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
+    shards and every market carries its own exchange_index; each V2 order body
+    therefore takes that field from its own leg's market rather than assuming a
+    single shard, and never sends the -1 auto-route sentinel. The legacy
+    endpoint cannot express any of that, so while ORDER_API_VERSION is not "v2"
+    a spec with a leg off config.DEFAULT_EXCHANGE_INDEX is refused before
+    anything is submitted (_legacy_routable, consulted at the top of
+    _execute_one) rather than misrouted.
 
     Order submission and position lookups use the SDK's raw-response variants
     (via _submit_order / _position_count) because 2026-07 API drift broke the
@@ -134,6 +146,37 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
         int: Maximum total cost in cents for the order.
     """
     return math.ceil(count * price_dollars * 100) + count * BUY_MAX_COST_SLIPPAGE_CENTS
+
+
+def _legacy_routable(spec: TradeSpec) -> bool:
+    """
+    Return True only when BOTH of a pair's legs are on DEFAULT_EXCHANGE_INDEX.
+
+    The legacy /portfolio/orders endpoint has no shard-routing parameter, so
+    the only shard it can reach is config.DEFAULT_EXCHANGE_INDEX — an order for
+    a market on any other shard would fail or, worse, misroute. Markets carry
+    their own exchange_index from ingest, so this is the single place where a
+    pair the legacy endpoint cannot reach is turned away, after sizing and
+    immediately before anything is submitted.
+
+    Consulted ONLY while config.ORDER_API_VERSION is not "v2". On the V2 path it
+    does not apply, because every V2 body routes itself via its own market's
+    exchange_index. The legacy path is retained indefinitely as the instant
+    rollback, so this guard outlives the migration with it.
+
+    Args:
+        spec (TradeSpec): The trade specification about to be executed. Both
+            spec.pair.market_a and spec.pair.market_b must carry an int
+            exchange_index (tagged at ingest).
+
+    Returns:
+        bool: True if both legs can be reached by the legacy order endpoint,
+            False if either leg sits on any other shard.
+    """
+    return (
+        spec.pair.market_a.exchange_index == DEFAULT_EXCHANGE_INDEX
+        and spec.pair.market_b.exchange_index == DEFAULT_EXCHANGE_INDEX
+    )
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
@@ -370,8 +413,8 @@ def _build_no_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The computed trade specification. Uses
-            spec.pair.market_a for the ticker and tick grid, spec.pair.nA for
-            the price cap, and spec.x for the contract count.
+            spec.pair.market_a for the ticker, tick grid and exchange shard,
+            spec.pair.nA for the price cap, and spec.x for the contract count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -386,9 +429,14 @@ def _build_no_order_v2(spec: TradeSpec) -> dict:
         "count": _format_count(spec.x),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 (auto-route): must agree with the shard the
-        # ingest-time guard (scanner._on_routable_shard) admitted this market on
-        "exchange_index": DEFAULT_EXCHANGE_INDEX,
+        # This leg's OWN market's shard, read from the market itself — legs of
+        # one pair can live on different shards. Explicit, never the -1
+        # auto-route sentinel: if our notion of a market's shard is ever wrong
+        # we want the exchange to reject the order loudly rather than silently
+        # settle it against a shard we never modelled. An explicit-shard write
+        # also bills only that shard's rate-limit bucket, where auto-route bills
+        # every nonzero shard's.
+        "exchange_index": spec.pair.market_a.exchange_index,
         # Opening exposure, not closing it
         "reduce_only": False,
         # We are deliberately takers — a post-only order would be rejected
@@ -409,8 +457,8 @@ def _build_yes_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The computed trade specification. Uses
-            spec.pair.market_b for the ticker and tick grid, spec.pair.pB for
-            the price cap, and spec.y for the contract count.
+            spec.pair.market_b for the ticker, tick grid and exchange shard,
+            spec.pair.pB for the price cap, and spec.y for the contract count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -424,8 +472,9 @@ def _build_yes_order_v2(spec: TradeSpec) -> dict:
         "count": _format_count(spec.y),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": DEFAULT_EXCHANGE_INDEX,
+        # Leg B's own market's shard — market_b may sit on a different shard
+        # than market_a. Explicit, never -1 auto-route — see _build_no_order_v2
+        "exchange_index": spec.pair.market_b.exchange_index,
         "reduce_only": False,
         "post_only": False,
     }
@@ -447,7 +496,8 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The trade whose leg A must be unwound. Uses
-            spec.pair.market_a for the ticker and spec.x for the count.
+            spec.pair.market_a for the ticker, tick grid and exchange shard,
+            and spec.x for the count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -462,8 +512,10 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
         "price": _format_price(_v2_rollback_price(spec.pair.market_a)),
         "count": _format_count(spec.x),
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": DEFAULT_EXCHANGE_INDEX,
+        # Market A's own shard — the unwind must route to the same shard the
+        # leg-A order opened the position on. Explicit, never -1 auto-route —
+        # see _build_no_order_v2
+        "exchange_index": spec.pair.market_a.exchange_index,
         # Can only reduce an existing position — never opens exposure even if
         # leg A turns out not to have filled after all
         "reduce_only": True,
@@ -873,6 +925,12 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     that we simply couldn't confirm — and is instead surfaced as
     status="manual_review" for a human to check the account.
 
+    While the LEGACY order path is selected, a pair with a leg on a shard that
+    endpoint cannot route to is refused before anything is submitted (see
+    _legacy_routable) — status "failed", because nothing was sent and there is
+    nothing to unwind. On the V2 path the guard does not apply: every order
+    body routes itself via its own market's exchange_index.
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade specification to execute.
@@ -883,6 +941,30 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             manual review), or "manual_review" (leg B's fill state could not
             be determined and no automated action was taken).
     """
+    # Legacy-mode shard guard — must run before ANY order is built or sent.
+    # Markets are tagged with their shard at ingest, but the legacy order
+    # endpoint has no shard-routing parameter and can only reach
+    # DEFAULT_EXCHANGE_INDEX. Read the module-level ORDER_API_VERSION exactly
+    # as the _*_any dispatchers do, so the guard and the dispatch can never
+    # disagree about which path is active.
+    if ORDER_API_VERSION != "v2" and not _legacy_routable(spec):
+        shards = (
+            f"{spec.pair.market_a.exchange_index}/{spec.pair.market_b.exchange_index}"
+        )
+        logging.warning(
+            "Skipping '%s' — legs on exchange shards %s; the legacy order"
+            " endpoint in use cannot route off shard %d (set"
+            " ORDER_API_VERSION='v2')",
+            spec.pair.canonical_title, shards, DEFAULT_EXCHANGE_INDEX,
+        )
+        return TradeResult(
+            spec=spec, status="failed",
+            error=(
+                f"leg on exchange shard {shards} — legacy order endpoint "
+                f"cannot route; set ORDER_API_VERSION='v2'"
+            ),
+        )
+
     order_a  = _build_no_order_any(spec)
     order_b  = _build_yes_order_any(spec)
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker

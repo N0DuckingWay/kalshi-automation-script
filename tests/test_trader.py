@@ -31,6 +31,7 @@ from kalshi_betting.trader import (
     _execute_one,
     _format_count,
     _format_price,
+    _legacy_routable,
     _v2_fill_status,
     _v2_limit_price,
     _v2_rollback_price,
@@ -57,22 +58,31 @@ def make_spec(
     pB: float = 0.35,
     structure: str = "",
     ranges: list | None = None,
+    shard_a: int = 0,
+    shard_b: int = 0,
 ) -> MagicMock:
     """Factory for a TradeSpec-like mock with the fields trader.py reads.
 
     Both markets carry explicit tick-structure attributes because the V2 order
     builders price against the market's own grid via scanner.tick_size_for_price;
     the defaults ("" / None) mean "unknown", i.e. the $0.01 fallback grid.
+
+    `shard_a`/`shard_b` pin REAL ints on each leg's exchange_index. This must
+    never be left to MagicMock's auto-attributes: an auto-attr is a truthy Mock
+    that compares unequal to DEFAULT_EXCHANGE_INDEX (so every spec would look
+    non-routable) and is not JSON-serializable in a V2 order body.
     """
     pair = MagicMock()
     pair.market_a.ticker = "TICK-A"
     pair.market_a.title = "Market A"
     pair.market_a.price_level_structure = structure
     pair.market_a.price_ranges = ranges
+    pair.market_a.exchange_index = shard_a
     pair.market_b.ticker = "TICK-B"
     pair.market_b.title = "Market B"
     pair.market_b.price_level_structure = structure
     pair.market_b.price_ranges = ranges
+    pair.market_b.exchange_index = shard_b
     pair.nA = nA
     pair.pB = pB
     pair.canonical_title = "test pair"
@@ -268,6 +278,69 @@ class TestExceptionDisambiguation:
         assert client.create_order_without_preload_content.call_count == 2
 
 
+class TestLegacyShardGuard:
+    """The legacy /portfolio/orders endpoint has no shard-routing parameter, so
+    while it is the selected path a pair with a leg off DEFAULT_EXCHANGE_INDEX
+    must be refused BEFORE anything is submitted. Markets are tagged with their
+    shard at ingest, so this guard is the only thing standing between an
+    unreachable shard and a misrouted real-money order. The V2 path is exempt:
+    every V2 body routes itself via its own market's exchange_index."""
+
+    def test_both_legs_default_shard_is_routable(self):
+        assert _legacy_routable(make_spec(shard_a=0, shard_b=0)) is True
+
+    def test_leg_a_off_default_shard_is_not_routable(self):
+        assert _legacy_routable(make_spec(shard_a=1, shard_b=0)) is False
+
+    def test_leg_b_off_default_shard_is_not_routable(self):
+        assert _legacy_routable(make_spec(shard_a=0, shard_b=1)) is False
+
+    def test_both_legs_off_default_shard_is_not_routable(self):
+        assert _legacy_routable(make_spec(shard_a=2, shard_b=2)) is False
+
+    def test_routable_check_is_gated_on_config_constant(self):
+        # Not a hardcoded 0 that would silently diverge from config.py.
+        assert _legacy_routable(
+            make_spec(shard_a=DEFAULT_EXCHANGE_INDEX, shard_b=DEFAULT_EXCHANGE_INDEX)
+        ) is True
+
+    def test_legacy_mode_off_shard_spec_fails_before_any_submission(
+        self, legacy_mode
+    ):
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shard_b=1))
+        assert result.status == "failed", (
+            'nothing was submitted, so there is nothing to unwind — "failed" '
+            "is the correct status vocabulary, not manual_review"
+        )
+        assert "shard" in result.error
+        # The guard must run BEFORE anything reaches either order path
+        client.create_order_without_preload_content.assert_not_called()
+        client.rest_client.request.assert_not_called()
+
+    def test_legacy_mode_default_shard_spec_proceeds(self, legacy_mode):
+        # Sanity: the guard must not block the ordinary single-shard case.
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            order_resp("executed"),   # leg B
+        ])
+        result = _execute_one(client, make_spec(shard_a=0, shard_b=0))
+        assert result.status == "executed"
+        assert client.create_order_without_preload_content.call_count == 2
+
+    def test_v2_mode_off_shard_spec_proceeds(self, v2_mode, monkeypatch):
+        # V2 bodies carry their own market's shard, so an off-shard pair is
+        # perfectly routable there — the guard must not fire.
+        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shard_a=1))
+        assert result.status == "executed"
+        assert post.call_count == 2
+        assert post.call_args_list[0].kwargs["body"]["exchange_index"] == 1
+
+
 class TestV2PriceMath:
     def test_ceil_to_tick_on_grid_unchanged(self):
         # A price already on the grid must not be nudged up a tick — that would
@@ -399,15 +472,29 @@ class TestV2OrderBuilders:
             assert body["time_in_force"] == "fill_or_kill"
             assert body["post_only"] is False
 
-    def test_all_legs_carry_explicit_routable_exchange_index(self):
-        # Never -1 (auto-route): the order's shard must agree with the shard
-        # the ingest-time guard admitted the market on.
+    def test_each_leg_carries_its_own_markets_shard(self):
+        # Per-leg routing: a pair's two legs can live on different shards, so
+        # each body takes exchange_index from its OWN market — and the rollback
+        # routes to market A, the shard the position was opened on. Never -1
+        # (auto-route): a wrong shard must be rejected loudly by the exchange,
+        # not silently papered over.
+        spec = make_spec(shard_a=2, shard_b=3)
+        no_body = _build_no_order_v2(spec)
+        yes_body = _build_yes_order_v2(spec)
+        rollback_body = _build_rollback_order_v2(spec)
+        assert no_body["exchange_index"] == 2
+        assert yes_body["exchange_index"] == 3
+        assert rollback_body["exchange_index"] == 2
+        for body in (no_body, yes_body, rollback_body):
+            assert body["exchange_index"] != -1
+
+    def test_default_shard_spec_carries_the_default_exchange_index(self):
+        # The universal case today: everything is on DEFAULT_EXCHANGE_INDEX.
         spec = make_spec()
         for body in (
             _build_no_order_v2(spec), _build_yes_order_v2(spec), _build_rollback_order_v2(spec),
         ):
             assert body["exchange_index"] == DEFAULT_EXCHANGE_INDEX
-            assert body["exchange_index"] != -1
 
     def test_client_order_ids_are_unique_uuids(self):
         spec = make_spec()
