@@ -3,6 +3,7 @@ legacy endpoint), V2 price/tick math, rollback verification, and exception
 disambiguation. All Kalshi API interaction is mocked per project policy (tests
 must run offline)."""
 import json
+import logging
 import math
 import uuid
 from decimal import Decimal
@@ -158,6 +159,32 @@ def legacy_mode(monkeypatch):
 def v2_mode(monkeypatch):
     """Pin trader to the V2 order path (the config default, made explicit)."""
     monkeypatch.setattr(trader, "ORDER_API_VERSION", "v2")
+
+
+@pytest.fixture(autouse=True)
+def _reset_v2_mapping_latch(monkeypatch):
+    """Start every test from a fresh process's unlatched NO-mapping state.
+
+    trader._V2_NO_MAPPING_CONFIRMED is a PROCESS-lifetime latch that real
+    execution flips, so without this a single test that confirms the mapping
+    would silently disable the backstop for every test that runs after it.
+    monkeypatch restores the pre-test value at teardown, so the latch can never
+    leak across tests in either direction.
+    """
+    monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+
+
+@pytest.fixture
+def v2_mapping_confirmed(monkeypatch):
+    """Pretend the V2 NO-leg mapping has already been confirmed this process.
+
+    _execute_one()'s backstop reads the account position after the first V2
+    leg-A fill (see TestV2NoMappingBackstop). Classes exercising the rollback /
+    disambiguation state machine on the V2 wire format aren't testing that
+    check and must not have their position mocks consumed by it, so they start
+    from the latched state a second trade would see.
+    """
+    monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
 
 
 class TestRollbackVerification:
@@ -329,7 +356,9 @@ class TestLegacyShardGuard:
         assert result.status == "executed"
         assert client.create_order_without_preload_content.call_count == 2
 
-    def test_v2_mode_off_shard_spec_proceeds(self, v2_mode, monkeypatch):
+    def test_v2_mode_off_shard_spec_proceeds(
+        self, v2_mode, v2_mapping_confirmed, monkeypatch
+    ):
         # V2 bodies carry their own market's shard, so an off-shard pair is
         # perfectly routable there — the guard must not fire.
         post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
@@ -556,8 +585,10 @@ class TestV2ExecuteOne:
     """The full legacy outcome matrix, replayed against the V2 order path."""
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode):
-        pass
+    def _use_v2(self, v2_mode, v2_mapping_confirmed):
+        """V2 path, with the NO-leg backstop already latched: these cases test
+        the state machine, not the first-fill mapping check, and must not have
+        their position mocks consumed by it."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -646,6 +677,140 @@ class TestV2ExecuteOne:
         assert post.call_count == 1
 
 
+class TestV2NoMappingBackstop:
+    """_V2_LEG_SIDE's NO-leg mapping (an `ask` on the YES book OPENS a NO
+    position) is doc-derived and unverifiable offline, so the first V2 leg-A
+    fill of a process must prove it: the account position has to go NEGATIVE
+    (Kalshi's ledger is signed — negative = NO). A wrong sign disproves the
+    mapping, and the pair stops at manual_review with leg B unsubmitted and
+    leg A deliberately left in place."""
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mode):
+        """V2 path with the latch left False — the state a fresh process is in
+        on its first trade (the module-level fixture resets it)."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    def test_negative_position_confirms_the_mapping_and_completes_the_pair(self, post):
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=-5)
+        )
+        assert _execute_one(client, make_spec()).status == "executed"
+        # Leg B still went out — the check must not disturb the state machine
+        assert post.call_count == 2
+        assert trader._V2_NO_MAPPING_CONFIRMED is True
+
+    def test_confirmation_latches_for_the_process(self, post):
+        post.side_effect = [v2_resp(5)] * 4
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=-5)
+        )
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert post.call_count == 4
+        # One positions read across two trades: the mapping is a property of
+        # the exchange, so the backstop costs one read per PROCESS, not per trade
+        client.get_positions_without_preload_content.assert_called_once()
+
+    def test_latched_state_skips_the_lookup_entirely(self, post, monkeypatch):
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        assert _execute_one(client, make_spec()).status == "executed"
+        client.get_positions_without_preload_content.assert_not_called()
+
+    def test_positive_position_disproves_the_mapping_and_stops_the_pair(
+        self, post, caplog
+    ):
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=5)
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "mapping disproven" in result.error
+        assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        # A disproven mapping must NOT latch — nothing was confirmed
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+    def test_zero_position_also_disproves_the_mapping(self, post):
+        # Non-negative is non-negative: a flat account after a "filled" NO buy
+        # is just as much a contradiction of the mapping as a long YES.
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=0)
+        )
+        assert _execute_one(client, make_spec()).status == "manual_review"
+
+    def test_disproven_mapping_submits_no_leg_b_and_no_rollback(self, post):
+        post.side_effect = [v2_resp(5), v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp("TICK-A", position=5)
+        )
+        assert _execute_one(client, make_spec()).status == "manual_review"
+        # Only leg A went out: leg B is not submitted (it would hedge a
+        # position we don't hold) and NO unwind is attempted (the unwind is a
+        # bid resting on the same disproven hypothesis).
+        assert post.call_count == 1
+        only_body = post.call_args_list[0].kwargs["body"]
+        assert only_body["ticker"] == "TICK-A"
+        assert only_body["side"] == "ask"
+        # Leg A's position is left exactly as it is for a human to flatten
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_failed_position_lookup_proceeds_without_latching(self, post, caplog):
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            side_effect=RuntimeError("lookup failed")
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            assert _execute_one(client, make_spec()).status == "executed"
+        # Unknown is not disproven — the fill itself was confirmed by the FoK
+        # response, so the pair proceeds and one flaky read cannot stall trading
+        assert post.call_count == 2
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+    def test_check_rearms_after_a_failed_lookup(self, post):
+        # Unlatched means the NEXT V2 NO fill re-checks: the first trade's
+        # lookup fails, the second's succeeds and confirms.
+        post.side_effect = [v2_resp(5)] * 4
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[
+            RuntimeError("lookup failed"),
+            positions_resp("TICK-A", position=-5),
+        ])
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert trader._V2_NO_MAPPING_CONFIRMED is True
+
+    def test_legacy_mode_never_consults_positions_on_a_fill(self, legacy_mode):
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"), order_resp("executed"),
+        ])
+        assert _execute_one(client, make_spec()).status == "executed"
+        # The backstop verifies the V2 mapping; on the legacy path there is
+        # nothing to verify, and an extra positions read would be pure cost.
+        client.get_positions_without_preload_content.assert_not_called()
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+
 class TestOrderVersionDispatch:
     def test_legacy_mode_uses_create_order_endpoint_unchanged(self, legacy_mode, monkeypatch):
         posted = MagicMock()
@@ -660,7 +825,9 @@ class TestOrderVersionDispatch:
         # The V2 route is never touched on the rollback path
         posted.assert_not_called()
 
-    def test_v2_mode_never_touches_legacy_endpoint(self, v2_mode, monkeypatch):
+    def test_v2_mode_never_touches_legacy_endpoint(
+        self, v2_mode, v2_mapping_confirmed, monkeypatch
+    ):
         posted = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
         monkeypatch.setattr(trader, "signed_request_json", posted)
         client = MagicMock()

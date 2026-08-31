@@ -58,6 +58,15 @@ Notes:
     calls signed_request_json directly; neither may ever be wrapped in
     api_call_with_retry.
 
+    The V2 NO-leg mapping (an `ask` on the YES book opening a NO position) is
+    doc-derived and cannot be proven offline, so the FIRST V2 leg-A fill of
+    each process is checked against the account's signed position
+    (_confirm_v2_no_mapping): a non-negative sign disproves the mapping and
+    stops the pair at "manual_review" with leg B unsubmitted and leg A
+    deliberately left in place. A process-lifetime latch
+    (_V2_NO_MAPPING_CONFIRMED) keeps the cost at one extra positions read per
+    run.
+
     Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
     shards and every market carries its own exchange_index; each V2 order body
     therefore takes that field from its own leg's market rather than assuming a
@@ -127,6 +136,17 @@ _V2_MAX_PRICE = Decimal("0.9999")
 # represents every grid point of every known regime ($0.01 / $0.001 / $0.0001),
 # so quantizing here can never move a price off-grid.
 _V2_PRICE_QUANTUM = Decimal("0.0001")
+
+# Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one().
+# False until a V2 NO buy has been observed to produce a NEGATIVE account
+# position (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
+# hypothesises). The mapping only needs disproving ONCE, and one confirmed
+# negative-sign position proves it for every later trade this run — so once
+# confirmed the check is skipped and the backstop costs one extra positions
+# read per PROCESS, not one per trade. Deliberately not persisted anywhere: a
+# fresh process re-verifies, which is cheap and keeps the check honest across
+# restarts and API changes.
+_V2_NO_MAPPING_CONFIRMED = False
 
 
 def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
@@ -904,6 +924,104 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
     return valid
 
 
+def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
+    """
+    Verify, once per process, that a filled V2 NO buy really opened a NO position.
+
+    This is the runtime backstop on the one thing about the V2 order path that
+    cannot be proven offline: _V2_LEG_SIDE's doc-derived hypothesis that an
+    `ask` on the single YES book OPENS a NO position (a short YES IS a long
+    NO). Kalshi's positions ledger is signed, so the evidence is simply the
+    sign of the position after the fill — negative is NO, positive is YES.
+
+    Called by _execute_one() immediately after leg A's ("buy NO") FoK reports
+    filled and BEFORE leg B is submitted, so a disproven mapping is caught with
+    exactly one wrong-side position outstanding rather than a completed pair.
+    No-ops entirely on the legacy path and after the first confirmation
+    (_V2_NO_MAPPING_CONFIRMED), so the mapping is verified once per process
+    rather than once per trade — it is a property of the exchange, not of a
+    particular trade.
+
+    Three outcomes:
+      * position < 0  -> hypothesis holds; latch it and proceed to leg B.
+      * position >= 0 -> hypothesis DISPROVEN live. Return a manual_review
+        result: leg B is not submitted (it would hedge a position we do not
+        actually hold) and leg A is deliberately NOT auto-unwound, because the
+        unwind is a bid resting on the SAME mapping hypothesis, so an
+        automated unwind could double the error rather than reverse it. The
+        rollback's reduce_only flag would make a wrong unwind fail safe into
+        "rollback_failed", but a human — not the bot — must decide what to do
+        with a position whose very sign contradicts our model. This is the
+        module's standing manual_review philosophy: never act automatically on
+        a state we cannot model. Remedy: set config.ORDER_API_VERSION =
+        "legacy", the instant rollback to the endpoint whose side mapping is
+        already proven.
+      * lookup failed (None) -> unknown, NOT disproven. Warn and proceed
+        WITHOUT latching, so the next V2 NO fill re-arms the check. One flaky
+        positions read must not stall trading, and the fill itself was already
+        confirmed by the FoK response, so proceeding leaves the trade no more
+        ambiguous than it already was.
+
+    Concurrency: execute_trades() runs pairs in parallel, so two trades can
+    reach this before either latches — that costs a duplicate positions read
+    and, in the disproven case, sends both to manual_review. Both outcomes are
+    harmless; a bool assignment is atomic under the GIL.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        spec (TradeSpec): The trade whose leg A just filled; its
+            spec.pair.market_a ticker is the one looked up.
+
+    Returns:
+        TradeResult | None: None when the caller should proceed to leg B
+            (mapping confirmed, already confirmed this process, legacy path, or
+            unverifiable); a status="manual_review" TradeResult when the
+            mapping was disproven and the pair must stop.
+    """
+    global _V2_NO_MAPPING_CONFIRMED
+    # Read the module-level ORDER_API_VERSION exactly as the _*_any dispatchers
+    # do, so the backstop can never check a path that was not the one submitted
+    if ORDER_API_VERSION != "v2" or _V2_NO_MAPPING_CONFIRMED:
+        return None
+    ticker = spec.pair.market_a.ticker
+    # Ground truth for the mapping: the account's own signed position
+    pos = _position_count(client, ticker)
+    if pos is None:
+        logging.warning(
+            "Could not verify the V2 NO-leg position sign on %s — proceeding"
+            " unlatched; the leg-A fill itself was confirmed by the order"
+            " response, and the check re-arms on the next V2 NO fill",
+            ticker,
+        )
+        return None
+    if pos < 0:
+        _V2_NO_MAPPING_CONFIRMED = True
+        logging.info(
+            "V2 NO-leg mapping confirmed live: the NO buy produced a short-YES"
+            " (negative) position %s on %s — not re-checked this process",
+            pos, ticker,
+        )
+        return None
+    logging.critical(
+        "V2 NO-LEG MAPPING DISPROVEN on %s — leg A's ask did not produce a"
+        " negative YES position: expected negative NO exposure, got %s. NOT"
+        " submitting leg B and NOT auto-unwinding (the unwind is a bid resting"
+        " on the same disproven hypothesis, so it could double the error). A"
+        " human must flatten this account position; set"
+        " config.ORDER_API_VERSION = \"legacy\" to revert to the proven order"
+        " path.",
+        ticker, pos,
+    )
+    return TradeResult(
+        spec=spec, status="manual_review",
+        error=(
+            f"V2 NO-leg mapping disproven: position sign non-negative after"
+            f" NO-leg fill (position {pos} on {ticker}); leg B not submitted"
+            f" and leg A not unwound"
+        ),
+    )
+
+
 def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     """
     Execute one arbitrage pair with sequential leg submission and rollback.
@@ -931,6 +1049,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     nothing to unwind. On the V2 path the guard does not apply: every order
     body routes itself via its own market's exchange_index.
 
+    On the V2 path the first leg-A fill of the process is also checked against
+    the account's position sign (see _confirm_v2_no_mapping) — a wrong sign
+    disproves the unverified NO-leg mapping and stops the pair at
+    "manual_review" before leg B is submitted.
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade specification to execute.
@@ -938,8 +1061,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: With status "executed", "failed", "rolled_back",
             "rollback_failed" (unwind did not fill — orphaned position needing
-            manual review), or "manual_review" (leg B's fill state could not
-            be determined and no automated action was taken).
+            manual review), or "manual_review" (leg B's fill state could not be
+            determined, or the V2 NO-leg mapping was disproven — in both cases
+            no automated action was taken).
     """
     # Legacy-mode shard guard — must run before ANY order is built or sent.
     # Markets are tagged with their shard at ingest, but the legacy order
@@ -1000,6 +1124,14 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             mA_title[:60], held_a, e,
         )
         return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
+
+    # Leg A filled. On the V2 path only, and only until it has been confirmed
+    # once in this process, check that the fill really opened a NO position —
+    # a wrong sign disproves the unverified _V2_LEG_SIDE mapping, and the pair
+    # must stop here rather than hedge (or unwind) a position we do not hold.
+    backstop = _confirm_v2_no_mapping(client, spec)
+    if backstop is not None:
+        return backstop
 
     # Leg A filled — submit leg B — YES on market B (version-dispatched)
     leg_b_error: str | None = None

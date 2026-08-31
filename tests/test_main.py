@@ -37,6 +37,7 @@ import pytest
 
 from kalshi_betting import main
 from kalshi_betting import scanner as scanner_mod
+from kalshi_betting import trader as trader_mod
 from kalshi_betting.config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -570,13 +571,34 @@ class TestRunProdLiveV2Replay:
     exactly one tradeable, selectable pair (SAME-EXP / SAME-CHEAP) so order
     counts are fully deterministic."""
 
+    @pytest.fixture(autouse=True)
+    def _fresh_v2_mapping_latch(self, monkeypatch):
+        """Every replay starts as a fresh process does: the V2 NO-leg mapping
+        unconfirmed, so trader._confirm_v2_no_mapping's first-fill check is
+        genuinely exercised end-to-end. The latch is a process global that real
+        execution flips, so monkeypatch also keeps it from leaking between
+        tests."""
+        monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", False)
+
     @staticmethod
     def _run(monkeypatch, fill_pattern, position_lookup_responses=None):
+        # After a filled NO buy the exchange reports a NEGATIVE (short-YES)
+        # position on the leg-A ticker — that sign is what trader's first-fill
+        # backstop verifies before leg B is submitted, so the replay account
+        # must model it or every pair would stop at manual_review.
+        lookups = {
+            _TICKER_SAME_EXP: {
+                "market_positions": [
+                    {"ticker": _TICKER_SAME_EXP, "position_fp": "-12.00"}
+                ]
+            },
+        }
+        lookups.update(position_lookup_responses or {})
         client = _live_shape_client(
             monkeypatch,
             balance_payload=_LIVE_BALANCE_PAYLOAD,
             order_side_effect=_order_side_effect(fill_pattern),
-            position_lookup_responses=position_lookup_responses,
+            position_lookup_responses=lookups,
         )
         captured: dict = {}
 
