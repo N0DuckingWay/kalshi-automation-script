@@ -7,12 +7,12 @@ Purpose:
     Offline unit tests for kalshi_betting.auth — the shard-aware balance
     parsing added when Kalshi scoped GET /portfolio/balance per exchange shard
     (2026-08-13). Covers the dollar-string → floored-cents converter, the
-    tiered fallback chain in _balance_cents_from_payload (shard-0 breakdown
-    entry → aggregate balance_dollars → legacy integer cents), and verify_auth
+    tiered fallback chain in _balance_cents_by_shard (full breakdown ->
+    aggregate balance_dollars -> legacy integer cents), and verify_auth
     end-to-end against a faked raw response.
 
 Dependencies:
-    Imports _balance_cents_from_payload, _dollar_str_to_cents, and verify_auth
+    Imports _balance_cents_by_shard, _dollar_str_to_cents, and verify_auth
     from kalshi_betting.auth, and DEFAULT_EXCHANGE_INDEX from
     kalshi_betting.config. Uses unittest.mock / SimpleNamespace to stand in for
     the SDK client and its RESTResponse — no network access.
@@ -21,6 +21,12 @@ Notes:
     The same-key-different-units trap is asserted explicitly: inside a
     balance_breakdown entry "balance" is a fixed-point DOLLAR STRING, while the
     TOP-LEVEL "balance" is legacy INTEGER CENTS. A test pins each.
+
+    verify_auth() returns the FULL per-shard dict, not a single scalar — the
+    old "shard-0 preferred over aggregate" behavior inverts here: shard-1
+    funds are now visible in the result, not excluded from it. Sizing is
+    portfolio-wide and lives in main.py (sum(shard_balances.values())), which
+    is exercised in test_main.py, not here.
 """
 import json
 import logging
@@ -31,7 +37,7 @@ import pytest
 from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting.auth import (
-    _balance_cents_from_payload,
+    _balance_cents_by_shard,
     _dollar_str_to_cents,
     verify_auth,
 )
@@ -92,13 +98,13 @@ class TestDollarStrToCents:
         assert _dollar_str_to_cents(2) == 200
 
 
-class TestBalanceCentsFromPayload:
-    def test_live_payload_uses_shard_zero_entry(self):
-        assert _balance_cents_from_payload(LIVE_PAYLOAD) == 114
+class TestBalanceCentsByShard:
+    def test_live_payload_returns_all_shards(self):
+        # Every shard is now visible — shard 1's $0.00 is included, not
+        # silently excluded the way the old shard-0-only lookup would have.
+        assert _balance_cents_by_shard(LIVE_PAYLOAD) == {0: 114, 1: 0}
 
-    def test_shard_zero_preferred_over_aggregate(self):
-        # The whole point of shard-awareness: $100 parked on shard 1 is
-        # unreachable by our order path and must NOT inflate Kelly sizing.
+    def test_multi_shard_both_nonzero(self):
         payload = {
             "balance_breakdown": [
                 {"balance": "5.00", "exchange_index": 0},
@@ -107,29 +113,35 @@ class TestBalanceCentsFromPayload:
             "balance_dollars": "105.00",
             "balance": 10500,
         }
-        assert _balance_cents_from_payload(payload) == 500
+        # Both shards' funds are visible — unlike the pre-multi-shard reader,
+        # shard-1 collateral is no longer dropped from the result.
+        assert _balance_cents_by_shard(payload) == {0: 500, 1: 10000}
 
     def test_no_breakdown_falls_back_to_balance_dollars(self):
-        assert _balance_cents_from_payload({"balance_dollars": "42.50"}) == 4250
+        assert _balance_cents_by_shard({"balance_dollars": "42.50"}) == {
+            DEFAULT_EXCHANGE_INDEX: 4250
+        }
 
     def test_legacy_integer_payload_is_already_cents(self):
         # Sandbox shape. 5000 means $50.00 — running it through the dollar
         # converter would report $5,000.00.
-        assert _balance_cents_from_payload({"balance": 5000}) == 5000
+        assert _balance_cents_by_shard({"balance": 5000}) == {
+            DEFAULT_EXCHANGE_INDEX: 5000
+        }
 
-    def test_breakdown_without_shard_zero_warns_and_uses_aggregate(self, caplog):
+    def test_breakdown_with_no_parseable_entries_warns_and_uses_aggregate(self, caplog):
         payload = {
-            "balance_breakdown": [{"balance": "100.00", "exchange_index": 1}],
+            "balance_breakdown": [{"exchange_index": "not-an-int", "balance": "100.00"}],
             "balance_dollars": "100.00",
         }
         with caplog.at_level(logging.WARNING):
-            assert _balance_cents_from_payload(payload) == 10000
+            assert _balance_cents_by_shard(payload) == {DEFAULT_EXCHANGE_INDEX: 10000}
         assert any(
             "balance_breakdown" in rec.message and rec.levelno == logging.WARNING
             for rec in caplog.records
         )
 
-    def test_malformed_entries_do_not_break_shard_zero_lookup(self):
+    def test_malformed_entries_do_not_break_good_entries(self):
         payload = {
             "balance_breakdown": [
                 "not-a-dict",
@@ -138,35 +150,55 @@ class TestBalanceCentsFromPayload:
                 {"exchange_index": "abc", "balance": "8.88"},
                 {"balance": "7.77"},
                 {"balance": "3.50", "exchange_index": DEFAULT_EXCHANGE_INDEX},
+                {"balance": "6.25", "exchange_index": 1},
             ],
             "balance_dollars": "999.00",
         }
-        assert _balance_cents_from_payload(payload) == 350
+        # Only the two well-formed entries survive; the malformed ones are
+        # skipped without aborting the scan of the good ones.
+        assert _balance_cents_by_shard(payload) == {
+            DEFAULT_EXCHANGE_INDEX: 350,
+            1: 625,
+        }
 
-    def test_shard_zero_entry_with_unparseable_balance_falls_through(self):
+    def test_unparseable_entry_balance_is_skipped(self):
+        # The only entry present is unparseable, so the breakdown yields
+        # nothing and falls all the way through to the aggregate.
         payload = {
             "balance_breakdown": [{"balance": "garbage", "exchange_index": 0}],
             "balance_dollars": "12.00",
         }
-        assert _balance_cents_from_payload(payload) == 1200
+        assert _balance_cents_by_shard(payload) == {DEFAULT_EXCHANGE_INDEX: 1200}
+
+    def test_one_unparseable_entry_among_others_is_just_dropped(self):
+        # A mix of one bad entry and one good entry: the good entry alone
+        # is returned — no fallback to the aggregate, since something parsed.
+        payload = {
+            "balance_breakdown": [
+                {"balance": "garbage", "exchange_index": 0},
+                {"balance": "2.00", "exchange_index": 1},
+            ],
+            "balance_dollars": "999.00",
+        }
+        assert _balance_cents_by_shard(payload) == {1: 200}
 
     def test_empty_payload_raises(self):
         with pytest.raises(ValueError):
-            _balance_cents_from_payload({})
+            _balance_cents_by_shard({})
 
     def test_nonsense_payload_raises(self):
         with pytest.raises(ValueError):
-            _balance_cents_from_payload({"nonsense": 1})
+            _balance_cents_by_shard({"nonsense": 1})
 
     def test_non_int_legacy_balance_raises(self):
         # A bool is an int subclass but a string is not — a stringy top-level
         # balance is not silently treated as cents.
         with pytest.raises(ValueError):
-            _balance_cents_from_payload({"balance": "114"})
+            _balance_cents_by_shard({"balance": "114"})
 
 
 class TestVerifyAuth:
-    def test_returns_shard_zero_cents_from_raw_response(self):
+    def test_returns_full_shard_dict_from_raw_response(self):
         client = MagicMock()
         client.get_balance_without_preload_content = MagicMock(
             return_value=_raw_balance_response(LIVE_PAYLOAD)
@@ -174,19 +206,31 @@ class TestVerifyAuth:
 
         result = verify_auth(client)
 
-        assert result == 114
-        assert isinstance(result, int)
+        assert result == {0: 114, 1: 0}
+        assert isinstance(result, dict)
         # The modeled call must not be used — it deserializes through the
         # pinned SDK's strict pydantic balance model.
         client.get_balance.assert_not_called()
         client.get_balance_without_preload_content.assert_called_once()
+
+    def test_log_line_contains_per_shard_breakdown_and_total(self, caplog):
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            return_value=_raw_balance_response(LIVE_PAYLOAD)
+        )
+        with caplog.at_level(logging.INFO):
+            verify_auth(client)
+        assert any(
+            "0: 114" in rec.message and "1: 0" in rec.message and "1.14" in rec.message
+            for rec in caplog.records
+        )
 
     def test_legacy_sandbox_payload(self):
         client = MagicMock()
         client.get_balance_without_preload_content = MagicMock(
             return_value=_raw_balance_response({"balance": 100000})
         )
-        assert verify_auth(client) == 100000
+        assert verify_auth(client) == {DEFAULT_EXCHANGE_INDEX: 100000}
 
     def test_non_2xx_raises_api_exception(self):
         # fetch_json_page must convert non-2xx statuses into ApiException so

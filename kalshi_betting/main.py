@@ -343,8 +343,15 @@ def _run_prod(client, args) -> None:
     """
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
-    # Confirm auth works and read the pre-trade balance in cents
-    balance_cents = verify_auth(client)
+    # Confirm auth works and read the pre-trade balance broken out by shard
+    shard_balances = verify_auth(client)
+    # Sizing is portfolio-wide, not per-shard: collateral is made fungible
+    # across shards by pre-execution transfers (a later commit), so Kelly
+    # sizing runs on the sum here, not any single shard's balance.
+    # shard_balances itself stays a live local — it is currently only used
+    # for this sum, but a later commit wires it into shard coverage /
+    # collateral-transfer logic that needs the full per-shard picture.
+    balance_cents = sum(shard_balances.values())
     if balance_cents < MIN_BALANCE_CENTS:
         # Don't waste API calls scanning when there's insufficient capital to trade
         logging.warning(
@@ -405,7 +412,7 @@ def _run_prod(client, args) -> None:
     # may already have filled at this point, so a failure here must not lose the
     # trade records — fall back to the pre-trade balance and keep going.
     try:
-        balance_after = verify_auth(client) / 100
+        balance_after = sum(verify_auth(client).values()) / 100
     except Exception as exc:
         logging.error(
             "Post-trade balance fetch failed: %s — logging with pre-trade balance", exc,

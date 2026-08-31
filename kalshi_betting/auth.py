@@ -36,10 +36,20 @@ Notes:
     Balance is shard-aware. Kalshi's 2026-08-13 change scoped
     /portfolio/balance per exchange shard: the body carries a
     balance_breakdown list of {exchange_index, balance} entries alongside the
-    aggregate. Beware the same-key-different-units trap — inside a breakdown
-    entry "balance" is a fixed-point DOLLAR STRING, while the TOP-LEVEL
-    "balance" is a legacy INTEGER CENTS field. They must never be parsed by
-    the same code path.
+    aggregate. verify_auth() returns the FULL per-shard breakdown as
+    dict[int, int] (exchange_index -> cents) rather than a single scalar —
+    a later collateral-transfer planner and a shard coverage check both need
+    every shard's balance, not just the routable one. Sizing itself stays
+    portfolio-wide: callers sum the dict before handing it to
+    strategy.compute_trade()/select_portfolio(), whose signatures take a
+    single scalar balance_cents and are NOT shard-aware. There is
+    deliberately no scalar-returning wrapper here — a dual API would invite
+    a future caller to size against the wrong (single-shard) number.
+
+    Beware the same-key-different-units trap — inside a breakdown entry
+    "balance" is a fixed-point DOLLAR STRING, while the TOP-LEVEL "balance"
+    is a legacy INTEGER CENTS field. They must never be parsed by the same
+    code path.
 """
 import json
 import logging
@@ -143,28 +153,39 @@ def _dollar_str_to_cents(value) -> int | None:
         return None
 
 
-def _balance_cents_from_payload(data: dict) -> int:
+def _balance_cents_by_shard(data: dict) -> dict[int, int]:
     """
-    Extract the spendable balance in cents from a raw /portfolio/balance body.
+    Extract the spendable balance in cents PER SHARD from a raw
+    /portfolio/balance body.
 
     Kalshi's 2026-08-13 change scoped the balance per exchange shard, so the
-    body now carries a balance_breakdown list alongside the aggregate. The
-    preference order is:
+    body now carries a balance_breakdown list alongside the aggregate. Unlike
+    the single-shard predecessor of this function, every parseable shard is
+    returned — a later collateral-transfer planner and a shard coverage check
+    both need the full picture, not just the routable shard. The preference
+    order (tiers 2 and 3 only apply when the breakdown is absent or entirely
+    unparseable):
 
-      1. The balance_breakdown entry for DEFAULT_EXCHANGE_INDEX — the only
-         shard our order path can reach, so funds parked on any other shard
-         must not inflate Kelly sizing. Entries carry the dollar string under
-         the key "balance" (NOT "balance_dollars").
-      2. Top-level balance_dollars — the fixed-point aggregate across shards.
-      3. Legacy top-level integer balance, already in cents. This is the
-         sandbox shape and the pre-drift production shape; it is returned
-         as-is and must NOT be run through the dollar converter.
+      1. Every balance_breakdown entry that parses: {exchange_index: cents}
+         for each entry, keyed by its own exchange_index (not just
+         DEFAULT_EXCHANGE_INDEX). Entries carry the dollar string under the
+         key "balance" (NOT "balance_dollars").
+      2. Top-level balance_dollars — the fixed-point aggregate across shards
+         — attributed to DEFAULT_EXCHANGE_INDEX, used only when the
+         breakdown is missing/empty or nothing in it parsed.
+      3. Legacy top-level integer balance, already in cents, attributed to
+         DEFAULT_EXCHANGE_INDEX. This is the sandbox shape and the
+         pre-drift production shape; it is returned as-is and must NOT be
+         run through the dollar converter.
 
     Args:
         data (dict): Parsed JSON body of GET /portfolio/balance.
 
     Returns:
-        int: Spendable balance in whole cents.
+        dict[int, int]: Spendable balance in whole cents, keyed by
+            exchange_index. Callers that need a single number for Kelly
+            sizing must sum this dict themselves — sizing is deliberately
+            portfolio-wide, not per-shard.
 
     Raises:
         ValueError: If no balance field in the payload parses. This is the
@@ -173,6 +194,7 @@ def _balance_cents_from_payload(data: dict) -> int:
             against an unknown balance is worse than aborting the run.
     """
     breakdown = data.get("balance_breakdown") or []
+    by_shard: dict[int, int] = {}
     for entry in breakdown:
         try:
             # A non-dict entry raises AttributeError on .get and a missing /
@@ -181,48 +203,58 @@ def _balance_cents_from_payload(data: dict) -> int:
             idx = int(entry.get("exchange_index"))
         except (TypeError, ValueError, AttributeError):
             continue
-        if idx == DEFAULT_EXCHANGE_INDEX:
-            # Inside a breakdown entry "balance" is a DOLLAR STRING (unlike the
-            # top-level "balance", which is integer cents) — hence the dollar
-            # converter here. balance_dollars is accepted first in case the
-            # field is ever added to the entries.
-            cents = _dollar_str_to_cents(entry.get("balance_dollars") or entry.get("balance"))
-            if cents is not None:
-                return cents
+        # Inside a breakdown entry "balance" is a DOLLAR STRING (unlike the
+        # top-level "balance", which is integer cents) — hence the dollar
+        # converter here. balance_dollars is accepted first in case the
+        # field is ever added to the entries.
+        cents = _dollar_str_to_cents(entry.get("balance_dollars") or entry.get("balance"))
+        if cents is not None:
+            by_shard[idx] = cents
+    if by_shard:
+        return by_shard
     if breakdown:
-        # Breakdown present but no usable shard-0 entry: fall through to the
+        # Breakdown present but nothing in it parsed: fall through to the
         # aggregate rather than reading $0 (which would falsely trip the
         # MIN_BALANCE_CENTS abort), but say so.
-        logging.warning("balance_breakdown had no parseable shard-%d entry; "
-                        "falling back to aggregate balance", DEFAULT_EXCHANGE_INDEX)
+        logging.warning("balance_breakdown had no parseable entries; "
+                        "falling back to aggregate balance")
     cents = _dollar_str_to_cents(data.get("balance_dollars"))
     if cents is not None:
-        return cents
+        return {DEFAULT_EXCHANGE_INDEX: cents}
     legacy = data.get("balance")
     if isinstance(legacy, int):
         # Top-level legacy field is ALREADY cents — no dollar conversion.
-        return legacy
+        return {DEFAULT_EXCHANGE_INDEX: legacy}
     raise ValueError(f"Unparseable balance payload: keys={sorted(data)}")
 
 
-def verify_auth(client: KalshiClient) -> int:
+def verify_auth(client: KalshiClient) -> dict[int, int]:
     """
-    Verify that the client's credentials are valid and return the account balance.
+    Verify that the client's credentials are valid and return the per-shard
+    account balance.
 
     Reads GET /portfolio/balance through the SDK's raw-response variant wrapped
     in api_call_with_retry(), so a transient 429/5xx doesn't abort the run
     before scanning even starts, and parses the shard-aware body itself (see
-    _balance_cents_from_payload). If authentication fails, fetch_json_page
+    _balance_cents_by_shard). If authentication fails, fetch_json_page
     re-raises the non-2xx as ApiException. Used in production mode both at
     startup (to confirm auth works and read the pre-trade balance) and after
     trading (to read the post-trade balance for the Excel log).
+
+    There is deliberately no scalar-returning variant of this function — the
+    dict is the single source of truth. Callers that need one number for
+    Kelly sizing (main.py, ultimately strategy.compute_trade() /
+    select_portfolio()) must explicitly sum(...) the returned dict; a dual
+    API here would invite a future caller to size against a single shard's
+    balance instead of the portfolio-wide total.
 
     Args:
         client (KalshiClient): An authenticated client produced by build_client().
 
     Returns:
-        int: Current spendable balance in cents on DEFAULT_EXCHANGE_INDEX
-            (e.g. 100000 = $1,000.00).
+        dict[int, int]: Spendable balance in whole cents, keyed by
+            exchange_index (e.g. {0: 100000, 1: 5000} = $1,000.00 on shard 0
+            and $50.00 on shard 1).
 
     Raises:
         ApiException: If the request returns a non-2xx status (e.g. 401
@@ -237,12 +269,10 @@ def verify_auth(client: KalshiClient) -> int:
     # events/orders/positions. fetch_json_page restores non-2xx semantics,
     # so bad credentials still raise ApiException loudly.
     data = api_call_with_retry(fetch_json_page, client.get_balance_without_preload_content)
-    # Prefer the shard we can actually route orders to over the cross-shard
-    # aggregate, so unreachable funds can't inflate Kelly sizing.
-    balance_cents = _balance_cents_from_payload(data)
+    shard_balances = _balance_cents_by_shard(data)
     logging.info(
-        "Auth OK — balance: %d cents  ($%.2f)",
-        balance_cents,
-        balance_cents / 100,
+        "Auth OK — balance by shard: %s (total $%.2f)",
+        shard_balances,
+        sum(shard_balances.values()) / 100,
     )
-    return balance_cents
+    return shard_balances

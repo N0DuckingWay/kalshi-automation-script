@@ -201,9 +201,10 @@ _TICK_PRICE_RANGES = [
 ]
 
 # Live-shape balance payload (2026-08-14 shard scoping): shard 0 holds
-# $250.00 (25000 cents) — the only shard our order path can reach — while
-# shard 1 and the cross-shard aggregate both carry much larger, WRONG values
-# that Kelly sizing must never see.
+# $250.00 and shard 1 holds $9,999.00 — sizing sums the BREAKDOWN
+# (1024900 cents = $10,249.00), deliberately != the $10,250.00 top-level
+# balance_dollars aggregate, so the replay proves the breakdown sum is what
+# Kelly sizing sees, not the top-level field.
 _LIVE_BALANCE_PAYLOAD = {
     "balance": 114,
     "balance_dollars": "10250.0000",
@@ -213,13 +214,17 @@ _LIVE_BALANCE_PAYLOAD = {
     ],
 }
 
-# Same shape, shard-0 entry below MIN_BALANCE_CENTS ($50) so _run_prod aborts.
+# Same shape, but the breakdown SUM is below MIN_BALANCE_CENTS ($50 = 5000
+# cents): shard0 $5.00 + shard1 $3.00 = 800 cents. Under multi-shard
+# semantics an account with money parked on shard 1 must still be summed in
+# — it's the total across shards that must clear the floor, not any single
+# shard — so this fixture only aborts because the TOTAL is sub-minimum.
 _LOW_BALANCE_PAYLOAD = {
     "balance": 1,
-    "balance_dollars": "100.0000",
+    "balance_dollars": "8.0000",
     "balance_breakdown": [
         {"exchange_index": 0, "balance": "5.0000"},
-        {"exchange_index": 1, "balance": "9999.0000"},
+        {"exchange_index": 1, "balance": "3.0000"},
     ],
 }
 
@@ -525,8 +530,11 @@ class TestRunProdDryRunLiveShapeReplay:
         with caplog.at_level(logging.INFO):
             main._run_prod(client, args)
 
-        # Shard-0 balance ($250.00), never the $10,250 aggregate or the $9,999 shard-1 entry.
-        assert "$250.00" in caplog.text
+        # Sum of the breakdown ($250.00 + $9,999.00 = $10,249.00) — never the
+        # $10,250.00 top-level balance_dollars aggregate. Sizing is
+        # portfolio-wide across shards, but must read the breakdown, not the
+        # aggregate field, so this pins the distinction.
+        assert "$10249.00" in caplog.text
 
         assert "results" in captured
         results = captured["results"]
