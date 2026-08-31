@@ -45,14 +45,16 @@ Purpose:
     so before execution the per-leg cash requirements are totalled by shard,
     greedy transfers are planned out of surplus shards, submitted one-shot to
     config.TRANSFER_PATH, and confirmed to have SETTLED (the endpoint is
-    asynchronous) before the trades that depend on them are allowed to run. It
-    is not yet called by main.py — a later change wires it in.
+    asynchronous) before the trades that depend on them are allowed to run.
+    main._run_prod calls it right after pre_execution_check — preceded by
+    drop_legacy_unroutable(), so on the legacy path no collateral is ever
+    moved for a spec the shard guard would then refuse.
 
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
     CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page plus
     signed_request_json from _http.py. Imports validate_pair_price and
-    tick_size_for_price from scanner.py, verify_auth from auth.py (the shard-aware
+    tick_size_for_price from scanner.py, read_shard_balances from auth.py (the shard-aware
     balance re-read the transfer settle-poll needs), and ORDER_API_VERSION,
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     TRANSFER_PATH, TRANSFER_POLL_INTERVAL_SECONDS,
@@ -120,7 +122,7 @@ from typing import Any
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import fetch_json_page, signed_request_json
-from .auth import verify_auth
+from .auth import read_shard_balances
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
@@ -173,6 +175,12 @@ _V2_PRICE_QUANTUM = Decimal("0.0001")
 # restarts and API changes.
 _V2_NO_MAPPING_CONFIRMED = False
 
+# Pause before re-reading a ZERO position in the NO-mapping backstop: zero
+# immediately after a confirmed fill is most often read-after-write lag in the
+# positions ledger, not disproof (genuine disproof reads POSITIVE). One second
+# is far above observed ledger lag and far below any price-staleness concern.
+_V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
+
 
 def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     """
@@ -222,6 +230,40 @@ def _legacy_routable(spec: TradeSpec) -> bool:
         spec.pair.market_a.exchange_index == DEFAULT_EXCHANGE_INDEX
         and spec.pair.market_b.exchange_index == DEFAULT_EXCHANGE_INDEX
     )
+
+
+def drop_legacy_unroutable(portfolio: list) -> list:
+    """
+    Drop specs the legacy order path can never route, BEFORE money moves.
+
+    A no-op (the portfolio unchanged) while ORDER_API_VERSION is "v2". On the
+    legacy path, _execute_one's _legacy_routable guard would refuse these specs
+    anyway — but that guard fires AFTER ensure_shard_collateral has already
+    POSTed real, non-idempotent transfers onto their shards, stranding funds on
+    a shard nothing will trade against. Routability is knowable statically, so
+    main.py calls this before any collateral is planned.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution.
+
+    Returns:
+        list: The specs the configured order path can actually route, in the
+            input order. Dropped specs are logged with both legs' shards.
+    """
+    if ORDER_API_VERSION == "v2":
+        return portfolio
+    kept = []
+    for spec in portfolio:
+        if _legacy_routable(spec):
+            kept.append(spec)
+            continue
+        logging.warning(
+            "Dropping '%s' before collateral funding — leg shards %d/%d are not "
+            "routable by the legacy order endpoint (set ORDER_API_VERSION='v2')",
+            spec.pair.canonical_title,
+            spec.pair.market_a.exchange_index, spec.pair.market_b.exchange_index,
+        )
+    return kept
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
@@ -1181,7 +1223,29 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
         Exception: Any transport-level error — the transfer's fate is then
             unknown and it is NEVER re-sent.
     """
-    body = {
+    # Retry-free by design (see docstring): signed_request_json signs the path
+    # verbatim, raises ApiException on non-2xx, and never retries.
+    data = signed_request_json(client, "POST", TRANSFER_PATH, body=_transfer_body(source, dest, cents))
+    return data.get("transfer_id")
+
+
+def _transfer_body(source: int, dest: int, cents: int) -> dict:
+    """
+    Build the JSON body for one intra-exchange collateral transfer.
+
+    PURE builder, split out of _execute_transfer so anything that needs to show
+    the exact request (the live probe CLI's evidence log) can print the body that is
+    actually sent rather than a hand-copied duplicate that could drift.
+
+    Args:
+        source (int): exchange_index the funds leave.
+        dest (int): exchange_index the funds arrive on.
+        cents (int): Amount to move, in whole CENTS.
+
+    Returns:
+        dict: The request body for POST config.TRANSFER_PATH.
+    """
+    return {
         # Both endpoints of an intra-exchange transfer are the trading balance;
         # "event_contract" is Kalshi's name for that collateral pool.
         "source": "event_contract",
@@ -1191,10 +1255,6 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
         "source_exchange_shard": source,
         "destination_exchange_shard": dest,
     }
-    # Retry-free by design (see docstring): signed_request_json signs the path
-    # verbatim, raises ApiException on non-2xx, and never retries.
-    data = signed_request_json(client, "POST", TRANSFER_PATH, body=body)
-    return data.get("transfer_id")
 
 
 def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[int, int]:
@@ -1208,14 +1268,15 @@ def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[in
     wall-clock jumps), returning whatever the last read showed so the caller can
     decide which trades are still fundable.
 
-    The balance read is auth.verify_auth, imported at module scope rather than
-    injected as a parameter: trader.py already sits BELOW auth.py in the
-    project's dependency order (config/_http -> auth/scanner -> strategy ->
-    trader), so the import introduces no cycle and no new layer, and it keeps
-    "landed" judged against exactly the same shard-aware parse the run's opening
-    balance came from. A balance_reader parameter would add a production-unused
-    argument to every call site for no behavioural gain; tests substitute the
-    reader by monkeypatching trader.verify_auth, which is equally easy.
+    The balance read is auth.read_shard_balances — the SINGLE-SHOT variant of
+    the shard-aware parse the run's opening balance came from, imported at
+    module scope (trader.py already sits BELOW auth.py in the dependency order,
+    so no cycle). Single-shot matters here: verify_auth wraps its read in
+    api_call_with_retry, whose exponential backoff can hold one call for ~60s
+    of sleeps during an outage — which would stretch this "bounded" wait far
+    past its deadline, since the monotonic deadline is only checked between
+    reads. A failed single read just costs one poll interval instead. Tests
+    substitute the reader by monkeypatching trader.read_shard_balances.
 
     A balance read that raises is treated as "nothing observed" (empty dict) and
     retried until the deadline: it is never treated as success, because
@@ -1235,9 +1296,9 @@ def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[in
     balances: dict[int, int] = {}
     while True:
         try:
-            # Same shard-aware balance read the run started with, so "landed"
-            # is judged against exactly the numbers sizing was based on.
-            balances = verify_auth(client)
+            # Single-shot shard-aware read (same parse the run started with);
+            # never the retry-wrapped verify_auth — see docstring for why.
+            balances = read_shard_balances(client)
         except Exception as exc:
             logging.warning("Balance re-read failed while awaiting transfers: %s", exc)
             balances = {}
@@ -1334,7 +1395,12 @@ def ensure_shard_collateral(
         return portfolio
 
     accepted: list[str] = []
-    attempted = False
+    # Cents actually accepted for movement INTO each destination shard — the
+    # settle wait must target only these, not the full requirement map: a
+    # deficit shard whose transfer was skipped (transfers inactive) or whose
+    # POST failed can never settle, and waiting on it would burn the whole
+    # timeout and then miscast transfers that DID settle as in-flight.
+    accepted_cents: dict[int, int] = {}
     for source, dest, cents in plan:
         if not _transfers_active(shard_statuses, source) or not _transfers_active(
             shard_statuses, dest
@@ -1356,18 +1422,26 @@ def ensure_shard_collateral(
                 cents / 100, source, dest, exc,
             )
             continue
-        attempted = True
         accepted.append(str(transfer_id))
+        accepted_cents[dest] = accepted_cents.get(dest, 0) + cents
         logging.info(
             "Collateral transfer accepted: $%.2f shard %d→%d (transfer_id=%s) — "
             "asynchronous, awaiting settlement",
             cents / 100, source, dest, transfer_id,
         )
 
-    if attempted:
+    if accepted_cents:
         # Acceptance is not settlement: block (bounded) until a fresh balance
-        # read proves the money landed before any order relies on it.
-        confirmed = _await_transfer_settlement(client, required)
+        # read proves the money landed before any order relies on it. Await
+        # only what the accepted transfers can actually deliver per shard —
+        # the lesser of its requirement and its prior balance plus the cents
+        # moved toward it — so an unfundable shard can't stall the wait.
+        awaitable = {
+            dest: min(required[dest], shard_balances.get(dest, 0) + moved)
+            for dest, moved in accepted_cents.items()
+            if dest in required
+        }
+        confirmed = _await_transfer_settlement(client, awaitable)
     else:
         # Nothing moved, so the opening balances are still the truth — don't
         # burn the settle timeout waiting for transfers that were never sent.
@@ -1378,12 +1452,16 @@ def ensure_shard_collateral(
         logging.info("All shard collateral requirements confirmed funded.")
         return portfolio
 
-    if attempted:
+    # MONEY IS IN FLIGHT applies only to shards an accepted transfer was headed
+    # for and that still read short — a shard whose transfer was never accepted
+    # is merely unfunded (already logged above), not ambiguous.
+    in_flight = sorted(s for s in unfunded if s in accepted_cents)
+    if in_flight:
         logging.critical(
             "Collateral transfer(s) did not settle within %ss — MONEY IS IN FLIGHT, "
             "CHECK THE ACCOUNT. transfer_ids=%s; shard(s) still under-funded: %s "
             "(required %s, confirmed %s)",
-            TRANSFER_SETTLE_TIMEOUT_SECONDS, accepted, sorted(unfunded), required, confirmed,
+            TRANSFER_SETTLE_TIMEOUT_SECONDS, accepted, in_flight, required, confirmed,
         )
 
     # Both legs must be payable — a funded leg A with an unpayable leg B is the
@@ -1471,6 +1549,22 @@ def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
             ticker,
         )
         return None
+    if pos == 0:
+        # A read of exactly zero right after a confirmed fill is ambiguous:
+        # genuine disproof looks like a POSITIVE position (the ask opened YES
+        # exposure), while zero can simply be read-after-write lag in the
+        # positions ledger. One short pause and a re-read separates the two —
+        # without it, ledger lag on an unattended run would falsely halt the
+        # pair at manual_review with a real, unhedged leg-A position open.
+        time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
+        pos = _position_count(client, ticker)
+        if pos is None:
+            logging.warning(
+                "V2 NO-leg re-read failed on %s after a zero first read —"
+                " proceeding unlatched; the check re-arms on the next fill",
+                ticker,
+            )
+            return None
     if pos < 0:
         _V2_NO_MAPPING_CONFIRMED = True
         logging.info(

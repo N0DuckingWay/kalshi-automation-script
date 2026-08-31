@@ -210,6 +210,17 @@ def _balance_cents_by_shard(data: dict) -> dict[int, int]:
         cents = _dollar_str_to_cents(entry.get("balance_dollars") or entry.get("balance"))
         if cents is not None:
             by_shard[idx] = cents
+        else:
+            # A parseable shard index with an unparseable balance means that
+            # shard's REAL funds silently vanish from sizing, the coverage
+            # audit, and the transfer planner — exactly the drift failure
+            # class this codebase keeps hitting. Under-sizing is safe, but it
+            # must never be invisible.
+            logging.warning(
+                "balance_breakdown entry for shard %d carried no parseable "
+                "balance (keys=%s) — that shard's funds are NOT counted",
+                idx, sorted(entry),
+            )
     if by_shard:
         return by_shard
     if breakdown:
@@ -276,3 +287,31 @@ def verify_auth(client: KalshiClient) -> dict[int, int]:
         sum(shard_balances.values()) / 100,
     )
     return shard_balances
+
+
+def read_shard_balances(client: KalshiClient) -> dict[int, int]:
+    """
+    Single-shot per-shard balance read — no retry, no backoff, no logging.
+
+    The bounded-poll variant of verify_auth(): trader._await_transfer_settlement
+    re-reads the balance every TRANSFER_POLL_INTERVAL_SECONDS against a
+    monotonic deadline, and that deadline is only checked BETWEEN reads — so
+    the read itself must return (or fail) quickly. verify_auth's
+    api_call_with_retry wrapper can hold a single call for ~60s of exponential
+    backoff during an outage, silently tripling the "bounded" wait; here a
+    transient failure just raises and costs the caller one poll interval.
+
+    Same parse, same shard-aware dict as verify_auth — "landed" is judged
+    against exactly the numbers sizing was based on.
+
+    Args:
+        client (KalshiClient): An authenticated client produced by build_client().
+
+    Returns:
+        dict[int, int]: Spendable balance in whole cents, keyed by exchange_index.
+
+    Raises:
+        ApiException: On a non-2xx status.
+        ValueError: If the response body carries no parseable balance field.
+    """
+    return _balance_cents_by_shard(fetch_json_page(client.get_balance_without_preload_content))

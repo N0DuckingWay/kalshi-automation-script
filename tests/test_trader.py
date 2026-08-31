@@ -589,14 +589,14 @@ class TestAwaitTransferSettlement:
 
     def test_returns_as_soon_as_every_shard_is_covered(self, monkeypatch):
         reader = MagicMock(side_effect=[{0: 100}, {0: 1500}])
-        monkeypatch.setattr(trader, "verify_auth", reader)
+        monkeypatch.setattr(trader, "read_shard_balances", reader)
         assert _await_transfer_settlement(MagicMock(), {0: 1500}) == {0: 1500}
         assert reader.call_count == 2
 
     def test_timeout_returns_the_last_observed_balances(self, monkeypatch):
         monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", 0)
         reader = MagicMock(return_value={0: 100})
-        monkeypatch.setattr(trader, "verify_auth", reader)
+        monkeypatch.setattr(trader, "read_shard_balances", reader)
         assert _await_transfer_settlement(MagicMock(), {0: 1500}) == {0: 100}
         assert reader.call_count == 1
 
@@ -605,7 +605,7 @@ class TestAwaitTransferSettlement:
         # balance is precisely what this function exists to refuse.
         monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", 0)
         monkeypatch.setattr(
-            trader, "verify_auth", MagicMock(side_effect=RuntimeError("boom"))
+            trader, "read_shard_balances", MagicMock(side_effect=RuntimeError("boom"))
         )
         with caplog.at_level(logging.WARNING, logger="root"):
             assert _await_transfer_settlement(MagicMock(), {0: 1500}) == {}
@@ -621,7 +621,7 @@ class TestEnsureShardCollateral:
         """Patch trader's two outbound calls and return the mocks.
 
         `transfer` is the signed_request_json stand-in (return_value or
-        side_effect already configured); `balances` is verify_auth's. The
+        side_effect already configured); `balances` is read_shard_balances's. The
         settle poll is compressed to milliseconds so the async-settlement
         contract is exercised for real (a real deadline, a real sleep) without
         the suite paying the production 30s bound.
@@ -629,7 +629,7 @@ class TestEnsureShardCollateral:
         post = MagicMock(return_value=transfer_resp()) if transfer is None else transfer
         va = MagicMock(return_value={}) if balances is None else balances
         monkeypatch.setattr(trader, "signed_request_json", post)
-        monkeypatch.setattr(trader, "verify_auth", va)
+        monkeypatch.setattr(trader, "read_shard_balances", va)
         monkeypatch.setattr(trader, "TRANSFER_POLL_INTERVAL_SECONDS", 0.001)
         monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", settle_timeout)
         return post, va
@@ -1209,15 +1209,51 @@ class TestV2NoMappingBackstop:
         # A disproven mapping must NOT latch — nothing was confirmed
         assert trader._V2_NO_MAPPING_CONFIRMED is False
 
-    def test_zero_position_also_disproves_the_mapping(self, post):
-        # Non-negative is non-negative: a flat account after a "filled" NO buy
-        # is just as much a contradiction of the mapping as a long YES.
+    def test_persistent_zero_position_disproves_the_mapping(self, post, monkeypatch):
+        # A flat account on BOTH reads after a "filled" NO buy is contradictory
+        # (fill reported, ledger flat) — still manual_review, but only after
+        # the lag re-read below has been given its chance.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         post.side_effect = [v2_resp(5), v2_resp(5)]
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(
             return_value=positions_resp("TICK-A", position=0)
         )
         assert _execute_one(client, make_spec()).status == "manual_review"
+        # Both the first read and the post-delay re-read happened
+        assert client.get_positions_without_preload_content.call_count == 2
+
+    def test_transient_zero_recovers_on_reread_and_latches(self, post, monkeypatch):
+        # Regression (adversarial review): a zero FIRST read is usually
+        # read-after-write lag in the positions ledger, not disproof. The
+        # re-read sees the real negative position, latches, and the pair
+        # completes — instead of falsely halting at manual_review with a
+        # real unhedged leg-A position left open on an unattended run.
+        slept = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[
+            positions_resp("TICK-A", position=0),      # lagging first read
+            positions_resp("TICK-A", position=-5.0),   # ledger catches up
+        ])
+        result = _execute_one(client, make_spec())
+        assert result.status == "executed"
+        assert trader._V2_NO_MAPPING_CONFIRMED is True
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    def test_zero_then_failed_reread_proceeds_unlatched(self, post, monkeypatch):
+        # Zero then a failed re-read is UNKNOWN, not disproven — proceed to
+        # leg B unlatched, same as a failed first read.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.side_effect = [v2_resp(5), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[
+            positions_resp("TICK-A", position=0),
+            RuntimeError("positions endpoint down"),
+        ])
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
 
     def test_disproven_mapping_submits_no_leg_b_and_no_rollback(self, post):
         post.side_effect = [v2_resp(5), v2_resp(5), v2_resp(5)]
@@ -1304,3 +1340,75 @@ class TestOrderVersionDispatch:
         # The default must be V2; "legacy" is only ever a deliberate rollback.
         assert config.ORDER_API_VERSION == "v2"
         assert trader.ORDER_API_VERSION == "v2"
+
+
+class TestDropLegacyUnroutable:
+    """Regression (adversarial review): on the legacy path, unroutable specs
+    must be dropped BEFORE collateral moves — never funded and then refused."""
+
+    def test_v2_mode_is_a_no_op(self, v2_mode):
+        portfolio = [make_spec(shard_a=0, shard_b=3)]
+        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+
+    def test_legacy_mode_drops_off_shard_specs_with_a_warning(self, legacy_mode, caplog):
+        keep = make_spec(shard_a=0, shard_b=0, title="routable")
+        drop = make_spec(shard_a=0, shard_b=1, title="off-shard")
+        with caplog.at_level(logging.WARNING):
+            kept = trader.drop_legacy_unroutable([keep, drop])
+        assert kept == [keep]
+        assert "before collateral funding" in caplog.text
+
+    def test_legacy_mode_keeps_default_shard_specs(self, legacy_mode):
+        portfolio = [make_spec(shard_a=0, shard_b=0)]
+        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+
+
+class TestSettleAwaitTargeting:
+    """Regression (adversarial review): the settle wait targets only shards an
+    accepted transfer was headed for — an unfundable deficit shard must not
+    burn the timeout or miscast settled transfers as money-in-flight."""
+
+    def _statuses(self, inactive_shard: int) -> dict:
+        st = {i: shard_status() for i in (0, 1, 2)}
+        st[inactive_shard] = shard_status(transfers_active=False)
+        return st
+
+    def test_await_targets_only_accepted_destinations(self, monkeypatch):
+        # Deficits on shards 1 (transferable) and 2 (transfers inactive):
+        # shard 2 can never settle, so the await must not include it.
+        specs = [
+            make_spec(shard_a=0, shard_b=1, cost_a=0.0, cost_b=2.00, title="s1"),
+            make_spec(shard_a=0, shard_b=2, cost_a=0.0, cost_b=3.00, title="s2"),
+        ]
+        balances = {0: 10_000, 1: 0, 2: 0}
+        monkeypatch.setattr(
+            trader, "signed_request_json", MagicMock(return_value=transfer_resp())
+        )
+        awaited = {}
+
+        def fake_await(client, required):
+            awaited.update(required)
+            return {0: 9_800, 1: 200, 2: 0}
+
+        monkeypatch.setattr(trader, "_await_transfer_settlement", fake_await)
+        kept = ensure_shard_collateral(
+            MagicMock(), specs, balances, self._statuses(inactive_shard=2)
+        )
+        assert set(awaited) == {1}
+        assert [s.pair.canonical_title for s in kept] == ["s1"]
+
+    def test_no_false_money_in_flight_for_never_accepted_shards(self, monkeypatch, caplog):
+        # Shard 2's transfer was never accepted (inactive) — its underfunding
+        # is a plain drop, never the MONEY IS IN FLIGHT critical.
+        specs = [make_spec(shard_a=0, shard_b=2, cost_a=0.0, cost_b=3.00)]
+        balances = {0: 10_000, 2: 0}
+        monkeypatch.setattr(
+            trader, "signed_request_json",
+            MagicMock(side_effect=AssertionError("nothing should be POSTed")),
+        )
+        with caplog.at_level(logging.INFO):
+            kept = ensure_shard_collateral(
+                MagicMock(), specs, balances, self._statuses(inactive_shard=2)
+            )
+        assert kept == []
+        assert "MONEY IS IN FLIGHT" not in caplog.text

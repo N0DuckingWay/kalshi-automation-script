@@ -672,6 +672,15 @@ def fetch_shard_statuses(client: Any) -> dict | None:
                 ),
                 "description": entry.get("description") or "",
             }
+        if not statuses:
+            # An empty list (or one with no parseable entries) is the same
+            # "breakdown unavailable" shape as an absent field — returning {}
+            # instead of None would falsely CRITICAL every ingested shard in
+            # check_shard_coverage and block every collateral transfer.
+            logging.info(
+                "per-shard exchange status empty — assuming single-shard semantics"
+            )
+            return None
         return statuses
     except Exception as exc:
         logging.info(
@@ -679,6 +688,26 @@ def fetch_shard_statuses(client: Any) -> dict | None:
             "semantics (%s)", exc,
         )
         return None
+
+
+def inactive_shard_indexes(shard_statuses: dict | None) -> set:
+    """
+    Derive the shards ingest must drop from a fetch_shard_statuses() result.
+
+    The single definition of "trading-inactive" for BOTH run modes — main.py's
+    dev and prod paths call this rather than each keeping its own comprehension,
+    so the two can never silently disagree about which shards a run scans.
+
+    Args:
+        shard_statuses (dict | None): Return value of fetch_shard_statuses().
+            None (breakdown unavailable) means no shard is known inactive.
+
+    Returns:
+        set: exchange_index values whose trading_active flag is falsy.
+    """
+    return {
+        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
+    }
 
 
 def check_shard_coverage(

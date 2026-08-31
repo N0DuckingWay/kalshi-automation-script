@@ -1447,3 +1447,31 @@ class TestTickSizeForPrice:
         with caplog.at_level(logging.WARNING):
             assert tick_size_for_price(m, 0.5) == Decimal("0.01")
         assert "KXTEST-1" in caplog.text
+
+
+class TestFetchShardStatusesEmptyBreakdown:
+    def test_empty_status_list_means_unavailable_not_zero_shards(self):
+        # Regression (adversarial review): an empty exchange_index_statuses
+        # list must map to None (single-shard semantics) like every other
+        # unavailable shape — {} would falsely CRITICAL every ingested shard
+        # in check_shard_coverage and block every collateral transfer.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": []}).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None
+
+    def test_all_unparseable_entries_also_mean_unavailable(self):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps(
+                    {"exchange_index_statuses": ["garbage", {"no": "index"}]}
+                ).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None

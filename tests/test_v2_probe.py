@@ -457,3 +457,36 @@ class TestPipelineIsolation:
             f"kalshi_betting/{module}.py references v2_probe — the probe must "
             "never be reachable from the pipeline"
         )
+
+
+class TestUnfillableAskCrossingGuard:
+    def test_top_bid_meeting_the_limit_refuses_to_run(self, monkeypatch):
+        # Regression (adversarial review): on a near-settled market the top
+        # YES bid can sit AT the top of the grid — the "unfillable" ask would
+        # actually fill (a real position) and the step would misreport broken
+        # FoK semantics. The step must refuse (NEUTRAL) instead.
+        submitted = []
+        monkeypatch.setattr(
+            v2_probe, "signed_request_json",
+            lambda *a, **k: submitted.append(k) or KILLED,
+        )
+        client = probe_client([0])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=orderbook_resp(yes_bid="0.99", qty="10")
+        )
+        out = v2_probe._step_unfillable_ask(client, TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert submitted == []
+
+    def test_unreadable_book_refuses_to_run(self, monkeypatch):
+        submitted = []
+        monkeypatch.setattr(
+            v2_probe, "signed_request_json",
+            lambda *a, **k: submitted.append(k) or KILLED,
+        )
+        client = probe_client([0])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(status=200, data=b"{}")
+        )
+        assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._NEUTRAL
+        assert submitted == []

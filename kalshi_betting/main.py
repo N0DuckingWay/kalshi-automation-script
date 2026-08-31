@@ -61,9 +61,15 @@ from .scanner import (
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_tickers,
+    inactive_shard_indexes,
 )
 from .strategy import compute_trade, select_portfolio
-from .trader import ensure_shard_collateral, execute_trades, pre_execution_check
+from .trader import (
+    drop_legacy_unroutable,
+    ensure_shard_collateral,
+    execute_trades,
+    pre_execution_check,
+)
 
 
 def _truncate(text: str, n: int = 40) -> str:
@@ -334,9 +340,7 @@ def _run_dev(client, args) -> None:
     # that aren't trading. Returns None on the sandbox / pre-sharding shape,
     # which degrades to single-shard semantics (keep everything).
     shard_statuses = fetch_shard_statuses(client)
-    inactive_shards = {
-        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
-    }
+    inactive_shards = inactive_shard_indexes(shard_statuses)
 
     # Fetch all open sandbox markets — the sandbox public endpoint does not require
     # valid authentication for read operations, so this works with the prod key too.
@@ -444,9 +448,7 @@ def _run_prod(client, args) -> None:
     # kept — ensure_shard_collateral below also reads each shard's
     # intra_exchange_transfers_active off it.
     shard_statuses    = fetch_shard_statuses(client)
-    inactive_shards   = {
-        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
-    }
+    inactive_shards   = inactive_shard_indexes(shard_statuses)
 
     # Fetch all open markets (every shard, tagged — only trading-inactive
     # shards are dropped) and pre-filter held tickers for downstream efficiency
@@ -501,6 +503,15 @@ def _run_prod(client, args) -> None:
     portfolio = pre_execution_check(client, portfolio)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
+        return
+
+    # On the legacy order path, drop statically-unroutable specs BEFORE any
+    # collateral is planned — otherwise real, non-idempotent transfers would
+    # fund shards whose trades _execute_one's guard then refuses, stranding
+    # money on a shard nothing will trade against. No-op on the V2 default.
+    portfolio = drop_legacy_unroutable(portfolio)
+    if not portfolio:
+        logging.info("No selected pair is routable by the configured order path.")
         return
 
     # Move collateral to the shards the selected trades draw from — sizing is

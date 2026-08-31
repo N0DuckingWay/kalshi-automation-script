@@ -608,6 +608,25 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     # Top of the market's own grid, via the same helper the live rollback uses:
     # the highest tradeable level (e.g. "0.9900" on a whole-cent market).
     price_str = trader._format_price(trader._v2_rollback_price(market))
+
+    # "Unfillable" is only true while no resting YES bid meets the limit. On a
+    # near-settled market the top bid can sit AT the top of the grid — the ask
+    # would then genuinely fill (a real position) and the step would misreport
+    # broken FoK semantics. Refuse to run rather than manufacture a false FAIL.
+    book = scanner._fetch_orderbook(client, ticker)
+    if book is None:
+        print(f"{_NEUTRAL}: order book unavailable for {ticker} — cannot prove the "
+              "ask would be unfillable.")
+        return _NEUTRAL
+    yes_bids = [Decimal(str(level[0])) for level in (book.get("yes") or [])]
+    if yes_bids and max(yes_bids) >= Decimal(price_str):
+        print(
+            f"{_NEUTRAL}: the top resting YES bid ({max(yes_bids)}) meets the "
+            f"top-of-grid limit {price_str} — the ask would actually FILL here. "
+            "Pick a market trading well below the top of its grid and re-run."
+        )
+        return _NEUTRAL
+
     body = _no_buy_body(market, 0.5)
     # Documented override #2: the deliberately unfillable price replaces the
     # builder's capped one — everything else in the body stays the builder's.
@@ -757,15 +776,10 @@ def _step_transfer(client: Any, ticker: str, assume_yes: bool, dest_shard: int) 
         )
         return _NEUTRAL
 
-    # Mirrors the body trader._execute_transfer builds internally, printed here
-    # so the evidence log shows the centicent conversion explicitly.
-    preview = {
-        "source": "event_contract",
-        "destination": "event_contract",
-        "amount": trader._cents_to_centicents(_TRANSFER_PROBE_CENTS),
-        "source_exchange_shard": _TRANSFER_SOURCE_SHARD,
-        "destination_exchange_shard": dest_shard,
-    }
+    # THE body trader._execute_transfer will send — built by the same function
+    # (trader._transfer_body), never hand-copied, so the printed evidence can
+    # never diverge from the request actually made.
+    preview = trader._transfer_body(_TRANSFER_SOURCE_SHARD, dest_shard, _TRANSFER_PROBE_CENTS)
     _emit("REQUEST BODY (outbound transfer, as trader._execute_transfer builds it)", preview)
     if not _confirm(
         assume_yes,

@@ -241,3 +241,23 @@ class TestVerifyAuth:
         )
         with pytest.raises(ApiException):
             verify_auth(client)
+
+
+class TestUnparseableEntryBalanceWarns:
+    def test_dropped_shard_funds_are_never_invisible(self, caplog):
+        # Regression (adversarial review): an entry with a parseable index but
+        # an unparseable balance silently vanished that shard's real funds
+        # from sizing, the coverage audit, and the transfer planner. The drop
+        # is still the safe behavior (under-sizing), but it must be LOUD.
+        import logging as _logging
+        payload = {
+            "balance_breakdown": [
+                {"exchange_index": 0, "balance": "10.0000"},
+                {"exchange_index": 2, "amount_dollars": "500.0000"},  # drifted key
+            ]
+        }
+        with caplog.at_level(_logging.WARNING):
+            out = _balance_cents_by_shard(payload)
+        assert out == {0: 1000}
+        assert "shard 2" in caplog.text
+        assert "NOT counted" in caplog.text
