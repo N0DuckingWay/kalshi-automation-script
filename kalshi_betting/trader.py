@@ -19,15 +19,18 @@ Purpose:
       "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
         a JSON body: bid/ask side on the single YES book, a dollar-string
         fill_or_kill LIMIT price, a fixed-point count, and an explicit
-        exchange_index. There is no "market" order type in V2, so a taker order
-        IS a marketable FoK limit and the LIMIT PRICE IS THE PRICE PROTECTION:
-        scanned price ceiled to the market's own tick grid plus
-        config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price).
+        exchange_index taken from THAT LEG'S OWN market, so each order routes to
+        the shard its market actually lives on. There is no "market" order type
+        in V2, so a taker order IS a marketable FoK limit and the LIMIT PRICE IS
+        THE PRICE PROTECTION: scanned price ceiled to the market's own tick grid
+        plus config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price).
       "legacy" — the original /portfolio/orders create-order call
         (CreateOrderRequest, type="market", integer-cents buy_max_cost). Kept
         fully intact and unmodified so flipping ORDER_API_VERSION back to
         "legacy" is an instant, code-free rollback if the V2 mapping misbehaves
-        on its first real submission.
+        on its first real submission. That endpoint has NO shard-routing
+        parameter, so while it is selected a pair with a leg off
+        config.DEFAULT_EXCHANGE_INDEX is refused outright (see _legacy_routable).
 
     An exception from either submission path does NOT prove the order was
     rejected (a timeout can land after the fill), so exception paths consult the
@@ -37,23 +40,63 @@ Purpose:
     concurrently and drops any whose prices have moved since the scan, reducing
     the chance of submitting orders against a stale price.
 
+    ensure_shard_collateral() closes the gap between portfolio-wide Kelly sizing
+    and per-shard settlement: an order settles against its own market's shard,
+    so before execution the per-leg cash requirements are totalled by shard,
+    greedy transfers are planned out of surplus shards, submitted one-shot to
+    config.TRANSFER_PATH, and confirmed to have SETTLED (the endpoint is
+    asynchronous) before the trades that depend on them are allowed to run.
+    main._run_prod calls it right after pre_execution_check — preceded by
+    drop_legacy_unroutable(), so on the legacy path no collateral is ever
+    moved for a spec the shard guard would then refuse.
+
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
     CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page plus
     signed_request_json from _http.py. Imports validate_pair_price and
-    tick_size_for_price from scanner.py, and ORDER_API_VERSION,
-    BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, ROUTABLE_EXCHANGE_INDEX,
-    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by
-    main.py after select_portfolio() selects the final trade list. Depends on
-    the KalshiClient produced by auth.py.
+    tick_size_for_price from scanner.py, read_shard_balances from auth.py (the shard-aware
+    balance re-read the transfer settle-poll needs), and ORDER_API_VERSION,
+    BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
+    TRANSFER_PATH, TRANSFER_POLL_INTERVAL_SECONDS,
+    TRANSFER_SETTLE_TIMEOUT_SECONDS, V2_ORDER_PATH and
+    V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by main.py after
+    select_portfolio() selects the final trade list. Depends on the KalshiClient
+    produced by auth.py.
 
 Notes:
-    Do NOT add retry logic to order submission, on EITHER path. A failed leg
-    indicates the market moved between scan time and execution time — retrying
-    risks buying one leg at a worse price and creating an unhedged directional
-    position. _submit_order calls fetch_json_page directly and _submit_order_v2
-    calls signed_request_json directly; neither may ever be wrapped in
-    api_call_with_retry.
+    Do NOT add retry logic to order submission, on EITHER path, NOR to the
+    collateral transfer POST. A failed leg indicates the market moved between
+    scan time and execution time — retrying risks buying one leg at a worse
+    price and creating an unhedged directional position; the transfer endpoint
+    is not idempotent, so a retried transfer moves the money twice.
+    _submit_order calls fetch_json_page directly and _submit_order_v2 /
+    _execute_transfer call signed_request_json directly; none may ever be
+    wrapped in api_call_with_retry (which this module deliberately does not even
+    import).
+
+    Money units in this module: contract prices are DOLLARS (float, or Decimal
+    on the V2 price path), balances and order costs are integer CENTS, and the
+    transfer endpoint's `amount` is CENTICENTS (1/100 of a cent). The last
+    conversion lives in exactly one place — _cents_to_centicents — and must
+    never be inlined at a call site.
+
+    The V2 NO-leg mapping (an `ask` on the YES book opening a NO position) is
+    doc-derived and cannot be proven offline, so the FIRST V2 leg-A fill of
+    each process is checked against the account's signed position
+    (_confirm_v2_no_mapping): a non-negative sign disproves the mapping and
+    stops the pair at "manual_review" with leg B unsubmitted and leg A
+    deliberately left in place. A process-lifetime latch
+    (_V2_NO_MAPPING_CONFIRMED) keeps the cost at one extra positions read per
+    run.
+
+    Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
+    shards and every market carries its own exchange_index; each V2 order body
+    therefore takes that field from its own leg's market rather than assuming a
+    single shard, and never sends the -1 auto-route sentinel. The legacy
+    endpoint cannot express any of that, so while ORDER_API_VERSION is not "v2"
+    a spec with a leg off config.DEFAULT_EXCHANGE_INDEX is refused before
+    anything is submitted (_legacy_routable, consulted at the top of
+    _execute_one) rather than misrouted.
 
     Order submission and position lookups use the SDK's raw-response variants
     (via _submit_order / _position_count) because 2026-07 API drift broke the
@@ -70,6 +113,7 @@ Notes:
 """
 import logging
 import math
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -78,11 +122,15 @@ from typing import Any
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import fetch_json_page, signed_request_json
+from .auth import read_shard_balances
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
+    DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
-    ROUTABLE_EXCHANGE_INDEX,
+    TRANSFER_PATH,
+    TRANSFER_POLL_INTERVAL_SECONDS,
+    TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
@@ -116,6 +164,23 @@ _V2_MAX_PRICE = Decimal("0.9999")
 # so quantizing here can never move a price off-grid.
 _V2_PRICE_QUANTUM = Decimal("0.0001")
 
+# Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one().
+# False until a V2 NO buy has been observed to produce a NEGATIVE account
+# position (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
+# hypothesises). The mapping only needs disproving ONCE, and one confirmed
+# negative-sign position proves it for every later trade this run — so once
+# confirmed the check is skipped and the backstop costs one extra positions
+# read per PROCESS, not one per trade. Deliberately not persisted anywhere: a
+# fresh process re-verifies, which is cheap and keeps the check honest across
+# restarts and API changes.
+_V2_NO_MAPPING_CONFIRMED = False
+
+# Pause before re-reading a ZERO position in the NO-mapping backstop: zero
+# immediately after a confirmed fill is most often read-after-write lag in the
+# positions ledger, not disproof (genuine disproof reads POSITIVE). One second
+# is far above observed ledger lag and far below any price-staleness concern.
+_V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
+
 
 def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     """
@@ -134,6 +199,71 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
         int: Maximum total cost in cents for the order.
     """
     return math.ceil(count * price_dollars * 100) + count * BUY_MAX_COST_SLIPPAGE_CENTS
+
+
+def _legacy_routable(spec: TradeSpec) -> bool:
+    """
+    Return True only when BOTH of a pair's legs are on DEFAULT_EXCHANGE_INDEX.
+
+    The legacy /portfolio/orders endpoint has no shard-routing parameter, so
+    the only shard it can reach is config.DEFAULT_EXCHANGE_INDEX — an order for
+    a market on any other shard would fail or, worse, misroute. Markets carry
+    their own exchange_index from ingest, so this is the single place where a
+    pair the legacy endpoint cannot reach is turned away, after sizing and
+    immediately before anything is submitted.
+
+    Consulted ONLY while config.ORDER_API_VERSION is not "v2". On the V2 path it
+    does not apply, because every V2 body routes itself via its own market's
+    exchange_index. The legacy path is retained indefinitely as the instant
+    rollback, so this guard outlives the migration with it.
+
+    Args:
+        spec (TradeSpec): The trade specification about to be executed. Both
+            spec.pair.market_a and spec.pair.market_b must carry an int
+            exchange_index (tagged at ingest).
+
+    Returns:
+        bool: True if both legs can be reached by the legacy order endpoint,
+            False if either leg sits on any other shard.
+    """
+    return (
+        spec.pair.market_a.exchange_index == DEFAULT_EXCHANGE_INDEX
+        and spec.pair.market_b.exchange_index == DEFAULT_EXCHANGE_INDEX
+    )
+
+
+def drop_legacy_unroutable(portfolio: list) -> list:
+    """
+    Drop specs the legacy order path can never route, BEFORE money moves.
+
+    A no-op (the portfolio unchanged) while ORDER_API_VERSION is "v2". On the
+    legacy path, _execute_one's _legacy_routable guard would refuse these specs
+    anyway — but that guard fires AFTER ensure_shard_collateral has already
+    POSTed real, non-idempotent transfers onto their shards, stranding funds on
+    a shard nothing will trade against. Routability is knowable statically, so
+    main.py calls this before any collateral is planned.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution.
+
+    Returns:
+        list: The specs the configured order path can actually route, in the
+            input order. Dropped specs are logged with both legs' shards.
+    """
+    if ORDER_API_VERSION == "v2":
+        return portfolio
+    kept = []
+    for spec in portfolio:
+        if _legacy_routable(spec):
+            kept.append(spec)
+            continue
+        logging.warning(
+            "Dropping '%s' before collateral funding — leg shards %d/%d are not "
+            "routable by the legacy order endpoint (set ORDER_API_VERSION='v2')",
+            spec.pair.canonical_title,
+            spec.pair.market_a.exchange_index, spec.pair.market_b.exchange_index,
+        )
+    return kept
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
@@ -370,8 +500,8 @@ def _build_no_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The computed trade specification. Uses
-            spec.pair.market_a for the ticker and tick grid, spec.pair.nA for
-            the price cap, and spec.x for the contract count.
+            spec.pair.market_a for the ticker, tick grid and exchange shard,
+            spec.pair.nA for the price cap, and spec.x for the contract count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -386,9 +516,14 @@ def _build_no_order_v2(spec: TradeSpec) -> dict:
         "count": _format_count(spec.x),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 (auto-route): must agree with the shard the
-        # ingest-time guard (scanner._on_routable_shard) admitted this market on
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        # This leg's OWN market's shard, read from the market itself — legs of
+        # one pair can live on different shards. Explicit, never the -1
+        # auto-route sentinel: if our notion of a market's shard is ever wrong
+        # we want the exchange to reject the order loudly rather than silently
+        # settle it against a shard we never modelled. An explicit-shard write
+        # also bills only that shard's rate-limit bucket, where auto-route bills
+        # every nonzero shard's.
+        "exchange_index": spec.pair.market_a.exchange_index,
         # Opening exposure, not closing it
         "reduce_only": False,
         # We are deliberately takers — a post-only order would be rejected
@@ -409,8 +544,8 @@ def _build_yes_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The computed trade specification. Uses
-            spec.pair.market_b for the ticker and tick grid, spec.pair.pB for
-            the price cap, and spec.y for the contract count.
+            spec.pair.market_b for the ticker, tick grid and exchange shard,
+            spec.pair.pB for the price cap, and spec.y for the contract count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -424,8 +559,9 @@ def _build_yes_order_v2(spec: TradeSpec) -> dict:
         "count": _format_count(spec.y),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        # Leg B's own market's shard — market_b may sit on a different shard
+        # than market_a. Explicit, never -1 auto-route — see _build_no_order_v2
+        "exchange_index": spec.pair.market_b.exchange_index,
         "reduce_only": False,
         "post_only": False,
     }
@@ -447,7 +583,8 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
 
     Args:
         spec (TradeSpec): The trade whose leg A must be unwound. Uses
-            spec.pair.market_a for the ticker and spec.x for the count.
+            spec.pair.market_a for the ticker, tick grid and exchange shard,
+            and spec.x for the count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -462,8 +599,10 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
         "price": _format_price(_v2_rollback_price(spec.pair.market_a)),
         "count": _format_count(spec.x),
         "time_in_force": "fill_or_kill",
-        # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        # Market A's own shard — the unwind must route to the same shard the
+        # leg-A order opened the position on. Explicit, never -1 auto-route —
+        # see _build_no_order_v2
+        "exchange_index": spec.pair.market_a.exchange_index,
         # Can only reduce an existing position — never opens exposure even if
         # leg A turns out not to have filled after all
         "reduce_only": True,
@@ -852,6 +991,608 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
     return valid
 
 
+def _cents_to_centicents(cents: int) -> int:
+    """
+    Convert whole cents to CENTICENTS, the transfer endpoint's money unit.
+
+    A centicent is 1/100 of a cent (so $1.00 = 100 cents = 10,000 centicents).
+    This is the THIRD money unit in the codebase and it exists in exactly one
+    place — the `amount` field of POST config.TRANSFER_PATH:
+
+      * integer CENTS        — balances, buy_max_cost, MIN_BALANCE_CENTS
+      * fixed-point DOLLARS  — the *_dollars API strings (auth._dollar_str_to_cents)
+      * integer CENTICENTS   — intra-exchange transfer amounts (here, only here)
+
+    The arithmetic is trivial on purpose; the function exists so the unit
+    conversion is NAMED at the one call site that needs it. Never inline the
+    factor: a missing ×100 moves 1% of the intended collateral (an unexplained
+    insufficient-funds rejection later), and a doubled one moves 100× the
+    intended amount out of a shard.
+
+    Args:
+        cents (int): Amount in whole cents. >= 0.
+
+    Returns:
+        int: The same amount expressed in centicents (cents × 100).
+    """
+    return cents * 100
+
+
+def _required_cents_by_shard(portfolio: list) -> dict[int, int]:
+    """
+    Sum each exchange shard's cash requirement across a selected portfolio.
+
+    Every leg draws its cash from the shard its own market lives on, so leg A
+    charges spec.pair.market_a.exchange_index and leg B charges
+    spec.pair.market_b.exchange_index. A pair whose legs share a shard simply
+    adds both costs to that one shard.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution. Each must
+            carry per-leg cash requirements in cost_with_fees_a / cost_with_fees_b
+            (dollars, fee-inclusive — see strategy.TradeSpec).
+
+    Returns:
+        dict[int, int]: exchange_index -> required cash in whole cents. Shards
+            no leg touches are absent (not zero-filled).
+    """
+    required: dict[int, int] = {}
+    for spec in portfolio:
+        for market, cost_dollars in (
+            (spec.pair.market_a, spec.cost_with_fees_a),
+            (spec.pair.market_b, spec.cost_with_fees_b),
+        ):
+            # Ceiling, never floor: under-funding a shard by even a fraction of
+            # a cent gets the order rejected for insufficient collateral, while
+            # over-funding it by one cent costs nothing. The round() first
+            # mirrors config.fee_leg_exact — it stops binary float noise (e.g.
+            # 7.000000000000001) from claiming a whole extra cent.
+            cents = math.ceil(round(cost_dollars * 100, 6))
+            required[market.exchange_index] = required.get(market.exchange_index, 0) + cents
+    return required
+
+
+def _unfunded_shards(required: dict[int, int], available: dict[int, int]) -> set[int]:
+    """
+    Return the shards whose available balance does not cover their requirement.
+
+    Pure comparison — a shard missing from `available` counts as holding zero,
+    which is the safe reading (we never assume money we could not observe).
+
+    Args:
+        required (dict[int, int]): exchange_index -> required cents.
+        available (dict[int, int]): exchange_index -> observed balance in cents.
+
+    Returns:
+        set[int]: exchange_index values still short of cash. Empty when every
+            requirement is covered.
+    """
+    return {shard for shard, need in required.items() if available.get(shard, 0) < need}
+
+
+def _plan_transfers(
+    required_by_shard: dict[int, int], available_by_shard: dict[int, int]
+) -> list[tuple[int, int, int]]:
+    """
+    Plan the shard-to-shard transfers that would fund every shard's requirement.
+
+    PURE function — no I/O, no logging, no clock. Deficit per shard is
+    max(0, required - available); surplus is max(0, available - required). Each
+    deficit is filled greedily from the largest REMAINING surplus first, which
+    minimizes the number of transfers (every transfer is a non-idempotent POST,
+    so fewer is strictly better).
+
+    Ordering is fully deterministic so the same balances always produce the same
+    plan (and so tests can assert on it): deficits are processed in ascending
+    shard-index order, and candidate sources are ranked by remaining surplus
+    descending, ties broken by ascending shard index.
+
+    When total surplus is less than total deficit, this plans what IS coverable
+    and leaves the rest short rather than failing outright — the caller detects
+    the still-unfunded shard(s) from the post-transfer balances and drops only
+    the trades that depend on them.
+
+    Args:
+        required_by_shard (dict[int, int]): exchange_index -> required cents.
+        available_by_shard (dict[int, int]): exchange_index -> available cents.
+
+    Returns:
+        list[tuple[int, int, int]]: (source_shard, destination_shard, cents)
+            transfers to perform, in execution order. Empty when no shard is
+            short, and also when nothing can be moved (no surplus anywhere) —
+            so an empty plan alone must NOT be read as "everything is funded".
+    """
+    deficits = sorted(
+        (shard, need - available_by_shard.get(shard, 0))
+        for shard, need in required_by_shard.items()
+        if need - available_by_shard.get(shard, 0) > 0
+    )
+    remaining_surplus = {
+        shard: avail - required_by_shard.get(shard, 0)
+        for shard, avail in available_by_shard.items()
+        if avail - required_by_shard.get(shard, 0) > 0
+    }
+
+    plan: list[tuple[int, int, int]] = []
+    for dest, shortfall in deficits:
+        # Re-rank per deficit so "largest remaining surplus first" stays true
+        # after earlier deficits have drawn a source down.
+        for source in sorted(remaining_surplus, key=lambda s: (-remaining_surplus[s], s)):
+            if shortfall <= 0:
+                break
+            take = min(remaining_surplus[source], shortfall)
+            if take <= 0:
+                continue
+            plan.append((source, dest, take))
+            remaining_surplus[source] -= take
+            shortfall -= take
+    return plan
+
+
+def _transfers_active(shard_statuses: dict | None, shard: int) -> bool:
+    """
+    Report whether the exchange says intra-shard transfers are usable on a shard.
+
+    shard_statuses=None means the per-shard breakdown was unavailable (sandbox
+    or pre-sharding shape, see scanner.fetch_shard_statuses) — there is nothing
+    to gate on, so transfers are attempted and the POST itself is allowed to
+    fail loudly if the endpoint is unsupported.
+
+    When a breakdown IS available, a shard missing from it is treated as
+    inactive: refusing to move money to or from a shard the exchange did not
+    advertise costs us at most a dropped trade, while attempting it risks a
+    transfer into a shard whose state we cannot reason about.
+
+    Args:
+        shard_statuses (dict | None): scanner.fetch_shard_statuses() output.
+        shard (int): exchange_index to check.
+
+    Returns:
+        bool: True if a transfer touching this shard may be attempted.
+    """
+    if shard_statuses is None:
+        return True
+    return bool((shard_statuses.get(shard) or {}).get("intra_exchange_transfers_active"))
+
+
+def _spec_shards(spec: TradeSpec) -> set[int]:
+    """
+    Return the set of exchange shards a single trade's two legs settle against.
+
+    Args:
+        spec (TradeSpec): The trade specification.
+
+    Returns:
+        set[int]: One element when both legs share a shard, two otherwise.
+    """
+    return {spec.pair.market_a.exchange_index, spec.pair.market_b.exchange_index}
+
+
+def _partition_by_funding(portfolio: list, unfunded: set[int]) -> tuple[list, list]:
+    """
+    Split a portfolio into the trades that are fully funded and those that aren't.
+
+    PURE function. A trade is droppable iff ANY of its legs sits on an unfunded
+    shard — both legs must be payable, since a funded leg A with an unpayable
+    leg B is precisely the unhedged half-fill the whole rollback machinery
+    exists to avoid.
+
+    Args:
+        portfolio (list): TradeSpec objects selected for execution.
+        unfunded (set[int]): exchange_index values still short of cash.
+
+    Returns:
+        tuple[list, list]: (kept, dropped), each preserving the input order.
+    """
+    kept: list = []
+    dropped: list = []
+    for spec in portfolio:
+        (dropped if _spec_shards(spec) & unfunded else kept).append(spec)
+    return kept, dropped
+
+
+def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | None:
+    """
+    Submit one intra-exchange collateral transfer and return its transfer id.
+
+    Deliberately NOT wrapped in api_call_with_retry: the transfer endpoint is
+    not idempotent, so retrying an ambiguous failure (a timeout that actually
+    landed) would move the money a second time. One attempt, and a failure is
+    reported to the caller as "this shard did not get funded".
+
+    The SDK has no generated method for this route, so the request goes through
+    _http.signed_request_json — a signed POST with a verbatim JSON body, which
+    applies the shared non-2xx -> ApiException + JSON-parse contract and, by
+    design, contains NO retry logic of its own. That is exactly the single-shot
+    contract this call site needs (the same reason _submit_order_v2 uses it).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        source (int): exchange_index the funds leave.
+        dest (int): exchange_index the funds arrive on.
+        cents (int): Amount to move, in whole CENTS (converted to the
+            endpoint's centicents here — see _cents_to_centicents).
+
+    Returns:
+        str | None: The accepted transfer's id, or None when the response
+            carried none (the transfer may still have been accepted, so the
+            caller must treat this as "in flight", not "failed").
+
+    Raises:
+        ApiException: On a non-2xx status from the transfer endpoint.
+        Exception: Any transport-level error — the transfer's fate is then
+            unknown and it is NEVER re-sent.
+    """
+    # Retry-free by design (see docstring): signed_request_json signs the path
+    # verbatim, raises ApiException on non-2xx, and never retries.
+    data = signed_request_json(client, "POST", TRANSFER_PATH, body=_transfer_body(source, dest, cents))
+    return data.get("transfer_id")
+
+
+def _transfer_body(source: int, dest: int, cents: int) -> dict:
+    """
+    Build the JSON body for one intra-exchange collateral transfer.
+
+    PURE builder, split out of _execute_transfer so anything that needs to show
+    the exact request (the live probe CLI's evidence log) can print the body that is
+    actually sent rather than a hand-copied duplicate that could drift.
+
+    Args:
+        source (int): exchange_index the funds leave.
+        dest (int): exchange_index the funds arrive on.
+        cents (int): Amount to move, in whole CENTS.
+
+    Returns:
+        dict: The request body for POST config.TRANSFER_PATH.
+    """
+    return {
+        # Both endpoints of an intra-exchange transfer are the trading balance;
+        # "event_contract" is Kalshi's name for that collateral pool.
+        "source": "event_contract",
+        "destination": "event_contract",
+        # CENTICENTS (1/100 cent) — NOT cents. See _cents_to_centicents.
+        "amount": _cents_to_centicents(cents),
+        "source_exchange_shard": source,
+        "destination_exchange_shard": dest,
+    }
+
+
+def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[int, int]:
+    """
+    Re-read the per-shard balance until every requirement is covered, or time out.
+
+    Transfers are asynchronous — acceptance is not settlement — so this is the
+    only thing that proves the collateral actually arrived. Polls every
+    config.TRANSFER_POLL_INTERVAL_SECONDS and gives up after
+    config.TRANSFER_SETTLE_TIMEOUT_SECONDS (a time.monotonic deadline, immune to
+    wall-clock jumps), returning whatever the last read showed so the caller can
+    decide which trades are still fundable.
+
+    The balance read is auth.read_shard_balances — the SINGLE-SHOT variant of
+    the shard-aware parse the run's opening balance came from, imported at
+    module scope (trader.py already sits BELOW auth.py in the dependency order,
+    so no cycle). Single-shot matters here: verify_auth wraps its read in
+    api_call_with_retry, whose exponential backoff can hold one call for ~60s
+    of sleeps during an outage — which would stretch this "bounded" wait far
+    past its deadline, since the monotonic deadline is only checked between
+    reads. A failed single read just costs one poll interval instead. Tests
+    substitute the reader by monkeypatching trader.read_shard_balances.
+
+    A balance read that raises is treated as "nothing observed" (empty dict) and
+    retried until the deadline: it is never treated as success, because
+    submitting orders against an unverifiable balance is exactly what this
+    function exists to prevent.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        required (dict[int, int]): exchange_index -> required cents; the loop
+            ends as soon as every one of these is covered.
+
+    Returns:
+        dict[int, int]: The most recent per-shard balance in cents (possibly
+            empty if every read failed).
+    """
+    deadline = time.monotonic() + TRANSFER_SETTLE_TIMEOUT_SECONDS
+    balances: dict[int, int] = {}
+    while True:
+        try:
+            # Single-shot shard-aware read (same parse the run started with);
+            # never the retry-wrapped verify_auth — see docstring for why.
+            balances = read_shard_balances(client)
+        except Exception as exc:
+            logging.warning("Balance re-read failed while awaiting transfers: %s", exc)
+            balances = {}
+        if not _unfunded_shards(required, balances):
+            return balances
+        if time.monotonic() >= deadline:
+            return balances
+        time.sleep(TRANSFER_POLL_INTERVAL_SECONDS)
+
+
+def ensure_shard_collateral(
+    client: Any,
+    portfolio: list,
+    shard_balances: dict[int, int],
+    shard_statuses: dict | None,
+    dry_run: bool = False,
+) -> list:
+    """
+    Move collateral onto the exchange shards the selected portfolio draws from.
+
+    Kelly sizing is portfolio-wide — it runs against the SUM of every shard's
+    balance — but an order settles against its own market's shard only. This
+    function closes that gap: it totals each shard's cash requirement from the
+    legs' cost_with_fees_* (_required_cents_by_shard), plans greedy transfers
+    out of surplus shards (_plan_transfers), executes them, and confirms the
+    asynchronous funds have actually landed before letting execution proceed.
+
+    Failure is always degradation, never an abort: a blocked, failed, or
+    unsettled transfer results in the affected trades being dropped from the
+    returned portfolio while the rest execute normally. Specifically:
+
+      * No shard is short  -> returns the portfolio unchanged, no API calls.
+      * dry_run            -> logs the planned transfers and returns the
+                              portfolio unchanged. NEVER POSTs.
+      * Transfers inactive on either endpoint shard (per shard_statuses) ->
+        that transfer is not attempted; a warning tells the operator to move
+        the funds manually in the Kalshi UI.
+      * A transfer POST raises -> logged as an error and NOT retried (the
+        endpoint is not idempotent); its shard simply stays unfunded.
+      * Transfers accepted but not settled within
+        config.TRANSFER_SETTLE_TIMEOUT_SECONDS -> logged CRITICAL with the
+        in-flight transfer ids ("money is in flight"), and only the trades
+        needing a still-unfunded shard are dropped.
+
+    In practice this is currently a no-op: while every selected market's legs
+    and all account funds sit on config.DEFAULT_EXCHANGE_INDEX, no shard is ever
+    short and the zero-deficit fast path returns immediately. It exists so the
+    funding path is already in place — and already exercised by that fast path —
+    from the first run on which a trade routes off shard 0.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        portfolio (list): TradeSpec objects selected for execution, each
+            carrying cost_with_fees_a / cost_with_fees_b.
+        shard_balances (dict[int, int]): exchange_index -> cents, as returned
+            by auth.verify_auth() before this run's orders.
+        shard_statuses (dict | None): scanner.fetch_shard_statuses() output,
+            used to skip shards whose intra_exchange_transfers_active is false.
+            None (breakdown unavailable) means transfers are attempted anyway
+            and the POST is allowed to fail loudly.
+        dry_run (bool): When True, plan and log but never POST. Defaults to False.
+
+    Returns:
+        list: The subset of `portfolio` whose every leg sits on a shard
+            confirmed to hold its required cash, in the input order. Equal to
+            `portfolio` whenever nothing needed funding or every transfer
+            settled; possibly empty when nothing could be funded.
+    """
+    if not portfolio:
+        return []
+
+    # Per-leg cash requirements totalled onto the shard each leg settles against
+    required = _required_cents_by_shard(portfolio)
+    # An empty plan is ambiguous (nothing needed vs. nothing movable), so the
+    # fast path keys off the deficit set itself, not off the plan being empty.
+    if not _unfunded_shards(required, shard_balances):
+        logging.info(
+            "All shards sufficiently funded for %d selected trade(s) — no collateral "
+            "transfers needed (required by shard: %s)", len(portfolio), required,
+        )
+        return portfolio
+
+    # Pure, deterministic greedy plan — no I/O happens until the loop below
+    plan = _plan_transfers(required, shard_balances)
+
+    if dry_run:
+        for source, dest, cents in plan:
+            logging.info(
+                "DRY RUN: would transfer $%.2f shard %d→%d", cents / 100, source, dest,
+            )
+        if not plan:
+            logging.info("DRY RUN: shard(s) %s under-funded and no surplus to draw on",
+                         sorted(_unfunded_shards(required, shard_balances)))
+        return portfolio
+
+    accepted: list[str] = []
+    # Cents actually accepted for movement INTO each destination shard — the
+    # settle wait must target only these, not the full requirement map: a
+    # deficit shard whose transfer was skipped (transfers inactive) or whose
+    # POST failed can never settle, and waiting on it would burn the whole
+    # timeout and then miscast transfers that DID settle as in-flight.
+    accepted_cents: dict[int, int] = {}
+    for source, dest, cents in plan:
+        if not _transfers_active(shard_statuses, source) or not _transfers_active(
+            shard_statuses, dest
+        ):
+            logging.warning(
+                "Intra-exchange transfers are not active on shard %d and/or %d — NOT "
+                "moving $%.2f; trades needing shard %d will be dropped. Move the funds "
+                "manually in the Kalshi UI to enable them.",
+                source, dest, cents / 100, dest,
+            )
+            continue
+        try:
+            # Single attempt by design — see _execute_transfer (non-idempotent).
+            transfer_id = _execute_transfer(client, source, dest, cents)
+        except Exception as exc:
+            logging.error(
+                "Collateral transfer of $%.2f from shard %d to shard %d FAILED (not "
+                "retried — the endpoint is not idempotent): %s",
+                cents / 100, source, dest, exc,
+            )
+            continue
+        accepted.append(str(transfer_id))
+        accepted_cents[dest] = accepted_cents.get(dest, 0) + cents
+        logging.info(
+            "Collateral transfer accepted: $%.2f shard %d→%d (transfer_id=%s) — "
+            "asynchronous, awaiting settlement",
+            cents / 100, source, dest, transfer_id,
+        )
+
+    if accepted_cents:
+        # Acceptance is not settlement: block (bounded) until a fresh balance
+        # read proves the money landed before any order relies on it. Await
+        # only what the accepted transfers can actually deliver per shard —
+        # the lesser of its requirement and its prior balance plus the cents
+        # moved toward it — so an unfundable shard can't stall the wait.
+        awaitable = {
+            dest: min(required[dest], shard_balances.get(dest, 0) + moved)
+            for dest, moved in accepted_cents.items()
+            if dest in required
+        }
+        confirmed = _await_transfer_settlement(client, awaitable)
+    else:
+        # Nothing moved, so the opening balances are still the truth — don't
+        # burn the settle timeout waiting for transfers that were never sent.
+        confirmed = shard_balances
+
+    unfunded = _unfunded_shards(required, confirmed)
+    if not unfunded:
+        logging.info("All shard collateral requirements confirmed funded.")
+        return portfolio
+
+    # MONEY IS IN FLIGHT applies only to shards an accepted transfer was headed
+    # for and that still read short — a shard whose transfer was never accepted
+    # is merely unfunded (already logged above), not ambiguous.
+    in_flight = sorted(s for s in unfunded if s in accepted_cents)
+    if in_flight:
+        logging.critical(
+            "Collateral transfer(s) did not settle within %ss — MONEY IS IN FLIGHT, "
+            "CHECK THE ACCOUNT. transfer_ids=%s; shard(s) still under-funded: %s "
+            "(required %s, confirmed %s)",
+            TRANSFER_SETTLE_TIMEOUT_SECONDS, accepted, in_flight, required, confirmed,
+        )
+
+    # Both legs must be payable — a funded leg A with an unpayable leg B is the
+    # unhedged half-fill the rollback machinery exists to avoid
+    kept, dropped = _partition_by_funding(portfolio, unfunded)
+    for spec in dropped:
+        logging.warning(
+            "Dropping '%s' — leg shard(s) %s include an under-funded shard %s",
+            spec.pair.canonical_title, sorted(_spec_shards(spec)), sorted(unfunded),
+        )
+    logging.warning(
+        "Collateral funding incomplete: %d of %d selected trade(s) dropped.",
+        len(dropped), len(portfolio),
+    )
+    return kept
+
+
+def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
+    """
+    Verify, once per process, that a filled V2 NO buy really opened a NO position.
+
+    This is the runtime backstop on the one thing about the V2 order path that
+    cannot be proven offline: _V2_LEG_SIDE's doc-derived hypothesis that an
+    `ask` on the single YES book OPENS a NO position (a short YES IS a long
+    NO). Kalshi's positions ledger is signed, so the evidence is simply the
+    sign of the position after the fill — negative is NO, positive is YES.
+
+    Called by _execute_one() immediately after leg A's ("buy NO") FoK reports
+    filled and BEFORE leg B is submitted, so a disproven mapping is caught with
+    exactly one wrong-side position outstanding rather than a completed pair.
+    No-ops entirely on the legacy path and after the first confirmation
+    (_V2_NO_MAPPING_CONFIRMED), so the mapping is verified once per process
+    rather than once per trade — it is a property of the exchange, not of a
+    particular trade.
+
+    Three outcomes:
+      * position < 0  -> hypothesis holds; latch it and proceed to leg B.
+      * position >= 0 -> hypothesis DISPROVEN live. Return a manual_review
+        result: leg B is not submitted (it would hedge a position we do not
+        actually hold) and leg A is deliberately NOT auto-unwound, because the
+        unwind is a bid resting on the SAME mapping hypothesis, so an
+        automated unwind could double the error rather than reverse it. The
+        rollback's reduce_only flag would make a wrong unwind fail safe into
+        "rollback_failed", but a human — not the bot — must decide what to do
+        with a position whose very sign contradicts our model. This is the
+        module's standing manual_review philosophy: never act automatically on
+        a state we cannot model. Remedy: set config.ORDER_API_VERSION =
+        "legacy", the instant rollback to the endpoint whose side mapping is
+        already proven.
+      * lookup failed (None) -> unknown, NOT disproven. Warn and proceed
+        WITHOUT latching, so the next V2 NO fill re-arms the check. One flaky
+        positions read must not stall trading, and the fill itself was already
+        confirmed by the FoK response, so proceeding leaves the trade no more
+        ambiguous than it already was.
+
+    Concurrency: execute_trades() runs pairs in parallel, so two trades can
+    reach this before either latches — that costs a duplicate positions read
+    and, in the disproven case, sends both to manual_review. Both outcomes are
+    harmless; a bool assignment is atomic under the GIL.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        spec (TradeSpec): The trade whose leg A just filled; its
+            spec.pair.market_a ticker is the one looked up.
+
+    Returns:
+        TradeResult | None: None when the caller should proceed to leg B
+            (mapping confirmed, already confirmed this process, legacy path, or
+            unverifiable); a status="manual_review" TradeResult when the
+            mapping was disproven and the pair must stop.
+    """
+    global _V2_NO_MAPPING_CONFIRMED
+    # Read the module-level ORDER_API_VERSION exactly as the _*_any dispatchers
+    # do, so the backstop can never check a path that was not the one submitted
+    if ORDER_API_VERSION != "v2" or _V2_NO_MAPPING_CONFIRMED:
+        return None
+    ticker = spec.pair.market_a.ticker
+    # Ground truth for the mapping: the account's own signed position
+    pos = _position_count(client, ticker)
+    if pos is None:
+        logging.warning(
+            "Could not verify the V2 NO-leg position sign on %s — proceeding"
+            " unlatched; the leg-A fill itself was confirmed by the order"
+            " response, and the check re-arms on the next V2 NO fill",
+            ticker,
+        )
+        return None
+    if pos == 0:
+        # A read of exactly zero right after a confirmed fill is ambiguous:
+        # genuine disproof looks like a POSITIVE position (the ask opened YES
+        # exposure), while zero can simply be read-after-write lag in the
+        # positions ledger. One short pause and a re-read separates the two —
+        # without it, ledger lag on an unattended run would falsely halt the
+        # pair at manual_review with a real, unhedged leg-A position open.
+        time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
+        pos = _position_count(client, ticker)
+        if pos is None:
+            logging.warning(
+                "V2 NO-leg re-read failed on %s after a zero first read —"
+                " proceeding unlatched; the check re-arms on the next fill",
+                ticker,
+            )
+            return None
+    if pos < 0:
+        _V2_NO_MAPPING_CONFIRMED = True
+        logging.info(
+            "V2 NO-leg mapping confirmed live: the NO buy produced a short-YES"
+            " (negative) position %s on %s — not re-checked this process",
+            pos, ticker,
+        )
+        return None
+    logging.critical(
+        "V2 NO-LEG MAPPING DISPROVEN on %s — leg A's ask did not produce a"
+        " negative YES position: expected negative NO exposure, got %s. NOT"
+        " submitting leg B and NOT auto-unwinding (the unwind is a bid resting"
+        " on the same disproven hypothesis, so it could double the error). A"
+        " human must flatten this account position; set"
+        " config.ORDER_API_VERSION = \"legacy\" to revert to the proven order"
+        " path.",
+        ticker, pos,
+    )
+    return TradeResult(
+        spec=spec, status="manual_review",
+        error=(
+            f"V2 NO-leg mapping disproven: position sign non-negative after"
+            f" NO-leg fill (position {pos} on {ticker}); leg B not submitted"
+            f" and leg A not unwound"
+        ),
+    )
+
+
 def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     """
     Execute one arbitrage pair with sequential leg submission and rollback.
@@ -873,6 +1614,17 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     that we simply couldn't confirm — and is instead surfaced as
     status="manual_review" for a human to check the account.
 
+    While the LEGACY order path is selected, a pair with a leg on a shard that
+    endpoint cannot route to is refused before anything is submitted (see
+    _legacy_routable) — status "failed", because nothing was sent and there is
+    nothing to unwind. On the V2 path the guard does not apply: every order
+    body routes itself via its own market's exchange_index.
+
+    On the V2 path the first leg-A fill of the process is also checked against
+    the account's position sign (see _confirm_v2_no_mapping) — a wrong sign
+    disproves the unverified NO-leg mapping and stops the pair at
+    "manual_review" before leg B is submitted.
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade specification to execute.
@@ -880,9 +1632,34 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: With status "executed", "failed", "rolled_back",
             "rollback_failed" (unwind did not fill — orphaned position needing
-            manual review), or "manual_review" (leg B's fill state could not
-            be determined and no automated action was taken).
+            manual review), or "manual_review" (leg B's fill state could not be
+            determined, or the V2 NO-leg mapping was disproven — in both cases
+            no automated action was taken).
     """
+    # Legacy-mode shard guard — must run before ANY order is built or sent.
+    # Markets are tagged with their shard at ingest, but the legacy order
+    # endpoint has no shard-routing parameter and can only reach
+    # DEFAULT_EXCHANGE_INDEX. Read the module-level ORDER_API_VERSION exactly
+    # as the _*_any dispatchers do, so the guard and the dispatch can never
+    # disagree about which path is active.
+    if ORDER_API_VERSION != "v2" and not _legacy_routable(spec):
+        shards = (
+            f"{spec.pair.market_a.exchange_index}/{spec.pair.market_b.exchange_index}"
+        )
+        logging.warning(
+            "Skipping '%s' — legs on exchange shards %s; the legacy order"
+            " endpoint in use cannot route off shard %d (set"
+            " ORDER_API_VERSION='v2')",
+            spec.pair.canonical_title, shards, DEFAULT_EXCHANGE_INDEX,
+        )
+        return TradeResult(
+            spec=spec, status="failed",
+            error=(
+                f"leg on exchange shard {shards} — legacy order endpoint "
+                f"cannot route; set ORDER_API_VERSION='v2'"
+            ),
+        )
+
     order_a  = _build_no_order_any(spec)
     order_b  = _build_yes_order_any(spec)
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker
@@ -918,6 +1695,14 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             mA_title[:60], held_a, e,
         )
         return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
+
+    # Leg A filled. On the V2 path only, and only until it has been confirmed
+    # once in this process, check that the fill really opened a NO position —
+    # a wrong sign disproves the unverified _V2_LEG_SIDE mapping, and the pair
+    # must stop here rather than hedge (or unwind) a position we do not hold.
+    backstop = _confirm_v2_no_mapping(client, spec)
+    if backstop is not None:
+        return backstop
 
     # Leg A filled — submit leg B — YES on market B (version-dispatched)
     leg_b_error: str | None = None

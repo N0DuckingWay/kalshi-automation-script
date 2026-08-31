@@ -54,8 +54,11 @@ secrets.json + PEM key
 ```
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
+  ├─ auth.verify_auth()            — read the per-shard balance breakdown (prod only; gate and size on the sum)
+  ├─ scanner.fetch_shard_statuses() — read GET /exchange/status per-shard trading/transfer flags (fail-soft)
   ├─ scanner.get_held_tickers()    — fetch currently-held positions (prod only) so we skip re-entering them
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets (attaches event titles for MVE grouping; drops markets on non-routable exchange shards)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged (attaches event titles for MVE grouping; drops only markets on trading-inactive shards)
+  ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts)
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection
@@ -64,7 +67,8 @@ main.py
   ├─ strategy.compute_trade()      — Kelly sizing per pair
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
-  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg to the V2 order endpoint (parallel across pairs, rollback on partial fill)
+  ├─ trader.ensure_shard_collateral() — move funds onto the shards the selected legs settle against (prod; dry-run only plans)
+  ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg to the V2 order endpoint, each leg routed to its own market's shard (parallel across pairs, rollback on partial fill)
   └─ reporter.append_to_prod_log() — write results to trade_log.xlsx
 ```
 
@@ -92,7 +96,7 @@ backtest.py (CLI)
 |--------|-------------|
 | `__init__.py` | Package initializer. No exports; marks the directory as the `kalshi_betting` package. |
 | `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths) and the two fee helper functions used throughout the codebase. |
-| `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance. |
+| `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
 | `_http.py` | Shared HTTP helpers used across the package: `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission calls it directly). |
 | `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. |
 | `strategy.py` | Applies the Kelly criterion to size each trade, computes minimum guaranteed profit and monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
@@ -177,6 +181,18 @@ kalshi_private_key.pem
 ## Run Commands
 
 CLI runs now echo log output to the terminal as well as `kalshi_arb.log`.
+
+### Live V2 order-mapping probe (~1 cent of real money)
+
+```bash
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|transfer] [--yes]
+```
+
+Human-run verification of the V2 order path's NO-leg mapping (an `ask` must open a NO
+position and a reduce-only `bid` must close it), fill-or-kill kill semantics, and the
+inter-shard transfer's centicent unit — against the production account, for roughly one
+cent of worst-case exposure. Never wired into the pipeline; run it before trusting the
+V2 path unsupervised.
 
 ### Dev dry-run (sandbox simulation, no real orders)
 

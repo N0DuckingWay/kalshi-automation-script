@@ -184,16 +184,51 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # settlement value, not a tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
-# The only exchange shard our order path can reach. Kalshi now partitions the
-# exchange into parallel instances keyed by `exchange_index` (on markets and
-# in the balance breakdown; index 1 observed live 2026-08-14). The legacy
-# create-order endpoint has no shard routing at all, so the scanner drops
-# markets on other shards at ingest and verify_auth reads the shard-0 balance
-# entry. The V2 order path DOES take an exchange_index, and trader.py sends
-# this value explicitly (never -1 "auto-route") so the shard an order is routed
-# to always agrees with the shard the ingest guard admitted the market on.
-# Currently every Kalshi market is on shard 0.
-ROUTABLE_EXCHANGE_INDEX       = 0
+# The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
+# instances keyed by `exchange_index` (on markets and in the balance breakdown;
+# combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
+# tennis/baseball to shard 3 on 2026-08-24). "Default" carries three
+# path-independent meanings, which is why this is not named "routable" —
+# routability depends on the order path (the legacy endpoint reaches only this
+# shard; V2 takes an explicit per-order exchange_index):
+#   1. the shard assumed when a market payload omits `exchange_index`
+#      (fail-safe — absence of the field must never drop markets);
+#   2. the shard the legacy/sandbox single-scalar balance shapes are
+#      attributed to (auth.py fallback tiers 2-3);
+#   3. the only shard the legacy order path may route to.
+DEFAULT_EXCHANGE_INDEX       = 0
+
+# ── Cross-shard collateral transfers ──────────────────────────────────────────
+
+# Full API path of the intra-exchange (shard-to-shard) collateral transfer
+# endpoint, used by trader.ensure_shard_collateral() to move cash onto whichever
+# shard a selected trade's legs actually settle against. The pinned SDK has no
+# generated method for this route, so it is reached through
+# _http.signed_request_json(), which signs the path VERBATIM — hence the full
+# string including the /trade-api/v2 prefix, not a suffix appended to PROD_URL.
+# WARNING: the request body's `amount` field is denominated in CENTICENTS
+# (1/100 of a cent), the codebase's THIRD money unit after integer cents and
+# fixed-point dollar strings. Convert with trader._cents_to_centicents(), never
+# by inlining a factor at the call site.
+TRANSFER_PATH = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
+
+# Seconds to keep waiting for accepted transfers to actually SETTLE. The
+# transfer endpoint is ASYNCHRONOUS: a 2xx means "accepted", not "the funds have
+# landed", so an order submitted immediately after could still be rejected for
+# insufficient collateral on its shard. ensure_shard_collateral() therefore
+# re-reads the per-shard balance until every under-funded shard is covered, and
+# this bounds that wait. 30s is long enough for an in-flight transfer to land,
+# short enough that a stuck transfer doesn't hold the run open while its scanned
+# prices go stale; on timeout the affected trades are dropped rather than
+# submitted against money that may not be there.
+TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
+
+# Seconds between per-shard balance re-reads while waiting for transfers to
+# settle. Each poll costs one GET /portfolio/balance, so 2s gives ~15 reads
+# inside TRANSFER_SETTLE_TIMEOUT_SECONDS — responsive enough to proceed promptly
+# once the funds land, infrequent enough not to spend rate-limit tokens on a hot
+# loop while money is in flight.
+TRANSFER_POLL_INTERVAL_SECONDS = 2
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the

@@ -10,16 +10,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from kalshi_betting import scanner
-from kalshi_betting.config import INCLUDE_MVE_MARKETS, ROUTABLE_EXCHANGE_INDEX
+from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX, INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
     PriceRange,
     _fetch_orderbook,
-    _on_routable_shard,
+    _market_from_dict,
     _parse_price_ranges,
+    _shard_index,
+    check_shard_coverage,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    fetch_shard_statuses,
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
@@ -766,121 +769,380 @@ class TestFetchOpenEventsMveStatusFilter:
             fetch_open_events_with_markets(client)
 
 
-class TestOnRoutableShard:
-    """Unit coverage for the fail-safe shard predicate itself."""
+class TestShardIndex:
+    """Unit coverage for the fail-safe shard *label* read itself. This never
+    decides whether a market is kept — market data is cross-shard — so every
+    unusable value must resolve to the default rather than raise."""
 
-    def test_missing_exchange_index_is_routable(self):
-        assert _on_routable_shard({"ticker": "T1"}) is True
+    def test_missing_exchange_index_is_default(self):
+        assert _shard_index({"ticker": "T1"}) == 0
 
-    def test_null_exchange_index_is_routable(self):
-        assert _on_routable_shard({"exchange_index": None}) is True
+    def test_null_exchange_index_is_default(self):
+        assert _shard_index({"exchange_index": None}) == 0
 
-    def test_unparseable_exchange_index_is_routable_fail_safe(self):
-        # Garbage input must fail open (routable) rather than empty the market
-        # list on an unrelated API shape change.
-        assert _on_routable_shard({"exchange_index": "not-a-number"}) is True
+    def test_unparseable_exchange_index_is_default_fail_safe(self):
+        # Garbage input must fail safe to the default rather than raise and
+        # kill ingest on an unrelated API shape change.
+        assert _shard_index({"exchange_index": "not-a-number"}) == 0
 
-    def test_int_zero_is_routable(self):
-        assert _on_routable_shard({"exchange_index": 0}) is True
+    def test_int_zero(self):
+        assert _shard_index({"exchange_index": 0}) == 0
 
-    def test_string_zero_is_routable(self):
-        assert _on_routable_shard({"exchange_index": "0"}) is True
+    def test_string_zero(self):
+        assert _shard_index({"exchange_index": "0"}) == 0
 
-    def test_shard_one_is_not_routable(self):
-        assert _on_routable_shard({"exchange_index": 1}) is False
+    def test_int_one(self):
+        assert _shard_index({"exchange_index": 1}) == 1
 
-    def test_routable_index_matches_config_constant(self):
-        # Sanity check that the predicate is actually gated on the config
-        # constant, not a hardcoded 0 that would silently diverge from it.
-        assert _on_routable_shard({"exchange_index": ROUTABLE_EXCHANGE_INDEX}) is True
+    def test_string_two(self):
+        assert _shard_index({"exchange_index": "2"}) == 2
 
-    def test_explicit_zero_index_is_not_treated_as_missing(self, monkeypatch):
+    def test_default_matches_config_constant(self):
+        # Sanity check that the fallback is the config constant, not a
+        # hardcoded 0 that would silently diverge from it.
+        assert _shard_index({}) == DEFAULT_EXCHANGE_INDEX
+
+    def test_explicit_zero_shard_index_not_conflated_with_missing(self, monkeypatch):
         # A declared exchange_index of 0 is a data statement, not an absent
-        # field. With a falsy-conflating `or` fallback, `0 or 1 == 1` would
-        # judge a shard-0 market routable the day the routable shard moves to
-        # 1 — the exact misroute this guard exists to prevent.
-        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
-        assert scanner._on_routable_shard({"exchange_index": 0}) is False
-        assert scanner._on_routable_shard({"exchange_index": 1}) is True
-
-    def test_missing_null_and_garbage_index_fail_safe(self, monkeypatch):
-        # The fail-safe (absence must never empty the market list) holds
-        # regardless of which shard is configured routable.
-        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
-        assert scanner._on_routable_shard({}) is True
-        assert scanner._on_routable_shard({"exchange_index": None}) is True
-        assert scanner._on_routable_shard({"exchange_index": "garbage"}) is True
+        # field. With a falsy-conflating `or` fallback (int(m.get(...) or
+        # DEFAULT_EXCHANGE_INDEX)), `0 or 9 == 9` would misreport a genuinely
+        # shard-0 market as being on shard 9 the moment DEFAULT_EXCHANGE_INDEX
+        # stops being 0 — exactly the conflation _shard_index's explicit
+        # `is None` check exists to avoid.
+        monkeypatch.setattr(scanner, "DEFAULT_EXCHANGE_INDEX", 9)
+        assert _shard_index({"exchange_index": 0}) == 0
+        assert _shard_index({}) == 9
 
 
-class TestFetchOpenEventsShardFilter:
-    """Markets on non-routable exchange shards must never become candidates —
-    the legacy create-order endpoint has no shard-routing parameter."""
+class TestMarketFromDictTagsExchangeIndex:
+    """_market_from_dict is the SOLE ApiMarket construction site — the shard
+    tag must be attached there, so every market in the pipeline carries it."""
 
-    def test_standard_loop_drops_non_shard_zero_keeps_missing_field(self):
+    def test_market_from_dict_tags_exchange_index(self):
+        tagged = _market_from_dict(
+            _raw_market("SHARD-2", "Rain tomorrow", exchange_index=2), "Weather Event"
+        )
+        assert tagged.exchange_index == 2
+
+        untagged = _market_from_dict(_raw_market("SHARD-NONE", "Rain tomorrow"), "Weather Event")
+        assert untagged.exchange_index == DEFAULT_EXCHANGE_INDEX
+
+
+class TestFetchShardStatuses:
+    """GET /exchange/status must be read RAW — the pinned SDK's ExchangeStatus
+    model silently drops exchange_index_statuses — and must fail soft."""
+
+    @staticmethod
+    def _client(payload, status=200):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=status, data=json.dumps(payload).encode("utf-8")
+            )
+        )
+        return client
+
+    def test_well_formed_payload_parses_all_fields(self):
+        client = self._client({
+            "exchange_active": True,
+            "exchange_index_statuses": [
+                {
+                    "exchange_index": 0, "description": "Main",
+                    "exchange_active": True, "trading_active": True,
+                    "intra_exchange_transfers_active": True,
+                },
+                {
+                    "exchange_index": 1, "description": "Combos",
+                    "exchange_active": True, "trading_active": False,
+                    "intra_exchange_transfers_active": False,
+                },
+            ],
+        })
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0, 1}
+        assert statuses[0] == {
+            "trading_active": True, "exchange_active": True,
+            "intra_exchange_transfers_active": True, "description": "Main",
+        }
+        assert statuses[1]["trading_active"] is False
+        # Read by the collateral-transfer path in a later commit
+        assert statuses[1]["intra_exchange_transfers_active"] is False
+
+    def test_string_exchange_index_is_coerced_to_int_key(self):
+        client = self._client({"exchange_index_statuses": [
+            {"exchange_index": "2", "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {2}
+
+    def test_absent_field_returns_none_with_info_log(self, caplog):
+        # The sandbox / pre-sharding shape: the breakdown is documented as
+        # absent when unavailable. Must degrade to single-shard semantics.
+        client = self._client({"exchange_active": True, "trading_active": True})
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_list_field_returns_none(self):
+        client = self._client({"exchange_index_statuses": {"0": {}}})
+        assert fetch_shard_statuses(client) is None
+
+    def test_malformed_entries_are_skipped_not_fatal(self):
+        client = self._client({"exchange_index_statuses": [
+            "not-a-dict",
+            {"description": "no index at all"},
+            {"exchange_index": "garbage", "trading_active": True},
+            {"exchange_index": 0, "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0}, "one bad record must not discard the good one"
+
+    def test_missing_boolean_fields_default_to_false(self):
+        client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
+        statuses = fetch_shard_statuses(client)
+        assert statuses[3] == {
+            "trading_active": False, "exchange_active": False,
+            "intra_exchange_transfers_active": False, "description": "",
+        }
+
+    def test_api_exception_returns_none_not_raised(self, caplog):
+        # An exchange-status hiccup must never abort a scan.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_2xx_status_returns_none(self):
+        # fetch_json_page raises ApiException on non-2xx; that must be caught.
+        # 400 (not 5xx) so api_call_with_retry doesn't spend its backoff budget.
+        client = self._client({"error": "nope"}, status=400)
+        assert fetch_shard_statuses(client) is None
+
+    def test_uses_raw_variant_not_modeled_call(self):
+        client = self._client({"exchange_index_statuses": []})
+        fetch_shard_statuses(client)
+        client.get_exchange_status_without_preload_content.assert_called_once()
+        client.get_exchange_status.assert_not_called()
+
+
+class TestFetchOpenEventsShardTagging:
+    """Market data is cross-shard: every shard's markets are INGESTED and
+    tagged with exchange_index. Only shards the exchange reports as
+    trading-inactive are dropped. (Routing is enforced at order submission —
+    per-leg on the V2 path, trader._legacy_routable on the legacy one — never
+    here.)"""
+
+    @staticmethod
+    def _client(std_events, mve_events=()):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(
+            return_value=_raw_page(list(std_events))
+        )
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(list(mve_events))
+        )
+        return client
+
+    def test_standard_loop_keeps_and_tags_every_shard(self):
         event = {"title": "Weather Event", "markets": [
             _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
             _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
             _raw_market("STD-NOFIELD", "Hail tomorrow"),
         ]}
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page([])
+        markets = fetch_open_events_with_markets(self._client([event]))
+        by_ticker = {m.ticker: m for m in markets}
+        assert set(by_ticker) == {"STD-SHARD0", "STD-SHARD1", "STD-NOFIELD"}, (
+            "markets from every shard must survive ingest"
         )
+        assert by_ticker["STD-SHARD1"].exchange_index == 1
+        assert by_ticker["STD-SHARD0"].exchange_index == 0
+        # Missing field is the pre-sharding shape — fail-safe to the default
+        assert by_ticker["STD-NOFIELD"].exchange_index == DEFAULT_EXCHANGE_INDEX
 
-        markets = fetch_open_events_with_markets(client)
-        tickers = {m.ticker for m in markets}
-        assert tickers == {"STD-SHARD0", "STD-NOFIELD"}, (
-            "only the shard-0 and field-missing markets should survive"
-        )
+    def test_no_non_routable_shard_warning_is_logged(self, caplog):
+        # The old drop-at-ingest warning must be gone — a shard-1 market is
+        # now a perfectly normal ingest, not an anomaly.
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(self._client([event]))
+        assert {m.ticker for m in markets} == {"STD-SHARD1"}
+        assert "non-routable" not in caplog.text
+        assert "trading-inactive" not in caplog.text
 
-    def test_warning_logged_with_correct_skipped_count(self, caplog):
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_loop_also_keeps_and_tags_every_shard(self):
+        mve_event = {"title": "2024 Election Winner", "markets": [
+            _raw_market("MVE-SHARD0", "Trump", status="active", exchange_index=0),
+            _raw_market("MVE-SHARD1", "Harris", status="active", exchange_index=1),
+        ]}
+        markets = fetch_open_events_with_markets(self._client([], [mve_event]))
+        by_ticker = {m.ticker: m for m in markets}
+        assert set(by_ticker) == {"MVE-SHARD0", "MVE-SHARD1"}
+        assert by_ticker["MVE-SHARD1"].exchange_index == 1
+
+    def test_inactive_shard_markets_are_dropped_with_warning(self, caplog):
         event = {"title": "Weather Event", "markets": [
             _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
             _raw_market("STD-SHARD1-A", "Snow tomorrow", exchange_index=1),
             _raw_market("STD-SHARD1-B", "Hail tomorrow", exchange_index=1),
         ]}
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page([])
-        )
-
         with caplog.at_level(logging.WARNING):
-            fetch_open_events_with_markets(client)
-        assert "Skipped 2 markets on non-routable exchange shards" in caplog.text
-
-    def test_no_warning_when_everything_is_shard_zero(self, caplog):
-        event = {"title": "Weather Event", "markets": [
-            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
-            _raw_market("STD-B", "Snow tomorrow"),
-        ]}
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page([])
-        )
-
-        with caplog.at_level(logging.WARNING):
-            markets = fetch_open_events_with_markets(client)
-        assert {m.ticker for m in markets} == {"STD-A", "STD-B"}
-        assert "non-routable exchange shards" not in caplog.text
+            markets = fetch_open_events_with_markets(
+                self._client([event]), inactive_shards={1}
+            )
+        assert {m.ticker for m in markets} == {"STD-SHARD0"}
+        assert "Skipped 2 markets on trading-inactive exchange shards [1]" in caplog.text
 
     @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
-    def test_mve_loop_also_drops_non_shard_zero(self):
+    def test_inactive_shard_drop_spans_both_loops_in_one_count(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+        ]}
         mve_event = {"title": "2024 Election Winner", "markets": [
-            _raw_market("MVE-SHARD0", "Trump", status="active", exchange_index=0),
             _raw_market("MVE-SHARD1", "Harris", status="active", exchange_index=1),
         ]}
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page([mve_event])
-        )
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(
+                self._client([event], [mve_event]), inactive_shards={1}
+            )
+        assert markets == []
+        # One summary line covering the standard AND MVE loops
+        assert "Skipped 2 markets on trading-inactive exchange shards [1]" in caplog.text
 
-        markets = fetch_open_events_with_markets(client)
-        tickers = {m.ticker for m in markets}
-        assert tickers == {"MVE-SHARD0"}
+    def test_no_warning_when_no_shard_is_inactive(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-B", "Snow tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(self._client([event]))
+        assert {m.ticker for m in markets} == {"STD-A", "STD-B"}
+        assert "trading-inactive" not in caplog.text
+
+    def test_per_shard_ingest_counts_are_logged(self, caplog):
+        # Load-bearing diagnostic: the only signal of which shards we actually
+        # saw markets on after a category migrates to a new shard.
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-B", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-C", "Hail tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.INFO):
+            fetch_open_events_with_markets(self._client([event]))
+        assert "Ingested markets by shard: {0: 1, 1: 2}" in caplog.text
+
+
+class TestCheckShardCoverage:
+    """Pure comparison of what /exchange/status advertises against what a run
+    actually observed. Severity is deliberately empty-vs-funded: an active
+    advertised shard with zero markets is only CRITICAL when money is parked
+    there (a real blind spot); otherwise it's a WARNING, since an advertised
+    shard being legitimately empty is expected during the shard rollout and
+    must not cry wolf at critical severity every week."""
+
+    @staticmethod
+    def _status(trading_active=True, description="Main"):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": description,
+        }
+
+    def test_full_coverage_is_silent(self):
+        advertised = {0: self._status(description="Main"), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0, 1}, {0})
+        assert critical == []
+        assert warnings == []
+
+    def test_active_shard_zero_markets_zero_funds_is_warning_only(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 1" in warnings[0]
+        assert "Combos" in warnings[0]
+        assert "may be legitimately empty" in warnings[0]
+
+    def test_active_shard_zero_markets_with_funds_is_critical(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, {1})
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 1" in critical[0]
+        assert "Combos" in critical[0]
+        assert "holds account funds" in critical[0]
+
+    def test_inactive_advertised_shard_with_zero_markets_is_not_a_problem(self):
+        advertised = {
+            0: self._status(),
+            1: self._status(trading_active=False, description="Crypto"),
+        }
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert warnings == []
+
+    def test_inactive_advertised_shard_with_funds_is_still_not_flagged(self):
+        # Its markets were deliberately dropped at ingest (and that drop logs
+        # its own warning) — re-reporting it here would be double-alerting.
+        advertised = {
+            0: self._status(),
+            1: self._status(trading_active=False, description="Crypto"),
+        }
+        critical, warnings = check_shard_coverage(advertised, {0}, {0, 1})
+        assert critical == []
+        assert warnings == []
+
+    def test_market_shard_not_advertised_is_critical(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0, 7}, set())
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 7" in critical[0]
+        assert "does not advertise" in critical[0]
+
+    def test_balance_shard_not_advertised_is_warning(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0}, {0, 9})
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]
+
+    def test_advertised_none_is_unknowable_even_with_weird_observed_sets(self):
+        critical, warnings = check_shard_coverage(None, {0, 1, 2, 99}, {0, 5})
+        assert critical == []
+        assert warnings == []
+
+    def test_empty_advertised_dict_is_not_treated_as_none(self):
+        # {} is a real (if degenerate) breakdown, not "unavailable": an
+        # observed market shard it doesn't list is still a disagreement.
+        critical, warnings = check_shard_coverage({}, {0}, set())
+        assert len(critical) == 1
+        assert "shard 0" in critical[0]
+
+    def test_multiple_simultaneous_problems_all_reported_correctly(self):
+        advertised = {
+            0: self._status(description="Main"),
+            1: self._status(description="Combos"),  # active, zero markets, funds -> critical
+            2: self._status(trading_active=False, description="Crypto"),  # never a problem
+        }
+        market_shards = {0, 7}  # 7 unadvertised -> critical
+        balance_shards = {1, 9}  # 1 funds shard 1 -> critical; 9 unadvertised -> warning
+        critical, warnings = check_shard_coverage(advertised, market_shards, balance_shards)
+
+        assert len(critical) == 2
+        assert any("shard 1" in p and "holds account funds" in p for p in critical)
+        assert any("shard 7" in p and "does not advertise" in p for p in critical)
+
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]
 
 
 class TestSubtitleFallback:
@@ -1185,3 +1447,31 @@ class TestTickSizeForPrice:
         with caplog.at_level(logging.WARNING):
             assert tick_size_for_price(m, 0.5) == Decimal("0.01")
         assert "KXTEST-1" in caplog.text
+
+
+class TestFetchShardStatusesEmptyBreakdown:
+    def test_empty_status_list_means_unavailable_not_zero_shards(self):
+        # Regression (adversarial review): an empty exchange_index_statuses
+        # list must map to None (single-shard semantics) like every other
+        # unavailable shape — {} would falsely CRITICAL every ingested shard
+        # in check_shard_coverage and block every collateral transfer.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": []}).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None
+
+    def test_all_unparseable_entries_also_mean_unavailable(self):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps(
+                    {"exchange_index_statuses": ["garbage", {"no": "index"}]}
+                ).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None
