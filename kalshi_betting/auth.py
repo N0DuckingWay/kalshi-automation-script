@@ -13,7 +13,7 @@ Purpose:
 
 Dependencies:
     Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, and
-    ROUTABLE_EXCHANGE_INDEX from config.py, and api_call_with_retry /
+    DEFAULT_EXCHANGE_INDEX from config.py, and api_call_with_retry /
     fetch_json_page from _http.py. build_client() is called by main.py,
     historical.py, and (indirectly) backtest.py. verify_auth() is called by
     main.py to confirm credentials and read balance.
@@ -50,10 +50,10 @@ from kalshi_python_sync.configuration import Configuration
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    DEFAULT_EXCHANGE_INDEX,
     DEV_PEM_FILE,
     PEM_FILE,
     PROD_URL,
-    ROUTABLE_EXCHANGE_INDEX,
     SANDBOX_URL,
     SECRETS_FILE,
 )
@@ -151,7 +151,7 @@ def _balance_cents_from_payload(data: dict) -> int:
     body now carries a balance_breakdown list alongside the aggregate. The
     preference order is:
 
-      1. The balance_breakdown entry for ROUTABLE_EXCHANGE_INDEX — the only
+      1. The balance_breakdown entry for DEFAULT_EXCHANGE_INDEX — the only
          shard our order path can reach, so funds parked on any other shard
          must not inflate Kelly sizing. Entries carry the dollar string under
          the key "balance" (NOT "balance_dollars").
@@ -181,7 +181,7 @@ def _balance_cents_from_payload(data: dict) -> int:
             idx = int(entry.get("exchange_index"))
         except (TypeError, ValueError, AttributeError):
             continue
-        if idx == ROUTABLE_EXCHANGE_INDEX:
+        if idx == DEFAULT_EXCHANGE_INDEX:
             # Inside a breakdown entry "balance" is a DOLLAR STRING (unlike the
             # top-level "balance", which is integer cents) — hence the dollar
             # converter here. balance_dollars is accepted first in case the
@@ -194,7 +194,7 @@ def _balance_cents_from_payload(data: dict) -> int:
         # aggregate rather than reading $0 (which would falsely trip the
         # MIN_BALANCE_CENTS abort), but say so.
         logging.warning("balance_breakdown had no parseable shard-%d entry; "
-                        "falling back to aggregate balance", ROUTABLE_EXCHANGE_INDEX)
+                        "falling back to aggregate balance", DEFAULT_EXCHANGE_INDEX)
     cents = _dollar_str_to_cents(data.get("balance_dollars"))
     if cents is not None:
         return cents
@@ -221,7 +221,7 @@ def verify_auth(client: KalshiClient) -> int:
         client (KalshiClient): An authenticated client produced by build_client().
 
     Returns:
-        int: Current spendable balance in cents on ROUTABLE_EXCHANGE_INDEX
+        int: Current spendable balance in cents on DEFAULT_EXCHANGE_INDEX
             (e.g. 100000 = $1,000.00).
 
     Raises:

@@ -42,7 +42,7 @@ Dependencies:
     CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page plus
     signed_request_json from _http.py. Imports validate_pair_price and
     tick_size_for_price from scanner.py, and ORDER_API_VERSION,
-    BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, ROUTABLE_EXCHANGE_INDEX,
+    BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by
     main.py after select_portfolio() selects the final trade list. Depends on
     the KalshiClient produced by auth.py.
@@ -81,8 +81,8 @@ from ._http import fetch_json_page, signed_request_json
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
+    DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
-    ROUTABLE_EXCHANGE_INDEX,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
@@ -388,7 +388,7 @@ def _build_no_order_v2(spec: TradeSpec) -> dict:
         "time_in_force": "fill_or_kill",
         # Explicit shard, never -1 (auto-route): must agree with the shard the
         # ingest-time guard (scanner._on_routable_shard) admitted this market on
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        "exchange_index": DEFAULT_EXCHANGE_INDEX,
         # Opening exposure, not closing it
         "reduce_only": False,
         # We are deliberately takers — a post-only order would be rejected
@@ -425,7 +425,7 @@ def _build_yes_order_v2(spec: TradeSpec) -> dict:
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
         # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        "exchange_index": DEFAULT_EXCHANGE_INDEX,
         "reduce_only": False,
         "post_only": False,
     }
@@ -463,7 +463,7 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
         "count": _format_count(spec.x),
         "time_in_force": "fill_or_kill",
         # Explicit shard, never -1 auto-route — see _build_no_order_v2
-        "exchange_index": ROUTABLE_EXCHANGE_INDEX,
+        "exchange_index": DEFAULT_EXCHANGE_INDEX,
         # Can only reduce an existing position — never opens exposure even if
         # leg A turns out not to have filled after all
         "reduce_only": True,

@@ -43,13 +43,13 @@ from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    DEFAULT_EXCHANGE_INDEX,
     DEFAULT_TICK_SIZE_DOLLARS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
-    ROUTABLE_EXCHANGE_INDEX,
     SAME_TITLE_MIN_PRICE_DIFF,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -568,9 +568,9 @@ def _on_routable_shard(m: dict) -> bool:
     market would fail or misroute at submission time. A missing, null, or
     unparseable exchange_index is treated as routable (fail-safe — absence of
     the field must not empty the market list). An explicitly declared index is
-    always compared against ROUTABLE_EXCHANGE_INDEX — an `or`-style fallback
+    always compared against DEFAULT_EXCHANGE_INDEX — an `or`-style fallback
     would conflate a declared 0 with a missing field, which silently inverts
-    the guard the day ROUTABLE_EXCHANGE_INDEX is changed to a non-zero shard.
+    the guard the day DEFAULT_EXCHANGE_INDEX is changed to a non-zero shard.
 
     Args:
         m (dict): One raw market JSON dict from an events-endpoint payload.
@@ -583,7 +583,7 @@ def _on_routable_shard(m: dict) -> bool:
         # Field absent or null — fail-safe: treat as routable
         return True
     try:
-        return int(raw) == ROUTABLE_EXCHANGE_INDEX
+        return int(raw) == DEFAULT_EXCHANGE_INDEX
     except (TypeError, ValueError):
         return True
 
@@ -610,7 +610,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
-    Both loops also drop any market not on ROUTABLE_EXCHANGE_INDEX (see
+    Both loops also drop any market not on DEFAULT_EXCHANGE_INDEX (see
     _on_routable_shard) — the legacy create-order endpoint has no shard
     routing, so a market on another exchange shard must never reach the
     pair-detection pipeline. A non-zero skip count is logged as a warning.
@@ -724,7 +724,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
     if skipped_shard:
         logging.warning(
             "Skipped %d markets on non-routable exchange shards (exchange_index != %d)",
-            skipped_shard, ROUTABLE_EXCHANGE_INDEX,
+            skipped_shard, DEFAULT_EXCHANGE_INDEX,
         )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets

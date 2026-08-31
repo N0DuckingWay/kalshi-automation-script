@@ -16,7 +16,7 @@ from kalshi_betting import config, trader
 from kalshi_betting.config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
-    ROUTABLE_EXCHANGE_INDEX,
+    DEFAULT_EXCHANGE_INDEX,
     V2_ORDER_PATH,
 )
 from kalshi_betting.scanner import PriceRange
@@ -406,7 +406,7 @@ class TestV2OrderBuilders:
         for body in (
             _build_no_order_v2(spec), _build_yes_order_v2(spec), _build_rollback_order_v2(spec),
         ):
-            assert body["exchange_index"] == ROUTABLE_EXCHANGE_INDEX
+            assert body["exchange_index"] == DEFAULT_EXCHANGE_INDEX
             assert body["exchange_index"] != -1
 
     def test_client_order_ids_are_unique_uuids(self):

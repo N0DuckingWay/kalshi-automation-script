@@ -184,16 +184,19 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # settlement value, not a tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
-# The only exchange shard our order path can reach. Kalshi now partitions the
-# exchange into parallel instances keyed by `exchange_index` (on markets and
-# in the balance breakdown; index 1 observed live 2026-08-14). The legacy
-# create-order endpoint has no shard routing at all, so the scanner drops
-# markets on other shards at ingest and verify_auth reads the shard-0 balance
-# entry. The V2 order path DOES take an exchange_index, and trader.py sends
-# this value explicitly (never -1 "auto-route") so the shard an order is routed
-# to always agrees with the shard the ingest guard admitted the market on.
-# Currently every Kalshi market is on shard 0.
-ROUTABLE_EXCHANGE_INDEX       = 0
+# The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
+# instances keyed by `exchange_index` (on markets and in the balance breakdown;
+# combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
+# tennis/baseball to shard 3 on 2026-08-24). "Default" carries three
+# path-independent meanings, which is why this is not named "routable" —
+# routability depends on the order path (the legacy endpoint reaches only this
+# shard; V2 takes an explicit per-order exchange_index):
+#   1. the shard assumed when a market payload omits `exchange_index`
+#      (fail-safe — absence of the field must never drop markets);
+#   2. the shard the legacy/sandbox single-scalar balance shapes are
+#      attributed to (auth.py fallback tiers 2-3);
+#   3. the only shard the legacy order path may route to.
+DEFAULT_EXCHANGE_INDEX       = 0
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the

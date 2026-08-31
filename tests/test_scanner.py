@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kalshi_betting import scanner
-from kalshi_betting.config import INCLUDE_MVE_MARKETS, ROUTABLE_EXCHANGE_INDEX
+from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX, INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
     PriceRange,
@@ -792,21 +792,21 @@ class TestOnRoutableShard:
     def test_routable_index_matches_config_constant(self):
         # Sanity check that the predicate is actually gated on the config
         # constant, not a hardcoded 0 that would silently diverge from it.
-        assert _on_routable_shard({"exchange_index": ROUTABLE_EXCHANGE_INDEX}) is True
+        assert _on_routable_shard({"exchange_index": DEFAULT_EXCHANGE_INDEX}) is True
 
     def test_explicit_zero_index_is_not_treated_as_missing(self, monkeypatch):
         # A declared exchange_index of 0 is a data statement, not an absent
         # field. With a falsy-conflating `or` fallback, `0 or 1 == 1` would
         # judge a shard-0 market routable the day the routable shard moves to
         # 1 — the exact misroute this guard exists to prevent.
-        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
+        monkeypatch.setattr(scanner, "DEFAULT_EXCHANGE_INDEX", 1)
         assert scanner._on_routable_shard({"exchange_index": 0}) is False
         assert scanner._on_routable_shard({"exchange_index": 1}) is True
 
     def test_missing_null_and_garbage_index_fail_safe(self, monkeypatch):
         # The fail-safe (absence must never empty the market list) holds
         # regardless of which shard is configured routable.
-        monkeypatch.setattr(scanner, "ROUTABLE_EXCHANGE_INDEX", 1)
+        monkeypatch.setattr(scanner, "DEFAULT_EXCHANGE_INDEX", 1)
         assert scanner._on_routable_shard({}) is True
         assert scanner._on_routable_shard({"exchange_index": None}) is True
         assert scanner._on_routable_shard({"exchange_index": "garbage"}) is True
