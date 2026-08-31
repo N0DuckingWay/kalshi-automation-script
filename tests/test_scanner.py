@@ -15,11 +15,14 @@ from kalshi_betting.scanner import (
     CandidatePair,
     PriceRange,
     _fetch_orderbook,
+    _market_from_dict,
     _on_routable_shard,
     _parse_price_ranges,
+    _shard_index,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    fetch_shard_statuses,
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
@@ -810,6 +813,165 @@ class TestOnRoutableShard:
         assert scanner._on_routable_shard({}) is True
         assert scanner._on_routable_shard({"exchange_index": None}) is True
         assert scanner._on_routable_shard({"exchange_index": "garbage"}) is True
+
+
+class TestShardIndex:
+    """Unit coverage for the fail-safe shard *label* read itself. This never
+    decides whether a market is kept — market data is cross-shard — so every
+    unusable value must resolve to the default rather than raise."""
+
+    def test_missing_exchange_index_is_default(self):
+        assert _shard_index({"ticker": "T1"}) == 0
+
+    def test_null_exchange_index_is_default(self):
+        assert _shard_index({"exchange_index": None}) == 0
+
+    def test_unparseable_exchange_index_is_default_fail_safe(self):
+        # Garbage input must fail safe to the default rather than raise and
+        # kill ingest on an unrelated API shape change.
+        assert _shard_index({"exchange_index": "not-a-number"}) == 0
+
+    def test_int_zero(self):
+        assert _shard_index({"exchange_index": 0}) == 0
+
+    def test_string_zero(self):
+        assert _shard_index({"exchange_index": "0"}) == 0
+
+    def test_int_one(self):
+        assert _shard_index({"exchange_index": 1}) == 1
+
+    def test_string_two(self):
+        assert _shard_index({"exchange_index": "2"}) == 2
+
+    def test_default_matches_config_constant(self):
+        # Sanity check that the fallback is the config constant, not a
+        # hardcoded 0 that would silently diverge from it.
+        assert _shard_index({}) == DEFAULT_EXCHANGE_INDEX
+
+    def test_explicit_zero_shard_index_not_conflated_with_missing(self, monkeypatch):
+        # A declared exchange_index of 0 is a data statement, not an absent
+        # field. With a falsy-conflating `or` fallback (int(m.get(...) or
+        # DEFAULT_EXCHANGE_INDEX)), `0 or 9 == 9` would misreport a genuinely
+        # shard-0 market as being on shard 9 the moment DEFAULT_EXCHANGE_INDEX
+        # stops being 0 — exactly the conflation _shard_index's explicit
+        # `is None` check exists to avoid.
+        monkeypatch.setattr(scanner, "DEFAULT_EXCHANGE_INDEX", 9)
+        assert _shard_index({"exchange_index": 0}) == 0
+        assert _shard_index({}) == 9
+
+
+class TestMarketFromDictTagsExchangeIndex:
+    """_market_from_dict is the SOLE ApiMarket construction site — the shard
+    tag must be attached there, so every market in the pipeline carries it."""
+
+    def test_market_from_dict_tags_exchange_index(self):
+        tagged = _market_from_dict(
+            _raw_market("SHARD-2", "Rain tomorrow", exchange_index=2), "Weather Event"
+        )
+        assert tagged.exchange_index == 2
+
+        untagged = _market_from_dict(_raw_market("SHARD-NONE", "Rain tomorrow"), "Weather Event")
+        assert untagged.exchange_index == DEFAULT_EXCHANGE_INDEX
+
+
+class TestFetchShardStatuses:
+    """GET /exchange/status must be read RAW — the pinned SDK's ExchangeStatus
+    model silently drops exchange_index_statuses — and must fail soft."""
+
+    @staticmethod
+    def _client(payload, status=200):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=status, data=json.dumps(payload).encode("utf-8")
+            )
+        )
+        return client
+
+    def test_well_formed_payload_parses_all_fields(self):
+        client = self._client({
+            "exchange_active": True,
+            "exchange_index_statuses": [
+                {
+                    "exchange_index": 0, "description": "Main",
+                    "exchange_active": True, "trading_active": True,
+                    "intra_exchange_transfers_active": True,
+                },
+                {
+                    "exchange_index": 1, "description": "Combos",
+                    "exchange_active": True, "trading_active": False,
+                    "intra_exchange_transfers_active": False,
+                },
+            ],
+        })
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0, 1}
+        assert statuses[0] == {
+            "trading_active": True, "exchange_active": True,
+            "intra_exchange_transfers_active": True, "description": "Main",
+        }
+        assert statuses[1]["trading_active"] is False
+        # Read by the collateral-transfer path in a later commit
+        assert statuses[1]["intra_exchange_transfers_active"] is False
+
+    def test_string_exchange_index_is_coerced_to_int_key(self):
+        client = self._client({"exchange_index_statuses": [
+            {"exchange_index": "2", "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {2}
+
+    def test_absent_field_returns_none_with_info_log(self, caplog):
+        # The sandbox / pre-sharding shape: the breakdown is documented as
+        # absent when unavailable. Must degrade to single-shard semantics.
+        client = self._client({"exchange_active": True, "trading_active": True})
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_list_field_returns_none(self):
+        client = self._client({"exchange_index_statuses": {"0": {}}})
+        assert fetch_shard_statuses(client) is None
+
+    def test_malformed_entries_are_skipped_not_fatal(self):
+        client = self._client({"exchange_index_statuses": [
+            "not-a-dict",
+            {"description": "no index at all"},
+            {"exchange_index": "garbage", "trading_active": True},
+            {"exchange_index": 0, "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0}, "one bad record must not discard the good one"
+
+    def test_missing_boolean_fields_default_to_false(self):
+        client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
+        statuses = fetch_shard_statuses(client)
+        assert statuses[3] == {
+            "trading_active": False, "exchange_active": False,
+            "intra_exchange_transfers_active": False, "description": "",
+        }
+
+    def test_api_exception_returns_none_not_raised(self, caplog):
+        # An exchange-status hiccup must never abort a scan.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_2xx_status_returns_none(self):
+        # fetch_json_page raises ApiException on non-2xx; that must be caught.
+        # 400 (not 5xx) so api_call_with_retry doesn't spend its backoff budget.
+        client = self._client({"error": "nope"}, status=400)
+        assert fetch_shard_statuses(client) is None
+
+    def test_uses_raw_variant_not_modeled_call(self):
+        client = self._client({"exchange_index_statuses": []})
+        fetch_shard_statuses(client)
+        client.get_exchange_status_without_preload_content.assert_called_once()
+        client.get_exchange_status.assert_not_called()
 
 
 class TestFetchOpenEventsShardFilter:

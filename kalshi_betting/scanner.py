@@ -500,6 +500,9 @@ class ApiMarket:
         price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
             _parse_price_ranges), or None when unknown/unparseable/absent.
             Also read by tick_size_for_price() — the authoritative grid.
+        exchange_index (int): The exchange shard this market lives on, tagged
+            at ingest (see _shard_index). DEFAULT_EXCHANGE_INDEX when the
+            payload omits the field (fail-safe).
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -513,6 +516,7 @@ class ApiMarket:
     yes_bid_dollars: Any = None
     price_level_structure: str = ""
     price_ranges: Any = None  # list[PriceRange] | None — None = unknown
+    exchange_index: int = DEFAULT_EXCHANGE_INDEX
     _event_title: str = field(default="")
 
 
@@ -555,8 +559,115 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         yes_bid_dollars=m.get("yes_bid_dollars"),
         price_level_structure=m.get("price_level_structure") or "",
         price_ranges=_parse_price_ranges(m.get("price_ranges")),
+        # Tag (never filter) the shard so downstream code — today only
+        # _on_routable_shard and, on the V2 order path, order submission —
+        # can decide what to do with it.
+        exchange_index=_shard_index(m),
         _event_title=event_title,
     )
+
+
+def _shard_index(m: dict) -> int:
+    """
+    Read the exchange shard a raw market dict lives on, fail-safe.
+
+    Kalshi partitions the exchange into parallel instances keyed by an integer
+    `exchange_index` on every market payload. Market-data endpoints are
+    cross-shard (they return every shard's markets, tagged), so this is purely
+    a labelling read — it never decides whether a market is kept; that policy
+    lives in _on_routable_shard.
+
+    A missing, null, or unparseable value is reported as DEFAULT_EXCHANGE_INDEX
+    rather than raising: absence of the field is the pre-sharding / sandbox
+    shape and must never crash ingest. The check is deliberately explicit
+    (`is None`, then a guarded `int()`) rather than the falsy idiom
+    `int(m.get(...) or DEFAULT_EXCHANGE_INDEX)` — that idiom would conflate an
+    explicitly declared shard 0 with a missing field, which is harmless only
+    while DEFAULT_EXCHANGE_INDEX is itself 0 and silently wrong the day it
+    changes to a non-zero shard.
+
+    Args:
+        m (dict): One raw market JSON dict from an events-endpoint payload.
+
+    Returns:
+        int: The market's exchange shard index, or DEFAULT_EXCHANGE_INDEX when
+            the field is absent, null, or unparseable.
+    """
+    raw = m.get("exchange_index")
+    if raw is None:
+        return DEFAULT_EXCHANGE_INDEX
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_EXCHANGE_INDEX
+
+
+def fetch_shard_statuses(client: Any) -> dict | None:
+    """
+    Read the per-exchange-shard status breakdown from GET /exchange/status.
+
+    Kalshi's sharded exchange reports one status record per shard under
+    `exchange_index_statuses`. The pinned SDK's ExchangeStatus pydantic model
+    silently DROPS that field (its config ignores extras), so this reads the
+    raw body through the `*_without_preload_content` variant instead — the
+    same raw-read pattern the events/orders/positions/balance calls already
+    use for drift reasons.
+
+    The field is documented as "absent when the per-index breakdown is
+    unavailable" — the sandbox and pre-sharding shape. That case, a malformed
+    payload, and ANY exception (including the HTTP call itself failing) all
+    return None, meaning "assume single-shard semantics". This is deliberately
+    fail-soft: an exchange-status hiccup must degrade to the pre-sharding
+    behaviour, never abort a scan.
+
+    Args:
+        client (Any): An authenticated KalshiClient produced by
+            auth.build_client().
+
+    Returns:
+        dict | None: Mapping of exchange_index (int) -> {"trading_active":
+            bool, "exchange_active": bool, "intra_exchange_transfers_active":
+            bool, "description": str}. Malformed entries are skipped. None
+            when the breakdown is unavailable or anything at all went wrong.
+    """
+    try:
+        # Read-only GET, so api_call_with_retry's 429/5xx backoff is correct
+        # here (the no-retry rule applies only to order submission).
+        data = api_call_with_retry(
+            fetch_json_page, client.get_exchange_status_without_preload_content
+        )
+        raw = data.get("exchange_index_statuses")
+        if not isinstance(raw, list):
+            logging.info(
+                "per-shard exchange status unavailable — assuming single-shard semantics"
+            )
+            return None
+        statuses: dict = {}
+        for entry in raw:
+            try:
+                # A non-dict entry raises AttributeError on .get; a missing or
+                # non-numeric exchange_index raises TypeError/ValueError. One
+                # malformed record must not discard the well-formed ones.
+                idx = int(entry.get("exchange_index"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            statuses[idx] = {
+                "trading_active": bool(entry.get("trading_active")),
+                "exchange_active": bool(entry.get("exchange_active")),
+                # Read by the collateral-transfer path in a later commit; kept
+                # here so the parsed shape doesn't have to change then.
+                "intra_exchange_transfers_active": bool(
+                    entry.get("intra_exchange_transfers_active")
+                ),
+                "description": entry.get("description") or "",
+            }
+        return statuses
+    except Exception as exc:
+        logging.info(
+            "per-shard exchange status unavailable — assuming single-shard "
+            "semantics (%s)", exc,
+        )
+        return None
 
 
 def _on_routable_shard(m: dict) -> bool:
