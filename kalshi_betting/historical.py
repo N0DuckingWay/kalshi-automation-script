@@ -80,6 +80,7 @@ from .config import (
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
     INCLUDE_MVE_MARKETS,
+    MARKET_PAGE_SIZE,
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
     PROJECT_ROOT,
@@ -424,7 +425,10 @@ def _load_or_build_event_titles(
         pages = 0
         barren = 0  # consecutive pages that resolved nothing
         while True:
-            kwargs: dict = {"status": status, "limit": 200}
+            # Events-listing page cap (MARKET_PAGE_SIZE, 200) — a different,
+            # smaller cap than the /historical & /markets endpoints' 1000 (see
+            # the hist_kwargs comment in fetch_all_settled_markets).
+            kwargs: dict = {"status": status, "limit": MARKET_PAGE_SIZE}
             if cursor:
                 kwargs["cursor"] = cursor
             data = api_call_with_retry(
@@ -470,7 +474,8 @@ def _load_or_build_event_titles(
         cursor = None
         barren = 0
         for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
-            kwargs = {"limit": 200}
+            # Same events-listing page cap as the status-listing loop above.
+            kwargs = {"limit": MARKET_PAGE_SIZE}
             if cursor:
                 kwargs["cursor"] = cursor
             data = api_call_with_retry(
@@ -821,6 +826,12 @@ def _log_slice_progress(label: str, done: int, total: int, day_lo: int,
     per-slice line the only feedback is a page counter that says nothing about
     how far along the run actually is.
 
+    Rate units are adaptive: a slow multi-hour fetch (e.g. a handful of
+    slices per hour) rendered at "%.1f slices/min" rounds to "0.0" beside a
+    perfectly finite ETA, which reads as broken math rather than "just slow".
+    Below 0.1 slices/min the rate is shown as slices/hour instead; the ETA
+    calculation itself is unchanged either way.
+
     Args:
         label (str): Phase name, e.g. "Archive day slices".
         done (int): Slices completed so far, including this one.
@@ -832,11 +843,16 @@ def _log_slice_progress(label: str, done: int, total: int, day_lo: int,
     elapsed = max(time.monotonic() - started, 1e-9)
     rate = done / elapsed  # slices per second
     eta = (total - done) / rate if rate > 0 else 0.0
+    rate_per_min = rate * 60
+    if rate_per_min >= 0.1:
+        rate_str = f"{rate_per_min:.1f} slices/min"
+    else:
+        rate_str = f"{rate * 3600:.1f} slices/hour"
     logging.info(
-        "%s: %d/%d complete (%s: %d markets, %.1f slices/min, ETA %s)",
+        "%s: %d/%d complete (%s: %d markets, %s, ETA %s)",
         label, done, total,
         datetime.fromtimestamp(day_lo, tz=UTC).date().isoformat(),
-        markets, rate * 60, _format_duration(eta),
+        markets, rate_str, _format_duration(eta),
     )
 
 
@@ -946,6 +962,60 @@ def _day_store_path(store: str, day_lo: int) -> Path:
     """
     day = datetime.fromtimestamp(day_lo, tz=UTC).date().isoformat()
     return CACHE_DIR / store / f"{day}.json.gz"
+
+
+def _prune_stale_live_days(cutoff_ts: int) -> int:
+    """
+    Delete live_days/ slices whose whole UTC day now lies at/before the cutoff.
+
+    When Kalshi advances the archive cutoff, every settlement in a day that
+    now lies entirely before the new cutoff migrates from the live endpoint
+    into the archive — that day's records are, from then on, only ever served
+    (and cached) via backtest_cache/archive_days/. Its old
+    backtest_cache/live_days/<day>.json.gz slice is never read again by any
+    future run (_fetch_live_phase only ever requests days at/after
+    max(cutoff_ts, start_ts)): it is pure dead disk that only grows across
+    repeated cutoff advances if nothing cleans it up. This is disk hygiene
+    only — deleting a slice loses no data, since the same day is fetched and
+    cached again as an archive slice regardless.
+
+    Filenames follow the _day_store_path convention (CACHE_DIR/live_days/
+    <YYYY-MM-DD>.json.gz, one file per UTC day); the day's lower bound is
+    parsed back out of the filename rather than tracked separately.
+
+    Args:
+        cutoff_ts (int): Unix timestamp of the current archive/live boundary
+            (market_settled_ts from /historical/cutoff).
+
+    Returns:
+        int: Number of slice files actually deleted.
+    """
+    store_dir = CACHE_DIR / "live_days"
+    if not store_dir.exists():
+        # Nothing fetched yet (or a fresh cache dir) — nothing to prune.
+        return 0
+    pruned = 0
+    for path in sorted(store_dir.glob("*.json.gz")):
+        day_str = path.name[: -len(".json.gz")]
+        try:
+            day = date.fromisoformat(day_str)
+        except ValueError:
+            # Not one of our day-slice filenames — leave it alone.
+            continue
+        day_lo = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+        if day_lo + 86400 > cutoff_ts:
+            # Day extends up to or past the cutoff — still (partly) live-only.
+            continue
+        try:
+            path.unlink()
+            pruned += 1
+        except OSError as e:
+            # Best-effort cleanup: a locked/already-gone file isn't fatal to
+            # the fetch, just leaves a byte or two of dead disk behind.
+            logging.warning("Failed to prune stale live-day slice %s: %s", path, e)
+    if pruned:
+        logging.info("Pruned %d stale pre-cutoff live day slice(s)", pruned)
+    return pruned
 
 
 def _day_store_load(
@@ -2149,6 +2219,10 @@ def fetch_all_settled_markets(
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
     # when False, the legacy "exclude" behaviour is preserved.
+    # 1000 is this endpoint family's own hard cap (verified live 2026-07-13),
+    # not MARKET_PAGE_SIZE (200) — that constant is the /events listing cap
+    # used by _load_or_build_event_titles. Different endpoint family, don't
+    # "fix" this to MARKET_PAGE_SIZE in a future sweep.
     hist_kwargs: dict = {"limit": 1000}
     if not INCLUDE_MVE_MARKETS:
         hist_kwargs["mve_filter"] = "exclude"
@@ -2191,6 +2265,12 @@ def fetch_all_settled_markets(
     logging.info("Historical endpoint: %d markets from %s", archive_count, start_date)
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
+    # Prune any live_days/ slices left over from a PRIOR cutoff before the
+    # sweep below reuses/repopulates the store — those days are now served by
+    # the archive and their old live-endpoint slices are dead disk (see
+    # _prune_stale_live_days). Cheap relative to the fetch itself; runs every
+    # call, not just when the cutoff has actually advanced.
+    _prune_stale_live_days(cutoff_ts)
     # min_settled_ts is honored server-side, so the sweep is bounded to
     # [live_min_ts, now) by the API itself; see _fetch_live_phase for why the
     # lower bound is max(cutoff_ts, start_ts) rather than bare cutoff_ts.
@@ -2323,7 +2403,9 @@ def fetch_candlesticks(
             period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
         )
         candles = []
-        for c in data.get("candlesticks") or []:
+        raw_candlesticks = data.get("candlesticks") or []
+        dropped = 0
+        for c in raw_candlesticks:
             try:
                 ya = c.get("yes_ask") or {}
                 yb = c.get("yes_bid") or {}
@@ -2341,7 +2423,12 @@ def fetch_candlesticks(
                     "no_ask_close": max(0.01, min(0.99, no_ask)),
                 })
             except (ValueError, TypeError, AttributeError, KeyError):
-                pass
+                dropped += 1
+        if dropped:
+            # The drop happens before the cache write, so a thinned series is
+            # otherwise cached as if it were complete with no visible signal.
+            logging.warning("%s: dropped %d/%d malformed candles",
+                            ticker, dropped, len(raw_candlesticks))
         # Rate limit: sleep briefly after each call to avoid 429 responses
         time.sleep(rate_limit_sleep)
         # Only successful fetches are cached (tagged with the window and

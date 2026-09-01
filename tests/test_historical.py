@@ -2,6 +2,7 @@
 import gzip
 import json
 import logging
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -399,6 +400,25 @@ class TestEventTitlesCache:
             "E1": "Good Title", "NEW-1": "",
         }
         assert fallback2.call_count == 0
+
+    def test_listing_pages_request_market_page_size_limit(self, isolated_cache, monkeypatch):
+        # BS-22: both bulk listing loops used to hardcode limit=200 rather than
+        # importing the shared MARKET_PAGE_SIZE constant. Assert the kwargs
+        # actually sent match the constant itself (not just today's value of
+        # 200), so a future change to MARKET_PAGE_SIZE stays honored here.
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("E1", "Event One")]], mve_pages=[[("E2", "MVE Two")]],
+        )
+        historical._load_or_build_event_titles(client, {"E1", "E2"})
+
+        events_calls = client.get_events_without_preload_content.call_args_list
+        mve_calls = client.get_multivariate_events_without_preload_content.call_args_list
+        assert events_calls, "status listing was never called"
+        assert mve_calls, "MVE listing was never called"
+        for call in events_calls:
+            assert call.kwargs["limit"] == historical.MARKET_PAGE_SIZE
+        for call in mve_calls:
+            assert call.kwargs["limit"] == historical.MARKET_PAGE_SIZE
 
 
 def _raw_market_dict(**overrides) -> dict:
@@ -1260,7 +1280,11 @@ class TestShardedFetch:
 
     def test_slice_progress_reports_position_and_eta(self, tmp_path, monkeypatch, caplog):
         # Each completed slice logs N/M plus a rate and ETA, so a multi-hour
-        # fetch reports how far along it actually is.
+        # fetch reports how far along it actually is. This fixture completes
+        # its handful of slices essentially instantly, so the observed rate
+        # is always comfortably above the 0.1 slices/min cutoff — the
+        # "fast" branch, rendered as slices/min. See
+        # test_slow_slice_progress_reports_slices_per_hour for the other branch.
         archive_markets, live_markets = self._fixture_markets()
         with caplog.at_level(logging.INFO):
             self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
@@ -1269,9 +1293,28 @@ class TestShardedFetch:
                        if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
         assert slice_lines
         assert all("ETA" in line and "slices/min" in line for line in slice_lines)
+        assert all("slices/hour" not in line for line in slice_lines)
         # Counter runs 1..N over the days actually fetched, never exceeding N.
         total = len(slice_lines)
         assert slice_lines[-1].split("complete")[0].strip().endswith(f"{total}/{total}")
+
+    def test_slow_slice_progress_reports_slices_per_hour(self, monkeypatch, caplog):
+        # BS-27: at rate < 0.1 slices/min, "%.1f slices/min" rounds to "0.0"
+        # beside a perfectly finite ETA — reads as broken math, not "just
+        # slow". Below that threshold the rate must render as slices/hour
+        # instead; "0.0 slices/min" must never appear. Call the logger
+        # directly with a huge elapsed time so the rate is controlled exactly,
+        # rather than relying on real wall-clock slowness in a test.
+        started = 0.0
+        monkeypatch.setattr(historical.time, "monotonic", lambda: 100_000.0)
+        with caplog.at_level(logging.INFO):
+            historical._log_slice_progress("Archive day slices", 1, 1000, 0, 5, started)
+        lines = [r.getMessage() for r in caplog.records
+                 if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
+        assert lines
+        assert "slices/hour" in lines[0]
+        assert "0.0 slices/min" not in lines[0]
+        assert "ETA" in lines[0]
 
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
@@ -1408,6 +1451,87 @@ class TestDayStore:
         with gzip.open(legacy, "wt", encoding="utf-8") as fh:
             json.dump({"meta": meta, "markets": markets}, fh)
         assert historical._day_store_load(legacy, meta) == markets
+
+
+class TestPruneStaleLiveDays:
+    """BS-32: once Kalshi advances the archive cutoff, every day that now
+    lies entirely before it is served (and cached) exclusively via
+    archive_days/ from then on — the old live_days/ slice for that day is
+    never read again by any future run and must be pruned."""
+
+    def _day_ts(self, iso_date: str) -> int:
+        d = date.fromisoformat(iso_date)
+        return int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
+
+    def _write_fake_slice(self, day_lo: int) -> Path:
+        path = historical._day_store_path("live_days", day_lo)
+        meta = {"kind": "live_settled_day", "cutoff_ts": 0,
+                "include_mve": True, "complete": True}
+        historical._day_store_save(path, meta, [{"ticker": "T1"}])
+        return path
+
+    def test_prunes_only_fully_pre_cutoff_days(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        # Cutoff at noon on the 15th: the 14th is entirely archive-covered,
+        # the 15th itself still has an afternoon that's live-only, the 16th
+        # is entirely still live.
+        cutoff_ts = self._day_ts("2026-08-15") + 12 * 3600
+
+        pre_cutoff = self._write_fake_slice(self._day_ts("2026-08-14"))
+        straddling = self._write_fake_slice(self._day_ts("2026-08-15"))
+        post_cutoff = self._write_fake_slice(self._day_ts("2026-08-16"))
+
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 1
+        assert not pre_cutoff.exists()
+        assert straddling.exists()
+        assert post_cutoff.exists()
+        assert any("Pruned 1 stale pre-cutoff live day slice" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_missing_live_days_dir_is_a_noop(self, tmp_path, monkeypatch, caplog):
+        # Fresh cache dir, or nothing fetched into live_days/ yet.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts=99_999_999_999)
+        assert pruned == 0
+        assert not any("Pruned" in r.getMessage() for r in caplog.records)
+
+    def test_no_stale_days_logs_nothing(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        cutoff_ts = self._day_ts("2026-08-15")
+        kept = self._write_fake_slice(self._day_ts("2026-08-16"))
+
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 0
+        assert kept.exists()
+        assert not any("Pruned" in r.getMessage() for r in caplog.records)
+
+    def test_unlink_failure_is_logged_and_does_not_raise(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        cutoff_ts = self._day_ts("2026-08-20")
+        stale = self._write_fake_slice(self._day_ts("2026-08-14"))
+
+        real_unlink = Path.unlink
+
+        def failing_unlink(self, *a, **k):
+            if self == stale:
+                raise OSError("permission denied")
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+        with caplog.at_level(logging.WARNING):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 0
+        assert stale.exists()
+        assert any("Failed to prune stale live-day slice" in r.getMessage()
+                   for r in caplog.records)
 
 
 class TestDayStreamWriter:
@@ -1734,6 +1858,48 @@ class TestFetchCandlesticks:
         )
         assert out[0]["yes_ask_close"] == pytest.approx(0.55)
         assert out[0]["no_ask_close"] == pytest.approx(0.47)
+
+    def test_malformed_candle_dropped_and_logged(self, tmp_path, monkeypatch, caplog):
+        # BS-23: a malformed candle used to be silently swallowed by a bare
+        # `except: pass`, so a thinned series was cached as if it were
+        # complete with no visible signal. One good candle + one unparseable
+        # candle (yes_ask.close is not a number) must keep the good candle,
+        # drop the bad one, and log exactly what was dropped.
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        payload = {"candlesticks": [
+            {"end_period_ts": 1_700_000_000,
+             "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}},
+            {"end_period_ts": 1_700_003_600,
+             "yes_ask": {"close": "not-a-number"}, "yes_bid": {"close": "0.50"}},
+        ]}
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(return_value=_raw_resp(payload)))
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+
+        assert len(out) == 1
+        assert out[0]["ts"] == 1_700_000_000
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("T1" in w and "dropped 1/2 malformed candles" in w for w in warnings)
+
+    def test_clean_candle_series_logs_no_drop_warning(self, tmp_path, monkeypatch, caplog):
+        # The flip side of the malformed-candle test: a fully clean series
+        # must never emit the drop warning (dropped == 0 is silent).
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000)
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+
+        assert len(out) == 1
+        assert not any("dropped" in r.getMessage() for r in caplog.records)
 
     def test_cache_hit_skips_api_when_window_covered(self, tmp_path, monkeypatch):
         # A second request for a window already covered by the cached window
