@@ -645,6 +645,62 @@ class TestFetchAllSettledMarkets:
                        in live.get_markets_without_preload_content.call_args_list]
         assert min(seen_min_ts) == expected_min_ts
 
+    def test_start_date_at_or_after_cutoff_warns(self, tmp_path, monkeypatch, caplog):
+        # BS-11: a start_date at/after the archive cutoff means every market
+        # in the window is live-era, and live-era markets 404 on the historical
+        # candlesticks endpoint (see the CLAUDE.md "Backtest windows must
+        # start BEFORE the archive cutoff" gotcha) — so the window is
+        # structurally 0-trade no matter what this fetch returns. This is a
+        # WARN, not an abort: the fetch must still run to completion.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2026, 7, 6), use_cache=False,
+            )
+
+        # Warn, never abort — the fetch still completes and returns normally.
+        assert out == []
+        assert any("archive cutoff" in r.getMessage() for r in caplog.records
+                   if r.levelname == "WARNING")
+
+    def test_start_date_before_cutoff_does_not_warn(self, tmp_path, monkeypatch, caplog):
+        # The common case (default start_date 2024-01-01, cutoff far later)
+        # must not trip the new warning.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2024, 1, 1), use_cache=False,
+            )
+
+        assert not any("archive cutoff" in r.getMessage() for r in caplog.records
+                       if r.levelname == "WARNING")
+
 
 # ─── Sharded-fetch fakes ──────────────────────────────────────────────────────
 #

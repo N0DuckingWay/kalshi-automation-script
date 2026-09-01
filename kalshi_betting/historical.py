@@ -2216,6 +2216,22 @@ def fetch_all_settled_markets(
     cutoff    = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")
     cutoff_ts = int(datetime.fromisoformat(cutoff["market_settled_ts"]).timestamp())
 
+    # A start_date at/after the archive cutoff means every market this window
+    # could ever touch is post-cutoff — i.e. live-era. Live-era markets 404 on
+    # /historical/markets/{ticker}/candlesticks (see the CLAUDE.md "Backtest
+    # windows must start BEFORE the archive cutoff" gotcha), so _find_entry()
+    # can never get candles for either leg and the run is structurally 0-trade
+    # no matter how many markets this fetch returns. Warn only — never abort,
+    # since the fetch can still be useful (e.g. for cache warming) and a false
+    # positive here must not block a legitimate run.
+    if start_ts >= cutoff_ts:
+        logging.warning(
+            "start_date (%s) is at or after the archive cutoff (%s) — "
+            "post-cutoff markets 404 on the historical candlesticks endpoint, "
+            "so this window is structurally 0-trade",
+            start_date, datetime.fromtimestamp(cutoff_ts, tz=UTC).date(),
+        )
+
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
     # when False, the legacy "exclude" behaviour is preserved.

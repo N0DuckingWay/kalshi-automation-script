@@ -1107,3 +1107,86 @@ class TestFetchCandlesParallel:
         with pytest.raises(KeyError):
             run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
                          start_date=date(2026, 1, 1), initial_balance=1000.0)
+
+
+class TestRunBacktestFeasibilityPreCheck:
+    """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
+    ever be entered, so run_backtest must skip the fetch entirely rather than
+    discover that only after paying for it.
+
+    `backtester.date` (not the stdlib `datetime.date`) is patched with a
+    thin subclass whose `.today()` is frozen, since backtester.py imports
+    `date` by name (`from datetime import ... date ...`) and calls
+    `date.today()` through that module-level binding.
+    """
+
+    class _FrozenDate(date):
+        _fixed: date
+
+        @classmethod
+        def today(cls):
+            return cls._fixed
+
+    def _freeze(self, monkeypatch, today: date):
+        frozen = type("FrozenDate", (self._FrozenDate,), {"_fixed": today})
+        monkeypatch.setattr(backtester, "date", frozen)
+
+    def _fetch_should_not_be_called(self, monkeypatch):
+        def _boom(*_a, **_k):
+            raise AssertionError("fetch_all_settled_markets was called despite an infeasible window")
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", _boom)
+
+    def test_start_date_equal_to_today_is_infeasible(self, monkeypatch, caplog):
+        # start_date == today: _find_entry's scan window ends at today - 1 day,
+        # so today itself can never host a checkpoint, and today - 1 day is
+        # strictly before start_date — the range is empty by construction.
+        today = date(2026, 8, 28)  # a Friday
+        self._freeze(monkeypatch, today)
+        self._fetch_should_not_be_called(monkeypatch)
+
+        with caplog.at_level("WARNING"):
+            trades, equity = run_backtest(
+                hist_client=MagicMock(), live_client=MagicMock(),
+                start_date=today, initial_balance=1000.0,
+            )
+
+        assert trades == []
+        assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
+        assert any("no monday" in r.getMessage().lower()
+                   for r in caplog.records if r.levelname == "WARNING")
+
+    def test_no_monday_falls_in_a_short_midweek_window(self, monkeypatch, caplog):
+        # Tuesday start, "today" the following Friday: the feasible range is
+        # [Tue, Thu] (today - 1 day), which contains no Monday at all — the
+        # next Monday doesn't arrive until after "today".
+        start = date(2026, 8, 25)  # Tuesday
+        today = date(2026, 8, 28)  # Friday, same week
+        self._freeze(monkeypatch, today)
+        self._fetch_should_not_be_called(monkeypatch)
+
+        with caplog.at_level("WARNING"):
+            trades, equity = run_backtest(
+                hist_client=MagicMock(), live_client=MagicMock(),
+                start_date=start, initial_balance=500.0,
+            )
+
+        assert trades == []
+        assert equity["portfolio_value"].iloc[0] == pytest.approx(500.0)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("no monday" in w.lower() for w in warnings)
+
+    def test_feasible_window_still_fetches(self, monkeypatch):
+        # Sanity check on the guard itself: a window that DOES contain a
+        # Monday must still reach the fetch call (the existing PnL tests
+        # already cover the full pipeline from there).
+        today = date(2026, 8, 28)  # Friday
+        self._freeze(monkeypatch, today)
+        called = []
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: called.append(True) or [])
+
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 8, 10), initial_balance=1000.0)
+
+        assert called == [True]

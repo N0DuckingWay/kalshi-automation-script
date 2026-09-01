@@ -797,8 +797,39 @@ def run_backtest(
 
     Returns (trades, equity_df) where equity_df has columns:
       [date, portfolio_value, daily_return]
+
+    Note:
+        Before any network call, this function checks whether [start_date,
+        today - 1 day] contains at least one Monday 09:00 UTC checkpoint (the
+        only kind _find_entry() can ever act on). If not, no trade can ever
+        be entered regardless of what the fetch would return, so the fetch is
+        skipped entirely and this returns the same empty-result shape as the
+        zero-trade path ([], an equity curve flat at initial_balance) with a
+        WARNING logged.
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
+
+    # Feasibility pre-check, BEFORE any network call: a trade can only ever be
+    # entered at a Monday 09:00 UTC checkpoint, and _find_entry()'s own scan
+    # window always ends at (min(close_a, close_b) - 1 day) — so a checkpoint
+    # dated today can never be scanned, and end_date must be "yesterday" here
+    # to match that. If [start_date, yesterday] contains no Monday at all, no
+    # trade can ever be entered by construction, no matter what the fetch
+    # returns — this is exactly the class of run that burned ~59 minutes
+    # fetching 9.2M records into a 2-byte assembled cache (0 markets survived
+    # the Monday-eligibility prefilter). Detecting it up front skips the fetch
+    # entirely instead of discovering it only after paying for it.
+    feasibility_end = date.today() - timedelta(days=1)
+    if not _monday_timestamps(start_date, feasibility_end):
+        logging.warning(
+            "No Monday 09:00 UTC entry checkpoint exists in [%s, %s] — no "
+            "trade can ever be entered; skipping the fetch entirely",
+            start_date, feasibility_end,
+        )
+        # Same empty-result shape the zero-trade path at the bottom of this
+        # function already produces, so backtest.py / generate_dashboard need
+        # no changes to handle this early-exit.
+        return [], _build_equity_curve([], start_date, initial_balance)
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
