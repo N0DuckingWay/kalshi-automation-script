@@ -783,6 +783,90 @@ class TestFetchOpenEventsMveStatusFilter:
         calls = client.get_multivariate_events_without_preload_content.call_count
         assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
 
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_pull_bails_after_consecutive_pages_with_no_active_markets(self, caplog):
+        # Regression (sandbox, live 2026-08): the bail-out counter used to
+        # reset on RAW nested-market count regardless of status. The MVE
+        # listing can serve thousands of pages whose nested markets are all
+        # non-active (closed/settled) — those pages must NOT reset the
+        # counter, or the bail-out never fires (observed live: 4,600+ pages
+        # flat at the same appended-market count with no bound). An endless
+        # supply of pages that each carry several non-active nested markets
+        # must still bail after exactly MVE_MAX_EMPTY_PAGES pages.
+        from itertools import count
+
+        from kalshi_betting.config import MVE_MAX_EMPTY_PAGES
+
+        def endless_inactive_mve_pages(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"MVE {n}", "markets": [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                    _raw_market(f"MVE-CLS-{n}-B", "Option B", status="closed"),
+                ]}],
+                cursor=f"CUR-{n}",
+            )
+        counter = count()
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=endless_inactive_mve_pages
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert markets == []
+        calls = client.get_multivariate_events_without_preload_content.call_count
+        assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
+        assert "no active nested" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_page_with_one_active_market_resets_bailout_counter(self):
+        # Mixed case: a page containing one ACTIVE market among otherwise
+        # inactive ones must reset the empty-page counter, so pagination
+        # continues past it rather than counting toward the bail-out.
+        from itertools import count
+
+        from kalshi_betting.config import MVE_MAX_EMPTY_PAGES
+
+        RESET_PAGE_INDEX = 3  # 0-indexed page that contains the one active market
+
+        def mve_pages_with_one_active(**kwargs):
+            n = next(counter)
+            if n == RESET_PAGE_INDEX:
+                mkts = [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                    _raw_market(f"MVE-ACT-{n}-B", "Option B", status="active"),
+                ]
+            else:
+                mkts = [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                ]
+            return _raw_page([{"title": f"MVE {n}", "markets": mkts}], cursor=f"CUR-{n}")
+        counter = count()
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=mve_pages_with_one_active
+        )
+
+        markets = fetch_open_events_with_markets(client)
+
+        # The active market from the reset page must be present.
+        assert {m.ticker for m in markets} == {f"MVE-ACT-{RESET_PAGE_INDEX}-B"}
+        # Pagination must have continued past RESET_PAGE_INDEX: total calls
+        # equal RESET_PAGE_INDEX + 1 (pages before/including the reset) plus
+        # another full MVE_MAX_EMPTY_PAGES run of inactive-only pages after it
+        # before the bail-out fires again.
+        calls = client.get_multivariate_events_without_preload_content.call_count
+        assert calls == RESET_PAGE_INDEX + 1 + MVE_MAX_EMPTY_PAGES, (
+            f"expected the counter to reset at page {RESET_PAGE_INDEX}, "
+            f"then bail after another {MVE_MAX_EMPTY_PAGES} pages; got {calls} calls"
+        )
+
     def test_non_2xx_raises_for_retry_helper(self):
         # The raw-response SDK variants do NOT raise on HTTP errors, so
         # _fetch_json_page must convert non-2xx statuses into ApiException —

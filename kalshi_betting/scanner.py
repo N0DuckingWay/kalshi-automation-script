@@ -516,10 +516,13 @@ def fetch_open_events_with_markets(client: Any) -> list:
     if INCLUDE_MVE_MARKETS:
         cursor = None
         # The MVE listing is effectively unbounded (hundreds of thousands of
-        # auto-generated collection events) and currently returns no nested
-        # markets at all, so the pull bails out after MVE_MAX_EMPTY_PAGES
-        # consecutive marketless pages instead of paging for hours. Pages that
-        # contain markets reset the counter.
+        # auto-generated collection events), so the pull bails out after
+        # MVE_MAX_EMPTY_PAGES consecutive unproductive pages instead of paging
+        # for hours. A page is "productive" only if it contributes at least one
+        # ACTIVE nested market — a page can be full of nested markets that are
+        # all closed/settled/determined (observed live in sandbox: thousands of
+        # such pages in a row), and those must NOT reset the counter, or the
+        # bail-out never fires. Pages that contribute active markets reset it.
         empty_pages = 0
         mve_pages = 0
         mve_market_count = 0
@@ -534,7 +537,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
             )
             mve_pages += 1
             events = data.get("events") or []
-            page_market_count = sum(len(ev.get("markets") or []) for ev in events)
+            page_active_count = 0
             for ev in events:
                 ev_title = ev.get("title") or ""
                 for m in ev.get("markets") or []:
@@ -546,17 +549,19 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     if (m.get("status") or "") == "active":
                         markets.append(_market_from_dict(m, ev_title))
                         mve_market_count += 1
+                        page_active_count += 1
             if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
                 logging.info(
                     "MVE events fetch: %d pages, %d markets so far", mve_pages, mve_market_count
                 )
-            if page_market_count == 0:
+            if page_active_count == 0:
                 empty_pages += 1
                 if empty_pages >= MVE_MAX_EMPTY_PAGES:
                     logging.warning(
-                        "MVE fetch: %d consecutive pages with no nested markets — "
-                        "stopping the MVE pull early (the API currently returns "
-                        "none; the listing itself is effectively unbounded)",
+                        "MVE fetch: %d consecutive pages with no active nested "
+                        "markets — stopping the MVE pull early (nested markets "
+                        "may still be present but none are active/usable; the "
+                        "listing itself is effectively unbounded)",
                         empty_pages,
                     )
                     break
