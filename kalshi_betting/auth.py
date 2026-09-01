@@ -13,9 +13,9 @@ Purpose:
 
 Dependencies:
     Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, and PEM_FILE from config.py, and
-    api_call_with_retry from _http.py. build_client() is called by main.py,
-    historical.py, and (indirectly) backtest.py. verify_auth() is called by
-    main.py to confirm credentials and read balance.
+    api_call_with_retry / fetch_json_page from _http.py. build_client() is called
+    by main.py, historical.py, and (indirectly) backtest.py. verify_auth() is
+    called by main.py to confirm credentials and read balance.
 
 Notes:
     KalshiClient does NOT accept api_key_id and private_key_pem as constructor
@@ -23,6 +23,9 @@ Notes:
     Configuration object via hasattr() and builds KalshiAuth internally.
     The sandbox endpoint (demo-api.kalshi.co) requires a completely separate
     account — the production key returns 401 there.
+    verify_auth() calls get_balance_without_preload_content and parses the JSON
+    body itself rather than the modeled get_balance() — see verify_auth's
+    docstring and the CLAUDE.md API-drift gotcha for why.
 """
 import json
 import logging
@@ -30,7 +33,7 @@ import logging
 from kalshi_python_sync import KalshiClient
 from kalshi_python_sync.configuration import Configuration
 
-from ._http import api_call_with_retry
+from ._http import api_call_with_retry, fetch_json_page
 from .config import DEV_PEM_FILE, PEM_FILE, PROD_URL, SANDBOX_URL, SECRETS_FILE
 
 
@@ -58,7 +61,9 @@ def build_client(mode: str) -> KalshiClient:
     Raises:
         FileNotFoundError: If secrets.json or the PEM file do not exist at the
             paths defined in config.py.
-        KeyError: If "Kalshi-api-key" is missing from secrets.json in prod mode.
+        KeyError: If "Kalshi-api-key" is missing from secrets.json in prod
+            mode, or if BOTH "dev_api_key" and "Kalshi-api-key" are missing
+            in dev mode (dev_api_key alone is sufficient).
         json.JSONDecodeError: If secrets.json cannot be parsed as JSON.
     """
     raw = SECRETS_FILE.read_text().strip()
@@ -74,7 +79,14 @@ def build_client(mode: str) -> KalshiClient:
         pem_text = PEM_FILE.read_text()
     else:
         url      = SANDBOX_URL
-        key_id   = secrets.get("dev_api_key", secrets["Kalshi-api-key"])
+        # Lazy fallback: dev_api_key is optional; only require the prod key
+        # when the dev key is absent (a .get() default is evaluated eagerly,
+        # so `secrets.get("dev_api_key", secrets["Kalshi-api-key"])` raised
+        # KeyError in dev mode even when dev_api_key WAS present)
+        if "dev_api_key" in secrets:
+            key_id = secrets["dev_api_key"]
+        else:
+            key_id = secrets["Kalshi-api-key"]
         pem_file = DEV_PEM_FILE if DEV_PEM_FILE.exists() else PEM_FILE
         pem_text = pem_file.read_text()
 
@@ -100,6 +112,14 @@ def verify_auth(client: KalshiClient) -> int:
     and read the pre-trade balance) and after trading (to read the post-trade
     balance for the Excel log).
 
+    Uses the raw-response variant + JSON parsing, same as trader._position_count
+    and scanner.get_held_tickers: the pinned SDK's GetBalanceResponse model
+    types balance/portfolio_value/updated_ts as legacy StrictInt fields, which
+    is the same field class that already drifted away for markets, positions,
+    and orders (see the CLAUDE.md API-drift gotcha) — the modeled get_balance
+    call is the last one of those still standing and would raise pydantic
+    ValidationError on a live response that no longer sends them.
+
     Args:
         client (KalshiClient): An authenticated client produced by build_client().
 
@@ -109,11 +129,26 @@ def verify_auth(client: KalshiClient) -> int:
     Raises:
         Exception: Any exception raised by the Kalshi API client if the request
             fails (e.g. 401 Unauthorized if credentials are wrong, network error).
+        KeyError: If the parsed response body has none of the recognized
+            balance fields ("balance", "balance_fp", "balance_dollars") — an
+            unrecognized response shape must fail loudly, not silently return
+            a wrong value.
     """
-    resp = api_call_with_retry(client.get_balance)
-    logging.info(
-        "Auth OK — balance: %d cents  ($%.2f)",
-        resp.balance,
-        resp.balance / 100,
-    )
-    return resp.balance
+    # Raw-response call: the raw variant skips the SDK's pydantic response
+    # model entirely (see module Notes), so a future field rename can't crash
+    # auth verification the way the modeled get_balance() would.
+    data = api_call_with_retry(fetch_json_page, client.get_balance_without_preload_content)
+    raw = data.get("balance")
+    if raw is None:
+        # Defensive drift fallback, mirroring the *_fp / *_dollars pattern
+        # used elsewhere (e.g. trader._position_count's position_fp fallback)
+        raw = data.get("balance_fp")
+        if raw is None and data.get("balance_dollars") is not None:
+            raw = float(data["balance_dollars"]) * 100
+    if raw is None:
+        raise KeyError(
+            f"No recognizable balance field in get_balance response (keys: {sorted(data)})"
+        )
+    balance = int(float(raw))
+    logging.info("Auth OK — balance: %d cents  ($%.2f)", balance, balance / 100)
+    return balance
