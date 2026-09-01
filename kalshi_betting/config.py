@@ -151,6 +151,20 @@ MVE_TITLE_LOOKUP_MAX_PAGES = 500
 # exponential backoff applies per worker. Raise cautiously.
 SETTLED_FETCH_MAX_WORKERS = 8
 
+# How many compact market dicts one day-slice worker buffers in memory before
+# streaming them out to its slice file (historical._DayStreamWriter). A UTC day
+# of settled Kalshi markets reached ~4.4–4.8M records in 2026-08, and each
+# worker used to hold an entire day in one Python list before serializing it:
+# live telemetry from the 2026-08-31 sweep showed RSS sawtoothing 3.4 → 4.3 →
+# 7.89 GB on a 16 GB host as workers filled their day buffers concurrently.
+# Chunking bounds a worker's buffer at this many records regardless of how big
+# the day is, so peak memory scales with (workers x chunk), not with day size.
+# Flushes land on API-page boundaries, so the true bound is this plus one page
+# (<= 1000 records). Bigger chunks amortize the per-write overhead slightly;
+# smaller ones bound memory tighter. 50k records is roughly 50 API pages, i.e.
+# a few tens of MB.
+SETTLED_FETCH_CHUNK_RECORDS = 50_000
+
 # Number of worker threads used by the backtester's per-ticker candlestick
 # fetch (backtester._fetch_candles_parallel). Each fetch is an independent
 # read-only GET routed through api_call_with_retry, so a 429 degrades to that

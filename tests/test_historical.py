@@ -11,6 +11,21 @@ import pytest
 from kalshi_betting import historical
 
 
+def _read_slice_file(path) -> list[dict]:
+    """Read a day-slice file's records with no help from historical.py.
+
+    Understands both on-disk formats so slice-content assertions stay
+    independent of which writer produced the file (legacy single JSON document
+    vs. streamed "jsonl-v1" lines).
+    """
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    head = json.loads(lines[0])
+    if "markets" in head:
+        return json.loads("\n".join(lines))["markets"]
+    return [json.loads(line) for line in lines[1:] if line.strip()]
+
+
 def _raw_resp(payload: dict) -> SimpleNamespace:
     """RESTResponse stand-in for the raw signed-GET path (_signed_raw_get)."""
     return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
@@ -983,6 +998,12 @@ class TestShardedFetch:
         assert live.calls < cold_live_calls
         assert (tmp_path / "cache" / "archive_days").exists()
         assert (tmp_path / "cache" / "live_days").exists()
+        # BS-15: the fetch workers persist through _DayStreamWriter, so every
+        # slice they wrote is in the streamed format — and run 2 proves those
+        # files are what the reuse prescan accepts.
+        for path in (tmp_path / "cache").glob("*_days/*.json.gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                assert json.loads(fh.readline())["meta"]["format"] == "jsonl-v1"
 
     def test_interrupted_run_resumes_from_day_slices(self, tmp_path, monkeypatch):
         # Serialize the workers so the interruption point is deterministic:
@@ -1069,8 +1090,8 @@ class TestShardedFetch:
         real_load = historical._day_store_load
         loads: list[str] = []
 
-        def counting_load(path, expect_meta):
-            result = real_load(path, expect_meta)
+        def counting_load(path, expect_meta, keep=None):
+            result = real_load(path, expect_meta, keep)
             if result is not None:
                 loads.append(str(path))
             return result
@@ -1128,8 +1149,7 @@ class TestShardedFetch:
         assert slices
         stored = set()
         for path in slices:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                stored |= {m["ticker"] for m in json.load(fh)["markets"]}
+            stored |= {m["ticker"] for m in _read_slice_file(path)}
         dropped = {m["ticker"] for m in out_full if not pred(m)}
         assert dropped & stored, "filtered-out records must still be on disk"
 
@@ -1388,6 +1408,204 @@ class TestDayStore:
         with gzip.open(legacy, "wt", encoding="utf-8") as fh:
             json.dump({"meta": meta, "markets": markets}, fh)
         assert historical._day_store_load(legacy, meta) == markets
+
+
+class TestDayStreamWriter:
+    """BS-15: day slices are streamed out in chunks so no fetch worker ever
+    holds a whole UTC day (millions of records at 2026-08 volumes) in memory.
+
+    The streamed "jsonl-v1" format and the legacy single-document format must
+    both stay readable — hundreds of MB of legacy slices already sit in
+    backtest_cache/ and refetching them costs hours.
+    """
+
+    META = {"kind": "archive_created_day", "cutoff_ts": 100,
+            "include_mve": True, "complete": True}
+
+    @staticmethod
+    def _markets(n: int) -> list[dict]:
+        return [{"ticker": f"T{i}", "result": "yes", "open_time": None} for i in range(n)]
+
+    def test_jsonl_roundtrip_preserves_order(self, tmp_path):
+        # Record order IS the contract: the server returns each window
+        # newest-first and the caller's ticker dedup is first-wins, so a
+        # reordering writer would silently change which duplicate survives.
+        path = tmp_path / "2026-06-09.json.gz"
+        markets = self._markets(5)
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(markets[:2])
+            writer.write_records(markets[2:])
+            assert writer.commit() == 5
+        assert historical._day_store_load(path, self.META) == markets
+        # Line framing is real JSONL, not an implementation detail of ours
+        assert _read_slice_file(path) == markets
+
+    def test_jsonl_meta_carries_format_tag(self, tmp_path):
+        path = tmp_path / "2026-06-09.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.commit()
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            head = json.loads(fh.readline())
+        assert head["meta"]["format"] == "jsonl-v1"
+        # The tag rides along inside meta, so identity gating is unaffected
+        assert all(head["meta"][k] == v for k, v in self.META.items())
+
+    def test_empty_day_is_meta_only_and_loads_as_zero_records(self, tmp_path):
+        # Routing edge: a meta-only file whole-parses as a perfectly good JSON
+        # dict, so routing on "did json.loads succeed" would call this legacy
+        # and report no markets key. It must route on CONTENT and load as [].
+        path = tmp_path / "2026-06-07.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.commit()
+        assert historical._day_store_load(path, self.META) == []
+        # ...and specifically not None, which would mean "refetch this day"
+        assert historical._day_store_load(path, self.META) is not None
+
+    def test_legacy_dict_slice_still_loads(self, tmp_path):
+        # Written the way every pre-BS-15 slice on disk was written.
+        path = tmp_path / "legacy.json.gz"
+        markets = self._markets(3)
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": self.META, "markets": markets}, fh)
+        assert historical._day_store_load(path, self.META) == markets
+        # Legacy empty day too — the other empty-file routing case
+        empty = tmp_path / "legacy_empty.json.gz"
+        with gzip.open(empty, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": self.META, "markets": []}, fh)
+        assert historical._day_store_load(empty, self.META) == []
+
+    def test_meta_mismatch_rejects_both_formats(self, tmp_path):
+        drifted = {**self.META, "cutoff_ts": 200}
+        jsonl = tmp_path / "jsonl.json.gz"
+        with historical._DayStreamWriter(jsonl, self.META) as writer:
+            writer.write_records(self._markets(2))
+            writer.commit()
+        legacy = tmp_path / "legacy.json.gz"
+        historical._day_store_save(legacy, self.META, self._markets(2))
+
+        assert historical._day_store_load(jsonl, drifted) is None
+        assert historical._day_store_load(legacy, drifted) is None
+        # Sanity: both load fine under the matching expectation
+        assert historical._day_store_load(jsonl, self.META)
+        assert historical._day_store_load(legacy, self.META)
+
+    def test_abort_leaves_no_visible_file(self, tmp_path):
+        # The atomicity contract: an interrupted worker must not publish a
+        # partial slice that a later run would trust as complete.
+        path = tmp_path / "2026-06-09.json.gz"
+        with pytest.raises(RuntimeError):
+            with historical._DayStreamWriter(path, self.META) as writer:
+                writer.write_records(self._markets(2))
+                raise RuntimeError("worker died mid-day")
+        assert not path.exists()
+        assert not list(tmp_path.glob("*.tmp"))
+        assert historical._day_store_load(path, self.META) is None
+
+    def test_truncated_jsonl_is_a_whole_slice_miss(self, tmp_path):
+        # A slice cut mid-record must fail entirely (→ refetch), never return
+        # the records that happened to survive.
+        path = tmp_path / "2026-06-09.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(self._markets(4))
+            writer.commit()
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        cut = raw[: raw.rindex(b"\n", 0, len(raw) - 1) + 25]  # mid-line
+        with gzip.open(path, "wb") as fh:
+            fh.write(cut)
+        assert historical._day_store_load(path, self.META) is None
+
+    def test_keep_predicate_filters_during_load(self, tmp_path):
+        # Pushed down so a multi-million-record day is never materialized just
+        # to be filtered afterwards; must equal filtering the full list.
+        path = tmp_path / "2026-06-09.json.gz"
+        markets = self._markets(6)
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(markets)
+            writer.commit()
+
+        def keep(m):
+            return m["ticker"] in ("T1", "T4")
+
+        assert historical._day_store_load(path, self.META, keep) == [
+            m for m in markets if keep(m)
+        ]
+        # The same equality must hold for legacy slices
+        legacy = tmp_path / "legacy.json.gz"
+        historical._day_store_save(legacy, self.META, markets)
+        assert historical._day_store_load(legacy, self.META, keep) == [
+            m for m in markets if keep(m)
+        ]
+        # _discard_all is the prescan's "parse but retain nothing" probe
+        assert historical._day_store_load(path, self.META, historical._discard_all) == []
+
+    def test_worker_chunks_a_large_day(self, tmp_path, monkeypatch):
+        # The point of BS-15: the worker's buffer is bounded by the chunk size,
+        # not by how big the day is. Verified through the real worker with a
+        # small chunk — emit must fire repeatedly, never once at the end.
+        from datetime import UTC, datetime
+
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+
+        day_lo = int(datetime(2026, 6, 9, tzinfo=UTC).timestamp())
+        page_size = 2
+        pages = [
+            {"markets": [_mk_raw_market(f"T{i}", "2026-06-09T12:00:00Z",
+                                        "2026-06-09T13:00:00Z")
+                         for i in range(p * page_size, (p + 1) * page_size)],
+             "cursor": "next"}
+            for p in range(5)
+        ]
+        pages.append({"markets": [], "cursor": None})
+        calls = iter(pages)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: next(calls))
+
+        batches: list[int] = []
+        real_write = historical._DayStreamWriter.write_records
+
+        def spy_write(self, batch):
+            batches.append(len(batch))
+            real_write(self, batch)
+
+        monkeypatch.setattr(historical._DayStreamWriter, "write_records", spy_write)
+
+        count = historical._fetch_and_store_archive_day(
+            MagicMock(), day_lo, {"limit": 1000},
+            historical._FetchProgress("test"), self.META,
+        )
+
+        assert count == 10
+        # More than one flush, and no buffer grew past the chunk size plus the
+        # page in flight (flushes land on page boundaries, so that — not the
+        # size of the day — is the worker's memory bound).
+        assert len(batches) > 1
+        assert max(batches) <= 3 + page_size
+        assert sum(batches) == 10
+        # The published slice is complete and in fetch order
+        path = historical._day_store_path("archive_days", day_lo)
+        loaded = historical._day_store_load(path, self.META)
+        assert [m["ticker"] for m in loaded] == [f"T{i}" for i in range(10)]
+
+    def test_no_emit_returns_the_list_unchanged(self, tmp_path, monkeypatch):
+        # The frontier day and the sequential fallbacks rely on the
+        # list-returning behavior — chunking must be strictly opt-in.
+        pages = [
+            {"markets": [_mk_raw_market("F1", "2026-06-12T01:00:00Z",
+                                        "2026-06-12T02:00:00Z")],
+             "cursor": None},
+        ]
+        calls = iter(pages)
+        monkeypatch.setattr(
+            historical, "api_call_with_retry",
+            lambda fn, *a, **k: next(calls),
+        )
+        out = historical._fetch_live_window(
+            MagicMock(), 0, None, historical._FetchProgress("test"),
+        )
+        assert isinstance(out, list)
+        assert [m["ticker"] for m in out] == ["F1"]
 
 
 class TestJsonCacheDurability:
