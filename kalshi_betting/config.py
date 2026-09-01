@@ -118,7 +118,18 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 # the floor kills the unwind instead of realizing an unbounded loss; the
 # orphaned position then surfaces as status="rollback_failed" for manual
 # review — the same path an unfilled market unwind already took.
-ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 5
+#
+# This allowance must cover the market's ENTIRE bid-ask spread, not just the
+# "acceptable loss": leg A entered at the NO ASK, but the unwind is a sell
+# that only fills against the NO BID, so (NO ask - NO bid) — the spread
+# itself — is a floor on the loss even with zero adverse price movement.
+# Any adverse move since entry is additive on top of that spread. At 5 cents
+# this was narrower than the spread on the illiquid markets this strategy
+# targets, so killed unwinds (rollback_failed orphans) were the normal
+# outcome, not the tail case. 12 cents lets a normal-spread book fill the
+# unwind while a genuinely collapsed book still kills it and surfaces
+# rollback_failed for manual review — the deliberate bounded-loss trade-off.
+ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the

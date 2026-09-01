@@ -138,6 +138,12 @@ class TestRollbackPriceFloor:
     def test_floor_is_entry_less_max_loss(self):
         spec = make_spec(nA=0.62)
         assert _rollback_floor_cents(spec) == 62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
+        # Literal guard: at the current calibration (BS-05, 12 cents to cover
+        # the full bid-ask spread plus adverse movement) this must be 50 cents
+        # exactly, so a silent change to the constant fails this test even
+        # though the assertion above would float along with it.
+        assert ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT == 12
+        assert _rollback_floor_cents(spec) == 50
 
     def test_floor_rounds_before_truncating(self):
         # 0.57 is stored as 0.5699999999999998, so 0.57 * 100 == 56.99999999999999.
