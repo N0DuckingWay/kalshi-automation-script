@@ -47,6 +47,10 @@ secrets.json + PEM key
     historical.py ──→ backtester.py ──→ dashboard.py
                             |
                     backtest.py (CLI entry)
+
+    (historical.py also imports auth.py's build_client for its own client
+     builders; backtester.py also imports scanner.py's normalize_title for
+     title-based pair grouping)
 ```
 
 ### Live Trading Data Flow
@@ -177,6 +181,10 @@ python3 -m kalshi_betting.main --mode dev --dry-run
 ```
 
 Scans the Kalshi sandbox markets with a virtual $1,000 balance and writes a simulation Excel file.
+Dev mode never submits real orders regardless of `--dry-run` — the flag is a no-op
+here (`main.py` logs `"--dry-run is inert in dev mode"` if you pass it) and is
+only meaningful in `--mode prod`; the heading above names the plain `--mode dev`
+behavior, not something `--dry-run` changes.
 
 Specify a different virtual balance:
 
@@ -197,6 +205,12 @@ Fetches the live account balance, scans real markets, submits batch orders, and 
 ```bash
 python3 -m kalshi_betting.main --mode prod --dry-run
 ```
+
+Uses the real account balance and real markets (read-only API calls only — no
+orders are submitted), but still writes a simulated row per discovered trade
+to `trade_log.xlsx` (status `"simulated"`), same as prod's real-order rows
+just without a live fill. Confirmed live behavior — don't assume `--dry-run`
+leaves `trade_log.xlsx` untouched.
 
 ### Limit how far out a contract's deadline can be
 
@@ -228,6 +242,16 @@ python3 -m kalshi_betting.backtest --max-horizon-days 14
 `--start-date` should predate the Kalshi archive cutoff. Markets that settled
 after the cutoff have no historical candlestick data, so a window starting after
 it produces no trades regardless of how many pairs it finds.
+
+**Feasibility pre-check (BS-11).** Before any network call, `run_backtest()`
+checks whether the `[--start-date, yesterday]` window contains at least one
+Monday-09:00-UTC entry checkpoint (the only time the replay ever enters a
+trade). If not, it logs a warning and returns the same empty result the
+zero-trade path already produces — instead of spending minutes fetching
+millions of settled-market records into a cache that was always going to
+produce zero trades. `historical.py` separately warns (without aborting) when
+`--start-date` is on or after the archive cutoff, since that also makes the
+window structurally 0-trade — see the paragraph above.
 
 `--max-horizon-days` only enters trades where the later-closing leg is within the
 given number of days of the *simulated* entry checkpoint (each Monday evaluated

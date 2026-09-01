@@ -44,7 +44,10 @@ class TradeSpec:
             execution — select_portfolio() budgets against this value.
         min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds:
             x * (1 - nA - pB). Always > 0 for trades that reach execution.
-        profit_ratio (float): Return on cost: (1 - nA - pB) / (nA + pB).
+        profit_ratio (float): Return on cost, net of the continuous fee
+            approximation: ((1 - nA - pB) - fee_per_pair_approx(nA, pB)) /
+            (nA + pB). This is "b" in the Kelly formula below (see
+            compute_trade()'s net_spread/profit_ratio computation).
         days_to_close (int): Calendar days until the later-closing market resolves. >= 1.
         monthly_profit_ratio (float): Profit ratio normalized to a 30-day period:
             profit_ratio * 30 / days_to_close. Used for portfolio ranking.

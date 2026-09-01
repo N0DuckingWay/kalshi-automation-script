@@ -158,13 +158,15 @@ POSITION_PAGE_SIZE = 500
 MVE_TITLE_LOOKUP_MAX_PAGES = 500
 
 # Number of worker threads used by historical.fetch_all_settled_markets to
-# fetch archive day-slices and live settled-day windows in parallel. The
-# settled-market history is tens of millions of records at 1000/page (the
-# API's hard page-size cap), so a sequential walk takes hours; sharding the
-# fetch across workers was live-verified 2026-07-13 at 12 workers / ~20 req/s
-# with zero HTTP 429s. Each worker's calls still go through
-# api_call_with_retry, so if Kalshi does start throttling, the normal
-# exponential backoff applies per worker. Raise cautiously.
+# fetch archive day-slices and live settled-day windows in parallel. Currently
+# 8. The settled-market history is tens of millions of records at 1000/page
+# (the API's hard page-size cap), so a sequential walk takes hours; sharding
+# the fetch across workers is what makes it tractable. Note the specific
+# figure below is a historical datapoint from a DIFFERENT worker count, not a
+# measurement of this constant's current value: at 12 workers, a 2026-07-13
+# live run measured ~20 req/s with zero HTTP 429s. Each worker's calls still
+# go through api_call_with_retry, so if Kalshi does start throttling, the
+# normal exponential backoff applies per worker. Raise cautiously.
 SETTLED_FETCH_MAX_WORKERS = 8
 
 # How many compact market dicts one day-slice worker buffers in memory before
@@ -182,17 +184,20 @@ SETTLED_FETCH_MAX_WORKERS = 8
 SETTLED_FETCH_CHUNK_RECORDS = 50_000
 
 # Number of worker threads used by the backtester's per-ticker candlestick
-# fetch (backtester._fetch_candles_parallel). Each fetch is an independent
-# read-only GET routed through api_call_with_retry, so a 429 degrades to that
-# worker's own exponential backoff rather than failing the run — live-verified
-# 2026-08-03 at ~20 req/s with 12 workers and zero HTTP 429s. Fetching
-# sequentially was live-measured the same day at ~4.3 tickers/sec, i.e. ~34
-# hours for a 3-month window, which makes this loop the dominant cost of a
-# backtest. Cache files are keyed per ticker, so two workers can never target
-# the same path — _save_json_cache writes atomically (tmp+replace), but its tmp
-# name is derived from the destination, so a shared cache path would still
-# collide; never introduce a fetch whose cache path is shared across workers. Each worker keeps
-# fetch_candlesticks' own rate_limit_sleep default (0.15s) between its pages.
+# fetch (backtester._fetch_candles_parallel). Currently 8. Each fetch is an
+# independent read-only GET routed through api_call_with_retry, so a 429
+# degrades to that worker's own exponential backoff rather than failing the
+# run. Note the specific figure below is a historical datapoint from a
+# DIFFERENT worker count, not a measurement of this constant's current value:
+# at 12 workers, a 2026-08-03 live run measured ~20 req/s with zero HTTP 429s.
+# Fetching sequentially was live-measured the same day at ~4.3 tickers/sec,
+# i.e. ~34 hours for a 3-month window, which makes this loop the dominant cost
+# of a backtest. Cache files are keyed per ticker, so two workers can never
+# target the same path — _save_json_cache writes atomically (tmp+replace), but
+# its tmp name is derived from the destination, so a shared cache path would
+# still collide; never introduce a fetch whose cache path is shared across
+# workers. Each worker keeps fetch_candlesticks' own rate_limit_sleep default
+# (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
 # Number of worker threads used by trader.py for both of its pools: the

@@ -524,6 +524,14 @@ def main() -> None:
         ],
     )
 
+    if args.mode == "dev" and args.dry_run:
+        # _run_dev always calls execute_trades(dry_run=True) regardless of
+        # args.dry_run (dev never submits real orders), so --dry-run has no
+        # effect in dev mode. Logged (not parser.error'd) after basicConfig so
+        # it lands in kalshi_arb.log for anyone diagnosing "why didn't
+        # --dry-run change anything" after the fact.
+        logging.warning("--dry-run is inert in dev mode — dev never submits orders")
+
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
     if args.mode == "dev":

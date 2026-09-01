@@ -387,6 +387,47 @@ class TestLoggingRotation:
             root.setLevel(saved_level)
 
 
+class TestDryRunInertInDev:
+    """BS-32: --dry-run has no effect in dev mode (dev always simulates), so
+    main() logs a warning naming that rather than leaving it silently
+    ignored.
+    """
+
+    def test_dev_dry_run_logs_inert_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING)
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "dev", "--dry-run"])
+
+        with (
+            patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main.main()
+
+        assert exc_info.value.code == EXIT_OK
+        assert "--dry-run is inert in dev mode" in caplog.text
+
+    def test_prod_dry_run_does_not_log_inert_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING)
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "prod", "--dry-run"])
+
+        with (
+            patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+            patch("kalshi_betting.main.verify_auth", return_value=MIN_BALANCE_CENTS - 1),
+        ):
+            with pytest.raises(SystemExit):
+                main.main()
+
+        assert "--dry-run is inert in dev mode" not in caplog.text
+
+
 def test_exit_code_constants_distinct():
     # Guard against a future accidental collision between the three codes —
     # the scheduler's log-level mapping depends on them being distinguishable.
