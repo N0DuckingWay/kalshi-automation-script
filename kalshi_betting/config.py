@@ -112,6 +112,14 @@ TAKER_FEE_RATE                = 0.07
 # submission: the order fills at or below (scanned price + allowance) or not at all.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
+# Maximum accepted per-contract loss (cents) when unwinding leg A after a
+# failed leg B, relative to leg A's scanned NO entry price. The rollback is a
+# fill-or-kill LIMIT sell at (entry - this), so a book that has collapsed past
+# the floor kills the unwind instead of realizing an unbounded loss; the
+# orphaned position then surfaces as status="rollback_failed" for manual
+# review — the same path an unfilled market unwind already took.
+ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 5
+
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
 # weekly scheduler daemon forever.
@@ -154,6 +162,17 @@ SETTLED_FETCH_MAX_WORKERS = 8
 # the same path (_save_json_cache writes non-atomically). Each worker keeps
 # fetch_candlesticks' own rate_limit_sleep default (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
+
+# Number of worker threads used by trader.py for both of its pools: the
+# pre-execution order-book re-checks (pre_execution_check) and the per-pair
+# execution of the selected portfolio (execute_trades). Each pool is sized
+# min(this, len(work)), so a small portfolio never over-provisions threads.
+# The portfolio is at most a handful of pairs in practice, so this is a
+# ceiling rather than a tuned throughput figure; unlike the fetch pools it has
+# never been exercised at scale against the live API. Raise cautiously — the
+# execution pool submits real orders, so each extra worker is another
+# concurrent write against the account.
+TRADER_MAX_WORKERS = 8
 
 # Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible

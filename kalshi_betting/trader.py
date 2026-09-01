@@ -10,9 +10,12 @@ Purpose:
     market B) only if leg A filled. Both buy legs carry a buy_max_cost cap derived
     from the scanned price plus a small slippage allowance, so a book that moved
     since the pre-execution check kills the order instead of filling it at a loss.
-    If leg B fails, a rollback sell order is immediately submitted to unwind leg A,
-    and the rollback's own fill status is verified — an unfilled rollback is
-    reported as status="rollback_failed" (orphaned position, manual review).
+    If leg B fails, a rollback sell order is immediately submitted to unwind leg A.
+    That unwind is itself a floored fill-or-kill LIMIT sell (leg A's scanned entry
+    less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT), so a collapsed book kills it rather
+    than realizing an unbounded loss, and the rollback's own fill status is
+    verified — an unfilled rollback is reported as status="rollback_failed"
+    (orphaned position, manual review).
     Multiple pairs are executed concurrently via ThreadPoolExecutor so no pair
     waits for another to complete.
 
@@ -34,7 +37,8 @@ Dependencies:
     CreateOrderRequest from the kalshi_python_sync SDK and both fetch_json_page
     and api_call_with_retry from _http.py (the retry wrapper is used ONLY for
     the read-only position lookups, never for order submission). Imports
-    validate_pair_price from scanner.py and BUY_MAX_COST_SLIPPAGE_CENTS from
+    validate_pair_price from scanner.py and BUY_MAX_COST_SLIPPAGE_CENTS,
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT and TRADER_MAX_WORKERS from
     config.py. Called by main.py after select_portfolio() selects the final
     trade list. Depends on the KalshiClient produced by auth.py.
 
@@ -61,7 +65,11 @@ from typing import Any
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import api_call_with_retry, fetch_json_page
-from .config import BUY_MAX_COST_SLIPPAGE_CENTS
+from .config import (
+    BUY_MAX_COST_SLIPPAGE_CENTS,
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+    TRADER_MAX_WORKERS,
+)
 from .reporter import TradeResult
 from .scanner import validate_pair_price
 from .strategy import TradeSpec
@@ -84,6 +92,12 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     Kalshi rejects (FoK) any fill that would cost more, so a book that moved
     against us since the pre-execution check cannot fill at a guaranteed loss.
 
+    The product is rounded to 6 decimals before the ceiling, the same idiom as
+    config.fee_leg_exact(): binary float noise (7 * 0.07 * 100 =
+    49.000000000000006) would otherwise ceil to an extra cent and LOOSEN the
+    cap. Removing that cent tightens price protection — the cap can only ever
+    become stricter than before, never more permissive.
+
     Args:
         count (int): Number of contracts on this leg. >= 1.
         price_dollars (float): Scanned per-contract price in dollars (0, 1).
@@ -91,7 +105,41 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     Returns:
         int: Maximum total cost in cents for the order.
     """
-    return math.ceil(count * price_dollars * 100) + count * BUY_MAX_COST_SLIPPAGE_CENTS
+    # Round before the ceiling so float noise can't buy the order an extra cent
+    # of headroom; this TIGHTENS the cap (stricter price protection).
+    return (
+        math.ceil(round(count * price_dollars * 100, 6))
+        + count * BUY_MAX_COST_SLIPPAGE_CENTS
+    )
+
+
+def _rollback_floor_cents(spec: TradeSpec) -> int:
+    """
+    Minimum acceptable per-contract NO sale price (cents) for a leg-A unwind.
+
+    The unwind is a fill-or-kill LIMIT sell rather than a market sell, so a book
+    that has collapsed since leg A filled kills the order instead of realizing
+    an unbounded loss. The floor is leg A's scanned NO entry price less
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, clamped into the API's valid limit
+    price range (1..99 cents inclusive) — an entry near either extreme would
+    otherwise produce a price the exchange rejects outright.
+
+    A killed unwind leaves the leg-A position open, which _rollback_leg_a
+    reports as status="rollback_failed" for manual review: the same outcome an
+    unfilled market unwind already produced, now with a bounded loss instead of
+    whatever the book happened to offer.
+
+    Args:
+        spec (TradeSpec): The trade being unwound. Uses spec.pair.nA, leg A's
+            scanned NO entry price in dollars (0, 1).
+
+    Returns:
+        int: Limit price in cents, always within [1, 99].
+    """
+    # round() BEFORE int: nA is a cent-quantized book price carried as a float,
+    # so int() alone would truncate 0.57 stored as 0.5699999999999998 to 56.
+    entry_cents = int(round(spec.pair.nA * 100))
+    return max(1, min(99, entry_cents - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT))
 
 
 def _build_no_order(spec: TradeSpec) -> CreateOrderRequest:
@@ -283,11 +331,21 @@ def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
     """
     Sell the leg-A NO position to unwind a half-filled pair, verifying the fill.
 
+    The unwind is a FLOORED fill-or-kill LIMIT sell, not a market sell: a market
+    sell has no proceeds floor (the SDK's CreateOrderRequest exposes no such
+    knob), so a book that collapsed between leg A's fill and the unwind would
+    realize an arbitrarily large loss. The limit price is _rollback_floor_cents()
+    — leg A's scanned entry less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — so the
+    unwind either recovers at least that much per contract or does not happen.
+
     reduce_only guarantees the sell can only close an existing position, so it
     is safe to submit even when leg A's fill state is ambiguous (it cannot open
-    a short). The rollback's own FoK status IS checked: an unfilled rollback
-    means the leg-A position is still open, which is reported as
-    status="rollback_failed" for manual review — never silently as "rolled_back".
+    a short). The rollback's own FoK status IS checked: an unfilled rollback —
+    including one killed by the price floor — means the leg-A position is still
+    open, which is reported as status="rollback_failed" for manual review, never
+    silently as "rolled_back". That is the same path an unfilled market unwind
+    already took, so the caller's contract is unchanged; only the loss is now
+    bounded.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -297,13 +355,18 @@ def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
 
     Returns:
         TradeResult: status="rolled_back" when the unwind filled,
-            status="rollback_failed" when it did not fill or raised.
+            status="rollback_failed" when it did not fill (rejected, or killed
+            by the price floor) or raised.
     """
     rollback = CreateOrderRequest(
         ticker=spec.pair.market_a.ticker,
         side="no",
         action="sell",
-        type="market",
+        # Limit, not market: only a limit order can carry a proceeds floor
+        type="limit",
+        # Floor the unwind: fill at >= (entry − max accepted loss) or not at
+        # all. See ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT in config.py.
+        no_price=_rollback_floor_cents(spec),
         count=spec.x,
         time_in_force="fill_or_kill",
         # Can only reduce an existing position — never opens a short even if
@@ -362,7 +425,7 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
         return []
 
     valid = []
-    with ThreadPoolExecutor(max_workers=min(8, len(portfolio))) as pool:
+    with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(portfolio))) as pool:
         future_to_spec = {
             pool.submit(validate_pair_price, client, spec): spec for spec in portfolio
         }
@@ -394,8 +457,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     Submits leg A (NO on market A) first via fill_or_kill. If it fills, submits
     leg B (YES on market B) via fill_or_kill. If leg B fails, immediately submits
-    a reduce-only market sell of the leg A contracts to unwind the position and
-    verifies that the rollback itself filled.
+    a reduce-only, price-floored fill-or-kill LIMIT sell of the leg A contracts to
+    unwind the position (see _rollback_leg_a) and verifies that the rollback itself
+    filled.
 
     A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
     however, is ambiguous — the order may have filled before a timeout — so
@@ -572,7 +636,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     concurrently across specs.
 
     In live mode, each spec is handled by _execute_one(): leg A submitted first,
-    then leg B only if leg A filled, with rollback if leg B fails. All specs are
+    then leg B only if leg A filled, with a floored-limit rollback if leg B
+    fails. All specs are
     submitted concurrently via ThreadPoolExecutor so no pair waits on another.
 
     In dry_run mode, no orders are submitted. The function logs the intended trade
@@ -615,7 +680,7 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             results.append(TradeResult(spec=spec, status="simulated"))
         return results
 
-    with ThreadPoolExecutor(max_workers=min(8, len(specs))) as pool:
+    with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
         futures = [pool.submit(_execute_one, client, spec) for spec in specs]
         results = [f.result() for f in futures]
 

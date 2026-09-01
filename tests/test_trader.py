@@ -14,12 +14,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from kalshi_betting import _http
-from kalshi_betting.config import BUY_MAX_COST_SLIPPAGE_CENTS
+from kalshi_betting.config import (
+    BUY_MAX_COST_SLIPPAGE_CENTS,
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+)
 from kalshi_betting.trader import (
     _build_no_order,
     _build_yes_order,
+    _buy_max_cost_cents,
     _execute_one,
     _position_count,
+    _rollback_floor_cents,
 )
 
 
@@ -111,6 +116,39 @@ class TestOrderPriceProtection:
         assert order.buy_max_cost == expected
         assert order.side == "yes"
 
+    def test_float_noise_does_not_loosen_the_cap(self):
+        # 7 * 0.07 * 100 == 49.00000000000001 in binary float, so a bare
+        # ceil() would hand the order a spurious extra cent of headroom.
+        # Rounding to 6 decimals first keeps the cap at the true 49 cents —
+        # strictly tighter price protection, never looser.
+        assert _buy_max_cost_cents(7, 0.07) == 49 + 7 * BUY_MAX_COST_SLIPPAGE_CENTS
+        assert math.ceil(7 * 0.07 * 100) == 50  # what the un-rounded form gave
+
+    def test_genuine_fraction_still_rounds_up(self):
+        # The guard must only remove noise: a real sub-cent remainder still
+        # ceils, or the cap could reject a fill at the scanned price.
+        assert _buy_max_cost_cents(3, 0.335) == 101 + 3 * BUY_MAX_COST_SLIPPAGE_CENTS
+
+
+class TestRollbackPriceFloor:
+    """The leg-A unwind is a floored FoK limit sell, not an unbounded market sell."""
+
+    def test_floor_is_entry_less_max_loss(self):
+        spec = make_spec(nA=0.62)
+        assert _rollback_floor_cents(spec) == 62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
+
+    def test_floor_rounds_before_truncating(self):
+        # 0.57 is stored as 0.5699999999999998, so 0.57 * 100 == 56.99999999999999.
+        # int() alone would truncate the entry to 56 and floor a cent too low.
+        spec = make_spec(nA=0.57)
+        assert _rollback_floor_cents(spec) == 57 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
+
+    def test_floor_clamped_to_valid_limit_price(self):
+        # 3 - 5 would be a negative limit price the API rejects outright.
+        assert _rollback_floor_cents(make_spec(nA=0.03)) == 1
+        # And the upper clamp keeps the price inside the API's 1..99 range.
+        assert _rollback_floor_cents(make_spec(nA=1.20)) == 99
+
 
 class TestRollbackVerification:
     def test_unfilled_rollback_reports_rollback_failed(self):
@@ -141,7 +179,10 @@ class TestRollbackVerification:
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
 
-    def test_rollback_order_is_reduce_only_sell(self):
+    def test_rollback_order_is_floored_reduce_only_limit_sell(self):
+        # The unwind must be a LIMIT sell carrying a proceeds floor: a market
+        # sell has no such knob, so a collapsed book would realize an unbounded
+        # loss on a position we only hold because leg B failed.
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),
@@ -149,12 +190,36 @@ class TestRollbackVerification:
             order_resp("executed"),
         ])
         client.get_positions_without_preload_content = positions_seq(None, None)
-        _execute_one(client, make_spec())
+        spec = make_spec(nA=0.40)
+        _execute_one(client, spec)
         rollback_call = client.create_order_without_preload_content.call_args_list[2]
         rollback_req = rollback_call.kwargs["create_order_request"]
         assert rollback_req.action == "sell"
         assert rollback_req.side == "no"
+        assert rollback_req.type == "limit"
+        assert rollback_req.no_price == 40 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
+        assert rollback_req.count == spec.x
+        assert rollback_req.time_in_force == "fill_or_kill"
         assert rollback_req.reduce_only is True
+
+    def test_floored_rollback_killed_by_price_reports_rollback_failed(self):
+        # A book below the floor kills the FoK limit sell. The position is
+        # still open, so the outcome must stay "rollback_failed" for manual
+        # review — the same contract the old market unwind had when unfilled.
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"),   # leg A
+            order_resp("canceled"),   # leg B rejected
+            order_resp("canceled"),   # floored unwind killed by the price floor
+        ])
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        result = _execute_one(client, make_spec(nA=0.62))
+        assert result.status == "rollback_failed"
+        assert "rollback FoK not filled" in result.error
+        rollback_req = client.create_order_without_preload_content.call_args_list[2].kwargs[
+            "create_order_request"
+        ]
+        assert rollback_req.no_price == 62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
 
     def test_clean_double_fill_submits_exactly_two_orders(self):
         # The happy path must be untouched by the delta protocol: two orders,
