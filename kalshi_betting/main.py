@@ -24,6 +24,7 @@ Dependencies:
 """
 import argparse
 import logging
+import logging.handlers
 import sys
 
 from tabulate import tabulate
@@ -273,10 +274,16 @@ def _run_dev(client, args) -> int:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info("No qualifying pairs found in sandbox (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
+        # BS-26: write_dev_simulation() already logs "Dev simulation written: %s" —
+        # this line carries the qualifier (why the file is empty) instead of
+        # repeating the artifact path a second time.
+        logging.info(
+            "No qualifying pairs found in sandbox (≥15%/30% deadline-gap-tiered "
+            "time-series or ≥5% same-title price diff) — simulation file will "
+            "contain headers only."
+        )
         # Write an empty simulation file so the run is still recorded
-        out = write_dev_simulation([], [], sandbox_balance_cents)
-        logging.info("Dev simulation written (empty): %s", out)
+        write_dev_simulation([], [], sandbox_balance_cents)
         return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the virtual balance
@@ -290,10 +297,13 @@ def _run_dev(client, args) -> int:
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        logging.info("No executable arbitrage trades found.")
+        # BS-26: qualifier only — write_dev_simulation() logs the "written" line itself.
+        logging.info(
+            "No executable arbitrage trades found — simulation file will "
+            "contain candidates only."
+        )
         # Write a simulation file showing candidates even though no trades were sized
-        out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
-        logging.info("Dev simulation written (candidates only): %s", out)
+        write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
         return EXIT_OK
 
     _print_portfolio(portfolio, "Simulated")
@@ -302,9 +312,10 @@ def _run_dev(client, args) -> int:
     # Returns TradeResult objects with status="simulated" — no API orders are placed
     results = execute_trades(client, portfolio, dry_run=True)
 
-    # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all candidates
-    out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
-    logging.info("Dev simulation written: %s", out)
+    # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all
+    # candidates. write_dev_simulation() logs "Dev simulation written: %s" itself
+    # (BS-26) — don't duplicate that line here.
+    write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
     return EXIT_OK
 
 
@@ -409,8 +420,9 @@ def _run_prod(client, args) -> int:
     # write fails (e.g. the file is open in Excel), dump every result to the log
     # so the record of real fills is never lost, then re-raise.
     try:
-        out = append_to_prod_log(results, balance_cents / 100, balance_after)
-        logging.info("Trade log updated: %s", out)
+        # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
+        # itself (BS-26) — don't duplicate that line here.
+        append_to_prod_log(results, balance_cents / 100, balance_after)
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
@@ -501,7 +513,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
+            # BS-25: rotate so a long-running scheduler daemon can't grow this file
+            # unbounded (see backtest.py's kalshi_backtest.log for the failure mode
+            # that motivated this). 5MB/3 backups is logging infra sized for this
+            # CLI's own verbosity, not a strategy constant, so it stays inline
+            # rather than in config.py.
+            logging.handlers.RotatingFileHandler(
+                PROJECT_ROOT / "kalshi_arb.log", maxBytes=5 * 1024 * 1024, backupCount=3,
+            ),
         ],
     )
 

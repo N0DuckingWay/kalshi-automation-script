@@ -25,6 +25,7 @@ Notes:
 """
 import argparse
 import logging
+import logging.handlers
 from datetime import date
 
 from .backtester import run_backtest
@@ -75,7 +76,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(PROJECT_ROOT / "kalshi_backtest.log"),
+            # BS-25: a single unrotated FileHandler grew to 398MB during one backtest
+            # sweep. 20MB/3 backups is logging infra sized for this CLI's own verbosity,
+            # not a strategy constant, so it stays inline rather than in config.py.
+            logging.handlers.RotatingFileHandler(
+                PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024, backupCount=3,
+            ),
         ],
     )
 
@@ -118,8 +124,9 @@ def main() -> None:
         # %-style logging has no thousands-separator flag — pre-format the value
         logging.info("  Final balance: $%s", f"{final_value:,.2f}")
 
-    out = generate_dashboard(trades, equity_df, start_date, args.balance)  # returns Path to the self-contained HTML dashboard file
-    logging.info("Dashboard written: %s", out)
+    # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
+    # don't duplicate that line here, just point the user at the file.
+    generate_dashboard(trades, equity_df, start_date, args.balance)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
 
 

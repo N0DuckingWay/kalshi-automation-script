@@ -8,6 +8,8 @@ strategy, trader, reporter) are mocked at their main-module import sites per
 project policy — tests run offline and never touch the real Kalshi API or
 the real kalshi_arb.log / trade_log.xlsx files.
 """
+import logging
+import logging.handlers
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -259,6 +261,130 @@ class TestMainEntryPoint:
 
         assert exc_info.value.code == EXIT_SKIPPED_LOW_BALANCE
         assert exc_info.value.code == 10
+
+
+def _fake_write_dev_simulation(results, candidate_pairs, balance_cents):
+    """Stand-in for reporter.write_dev_simulation() that reproduces its one
+    real log line (reporter.py:544, "Dev simulation written: %s") so the
+    BS-26 tests below can assert main._run_dev's caller side does not log a
+    duplicate of it on any exit path.
+    """
+    logging.info("Dev simulation written: %s", "dev_sim.xlsx")
+    return "dev_sim.xlsx"
+
+
+class TestDevSimulationLoggedOnce:
+    """BS-26: write_dev_simulation() already logs "Dev simulation written: %s"
+    itself — main._run_dev must not repeat that line (with or without an
+    "(empty)"/"(candidates only)" qualifier) on any of its three exit paths.
+    """
+
+    def test_empty_candidate_pairs_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        with (
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+    def test_empty_portfolio_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        pair = make_spec().pair
+        with (
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[pair]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[pair]),
+            patch("kalshi_betting.main.compute_trade", return_value=None),
+            patch("kalshi_betting.main.select_portfolio", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+    def test_full_run_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        spec = make_spec()
+        with (
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[spec.pair]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[spec.pair]),
+            patch("kalshi_betting.main.compute_trade", return_value=spec),
+            patch("kalshi_betting.main.select_portfolio", return_value=[spec]),
+            patch(
+                "kalshi_betting.main.execute_trades",
+                return_value=[TradeResult(spec=spec, status="simulated")],
+            ),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+
+class TestLoggingRotation:
+    """BS-25: kalshi_arb.log must rotate (5MB x 3 backups) instead of growing
+    unbounded. logging.basicConfig() is a no-op once the root logger already
+    has handlers (pytest installs its own), so this test clears the root
+    logger first to actually exercise main()'s handler configuration.
+    """
+
+    def test_main_configures_rotating_file_handler(self, tmp_path, monkeypatch):
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        for h in saved_handlers:
+            root.removeHandler(h)
+
+        try:
+            monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+            monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "dev"])
+            with (
+                patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+                patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+                patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+                patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+                patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+                patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+                patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
+            ):
+                with pytest.raises(SystemExit):
+                    main.main()
+
+            file_handlers = [
+                h for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers) == 1
+            handler = file_handlers[0]
+            assert handler.maxBytes == 5 * 1024 * 1024
+            assert handler.backupCount == 3
+        finally:
+            # Close whatever main() attached so tmp_path teardown isn't blocked
+            # by an open file handle on any platform, then restore the root
+            # logger exactly as pytest had it configured.
+            for h in root.handlers[:]:
+                h.close()
+                root.removeHandler(h)
+            for h in saved_handlers:
+                root.addHandler(h)
+            root.setLevel(saved_level)
 
 
 def test_exit_code_constants_distinct():
