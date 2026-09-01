@@ -627,8 +627,10 @@ def _fetch_candles_parallel(
     threads. Parallelism is result-neutral here for three reasons: the returned
     mapping is only ever read by key (never iterated), so completion order
     cannot matter; each ticker's disk cache path is derived from its ticker, so
-    two workers can never write the same file (historical._save_json_cache is a
-    plain non-atomic write, so a shared path WOULD corrupt); and each fetch is
+    two workers can never write the same file (historical._save_json_cache is an
+    atomic tmp+replace, but its tmp name is derived from the destination, so a
+    shared path WOULD still collide — path uniqueness stays load-bearing); and
+    each fetch is
     an independent read-only GET whose retry/backoff already lives per-call
     inside api_call_with_retry.
 

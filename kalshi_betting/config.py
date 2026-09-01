@@ -159,7 +159,9 @@ SETTLED_FETCH_MAX_WORKERS = 8
 # sequentially was live-measured the same day at ~4.3 tickers/sec, i.e. ~34
 # hours for a 3-month window, which makes this loop the dominant cost of a
 # backtest. Cache files are keyed per ticker, so two workers can never target
-# the same path (_save_json_cache writes non-atomically). Each worker keeps
+# the same path — _save_json_cache writes atomically (tmp+replace), but its tmp
+# name is derived from the destination, so a shared cache path would still
+# collide; never introduce a fetch whose cache path is shared across workers. Each worker keeps
 # fetch_candlesticks' own rate_limit_sleep default (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 

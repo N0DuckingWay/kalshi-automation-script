@@ -278,32 +278,55 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
 
 def _load_json_cache(path: Path):
     """
-    Load and parse a JSON file from disk if it exists.
+    Load and parse a JSON file from disk if it exists, treating corruption as a miss.
+
+    A truncated or otherwise unreadable file is NOT an error: these caches are
+    written by multi-hour fetches that have historically been interrupted by
+    OOM kills and SIGKILLs, and the only safe interpretation of a half-written
+    file is "no cache" — same guarded-read philosophy as _day_store_load.
 
     Args:
         path (Path): Filesystem path to the JSON cache file.
 
     Returns:
-        Any: Parsed JSON content (typically a list or dict) if the file exists,
-            or None if the file does not exist.
+        Any: Parsed JSON content (typically a list or dict) if the file exists
+            and parses, or None if the file is absent, unreadable, or corrupt.
     """
-    if path.exists():
+    if not path.exists():
+        return None
+    try:
         return json.loads(path.read_text())
-    return None
+    except (OSError, ValueError):
+        # Truncated/corrupt file (interrupted write, OOM, SIGKILL — all
+        # documented past events for these multi-hour fetches) is a cache
+        # miss, not a crash.
+        logging.warning("Corrupt JSON cache %s — treating as cache miss", path)
+        return None
 
 
 def _save_json_cache(path: Path, data) -> None:
     """
-    Serialize data to JSON and write it to path, creating parent directories as needed.
+    Atomically serialize data to JSON at path, creating parent directories as needed.
 
-    Uses a default=str serializer to handle datetime objects that may appear in the data.
+    Uses a default=str serializer to handle datetime objects that may appear in
+    the data. The write goes to a sibling temp file that is then renamed over
+    the destination, so an interrupted run can never leave a truncated file
+    that a later run would read back and trust.
 
     Args:
         path (Path): Destination file path. Parent directories are created if absent.
         data: JSON-serializable data structure (list, dict, etc.) to write.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, default=str))
+    # Atomic tmp+replace, same idiom as _day_store_save. The tmp name is derived
+    # from the destination, so it is unique because cache paths themselves are
+    # unique (per-ticker for candlesticks, per-start-date for assembled settled
+    # markets) — the same path-uniqueness invariant that keeps the parallel
+    # candlestick fetch safe. Never introduce a fetch whose cache path is shared
+    # across workers.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, default=str))
+    tmp.replace(path)
 
 
 def _load_or_build_event_titles(
@@ -336,6 +359,15 @@ def _load_or_build_event_titles(
     Results are persisted to _EVENT_TITLES_CACHE so subsequent runs are essentially
     free. Tickers that cannot be resolved — lookup failed, or skipped by the cap —
     are stored as empty strings (poison pill) so we do not retry them every run.
+
+    The on-disk cache is a cross-run ACCUMULATOR and is written as a MERGE, so a
+    single run (in particular a `--no-cache` run, which resolves from scratch)
+    can never wipe titles other runs paid for. Merge rule: disk entries are
+    preserved; a fresh non-empty title wins over the disk value; a fresh "" —
+    the poison pill from a failed lookup or the fallback cap — NEVER clobbers a
+    non-empty disk title, but a fresh "" for a ticker unknown to disk IS stored
+    (poison-pill semantics preserved).
+
     An unresolved ticker is not an error: the caller groups those markets by
     market title alone, which is exactly what a failed lookup has always done.
 
@@ -344,15 +376,24 @@ def _load_or_build_event_titles(
             (e.g. the client from build_prod_live_client()).
         event_tickers (set[str]): The set of event_ticker values whose titles
             we need. May contain hundreds or thousands of entries.
-        use_cache (bool): If True, load existing cache from disk first. If False,
-            re-fetch all titles. The on-disk cache is written either way.
+        use_cache (bool): If True, seed resolution from the on-disk accumulator.
+            If False, start empty so this run's tickers are genuinely re-fetched.
+            The on-disk accumulator is read (for the merge) and rewritten either
+            way — a `--no-cache` run refreshes its own tickers without discarding
+            titles it did not ask about.
 
     Returns:
-        dict[str, str]: Mapping event_ticker → event_title. Tickers that could
-            not be resolved map to "". Caller treats those markets as ungrouped
-            (effectively MVE-excluded).
+        dict[str, str]: Mapping event_ticker → event_title for THIS run's
+            resolution (the merged accumulator is only written to disk, not
+            returned). Tickers that could not be resolved map to "". Caller
+            treats those markets as ungrouped (effectively MVE-excluded).
     """
-    cached: dict[str, str] = (_load_json_cache(_EVENT_TITLES_CACHE) or {}) if use_cache else {}
+    # Always read the accumulator: even when use_cache is False and it must not
+    # seed resolution, it is needed at save time so this run's writes MERGE with
+    # (rather than replace) titles earlier runs paid round trips for. Corrupt
+    # file → {} plus a warning, via the guarded loader.
+    disk_titles: dict[str, str] = _load_json_cache(_EVENT_TITLES_CACHE) or {}
+    cached: dict[str, str] = dict(disk_titles) if use_cache else {}
     missing = event_tickers - cached.keys()
     if not missing:
         return cached
@@ -508,8 +549,18 @@ def _load_or_build_event_titles(
                                  "(ETA %s)", done, len(to_look_up),
                                  _format_duration(remaining))
 
-    _save_json_cache(_EVENT_TITLES_CACHE, cached)
-    logging.info("Event titles resolved: %d cached entries", len(cached))
+    # Merge into the on-disk accumulator rather than overwriting it: disk entries
+    # are preserved, a fresh non-empty title wins over the disk value, and a
+    # fresh "" (poison pill from a failed lookup or the fallback cap) never
+    # clobbers a non-empty disk title — but a fresh "" for a ticker disk has
+    # never seen IS stored, so poison-pill semantics survive.
+    merged = dict(disk_titles)
+    for tkr, title in cached.items():
+        if title or not merged.get(tkr):
+            merged[tkr] = title
+    _save_json_cache(_EVENT_TITLES_CACHE, merged)
+    logging.info("Event titles resolved: %d this run, %d cached entries on disk",
+                 len(cached), len(merged))
     return cached
 
 
@@ -1869,8 +1920,11 @@ def fetch_candlesticks(
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CANDLES_DIR / f"{ticker}.json"
-    if use_cache and cache_path.exists():
-        cached = json.loads(cache_path.read_text())
+    if use_cache:
+        # Guarded loader: absent OR corrupt (a truncated file from an
+        # interrupted run) both read back as None, so a damaged cache falls
+        # through to a refetch instead of raising out of the worker thread.
+        cached = _load_json_cache(cache_path)
         # Legacy cache files are a bare list with no window metadata (or predate
         # the period_interval tag) — we can't confirm what range/granularity
         # they cover, so fall through and refetch. The refetch below re-saves

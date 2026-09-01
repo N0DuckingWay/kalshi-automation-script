@@ -2,6 +2,7 @@
 import gzip
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -301,6 +302,89 @@ class TestEventTitlesCache:
         assert result["E1"] == "Fresh Title"
         assert client2.get_events_without_preload_content.call_count >= 1
 
+    def test_corrupt_cache_is_treated_as_miss(self, isolated_cache, monkeypatch, caplog):
+        # A truncated accumulator (interrupted write from an older build, OOM
+        # kill mid-run) must read back as "no cache", not crash the backtest
+        # before it has issued a single request.
+        isolated_cache.write_text('{"E1": "Half A Titl')
+        client = _make_client_with_event_pages(non_mve_pages=[[("E1", "Recovered Title")]])
+        _patch_single_event_lookups(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, {"E1"})
+
+        assert result == {"E1": "Recovered Title"}
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # And the damaged file is replaced by a well-formed one.
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Recovered Title"}
+
+    def test_no_cache_run_preserves_unrelated_disk_titles(self, isolated_cache, monkeypatch):
+        # BS-09: the on-disk map is a cross-run ACCUMULATOR. A --no-cache run
+        # resolves its own tickers from scratch, but must not wipe titles other
+        # runs paid a round trip each for.
+        _patch_single_event_lookups(monkeypatch)
+        client1 = _make_client_with_event_pages(non_mve_pages=[[("E1", "Title One")]])
+        historical._load_or_build_event_titles(client1, {"E1"})
+
+        client2 = _make_client_with_event_pages(non_mve_pages=[[("E2", "Title Two")]])
+        result = historical._load_or_build_event_titles(client2, {"E2"}, use_cache=False)
+
+        # This run's return value covers only this run's tickers...
+        assert result == {"E2": "Title Two"}
+        # ...but the accumulator on disk keeps both.
+        assert json.loads(isolated_cache.read_text()) == {
+            "E1": "Title One", "E2": "Title Two",
+        }
+
+    def test_fresh_non_empty_title_wins_over_disk(self, isolated_cache, monkeypatch):
+        # A re-resolved title is the newer truth — it must overwrite the disk
+        # value, otherwise --no-cache could never correct a stale title.
+        _patch_single_event_lookups(monkeypatch)
+        isolated_cache.write_text(json.dumps({"E1": "Stale Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[[("E1", "Fresh Title")]])
+
+        result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+
+        assert result["E1"] == "Fresh Title"
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Fresh Title"}
+
+    def test_fresh_poison_pill_does_not_clobber_disk_title(self, isolated_cache, monkeypatch):
+        # A failed lookup / cap-skipped ticker resolves to "" for THIS run, but
+        # "" is an absence of information — it must never overwrite a real
+        # title an earlier run resolved.
+        isolated_cache.write_text(json.dumps({"E1": "Good Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+
+        assert result == {"E1": ""}  # this run genuinely could not resolve it
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Good Title"}
+
+    def test_fresh_poison_pill_stored_for_ticker_unknown_to_disk(self, isolated_cache,
+                                                                 monkeypatch):
+        # Poison-pill semantics survive the merge: an unresolvable ticker disk
+        # has never seen is still recorded as "", so later runs don't re-pay
+        # the failing round trip.
+        isolated_cache.write_text(json.dumps({"E1": "Good Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
+
+        result = historical._load_or_build_event_titles(client, {"NEW-1"}, use_cache=False)
+
+        assert result == {"NEW-1": ""}
+        assert fallback.call_count == 1
+        assert json.loads(isolated_cache.read_text()) == {
+            "E1": "Good Title", "NEW-1": "",
+        }
+        # The pill is honored on the next cached run — no repeat lookup.
+        client2 = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback2 = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
+        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {
+            "E1": "Good Title", "NEW-1": "",
+        }
+        assert fallback2.call_count == 0
+
 
 def _raw_market_dict(**overrides) -> dict:
     """A raw market JSON dict as the current API sends it (ISO time strings,
@@ -412,6 +496,48 @@ class TestFetchAllSettledMarkets:
         assert m["yes_ask_dollars"] == "0.40"
         assert m["settlement_ts"] == "2026-02-15T00:00:00Z"
         assert m["event_title"] == ""
+
+    def test_corrupt_assembled_cache_falls_through_to_refetch(self, tmp_path, monkeypatch,
+                                                              caplog):
+        # BS-08: a truncated assembled cache (the multi-hour fetch's final
+        # write, historically interrupted by OOM kills) must read back as a
+        # miss and refetch, not raise before a single request is issued.
+        from datetime import date
+
+        cache_dir = tmp_path / "cache"
+        monkeypatch.setattr(historical, "CACHE_DIR", cache_dir)
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "settled_markets_2026-02-01.json").write_text('[{"ticker": "T1"')
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(return_value=_raw_resp({
+            "markets": [{"ticker": "RECENT", "event_ticker": "EV", "title": "Q",
+                         "result": "yes", "yes_ask_dollars": "0.40",
+                         "no_ask_dollars": "0.60", "yes_bid_dollars": "0.38",
+                         "close_time": "2026-03-05T00:00:00Z",
+                         "settlement_ts": "2026-03-05T00:00:00Z",
+                         "status": "finalized"}],
+            "cursor": None,
+        }))
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2026, 2, 1), use_cache=True,
+            )
+
+        assert {m["ticker"] for m in out} == {"RECENT"}
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # The damaged file is replaced by a well-formed one for the next run.
+        assert json.loads(
+            (cache_dir / "settled_markets_2026-02-01.json").read_text()
+        ) == out
 
     def test_live_sweep_bounds_min_settled_ts_to_start_date(self, tmp_path, monkeypatch):
         # Regression: min_settled_ts used to be hardcoded to cutoff_ts, so a
@@ -1114,6 +1240,73 @@ class TestDayStore:
         assert historical._day_store_load(legacy, meta) == markets
 
 
+class TestJsonCacheDurability:
+    """BS-08: the plain-JSON cache helpers must fail safe, not fail loud.
+
+    These caches are written at the end of multi-hour fetches that have
+    historically been killed by OOM and SIGKILL, so a half-written file is a
+    realistic on-disk state. Reads treat it as a miss; writes can never produce
+    it in the first place.
+    """
+
+    def test_missing_file_is_a_miss(self, tmp_path):
+        assert historical._load_json_cache(tmp_path / "nope.json") is None
+
+    def test_roundtrip(self, tmp_path):
+        path = tmp_path / "sub" / "cache.json"  # parent dirs created on save
+        historical._save_json_cache(path, {"a": [1, 2]})
+        assert historical._load_json_cache(path) == {"a": [1, 2]}
+
+    def test_corrupt_file_is_a_miss_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "cache.json"
+        path.write_text('[{"ticker": "T1"')  # truncated mid-write
+        with caplog.at_level(logging.WARNING):
+            assert historical._load_json_cache(path) is None
+        assert any("Corrupt JSON cache" in r.getMessage() and "cache.json" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_leftover_tmp_without_real_file_is_a_miss(self, tmp_path):
+        # A run killed between the tmp write and the rename leaves only the
+        # sidecar. The real path is still absent, so this is a plain miss —
+        # the partial tmp must never be read as if it were the cache.
+        path = tmp_path / "cache.json"
+        path.with_name(path.name + ".tmp").write_text('[{"ticker": "T1"')
+        assert historical._load_json_cache(path) is None
+
+    def test_serializer_failure_leaves_no_partial_file(self, tmp_path):
+        # json.dumps calls default=str for unserializable values; this one
+        # explodes there, i.e. mid-save.
+        class _Boom:
+            def __str__(self):
+                raise RuntimeError("serializer blew up")
+
+        path = tmp_path / "cache.json"
+        historical._save_json_cache(path, {"good": 1})
+        with pytest.raises(RuntimeError):
+            historical._save_json_cache(path, {"bad": _Boom()})
+        # The previously good file is intact — no truncation in place.
+        assert historical._load_json_cache(path) == {"good": 1}
+
+    def test_write_crash_never_reaches_the_real_path(self, tmp_path, monkeypatch):
+        # Simulate the disk-full / SIGKILL case: half the bytes land, then the
+        # write raises. With tmp+replace, the damaged bytes are confined to the
+        # sidecar and the real path never becomes visible-but-truncated.
+        real_write_text = Path.write_text
+
+        def half_then_die(self, data, *args, **kwargs):
+            real_write_text(self, data[: len(data) // 2])
+            raise OSError("no space left on device")
+
+        path = tmp_path / "cache.json"
+        monkeypatch.setattr(Path, "write_text", half_then_die)
+        with pytest.raises(OSError):
+            historical._save_json_cache(path, {"ticker": "T1", "candles": [1, 2, 3]})
+        monkeypatch.undo()
+
+        assert not path.exists()
+        assert historical._load_json_cache(path) is None
+
+
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
                         legacy_format=False) -> MagicMock:
     """Patch _signed_raw_get to serve one raw candlestick page.
@@ -1242,6 +1435,30 @@ class TestFetchCandlesticks:
         )
         assert fetch.call_count == 1
         assert out[0]["ts"] == 1_700_000_000
+
+    def test_corrupt_cache_falls_through_to_refetch(self, tmp_path, monkeypatch, caplog):
+        # BS-08: the per-ticker cache read used to be a bare json.loads OUTSIDE
+        # the fetch try-block, so one truncated file raised straight out of a
+        # candlestick worker thread and killed the whole backtest. A damaged
+        # file must behave exactly like a cache miss.
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        (candles_dir / "T1.json").write_text(
+            '{"open_ts": 0, "close_ts": 1000, "period_interval": 60, "candles": [{"ts"'
+        )
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+            )
+
+        assert fetch.call_count == 1
+        assert out[0]["ts"] == 1_700_000_000
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # The refetch rewrites the file in the current tagged format.
+        assert json.loads((candles_dir / "T1.json").read_text())["candles"] == out
 
     def test_use_cache_false_still_persists_fetch_to_disk(self, tmp_path, monkeypatch):
         # Regression: use_cache=False (--no-cache) must still refresh the disk
