@@ -75,6 +75,7 @@ from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
 from .config import (
     ARCHIVE_MAX_BARREN_PAGES,
+    ARCHIVE_TAIL_MAX_PAGES,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
@@ -1496,12 +1497,23 @@ def _fetch_archive_tail(
     such a page shows up almost immediately — the old rule killed the tail
     after one or two pages and silently dropped long-lived in-window settlers.
 
+    That barren rule only bounds depth PAST the last productive page, though: a
+    single long-dated in-window settlement resets the counter, so the walk is
+    additionally capped at ARCHIVE_TAIL_MAX_PAGES total pages. This tail is
+    serial (one 1000-record request at a time) and is never persisted as a day
+    slice, so it is re-paid on every run — an unbounded version can crawl most
+    of created-time history. Hitting the cap logs a WARNING and truncates.
+
     Args:
         hist_client (Any): Authenticated KalshiClient.
         start_ts (int): Backtest window start, epoch seconds (UTC midnight).
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
-        progress (_FetchProgress): Shared page counter for log output.
+        progress (_FetchProgress): Page counter for log output. The caller
+            passes a progress object labeled for the TAIL specifically — these
+            pages are not day-slice pages, and CLAUDE.md's progress-label rule
+            means a shared "[sharded]" label would make a stalled tail
+            indistinguishable in the log from a stalled day-slice pool.
 
     Returns:
         list[dict]: Compact market dicts created before start_ts that settled
@@ -1515,9 +1527,11 @@ def _fetch_archive_tail(
     kept: list[dict] = []
     first_page = True
     barren = 0
+    pages = 0
     while True:
         data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
                                cursor=cursor, **hist_kwargs)
+        pages += 1
         page = data.get("markets") or []
         if first_page and page:
             newest = _iso_epoch(page[0].get("created_time"))
@@ -1560,6 +1574,19 @@ def _fetch_archive_tail(
                 "Historical archive tail: %d consecutive pages with no in-window "
                 "settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping pagination",
                 barren,
+            )
+            return kept
+        # Absolute depth backstop: the barren rule above only bounds depth past
+        # the last PRODUCTIVE page, so one long-dated in-window settlement
+        # resets it and the serial, uncached tail keeps crawling.
+        if pages >= ARCHIVE_TAIL_MAX_PAGES:
+            logging.warning(
+                "Historical archive tail: reached the %d-page cap "
+                "(ARCHIVE_TAIL_MAX_PAGES) after walking %d pages below "
+                "created_time == start_date — stopping. Very long-lived markets "
+                "created deeper than this that settle inside the window may be "
+                "missed; raise ARCHIVE_TAIL_MAX_PAGES if a run needs them.",
+                ARCHIVE_TAIL_MAX_PAGES, pages,
             )
             return kept
         cursor = next_cursor
@@ -1822,7 +1849,13 @@ def _fetch_archive_phase(
 
         # Long-lived markets created before start_date but settling inside the
         # window — same records the sequential walk picked up past start_ts.
-        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+        # Its own progress object, labeled "[tail]": these pages are a serial
+        # walk, not day-slice pages, and sharing the "[sharded]" counter made a
+        # slow tail read in the log as a slow (parallel) slice pool — exactly
+        # the label ambiguity CLAUDE.md calls load-bearing for diagnosis.
+        tail_progress = _FetchProgress("Historical archive [tail]")
+        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs,
+                                   tail_progress)
 
         return _assemble_day_slices("archive_days", on_disk, expect_meta, keep), tail
     except _ShardedFetchUnsupported as exc:

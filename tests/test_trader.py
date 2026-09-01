@@ -81,9 +81,11 @@ def positions_seq(*readings) -> MagicMock:
 
     Each element is either a (ticker, position) tuple, None for "no position
     on file", or an Exception instance to raise for that call. _execute_one
-    reads the position once before each submission and once more after an
-    ambiguous one, so the script is consumed in that order:
-        before_a, [after_a], before_b, [after_b]
+    reads BOTH baselines up front — before either order is submitted, so no
+    blocking call sits in the unhedged window between leg A's fill and leg B's
+    submission — and then once more after an ambiguous leg, so the script is
+    consumed in that order:
+        before_a, before_b, [after_a], [after_b]
 
     A flat return_value cannot express this: before and after would be equal,
     which is precisely the delta-0 "confirmed non-fill" case.
@@ -241,13 +243,38 @@ class TestRollbackVerification:
         client.create_order_without_preload_content = MagicMock(
             return_value=order_resp("canceled")
         )
-        client.get_positions_without_preload_content = positions_seq(None)
+        client.get_positions_without_preload_content = positions_seq(None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert "Leg A FoK not filled" in result.error
         assert client.create_order_without_preload_content.call_count == 1
-        # Only the pre-submission baseline was read
-        assert client.get_positions_without_preload_content.call_count == 1
+        # Only the two up-front baselines were read — no ambiguity snapshot
+        assert client.get_positions_without_preload_content.call_count == 2
+
+    def test_both_baselines_are_read_before_any_order_is_submitted(self):
+        # The unhedged window is the gap between leg A's fill and leg B's
+        # submission. A position read in there is a blocking network call that
+        # can burn the full ~62s retry schedule while the account holds a naked
+        # NO on market A, so BOTH baselines must be taken up front. Leg B's is
+        # equally valid there: it reads a different ticker, and no fill on that
+        # ticker can have happened yet.
+        calls: list[str] = []
+
+        def record_positions(*args, **kwargs):
+            calls.append("positions")
+            return positions_resp()
+
+        def record_order(*args, **kwargs):
+            calls.append("order")
+            return order_resp("executed")
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=record_positions)
+        client.create_order_without_preload_content = MagicMock(side_effect=record_order)
+
+        result = _execute_one(client, make_spec())
+        assert result.status == "executed"
+        assert calls == ["positions", "positions", "order", "order"]
 
 
 class TestLegAExceptionDisambiguation:
@@ -257,7 +284,8 @@ class TestLegAExceptionDisambiguation:
         # Exception + position unchanged → confirmed non-fill, no rollback sent
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
-        client.get_positions_without_preload_content = positions_seq(None, None)
+        # before_a, before_b (both up front), then after_a
+        client.get_positions_without_preload_content = positions_seq(None, None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert client.create_order_without_preload_content.call_count == 1
@@ -270,8 +298,9 @@ class TestLegAExceptionDisambiguation:
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
-            ("TICK-A", -10),   # before
-            ("TICK-A", -10),   # after — unmoved
+            ("TICK-A", -10),   # before_a
+            None,              # before_b (taken up front, unused here)
+            ("TICK-A", -10),   # after_a — unmoved
         )
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
@@ -288,8 +317,9 @@ class TestLegAExceptionDisambiguation:
             order_resp("executed"),   # rollback fills
         ])
         client.get_positions_without_preload_content = positions_seq(
-            ("TICK-A", -10),   # before
-            ("TICK-A", -15),   # after — moved by -5 == -spec.x
+            ("TICK-A", -10),   # before_a
+            None,              # before_b (taken up front, unused here)
+            ("TICK-A", -15),   # after_a — moved by -5 == -spec.x
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
@@ -303,8 +333,9 @@ class TestLegAExceptionDisambiguation:
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
-            ("TICK-A", 0),
-            ("TICK-A", -3),    # -3, but spec.x is 7
+            ("TICK-A", 0),     # before_a
+            None,              # before_b (taken up front, unused here)
+            ("TICK-A", -3),    # after_a — -3, but spec.x is 7
         )
         result = _execute_one(client, make_spec(x=7))
         assert result.status == "manual_review"
@@ -324,15 +355,16 @@ class TestLegAExceptionDisambiguation:
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
-            None,
-            RuntimeError("lookup failed"),   # non-retryable → must fail fast
+            None,                            # before_a
+            None,                            # before_b (taken up front)
+            RuntimeError("lookup failed"),   # after_a — non-retryable → fail fast
         )
         with patch.object(_http.time, "sleep") as sleep:
             result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert "delta=None" in result.error
         assert client.create_order_without_preload_content.call_count == 1
-        assert client.get_positions_without_preload_content.call_count == 2
+        assert client.get_positions_without_preload_content.call_count == 3
         sleep.assert_not_called()
 
 

@@ -1138,9 +1138,12 @@ class TestRunBacktestFeasibilityPreCheck:
         monkeypatch.setattr(backtester, "fetch_all_settled_markets", _boom)
 
     def test_start_date_equal_to_today_is_infeasible(self, monkeypatch, caplog):
-        # start_date == today: _find_entry's scan window ends at today - 1 day,
-        # so today itself can never host a checkpoint, and today - 1 day is
-        # strictly before start_date — the range is empty by construction.
+        # start_date == today on a NON-Monday: the window is the single day
+        # [Friday, Friday], which contains no Monday checkpoint at all. (The
+        # guard's window now ends at today rather than yesterday, since a
+        # market that settled early can carry a future close_time and make
+        # today a legitimate checkpoint — so "today" being a Monday would be a
+        # feasible window; see test_today_is_monday_is_feasible.)
         today = date(2026, 8, 28)  # a Friday
         self._freeze(monkeypatch, today)
         self._fetch_should_not_be_called(monkeypatch)
@@ -1157,9 +1160,9 @@ class TestRunBacktestFeasibilityPreCheck:
                    for r in caplog.records if r.levelname == "WARNING")
 
     def test_no_monday_falls_in_a_short_midweek_window(self, monkeypatch, caplog):
-        # Tuesday start, "today" the following Friday: the feasible range is
-        # [Tue, Thu] (today - 1 day), which contains no Monday at all — the
-        # next Monday doesn't arrive until after "today".
+        # Tuesday start, "today" the same-week Friday: the range [Tue, Fri]
+        # contains no Monday at all — the next Monday doesn't arrive until
+        # after "today".
         start = date(2026, 8, 25)  # Tuesday
         today = date(2026, 8, 28)  # Friday, same week
         self._freeze(monkeypatch, today)
@@ -1188,5 +1191,22 @@ class TestRunBacktestFeasibilityPreCheck:
 
         run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
                      start_date=date(2026, 8, 10), initial_balance=1000.0)
+
+        assert called == [True]
+
+    def test_today_is_monday_is_feasible(self, monkeypatch):
+        # Today IS the only Monday in the window. The guard used to end the
+        # window at today - 1 day and wrongly skipped this run — but a market
+        # that settled early can carry a close_time in the future, which makes
+        # today a legitimate checkpoint. The guard is only for the
+        # structurally-impossible case, so it must not fire here.
+        today = date(2026, 8, 31)  # Monday
+        self._freeze(monkeypatch, today)
+        called = []
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: called.append(True) or [])
+
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 8, 26), initial_balance=1000.0)
 
         assert called == [True]

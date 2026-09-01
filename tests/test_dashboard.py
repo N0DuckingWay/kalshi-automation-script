@@ -93,6 +93,15 @@ class TestMaxDrawdown:
         result = _max_drawdown(series)
         assert result == (0.0, None)
 
+    def test_all_zero_series_returns_zero_and_none(self):
+        # Every point is 0/0 after the cummax division, so the drawdown series
+        # is all-NaN even though the equity series itself is not — idxmin()
+        # would raise ValueError without the post-division guard.
+        idx = [date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)]
+        series = pd.Series([0.0, 0.0, 0.0], index=idx)
+        result = _max_drawdown(series)
+        assert result == (0.0, None)
+
     def test_normal_declining_series_reports_negative_drawdown(self):
         idx = [date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3), date(2026, 1, 4)]
         series = pd.Series([100.0, 120.0, 90.0, 110.0], index=idx)

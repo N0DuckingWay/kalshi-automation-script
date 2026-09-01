@@ -283,6 +283,20 @@ MVE_MAX_EMPTY_PAGES = 25
 # page that produced anything.
 ARCHIVE_MAX_BARREN_PAGES = 50
 
+# Absolute ceiling on how many pages the archive TAIL walk (the sequential
+# downward walk below created_time == start_date, historical._fetch_archive_tail)
+# may request — roughly 2M records of created-time depth below start_date at the
+# archive's 1000-record page cap. ARCHIVE_MAX_BARREN_PAGES above is the PRIMARY
+# stop rule; this is the backstop, because that rule only bounds depth PAST the
+# last productive page: a single long-dated in-window settlement resets the
+# barren counter, so without a ceiling the tail can crawl most of created-time
+# history one serial request at a time, uncached, on every run. When the cap is
+# hit, a WARNING names how many pages were walked and that very-long-lived
+# pre-start markets beyond it may be missed — the same bounded-scan idiom as
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS (bound the work, then say loudly what the
+# bound cost).
+ARCHIVE_TAIL_MAX_PAGES = 2000
+
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE
 # loops, get_held_tickers). A live dev-mode run paged 125,538 sandbox markets

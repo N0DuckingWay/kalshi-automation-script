@@ -272,8 +272,14 @@ markets — ones created before `--start-date` that settled inside the window.
 The archive is ordered by creation time, and the old walk stopped too early to
 reach them. Run the backtest once with `--no-cache` to rebuild those assembled
 files; the per-day slice files under `archive_days/` and `live_days/` are
-unaffected and are reused, and the tail walk that collects these markets is
-never slice-cached, so the refresh is cheap.
+unaffected and are reused, so the rebuild re-pays only the tail walk. That tail
+is *not* free: it is never slice-cached, so it is a sequential, one-page-at-a-
+time walk down created-time history that is re-paid on **every** run, rebuild or
+not. It stops after `ARCHIVE_MAX_BARREN_PAGES` (50) consecutive pages with no
+in-window settlement, and — because a single long-dated settler resets that
+counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (2000) pages total, which
+logs a WARNING when hit (markets created deeper than that may be missed; raise
+the constant if a run needs them).
 
 Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
 parallel workers, one independent request per ticker. Cache files are keyed per
@@ -291,7 +297,22 @@ cutoff has no price data for any of its tickers and produces no trades.
 python3 -m kalshi_betting.scheduler
 ```
 
-Runs the production bot every Monday at 09:00 in a blocking loop. The log also prints the equivalent `crontab` entry if you prefer cron.
+Runs the production bot every Monday at 09:00 (local time) in a blocking loop, each run spawned as a `python3 -m kalshi_betting.main --mode prod` subprocess and killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` (3600s). The log also prints the equivalent `crontab` entry if you prefer cron.
+
+**Slot record and startup catch-up.** Each run claims its Monday-09:00 slot in `scheduler_state.json` (repo root) *before* spawning the subprocess and finalizes the record — `finished_at`, `exit_code` — on every exit path, including timeout and spawn failure. On startup, the daemon compares the most recent Monday-09:00 slot against that record: if the slot has **no** recorded attempt (daemon not running when it came around — never started, crashed, host rebooted, mid-deploy), it runs a catch-up job immediately rather than waiting up to a week for the next Monday. A slot whose recorded attempt merely *failed* is not retried; only a slot with no attempt at all triggers catch-up.
+
+> ⚠️ **The first daemon start after this upgrade immediately runs a live production trade.** `scheduler_state.json` does not exist yet, so the startup check sees no record for the most recent Monday slot and fires a real `--mode prod` run right away — not at the next Monday 09:00. The same applies to **any** restart after a Monday 09:00 slot passed while the daemon was down. Start the daemon only when you are prepared for it to trade immediately; if you are not, run `python3 -m kalshi_betting.main --mode prod --dry-run` first to confirm what it would do.
+
+**Process exit codes.** `main.py`'s exit code is the only signal the scheduler has for what happened inside a run:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | `EXIT_OK` — run completed (including a clean run that found no qualifying pairs) |
+| `10` | `EXIT_SKIPPED_LOW_BALANCE` — run skipped because the account balance was below the minimum |
+| `20` | `EXIT_TRADES_NEED_ATTENTION` — at least one trade came back `rollback_failed` or `manual_review`; **a human must check the account and trade log** |
+| `1`  | Unhandled exception — the interpreter's default for a crash; not part of the contract above |
+
+The constants live in `config.py` (`EXIT_OK` / `EXIT_SKIPPED_LOW_BALANCE` / `EXIT_TRADES_NEED_ATTENTION`) and the scheduler maps each to a distinct log level and message, so a low-balance skip or a manual-review run is never logged as "completed successfully".
 
 ---
 

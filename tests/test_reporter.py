@@ -144,3 +144,33 @@ class TestAppendToProdLog:
 
         # No .tmp residue from the fallback path either.
         assert not result_path.with_name(result_path.name + ".tmp").exists()
+
+    def test_lock_open_oserror_falls_back_without_raising(
+        self, reporter_paths, monkeypatch, caplog, tmp_path
+    ):
+        # A filesystem error while creating/opening the sidecar (read-only
+        # mount, permissions, ENOSPC) must not kill the save — it degrades to
+        # the lock-free standalone fallback file.
+        log_path, _ = reporter_paths
+
+        def boom(*args, **kwargs):
+            raise OSError(30, "Read-only file system")
+
+        # reporter's module globals are consulted before builtins, so this
+        # replaces only reporter's own open() call in _acquire_lock — openpyxl
+        # still saves normally through its own module's open().
+        monkeypatch.setattr(reporter, "open", boom, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            result_path = reporter.append_to_prod_log([make_result("x")], 50.0, 45.0)
+
+        assert result_path != log_path
+        assert not log_path.exists()
+        assert result_path.parent == tmp_path
+        assert result_path.name.startswith("trade_log_")
+        assert _count_data_rows(result_path) == 1
+
+        assert any(
+            rec.levelno == logging.WARNING and "Could not open lock file" in rec.message
+            for rec in caplog.records
+        )

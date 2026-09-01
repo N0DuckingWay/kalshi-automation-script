@@ -141,7 +141,13 @@ def verify_auth(client: KalshiClient) -> int:
     raw = data.get("balance")
     if raw is None:
         # Defensive drift fallback, mirroring the *_fp / *_dollars pattern
-        # used elsewhere (e.g. trader._position_count's position_fp fallback)
+        # used elsewhere (e.g. trader._position_count's position_fp fallback).
+        # NOTE: balance_fp is consumed here as CENTS, purely by analogy to
+        # position_fp (a stringified form of the same integer quantity the
+        # legacy field carried). It has NOT been verified against a live
+        # payload — if a real response ever exercises this branch, confirm the
+        # unit before trusting the number. balance_dollars IS dollars (the
+        # *_dollars convention is verified elsewhere), hence the × 100.
         raw = data.get("balance_fp")
         if raw is None and data.get("balance_dollars") is not None:
             raw = float(data["balance_dollars"]) * 100
@@ -149,6 +155,8 @@ def verify_auth(client: KalshiClient) -> int:
         raise KeyError(
             f"No recognizable balance field in get_balance response (keys: {sorted(data)})"
         )
-    balance = int(float(raw))
+    # round() before int(): float("2.03") * 100 == 202.99999999999997, which
+    # int() would truncate to 202 — a silent one-cent loss on the drift path.
+    balance = int(round(float(raw)))
     logging.info("Auth OK — balance: %d cents  ($%.2f)", balance, balance / 100)
     return balance

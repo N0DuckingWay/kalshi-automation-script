@@ -22,8 +22,10 @@ Purpose:
     An exception from create_order does NOT prove the order was rejected (a
     timeout can land after the fill), so exception paths consult the actual
     account position for the ticker before classifying the outcome. The check
-    is a DELTA: a snapshot is taken immediately before each submission and
-    compared against one taken after the exception, so the decision reflects
+    is a DELTA: baseline snapshots for both tickers are taken up front, before
+    either order is submitted (so no blocking call sits in the unhedged window
+    between leg A's fill and leg B's submission), and each is compared against
+    a reading taken after the exception, so the decision reflects
     what this order did rather than what the account happens to hold (an
     unrelated pre-existing holding in the same ticker used to read as "our leg
     filled", and an unrelated absence used to read as "our leg didn't").
@@ -463,11 +465,14 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
     however, is ambiguous — the order may have filled before a timeout — so
-    exception paths attribute the outcome by POSITION DELTA: a baseline
-    position is read immediately before each submission and compared with a
-    reading taken after the exception. Only the change is evidence about this
-    order; the absolute holding is not, because the account may already hold
-    contracts in the same ticker from an earlier run or a manual trade.
+    exception paths attribute the outcome by POSITION DELTA: baseline positions
+    for BOTH tickers are read up front, before any order is submitted, and are
+    compared with a reading taken after the exception. Only the change is
+    evidence about this order; the absolute holding is not, because the account
+    may already hold contracts in the same ticker from an earlier run or a
+    manual trade. Both baselines are taken before leg A precisely so that no
+    blocking network call sits between leg A's fill and leg B's submission —
+    that gap is the unhedged window.
 
     Leg A ambiguous resolves as: delta 0 → confirmed non-fill, status="failed";
     delta of exactly -spec.x (our NO buy) → unwind via _rollback_leg_a. Anything
@@ -498,10 +503,17 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker
     mB_title = spec.pair.market_b.title or spec.pair.market_b.ticker
 
-    # Baseline read taken as late as possible before submission, so an ambiguous
-    # outcome is judged by how the position MOVED rather than by what the
-    # account happens to hold (which may predate this bot entirely).
+    # Baselines for BOTH legs are read up front, before either order is
+    # submitted, so an ambiguous outcome is judged by how the position MOVED
+    # rather than by what the account happens to hold (which may predate this
+    # bot entirely). Leg B's baseline is equally valid here — it reads a
+    # different ticker, and no fill on market B can have happened yet — and
+    # taking it now means ZERO blocking network calls sit between leg A's fill
+    # and leg B's submission. Reading it after leg A filled put a retryable
+    # lookup (up to ~62s of backoff) inside the window where the account holds
+    # an unhedged NO position on market A.
     before_a = _position_count(client, spec.pair.market_a.ticker)
+    before_b = _position_count(client, spec.pair.market_b.ticker)
 
     # Submit leg A — NO on market A (raw-response endpoint; see _submit_order)
     leg_a_error: str | None = None
@@ -567,9 +579,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             error=f"Leg A ambiguous, delta={delta}: {leg_a_error}",
         )
 
-    # Leg A filled — baseline for leg B, same delta-attribution rationale
-    before_b = _position_count(client, spec.pair.market_b.ticker)
-
+    # Leg A filled — submit leg B immediately against the baseline already
+    # taken above (see the up-front baseline comment): nothing blocking runs
+    # between the fill and this submission.
     # Submit leg B — YES on market B (raw-response endpoint)
     leg_b_error: str | None = None
     leg_b_ambiguous = False

@@ -991,6 +991,63 @@ class TestShardedFetch:
                             _FakeLive(live_markets))
         assert "LONGLIVED" in {m["ticker"] for m in out_seq}
 
+    def test_tail_progress_logs_under_its_own_label(self, tmp_path, monkeypatch,
+                                                    caplog):
+        # CLAUDE.md: progress labels are load-bearing for diagnosis. The tail is
+        # a SERIAL walk, but it used to share the day-slice pool's progress
+        # object, so its pages logged as "[sharded]" — a stalled tail was
+        # indistinguishable in the log from a stalled (parallel) slice pool.
+        captured = {}
+        real_tail = historical._fetch_archive_tail
+
+        def spy(hist_client, start_ts, cutoff_ts, hist_kwargs, progress):
+            captured["progress"] = progress
+            return real_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+
+        monkeypatch.setattr(historical, "_fetch_archive_tail", spy)
+        archive_markets, live_markets = self._fixture_markets()
+        self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                  _FakeLive(live_markets))
+
+        progress = captured["progress"]
+        # The tail really did page through this progress object...
+        assert progress.pages > 0
+        # ...and it is not the day-slice pool's counter (a shared object would
+        # already be carrying the slice pages).
+        with caplog.at_level(logging.INFO):
+            # _FetchProgress only logs every 100 pages, so drive it to the next
+            # boundary and read the label off the line it emits.
+            for _ in range(100 - progress.pages % 100):
+                progress.tick(0)
+        lines = [r.getMessage() for r in caplog.records if "pages scanned" in r.getMessage()]
+        assert lines
+        assert all("Historical archive [tail]" in ln for ln in lines)
+        assert not any("[sharded]" in ln for ln in lines)
+
+    def test_tail_stops_at_the_absolute_page_cap(self, monkeypatch, caplog):
+        # The barren rule only bounds depth PAST the last productive page: every
+        # page here holds an in-window settlement, so the counter never rises
+        # and only ARCHIVE_TAIL_MAX_PAGES ends this serial, uncached walk.
+        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_PAGES", 3)
+        pages = [
+            # Created before start_date, settling inside the window → every page
+            # is "productive", so the barren counter stays at 0 throughout.
+            [_mk_raw_market(f"LL{i}", f"2026-06-04T2{i}:00:00Z",
+                            "2026-06-06T10:00:00Z")]
+            for i in range(3)
+        ] + [
+            # Beyond the cap: must never be requested (_PagedArchive asserts).
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        with caplog.at_level(logging.WARNING):
+            kept, calls = self._walk_paged(
+                monkeypatch, historical._fetch_archive_tail, pages,
+            )
+        assert kept == {"LL0", "LL1", "LL2"}
+        assert calls == 3
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+
     def _walk_paged(self, monkeypatch, walk, pages):
         """Run one archive walk against hand-built pages; return (kept, calls)."""
         paged = _PagedArchive(pages)
@@ -1450,6 +1507,9 @@ class TestProgressLabels:
         source = inspect.getsource(historical)
         assert 'Historical archive [sharded]' in source
         assert 'Historical archive [sequential]' in source
+        # The tail is a third distinct phase, serial and uncached — its pages
+        # must not be attributed to the parallel day-slice pool.
+        assert 'Historical archive [tail]' in source
         assert 'Live settled sweep [windowed]' in source
         assert 'Live settled sweep [sequential]' in source
         # No un-suffixed variant left behind.

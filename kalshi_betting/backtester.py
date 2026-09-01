@@ -810,16 +810,21 @@ def run_backtest(
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
     # Feasibility pre-check, BEFORE any network call: a trade can only ever be
-    # entered at a Monday 09:00 UTC checkpoint, and _find_entry()'s own scan
-    # window always ends at (min(close_a, close_b) - 1 day) — so a checkpoint
-    # dated today can never be scanned, and end_date must be "yesterday" here
-    # to match that. If [start_date, yesterday] contains no Monday at all, no
-    # trade can ever be entered by construction, no matter what the fetch
-    # returns — this is exactly the class of run that burned ~59 minutes
-    # fetching 9.2M records into a 2-byte assembled cache (0 markets survived
-    # the Monday-eligibility prefilter). Detecting it up front skips the fetch
-    # entirely instead of discovering it only after paying for it.
-    feasibility_end = date.today() - timedelta(days=1)
+    # entered at a Monday 09:00 UTC checkpoint. If [start_date, today] contains
+    # no Monday at all, no trade can ever be entered by construction, no matter
+    # what the fetch returns — this is exactly the class of run that burned ~59
+    # minutes fetching 9.2M records into a 2-byte assembled cache (0 markets
+    # survived the Monday-eligibility prefilter). Detecting it up front skips
+    # the fetch entirely instead of discovering it only after paying for it.
+    #
+    # The window end is today, NOT yesterday. _find_entry()'s per-pair scan
+    # ends at (min(close_a, close_b) - 1 day), but a market that settled early
+    # can still carry a close_time in the future, which makes TODAY a
+    # legitimate checkpoint for that pair. This guard exists only to catch the
+    # structurally-impossible case, so it must be strictly conservative: an
+    # over-tight end date would wrongly skip a real run (e.g. today is Monday
+    # and start_date is within the last week).
+    feasibility_end = date.today()
     if not _monday_timestamps(start_date, feasibility_end):
         logging.warning(
             "No Monday 09:00 UTC entry checkpoint exists in [%s, %s] — no "
@@ -1050,6 +1055,12 @@ def run_backtest(
         # closed, so (as live) the ticker is no longer blocked. Set difference
         # is safe because the conflict filter below guarantees a ticker is in
         # at most one open trade at a time.
+        # NOTE the `<= d` (not `< d`): a trade exiting ON date d frees its
+        # tickers for a later candidate entering that same date d. This is a
+        # deliberate symmetry with the cash rule directly above, which likewise
+        # returns that trade's settlement receipt on d — both resources are
+        # freed on exactly the same day, so a same-day re-entry is funded and
+        # unblocked together rather than one without the other.
         active_tickers.difference_update(tk for ed, tk in active_until if ed <= d)
         active_until = [(ed, tk) for ed, tk in active_until if ed > d]
 

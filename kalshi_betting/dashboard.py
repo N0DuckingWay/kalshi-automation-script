@@ -93,7 +93,9 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
             max_drawdown is the largest fractional decline from any prior peak
             (expressed as a negative number, e.g. -0.15 for a 15% drawdown),
             and trough_date is the index label at the trough. Returns (0.0, None)
-            if equity is empty or entirely NaN — there is no trough to report.
+            if equity is empty or entirely NaN, or if the drawdown series itself
+            is entirely NaN (e.g. an all-zero equity curve, where every point
+            divides 0 by a running peak of 0) — there is no trough to report.
     """
     # idxmin() raises ValueError on an empty or all-NaN Series rather than
     # returning None, so that case must be handled before calling it.
@@ -101,6 +103,11 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
         return 0.0, None
     rolling_max = equity.cummax()
     dd = (equity - rolling_max) / rolling_max
+    # An all-zero (or zero-peaked) curve makes every element 0/0 → NaN, so the
+    # emptiness check above is not sufficient: re-check AFTER the division so
+    # this function is total for any numeric input.
+    if dd.isna().all():
+        return 0.0, None
     max_dd = float(dd.min())
     when = dd.idxmin()
     return max_dd, when

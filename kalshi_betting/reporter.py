@@ -275,10 +275,24 @@ def _acquire_lock(lock_path: Path):
 
     Returns:
         The open file object holding the lock (caller must close it — via
-        _release_lock — when done), or None if the timeout elapsed first.
+        _release_lock — when done), or None if the timeout elapsed first or the
+        lock file could not be created/opened at all.
     """
-    lock_path.touch(exist_ok=True)
-    fh = open(lock_path, "r+")
+    # Creating/opening the sidecar must never be fatal: this is a coordination
+    # nicety, and an OSError here (read-only mount, permissions, ENOSPC, a
+    # directory in the way) previously escaped all the way out of
+    # append_to_prod_log and killed a save that would otherwise have gone
+    # through. Treat it as a failed acquisition — the caller's fallback path
+    # writes a standalone timestamped file, which needs no lock at all.
+    try:
+        lock_path.touch(exist_ok=True)
+        fh = open(lock_path, "r+")
+    except OSError as e:
+        logging.warning(
+            "Could not open lock file %s (%s) — proceeding without the lock",
+            lock_path, e,
+        )
+        return None
     deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
     while True:
         try:

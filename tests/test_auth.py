@@ -186,6 +186,16 @@ class TestVerifyAuth:
         with patch.object(_http.time, "sleep"):
             assert auth.verify_auth(client) == 25677
 
+    def test_balance_dollars_rounds_not_truncates(self):
+        # float("2.03") * 100 == 202.99999999999997; int() would truncate that
+        # to 202, silently losing a cent. verify_auth must round.
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            return_value=balance_resp(200, {"balance_dollars": "2.03"})
+        )
+        with patch.object(_http.time, "sleep"):
+            assert auth.verify_auth(client) == 203
+
     def test_retries_429_then_succeeds(self):
         client = MagicMock()
         client.get_balance_without_preload_content = MagicMock(
