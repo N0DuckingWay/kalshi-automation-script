@@ -251,9 +251,13 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
 
     Ticker-conflict filter: once a spec is chosen, both of its market tickers are
     marked used and no later spec that touches either ticker is selected. This
-    prevents a single market from being a leg in two overlapping pairs, matching
-    the "one active position per ticker" invariant that get_held_tickers enforces
-    across runs and that the backtester enforces in its Pass-2 filter.
+    prevents a single market from being a leg in two overlapping pairs within one
+    run. Across runs the same invariant is enforced by scanner.get_held_tickers(),
+    but only for as long as a position is OPEN: it queries positions with
+    count_filter="position", so a ticker drops out of the held set once its market
+    settles and may legitimately be entered again afterwards. The backtester's
+    Pass-2 filter mirrors exactly that — it blocks a ticker until its trade's exit
+    date and releases it there.
 
     At equal monthly profit ratios, same_title pairs rank above time_series because
     the same-title guarantee is simpler (identical questions must co-resolve) and

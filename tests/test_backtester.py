@@ -1,6 +1,7 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import time
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,10 +19,13 @@ from kalshi_betting.backtester import (
     _group_by_normalized_title,
     _pair_key,
     _parse_iso_date,
+    _parse_iso_datetime,
     _settlement_receipt,
     run_backtest,
 )
-from kalshi_betting.config import MAX_DEADLINE_GAP_DAYS
+from kalshi_betting.config import MAX_DEADLINE_GAP_DAYS, fee_leg_exact
+from kalshi_betting.scanner import CandidatePair
+from kalshi_betting.strategy import compute_trade
 
 
 def _md(ticker, event_ticker, title="", subtitle="", event_title=""):
@@ -347,6 +351,10 @@ class TestRunBacktestPnL:
         # Sized against the balance at entry, not hardcoded
         assert t.balance_at_entry == pytest.approx(1000.0)
         assert t.total_cost + t.fees <= 1000.0
+        # The fee-inclusive outlay must fit the Kelly budget it was sized
+        # against — fees ride on top of the contract cost, so this only holds
+        # because Pass 2 shrinks n (see TestKellyShrinkParity)
+        assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
         # Both YES → only the YES leg pays: receipt is exactly n dollars
         assert t.actual_payoff == pytest.approx(float(t.n))
         # Profit deducts cost and fees exactly once
@@ -394,6 +402,230 @@ class TestRunBacktestPnL:
         assert trades == []
 
 
+# Same-title fixture shared by the sizing-parity and malformed-timestamp tests:
+# SA is the expensive side (pA=0.70, nA=0.32), SB the cheap one (pB=0.55), both
+# resolving YES on 2026-02-01. These are the numbers TestRunBacktestPnL uses, so
+# the parity assertions below are pinned to the same trade that test checks.
+_PARITY_PA, _PARITY_NA, _PARITY_PB = 0.70, 0.32, 0.55
+
+
+def _same_title_markets(close_time_b: str = "2026-02-01T00:00:00+00:00") -> list[dict]:
+    """Two markets in one exact-title group; close_time_b is overridable so a
+    malformed timestamp can be injected on exactly one leg."""
+    return [
+        {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+         "title": "Q", "subtitle": "", "result": "yes",
+         "close_time": "2026-02-01T00:00:00+00:00",
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+         "title": "Q", "subtitle": "", "result": "yes",
+         "close_time": close_time_b,
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+    ]
+
+
+class TestKellyShrinkParity:
+    """Pass 2 must size a trade exactly like live strategy.compute_trade (BS-06).
+
+    The Kelly budget covers the CONTRACTS only — the exact ceiling-rounded taker
+    fees are charged on top — so the raw n = int(budget / (nA + pB)) systematically
+    overshoots the cap. compute_trade shrinks n until the fee-inclusive cost fits
+    (CLAUDE.md forbids removing that loop); the backtest skipped the shrink
+    entirely and only rejected trades that didn't fit the whole CASH balance, so
+    every simulated trade was sized slightly above the Kelly fraction it reported.
+    """
+
+    @staticmethod
+    def _live_n(balance_cents: int) -> int:
+        """The contract count live compute_trade picks for the same inputs."""
+        def _market(ticker):
+            # compute_trade only reads .close_time (for days_to_close, which
+            # doesn't affect n) and .ticker
+            return SimpleNamespace(
+                ticker=ticker, close_time=datetime.now(UTC) + timedelta(days=27),
+            )
+
+        pair = CandidatePair(
+            market_a=_market("SA"), market_b=_market("SB"),
+            pA=_PARITY_PA, pB=_PARITY_PB, nA=_PARITY_NA,
+            tradeable=True, canonical_title="Q", pair_type="same_title",
+            # 0 = not depth-capped, which is the only state the backtest can
+            # model (a backtest has candle closes, no orderbook)
+            max_contracts=0,
+        )
+        spec = compute_trade(pair, balance_cents)
+        assert spec is not None
+        return spec.x
+
+    def test_backtest_n_matches_compute_trade_n(self, monkeypatch):
+        candles = {
+            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
+            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: _same_title_markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+
+        # The load-bearing assertion: identical (nA, pB, kelly, balance) inputs
+        # must produce an identical contract count on both code paths.
+        assert t.n == self._live_n(100_000)
+
+        # Guard against a vacuous pass: the shrink loop must actually have bitten
+        # here, i.e. the un-shrunk n did NOT fit the Kelly budget once fees were
+        # added. (Pre-fix the backtest recorded exactly that raw n.)
+        budget = 1000.0 * t.kelly_fraction
+        raw_n = int(budget / (_PARITY_NA + _PARITY_PB))
+        assert raw_n > t.n
+        raw_cost = raw_n * (_PARITY_NA + _PARITY_PB)
+        raw_fees = fee_leg_exact(raw_n, _PARITY_NA) + fee_leg_exact(raw_n, _PARITY_PB)
+        assert raw_cost + raw_fees > budget
+        # ...and the chosen n does fit, which is the invariant being restored
+        assert t.total_cost + t.fees <= budget + 1e-9
+
+    def test_shrunk_size_still_respects_the_budget_fraction(self, monkeypatch):
+        # Second balance point, so the parity isn't an artifact of one number.
+        candles = {
+            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
+            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: _same_title_markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=250.0,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.n == self._live_n(25_000)
+        assert t.total_cost + t.fees <= 250.0 * t.kelly_fraction + 1e-9
+
+
+class TestRunBacktestMalformedTimestamps:
+    """A single market with an unparseable close_time must not kill a run.
+
+    The time-series extraction path already drops such members while windowing
+    by close date (TestExtractPairsWindowedEquivalence), but the same-title path
+    is naive and carries them straight into the candlestick fetch, where the
+    pre-pool window computation used a bare datetime.fromisoformat — on the main
+    thread, before any worker starts, so it aborted the whole backtest (BS-07).
+    """
+
+    def test_malformed_close_time_is_skipped_not_raised(self, monkeypatch, caplog):
+        markets = _same_title_markets(close_time_b="not-a-timestamp")
+        # Only SA has a fetchable window; a KeyError here would mean SB reached
+        # the fetch despite having no parseable close_time.
+        candles = {"SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)]}
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        with caplog.at_level("WARNING"):
+            trades, equity = run_backtest(
+                hist_client=MagicMock(), live_client=MagicMock(),
+                start_date=date(2026, 1, 1), initial_balance=1000.0,
+            )
+
+        # No trade: _find_entry can't derive a scan window for the bad leg
+        assert trades == []
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(1000.0)
+        # The dropped ticker is named, so an empty series can't be mistaken for
+        # "this market genuinely had no prices"
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("SB" in msg and "close_time" in msg for msg in warnings)
+
+
+class TestActiveTickerRelease:
+    """A ticker is blocked only while its position is OPEN (BS-24).
+
+    Live, scanner.get_held_tickers() reads positions with count_filter="position",
+    so a ticker leaves the blocked set the moment its market settles. The
+    backtest used to add tickers to active_tickers and never remove them, so one
+    early trade blocked that ticker for the entire remaining simulation.
+
+    Fixture: TX/TY share an exact title (same-title pair, entering at the first
+    Monday); TX/TZ share a normalized title with an 18-day deadline gap
+    (time-series pair, which can only enter at the second Monday because TZ has
+    no earlier candle). Both candidates therefore contain TX, at different entry
+    dates. TX settles before its close_time — an early determination, which is
+    what makes re-entry on a shared ticker reachable at all.
+    """
+
+    _M2 = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
+
+    @staticmethod
+    def _markets(tx_settlement: str) -> list[dict]:
+        return [
+            {"ticker": "TX", "event_ticker": "EX", "event_title": "EV",
+             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-02T00:00:00+00:00",
+             "settlement_ts": tx_settlement},
+            {"ticker": "TY", "event_ticker": "EY", "event_title": "EV",
+             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-01-20T00:00:00+00:00",
+             "settlement_ts": "2026-01-08T12:00:00+00:00"},
+            {"ticker": "TZ", "event_ticker": "EZ", "event_title": "EV",
+             "title": "Team wins by April 2026", "subtitle": "", "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-20T00:00:00+00:00",
+             "settlement_ts": "2026-02-20T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch, tx_settlement):
+        candles = {
+            # TX: expensive YES with a cheap NO — clears the same-title gap
+            # against TY and the 30% long-gap tier against TZ
+            "TX": [_candle(_MONDAY_TS, 0.90, 0.05)],
+            "TY": [_candle(_MONDAY_TS, 0.70, 0.30)],
+            # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
+            # enter until then
+            "TZ": [_candle(self._M2, 0.10, 0.90)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._markets(tx_settlement))
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        return trades
+
+    def test_ticker_is_reusable_once_its_trade_has_settled(self, monkeypatch):
+        # TX settles 2026-01-08, four days before the second pair's entry
+        trades = self._run(monkeypatch, "2026-01-08T12:00:00+00:00")
+        assert len(trades) == 2
+        first, second = trades
+        assert (first.pair_type, first.ticker_a, first.ticker_b) == ("same_title", "TX", "TY")
+        assert first.entry_date == date(2026, 1, 5)
+        assert first.exit_date == date(2026, 1, 8)
+        # Same ticker, entered again after the first position closed
+        assert (second.pair_type, second.ticker_a, second.ticker_b) == ("time_series", "TX", "TZ")
+        assert second.entry_date == date(2026, 1, 12)
+        assert second.entry_date > first.exit_date
+
+    def test_ticker_stays_blocked_while_its_trade_is_open(self, monkeypatch):
+        # Only change: TX settles 2026-02-02, i.e. AFTER the second pair's
+        # entry date — the positions would overlap, so the second is skipped
+        trades = self._run(monkeypatch, "2026-02-02T12:00:00+00:00")
+        assert len(trades) == 1
+        assert trades[0].pair_type == "same_title"
+        assert trades[0].exit_date == date(2026, 2, 2)
+
+
 # Anchor Monday reused across the eligibility-prefilter tests below — matches
 # _MONDAY_TS's 2026-01-05 anchor so date arithmetic stays consistent with the
 # rest of this file. All offsets are computed with timedelta so weekday
@@ -425,6 +657,30 @@ class TestParseIsoDate:
 
     def test_unparseable_string_returns_none(self):
         assert _parse_iso_date("not-a-date") is None
+
+
+class TestParseIsoDatetime:
+    """Sibling of _parse_iso_date that keeps the time-of-day the candlestick
+    fetch window needs — truncating to midnight would move the window."""
+
+    def test_parses_valid_iso_string_with_time(self):
+        assert _parse_iso_datetime("2026-01-05T09:30:00+00:00") == datetime(
+            2026, 1, 5, 9, 30, tzinfo=UTC
+        )
+
+    def test_keeps_time_of_day_that_the_date_helper_drops(self):
+        value = "2026-01-05T23:45:00+00:00"
+        assert _parse_iso_datetime(value).hour == 23
+        assert _parse_iso_date(value) == date(2026, 1, 5)
+
+    def test_none_returns_none(self):
+        assert _parse_iso_datetime(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_iso_datetime("") is None
+
+    def test_unparseable_string_returns_none(self):
+        assert _parse_iso_datetime("not-a-timestamp") is None
 
 
 class TestCanEverEnter:

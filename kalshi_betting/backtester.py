@@ -25,8 +25,11 @@ Notes:
     ENTRY-TIME expected return, never realized results), maintains a running cash
     balance — sizing each trade against the cash available at entry and releasing
     settlement receipts on exit dates — and applies a greedy ticker-conflict filter
-    so each market ticker appears in at most one trade. This mirrors the live bot's
-    Kelly sizing against the current balance and its no-re-entry rule.
+    so each market ticker appears in at most one OPEN trade at a time (the ticker
+    is released on its trade's exit date, alongside the cash). This mirrors the
+    live bot's Kelly sizing against the current balance and its one-active-
+    position-per-ticker rule: get_held_tickers() reads positions with
+    count_filter="position", so a settled ticker leaves the blocked set live too.
 
     Before grouping, run_backtest() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
@@ -204,6 +207,33 @@ def _parse_iso_date(value: str | None) -> date | None:
         return None
     try:
         return datetime.fromisoformat(value).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    """
+    Parse an ISO 8601 timestamp string to a datetime, tolerating missing/bad input.
+
+    Sibling of _parse_iso_date for the callers that need the time-of-day
+    component, which the date-only helper throws away: the candlestick fetch
+    window is expressed in unix seconds, so truncating a close_time to midnight
+    would silently move the window. Same "can't parse it → treat as unknown,
+    not an error" contract as _parse_iso_date.
+
+    Args:
+        value (str | None): An ISO 8601 timestamp string (e.g. "close_time"
+            from a market dict), or None/empty if absent.
+
+    Returns:
+        datetime | None: The parsed datetime (naive or aware, exactly as the
+            string expressed it), or None if value is falsy or fails to parse.
+            Never raises.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
 
@@ -498,16 +528,17 @@ def _find_entry(
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB" (float),
             "nA" (float), "mA" (dict), "mB" (dict) for the first qualifying Monday.
-            Returns None if no qualifying Monday was found in the scan window.
+            Returns None if no qualifying Monday was found in the scan window, or
+            if either leg's close_time is missing or unparseable (no scan window
+            can be derived, so the pair is simply not enterable).
     """
-    # Both markets must have a close_time; without it we can't determine the scan window
-    if mA.get("close_time"):
-        close_a = datetime.fromisoformat(mA["close_time"]).date()
-    else:
-        return None
-    if mB.get("close_time"):
-        close_b = datetime.fromisoformat(mB["close_time"]).date()
-    else:
+    # Both markets must have a PARSEABLE close_time; without one we can't
+    # determine the scan window. A malformed timestamp is treated exactly like
+    # a missing one (the file-wide "can't parse it = unknown, not an error"
+    # convention) rather than raising out of the caller's candidate loop.
+    close_a = _parse_iso_date(mA.get("close_time"))
+    close_b = _parse_iso_date(mB.get("close_time"))
+    if close_a is None or close_b is None:
         return None
 
     # Scan up to (but not including) the day the earlier market closes —
@@ -635,7 +666,10 @@ def _fetch_candles_parallel(
     inside api_call_with_retry.
 
     Markets with no close_time get an empty series without any HTTP call, which
-    is what the sequential version did — there is no window to request.
+    is what the sequential version did — there is no window to request. A
+    present-but-unparseable close_time is handled the same way (with a warning):
+    it is a data defect in one market, not a reason to abort the whole run from
+    the main thread before any worker starts.
 
     Worker exceptions are deliberately NOT caught: fetch_candlesticks already
     fail-softs network errors to an empty list internally, so anything that
@@ -656,7 +690,7 @@ def _fetch_candles_parallel(
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
         no_ask_close). Every key of needed_tickers is present; the value is an
-        empty list for markets with no usable close_time.
+        empty list for markets with no usable (missing or unparseable) close_time.
 
     Raises:
         Exception: Whatever a worker's fetch_candlesticks call raises, after
@@ -677,7 +711,19 @@ def _fetch_candles_parallel(
         if not close_time:
             candles_by_ticker[ticker] = []
             continue
-        close_dt = datetime.fromisoformat(close_time)
+        close_dt = _parse_iso_datetime(close_time)
+        if close_dt is None:
+            # A malformed timestamp yields no requestable window, exactly like a
+            # missing one — resolve the ticker to an empty series instead of
+            # raising on the main thread and killing a multi-hour run. Logged
+            # (not silent) because an empty series is otherwise indistinguishable
+            # from "this market genuinely has no price history".
+            logging.warning(
+                "Unparseable close_time %r for %s — fetching no candles for it",
+                close_time, ticker,
+            )
+            candles_by_ticker[ticker] = []
+            continue
         # close_ts: one day past market close to include the final candle
         close_ts = int(close_dt.timestamp()) + 86400
         work.append((ticker, close_ts))
@@ -864,11 +910,20 @@ def run_backtest(
         if outcome_a not in ("yes", "no") or outcome_b not in ("yes", "no"):
             continue
 
-        # Determine the exit date as the later of the two settlement timestamps
-        st_a = mA.get("settlement_ts")
-        st_b = mB.get("settlement_ts")
-        exit_date_a = datetime.fromisoformat(st_a).date() if st_a else entry_date
-        exit_date_b = datetime.fromisoformat(st_b).date() if st_b else entry_date
+        # Determine the exit date as the later of the two settlement timestamps.
+        # Belt-and-braces: fetch_all_settled_markets only keeps records that
+        # carry a settlement_ts, so a miss here should be impossible — but an
+        # unparseable value must not raise out of the candidate loop, and a
+        # candidate with no exit date can't be cash-simulated at all (its
+        # capital would be released on an invented day), so it is skipped.
+        exit_date_a = _parse_iso_date(mA.get("settlement_ts"))
+        exit_date_b = _parse_iso_date(mB.get("settlement_ts"))
+        if exit_date_a is None or exit_date_b is None:
+            logging.debug(
+                "Skipping candidate %s/%s: missing or unparseable settlement_ts",
+                mA.get("ticker"), mB.get("ticker"),
+            )
+            continue
         exit_date   = max(exit_date_a, exit_date_b)
 
         holding_days = max(1, (exit_date - entry_date).days)
@@ -877,8 +932,18 @@ def run_backtest(
         # using only information available at entry (entry prices and the market
         # close dates). Sorting Pass 2 by REALIZED returns would leak settlement
         # outcomes into trade selection (look-ahead bias).
-        close_a_d = datetime.fromisoformat(mA["close_time"]).date()
-        close_b_d = datetime.fromisoformat(mB["close_time"]).date()
+        # Belt-and-braces again: _find_entry already required a parseable
+        # close_time on both legs to derive its scan window, so neither guard
+        # can fire in practice — but a bare [...] index plus an unguarded
+        # fromisoformat would turn any future data drift into a mid-run crash.
+        close_a_d = _parse_iso_date(mA.get("close_time"))
+        close_b_d = _parse_iso_date(mB.get("close_time"))
+        if close_a_d is None or close_b_d is None:
+            logging.debug(
+                "Skipping candidate %s/%s: missing or unparseable close_time",
+                mA.get("ticker"), mB.get("ticker"),
+            )
+            continue
         expected_days = max(1, (max(close_a_d, close_b_d) - entry_date).days)
         entry_monthly_ratio = profit_ratio_entry * 30.0 / expected_days
 
@@ -930,20 +995,35 @@ def run_backtest(
     # is Kelly-sized against the cash available at its entry (like the live bot
     # sizing against the current account balance), and settlement receipts return
     # to cash on their exit dates. A ticker-conflict filter mirrors the live
-    # bot's no-re-entry rule.
+    # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
+    # rule comes from scanner.get_held_tickers(), which queries positions with
+    # count_filter="position" — so a ticker leaves the held set once its market
+    # settles and may be entered again. The backtest therefore holds a ticker
+    # only until its trade's exit date, released below on the same schedule as
+    # the settlement receipts.
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
     cash = initial_balance
     pending_exits: list[tuple[date, float]] = []  # (exit_date, settlement receipt)
+    # (exit_date, ticker) for every leg of a still-open trade — the release
+    # ledger for active_tickers, kept alongside pending_exits so cash and
+    # ticker availability are always freed on exactly the same day.
+    active_until: list[tuple[date, str]] = []
 
     for c in candidates:
         d = c["entry_date"]
         # Release settlement receipts from trades that exited on or before this entry
         cash += sum(amt for ed, amt in pending_exits if ed <= d)
         pending_exits = [(ed, amt) for ed, amt in pending_exits if ed > d]
+        # Release the tickers of those same settled trades — the position is
+        # closed, so (as live) the ticker is no longer blocked. Set difference
+        # is safe because the conflict filter below guarantees a ticker is in
+        # at most one open trade at a time.
+        active_tickers.difference_update(tk for ed, tk in active_until if ed <= d)
+        active_until = [(ed, tk) for ed, tk in active_until if ed > d]
 
         mA, mB = c["mA"], c["mB"]
-        # Skip if either ticker is already committed to an earlier trade
+        # Skip if either ticker is still committed to a trade that hasn't settled
         if mA["ticker"] in active_tickers or mB["ticker"] in active_tickers:
             continue
 
@@ -956,9 +1036,23 @@ def run_backtest(
             # Kelly budget can't afford one contract — live compute_trade skips too
             continue
 
+        # Mirror live compute_trade's shrink loop exactly (strategy.py): the
+        # budget above covers the CONTRACTS only, while the exact ceiling-rounded
+        # fees ride on top — so the raw n systematically overshoots the Kelly cap.
+        # Shrink until the fee-inclusive cost actually fits the Kelly budget.
+        # (No max_contracts analog here: the backtest has no orderbook depth to
+        # cap against, only candle closes.)
+        fee_a, fee_b = fee_leg_exact(n, nA), fee_leg_exact(n, pB)
+        while n > 0 and n * (nA + pB) + fee_a + fee_b > budget:
+            n -= 1
+            fee_a, fee_b = fee_leg_exact(n, nA), fee_leg_exact(n, pB)
+        if n < 1:
+            # Fees ate the entire Kelly budget — no contract count fits
+            continue
+
         total_cost = n * (nA + pB)
         # Exact ceiling-rounded taker fees for both legs, charged at entry
-        fees = fee_leg_exact(n, nA) + fee_leg_exact(n, pB)
+        fees = fee_a + fee_b
         # Guaranteed NET profit floor after exact fees — reject if the ceiling
         # rounding ate the margin (mirrors live compute_trade's min_payoff gate)
         expected_payoff = n * (1.0 - nA - pB) - fees
@@ -1010,9 +1104,12 @@ def run_backtest(
         cash -= invested
         pending_exits.append((c["exit_date"], receipt))
 
-        # Mark both tickers as active so no overlapping pair is added later
+        # Mark both tickers as active so no OVERLAPPING pair is added later;
+        # the release ledger frees them again on this trade's exit date.
         active_tickers.add(mA["ticker"])
         active_tickers.add(mB["ticker"])
+        active_until.append((c["exit_date"], mA["ticker"]))
+        active_until.append((c["exit_date"], mB["ticker"]))
 
     logging.info(
         "Backtest complete: %d trades, %d profitable",
