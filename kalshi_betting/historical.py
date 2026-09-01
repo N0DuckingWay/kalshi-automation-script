@@ -67,6 +67,7 @@ from urllib.parse import urlencode, urlparse
 from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
 from .config import (
+    ARCHIVE_MAX_BARREN_PAGES,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
@@ -1119,12 +1120,19 @@ def _fetch_archive_tail(
 
     The archive is ordered by created_time, not settlement time, so markets
     CREATED before start_date can still SETTLE inside the backtest window
-    (long-lived markets). The sequential walk caught those by keeping any
-    in-window settlement it passed until its settlement-based early stop
-    fired; this tail reproduces exactly that behavior — page downward from
-    created_time == start_ts, keep in-window settlements, and stop at the
-    first page whose newest record settled before start_ts (the original
-    early-stop rule).
+    (long-lived markets). The per-day slices cover everything created on or
+    after start_date; this tail is what collects those older-created records,
+    paging downward from created_time == start_ts.
+
+    Stop rule: no EXACT one exists on a created-ordered walk, because a market
+    created arbitrarily early can still settle in-window. The walk therefore
+    stops after ARCHIVE_MAX_BARREN_PAGES CONSECUTIVE pages that contain no
+    in-window settlement at all (or when the archive runs out of pages). It
+    deliberately does NOT stop at the first page whose newest-created record
+    settled pre-window: that record's settlement says nothing about the rest
+    of the page or about deeper pages, and since most markets are short-lived
+    such a page shows up almost immediately — the old rule killed the tail
+    after one or two pages and silently dropped long-lived in-window settlers.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
@@ -1144,6 +1152,7 @@ def _fetch_archive_tail(
     cursor = _encode_archive_cursor(start_ts, 0, _CURSOR_TICKER_SENTINEL)
     kept: list[dict] = []
     first_page = True
+    barren = 0
     while True:
         data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
                                cursor=cursor, **hist_kwargs)
@@ -1173,13 +1182,22 @@ def _fetch_archive_tail(
         next_cursor = data.get("cursor")
         if not next_cursor or not page:
             return kept
-        # Original early-stop rule: once even the newest record on a page
-        # settled before start_ts, deeper pages hold nothing collectible.
-        newest_settle = _iso_epoch(page[0].get("settlement_ts"))
-        if newest_settle is not None and newest_settle < start_ts:
+        # Productivity bail-out (see the stop-rule note in the docstring).
+        # Judged on ANY in-window settlement on the page, deliberately
+        # independent of the result/created_time keep filters above: a page
+        # made entirely of voided markets, or of records skipped because they
+        # belong to a day slice, still proves the walk is in productive
+        # created-time territory and must not trip the counter.
+        page_in_window = any(
+            s is not None and start_ts <= s < cutoff_ts
+            for s in (_iso_epoch(m.get("settlement_ts")) for m in page)
+        )
+        barren = 0 if page_in_window else barren + 1
+        if barren >= ARCHIVE_MAX_BARREN_PAGES:
             logging.info(
-                "Historical archive tail page predates the backtest window — "
-                "stopping pagination early"
+                "Historical archive tail: %d consecutive pages with no in-window "
+                "settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping pagination",
+                barren,
             )
             return kept
         cursor = next_cursor
@@ -1195,11 +1213,16 @@ def _fetch_archive_sequential(
     Original sequential archive walk — the sharding fallback path.
 
     Pages the archive from the top with the server-provided cursor chain,
-    keeping every binary market that settled within [start_ts, cutoff_ts),
-    and stops at the first page whose newest record settled before start_ts.
-    Relies only on documented pagination behavior, so it works even if the
-    cursor format drifts. Slow (one serial request per 1000 records) but
-    always correct.
+    keeping every binary market that settled within [start_ts, cutoff_ts).
+    Relies only on documented pagination behavior (never on cursor synthesis),
+    so it works even if the cursor format drifts — that is what makes it a
+    safe fallback. Slow: one serial request per 1000 records.
+
+    Completeness is bounded, not exact. The archive is ordered by created_time,
+    so a market created arbitrarily early can settle in-window and no page
+    proves that deeper pages hold nothing. The walk therefore stops after
+    ARCHIVE_MAX_BARREN_PAGES consecutive pages with no in-window settlement —
+    the same rule as _fetch_archive_tail, and for the same reason.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
@@ -1213,6 +1236,7 @@ def _fetch_archive_sequential(
     selected: list[dict] = []
     cursor = None
     page_no = 0
+    barren = 0
     while True:
         kwargs: dict = dict(hist_kwargs)
         # Include cursor for pages after the first to continue pagination
@@ -1237,17 +1261,24 @@ def _fetch_archive_sequential(
         # A None or empty cursor signals the last page
         if not cursor:
             break
-        # The archive walk must stop once a page lies entirely before the
-        # backtest window — the archive ignores settlement-time filters
-        # server-side, so without this the loop pages the full multi-million-
-        # market archive no matter how recent start_date is. The newest market
-        # on the page is its first entry; if even that predates start_ts,
-        # every later page is older still.
-        newest_epoch = _iso_epoch(page_markets[0].get("settlement_ts")) if page_markets else None
-        if newest_epoch is not None and newest_epoch < start_ts:
+        # The walk must be bounded somehow — the archive ignores settlement-time
+        # filters server-side, so without a stop rule the loop pages the full
+        # multi-million-market archive no matter how recent start_date is. It is
+        # ordered by created_time, though, so no page proves deeper pages are
+        # unproductive; bail out on sustained unproductiveness instead. Judged
+        # on ANY in-window settlement, independent of the result filter above,
+        # so a run of all-voided pages can't spuriously trip the counter.
+        page_in_window = any(
+            s is not None and start_ts <= s < cutoff_ts
+            for s in (_iso_epoch(m.get("settlement_ts")) for m in page_markets)
+        )
+        barren = 0 if page_in_window else barren + 1
+        if barren >= ARCHIVE_MAX_BARREN_PAGES:
             logging.info(
-                "Historical archive page predates the backtest window — "
-                "stopping pagination early"
+                "Historical archive [sequential]: %d consecutive pages with no "
+                "in-window settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping "
+                "pagination",
+                barren,
             )
             break
     return selected

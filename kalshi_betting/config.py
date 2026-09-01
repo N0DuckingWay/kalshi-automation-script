@@ -230,6 +230,24 @@ EVENT_TITLE_LISTING_MAX_BARREN_PAGES = 50
 # resumes automatically if the API starts sending nested markets again.
 MVE_MAX_EMPTY_PAGES = 25
 
+# Stop an archive walk (historical._fetch_archive_tail and
+# _fetch_archive_sequential) after this many CONSECUTIVE pages containing zero
+# settlements inside the backtest window.
+#
+# /historical/markets is ordered by created_time DESC, ticker DESC — NOT by
+# settlement time — so no EXACT stop rule exists: a market created arbitrarily
+# early can settle arbitrarily late, i.e. inside the window. The walks used to
+# stop at the first page whose FIRST record (the newest-CREATED one on that
+# page) settled before start_ts, which is not a valid proof that deeper pages
+# hold nothing: it silently dropped long-lived in-window settlers, and because
+# most Kalshi markets are short-lived it typically fired after one or two
+# pages. Since correctness can't be proven, bound the walk by productivity
+# instead — the same idiom as EVENT_TITLE_LISTING_MAX_BARREN_PAGES and
+# MVE_MAX_EMPTY_PAGES. At the archive's 1000-record page cap, 50 consecutive
+# barren pages is ~50k records of created-time depth searched past the last
+# page that produced anything.
+ARCHIVE_MAX_BARREN_PAGES = 50
+
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE
 # loops, get_held_tickers). A live dev-mode run paged 125,538 sandbox markets

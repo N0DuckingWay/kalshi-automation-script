@@ -242,6 +242,15 @@ present. An interrupted fetch resumes at day granularity, and `--no-cache`
 reuses the day slices (they cannot go stale — see CLAUDE.md), so a refresh only
 fetches the current day plus any days not yet on disk.
 
+**One-time cache rebuild (BS-02).** Assembled `settled_markets_*.json` files
+written before the archive stop rule was fixed can be missing *long-lived*
+markets — ones created before `--start-date` that settled inside the window.
+The archive is ordered by creation time, and the old walk stopped too early to
+reach them. Run the backtest once with `--no-cache` to rebuild those assembled
+files; the per-day slice files under `archive_days/` and `live_days/` are
+unaffected and are reused, and the tail walk that collects these markets is
+never slice-cached, so the refresh is cheap.
+
 Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
 parallel workers, one independent request per ticker. Cache files are keyed per
 ticker, so workers never contend for a path and any ticker already on disk is

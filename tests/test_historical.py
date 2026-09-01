@@ -440,14 +440,18 @@ class TestMarketToDict:
 
 
 class TestFetchAllSettledMarkets:
-    def test_archive_early_stop_and_dict_output(self, tmp_path, monkeypatch):
-        # The /historical/markets archive ignores settlement-time filters and
-        # is paged newest-first; the sequential walk must stop once a page
-        # predates start_date instead of walking the multi-million-market
-        # archive. These fake pages use opaque cursors and records without
-        # created_time, so the sharded path's synthesis check fails and the
-        # fetch exercises the sequential fallback — the path this early-stop
-        # rule lives on. Also verifies dicts flow through to the cached format.
+    def test_archive_pages_past_barren_page_and_dict_output(self, tmp_path, monkeypatch):
+        # The /historical/markets archive ignores settlement-time filters, so
+        # the sequential walk needs SOME stop rule or it walks the whole
+        # multi-million-market archive. BS-02: that rule is no longer "the
+        # first page whose newest-created record predates start_date" — the
+        # archive is created-ordered, so such a page proves nothing about
+        # deeper ones. The walk pages past it (up to ARCHIVE_MAX_BARREN_PAGES
+        # consecutive unproductive pages) and still collects the long-lived
+        # market behind it. These fake pages use opaque cursors and records
+        # without created_time, so the sharded path's synthesis check fails and
+        # the fetch exercises the sequential fallback — the path this stop rule
+        # lives on. Also verifies dicts flow through to the cached format.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
         monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
         from datetime import date
@@ -458,22 +462,25 @@ class TestFetchAllSettledMarkets:
                     "yes_bid_dollars": "0.38", "close_time": settled,
                     "settlement_ts": settled, "status": "finalized"}
 
-        # Archive pages newest-first: page1 in-window, page2 predates start_date
-        # entirely (cursor still set — the early stop must ignore it), then the
-        # live endpoint returns one post-cutoff market.
+        # Archive pages newest-CREATED first: page1 in-window, page2 predates
+        # start_date entirely (barren — but not a stop signal), page3 holds a
+        # long-lived in-window settler and ends the chain; then the live
+        # endpoint returns one post-cutoff market.
         pages = {
             "cutoff": {"market_settled_ts": "2026-03-01T00:00:00Z"},
             "hist1": {"markets": [market("IN-WINDOW", "2026-02-15T00:00:00Z")], "cursor": "C2"},
             "hist2": {"markets": [market("TOO-OLD", "2026-01-01T00:00:00Z")], "cursor": "C3"},
+            "hist3": {"markets": [market("LONGLIVED", "2026-02-20T00:00:00Z")], "cursor": None},
         }
         calls = {"hist": 0}
+        by_cursor = {"C2": pages["hist2"], "C3": pages["hist3"]}
 
         def fake_signed_get(client, path, **params):
             if path.endswith("/historical/cutoff"):
                 return _raw_resp(pages["cutoff"])
             assert path.endswith("/historical/markets")
             calls["hist"] += 1
-            return _raw_resp(pages["hist2"] if params.get("cursor") == "C2" else pages["hist1"])
+            return _raw_resp(by_cursor.get(params.get("cursor"), pages["hist1"]))
 
         monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
         live = MagicMock()
@@ -484,13 +491,13 @@ class TestFetchAllSettledMarkets:
         out = historical.fetch_all_settled_markets(
             MagicMock(), live, start_date=date(2026, 2, 1), use_cache=False,
         )
-        # 3 archive calls: 1 synthesis probe (fails — opaque cursor), then the
-        # sequential walk's page 1 and page 2. Early stop: page 2 (all
-        # pre-start) is fetched, detected, and pagination halts even though
-        # its cursor points at a page 3.
-        assert calls["hist"] == 3
+        # 4 archive calls: 1 synthesis probe (fails — opaque cursor), then the
+        # sequential walk's three pages. Page 2 is barren but its cursor is
+        # followed (one barren page is far below ARCHIVE_MAX_BARREN_PAGES);
+        # page 3's null cursor is what ends the walk.
+        assert calls["hist"] == 4
         tickers = {m["ticker"] for m in out}
-        assert tickers == {"IN-WINDOW", "RECENT"}
+        assert tickers == {"IN-WINDOW", "LONGLIVED", "RECENT"}
         # Output dicts carry the exact cached format
         m = next(mm for mm in out if mm["ticker"] == "IN-WINDOW")
         assert m["yes_ask_dollars"] == "0.40"
@@ -714,29 +721,62 @@ def _install_sharded_fakes(monkeypatch, tmp_path, archive, cutoff_iso):
     monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
 
 
-def _old_semantics_expected(archive_markets, live_markets, start_ts, cutoff_ts,
-                            page_size=3):
-    """Oracle: the ticker set the ORIGINAL sequential implementation returns —
-    walk the archive newest-first with the settlement early-stop rule, then
-    sweep the live endpoint from max(cutoff_ts, start_ts)."""
-    expected = set()
-    walk = sorted(archive_markets, key=_created_key, reverse=True)
-    for page_start in range(0, len(walk), page_size):
-        page = walk[page_start: page_start + page_size]
-        for m in page:
+def _expected_in_window(archive_markets, live_markets, start_ts, cutoff_ts):
+    """Oracle: ground truth computed DIRECTLY from the fixture records — every
+    binary market that settled inside the backtest window, whichever endpoint
+    serves it.
+
+    Deliberately not a re-implementation of the page walk. The previous oracle
+    replayed the walk's own early-stop rule, so it shared BS-02's bug (it
+    sorted by created_time DESC but stopped on a settlement comparison) and the
+    parity tests could never disagree with the code they were checking. Ground
+    truth here is a plain predicate over the fixture, so a walk that drops a
+    record now fails the test.
+
+    Archive side: result in ("yes", "no") and start_ts <= settle < cutoff_ts.
+    Live side: result in ("yes", "no") and settle >= max(cutoff_ts, start_ts) —
+    the live endpoint does not serve pre-cutoff settlements at all.
+    """
+    def _binary_settles_in(markets, lo, hi):
+        out = set()
+        for m in markets:
+            if m["result"] not in ("yes", "no"):
+                continue
             settle = historical._iso_epoch(m["settlement_ts"])
-            if (m["result"] in ("yes", "no") and settle is not None
-                    and start_ts <= settle < cutoff_ts):
-                expected.add(m["ticker"])
-        newest = historical._iso_epoch(page[0]["settlement_ts"])
-        if newest is not None and newest < start_ts:
-            break
-    live_min = max(cutoff_ts, start_ts)
-    for m in live_markets:
-        settle = historical._iso_epoch(m["settlement_ts"])
-        if m["result"] in ("yes", "no") and settle is not None and settle >= live_min:
-            expected.add(m["ticker"])
+            if settle is None:
+                continue
+            if lo <= settle and (hi is None or settle < hi):
+                out.add(m["ticker"])
+        return out
+
+    expected = _binary_settles_in(archive_markets, start_ts, cutoff_ts)
+    expected |= _binary_settles_in(live_markets, max(cutoff_ts, start_ts), None)
     return expected
+
+
+class _PagedArchive:
+    """Serves a fixed list of hand-built pages in order, ignoring the cursor.
+
+    Both archive walks are strictly linear (one cursor chain, no jumps once
+    started), so call N is page N. Used where the page BOUNDARIES themselves
+    are the thing under test — the stop rule counts pages, so the fixture has
+    to control exactly which records share one.
+    """
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = 0
+
+    def page(self, **_):
+        idx = self.calls
+        self.calls += 1
+        assert idx < len(self.pages), (
+            f"page {idx} requested — the walk paged past every page the "
+            f"fixture defines"
+        )
+        # Always advertise a next page: the stop rule, not exhaustion, is what
+        # must end the walk (the last page's cursor still points onward).
+        return {"markets": self.pages[idx], "cursor": f"CUR{idx + 1}"}
 
 
 class TestShardedFetch:
@@ -757,7 +797,16 @@ class TestShardedFetch:
         # multiple pages per day, a created_time tie, a non-binary result, a
         # record with no settlement_ts, a long-lived market created BEFORE
         # start_date settling inside the window (tail territory), and
-        # fast-settled pre-start markets that trigger the early stop.
+        # fast-settled pre-start markets.
+        #
+        # BS-02 arrangement (load-bearing): the five PRE* records sit between
+        # start_date and LONGLIVED in created order so that — at page_size 3,
+        # in BOTH the tail walk and the top-down sequential walk — LONGLIVED
+        # lands on the page immediately AFTER a page whose records all settled
+        # before the window. The old "stop when page[0] settled pre-window"
+        # rule therefore provably drops LONGLIVED on both paths; the
+        # barren-page rule finds it. Changing the count or the created_time
+        # ordering of the PRE* records breaks that alignment.
         archive = [
             # day 2026-06-09 (top day, 4 records → 2 pages at page_size 3)
             _mk_raw_market("A1", "2026-06-09T20:00:00.500000Z", "2026-06-09T22:00:00Z"),
@@ -773,9 +822,17 @@ class TestShardedFetch:
             _mk_raw_market("C1", "2026-06-06T08:00:00Z", "2026-06-06T09:00:00Z"),
             # day 2026-06-05 (bottom slice, record at the exact day boundary)
             _mk_raw_market("D1", "2026-06-05T00:00:00Z", "2026-06-05T02:00:00Z"),
-            # tail: created before start_date but settled inside the window
+            # Short-lived pre-window settlers created just below start_date:
+            # these fill the barren page that used to end both walks.
+            _mk_raw_market("PRE1", "2026-06-04T23:50:00Z", "2026-06-04T23:55:00Z"),
+            _mk_raw_market("PRE2", "2026-06-04T23:45:00Z", "2026-06-04T23:50:00Z"),
+            _mk_raw_market("PRE3", "2026-06-04T23:40:00Z", "2026-06-04T23:45:00Z"),
+            _mk_raw_market("PRE4", "2026-06-04T23:35:00Z", "2026-06-04T23:40:00Z"),
+            _mk_raw_market("PRE5", "2026-06-04T23:30:00Z", "2026-06-04T23:35:00Z"),
+            # tail: created before start_date but settled inside the window —
+            # reachable only by paging PAST the all-pre-window page above
             _mk_raw_market("LONGLIVED", "2026-06-04T23:00:00Z", "2026-06-06T10:00:00Z"),
-            # pre-start fast markets: settle before start → early stop fodder
+            # more pre-start fast markets below it
             _mk_raw_market("OLD1", "2026-06-04T20:00:00Z", "2026-06-04T21:00:00Z"),
             _mk_raw_market("OLD2", "2026-06-04T10:00:00Z", "2026-06-04T11:00:00Z"),
             _mk_raw_market("OLD3", "2026-06-03T10:00:00Z", "2026-06-03T11:00:00Z"),
@@ -804,18 +861,111 @@ class TestShardedFetch:
         live = _FakeLive(live_markets)
         out = self._run(monkeypatch, tmp_path, archive, live)
 
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
         assert {m["ticker"] for m in out} == expected
-        assert "LONGLIVED" in expected  # the tail case is actually exercised
+        # BS-02: the long-lived tail settler must be in the RESULT, not merely
+        # in the oracle's set — it sits behind an all-pre-window page that the
+        # old early-stop rule never paged past.
+        assert "LONGLIVED" in {m["ticker"] for m in out}
         # No duplicate tickers despite deliberately overlapping slice boundaries
         assert len(out) == len({m["ticker"] for m in out})
         # Compact dict format survives the day store round-trip
         a1 = next(m for m in out if m["ticker"] == "A1")
         assert a1["open_time"] == "2026-06-09T20:00:00.500000Z"
         assert a1["yes_ask_dollars"] == "0.40"
+
+    def test_tail_keeps_longlived_settlement_past_barren_page(self, tmp_path,
+                                                              monkeypatch):
+        # BS-02, headline regression. The archive is ordered by created_time,
+        # so page[0] is only the newest-CREATED record — its settlement time
+        # says nothing about the rest of the page, let alone deeper pages. The
+        # old rule stopped both walks at the first page whose page[0] settled
+        # pre-window, which (most markets being short-lived) fires almost
+        # immediately and silently drops long-lived in-window settlers.
+        # LONGLIVED is positioned one page BEHIND such a page in both walks.
+        archive_markets, live_markets = self._fixture_markets()
+
+        # Sharded path — the tail walk below created_time == start_date.
+        out = self._run(monkeypatch, tmp_path / "sharded",
+                        _FakeArchive(archive_markets), _FakeLive(live_markets))
+        assert "LONGLIVED" in {m["ticker"] for m in out}
+
+        # Sequential fallback — same rule, same fixture, top-down walk.
+        # Opaque cursors defeat cursor synthesis, forcing the fallback.
+        out_seq = self._run(monkeypatch, tmp_path / "sequential",
+                            _FakeArchive(archive_markets, opaque_cursors=True),
+                            _FakeLive(live_markets))
+        assert "LONGLIVED" in {m["ticker"] for m in out_seq}
+
+    def _walk_paged(self, monkeypatch, walk, pages):
+        """Run one archive walk against hand-built pages; return (kept, calls)."""
+        paged = _PagedArchive(pages)
+        monkeypatch.setattr(
+            historical, "_signed_raw_get",
+            lambda client, path, **params: _raw_resp(paged.page(**params)),
+        )
+        start_ts = self._ts(self.START + "T00:00:00+00:00")
+        cutoff_ts = self._ts(self.CUTOFF)
+        if walk is historical._fetch_archive_tail:
+            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000},
+                        historical._FetchProgress("test tail"))
+        else:
+            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000})
+        return {m["ticker"] for m in kept}, paged.calls
+
+    @pytest.mark.parametrize("walk", [
+        historical._fetch_archive_tail,
+        historical._fetch_archive_sequential,
+    ])
+    def test_archive_walk_stops_after_max_barren_pages(self, monkeypatch, walk):
+        # No exact stop rule exists on a created-ordered walk, so the walks are
+        # bounded by productivity instead: ARCHIVE_MAX_BARREN_PAGES consecutive
+        # pages with zero in-window settlements ends the walk. Deeper pages
+        # must never be requested (_PagedArchive asserts if they are).
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 3)
+        pages = [
+            # Productive page: resets/holds the counter at 0.
+            [_mk_raw_market("NEAR", "2026-06-04T23:00:00Z", "2026-06-06T00:00:00Z")],
+            # Three consecutive barren pages → counter reaches the cap.
+            [_mk_raw_market("PB1", "2026-06-04T22:00:00Z", "2026-06-04T22:30:00Z")],
+            [_mk_raw_market("PB2", "2026-06-04T21:00:00Z", "2026-06-04T21:30:00Z")],
+            [_mk_raw_market("PB3", "2026-06-04T20:00:00Z", "2026-06-04T20:30:00Z")],
+            # Beyond the cap: an in-window settler the walk must NOT reach.
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        assert kept == {"NEAR"}
+        assert calls == 4  # the fourth barren-capped page is the last fetched
+
+    @pytest.mark.parametrize("walk", [
+        historical._fetch_archive_tail,
+        historical._fetch_archive_sequential,
+    ])
+    def test_barren_counter_is_consecutive_and_result_agnostic(self, monkeypatch, walk):
+        # Two things at once: the counter RESETS on a productive page (so the
+        # bound is consecutive, not cumulative), and productivity is judged on
+        # ANY in-window settlement — the reset page here holds only a VOIDED
+        # market, which neither walk keeps. Pages full of voided (or, in the
+        # tail, day-sliced) records must not spuriously trip the counter.
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 2)
+        pages = [
+            [_mk_raw_market("NEAR", "2026-06-04T23:00:00Z", "2026-06-06T00:00:00Z")],
+            [_mk_raw_market("PB1", "2026-06-04T22:00:00Z", "2026-06-04T22:30:00Z")],
+            # Kept by neither walk, but proof the walk is still in productive
+            # created-time territory → counter back to 0.
+            [_mk_raw_market("VOIDED", "2026-06-04T21:00:00Z", "2026-06-06T05:00:00Z",
+                            result="void")],
+            [_mk_raw_market("PB2", "2026-06-04T20:00:00Z", "2026-06-04T20:30:00Z")],
+            [_mk_raw_market("PB3", "2026-06-04T19:00:00Z", "2026-06-04T19:30:00Z")],
+            # Never reached: the cap is hit on the page above.
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        assert kept == {"NEAR"}
+        assert calls == 5
 
     def test_second_run_reuses_day_slices(self, tmp_path, monkeypatch):
         archive_markets, live_markets = self._fixture_markets()
@@ -858,7 +1008,7 @@ class TestShardedFetch:
         archive.fail_after = None
         archive.calls = 0
         out = self._run(monkeypatch, tmp_path / "warm", archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -874,7 +1024,7 @@ class TestShardedFetch:
         archive = _FakeArchive(archive_markets, opaque_cursors=True)
         live = _FakeLive(live_markets)
         out = self._run(monkeypatch, tmp_path, archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -903,7 +1053,7 @@ class TestShardedFetch:
         out2 = historical.fetch_all_settled_markets(
             MagicMock(), empty_live, start_date=date(2026, 6, 5), use_cache=False,
         )
-        assert {m["ticker"] for m in out2} == _old_semantics_expected(
+        assert {m["ticker"] for m in out2} == _expected_in_window(
             archive_markets + live_markets, [],
             self._ts(self.START + "T00:00:00+00:00"), self._ts(new_cutoff),
         )
@@ -1046,7 +1196,7 @@ class TestShardedFetch:
             out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
                             _FakeLive(live_markets))
 
-        assert {m["ticker"] for m in out} == _old_semantics_expected(
+        assert {m["ticker"] for m in out} == _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -1083,7 +1233,7 @@ class TestShardedFetch:
         # The pool was torn down with cancel_futures, not drained.
         assert any(c["cancel_futures"] and not c["wait"] for c in recorded), recorded
         # And the fallback still produced the correct, complete result.
-        assert {m["ticker"] for m in out} == _old_semantics_expected(
+        assert {m["ticker"] for m in out} == _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -1111,7 +1261,7 @@ class TestShardedFetch:
         archive = _FakeArchive(archive_markets)
         live = _FakeLive(live_markets, ignore_max=True)
         out = self._run(monkeypatch, tmp_path, archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
