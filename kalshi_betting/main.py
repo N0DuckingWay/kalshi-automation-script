@@ -10,22 +10,32 @@ Purpose:
     cycle: building an authenticated API client, fetching open markets, finding
     arbitrage candidate pairs, sizing trades via Kelly criterion, submitting batch
     orders to the Kalshi REST API, and writing results to Excel. This is the only
-    module that ties all other modules together in the live trading path.
+    module that ties all other modules together in the live trading path. The
+    process exit code communicates the run's outcome to the scheduler (a
+    separate subprocess) — see the EXIT_* constants in config.py (BS-14): an
+    unhandled exception still propagates to exit 1, same as always.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold and file paths), reporter.py (Excel output), scanner.py
-    (market fetching and pair detection), strategy.py (trade sizing and portfolio
-    selection), and trader.py (order execution). Entry point for
-    `python3 -m kalshi_betting.main`.
+    (balance threshold, exit-code contract, and file paths), reporter.py (Excel
+    output), scanner.py (market fetching and pair detection), strategy.py (trade
+    sizing and portfolio selection), and trader.py (order execution). Entry
+    point for `python3 -m kalshi_betting.main`.
 """
 import argparse
 import logging
+import sys
 
 from tabulate import tabulate
 
 from .auth import build_client, verify_auth
-from .config import MIN_BALANCE_CENTS, PROJECT_ROOT
+from .config import (
+    EXIT_OK,
+    EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TRADES_NEED_ATTENTION,
+    MIN_BALANCE_CENTS,
+    PROJECT_ROOT,
+)
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     display_title,
@@ -214,7 +224,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
         logging.info(line)
 
 
-def _run_dev(client, args) -> None:
+def _run_dev(client, args) -> int:
     """
     Execute a full dev/sandbox mode scan and simulation.
 
@@ -229,6 +239,13 @@ def _run_dev(client, args) -> None:
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
+
+    Returns:
+        int: Always EXIT_OK — dev mode never submits real orders, so there is
+            no low-balance skip or manual-review outcome to distinguish.
+            Returned as an int (rather than None) for symmetry with _run_prod,
+            since main() dispatches to either and passes the result to
+            sys.exit().
     """
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
@@ -260,7 +277,7 @@ def _run_dev(client, args) -> None:
         # Write an empty simulation file so the run is still recorded
         out = write_dev_simulation([], [], sandbox_balance_cents)
         logging.info("Dev simulation written (empty): %s", out)
-        return
+        return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the virtual balance
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
@@ -277,7 +294,7 @@ def _run_dev(client, args) -> None:
         # Write a simulation file showing candidates even though no trades were sized
         out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
         logging.info("Dev simulation written (candidates only): %s", out)
-        return
+        return EXIT_OK
 
     _print_portfolio(portfolio, "Simulated")
 
@@ -288,9 +305,10 @@ def _run_dev(client, args) -> None:
     # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all candidates
     out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
     logging.info("Dev simulation written: %s", out)
+    return EXIT_OK
 
 
-def _run_prod(client, args) -> None:
+def _run_prod(client, args) -> int:
     """
     Execute a full production run using the real Kalshi account.
 
@@ -306,6 +324,15 @@ def _run_prod(client, args) -> None:
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
+
+    Returns:
+        int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
+            account balance is below MIN_BALANCE_CENTS (no scan attempted).
+            EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
+            results has status "rollback_failed" or "manual_review" — either
+            means a human must check the account/trade log. EXIT_OK for every
+            other path, including dry-run, no candidate pairs, no executable
+            trades, and all-pairs-failed-pre-execution-check.
     """
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
@@ -318,7 +345,7 @@ def _run_prod(client, args) -> None:
             balance_cents / 100,
             MIN_BALANCE_CENTS / 100,
         )
-        return
+        return EXIT_SKIPPED_LOW_BALANCE
 
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
@@ -340,7 +367,7 @@ def _run_prod(client, args) -> None:
 
     if not candidate_pairs:
         logging.info("No qualifying pairs found (≥15%/30% deadline-gap-tiered time-series or ≥5% same-title price diff).")
-        return
+        return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
@@ -354,7 +381,7 @@ def _run_prod(client, args) -> None:
 
     if not portfolio:
         logging.info("No executable arbitrage trades found.")
-        return
+        return EXIT_OK
 
     _print_portfolio(portfolio, "Selected")
 
@@ -362,7 +389,7 @@ def _run_prod(client, args) -> None:
     portfolio = pre_execution_check(client, portfolio)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
-        return
+        return EXIT_OK
 
     # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
@@ -401,25 +428,32 @@ def _run_prod(client, args) -> None:
 
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
-    else:
-        n_ok       = sum(1 for r in results if r.status == "executed")
-        n_rolled   = sum(1 for r in results if r.status == "rolled_back")
-        n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-        # "manual_review" means leg B's fill state was undetermined and no
-        # automated rollback was attempted — just as urgent as an orphaned
-        # rollback failure, so it's counted in the same manual-review alert.
-        n_unknown  = sum(1 for r in results if r.status == "manual_review")
-        logging.info(
-            "Submitted %d of %d order pair(s) successfully. %d rolled back, "
-            "%d rollback failure(s), %d unknown fill state(s).",
-            n_ok, len(results), n_rolled, n_orphaned, n_unknown,
+        return EXIT_OK
+
+    n_ok       = sum(1 for r in results if r.status == "executed")
+    n_rolled   = sum(1 for r in results if r.status == "rolled_back")
+    n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
+    # "manual_review" means leg B's fill state was undetermined and no
+    # automated rollback was attempted — just as urgent as an orphaned
+    # rollback failure, so it's counted in the same manual-review alert.
+    n_unknown  = sum(1 for r in results if r.status == "manual_review")
+    logging.info(
+        "Submitted %d of %d order pair(s) successfully. %d rolled back, "
+        "%d rollback failure(s), %d unknown fill state(s).",
+        n_ok, len(results), n_rolled, n_orphaned, n_unknown,
+    )
+    if n_orphaned or n_unknown:
+        logging.critical(
+            "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
+            "UNDETERMINED fill state — manual review required (see trade log).",
+            n_orphaned, n_unknown,
         )
-        if n_orphaned or n_unknown:
-            logging.critical(
-                "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
-                "UNDETERMINED fill state — manual review required (see trade log).",
-                n_orphaned, n_unknown,
-            )
+        # Surface via the process exit code too (BS-14) — the scheduler reads
+        # this, not the log file, and needs to distinguish "trades happened
+        # but need a human to check" from a clean run.
+        return EXIT_TRADES_NEED_ATTENTION
+
+    return EXIT_OK
 
 
 def main() -> None:
@@ -429,7 +463,17 @@ def main() -> None:
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days), configures logging, builds the appropriate Kalshi
     client, and dispatches to _run_dev (sandbox simulation) or _run_prod
-    (real account trading).
+    (real account trading). Exits the process via sys.exit() with the
+    dispatched run's return code (see the EXIT_* constants in config.py,
+    BS-14) so a caller that only sees the process exit status — the
+    scheduler, which runs this as a subprocess — can distinguish a clean run
+    from a low-balance skip or a run with trades needing manual review. An
+    unhandled exception is not caught here and propagates to the normal
+    interpreter exit code 1.
+
+    Returns:
+        None: This function never returns to its caller — it always ends by
+            calling sys.exit(code), which raises SystemExit.
     """
     parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
     parser.add_argument(
@@ -464,9 +508,13 @@ def main() -> None:
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
     if args.mode == "dev":
-        _run_dev(client, args)
+        code = _run_dev(client, args)
     else:
-        _run_prod(client, args)
+        code = _run_prod(client, args)
+
+    # Only sys.exit() communicates the outcome to a subprocess caller (the
+    # scheduler) — a bare return here would always look like exit 0.
+    sys.exit(code)
 
 
 if __name__ == "__main__":

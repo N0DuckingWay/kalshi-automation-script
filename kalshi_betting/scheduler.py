@@ -29,7 +29,13 @@ import time
 
 import schedule
 
-from .config import PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS
+from .config import (
+    EXIT_OK,
+    EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TRADES_NEED_ATTENTION,
+    PROJECT_ROOT,
+    SCHEDULER_JOB_TIMEOUT_SECONDS,
+)
 
 
 def run_job() -> None:
@@ -44,7 +50,12 @@ def run_job() -> None:
     past the next scheduled fire.
 
     Logs stdout on success and stderr + exit code on failure so every run is
-    traceable in kalshi_arb.log.
+    traceable in kalshi_arb.log. The subprocess's exit code is mapped to a
+    distinct log level/message per the EXIT_* contract in config.py (BS-14):
+    a low-balance skip and a run with trades needing manual review are no
+    longer indistinguishable from a clean run in this log — previously the
+    only signal was a WARNING inside kalshi_arb.log that this scheduler
+    process never reads.
     """
     logging.info("Scheduler: starting weekly arbitrage scan.")
     try:
@@ -67,10 +78,18 @@ def run_job() -> None:
         return
     if result.stdout:
         logging.info("stdout:\n%s", result.stdout)
-    if result.returncode != 0:
-        logging.error("Job failed (exit %d):\n%s", result.returncode, result.stderr)
-    else:
+
+    if result.returncode == EXIT_OK:
         logging.info("Job completed successfully.")
+    elif result.returncode == EXIT_SKIPPED_LOW_BALANCE:
+        logging.warning("Job skipped: balance below minimum — no trades attempted.")
+    elif result.returncode == EXIT_TRADES_NEED_ATTENTION:
+        logging.error(
+            "Job completed but one or more trades need MANUAL REVIEW — "
+            "check kalshi_arb.log and trade_log.xlsx.",
+        )
+    else:
+        logging.error("Job failed (exit %d):\n%s", result.returncode, result.stderr)
 
 
 def main() -> None:

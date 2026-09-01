@@ -125,6 +125,22 @@ ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 5
 # weekly scheduler daemon forever.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
+# ── Process exit-code contract ────────────────────────────────────────────────
+# main.py's process exit code is the only signal the scheduler (a separate
+# subprocess, per scheduler.run_job) has for what happened in a run beyond a
+# generic pass/fail — a prod run skipped for insufficient balance used to exit
+# 0 just like a clean run, so the scheduler logged "Job completed successfully."
+# and the WARNING explaining why nothing happened was buried in a log the
+# scheduler never reads (BS-14). These three codes are shared between main.py
+# (which returns/exits them) and scheduler.py (which maps them to distinct log
+# levels/messages) — they live in config.py so both modules import the same
+# values instead of duplicating magic numbers. An unhandled exception in
+# main.py is NOT covered here: it still propagates and the interpreter exits
+# 1, same as always.
+EXIT_OK                       = 0
+EXIT_SKIPPED_LOW_BALANCE      = 10
+EXIT_TRADES_NEED_ATTENTION    = 20
+
 # ── API pagination ────────────────────────────────────────────────────────────
 
 # Number of items to request per page when paginating market/event endpoints.
