@@ -18,7 +18,12 @@ Purpose:
 
     An exception from create_order does NOT prove the order was rejected (a
     timeout can land after the fill), so exception paths consult the actual
-    account position for the ticker before classifying the outcome.
+    account position for the ticker before classifying the outcome. The check
+    is a DELTA: a snapshot is taken immediately before each submission and
+    compared against one taken after the exception, so the decision reflects
+    what this order did rather than what the account happens to hold (an
+    unrelated pre-existing holding in the same ticker used to read as "our leg
+    filled", and an unrelated absence used to read as "our leg didn't").
 
     pre_execution_check() re-fetches order books for each spec in the portfolio
     concurrently and drops any whose prices have moved since the scan, reducing
@@ -26,16 +31,20 @@ Purpose:
 
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
-    CreateOrderRequest from the kalshi_python_sync SDK and fetch_json_page from
-    _http.py. Imports validate_pair_price from scanner.py and
-    BUY_MAX_COST_SLIPPAGE_CENTS from config.py. Called by main.py after
-    select_portfolio() selects the final trade list. Depends on the
-    KalshiClient produced by auth.py.
+    CreateOrderRequest from the kalshi_python_sync SDK and both fetch_json_page
+    and api_call_with_retry from _http.py (the retry wrapper is used ONLY for
+    the read-only position lookups, never for order submission). Imports
+    validate_pair_price from scanner.py and BUY_MAX_COST_SLIPPAGE_CENTS from
+    config.py. Called by main.py after select_portfolio() selects the final
+    trade list. Depends on the KalshiClient produced by auth.py.
 
 Notes:
     Do NOT add retry logic to order submission. A failed leg indicates the market
     moved between scan time and execution time — retrying risks buying one leg at
-    a worse price and creating an unhedged directional position.
+    a worse price and creating an unhedged directional position. The position
+    lookups in _position_count ARE retried: they are read-only GETs, so a
+    transient 429 there cannot duplicate a trade — but it CAN escalate an
+    otherwise-resolvable ambiguity into a rollback or manual_review.
 
     Order submission and position lookups use the SDK's raw-response variants
     (via _submit_order / _position_count) because 2026-07 API drift broke the
@@ -51,11 +60,19 @@ from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
 
-from ._http import fetch_json_page
+from ._http import api_call_with_retry, fetch_json_page
 from .config import BUY_MAX_COST_SLIPPAGE_CENTS
 from .reporter import TradeResult
 from .scanner import validate_pair_price
 from .strategy import TradeSpec
+
+# Tolerance for comparing position deltas against whole-contract expectations.
+# Contract counts are always whole numbers on the wire, but the API now sends
+# them as the `position_fp` STRING, which _position_count parses with float() —
+# so an exact `delta == -spec.x` comparison would be at the mercy of decimal
+# round-tripping. Any real mismatch is at least one whole contract, many orders
+# of magnitude above this epsilon.
+_DELTA_EPS = 1e-6
 
 
 def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
@@ -150,11 +167,23 @@ def _position_count(client: Any, ticker: str) -> float | None:
     account's actual position is the ground truth. Kalshi convention: negative
     counts are NO contracts, positive counts are YES contracts.
 
+    The returned number is the account's ABSOLUTE holding, which may include
+    contracts this bot never bought (an earlier run, or a manual trade).
+    Callers therefore never interpret a single reading: _execute_one snapshots
+    before and after each submission and attributes only the DELTA (see
+    _fill_delta). A single reading is meaningful only as a baseline.
+
     Uses the raw-response variant + JSON parsing because the pinned SDK's
     MarketPosition model requires legacy integer fields the API stopped
     sending in 2026-07 (the count now arrives as the `position_fp` string) —
     the modeled get_positions call raises ValidationError on any non-empty
     page, which would turn every ambiguous order into manual_review.
+
+    The read goes through api_call_with_retry because it is a read-only GET:
+    the project's no-retry rule covers order submission only, and retrying a
+    GET cannot duplicate a trade. Without the retry a single transient 429 here
+    reads as "state unknown" and escalates a recoverable ambiguity into a
+    rollback or manual_review.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -162,12 +191,17 @@ def _position_count(client: Any, ticker: str) -> float | None:
 
     Returns:
         float | None: Signed contract count (0 = confirmed no position; may be
-            fractional — callers only test zero/non-zero), or None when the
-            lookup itself failed and the state remains unknown.
+            fractional because position_fp is float-parsed), or None when the
+            lookup itself failed on every attempt and the state is unknown.
     """
     try:
-        # Filter server-side by ticker so a single page is guaranteed to contain it
-        data = fetch_json_page(client.get_positions_without_preload_content, ticker=ticker)
+        # Filter server-side by ticker so a single page is guaranteed to contain
+        # it. Retried: read-only GET, so the no-retry rule (order submission
+        # only) does not apply, and a transient 429 must not be mistaken for
+        # "position unknown" — see _execute_one's ambiguity handling.
+        data = api_call_with_retry(
+            fetch_json_page, client.get_positions_without_preload_content, ticker=ticker
+        )
         for pos in data.get("market_positions") or []:
             if pos.get("ticker") == ticker:
                 # position_fp is the signed contract count the API now sends;
@@ -180,6 +214,33 @@ def _position_count(client: Any, ticker: str) -> float | None:
     except Exception as exc:
         logging.warning("Position lookup failed for %s: %s", ticker, exc)
         return None
+
+
+def _fill_delta(before: float | None, after: float | None) -> float | None:
+    """
+    Signed position change attributable to one order, or None if unknown.
+
+    The account's absolute position is not evidence about a specific order —
+    it may already hold contracts in the same ticker from an earlier run or a
+    manual trade. The change across the submission is, provided both readings
+    succeeded. Either reading being None (the lookup failed after retries)
+    makes the delta unknowable, and the caller must treat that as unknown
+    state rather than as zero.
+
+    Args:
+        before (float | None): Signed position immediately before submission,
+            or None if that lookup failed.
+        after (float | None): Signed position after the ambiguous submission,
+            or None if that lookup failed.
+
+    Returns:
+        float | None: after - before, or None when either snapshot is missing.
+            Deltas produced by real fills are whole contracts, but callers
+            compare with _DELTA_EPS because position_fp is float-parsed.
+    """
+    if before is None or after is None:
+        return None
+    return after - before
 
 
 def _submit_order(client: Any, order: CreateOrderRequest) -> str:
@@ -196,6 +257,9 @@ def _submit_order(client: Any, order: CreateOrderRequest) -> str:
 
     Deliberately NOT wrapped in api_call_with_retry: retrying a FoK order
     could double-submit a leg at a different price (see module docstring).
+    _position_count in this same module IS wrapped — do not "unify" the two:
+    that asymmetry is the rule, not an oversight. A GET can be repeated
+    harmlessly; a state-changing POST cannot.
     fetch_json_page raises ApiException on non-2xx just like the modeled call
     did, so callers' exception handling is unchanged.
 
@@ -335,12 +399,24 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
     however, is ambiguous — the order may have filled before a timeout — so
-    exception paths check the account's actual position for the ticker:
-    leg A ambiguous with a position (or unknown state) is unwound; leg B
-    ambiguous with a confirmed position means the pair actually completed.
-    Leg B ambiguous with an UNKNOWN position (the lookup itself failed) is
-    never auto-rolled-back — an automated unwind could reverse a real fill
-    that we simply couldn't confirm — and is instead surfaced as
+    exception paths attribute the outcome by POSITION DELTA: a baseline
+    position is read immediately before each submission and compared with a
+    reading taken after the exception. Only the change is evidence about this
+    order; the absolute holding is not, because the account may already hold
+    contracts in the same ticker from an earlier run or a manual trade.
+
+    Leg A ambiguous resolves as: delta 0 → confirmed non-fill, status="failed";
+    delta of exactly -spec.x (our NO buy) → unwind via _rollback_leg_a. Anything
+    else — the lookup failed, or the position moved by an amount this order
+    cannot explain — is status="manual_review" with NO automated unwind: a
+    reduce_only sell against a position this order may not own would liquidate
+    an unrelated holding.
+
+    Leg B ambiguous resolves as: delta of exactly +spec.y → the pair actually
+    completed, status="executed"; delta 0 → confirmed non-fill, roll leg A
+    back. Anything else — including an UNKNOWN state because the lookup itself
+    failed — is never auto-rolled-back (an automated unwind could reverse a
+    real fill we simply couldn't confirm) and is surfaced as
     status="manual_review" for a human to check the account.
 
     Args:
@@ -350,15 +426,21 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: With status "executed", "failed", "rolled_back",
             "rollback_failed" (unwind did not fill — orphaned position needing
-            manual review), or "manual_review" (leg B's fill state could not
-            be determined and no automated action was taken).
+            manual review), or "manual_review" (a leg's fill state could not be
+            attributed to this order and no automated action was taken).
     """
     order_a  = _build_no_order(spec)
     order_b  = _build_yes_order(spec)
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker
     mB_title = spec.pair.market_b.title or spec.pair.market_b.ticker
 
+    # Baseline read taken as late as possible before submission, so an ambiguous
+    # outcome is judged by how the position MOVED rather than by what the
+    # account happens to hold (which may predate this bot entirely).
+    before_a = _position_count(client, spec.pair.market_a.ticker)
+
     # Submit leg A — NO on market A (raw-response endpoint; see _submit_order)
+    leg_a_error: str | None = None
     try:
         status_a = _submit_order(client, order_a)
         if status_a != "executed":
@@ -372,24 +454,59 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
                 error=f"Leg A FoK not filled: status={status_a}",
             )
     except Exception as e:
-        # Ambiguous: the order may have filled before the exception (e.g. a
-        # timeout after the fill). Consult the actual position before concluding.
-        held_a = _position_count(client, spec.pair.market_a.ticker)
-        if held_a == 0:
-            logging.error(
-                "Leg A submission failed for '%s' (no position confirmed): %s",
-                mA_title[:60], e,
-            )
-            return TradeResult(spec=spec, status="failed", error=f"Leg A error: {e}")
-        # Position exists — or lookup failed and the state is unknown. Unwind:
-        # the rollback is reduce_only, so it is harmless if nothing was filled.
-        logging.error(
-            "Leg A raised for '%s' but position=%s — unwinding: %s",
-            mA_title[:60], held_a, e,
-        )
-        return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
+        leg_a_error = str(e)
 
-    # Leg A filled — submit leg B — YES on market B (raw-response endpoint)
+    # Disambiguation runs OUTSIDE the except block (mirroring leg B below) so
+    # the position lookup is not executed while leg A's exception is still the
+    # active one: anything raised in there would inherit it as __context__, and
+    # api_call_with_retry walks that chain — a fatal lookup error would be
+    # misread as transient and retried through the full backoff schedule
+    # (~62s) before this already-urgent decision could be made.
+    if leg_a_error is not None:
+        # Ambiguous: the order may have filled before the exception (e.g. a
+        # timeout after the fill). Attribute by delta against the baseline.
+        after_a = _position_count(client, spec.pair.market_a.ticker)
+        delta = _fill_delta(before_a, after_a)
+        if delta is not None and abs(delta) < _DELTA_EPS:
+            # Confirmed non-fill: the position did not move at all
+            logging.error(
+                "Leg A submission failed for '%s' (position unchanged — no fill): %s",
+                mA_title[:60], leg_a_error,
+            )
+            return TradeResult(
+                spec=spec, status="failed", error=f"Leg A error: {leg_a_error}",
+            )
+        if delta is not None and abs(delta + spec.x) < _DELTA_EPS:
+            # Moved by exactly -spec.x: our NO buy filled (NO contracts are
+            # negative by Kalshi convention). Unwind the now-unhedged leg.
+            logging.error(
+                "Leg A raised for '%s' but position moved by %s (our %d NO buy) —"
+                " unwinding: %s",
+                mA_title[:60], delta, spec.x, leg_a_error,
+            )
+            return _rollback_leg_a(
+                client, spec, f"Leg A ambiguous error: {leg_a_error}",
+            )
+        # Unknown (a snapshot failed) or unattributable (the position moved by
+        # an amount this order cannot explain — e.g. an unrelated trade landed
+        # in the snapshot window). Do NOT auto-trade against it: a reduce_only
+        # sell would liquidate a holding this order may not own.
+        logging.critical(
+            "Leg A raised for '%s' and the fill could NOT be attributed"
+            " (position delta=%s, expected 0 or %d) — NOT unwinding, since a"
+            " reduce-only sell could liquidate an unrelated position. Manual"
+            " review required: %s",
+            mA_title[:60], delta, -spec.x, leg_a_error,
+        )
+        return TradeResult(
+            spec=spec, status="manual_review",
+            error=f"Leg A ambiguous, delta={delta}: {leg_a_error}",
+        )
+
+    # Leg A filled — baseline for leg B, same delta-attribution rationale
+    before_b = _position_count(client, spec.pair.market_b.ticker)
+
+    # Submit leg B — YES on market B (raw-response endpoint)
     leg_b_error: str | None = None
     leg_b_ambiguous = False
     try:
@@ -402,35 +519,40 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     if leg_b_error:
         if leg_b_ambiguous:
-            # The exception may have arrived after the fill — check the position
-            # before rolling back leg A, or we'd reverse the unhedged exposure.
-            held_b = _position_count(client, spec.pair.market_b.ticker)
-            if held_b:  # non-zero and lookup succeeded → leg B actually filled
+            # The exception may have arrived after the fill — attribute by delta
+            # before rolling back leg A, or we'd reverse a completed hedge.
+            after_b = _position_count(client, spec.pair.market_b.ticker)
+            delta = _fill_delta(before_b, after_b)
+            if delta is not None and abs(delta - spec.y) < _DELTA_EPS:
+                # Moved by exactly +spec.y: our YES buy filled, pair complete
                 logging.warning(
-                    "Leg B raised for '%s' but position=%s — pair is complete: %s",
-                    mB_title[:60], held_b, leg_b_error,
+                    "Leg B raised for '%s' but position moved by %s (our %d YES buy)"
+                    " — pair is complete: %s",
+                    mB_title[:60], delta, spec.y, leg_b_error,
                 )
                 return TradeResult(
                     spec=spec, status="executed",
-                    error=f"Leg B ambiguous but position confirmed: {leg_b_error}",
+                    error=f"Leg B ambiguous but fill confirmed by position delta: {leg_b_error}",
                 )
-            if held_b is None:
-                # The position lookup itself failed, so leg B's fill state is
-                # genuinely unknown — it may have filled. Rolling back leg A
-                # here would be wrong if leg B actually did fill (we'd sell the
-                # hedge and be left with a naked YES position on B while the
-                # log says "rolled_back", implying flat). Do NOT auto-rollback;
+            if delta is None or abs(delta) >= _DELTA_EPS:
+                # Either the lookup failed (state genuinely unknown) or the
+                # position moved by an amount this order cannot explain. Rolling
+                # back leg A here would be wrong if leg B actually did fill (we'd
+                # sell the hedge and be left with a naked YES position on B while
+                # the log says "rolled_back", implying flat). Do NOT auto-rollback;
                 # surface for manual review instead.
                 logging.critical(
-                    "Leg B raised for '%s' and position lookup FAILED — fill "
-                    "state unknown, NOT auto-rolling-back leg A to avoid "
-                    "reversing a possible real fill. Manual review required: %s",
-                    mB_title[:60], leg_b_error,
+                    "Leg B raised for '%s' and the fill could NOT be attributed"
+                    " (position delta=%s, expected 0 or %d) — NOT auto-rolling-back"
+                    " leg A to avoid reversing a possible real fill. Manual review"
+                    " required: %s",
+                    mB_title[:60], delta, spec.y, leg_b_error,
                 )
                 return TradeResult(
                     spec=spec, status="manual_review",
-                    error=f"Leg B ambiguous and position lookup failed: {leg_b_error}",
+                    error=f"Leg B ambiguous, delta={delta}: {leg_b_error}",
                 )
+            # delta == 0 → confirmed non-fill; fall through to the rollback below
         logging.error(
             "Leg B (YES on '%s') failed after Leg A filled — attempting rollback: %s",
             mB_title[:60], leg_b_error,
@@ -468,10 +590,11 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     Returns:
         list: List of TradeResult objects (from reporter.py), one per spec. Each
             result has status="executed" (both legs filled), "simulated" (dry run),
-            "failed" (leg A failed), "rolled_back" (leg B failed, leg A unwound),
-            "rollback_failed" (leg A unwind did not fill — orphaned position),
-            or "manual_review" (leg B's fill state could not be determined —
-            no automated rollback was attempted).
+            "failed" (leg A confirmed unfilled), "rolled_back" (leg B confirmed
+            unfilled, leg A unwound), "rollback_failed" (leg A unwind did not
+            fill — orphaned position), or "manual_review" (a leg's fill state
+            could not be attributed to this order — no automated order was
+            submitted in response).
     """
     # ThreadPoolExecutor(max_workers=0) raises ValueError, so short-circuit empty input
     if not specs:
