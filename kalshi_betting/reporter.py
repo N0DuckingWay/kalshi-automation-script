@@ -21,8 +21,19 @@ Notes:
     The TradeResult dataclass is defined here (not in trader.py) because reporter.py
     is the authoritative consumer of trade outcomes — trader.py only needs to
     construct and return these objects.
+
+    append_to_prod_log() coordinates concurrent writers (e.g. the scheduler and a
+    manual invocation racing) via a sidecar advisory lock (fcntl.flock) around the
+    load -> append -> save sequence, and saves atomically (tmp file + os.replace)
+    so a crash mid-save can never truncate the accumulated trade history. If the
+    lock cannot be acquired within _LOCK_TIMEOUT_SECONDS, this run's rows are never
+    silently dropped — they're written to a standalone timestamped fallback file
+    instead of touching the shared log. See BS-18 in CLAUDE.md's bug-sweep history.
 """
+import fcntl
 import logging
+import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +47,16 @@ from .scanner import display_title
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
+
+# Sidecar lock file coordinating concurrent writers to PROD_LOG_PATH (e.g. the
+# weekly scheduler and a manual run racing) — see _acquire_lock().
+_LOCK_PATH = PROD_LOG_PATH.with_name(PROD_LOG_PATH.name + ".lock")
+# Bounded acquire loop: a non-blocking flock() attempt polled at this interval,
+# up to this many total seconds, rather than a blocking flock() call — so a
+# wedged lock holder (crashed mid-hold, or just slow) can never hang this run
+# forever. Deliberately short relative to a full bot run.
+_LOCK_TIMEOUT_SECONDS = 30
+_LOCK_POLL_SECONDS = 0.5
 
 # Column definitions shared by both sheets
 _TRADE_COLUMNS = [
@@ -190,27 +211,117 @@ def _apply_number_formats(ws, row_idx: int) -> None:
     ws.cell(row=row_idx, column=16).number_format = "0.00%"
 
 
-# ─────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────
-
-def append_to_prod_log(results: list, balance_before: float, balance_after: float) -> Path:
+def _write_separator_row(
+    ws, run_ts: datetime, balance_before: float, balance_after: float, n_results: int
+) -> None:
     """
-    Append executed trade results to the persistent production trade log Excel file.
+    Append a styled run-separator row summarizing this run's balance change.
 
-    If the file does not yet exist, creates it with a styled dark-blue header row.
-    Each call appends a run-separator row (showing timestamp and balance change)
-    followed by one data row per trade result, color-coded by status. The file is
-    designed to accumulate all runs over the life of the bot.
+    Shared by the normal prod-log append path and the lock-timeout fallback path
+    so both files carry the same run-summary banner.
 
     Args:
-        results (list): List of TradeResult objects from trader.execute_trades().
-            May be empty if no trades were executed this run.
+        ws: The openpyxl Worksheet to append to.
+        run_ts (datetime): Timestamp of this run.
+        balance_before (float): Account balance in dollars before this run's trades.
+        balance_after (float): Account balance in dollars after this run's trades.
+        n_results (int): Number of trade results in this run, shown in the banner.
+    """
+    sep_row = ws.max_row + 1
+    sep_cell = ws.cell(row=sep_row, column=1,
+                       value=f"── Run: {run_ts.strftime('%Y-%m-%d %H:%M')}  |  "
+                             f"Balance before: ${balance_before:.2f}  →  "
+                             f"after: ${balance_after:.2f}  |  "
+                             f"{n_results} trade(s)")
+    sep_cell.font = Font(italic=True, color="595959", size=9)
+    sep_cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    ws.merge_cells(
+        start_row=sep_row, start_column=1,
+        end_row=sep_row, end_column=len(_TRADE_COLUMNS)
+    )
+
+
+def _write_trade_rows(ws, results: list, run_ts: datetime) -> None:
+    """
+    Append one styled, color-coded data row per TradeResult.
+
+    Shared by the normal prod-log append path and the lock-timeout fallback path.
+
+    Args:
+        ws: The openpyxl Worksheet to append to.
+        results (list): List of TradeResult objects to write, in order.
+        run_ts (datetime): Timestamp of this run, used for the Date/Time columns.
+    """
+    for result in results:
+        row_idx = ws.max_row + 1
+        row_data = _result_to_row(result, run_ts)
+        for col_idx, value in enumerate(row_data, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+        _apply_data_row_styles(ws, row_idx, result.status)
+        _apply_number_formats(ws, row_idx)
+
+
+def _acquire_lock(lock_path: Path):
+    """
+    Acquire an exclusive advisory lock on lock_path, polling up to _LOCK_TIMEOUT_SECONDS.
+
+    Uses a bounded loop of non-blocking fcntl.flock() attempts rather than a single
+    blocking flock() call, so a lock held by a hung (but still alive) process can
+    never wedge this call forever — the caller falls back to a standalone file
+    instead of waiting indefinitely.
+
+    Args:
+        lock_path (Path): Path to the sidecar lock file. Created if it doesn't exist.
+
+    Returns:
+        The open file object holding the lock (caller must close it — via
+        _release_lock — when done), or None if the timeout elapsed first.
+    """
+    lock_path.touch(exist_ok=True)
+    fh = open(lock_path, "r+")
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                return None
+            time.sleep(_LOCK_POLL_SECONDS)
+
+
+def _release_lock(lock_fh) -> None:
+    """
+    Release a lock acquired by _acquire_lock() and close its file handle.
+
+    Deliberately does NOT unlink the lock file: removing a flock'd file while
+    another process might be about to open/lock that same path is a TOCTOU race
+    (the other process could end up locking a different, newly-created inode of
+    the same name, defeating the lock entirely). The sidecar file is small and
+    harmless to keep around indefinitely — it's gitignored.
+
+    Args:
+        lock_fh: The open file object returned by _acquire_lock().
+    """
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_fh.close()
+
+
+def _append_locked(results: list, balance_before: float, balance_after: float) -> Path:
+    """
+    Load, append, and atomically save PROD_LOG_PATH. Must only be called while
+    holding the sidecar lock (see append_to_prod_log).
+
+    Args:
+        results (list): List of TradeResult objects from this run.
         balance_before (float): Account balance in dollars before this run's trades.
         balance_after (float): Account balance in dollars after this run's trades.
 
     Returns:
-        Path: Absolute path to the trade log file (PROJECT_ROOT / "trade_log.xlsx").
+        Path: Absolute path to the trade log file (PROD_LOG_PATH).
     """
     if PROD_LOG_PATH.exists():
         wb = openpyxl.load_workbook(PROD_LOG_PATH)
@@ -224,32 +335,101 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
 
     # Use local time for the separator row so timestamps are human-readable
     run_ts = datetime.now(UTC).astimezone()
+    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results))
+    _write_trade_rows(ws, results, run_ts)
 
-    # Write a run-separator row
-    sep_row = ws.max_row + 1
-    sep_cell = ws.cell(row=sep_row, column=1,
-                       value=f"── Run: {run_ts.strftime('%Y-%m-%d %H:%M')}  |  "
-                             f"Balance before: ${balance_before:.2f}  →  "
-                             f"after: ${balance_after:.2f}  |  "
-                             f"{len(results)} trade(s)")
-    sep_cell.font = Font(italic=True, color="595959", size=9)
-    sep_cell.fill = PatternFill("solid", fgColor="F2F2F2")
-    ws.merge_cells(
-        start_row=sep_row, start_column=1,
-        end_row=sep_row, end_column=len(_TRADE_COLUMNS)
-    )
-
-    for result in results:
-        row_idx = ws.max_row + 1
-        row_data = _result_to_row(result, run_ts)
-        for col_idx, value in enumerate(row_data, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
-        _apply_data_row_styles(ws, row_idx, result.status)
-        _apply_number_formats(ws, row_idx)
-
-    wb.save(PROD_LOG_PATH)
+    # Atomic save: openpyxl's wb.save() writes directly to the target path,
+    # truncating it first — a crash partway through would destroy the entire
+    # accumulated history. Writing to a tmp file and renaming it into place
+    # means the visible PROD_LOG_PATH only ever transitions between complete
+    # states (os.replace is an atomic rename on POSIX).
+    tmp_path = PROD_LOG_PATH.with_name(PROD_LOG_PATH.name + ".tmp")
+    wb.save(tmp_path)
+    os.replace(tmp_path, PROD_LOG_PATH)
     logging.info("Trade log updated: %s (%d new row(s))", PROD_LOG_PATH, len(results))
     return PROD_LOG_PATH
+
+
+def _write_fallback_log(results: list, balance_before: float, balance_after: float) -> Path:
+    """
+    Write this run's trade rows to a standalone timestamped file instead of the
+    shared trade_log.xlsx.
+
+    Called only when the sidecar lock could not be acquired within
+    _LOCK_TIMEOUT_SECONDS — guarantees this run's rows are never silently lost,
+    at the cost of splitting the trade history across an extra file the operator
+    must merge in by hand (or simply keep alongside the main log).
+
+    Args:
+        results (list): List of TradeResult objects from this run.
+        balance_before (float): Account balance in dollars before this run's trades.
+        balance_after (float): Account balance in dollars after this run's trades.
+
+    Returns:
+        Path: Absolute path to the fallback file
+            (PROJECT_ROOT / "trade_log_<timestamp>.xlsx").
+    """
+    run_ts = datetime.now(UTC).astimezone()
+    fallback_path = PROJECT_ROOT / f"trade_log_{run_ts.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Trade Log"
+    _apply_header_row(ws, _HEADER_FILL_PROD)
+    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results))
+    _write_trade_rows(ws, results, run_ts)
+
+    wb.save(fallback_path)
+    logging.info("Fallback trade log written: %s (%d row(s))", fallback_path, len(results))
+    return fallback_path
+
+
+# ─────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────
+
+def append_to_prod_log(results: list, balance_before: float, balance_after: float) -> Path:
+    """
+    Append executed trade results to the persistent production trade log Excel file.
+
+    If the file does not yet exist, creates it with a styled dark-blue header row.
+    Each call appends a run-separator row (showing timestamp and balance change)
+    followed by one data row per trade result, color-coded by status. The file is
+    designed to accumulate all runs over the life of the bot.
+
+    Concurrent callers (e.g. the scheduler and a manual run racing) are
+    coordinated via a sidecar advisory lock (PROD_LOG_PATH + ".lock") so a
+    load -> append -> save race can't silently clobber rows from another run,
+    and the save itself is atomic (tmp file + os.replace) so a crash mid-save
+    can't truncate the accumulated history. If the lock can't be acquired within
+    _LOCK_TIMEOUT_SECONDS, this run's rows are never dropped — they're written
+    to a separate timestamped fallback file instead (see _write_fallback_log).
+
+    Args:
+        results (list): List of TradeResult objects from trader.execute_trades().
+            May be empty if no trades were executed this run.
+        balance_before (float): Account balance in dollars before this run's trades.
+        balance_after (float): Account balance in dollars after this run's trades.
+
+    Returns:
+        Path: Absolute path to the file actually written — either PROD_LOG_PATH
+            on the normal path, or a standalone fallback file if the lock timed out.
+    """
+    lock_fh = _acquire_lock(_LOCK_PATH)
+    if lock_fh is None:
+        # Never clobber the shared log and never lose this run's rows: another
+        # process appears to be mid-save. Write a standalone file instead.
+        logging.warning(
+            "Could not acquire lock on %s within %ds — writing this run's rows "
+            "to a standalone fallback file instead of the shared trade log",
+            _LOCK_PATH, _LOCK_TIMEOUT_SECONDS,
+        )
+        return _write_fallback_log(results, balance_before, balance_after)
+
+    try:
+        return _append_locked(results, balance_before, balance_after)
+    finally:
+        _release_lock(lock_fh)
 
 
 def write_dev_simulation(
