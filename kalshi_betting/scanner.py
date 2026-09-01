@@ -840,33 +840,147 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     return levels
 
 
+# Unit tags for an orderbook side-key candidate set. Dollar sets carry bid prices
+# as 0-1 dollar strings (parsed straight by _bids_to_ask_levels); cents sets carry
+# integer cents and MUST be converted to dollars before that parser sees them.
+_UNIT_DOLLARS = "dollars"
+_UNIT_CENTS = "cents"
+
+# Valid inclusive bounds for an integer-cent bid price on the legacy arrays. A
+# level outside this range is not a price Kalshi can quote (0 and 100 are the
+# settled extremes), so it signals a unit/shape drift rather than a real bid.
+_MIN_BID_CENTS = 1
+_MAX_BID_CENTS = 99
+
 # Matched wire-format generations for the orderbook response: each container key
-# pairs with its OWN side keys and units, and the two must never be mixed. The
-# current live API returns the book under `orderbook_fp` with dollar-string bid
-# arrays; the legacy `orderbook` container carried integer-cent arrays. Resolving
-# container and side keys independently (a plain `or` across both generations)
-# risked cross-reading a cents array through the dollars parser, so the pairing is
-# enforced explicitly in _fetch_orderbook. Order matters: orderbook_fp (current)
-# is tried before orderbook (legacy).
-_ORDERBOOK_SIDE_KEYS: dict[str, tuple[str, str]] = {
-    "orderbook_fp": ("yes_dollars", "no_dollars"),
-    "orderbook": ("yes", "no"),
+# owns an ordered tuple of candidate (yes_key, no_key, unit) side-key sets, and a
+# container is NEVER read with another container's sets. Verified against the
+# pinned SDK's models/orderbook.py:
+#   * `orderbook_fp` — live-observed only (absent from the SDK entirely); serves
+#     `yes_dollars`/`no_dollars` dollar-string bid arrays. This is what production
+#     receives today, so its handling must stay behaviour-identical.
+#   * `orderbook` — the SDK-modeled container. Its model REQUIRES
+#     `yes_dollars`/`no_dollars` (dollar strings) and aliases the legacy integer-cent
+#     arrays as `"true"`/`"false"` — never `"yes"`/`"no"`, which this table wrongly
+#     assumed before. Both shapes are accepted, dollars first, cents second.
+# Resolving container and side keys independently (a plain `or` across both
+# generations) risked cross-reading a cents array through the dollars parser, so
+# the pairing is enforced explicitly in _fetch_orderbook. Order matters within a
+# container too: the first candidate set whose BOTH keys are present wins.
+_ORDERBOOK_SIDE_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "orderbook_fp": (
+        ("yes_dollars", "no_dollars", _UNIT_DOLLARS),
+    ),
+    "orderbook": (
+        ("yes_dollars", "no_dollars", _UNIT_DOLLARS),
+        ("true", "false", _UNIT_CENTS),
+    ),
 }
+
+
+def _coerce_int_cents(value: Any) -> int | None:
+    """
+    Coerce one raw legacy-array bid price to an integer number of cents.
+
+    Accepts a genuine int, an integral float (45.0), or a string spelling either
+    ("45", "45.0"). Anything fractional, non-numeric, or boolean is rejected —
+    a fractional "cent" means the array is really carrying dollars and must not
+    be multiplied through the cents path.
+
+    Args:
+        value (Any): Raw price element from a legacy `true`/`false` bid level.
+
+    Returns:
+        int | None: The value as whole cents, or None if it is not an integral
+            number (which the caller treats as a malformed level).
+    """
+    # bool is an int subclass; True would silently become 1 cent
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except ValueError:
+            return None
+        return int(num) if num.is_integer() else None
+    return None
+
+
+def _cents_bids_to_dollar_bids(ticker: str, side_key: str, bids_raw: list) -> list:
+    """
+    Convert one legacy integer-cent bid array to the dollar form the parser expects.
+
+    _bids_to_ask_levels is dollars-only by contract: it computes 1 - price, so a
+    cents value fed to it straight yields a wildly negative ask that its own
+    range check silently discards — a full cents book would parse as an empty
+    book with no warning at all. This converts cents to dollars first and drops
+    (loudly) any level whose price is not a whole cent in [1, 99], so a unit
+    drift surfaces as a warning naming the offending value instead of silence.
+
+    Args:
+        ticker (str): Market ticker, for the drop warning.
+        side_key (str): The side key being converted ("true"/"false"), for the
+            drop warning.
+        bids_raw (list): Raw bid levels, each expected as [price_cents, qty].
+
+    Returns:
+        list: [[price_dollars, qty], ...] in the original order, with malformed
+            levels omitted. Returns [] when every level was malformed.
+    """
+    converted: list = []
+    for entry in bids_raw:
+        try:
+            raw_price = entry[0]
+            qty = entry[1]
+        except (TypeError, IndexError, KeyError):
+            logging.warning(
+                "Dropping malformed legacy cents array level for %s side '%s': %r "
+                "(level is not a [price, qty] pair)",
+                ticker,
+                side_key,
+                entry,
+            )
+            continue
+        cents = _coerce_int_cents(raw_price)
+        if cents is None or not (_MIN_BID_CENTS <= cents <= _MAX_BID_CENTS):
+            logging.warning(
+                "Dropping malformed legacy cents array level for %s side '%s': price %r "
+                "is not a whole cent in [%d, %d]",
+                ticker,
+                side_key,
+                raw_price,
+                _MIN_BID_CENTS,
+                _MAX_BID_CENTS,
+            )
+            continue
+        converted.append([cents / 100.0, qty])
+    return converted
 
 
 def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     """
     Fetch the order book for a market.
 
-    The live Kalshi API returns the book under one of two matched key generations
-    (see _ORDERBOOK_SIDE_KEYS): the current `orderbook_fp` container with
-    `yes_dollars`/`no_dollars` dollar-string bid arrays, or the legacy `orderbook`
-    container with `yes`/`no` arrays. The container key selects which side keys are
-    expected — the two generations are never mixed. Once a container is found, its
-    matched side keys MUST be present (either may be empty or null for a side with
-    no resting bids); a container whose matched side keys are absent, or which is
-    not even a dict, signals a Kalshi API shape change and is treated as a hard
-    failure rather than silently cross-reading the other generation's keys.
+    The book arrives under one of two matched key generations (see
+    _ORDERBOOK_SIDE_KEYS). The container key strictly selects which side-key sets
+    are eligible — generations are never mixed:
+
+      * `orderbook_fp` (what production receives today) → `yes_dollars`/`no_dollars`
+        dollar-string bid arrays.
+      * `orderbook` (the SDK-modeled container) → `yes_dollars`/`no_dollars` dollar
+        strings if present, else the legacy `true`/`false` INTEGER-CENT arrays,
+        which are converted to dollars here before any parsing.
+
+    A container present but null or empty (`{}`) is an empty book — a market with
+    no resting bids, not a shape change. A container that is a non-empty dict but
+    matches none of its own candidate side-key sets (or is some other non-dict
+    value) signals a Kalshi API shape change and fails closed with a "potential
+    orderbook key mismatch" warning, rather than cross-reading another
+    generation's keys (which could feed a cents array through the dollars parser).
 
     Args:
         client (Any): Authenticated KalshiClient exposing the raw-response
@@ -874,11 +988,12 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
         ticker (str): Market ticker whose order book to fetch.
 
     Returns:
-        dict | None: {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes'
-            is YES bids and 'no' is NO bids, or None on failure. Returns None when
-            no recognized container key is present, when the selected container is
-            not a dict, or when the container's matched side keys are missing (a
-            potential key mismatch — logged as such).
+        dict | None: {'yes': [[price, qty], ...], 'no': [...]} where 'yes' is YES
+            bids and 'no' is NO bids and every price is in DOLLARS (dollar-string
+            levels pass through untouched; cents levels are converted). Returns
+            None when no recognized container key is present, or when the selected
+            container matches none of its candidate side-key sets (a potential key
+            mismatch — logged as such).
     """
     try:
         # Raw-response call: the live API returns only the orderbook_fp key,
@@ -904,29 +1019,54 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             )
             return None
         ob = data[container_key]
-        yes_key, no_key = _ORDERBOOK_SIDE_KEYS[container_key]
-        # TODO: validate this strict container->side-key mapping against captured
-        # test data from Kalshi's live API.
-        if not isinstance(ob, dict) or yes_key not in ob or no_key not in ob:
-            # Container present but its matched side keys are absent (or it is not
-            # even a dict). This is a potential key mismatch — the container and
-            # side keys have drifted out of sync, or Kalshi changed the response
-            # shape. Fail closed instead of cross-reading the other generation's
-            # keys (which could feed a cents array through the dollars parser).
+        # The container->side-key mapping below is validated against the pinned
+        # SDK's documented Orderbook shapes (models/orderbook.py) by
+        # TestFetchOrderbookKeyMapping in tests/test_scanner.py, which exercises
+        # every generation, unit, and degenerate container this branch handles.
+        if ob is None or ob == {}:
+            # Container present but carries no book at all. That is a market with
+            # no resting bids on either side, NOT a shape change — return an empty
+            # book so the mismatch warning stays reserved for genuine drift.
+            return {"yes": [], "no": []}
+        selected = None
+        if isinstance(ob, dict):
+            # First candidate set whose BOTH keys are present wins; a set is only
+            # ever taken whole, so units can never be inferred from the wrong keys.
+            selected = next(
+                (
+                    keys
+                    for keys in _ORDERBOOK_SIDE_KEYS[container_key]
+                    if keys[0] in ob and keys[1] in ob
+                ),
+                None,
+            )
+        if selected is None:
+            # Container present and non-empty but matches none of ITS OWN candidate
+            # side-key sets (or is not even a dict). This is a potential key
+            # mismatch — the container and side keys have drifted out of sync, or
+            # Kalshi changed the response shape. Fail closed instead of
+            # cross-reading another generation's keys (which could feed a cents
+            # array through the dollars parser).
             logging.warning(
-                "Potential orderbook key mismatch for %s: container '%s' present but its "
-                "expected side keys %s are missing (got %s) — check for bugs or changes to "
-                "Kalshi's API",
+                "Potential orderbook key mismatch for %s: container '%s' present but matches "
+                "none of its expected side-key sets %s (got %s) — check for bugs or changes "
+                "to Kalshi's API",
                 ticker,
                 container_key,
-                (yes_key, no_key),
+                [(y, n) for y, n, _ in _ORDERBOOK_SIDE_KEYS[container_key]],
                 sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__,
             )
             return None
+        yes_key, no_key, unit = selected
         # Matched side keys are guaranteed present; a side with no resting bids
         # arrives as null or [] and must read as an empty (not missing) side.
         yes_raw = list(ob[yes_key] or [])
         no_raw  = list(ob[no_key] or [])
+        if unit == _UNIT_CENTS:
+            # Convert to dollars HERE — _bids_to_ask_levels is dollars-only, and
+            # cents fed through it parse as an empty book with no warning at all
+            yes_raw = _cents_bids_to_dollar_bids(ticker, yes_key, yes_raw)
+            no_raw  = _cents_bids_to_dollar_bids(ticker, no_key, no_raw)
         return {"yes": yes_raw, "no": no_raw}
     except Exception as exc:
         logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)

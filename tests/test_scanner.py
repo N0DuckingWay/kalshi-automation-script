@@ -10,6 +10,7 @@ import pytest
 from kalshi_betting.config import INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
+    _bids_to_ask_levels,
     _fetch_orderbook,
     display_title,
     enrich_with_orderbook_prices,
@@ -497,10 +498,13 @@ def _orderbook_payload_client(payload: dict):
 
 
 class TestFetchOrderbookKeyMapping:
-    """_fetch_orderbook must couple the container key to its matched side keys:
-    orderbook_fp -> yes_dollars/no_dollars, orderbook -> yes/no. A container whose
-    matched side keys are missing is a potential API-shape mismatch — logged and
-    treated as unavailable (None), never cross-read against the other generation."""
+    """_fetch_orderbook must couple the container key to its OWN candidate side-key
+    sets: orderbook_fp -> yes_dollars/no_dollars (dollars); orderbook ->
+    yes_dollars/no_dollars (dollars) or the SDK-aliased legacy true/false arrays
+    (integer cents, converted to dollars before parsing). A null/empty container is
+    an empty book; a non-empty container matching none of its own sets is a
+    potential API-shape mismatch — logged and treated as unavailable (None), never
+    cross-read against the other generation."""
 
     def test_current_format_parses(self):
         # orderbook_fp container with dollar-string side arrays (the live shape)
@@ -509,21 +513,73 @@ class TestFetchOrderbookKeyMapping:
         ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CURRENT")
         assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
 
-    def test_legacy_format_parses(self):
-        # orderbook container with legacy yes/no side arrays still routes correctly
-        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
-        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
+    def test_orderbook_container_dollar_keys_parse(self):
+        # The SDK's Orderbook model REQUIRES yes_dollars/no_dollars even under the
+        # plain `orderbook` container — that shape must parse identically.
+        payload = {"orderbook": {"yes_dollars": [["0.50", "10"]],
+                                 "no_dollars": [["0.40", "5"]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-OB-DOLLARS")
         assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+
+    def test_orderbook_container_legacy_cent_keys_convert_to_dollars(self, caplog):
+        # The legacy integer-cent arrays are aliased "true"/"false" by the SDK.
+        # A 45c YES bid must become a 0.45 dollar bid -> NO ask at 0.55, and
+        # NOTHING may be silently dropped (cents through the dollars parser would
+        # yield 1-45 = -44 and be discarded with no warning at all).
+        payload = {"orderbook": {"true": [[45, 100], [40, 50]],
+                                 "false": [[30, 20]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTS")
+        assert ob == {"yes": [[0.45, 100], [0.40, 50]], "no": [[0.30, 20]]}
+        assert caplog.text == ""
+        # Downstream complement: YES bid 0.45 -> NO ask 0.55 at the same qty
+        assert _bids_to_ask_levels(ob["yes"]) == [(0.55, 100.0), (0.60, 50.0)]
+
+    def test_orderbook_container_legacy_cent_string_prices_convert(self):
+        # Cents may arrive as strings ("45"); still integral cents, still converted
+        payload = {"orderbook": {"true": [["45", "100"]], "false": []}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTSTR")
+        assert ob == {"yes": [[0.45, "100"]], "no": []}
+
+    def test_malformed_cent_level_is_dropped_with_warning(self, caplog):
+        # 4500 is not a whole cent in [1, 99] — the level is dropped LOUDLY,
+        # naming the ticker and the raw value; valid levels still come through.
+        payload = {"orderbook": {"true": [[45, 100], [4500, 7]], "false": []}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-BADCENTS")
+        assert ob == {"yes": [[0.45, 100]], "no": []}
+        assert "legacy cents array" in caplog.text
+        assert "MKT-BADCENTS" in caplog.text
+        assert "4500" in caplog.text
+
+    def test_orderbook_container_with_removed_yes_no_keys_is_a_mismatch(self, caplog):
+        # Regression for BS-03: `orderbook` + yes/no was never a real SDK shape
+        # (the model aliases the legacy arrays as true/false). It is no longer a
+        # recognized generation, so it must fail closed rather than parse.
+        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+        assert "MKT-LEGACY" in caplog.text
 
     def test_mixed_generation_keys_return_none_and_warn(self, caplog):
         # orderbook_fp container but with the OTHER generation's side keys —
         # must not cross-read; returns None and logs a key-mismatch warning.
-        payload = {"orderbook_fp": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
+        payload = {"orderbook_fp": {"true": [[50, 10]], "false": [[40, 5]]}}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-MIXED")
         assert ob is None
         assert "Potential orderbook key mismatch" in caplog.text
         assert "MKT-MIXED" in caplog.text
+
+    def test_unrecognized_side_keys_return_none_and_warn(self, caplog):
+        # A non-empty dict container matching NEITHER candidate set fails closed
+        payload = {"orderbook": {"bids_yes": [["0.50", "10"]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NOSET")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
 
     def test_empty_and_null_sides_are_not_a_mismatch(self, caplog):
         # Side keys present but empty ([]) or null map to empty sides, NOT a
@@ -534,13 +590,22 @@ class TestFetchOrderbookKeyMapping:
         assert ob == {"yes": [], "no": []}
         assert "key mismatch" not in caplog.text
 
-    def test_non_dict_container_returns_none_and_warns(self, caplog):
-        # Container key present but its value is not a dict (e.g. null) — fail closed.
+    def test_null_container_is_an_empty_book(self, caplog):
+        # BS-28: container key present but null — that is a book with no resting
+        # bids at all, not an API shape change. Empty book, no warning.
         payload = {"orderbook_fp": None}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NULLC")
-        assert ob is None
-        assert "Potential orderbook key mismatch" in caplog.text
+        assert ob == {"yes": [], "no": []}
+        assert caplog.text == ""
+
+    def test_empty_dict_container_is_an_empty_book(self, caplog):
+        # Same for an empty-dict container, under either generation
+        payload = {"orderbook": {}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-EMPTYC")
+        assert ob == {"yes": [], "no": []}
+        assert caplog.text == ""
 
     def test_unknown_container_key_returns_none_and_warns(self, caplog):
         # No recognized container key at all — log the actual response keys so a
