@@ -228,6 +228,15 @@ EVENT_TITLE_LISTING_MAX_BARREN_PAGES = 50
 # resumes automatically if the API starts sending nested markets again.
 MVE_MAX_EMPTY_PAGES = 25
 
+# Emit a progress log line every this many pages in scanner.py's three
+# pagination loops (fetch_open_events_with_markets's standard-events and MVE
+# loops, get_held_tickers). A live dev-mode run paged 125,538 sandbox markets
+# in 13m27s with zero log lines in kalshi_arb.log — indistinguishable from a
+# hang, the exact misdiagnosis class the sharded historical fetcher's
+# "[sharded]"/"[windowed]" progress labels exist to prevent (see the
+# sharded-fetch gotcha in CLAUDE.md). Purely a logging cadence, not a bound.
+SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
+
 # ── Backtest candlestick granularity ────────────────────────────────────────
 
 # Minutes per candle requested from /historical/markets/{ticker}/candlesticks.

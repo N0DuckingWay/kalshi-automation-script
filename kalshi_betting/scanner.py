@@ -48,6 +48,7 @@ from .config import (
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SCANNER_PROGRESS_LOG_EVERY_PAGES,
     fee_per_pair_approx,
     min_price_diff_for_gap,
 )
@@ -304,6 +305,7 @@ def get_held_tickers(client: Any) -> set:
     """
     held: set = set()
     cursor: str | None = None
+    pages = 0
     while True:
         kwargs: dict = {"limit": POSITION_PAGE_SIZE, "count_filter": "position"}
         # Include cursor for pages after the first to continue pagination
@@ -313,6 +315,7 @@ def get_held_tickers(client: Any) -> set:
         data = api_call_with_retry(
             fetch_json_page, client.get_positions_without_preload_content, **kwargs
         )
+        pages += 1
         for pos in data.get("market_positions") or []:
             ticker = pos.get("ticker") or ""
             try:
@@ -328,7 +331,21 @@ def get_held_tickers(client: Any) -> set:
                 # If we can't parse the position, be conservative and treat it as held
                 if ticker:
                     held.add(ticker)
-        cursor = data.get("cursor")
+        if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+            logging.info("Positions fetch: %d pages, %d held tickers so far", pages, len(held))
+        new_cursor = data.get("cursor")
+        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
+        # the exact cursor we just used is already proof the server isn't
+        # advancing — one more page would come back identical forever, same
+        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and new_cursor == cursor:
+            logging.warning(
+                "Positions fetch: cursor did not advance on page %d — "
+                "stopping pagination to avoid an infinite loop",
+                pages,
+            )
+            break
+        cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
@@ -445,6 +462,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
     markets: list = []
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
+    pages = 0
     while True:
         kwargs: dict = {
             "status": "open",
@@ -458,6 +476,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
         data = api_call_with_retry(
             fetch_json_page, client.get_events_without_preload_content, **kwargs
         )
+        pages += 1
         for ev in data.get("events") or []:
             ev_title = ev.get("title") or ""
             for m in ev.get("markets") or []:
@@ -473,7 +492,21 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it
                 markets.append(_market_from_dict(m, ev_title))
-        cursor = data.get("cursor")
+        if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+            logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
+        new_cursor = data.get("cursor")
+        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
+        # the exact cursor we just used already proves the server isn't
+        # advancing — one more page would come back identical forever. Same
+        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and new_cursor == cursor:
+            logging.warning(
+                "Open-events fetch: cursor did not advance on page %d — "
+                "stopping pagination to avoid an infinite loop",
+                pages,
+            )
+            break
+        cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
@@ -488,6 +521,8 @@ def fetch_open_events_with_markets(client: Any) -> list:
         # consecutive marketless pages instead of paging for hours. Pages that
         # contain markets reset the counter.
         empty_pages = 0
+        mve_pages = 0
+        mve_market_count = 0
         while True:
             kwargs = {"limit": MARKET_PAGE_SIZE, "with_nested_markets": True}
             if cursor:
@@ -497,6 +532,7 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 client.get_multivariate_events_without_preload_content,
                 **kwargs,
             )
+            mve_pages += 1
             events = data.get("events") or []
             page_market_count = sum(len(ev.get("markets") or []) for ev in events)
             for ev in events:
@@ -509,6 +545,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     # — there is no "open" status).
                     if (m.get("status") or "") == "active":
                         markets.append(_market_from_dict(m, ev_title))
+                        mve_market_count += 1
+            if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+                logging.info(
+                    "MVE events fetch: %d pages, %d markets so far", mve_pages, mve_market_count
+                )
             if page_market_count == 0:
                 empty_pages += 1
                 if empty_pages >= MVE_MAX_EMPTY_PAGES:
@@ -521,7 +562,19 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     break
             else:
                 empty_pages = 0
-            cursor = data.get("cursor")
+            new_cursor = data.get("cursor")
+            # Stuck-cursor guard: the cursor is a keyset position, so a single
+            # repeat of the cursor we just used already proves the server
+            # isn't advancing — same bounded-scan idiom as the empty-pages
+            # bail-out just above.
+            if new_cursor and new_cursor == cursor:
+                logging.warning(
+                    "MVE events fetch: cursor did not advance on page %d — "
+                    "stopping pagination to avoid an infinite loop",
+                    mve_pages,
+                )
+                break
+            cursor = new_cursor
             if not cursor:
                 break
 

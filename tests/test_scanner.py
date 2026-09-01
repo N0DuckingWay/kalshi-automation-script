@@ -801,6 +801,147 @@ class TestFetchOpenEventsMveStatusFilter:
         with pytest.raises(ApiException):
             fetch_open_events_with_markets(client)
 
+    def test_standard_events_progress_logged_at_cadence(self, caplog):
+        # A silent multi-page fetch is indistinguishable from a hang (BS-13):
+        # a live dev-mode run paged 125,538 markets in 13m27s with zero log
+        # lines. A ~60-page fetch must emit progress lines at the configured
+        # cadence, not just a final summary.
+        from itertools import count
+
+        from kalshi_betting.config import SCANNER_PROGRESS_LOG_EVERY_PAGES
+
+        n_pages = 2 * SCANNER_PROGRESS_LOG_EVERY_PAGES + 10
+        counter = count()
+
+        def paged_events(**kwargs):
+            n = next(counter)
+            cursor = f"CUR-{n}" if n < n_pages - 1 else None
+            return _raw_page(
+                [{"title": f"E{n}", "markets": [_raw_market(f"T{n}", f"Q {n}")]}],
+                cursor=cursor,
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=paged_events)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.INFO):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == n_pages
+        progress_lines = [
+            r.message for r in caplog.records
+            if "Open-events fetch" in r.message and "pages" in r.message
+        ]
+        assert len(progress_lines) >= 2, f"expected >=2 progress lines, got {progress_lines}"
+        assert all("markets" in line for line in progress_lines)
+
+    def test_standard_events_stuck_cursor_stops_pagination(self, caplog):
+        # The cursor is a keyset position — a page handing back the exact
+        # cursor we just requested with already proves the server isn't
+        # advancing. One repeat must stop the loop rather than spin forever.
+        page1 = _raw_page(
+            [{"title": "E1", "markets": [_raw_market("PAGE1", "Q one")]}], cursor="CUR-STUCK"
+        )
+        page2 = _raw_page(
+            [{"title": "E2", "markets": [_raw_market("PAGE2", "Q two")]}], cursor="CUR-STUCK"
+        )
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=[page1, page2])
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # Only the two pages fetched before the guard fired — a third call
+        # would raise StopIteration against the side_effect list, which
+        # would fail this test on its own.
+        assert {m.ticker for m in markets} == {"PAGE1", "PAGE2"}
+        assert client.get_events_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_pagination_unions_pages(self):
+        # get_held_tickers previously had no multi-page test coverage at all.
+        from kalshi_betting.scanner import get_held_tickers
+
+        page1 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-1", "position_fp": "3"}],
+                "cursor": "CUR-2",
+            }).encode(),
+        )
+        page2 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-2", "position_fp": "-1"}],
+                "cursor": None,
+            }).encode(),
+        )
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[page1, page2])
+
+        assert get_held_tickers(client) == {"HELD-1", "HELD-2"}
+        assert client.get_positions_without_preload_content.call_count == 2
+
+    def test_get_held_tickers_stuck_cursor_stops_and_warns(self, caplog):
+        from kalshi_betting.scanner import get_held_tickers
+
+        page1 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-1", "position_fp": "3"}],
+                "cursor": "CUR-STUCK",
+            }).encode(),
+        )
+        page2 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-2", "position_fp": "-1"}],
+                "cursor": "CUR-STUCK",
+            }).encode(),
+        )
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[page1, page2])
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        # Partial results from both fetched pages are kept, not discarded.
+        assert held == {"HELD-1", "HELD-2"}
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_stuck_cursor_stops_pagination(self, caplog):
+        page1 = _raw_page(
+            [{"title": "MVE E1", "markets": [_raw_market("MVE-1", "Q one")]}],
+            cursor="CUR-STUCK",
+        )
+        page2 = _raw_page(
+            [{"title": "MVE E2", "markets": [_raw_market("MVE-2", "Q two")]}],
+            cursor="CUR-STUCK",
+        )
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=[page1, page2]
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert {m.ticker for m in markets} == {"MVE-1", "MVE-2"}
+        assert client.get_multivariate_events_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "MVE events fetch" in caplog.text
+
 
 class TestFilterMarketsWithinHorizon:
     def test_none_horizon_returns_markets_unchanged(self):
