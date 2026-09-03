@@ -917,16 +917,39 @@ class TestRunProdLiveV2Replay:
         order_side_effect=None,
         dry_run: bool = False,
     ):
-        # After a filled NO buy the exchange reports a NEGATIVE (short-YES)
-        # position on the leg-A ticker — that sign is what trader's first-fill
-        # backstop verifies before leg B is submitted, so the replay account
-        # must model it or every pair would stop at manual_review.
+        # trader's first-fill backstop judges the V2 NO-leg mapping by how the
+        # leg-A position MOVED across the fill, not by its absolute sign, so
+        # the replay account must model a CHANGE: flat on the baseline read
+        # (taken before either order is submitted), then short by exactly the
+        # contracts leg A bought. A single static payload would give a delta of
+        # 0 and stop every pair at manual_review. The moved count is read back
+        # from the submitted body rather than hardcoded, so it can't drift out
+        # of step with Kelly sizing.
+        submitted: dict = {}
+        base_orders = (
+            order_side_effect if order_side_effect is not None
+            else _order_side_effect(fill_pattern)
+        )
+
+        def recording_orders(verb, url, headers=None, body=None):
+            # First body per ticker is that leg's opening order; a later
+            # rollback on the same ticker must not overwrite it.
+            if TRANSFER_PATH not in url and isinstance(body, dict):
+                submitted.setdefault(body["ticker"], body["count"])
+            return base_orders(verb, url, headers=headers, body=body)
+
         lookups = {
-            _TICKER_SAME_EXP: {
-                "market_positions": [
-                    {"ticker": _TICKER_SAME_EXP, "position_fp": "-12.00"}
-                ]
-            },
+            _TICKER_SAME_EXP: [
+                {"market_positions": []},
+                lambda: {
+                    "market_positions": [
+                        {
+                            "ticker": _TICKER_SAME_EXP,
+                            "position_fp": f"-{submitted.get(_TICKER_SAME_EXP, '0')}",
+                        }
+                    ]
+                },
+            ],
         }
         lookups.update(position_lookup_responses or {})
         client = _live_shape_client(
@@ -934,10 +957,7 @@ class TestRunProdLiveV2Replay:
             balance_payload=balance_payload,
             balance_payload_after=balance_payload_after,
             same_cheap_shard=same_cheap_shard,
-            order_side_effect=(
-                order_side_effect if order_side_effect is not None
-                else _order_side_effect(fill_pattern)
-            ),
+            order_side_effect=recording_orders,
             position_lookup_responses=lookups,
         )
         captured: dict = {}

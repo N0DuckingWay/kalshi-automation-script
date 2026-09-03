@@ -25,7 +25,7 @@ Purpose:
     STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is on by default
     (config.ORDER_API_VERSION = "v2") and does not wait for this probe. What
     backstops it instead is trader._confirm_v2_no_mapping(), which checks the
-    very same position sign on the first live V2 NO fill of a process — but
+    very same position MOVEMENT on the first live V2 NO fill of a process — but
     that check pays for its evidence with a REAL trade-sized position, while
     this probe buys the identical evidence for ~1c. If either mapping step
     FAILS, set config.ORDER_API_VERSION = "legacy" to hold the bot on the

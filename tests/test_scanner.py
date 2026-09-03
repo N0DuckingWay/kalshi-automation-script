@@ -591,6 +591,20 @@ class TestFetchOrderbookKeyMapping:
         assert ob is None
         assert "Potential orderbook key mismatch" in caplog.text
 
+    def test_non_dict_container_returns_none_and_warns(self, caplog):
+        # A container that is present and non-empty but is not a dict at all
+        # (here a bare list of levels) can't be probed for side keys. It must
+        # fail closed exactly like an unrecognized key set, and the warning
+        # names the TYPE rather than a key list — the branch that logs
+        # type(ob).__name__ instead of sorted(ob.keys()).
+        payload = {"orderbook_fp": [["0.50", "10"]]}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NOTDICT")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+        assert "MKT-NOTDICT" in caplog.text
+        assert "list" in caplog.text
+
     def test_empty_and_null_sides_are_not_a_mismatch(self, caplog):
         # Side keys present but empty ([]) or null map to empty sides, NOT a
         # mismatch — a market with no resting bids on a side is normal.
