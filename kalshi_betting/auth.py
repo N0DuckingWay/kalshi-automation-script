@@ -12,10 +12,11 @@ Purpose:
     Kalshi API receives a KalshiClient produced by this module.
 
 Dependencies:
-    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, and PEM_FILE from config.py, and
-    api_call_with_retry / fetch_json_page from _http.py. build_client() is called
-    by main.py, historical.py, and (indirectly) backtest.py. verify_auth() is
-    called by main.py to confirm credentials and read balance.
+    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, and
+    DEFAULT_EXCHANGE_INDEX from config.py, and api_call_with_retry /
+    fetch_json_page from _http.py. build_client() is called by main.py,
+    historical.py, and (indirectly) backtest.py. verify_auth() is called by
+    main.py to confirm credentials and read balance.
 
 Notes:
     KalshiClient does NOT accept api_key_id and private_key_pem as constructor
@@ -23,18 +24,49 @@ Notes:
     Configuration object via hasattr() and builds KalshiAuth internally.
     The sandbox endpoint (demo-api.kalshi.co) requires a completely separate
     account — the production key returns 401 there.
-    verify_auth() calls get_balance_without_preload_content and parses the JSON
-    body itself rather than the modeled get_balance() — see verify_auth's
-    docstring and the CLAUDE.md API-drift gotcha for why.
+
+    verify_auth() deliberately does NOT use the modeled client.get_balance().
+    That call deserializes through the pinned SDK's strict pydantic model,
+    which types balance / portfolio_value / updated_ts as required ints — the
+    exact drift-fragile pattern that already broke the events, orders, and
+    positions endpoints when Kalshi moved money fields to *_dollars strings.
+    It reads the raw body through _http.fetch_json_page() instead, which keeps
+    the non-2xx → ApiException semantics so bad credentials still fail loudly.
+
+    Balance is shard-aware. Kalshi's 2026-08-13 change scoped
+    /portfolio/balance per exchange shard: the body carries a
+    balance_breakdown list of {exchange_index, balance} entries alongside the
+    aggregate. verify_auth() returns the FULL per-shard breakdown as
+    dict[int, int] (exchange_index -> cents) rather than a single scalar —
+    a later collateral-transfer planner and a shard coverage check both need
+    every shard's balance, not just the routable one. Sizing itself stays
+    portfolio-wide: callers sum the dict before handing it to
+    strategy.compute_trade()/select_portfolio(), whose signatures take a
+    single scalar balance_cents and are NOT shard-aware. There is
+    deliberately no scalar-returning wrapper here — a dual API would invite
+    a future caller to size against the wrong (single-shard) number.
+
+    Beware the same-key-different-units trap — inside a breakdown entry
+    "balance" is a fixed-point DOLLAR STRING, while the TOP-LEVEL "balance"
+    is a legacy INTEGER CENTS field. They must never be parsed by the same
+    code path.
 """
 import json
 import logging
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 
 from kalshi_python_sync import KalshiClient
 from kalshi_python_sync.configuration import Configuration
 
 from ._http import api_call_with_retry, fetch_json_page
-from .config import DEV_PEM_FILE, PEM_FILE, PROD_URL, SANDBOX_URL, SECRETS_FILE
+from .config import (
+    DEFAULT_EXCHANGE_INDEX,
+    DEV_PEM_FILE,
+    PEM_FILE,
+    PROD_URL,
+    SANDBOX_URL,
+    SECRETS_FILE,
+)
 
 
 def build_client(mode: str) -> KalshiClient:
@@ -101,16 +133,140 @@ def build_client(mode: str) -> KalshiClient:
     return client
 
 
-def verify_auth(client: KalshiClient) -> int:
+def _dollar_str_to_cents(value) -> int | None:
     """
-    Verify that the client's credentials are valid and return the account balance.
+    Convert a fixed-point dollar string (e.g. "1.1407") to whole cents, floored.
 
-    Calls the Kalshi get_balance() endpoint through api_call_with_retry() so a
-    transient 429/5xx doesn't abort the run before scanning even starts. If
-    authentication fails, this call will raise an exception from the underlying
-    HTTP client. Used in production mode both at startup (to confirm auth works
-    and read the pre-trade balance) and after trading (to read the post-trade
-    balance for the Excel log).
+    Floors rather than rounds: the bot must never be told it holds sub-cent
+    money it cannot actually spend, because Kelly sizing would then overshoot
+    the real balance by a cent. Parsing goes through Decimal rather than float
+    — binary float parsing would reintroduce exactly the truncation noise the
+    *_dollars string fields exist to avoid.
+
+    Args:
+        value: The raw field value from the API body. Normally a fixed-point
+            string; a float or int is accepted and converted via its str form.
+            None or an unparseable value yields None.
+
+    Returns:
+        int | None: The value in whole cents (floored toward negative
+            infinity), or None if value is missing or unparseable.
+    """
+    if value is None:
+        return None
+    try:
+        # Decimal(str(...)) keeps the exact decimal digits the API sent; the
+        # ROUND_FLOOR quantize is the "never overstate spendable funds" rule.
+        return int((Decimal(str(value)) * 100).to_integral_value(rounding=ROUND_FLOOR))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _balance_cents_by_shard(data: dict) -> dict[int, int]:
+    """
+    Extract the spendable balance in cents PER SHARD from a raw
+    /portfolio/balance body.
+
+    Kalshi's 2026-08-13 change scoped the balance per exchange shard, so the
+    body now carries a balance_breakdown list alongside the aggregate. Unlike
+    the single-shard predecessor of this function, every parseable shard is
+    returned — a later collateral-transfer planner and a shard coverage check
+    both need the full picture, not just the routable shard. The preference
+    order (tiers 2 and 3 only apply when the breakdown is absent or entirely
+    unparseable):
+
+      1. Every balance_breakdown entry that parses: {exchange_index: cents}
+         for each entry, keyed by its own exchange_index (not just
+         DEFAULT_EXCHANGE_INDEX). Entries carry the dollar string under the
+         key "balance" (NOT "balance_dollars").
+      2. Top-level balance_dollars — the fixed-point aggregate across shards
+         — attributed to DEFAULT_EXCHANGE_INDEX, used only when the
+         breakdown is missing/empty or nothing in it parsed.
+      3. Legacy top-level integer balance, already in cents, attributed to
+         DEFAULT_EXCHANGE_INDEX. This is the sandbox shape and the
+         pre-drift production shape; it is returned as-is and must NOT be
+         run through the dollar converter.
+
+    Args:
+        data (dict): Parsed JSON body of GET /portfolio/balance.
+
+    Returns:
+        dict[int, int]: Spendable balance in whole cents, keyed by
+            exchange_index. Callers that need a single number for Kelly
+            sizing must sum this dict themselves — sizing is deliberately
+            portfolio-wide, not per-shard.
+
+    Raises:
+        ValueError: If no balance field in the payload parses. This is the
+            deliberate loud-failure carve-out to the project's
+            return-None-on-validation-failure convention: sizing real trades
+            against an unknown balance is worse than aborting the run.
+    """
+    breakdown = data.get("balance_breakdown") or []
+    by_shard: dict[int, int] = {}
+    for entry in breakdown:
+        try:
+            # A non-dict entry raises AttributeError on .get and a missing /
+            # non-numeric exchange_index raises TypeError/ValueError — a
+            # malformed entry must never abort the scan of the good ones.
+            idx = int(entry.get("exchange_index"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        # Inside a breakdown entry "balance" is a DOLLAR STRING (unlike the
+        # top-level "balance", which is integer cents) — hence the dollar
+        # converter here. balance_dollars is accepted first in case the
+        # field is ever added to the entries.
+        cents = _dollar_str_to_cents(entry.get("balance_dollars") or entry.get("balance"))
+        if cents is not None:
+            by_shard[idx] = cents
+        else:
+            # A parseable shard index with an unparseable balance means that
+            # shard's REAL funds silently vanish from sizing, the coverage
+            # audit, and the transfer planner — exactly the drift failure
+            # class this codebase keeps hitting. Under-sizing is safe, but it
+            # must never be invisible.
+            logging.warning(
+                "balance_breakdown entry for shard %d carried no parseable "
+                "balance (keys=%s) — that shard's funds are NOT counted",
+                idx, sorted(entry),
+            )
+    if by_shard:
+        return by_shard
+    if breakdown:
+        # Breakdown present but nothing in it parsed: fall through to the
+        # aggregate rather than reading $0 (which would falsely trip the
+        # MIN_BALANCE_CENTS abort), but say so.
+        logging.warning("balance_breakdown had no parseable entries; "
+                        "falling back to aggregate balance")
+    cents = _dollar_str_to_cents(data.get("balance_dollars"))
+    if cents is not None:
+        return {DEFAULT_EXCHANGE_INDEX: cents}
+    legacy = data.get("balance")
+    if isinstance(legacy, int):
+        # Top-level legacy field is ALREADY cents — no dollar conversion.
+        return {DEFAULT_EXCHANGE_INDEX: legacy}
+    raise ValueError(f"Unparseable balance payload: keys={sorted(data)}")
+
+
+def verify_auth(client: KalshiClient) -> dict[int, int]:
+    """
+    Verify that the client's credentials are valid and return the per-shard
+    account balance.
+
+    Reads GET /portfolio/balance through the SDK's raw-response variant wrapped
+    in api_call_with_retry(), so a transient 429/5xx doesn't abort the run
+    before scanning even starts, and parses the shard-aware body itself (see
+    _balance_cents_by_shard). If authentication fails, fetch_json_page
+    re-raises the non-2xx as ApiException. Used in production mode both at
+    startup (to confirm auth works and read the pre-trade balance) and after
+    trading (to read the post-trade balance for the Excel log).
+
+    There is deliberately no scalar-returning variant of this function — the
+    dict is the single source of truth. Callers that need one number for
+    Kelly sizing (main.py, ultimately strategy.compute_trade() /
+    select_portfolio()) must explicitly sum(...) the returned dict; a dual
+    API here would invite a future caller to size against a single shard's
+    balance instead of the portfolio-wide total.
 
     Uses the raw-response variant + JSON parsing, same as trader._position_count
     and scanner.get_held_tickers: the pinned SDK's GetBalanceResponse model
@@ -124,39 +280,55 @@ def verify_auth(client: KalshiClient) -> int:
         client (KalshiClient): An authenticated client produced by build_client().
 
     Returns:
-        int: Current account balance in cents (e.g. 100000 = $1,000.00).
+        dict[int, int]: Spendable balance in whole cents, keyed by
+            exchange_index (e.g. {0: 100000, 1: 5000} = $1,000.00 on shard 0
+            and $50.00 on shard 1).
 
     Raises:
-        Exception: Any exception raised by the Kalshi API client if the request
-            fails (e.g. 401 Unauthorized if credentials are wrong, network error).
-        KeyError: If the parsed response body has none of the recognized
-            balance fields ("balance", "balance_fp", "balance_dollars") — an
-            unrecognized response shape must fail loudly, not silently return
-            a wrong value.
+        ApiException: If the request returns a non-2xx status (e.g. 401
+            Unauthorized when credentials are wrong).
+        ValueError: If the response body carries no parseable balance field.
+        Exception: Any other exception raised by the underlying HTTP client
+            (e.g. a network error that outlived the retry budget).
     """
-    # Raw-response call: the raw variant skips the SDK's pydantic response
-    # model entirely (see module Notes), so a future field rename can't crash
-    # auth verification the way the modeled get_balance() would.
+    # Raw-response call: the modeled get_balance() deserializes through the
+    # pinned SDK's strict pydantic model (balance/portfolio_value/updated_ts
+    # all required) — the same drift failure class that already broke
+    # events/orders/positions. fetch_json_page restores non-2xx semantics,
+    # so bad credentials still raise ApiException loudly.
     data = api_call_with_retry(fetch_json_page, client.get_balance_without_preload_content)
-    raw = data.get("balance")
-    if raw is None:
-        # Defensive drift fallback, mirroring the *_fp / *_dollars pattern
-        # used elsewhere (e.g. trader._position_count's position_fp fallback).
-        # NOTE: balance_fp is consumed here as CENTS, purely by analogy to
-        # position_fp (a stringified form of the same integer quantity the
-        # legacy field carried). It has NOT been verified against a live
-        # payload — if a real response ever exercises this branch, confirm the
-        # unit before trusting the number. balance_dollars IS dollars (the
-        # *_dollars convention is verified elsewhere), hence the × 100.
-        raw = data.get("balance_fp")
-        if raw is None and data.get("balance_dollars") is not None:
-            raw = float(data["balance_dollars"]) * 100
-    if raw is None:
-        raise KeyError(
-            f"No recognizable balance field in get_balance response (keys: {sorted(data)})"
-        )
-    # round() before int(): float("2.03") * 100 == 202.99999999999997, which
-    # int() would truncate to 202 — a silent one-cent loss on the drift path.
-    balance = int(round(float(raw)))
-    logging.info("Auth OK — balance: %d cents  ($%.2f)", balance, balance / 100)
-    return balance
+    shard_balances = _balance_cents_by_shard(data)
+    logging.info(
+        "Auth OK — balance by shard: %s (total $%.2f)",
+        shard_balances,
+        sum(shard_balances.values()) / 100,
+    )
+    return shard_balances
+
+
+def read_shard_balances(client: KalshiClient) -> dict[int, int]:
+    """
+    Single-shot per-shard balance read — no retry, no backoff, no logging.
+
+    The bounded-poll variant of verify_auth(): trader._await_transfer_settlement
+    re-reads the balance every TRANSFER_POLL_INTERVAL_SECONDS against a
+    monotonic deadline, and that deadline is only checked BETWEEN reads — so
+    the read itself must return (or fail) quickly. verify_auth's
+    api_call_with_retry wrapper can hold a single call for ~60s of exponential
+    backoff during an outage, silently tripling the "bounded" wait; here a
+    transient failure just raises and costs the caller one poll interval.
+
+    Same parse, same shard-aware dict as verify_auth — "landed" is judged
+    against exactly the numbers sizing was based on.
+
+    Args:
+        client (KalshiClient): An authenticated client produced by build_client().
+
+    Returns:
+        dict[int, int]: Spendable balance in whole cents, keyed by exchange_index.
+
+    Raises:
+        ApiException: On a non-2xx status.
+        ValueError: If the response body carries no parseable balance field.
+    """
+    return _balance_cents_by_shard(fetch_json_page(client.get_balance_without_preload_content))

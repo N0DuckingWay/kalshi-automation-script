@@ -106,10 +106,23 @@ INCLUDE_MVE_MARKETS           = True
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
+# LEGACY ORDER PATH ONLY — the V2 order path uses BUY_SLIPPAGE_TICKS below.
 # Slippage allowance, in cents per contract, added on top of the scanned price
 # when computing the buy_max_cost cap for each market FoK order leg. The cap
 # protects against the order book moving between the pre-execution check and
 # submission: the order fills at or below (scanned price + allowance) or not at all.
+# This stays a whole-cent value because `buy_max_cost` is an integer-cents field
+# on the legacy /portfolio/orders create-order endpoint — a sub-cent-aware cap
+# can't be expressed there no matter how finely a market's own tick grid is
+# subdivided (see ApiMarket.price_level_structure / price_ranges in scanner.py).
+# On 2026-08-17, all MVE/combo markets migrated to the
+# `center_deci_edge_centi_cent` tick regime — $0.0001 ticks below $0.01 and
+# above $0.99, $0.001 ticks in between — so this 1c tolerance permits roughly
+# 10-100 ticks of price drift on those markets, depending on where in the band
+# the price sits, rather than the intended ~1. That is precisely why the
+# default order path is now ORDER_API_VERSION = "v2" (below), whose dollar-
+# string limit price is capped in ticks; this constant only still applies when
+# that switch is flipped back to "legacy" as a rollback.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
 # Maximum accepted per-contract loss (cents) when unwinding leg A after a
@@ -129,7 +142,122 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 # outcome, not the tail case. 12 cents lets a normal-spread book fill the
 # unwind while a genuinely collapsed book still kills it and surfaces
 # rollback_failed for manual review — the deliberate bounded-loss trade-off.
+#
+# The floor applies to BOTH order paths. On the legacy path it is the NO limit
+# sell price directly. On the V2 path a held NO position is a short YES, so the
+# unwind is a YES BUY and the same bound becomes a bid CEILING of
+# (1 - floor/100) dollars, ceiling-quantized onto the market's tick grid and
+# clamped by V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._v2_rollback_price).
 ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
+
+# Slippage allowance for the V2 order path, denominated in TICKS of the market's
+# own price grid rather than in whole cents. The V2 endpoint
+# (/portfolio/events/orders) takes dollar-string limit prices, so a FoK cap can
+# finally be expressed at the market's real resolution: cap = scanned price +
+# BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
+# scanner.tick_size_for_price(). One tick restores the original intent of
+# BUY_MAX_COST_SLIPPAGE_CENTS = 1, which meant ~1 tick back when every market
+# was on a 1c grid but means roughly 10-100 ticks on the centi-cent regimes
+# MVE/combo markets migrated to on 2026-08-17.
+BUY_SLIPPAGE_TICKS            = 1
+
+# Fallback tick size, in dollars, for a market whose tick structure is unknown
+# or uniform-cent ("linear_cent", or no price_ranges bands at all). Kalshi's
+# tick grids are nested ($0.01 ⊂ $0.001 ⊂ $0.0001), so the coarsest grid is
+# always a safe, always-valid fallback. Stored as a dollar STRING and parsed
+# with Decimal at the point of use — same rule as the balance parsing in
+# auth.py: float literals reintroduce exactly the binary representation noise
+# the API's dollar-string fields exist to avoid.
+DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
+
+# Which create-order endpoint trader.py submits through. Allowed values:
+#   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
+#              (the limit price IS the price protection), fixed-point counts,
+#              bid/ask sides on the single YES book, explicit exchange_index.
+#              Only this path can express a cap at the market's real tick
+#              resolution (see BUY_SLIPPAGE_TICKS above).
+#   "legacy" — the original /portfolio/orders create-order call
+#              (CreateOrderRequest, type="market", integer-cents buy_max_cost
+#              via BUY_MAX_COST_SLIPPAGE_CENTS).
+# The legacy path is retained UNMODIFIED in trader.py purely so flipping this
+# constant to "legacy" is the instant rollback procedure if the first live or
+# sandbox V2 submission misbehaves — no code change, no redeploy of logic.
+# Default is "v2" because the legacy endpoint is past its "no earlier than
+# 2026-05-06" deprecation window and costs 5x rate-limit tokens per request.
+# Note that dev/sandbox V2 support is UNVERIFIED (dev mode never submits
+# orders), so the first real production submission is the true verification of
+# the V2 request/response mapping — see the V2 gotcha in CLAUDE.md.
+ORDER_API_VERSION             = "v2"
+
+# Full API path of the V2 create-order endpoint, including the /trade-api/v2
+# prefix. A constant (not an inline literal) because the path is signed as part
+# of every request — _http.signed_request_json signs timestamp + method + path,
+# so the string used to build the URL and the string that is signed must be one
+# and the same value.
+V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
+
+# TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
+# bid that unwinds a filled leg A. On the single-YES-book model a held NO
+# position is a short YES, so closing it is a YES BUY (bid).
+#
+# This is NOT the price submitted. The submitted bid is the bounded-loss
+# ceiling derived from ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — (1 - floor/100),
+# ceiling-quantized onto the market's own tick grid — and this constant is only
+# the upper clamp applied to it (trader._v2_rollback_price). It matters because
+# a low-priced leg A can push the derived ceiling above the highest tradeable
+# level, and because it defines what "as aggressive as possible" means when the
+# clamp binds: this is the finest-grid target ($0.0001 ticks), floored onto the
+# grid of the market actually being unwound (0.99 on linear-cent, 0.999 on
+# deci-cent, 0.9999 on a centi-cent edge band) — a flat 0.99 would fail to
+# cross asks resting in (0.99, 1) on sub-cent regimes. Deliberately not "1" —
+# that is a settlement value, not a tradeable level.
+V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
+
+# The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
+# instances keyed by `exchange_index` (on markets and in the balance breakdown;
+# combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
+# tennis/baseball to shard 3 on 2026-08-24). "Default" carries three
+# path-independent meanings, which is why this is not named "routable" —
+# routability depends on the order path (the legacy endpoint reaches only this
+# shard; V2 takes an explicit per-order exchange_index):
+#   1. the shard assumed when a market payload omits `exchange_index`
+#      (fail-safe — absence of the field must never drop markets);
+#   2. the shard the legacy/sandbox single-scalar balance shapes are
+#      attributed to (auth.py fallback tiers 2-3);
+#   3. the only shard the legacy order path may route to.
+DEFAULT_EXCHANGE_INDEX       = 0
+
+# ── Cross-shard collateral transfers ──────────────────────────────────────────
+
+# Full API path of the intra-exchange (shard-to-shard) collateral transfer
+# endpoint, used by trader.ensure_shard_collateral() to move cash onto whichever
+# shard a selected trade's legs actually settle against. The pinned SDK has no
+# generated method for this route, so it is reached through
+# _http.signed_request_json(), which signs the path VERBATIM — hence the full
+# string including the /trade-api/v2 prefix, not a suffix appended to PROD_URL.
+# WARNING: the request body's `amount` field is denominated in CENTICENTS
+# (1/100 of a cent), the codebase's THIRD money unit after integer cents and
+# fixed-point dollar strings. Convert with trader._cents_to_centicents(), never
+# by inlining a factor at the call site.
+TRANSFER_PATH = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
+
+# Seconds to keep waiting for accepted transfers to actually SETTLE. The
+# transfer endpoint is ASYNCHRONOUS: a 2xx means "accepted", not "the funds have
+# landed", so an order submitted immediately after could still be rejected for
+# insufficient collateral on its shard. ensure_shard_collateral() therefore
+# re-reads the per-shard balance until every under-funded shard is covered, and
+# this bounds that wait. 30s is long enough for an in-flight transfer to land,
+# short enough that a stuck transfer doesn't hold the run open while its scanned
+# prices go stale; on timeout the affected trades are dropped rather than
+# submitted against money that may not be there.
+TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
+
+# Seconds between per-shard balance re-reads while waiting for transfers to
+# settle. Each poll costs one GET /portfolio/balance, so 2s gives ~15 reads
+# inside TRANSFER_SETTLE_TIMEOUT_SECONDS — responsive enough to proceed promptly
+# once the funds land, infrequent enough not to spend rate-limit tokens on a hot
+# loop while money is in flight.
+TRANSFER_POLL_INTERVAL_SECONDS = 2
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the

@@ -29,6 +29,26 @@ class TestProjectRoot:
         assert PROJECT_ROOT == pathlib.Path(config.__file__).resolve().parent.parent
 
 
+class TestPackagingGuards:
+    def test_no_shadow_requirements_file(self):
+        # A second dependency list inside the package once pinned the SDK to
+        # 3.13.0 — the exact version whose metadata requires Python >= 3.13 and
+        # breaks `pip install -e ".[dev]"` on 3.11. pyproject.toml is the single
+        # source of truth; this guards against the shadow file reappearing.
+        assert not (PROJECT_ROOT / "kalshi_betting" / "requirements.txt").exists()
+
+    def test_sdk_pin_is_3_2_0(self):
+        # kalshi-python-sync must stay pinned at 3.2.0: every newer release
+        # requires Python >= 3.13, which breaks install (and CI) on 3.11.
+        import tomllib
+
+        with open(PROJECT_ROOT / "pyproject.toml", "rb") as fh:
+            pyproject = tomllib.load(fh)
+        deps = pyproject["project"]["dependencies"]
+        sdk_pins = [d for d in deps if d.startswith("kalshi-python-sync")]
+        assert sdk_pins == ["kalshi-python-sync==3.2.0"]
+
+
 class TestFeeLegExact:
     def test_ceiling_rounding(self):
         # ceil(0.07 * 1 * 0.5 * 0.5 * 100) = ceil(1.75) = 2 → 0.02

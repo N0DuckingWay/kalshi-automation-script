@@ -26,6 +26,10 @@ Notes:
     file. If you want the scheduler to run at a different time or interval, edit
     the `schedule.every().monday.at("09:00")` call in main().
 
+    The Monday 09:00 schedule fires in HOST-LOCAL time (the `schedule` library
+    reads the system clock, no timezone conversion) — this is deliberate,
+    existing behavior, not a bug to "fix" by adding UTC conversion.
+
     CPython quirk (BS-16, reproduced on this host): subprocess.TimeoutExpired's
     .stdout/.stderr are raw BYTES even when subprocess.run() was called with
     text=True — text=True only governs decoding of the CompletedProcess
@@ -60,6 +64,7 @@ Notes:
 """
 import json
 import logging
+import pathlib
 import subprocess
 import sys
 import time
@@ -348,6 +353,33 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
         run_job()
 
 
+def _setup_logging(log_path: pathlib.Path) -> None:
+    """
+    Configure root logging with both a console handler and a file handler.
+
+    main.py has a twin of this helper (kalshi_betting.main._setup_logging).
+    The two are deliberately duplicated rather than shared: scheduler.py must
+    not import main.py (scheduler spawns main as an isolated subprocess so a
+    crash in one run can't take down the daemon — importing main directly
+    would defeat that isolation and create a needless coupling).
+
+    Args:
+        log_path (pathlib.Path): Path to the log file to append to.
+
+    Returns:
+        None
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, delay=True),
+        ],
+    )
+
+
 def main() -> None:
     """
     Entry point for the weekly scheduler daemon.
@@ -361,14 +393,7 @@ def main() -> None:
     was added will always trigger an immediate prod run, since
     scheduler_state.json does not yet exist on that first start.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(PROJECT_ROOT / "kalshi_arb.log"),
-        ],
-    )
+    _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
 
     # BS-17: catch up on a missed run before registering future ones, so a
     # daemon that was offline across a scheduled Monday 09:00 doesn't wait

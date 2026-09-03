@@ -460,6 +460,28 @@ class TestMarketToDict:
         d = historical._market_to_dict(_raw_market_dict())
         assert d["subtitle"] is None
 
+    def test_yes_sub_title_maps_to_subtitle_key(self):
+        # 2026-08 drift: the archive now carries the outcome label in
+        # yes_sub_title. It must land on the `subtitle` cache key so the
+        # backtester's (event_title, title, subtitle) grouping keeps its
+        # intra-title discriminator without a cache-shape change.
+        d = historical._market_to_dict(
+            _raw_market_dict(yes_sub_title="Pierbattista Pizzaballa")
+        )
+        assert d["subtitle"] == "Pierbattista Pizzaballa"
+
+    def test_explicit_subtitle_wins_over_yes_sub_title(self):
+        d = historical._market_to_dict(
+            _raw_market_dict(subtitle="Legacy Label", yes_sub_title="New Label")
+        )
+        assert d["subtitle"] == "Legacy Label"
+
+    def test_no_sub_title_is_not_used_as_subtitle(self):
+        # no_sub_title is the negated phrasing — using it would produce a
+        # grouping key that differs between the YES and NO framings.
+        d = historical._market_to_dict(_raw_market_dict(no_sub_title="Someone else"))
+        assert d["subtitle"] is None
+
     def test_carries_open_time(self):
         # open_time feeds backtester._can_ever_enter()'s eligibility prefilter
         d = historical._market_to_dict(_raw_market_dict())
@@ -472,6 +494,49 @@ class TestMarketToDict:
         del raw["open_time"]
         d = historical._market_to_dict(raw)
         assert d["open_time"] is None
+
+    def test_tick_structure_fields_pass_through_raw(self):
+        # price_level_structure/price_ranges (2026-08 groundwork) must be
+        # stored RAW — not parsed into scanner.PriceRange objects — since this
+        # dict is JSON-serialized straight into the backtest cache.
+        raw = _raw_market_dict(
+            price_level_structure="deci_cent",
+            price_ranges=[{"start": "0.0000", "end": "1.0000", "step": "0.0010"}],
+        )
+        d = historical._market_to_dict(raw)
+        assert d["price_level_structure"] == "deci_cent"
+        assert d["price_ranges"] == [{"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+
+    def test_missing_tick_structure_fields_map_to_none(self):
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["price_level_structure"] is None
+        assert d["price_ranges"] is None
+
+    def test_market_to_dict_passes_exchange_index_through(self):
+        # Shard fidelity (2026-08): stored raw so backtest data can
+        # distinguish exchange shards; never filtered on the backtest path.
+        d = historical._market_to_dict(_raw_market_dict(exchange_index=1))
+        assert d["exchange_index"] == 1
+
+    def test_missing_exchange_index_maps_to_none(self):
+        # Pre-existing cache records lack the key and must read back as None
+        d = historical._market_to_dict(_raw_market_dict())
+        assert d["exchange_index"] is None
+
+    def test_stored_record_is_json_serializable(self):
+        # The produced dict is gzip+json-dumped straight into the cache — a
+        # non-JSON-native value here (e.g. an accidentally-parsed PriceRange
+        # dataclass) would blow up at cache-write time, not at read time.
+        raw = _raw_market_dict(
+            price_level_structure="tapered_deci_cent",
+            price_ranges=[
+                {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            ],
+        )
+        d = historical._market_to_dict(raw, "Some Event Title")
+        round_tripped = json.loads(json.dumps(d))
+        assert round_tripped == d
 
 
 class TestFetchAllSettledMarkets:
@@ -1933,6 +1998,43 @@ def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
     mock = MagicMock(return_value=_raw_resp(payload))
     monkeypatch.setattr(historical, "_signed_raw_get", mock)
     return mock
+
+
+class TestCandleClose:
+    def test_candle_numeric_zero_close_dollars_is_used_not_fallthrough(self):
+        # Regression: `ya.get("close_dollars") or ya.get("close")` treated a
+        # valid falsy close_dollars (numeric 0) as absent and silently read
+        # the legacy field instead.
+        assert historical._candle_close({"close_dollars": 0, "close": "55"}) == 0.0
+
+    def test_candle_empty_string_close_dollars_falls_back_to_close(self):
+        # An empty string is absence-of-value, not a price — keep the fallback
+        assert historical._candle_close({"close_dollars": "", "close": "0.55"}) == 0.55
+
+    def test_candle_missing_both_closes_is_none(self):
+        assert historical._candle_close({}) is None
+        assert historical._candle_close({"close_dollars": None, "close": None}) is None
+
+    def test_candle_unparseable_close_dollars_is_none_not_fallthrough(self):
+        # A present-but-garbage close_dollars means the payload shape is off;
+        # don't guess from the legacy field.
+        assert historical._candle_close({"close_dollars": "n/a", "close": "0.55"}) is None
+
+    def test_candle_missing_close_skipped_in_fetch(self, tmp_path, monkeypatch):
+        # Through-path: a candle whose sides carry no close at all is skipped
+        # rather than raising or emitting a bogus price.
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        mock = MagicMock(return_value={
+            "candlesticks": [
+                {"end_period_ts": 1, "yes_ask": {}, "yes_bid": {}},
+                {"end_period_ts": 2, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}},
+            ]
+        })
+        monkeypatch.setattr(historical, "_historical_get", mock)
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
+        )
+        assert [c["ts"] for c in out] == [2]
 
 
 class TestFetchCandlesticks:

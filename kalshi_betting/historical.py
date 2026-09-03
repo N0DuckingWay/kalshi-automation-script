@@ -259,13 +259,38 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
     Returns:
         dict: A flat dictionary with keys: ticker, event_ticker, event_title,
             title, subtitle, result, yes_ask_dollars, no_ask_dollars,
-            yes_bid_dollars, open_time, close_time, settlement_ts, status.
+            yes_bid_dollars, open_time, close_time, settlement_ts, status,
+            price_level_structure, price_ranges.
             Note: open_time is a new field (added alongside the backtester's
             eligibility prefilter) — cache files written before this change
             don't have it and will read back as None until refreshed with
             --no-cache; backtester._can_ever_enter() treats that as "can't
             prove ineligibility" and keeps the market (no speedup, no
             incorrect drop).
+            Note: subtitle is sourced from the legacy `subtitle` key with a
+            fallback to `yes_sub_title`, which is where the archive now puts
+            the outcome label (2026-08 drift). The cache key name is unchanged
+            so backtester._group_by_exact_title and the display labels read it
+            as before. Day-slice files written before this change carry
+            subtitle=None and reproduce the pre-fix (weakened) same-title
+            grouping; `--no-cache` alone does NOT refresh them, since day
+            slices can't go stale by construction — a full refresh requires
+            deleting backtest_cache/archive_days/ and backtest_cache/live_days/
+            AND re-running with --no-cache, because a default run loads the
+            assembled backtest_cache/settled_markets_*.json first and returns
+            before the day slices are consulted at all.
+            Note: price_level_structure/price_ranges are new, raw pass-through
+            groundwork fields (2026-08) for a future tick-aware order cap —
+            nothing in the backtester reads them yet. Cache records written
+            before this change lack both and read back as None. They are
+            stored raw (not parsed into scanner.PriceRange objects) because
+            this dict is JSON-serialized straight into the cache file, and
+            parsed dataclasses wouldn't round-trip through json.dump. Size
+            impact is negligible (a short string plus a handful of small
+            dicts per market) relative to the fields already kept here —
+            deliberately considered against the OOM history documented in
+            CLAUDE.md, which was caused by caching whole raw payloads, not by
+            small additions to this already-compact record.
     """
     return {
         "ticker": m.get("ticker"),
@@ -273,7 +298,14 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # Resolved by fetch_all_settled_markets via _load_or_build_event_titles
         "event_title": event_title or "",
         "title": m.get("title"),
-        "subtitle": m.get("subtitle"),
+        # `subtitle` was dropped from API payloads (2026-08 drift);
+        # yes_sub_title carries the same outcome discriminator. Cache records
+        # written before this fix keep subtitle=None — that reproduces the
+        # pre-fix (weakened) grouping. Refreshing needs BOTH deleting
+        # backtest_cache/{archive_days,live_days}/ and a --no-cache run (which
+        # bypasses the assembled settled_markets_*.json that would otherwise
+        # short-circuit the fetch before any slice is read).
+        "subtitle": m.get("subtitle") or m.get("yes_sub_title"),
         "result": m.get("result"),
         "yes_ask_dollars": m.get("yes_ask_dollars"),
         "no_ask_dollars": m.get("no_ask_dollars"),
@@ -284,6 +316,16 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         "close_time": m.get("close_time"),
         "settlement_ts": m.get("settlement_ts"),
         "status": m.get("status"),
+        # Tick-structure groundwork (2026-08): raw pass-through for cache
+        # fidelity; no reader yet. Pre-existing cache records read back None.
+        "price_level_structure": m.get("price_level_structure"),
+        "price_ranges": m.get("price_ranges"),
+        # Shard fidelity (2026-08): raw pass-through so backtest data can
+        # distinguish exchange shards. Stored, never filtered — all historical
+        # markets are shard 0, and filtering would silently change backtest
+        # results with no live-safety gain (the live order path is guarded at
+        # scanner ingest). Pre-existing cache records read back None.
+        "exchange_index": m.get("exchange_index"),
     }
 
 
@@ -2221,8 +2263,12 @@ def fetch_all_settled_markets(
         list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
             event_title, title, subtitle, result ("yes" | "no"), yes_ask_dollars,
             no_ask_dollars, yes_bid_dollars, open_time, close_time (ISO str),
-            settlement_ts (ISO str), status. Only includes markets with a
-            non-null settlement_ts and a binary result; tickers are unique.
+            settlement_ts (ISO str), status, price_level_structure,
+            price_ranges. Only includes markets with a non-null settlement_ts
+            and a binary result; tickers are unique. See _market_to_dict for
+            the per-key notes (subtitle now falls back to yes_sub_title;
+            price_level_structure/price_ranges are unread groundwork that older
+            cache records lack entirely).
     """
     if (prefilter is None) != (prefilter_tag is None):
         raise ValueError(
@@ -2360,6 +2406,36 @@ def fetch_all_settled_markets(
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────
 
+def _candle_close(side: dict) -> float | None:
+    """
+    Extract the closing price in dollars from one candle side dict.
+
+    The API sends fixed-point DOLLAR strings (e.g. "0.5500"). Older payloads
+    named the field close_dollars alongside an integer-cent close; the current
+    format sends the dollar string AS close — prefer close_dollars whenever it
+    is actually present so both formats parse to dollars, never cents. The
+    presence check is explicit (None / empty string = absent) rather than
+    truthiness: a valid falsy close_dollars of numeric 0 must be used, not
+    silently fall through to the legacy field.
+
+    Args:
+        side (dict): A candle's "yes_ask" or "yes_bid" sub-dict.
+
+    Returns:
+        float | None: Closing price in dollars, or None when neither field is
+            present/parseable (caller skips the candle).
+    """
+    for key in ("close_dollars", "close"):
+        raw = side.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
@@ -2458,14 +2534,20 @@ def fetch_candlesticks(
             try:
                 ya = c.get("yes_ask") or {}
                 yb = c.get("yes_bid") or {}
-                # The API sends fixed-point DOLLAR strings (e.g. "0.5500").
-                # Older payloads named the field close_dollars alongside an
-                # integer-cent close; the current format sends the dollar
-                # string AS close — prefer close_dollars when present so both
-                # formats parse to dollars, never cents.
-                yes_ask = float(ya.get("close_dollars") or ya.get("close"))
+                # Dollar-string extraction with explicit presence checks —
+                # see _candle_close for why truthiness fallthrough is wrong
+                yes_ask = _candle_close(ya)
+                yes_bid = _candle_close(yb)
+                if yes_ask is None or yes_bid is None:
+                    # Counts as a DROP, not a silent skip: _candle_close
+                    # signals an unparseable/absent close by returning None
+                    # rather than raising, so without this the candle would
+                    # bypass the counter below and a thinned series would be
+                    # cached with no visible signal at all (BS-23).
+                    dropped += 1
+                    continue
                 # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                no_ask  = 1.0 - float(yb.get("close_dollars") or yb.get("close"))
+                no_ask  = 1.0 - yes_bid
                 candles.append({
                     "ts": c["end_period_ts"],
                     "yes_ask_close": yes_ask,

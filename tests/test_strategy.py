@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting.config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB
+from kalshi_betting.config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
 
 
@@ -142,6 +142,31 @@ class TestComputeTrade:
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.total_cost_with_fees > result.total_cost
+
+    def test_per_leg_costs_sum_to_total(self):
+        # cost_with_fees_a + cost_with_fees_b must equal total_cost_with_fees —
+        # same terms, same fee calls, just not summed together. This is the
+        # invariant the collateral transfer planner relies on.
+        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        result = compute_trade(pair, 100_000)
+        assert result is not None
+        assert result.cost_with_fees_a + result.cost_with_fees_b == pytest.approx(
+            result.total_cost_with_fees
+        )
+
+    def test_per_leg_costs_match_component_construction(self):
+        # Each leg's cost is that leg's own contracts-times-price plus its own
+        # exact ceiling-rounded fee — verify against a direct re-derivation
+        # rather than trusting compute_trade's internal arithmetic.
+        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        result = compute_trade(pair, 100_000)
+        assert result is not None
+        assert result.cost_with_fees_a == pytest.approx(
+            result.x * pair.nA + fee_leg_exact(result.x, pair.nA)
+        )
+        assert result.cost_with_fees_b == pytest.approx(
+            result.y * pair.pB + fee_leg_exact(result.y, pair.pB)
+        )
 
     def test_fee_inclusive_cost_never_exceeds_kelly_budget(self):
         # Regression: n was originally derived from budget_dollars / (nA + pB),

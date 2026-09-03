@@ -1,25 +1,35 @@
 """Tests for scanner.py normalize_title() — the core pair-detection function."""
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting.config import INCLUDE_MVE_MARKETS
+from kalshi_betting import scanner
+from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX, INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
+    PriceRange,
     _bids_to_ask_levels,
     _fetch_orderbook,
+    _market_from_dict,
+    _parse_price_ranges,
+    _shard_index,
+    check_shard_coverage,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
+    fetch_shard_statuses,
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
     normalize_title,
     pair_key,
+    tick_size_for_price,
     validate_pair_price,
 )
 
@@ -1027,6 +1037,482 @@ class TestFetchOpenEventsMveStatusFilter:
         assert "MVE events fetch" in caplog.text
 
 
+class TestShardIndex:
+    """Unit coverage for the fail-safe shard *label* read itself. This never
+    decides whether a market is kept — market data is cross-shard — so every
+    unusable value must resolve to the default rather than raise."""
+
+    def test_missing_exchange_index_is_default(self):
+        assert _shard_index({"ticker": "T1"}) == 0
+
+    def test_null_exchange_index_is_default(self):
+        assert _shard_index({"exchange_index": None}) == 0
+
+    def test_unparseable_exchange_index_is_default_fail_safe(self):
+        # Garbage input must fail safe to the default rather than raise and
+        # kill ingest on an unrelated API shape change.
+        assert _shard_index({"exchange_index": "not-a-number"}) == 0
+
+    def test_int_zero(self):
+        assert _shard_index({"exchange_index": 0}) == 0
+
+    def test_string_zero(self):
+        assert _shard_index({"exchange_index": "0"}) == 0
+
+    def test_int_one(self):
+        assert _shard_index({"exchange_index": 1}) == 1
+
+    def test_string_two(self):
+        assert _shard_index({"exchange_index": "2"}) == 2
+
+    def test_default_matches_config_constant(self):
+        # Sanity check that the fallback is the config constant, not a
+        # hardcoded 0 that would silently diverge from it.
+        assert _shard_index({}) == DEFAULT_EXCHANGE_INDEX
+
+    def test_explicit_zero_shard_index_not_conflated_with_missing(self, monkeypatch):
+        # A declared exchange_index of 0 is a data statement, not an absent
+        # field. With a falsy-conflating `or` fallback (int(m.get(...) or
+        # DEFAULT_EXCHANGE_INDEX)), `0 or 9 == 9` would misreport a genuinely
+        # shard-0 market as being on shard 9 the moment DEFAULT_EXCHANGE_INDEX
+        # stops being 0 — exactly the conflation _shard_index's explicit
+        # `is None` check exists to avoid.
+        monkeypatch.setattr(scanner, "DEFAULT_EXCHANGE_INDEX", 9)
+        assert _shard_index({"exchange_index": 0}) == 0
+        assert _shard_index({}) == 9
+
+
+class TestMarketFromDictTagsExchangeIndex:
+    """_market_from_dict is the SOLE ApiMarket construction site — the shard
+    tag must be attached there, so every market in the pipeline carries it."""
+
+    def test_market_from_dict_tags_exchange_index(self):
+        tagged = _market_from_dict(
+            _raw_market("SHARD-2", "Rain tomorrow", exchange_index=2), "Weather Event"
+        )
+        assert tagged.exchange_index == 2
+
+        untagged = _market_from_dict(_raw_market("SHARD-NONE", "Rain tomorrow"), "Weather Event")
+        assert untagged.exchange_index == DEFAULT_EXCHANGE_INDEX
+
+
+class TestFetchShardStatuses:
+    """GET /exchange/status must be read RAW — the pinned SDK's ExchangeStatus
+    model silently drops exchange_index_statuses — and must fail soft."""
+
+    @staticmethod
+    def _client(payload, status=200):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=status, data=json.dumps(payload).encode("utf-8")
+            )
+        )
+        return client
+
+    def test_well_formed_payload_parses_all_fields(self):
+        client = self._client({
+            "exchange_active": True,
+            "exchange_index_statuses": [
+                {
+                    "exchange_index": 0, "description": "Main",
+                    "exchange_active": True, "trading_active": True,
+                    "intra_exchange_transfers_active": True,
+                },
+                {
+                    "exchange_index": 1, "description": "Combos",
+                    "exchange_active": True, "trading_active": False,
+                    "intra_exchange_transfers_active": False,
+                },
+            ],
+        })
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0, 1}
+        assert statuses[0] == {
+            "trading_active": True, "exchange_active": True,
+            "intra_exchange_transfers_active": True, "description": "Main",
+        }
+        assert statuses[1]["trading_active"] is False
+        # Read by the collateral-transfer path in a later commit
+        assert statuses[1]["intra_exchange_transfers_active"] is False
+
+    def test_string_exchange_index_is_coerced_to_int_key(self):
+        client = self._client({"exchange_index_statuses": [
+            {"exchange_index": "2", "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {2}
+
+    def test_absent_field_returns_none_with_info_log(self, caplog):
+        # The sandbox / pre-sharding shape: the breakdown is documented as
+        # absent when unavailable. Must degrade to single-shard semantics.
+        client = self._client({"exchange_active": True, "trading_active": True})
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_list_field_returns_none(self):
+        client = self._client({"exchange_index_statuses": {"0": {}}})
+        assert fetch_shard_statuses(client) is None
+
+    def test_malformed_entries_are_skipped_not_fatal(self):
+        client = self._client({"exchange_index_statuses": [
+            "not-a-dict",
+            {"description": "no index at all"},
+            {"exchange_index": "garbage", "trading_active": True},
+            {"exchange_index": 0, "trading_active": True},
+        ]})
+        statuses = fetch_shard_statuses(client)
+        assert set(statuses) == {0}, "one bad record must not discard the good one"
+
+    def test_missing_boolean_fields_default_to_false(self):
+        client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
+        statuses = fetch_shard_statuses(client)
+        assert statuses[3] == {
+            "trading_active": False, "exchange_active": False,
+            "intra_exchange_transfers_active": False, "description": "",
+        }
+
+    def test_api_exception_returns_none_not_raised(self, caplog):
+        # An exchange-status hiccup must never abort a scan.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+        with caplog.at_level(logging.INFO):
+            assert fetch_shard_statuses(client) is None
+        assert "per-shard exchange status unavailable" in caplog.text
+
+    def test_non_2xx_status_returns_none(self):
+        # fetch_json_page raises ApiException on non-2xx; that must be caught.
+        # 400 (not 5xx) so api_call_with_retry doesn't spend its backoff budget.
+        client = self._client({"error": "nope"}, status=400)
+        assert fetch_shard_statuses(client) is None
+
+    def test_uses_raw_variant_not_modeled_call(self):
+        client = self._client({"exchange_index_statuses": []})
+        fetch_shard_statuses(client)
+        client.get_exchange_status_without_preload_content.assert_called_once()
+        client.get_exchange_status.assert_not_called()
+
+
+class TestFetchOpenEventsShardTagging:
+    """Market data is cross-shard: every shard's markets are INGESTED and
+    tagged with exchange_index. Only shards the exchange reports as
+    trading-inactive are dropped. (Routing is enforced at order submission —
+    per-leg on the V2 path, trader._legacy_routable on the legacy one — never
+    here.)"""
+
+    @staticmethod
+    def _client(std_events, mve_events=()):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(
+            return_value=_raw_page(list(std_events))
+        )
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(list(mve_events))
+        )
+        return client
+
+    def test_standard_loop_keeps_and_tags_every_shard(self):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-NOFIELD", "Hail tomorrow"),
+        ]}
+        markets = fetch_open_events_with_markets(self._client([event]))
+        by_ticker = {m.ticker: m for m in markets}
+        assert set(by_ticker) == {"STD-SHARD0", "STD-SHARD1", "STD-NOFIELD"}, (
+            "markets from every shard must survive ingest"
+        )
+        assert by_ticker["STD-SHARD1"].exchange_index == 1
+        assert by_ticker["STD-SHARD0"].exchange_index == 0
+        # Missing field is the pre-sharding shape — fail-safe to the default
+        assert by_ticker["STD-NOFIELD"].exchange_index == DEFAULT_EXCHANGE_INDEX
+
+    def test_no_non_routable_shard_warning_is_logged(self, caplog):
+        # The old drop-at-ingest warning must be gone — a shard-1 market is
+        # now a perfectly normal ingest, not an anomaly.
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(self._client([event]))
+        assert {m.ticker for m in markets} == {"STD-SHARD1"}
+        assert "non-routable" not in caplog.text
+        assert "trading-inactive" not in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_loop_also_keeps_and_tags_every_shard(self):
+        mve_event = {"title": "2024 Election Winner", "markets": [
+            _raw_market("MVE-SHARD0", "Trump", status="active", exchange_index=0),
+            _raw_market("MVE-SHARD1", "Harris", status="active", exchange_index=1),
+        ]}
+        markets = fetch_open_events_with_markets(self._client([], [mve_event]))
+        by_ticker = {m.ticker: m for m in markets}
+        assert set(by_ticker) == {"MVE-SHARD0", "MVE-SHARD1"}
+        assert by_ticker["MVE-SHARD1"].exchange_index == 1
+
+    def test_inactive_shard_markets_are_dropped_with_warning(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD0", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-SHARD1-A", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-SHARD1-B", "Hail tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(
+                self._client([event]), inactive_shards={1}
+            )
+        assert {m.ticker for m in markets} == {"STD-SHARD0"}
+        assert "Skipped 2 markets on trading-inactive exchange shards [1]" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_inactive_shard_drop_spans_both_loops_in_one_count(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
+        ]}
+        mve_event = {"title": "2024 Election Winner", "markets": [
+            _raw_market("MVE-SHARD1", "Harris", status="active", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(
+                self._client([event], [mve_event]), inactive_shards={1}
+            )
+        assert markets == []
+        # One summary line covering the standard AND MVE loops
+        assert "Skipped 2 markets on trading-inactive exchange shards [1]" in caplog.text
+
+    def test_no_warning_when_no_shard_is_inactive(self, caplog):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-B", "Snow tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(self._client([event]))
+        assert {m.ticker for m in markets} == {"STD-A", "STD-B"}
+        assert "trading-inactive" not in caplog.text
+
+    def test_per_shard_ingest_counts_are_logged(self, caplog):
+        # Load-bearing diagnostic: the only signal of which shards we actually
+        # saw markets on after a category migrates to a new shard.
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("STD-A", "Rain tomorrow", exchange_index=0),
+            _raw_market("STD-B", "Snow tomorrow", exchange_index=1),
+            _raw_market("STD-C", "Hail tomorrow", exchange_index=1),
+        ]}
+        with caplog.at_level(logging.INFO):
+            fetch_open_events_with_markets(self._client([event]))
+        assert "Ingested markets by shard: {0: 1, 1: 2}" in caplog.text
+
+
+class TestCheckShardCoverage:
+    """Pure comparison of what /exchange/status advertises against what a run
+    actually observed. Severity is deliberately empty-vs-funded: an active
+    advertised shard with zero markets is only CRITICAL when money is parked
+    there (a real blind spot); otherwise it's a WARNING, since an advertised
+    shard being legitimately empty is expected during the shard rollout and
+    must not cry wolf at critical severity every week."""
+
+    @staticmethod
+    def _status(trading_active=True, description="Main"):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": description,
+        }
+
+    def test_full_coverage_is_silent(self):
+        advertised = {0: self._status(description="Main"), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0, 1}, {0})
+        assert critical == []
+        assert warnings == []
+
+    def test_active_shard_zero_markets_zero_funds_is_warning_only(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 1" in warnings[0]
+        assert "Combos" in warnings[0]
+        assert "may be legitimately empty" in warnings[0]
+
+    def test_active_shard_zero_markets_with_funds_is_critical(self):
+        advertised = {0: self._status(), 1: self._status(description="Combos")}
+        critical, warnings = check_shard_coverage(advertised, {0}, {1})
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 1" in critical[0]
+        assert "Combos" in critical[0]
+        assert "holds account funds" in critical[0]
+
+    def test_inactive_advertised_shard_with_zero_markets_is_not_a_problem(self):
+        advertised = {
+            0: self._status(),
+            1: self._status(trading_active=False, description="Crypto"),
+        }
+        critical, warnings = check_shard_coverage(advertised, {0}, set())
+        assert critical == []
+        assert warnings == []
+
+    def test_inactive_advertised_shard_with_funds_is_still_not_flagged(self):
+        # Its markets were deliberately dropped at ingest (and that drop logs
+        # its own warning) — re-reporting it here would be double-alerting.
+        advertised = {
+            0: self._status(),
+            1: self._status(trading_active=False, description="Crypto"),
+        }
+        critical, warnings = check_shard_coverage(advertised, {0}, {0, 1})
+        assert critical == []
+        assert warnings == []
+
+    def test_market_shard_not_advertised_is_critical(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0, 7}, set())
+        assert warnings == []
+        assert len(critical) == 1
+        assert "shard 7" in critical[0]
+        assert "does not advertise" in critical[0]
+
+    def test_balance_shard_not_advertised_is_warning(self):
+        advertised = {0: self._status()}
+        critical, warnings = check_shard_coverage(advertised, {0}, {0, 9})
+        assert critical == []
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]
+
+    def test_advertised_none_is_unknowable_even_with_weird_observed_sets(self):
+        critical, warnings = check_shard_coverage(None, {0, 1, 2, 99}, {0, 5})
+        assert critical == []
+        assert warnings == []
+
+    def test_empty_advertised_dict_is_not_treated_as_none(self):
+        # {} is a real (if degenerate) breakdown, not "unavailable": an
+        # observed market shard it doesn't list is still a disagreement.
+        critical, warnings = check_shard_coverage({}, {0}, set())
+        assert len(critical) == 1
+        assert "shard 0" in critical[0]
+
+    def test_multiple_simultaneous_problems_all_reported_correctly(self):
+        advertised = {
+            0: self._status(description="Main"),
+            1: self._status(description="Combos"),  # active, zero markets, funds -> critical
+            2: self._status(trading_active=False, description="Crypto"),  # never a problem
+        }
+        market_shards = {0, 7}  # 7 unadvertised -> critical
+        balance_shards = {1, 9}  # 1 funds shard 1 -> critical; 9 unadvertised -> warning
+        critical, warnings = check_shard_coverage(advertised, market_shards, balance_shards)
+
+        assert len(critical) == 2
+        assert any("shard 1" in p and "holds account funds" in p for p in critical)
+        assert any("shard 7" in p and "does not advertise" in p for p in critical)
+
+        assert len(warnings) == 1
+        assert "shard 9" in warnings[0]
+        assert "does not advertise" in warnings[0]
+
+
+class TestSubtitleFallback:
+    """The API dropped `subtitle` (2026-08 drift) — ingest must read yes_sub_title."""
+
+    def _parse_one(self, **extra):
+        # Route through the real raw-JSON parse path (fetch_open_events_with_markets
+        # → _market_from_dict), not the dataclass constructor, so the test covers
+        # the actual ingest the live scanner uses.
+        event = {"title": "Papal Conclave", "markets": [
+            _raw_market("SUB-1", "Who will the next Pope be?", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_explicit_subtitle_wins_over_yes_sub_title(self):
+        m = self._parse_one(subtitle="Legacy Label", yes_sub_title="New Label")
+        assert m.subtitle == "Legacy Label"
+
+    def test_yes_sub_title_used_when_subtitle_absent(self):
+        m = self._parse_one(yes_sub_title="Pierbattista Pizzaballa")
+        assert m.subtitle == "Pierbattista Pizzaballa"
+
+    def test_null_subtitle_falls_back_to_yes_sub_title(self):
+        # The archive/live payloads sometimes carry an explicit null rather than
+        # omitting the key — that must still fall through to yes_sub_title.
+        m = self._parse_one(subtitle=None, yes_sub_title="Peter Turkson")
+        assert m.subtitle == "Peter Turkson"
+
+    def test_both_absent_yields_empty_string(self):
+        m = self._parse_one()
+        assert m.subtitle == ""
+
+    def test_no_sub_title_is_not_used(self):
+        # no_sub_title is the negated phrasing; using it would make the grouping
+        # key asymmetric between the YES and NO framings of the same outcome.
+        m = self._parse_one(no_sub_title="Someone else")
+        assert m.subtitle == ""
+
+
+class TestSameTitleSubtitleDiscriminator:
+    """Regression: distinct outcomes sharing one title must not be paired.
+
+    Before the yes_sub_title fallback, every market parsed with subtitle="",
+    so the (event_title, title, subtitle) grouping key collapsed to
+    (event_title, title) — two DIFFERENT outcomes under one shared question
+    title on different event tickers would group together and be traded under
+    the 95% co-resolution assumption. Real money, wrong contract.
+    """
+
+    @staticmethod
+    def _pope_event(event_ticker, ticker, sub, yes_ask, no_ask):
+        # Same event *title* on both sides so the event_title component of the
+        # grouping key matches — the subtitle is the only discriminator left.
+        return {"title": "Papal Conclave", "markets": [
+            _raw_market(
+                ticker, "Who will the next Pope be?",
+                event_ticker=event_ticker,
+                yes_sub_title=sub,
+                yes_ask_dollars=str(yes_ask), no_ask_dollars=str(no_ask),
+            ),
+        ]}
+
+    @staticmethod
+    def _markets(events):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(events))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        return fetch_open_events_with_markets(client)
+
+    def test_distinct_outcomes_under_shared_title_do_not_pair(self):
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-PIZZABALLA", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-TURKSON", "Peter Turkson", 0.30, 0.70),
+        ])
+        # Both parsed subtitles must be populated — otherwise the assertion
+        # below would pass for the wrong reason (e.g. a parse failure).
+        assert {m.subtitle for m in markets} == {"Pierbattista Pizzaballa", "Peter Turkson"}
+        pairs = find_same_title_pairs(markets)
+        assert pairs == [], f"Different outcomes must not be same-title paired; got {pairs}"
+
+    def test_identical_outcome_across_events_still_pairs(self):
+        # Positive control: same outcome label, different event tickers, price
+        # gap well above SAME_TITLE_MIN_PRICE_DIFF — the legitimate arbitrage.
+        markets = self._markets([
+            self._pope_event("EVT-A", "POPE-A", "Pierbattista Pizzaballa", 0.45, 0.55),
+            self._pope_event("EVT-B", "POPE-B", "Pierbattista Pizzaballa", 0.30, 0.70),
+        ])
+        pairs = find_same_title_pairs(markets)
+        assert len(pairs) == 1
+        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"POPE-A", "POPE-B"}
+        # market_a is canonicalized to the more expensive side
+        assert pairs[0].market_a.ticker == "POPE-A"
+
+
 class TestFilterMarketsWithinHorizon:
     def test_none_horizon_returns_markets_unchanged(self):
         markets = [
@@ -1069,3 +1555,191 @@ class TestFilterMarketsWithinHorizon:
         m = _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 12, 1))
         result = filter_markets_within_horizon([m], 7)
         assert result == []
+
+
+class TestParsePriceRanges:
+    """_parse_price_ranges: ingest for the price_ranges tick-band array
+    (2026-08). These tests cover the parse itself; tick_size_for_price's
+    reading of the parsed bands is covered by TestTickSizeForPrice below."""
+
+    def test_single_band_deci_cent(self):
+        bands = _parse_price_ranges(
+            [{"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+        )
+        assert bands == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_multi_band_tapered_market(self):
+        raw = [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [
+            PriceRange(start=0.0, end=0.1, step=0.001),
+            PriceRange(start=0.1, end=0.9, step=0.01),
+            PriceRange(start=0.9, end=1.0, step=0.001),
+        ]
+
+    def test_none_returns_none(self):
+        assert _parse_price_ranges(None) is None
+
+    def test_not_a_list_returns_none(self):
+        assert _parse_price_ranges({"start": "0", "end": "1", "step": "0.01"}) is None
+
+    def test_empty_list_returns_none(self):
+        assert _parse_price_ranges([]) is None
+
+    def test_all_bands_missing_keys_returns_none(self):
+        # Every band fails to parse -> the result must be None, not [].
+        assert _parse_price_ranges([{"foo": "bar"}, {"start": "0"}]) is None
+
+    def test_one_good_one_malformed_band_keeps_only_the_good_one(self):
+        raw = [
+            {"start": "0.0000", "end": "0.5000", "step": "0.0100"},
+            {"start": "0.5000", "end": "1.0000"},  # missing "step"
+        ]
+        bands = _parse_price_ranges(raw)
+        assert bands == [PriceRange(start=0.0, end=0.5, step=0.01)]
+
+    def test_price_range_is_frozen(self):
+        band = PriceRange(start=0.0, end=1.0, step=0.01)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            band.start = 0.5
+
+
+class TestTickStructureIngest:
+    """Tick-structure fields flow through the real raw-JSON parse path
+    (fetch_open_events_with_markets -> _market_from_dict), matching how the
+    subtitle-fallback tests above exercise ingest."""
+
+    def _parse_one(self, **extra):
+        event = {"title": "Weather Event", "markets": [
+            _raw_market("TICK-1", "Rain tomorrow", **extra),
+        ]}
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([event]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+        [m] = fetch_open_events_with_markets(client)
+        return m
+
+    def test_deci_cent_single_band(self):
+        m = self._parse_one(
+            price_level_structure="deci_cent",
+            price_ranges=[{"start": "0.0000", "end": "1.0000", "step": "0.0010"}],
+        )
+        assert m.price_level_structure == "deci_cent"
+        assert m.price_ranges == [PriceRange(start=0.0, end=1.0, step=0.001)]
+
+    def test_tapered_multi_band(self):
+        m = self._parse_one(
+            price_level_structure="tapered_deci_cent",
+            price_ranges=[
+                {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+                {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+            ],
+        )
+        assert m.price_level_structure == "tapered_deci_cent"
+        assert len(m.price_ranges) == 3
+        assert [b.step for b in m.price_ranges] == [0.001, 0.01, 0.001]
+
+    def test_absent_fields_default_to_empty_and_none(self):
+        m = self._parse_one()
+        assert m.price_level_structure == ""
+        assert m.price_ranges is None
+
+
+class TestTickSizeForPrice:
+    """tick_size_for_price: maps a price onto the market's own tick grid,
+    falling back to the coarse $0.01 grid (valid on every regime, since the
+    grids are nested) whenever the structure is uniform-cent or unusable."""
+
+    # center_deci_edge_centi_cent: $0.0001 below $0.01 and above $0.99,
+    # $0.001 in between — the regime MVE/combo markets moved to on 2026-08-17.
+    _CENTI_BANDS = [
+        PriceRange(start=0.0, end=0.01, step=0.0001),
+        PriceRange(start=0.01, end=0.99, step=0.001),
+        PriceRange(start=0.99, end=1.0, step=0.0001),
+    ]
+
+    @staticmethod
+    def _market(structure: str, ranges) -> SimpleNamespace:
+        """SimpleNamespace market stand-in carrying only the tick fields read."""
+        return SimpleNamespace(
+            ticker="KXTEST-1", price_level_structure=structure, price_ranges=ranges,
+        )
+
+    def test_linear_cent_returns_one_cent(self):
+        m = self._market("linear_cent", [PriceRange(start=0.0, end=1.0, step=0.01)])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_empty_structure_returns_one_cent(self):
+        m = self._market("", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_deci_cent_uniform_band(self):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.001)])
+        assert tick_size_for_price(m, 0.42) == Decimal("0.001")
+
+    def test_centi_cent_middle_band_is_deci_cent(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.50) == Decimal("0.001")
+
+    def test_centi_cent_edge_bands(self):
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.005) == Decimal("0.0001")
+        assert tick_size_for_price(m, 0.995) == Decimal("0.0001")
+
+    def test_band_boundary_price_uses_first_containing_band(self):
+        # 0.01 is the end of band 1 and the start of band 2; first match wins.
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.01) == Decimal("0.0001")
+
+    def test_none_ranges_falls_back(self):
+        # Structure names a fine grid but the bands failed to parse — the
+        # coarse default is still a valid grid point on every regime.
+        m = self._market("deci_cent", None)
+        assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+
+    def test_no_containing_band_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=0.4, step=0.001)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.9) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text
+
+    def test_nonpositive_step_falls_back_with_warning(self, caplog):
+        m = self._market("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.0)])
+        with caplog.at_level(logging.WARNING):
+            assert tick_size_for_price(m, 0.5) == Decimal("0.01")
+        assert "KXTEST-1" in caplog.text
+
+
+class TestFetchShardStatusesEmptyBreakdown:
+    def test_empty_status_list_means_unavailable_not_zero_shards(self):
+        # Regression (adversarial review): an empty exchange_index_statuses
+        # list must map to None (single-shard semantics) like every other
+        # unavailable shape — {} would falsely CRITICAL every ingested shard
+        # in check_shard_coverage and block every collateral transfer.
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": []}).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None
+
+    def test_all_unparseable_entries_also_mean_unavailable(self):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps(
+                    {"exchange_index_statuses": ["garbage", {"no": "index"}]}
+                ).encode(),
+            )
+        )
+        assert fetch_shard_statuses(client) is None

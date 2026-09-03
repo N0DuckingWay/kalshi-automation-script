@@ -31,17 +31,28 @@ Notes:
     pinned SDK's Market model requires, so fetch_open_events_with_markets()
     uses the *_without_preload_content raw-response variants and parses JSON
     into ApiMarket itself (see fetch_json_page for the error-handling contract).
+
+    The exchange is sharded. Market data is cross-shard, so ingest TAGS every
+    market with its exchange_index (_shard_index) and keeps it; the one
+    ingest-time shard exclusion is a shard the exchange reports as not
+    trading-active (fetch_shard_statuses -> the caller's inactive_shards).
+    check_shard_coverage() is the pure audit that compares the advertised
+    shards against the ones a run actually observed, so a shard we silently
+    stopped seeing markets on cannot pass unnoticed.
 """
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    DEFAULT_EXCHANGE_INDEX,
+    DEFAULT_TICK_SIZE_DOLLARS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
@@ -93,6 +104,129 @@ _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
 # Minimum ask price to consider a market actively priced (not settled/illiquid)
 _MIN_ACTIVE_PRICE = 0.01
 _MAX_ACTIVE_PRICE = 0.99
+
+
+@dataclass(frozen=True)
+class PriceRange:
+    """
+    One tick-size band from a market's price_ranges array, in dollars.
+
+    Kalshi markets can have a non-uniform tick grid across their price range
+    (e.g. finer ticks near 0 and 1, coarser in the middle — "tapered" tick
+    structure). Each band names its own step size; a market's full grid is
+    the ordered list of bands covering [0, 1]. Read by tick_size_for_price().
+
+    Attributes:
+        start (float): Lower bound of this band, in dollars (e.g. 0.0).
+        end (float): Upper bound of this band, in dollars (e.g. 1.0).
+        step (float): Tick size within this band, in dollars (e.g. 0.001).
+    """
+    start: float
+    end: float
+    step: float
+
+
+def _parse_price_ranges(raw: Any) -> list | None:
+    """
+    Parse a raw price_ranges array into PriceRange bands, or None if unknown.
+
+    Fail-soft per the return-None convention: a missing, empty, or malformed
+    array means "tick structure unknown", never an error — tick_size_for_price()
+    then falls back to the default $0.01 grid, which is valid on every regime
+    because Kalshi's grids are nested (combo markets moved to the
+    center_deci_edge_centi_cent tick regime on 2026-08-17).
+
+    Args:
+        raw (Any): The raw `price_ranges` value from a market JSON dict —
+            expected to be a list of {"start": str, "end": str, "step": str}
+            dollar-string dicts, but may be missing, empty, or malformed.
+
+    Returns:
+        list[PriceRange] | None: Parsed bands in their original order, or
+            None when raw is not a non-empty list, or when every band in it
+            fails to parse. Individual malformed bands within an otherwise
+            valid list are skipped rather than failing the whole array.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    bands = []
+    for band in raw:
+        try:
+            bands.append(PriceRange(
+                start=float(band["start"]), end=float(band["end"]), step=float(band["step"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return bands or None
+
+
+def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
+    """
+    Return the tick size, in dollars, that applies at a given price on a market.
+
+    Kalshi markets no longer share one uniform price grid. Known regimes, named
+    by `price_level_structure`: "linear_cent" (uniform $0.01), "deci_cent"
+    (uniform $0.001), "tapered_deci_cent" (banded), and
+    "center_deci_edge_centi_cent" ($0.0001 below $0.01 and above $0.99, $0.001
+    in between). The authoritative grid is the market's own `price_ranges`
+    bands; the structure name is only used to short-circuit the uniform-cent
+    case. The first band containing the price wins, so a price sitting exactly
+    on a band boundary resolves to the earlier (by convention finer) band.
+
+    These grids are NESTED: $0.01 ⊂ $0.001 ⊂ $0.0001, so every point of a
+    coarser grid is also a point of any finer one. Later price math relies on
+    that — a cap computed as price + n × tick that crosses into a neighbouring
+    band still lands on a valid grid point of that band, and the $0.01 fallback
+    below is valid on every regime — so this function does not need to
+    re-quantize across band edges.
+
+    Returns a Decimal (never a float) because the V2 order endpoint takes
+    dollar-string prices: binary float noise in a tick size would propagate
+    into a price string the exchange rejects as off-grid.
+
+    Args:
+        market (Any): A market object — ApiMarket or any object with
+            `price_level_structure` (str) and `price_ranges`
+            (list[PriceRange] | None) attributes. Missing attributes are
+            treated as unknown, not as an error.
+        price_dollars (float): The price at which the tick size is needed, in
+            dollars. Range: [0, 1].
+
+    Returns:
+        Decimal: The tick size in dollars for that price. Falls back to
+            Decimal(config.DEFAULT_TICK_SIZE_DOLLARS) when the structure is
+            uniform-cent or unknown, when no band contains the price, or when
+            the matching band's step is nonpositive — logging a warning in the
+            latter two cases, which indicate a payload that drifted from the
+            shapes above.
+    """
+    default = Decimal(DEFAULT_TICK_SIZE_DOLLARS)
+    structure = getattr(market, "price_level_structure", "") or ""
+    bands = getattr(market, "price_ranges", None)
+    # Uniform-cent markets (and any market whose bands failed to parse — see
+    # _parse_price_ranges' fail-soft contract) use the coarse default grid.
+    if structure in ("", "linear_cent") or not bands:
+        return default
+
+    for band in bands:
+        try:
+            if band.start <= price_dollars <= band.end:
+                # Decimal(str(...)), never Decimal(float): the float came from
+                # parsing a dollar string and str() round-trips it back exactly.
+                step = Decimal(str(band.step))
+                if step > 0:
+                    return step
+                break
+        except (AttributeError, TypeError, InvalidOperation):
+            break
+
+    # Only reached on a malformed or non-covering band list; called once per
+    # order leg at build time, so a warning here cannot spam the log.
+    logging.warning(
+        "No usable tick band for %s at price %.4f (structure=%r) — falling back to $%s",
+        getattr(market, "ticker", "<unknown>"), price_dollars, structure, DEFAULT_TICK_SIZE_DOLLARS,
+    )
+    return default
 
 
 @dataclass
@@ -152,6 +286,11 @@ def market_title(market: Any) -> str:
     Return the best available display title for a market object.
 
     Prefers `.title`, falls back to `.subtitle`, then `.ticker` as a last resort.
+
+    Since the 2026-08 API drift, `.subtitle` is sourced from `yes_sub_title`
+    (see `_market_from_dict`), so a title-less market now falls back to its
+    outcome label (e.g. a candidate name) rather than dropping through to the
+    opaque ticker as it did while subtitle was always "".
 
     Args:
         market (Any): A Kalshi market API object with `.title`, `.subtitle`, and `.ticker` attributes.
@@ -371,14 +510,28 @@ class ApiMarket:
         ticker (str): Market ticker, e.g. "KXBTC-24MAR-T80".
         event_ticker (str): Parent event ticker.
         title (str): Market question text.
-        subtitle (str): Market subtitle ("" when the API omits it, as it
-            currently does — matches the SDK model's empty default).
+        subtitle (str): Market subtitle, from the legacy `subtitle` key with a
+            fallback to `yes_sub_title` (the API dropped `subtitle` in the
+            2026-08 drift). "" when both are absent.
         status (str): SDK-style status string; open markets are "active".
         close_time (datetime | None): Parsed tz-aware close time, or None if
             missing/unparseable.
         yes_ask_dollars: YES ask as a dollar string (e.g. "0.35") or None.
         no_ask_dollars: NO ask as a dollar string or None.
         yes_bid_dollars: YES bid as a dollar string or None.
+        price_level_structure (str): Tick regime name, e.g. "linear_cent",
+            "tapered_deci_cent", "deci_cent". "" if absent. Read by
+            tick_size_for_price(), which trader.py uses to cap V2 order prices.
+        price_ranges (list[PriceRange] | None): Parsed tick-size bands (see
+            _parse_price_ranges), or None when unknown/unparseable/absent.
+            Also read by tick_size_for_price() — the authoritative grid.
+        exchange_index (int): The exchange shard this market lives on (see
+            _shard_index). Market data is cross-shard, so every shard's
+            markets are ingested and simply tagged with this; on the V2 order
+            path it routes the order, and while the legacy path is in use it
+            is trader._legacy_routable that refuses to submit an order for a
+            non-DEFAULT_EXCHANGE_INDEX market. DEFAULT_EXCHANGE_INDEX when the
+            payload omits the field (fail-safe).
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -390,6 +543,9 @@ class ApiMarket:
     yes_ask_dollars: Any = None
     no_ask_dollars: Any = None
     yes_bid_dollars: Any = None
+    price_level_structure: str = ""
+    price_ranges: Any = None  # list[PriceRange] | None — None = unknown
+    exchange_index: int = DEFAULT_EXCHANGE_INDEX
     _event_title: str = field(default="")
 
 
@@ -419,17 +575,255 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         ticker=m.get("ticker") or "",
         event_ticker=m.get("event_ticker") or "",
         title=m.get("title") or "",
-        subtitle=m.get("subtitle") or "",
+        # The API dropped `subtitle` from market payloads (2026-08 drift);
+        # yes_sub_title carries the same intra-title outcome label (e.g. the
+        # option name in a multi-choice event) and is the discriminator
+        # same-title grouping depends on. no_sub_title is deliberately NOT
+        # used — it is the negated phrasing and would yield asymmetric keys.
+        subtitle=m.get("subtitle") or m.get("yes_sub_title") or "",
         status=m.get("status") or "",
         close_time=close_dt,
         yes_ask_dollars=m.get("yes_ask_dollars"),
         no_ask_dollars=m.get("no_ask_dollars"),
         yes_bid_dollars=m.get("yes_bid_dollars"),
+        price_level_structure=m.get("price_level_structure") or "",
+        price_ranges=_parse_price_ranges(m.get("price_ranges")),
+        # Tag (never filter) the shard so downstream code — V2 order routing,
+        # trader._legacy_routable, the collateral planner — can decide what
+        # to do with it.
+        exchange_index=_shard_index(m),
         _event_title=event_title,
     )
 
 
-def fetch_open_events_with_markets(client: Any) -> list:
+def _shard_index(m: dict) -> int:
+    """
+    Read the exchange shard a raw market dict lives on, fail-safe.
+
+    Kalshi partitions the exchange into parallel instances keyed by an integer
+    `exchange_index` on every market payload. Market-data endpoints are
+    cross-shard (they return every shard's markets, tagged), so this is purely
+    a labelling read — it never decides whether a market is kept.
+
+    A missing, null, or unparseable value is reported as DEFAULT_EXCHANGE_INDEX
+    rather than raising: absence of the field is the pre-sharding / sandbox
+    shape and must never crash ingest. The check is deliberately explicit
+    (`is None`, then a guarded `int()`) rather than the falsy idiom
+    `int(m.get(...) or DEFAULT_EXCHANGE_INDEX)` — that idiom would conflate an
+    explicitly declared shard 0 with a missing field, which is harmless only
+    while DEFAULT_EXCHANGE_INDEX is itself 0 and silently wrong the day it
+    changes to a non-zero shard.
+
+    Args:
+        m (dict): One raw market JSON dict from an events-endpoint payload.
+
+    Returns:
+        int: The market's exchange shard index, or DEFAULT_EXCHANGE_INDEX when
+            the field is absent, null, or unparseable.
+    """
+    raw = m.get("exchange_index")
+    if raw is None:
+        return DEFAULT_EXCHANGE_INDEX
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_EXCHANGE_INDEX
+
+
+def fetch_shard_statuses(client: Any) -> dict | None:
+    """
+    Read the per-exchange-shard status breakdown from GET /exchange/status.
+
+    Kalshi's sharded exchange reports one status record per shard under
+    `exchange_index_statuses`. The pinned SDK's ExchangeStatus pydantic model
+    silently DROPS that field (its config ignores extras), so this reads the
+    raw body through the `*_without_preload_content` variant instead — the
+    same raw-read pattern the events/orders/positions/balance calls already
+    use for drift reasons.
+
+    The field is documented as "absent when the per-index breakdown is
+    unavailable" — the sandbox and pre-sharding shape. That case, a malformed
+    payload, and ANY exception (including the HTTP call itself failing) all
+    return None, meaning "assume single-shard semantics". This is deliberately
+    fail-soft: an exchange-status hiccup must degrade to the pre-sharding
+    behaviour, never abort a scan.
+
+    Args:
+        client (Any): An authenticated KalshiClient produced by
+            auth.build_client().
+
+    Returns:
+        dict | None: Mapping of exchange_index (int) -> {"trading_active":
+            bool, "exchange_active": bool, "intra_exchange_transfers_active":
+            bool, "description": str}. Malformed entries are skipped. None
+            when the breakdown is unavailable or anything at all went wrong.
+    """
+    try:
+        # Read-only GET, so api_call_with_retry's 429/5xx backoff is correct
+        # here (the no-retry rule applies only to order submission).
+        data = api_call_with_retry(
+            fetch_json_page, client.get_exchange_status_without_preload_content
+        )
+        raw = data.get("exchange_index_statuses")
+        if not isinstance(raw, list):
+            logging.info(
+                "per-shard exchange status unavailable — assuming single-shard semantics"
+            )
+            return None
+        statuses: dict = {}
+        for entry in raw:
+            try:
+                # A non-dict entry raises AttributeError on .get; a missing or
+                # non-numeric exchange_index raises TypeError/ValueError. One
+                # malformed record must not discard the well-formed ones.
+                idx = int(entry.get("exchange_index"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            statuses[idx] = {
+                "trading_active": bool(entry.get("trading_active")),
+                "exchange_active": bool(entry.get("exchange_active")),
+                # Read by the collateral-transfer path in a later commit; kept
+                # here so the parsed shape doesn't have to change then.
+                "intra_exchange_transfers_active": bool(
+                    entry.get("intra_exchange_transfers_active")
+                ),
+                "description": entry.get("description") or "",
+            }
+        if not statuses:
+            # An empty list (or one with no parseable entries) is the same
+            # "breakdown unavailable" shape as an absent field — returning {}
+            # instead of None would falsely CRITICAL every ingested shard in
+            # check_shard_coverage and block every collateral transfer.
+            logging.info(
+                "per-shard exchange status empty — assuming single-shard semantics"
+            )
+            return None
+        return statuses
+    except Exception as exc:
+        logging.info(
+            "per-shard exchange status unavailable — assuming single-shard "
+            "semantics (%s)", exc,
+        )
+        return None
+
+
+def inactive_shard_indexes(shard_statuses: dict | None) -> set:
+    """
+    Derive the shards ingest must drop from a fetch_shard_statuses() result.
+
+    The single definition of "trading-inactive" for BOTH run modes — main.py's
+    dev and prod paths call this rather than each keeping its own comprehension,
+    so the two can never silently disagree about which shards a run scans.
+
+    Args:
+        shard_statuses (dict | None): Return value of fetch_shard_statuses().
+            None (breakdown unavailable) means no shard is known inactive.
+
+    Returns:
+        set: exchange_index values whose trading_active flag is falsy.
+    """
+    return {
+        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
+    }
+
+
+def check_shard_coverage(
+    advertised: dict | None, market_shards: set, balance_shards: set
+) -> tuple:
+    """
+    Compare the shards /exchange/status advertises against what a run actually
+    saw, and classify any mismatch as a real blind spot or an expected gap.
+
+    This is a pure function — no I/O, no logging — so the caller decides how
+    loudly to report each problem string; see main._log_shard_coverage for the
+    logging split (critical vs warning) this function's two return lists map
+    onto directly.
+
+    Severity rationale:
+        A shard the exchange advertises as `trading_active=True` but that
+        produced zero ingested markets is a genuine coverage gap ONLY when it
+        also holds account funds — money sitting on a shard whose order book
+        we never scanned is a real blind spot, because a same-title or
+        time-series pair on that shard could exist and go undetected. When no
+        funds are parked there, an empty active shard is business-as-usual
+        during the shard rollout — it would be wrong to CRITICAL-alert every
+        single week on an expected transient state, so that case is a warning
+        instead. The same empty-vs-funded split applies to a market or balance
+        shard the exchange doesn't even advertise: markets ingested from an
+        unadvertised shard mean the payloads and /exchange/status disagree with
+        each other, which is always treated as critical (it signals the two
+        data sources are out of sync, independent of money); account funds
+        sitting on an unadvertised shard are logged as a warning, since funds
+        alone (with no market activity to miss) are an accounting curiosity,
+        not a missed arbitrage opportunity. A `trading_active=False` advertised
+        shard is never flagged at all — fetch_open_events_with_markets() drops
+        its markets deliberately, and that drop already logs its own warning.
+
+    Args:
+        advertised (dict | None): The per-shard status breakdown from
+            fetch_shard_statuses(), or None when the breakdown was
+            unavailable (sandbox / pre-sharding shape). None makes coverage
+            unknowable — this function returns ([], []) unconditionally in
+            that case, regardless of what market_shards/balance_shards show,
+            because an observed shard with no status data to compare against
+            is not actionable.
+        market_shards (set): The set of exchange_index values actually seen
+            among ingested ApiMarket objects for this run.
+        balance_shards (set): The set of exchange_index values holding a
+            NONZERO balance. Contract: the caller is responsible for this
+            filtering — pass `{s for s, c in shard_balances.items() if c > 0}`
+            so a shard with a zero-cent breakdown entry (still "present" in
+            the raw balance dict) does not count as fund presence here. This
+            function only checks set membership; it has no concept of an
+            amount.
+
+    Returns:
+        tuple[list, list]: (critical, warnings) — human-readable problem
+            strings. ([], []) means full coverage (or status unavailable).
+    """
+    if advertised is None:
+        return [], []
+
+    critical: list = []
+    warnings: list = []
+
+    for idx, status in advertised.items():
+        if not status.get("trading_active"):
+            # Deliberately dropped at ingest; fetch_open_events_with_markets
+            # already warns about this — not this function's job to repeat it.
+            continue
+        if idx in market_shards:
+            continue
+        description = status.get("description") or ""
+        if idx in balance_shards:
+            critical.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets but holds account funds"
+            )
+        else:
+            warnings.append(
+                f"advertised active shard {idx} ({description}) produced zero "
+                "ingested markets (may be legitimately empty)"
+            )
+
+    for idx in market_shards - set(advertised):
+        critical.append(
+            f"markets ingested from shard {idx} which /exchange/status does "
+            "not advertise — payloads and status disagree"
+        )
+
+    for idx in balance_shards - set(advertised):
+        warnings.append(
+            f"account funds on shard {idx} which /exchange/status does not "
+            "advertise"
+        )
+
+    return critical, warnings
+
+
+def fetch_open_events_with_markets(
+    client: Any, inactive_shards: set | None = None
+) -> list:
     """
     Fetch all open Kalshi markets via the events endpoint (with nested markets).
 
@@ -451,15 +845,37 @@ def fetch_open_events_with_markets(client: Any) -> list:
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
+    Markets are TAGGED with their exchange shard, not filtered by it. The
+    market-data endpoints are cross-shard, so every shard's bids and asks
+    reach the pair pipeline and each ApiMarket carries its own
+    `exchange_index` (see _shard_index). The ONLY ingest-time shard exclusion
+    is `inactive_shards`: nothing on a shard the exchange itself reports as
+    not trading-active can be traded, nor should it be left to linger as a
+    stale candidate, so those markets are dropped here. Whether a
+    trading-active shard's market can actually be ordered is decided at
+    submission time (per-leg routing on the V2 path, trader._legacy_routable
+    on the legacy one), not here.
+
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
+        inactive_shards (set | None): Exchange shard indexes to drop at ingest
+            because the exchange reports trading_active=false for them.
+            None/empty (the default, and what a single-shard exchange yields)
+            keeps every market.
 
     Returns:
         list: Flat list of ApiMarket objects for all open markets, each with
             `_event_title` set to its parent event's full title (may be empty
-            string if the event had no title). May contain thousands of items.
+            string if the event had no title) and `exchange_index` set to its
+            shard. May contain thousands of items.
     """
     markets: list = []
+    # Normalize once so both loops below do a plain set membership test
+    inactive = inactive_shards or set()
+    # Counts markets dropped for living on a trading-inactive shard — shared
+    # across both the standard and MVE loops below so the summary warning
+    # reflects the whole fetch.
+    skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
     pages = 0
@@ -488,6 +904,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
                 # most stale markets too, but this stops them from being paired
                 # (and shown as tradeable candidates) in the first place.
                 if (m.get("status") or "") != "active":
+                    continue
+                # A shard the exchange reports as not trading-active has no
+                # live book worth pairing — drop before it becomes a candidate
+                if _shard_index(m) in inactive:
+                    skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it
@@ -547,6 +968,11 @@ def fetch_open_events_with_markets(client: Any) -> list:
                     # (allowed values: initialized/active/closed/settled/determined
                     # — there is no "open" status).
                     if (m.get("status") or "") == "active":
+                        # Same trading-inactive shard drop as the standard loop
+                        # above — the two share one skip counter
+                        if _shard_index(m) in inactive:
+                            skipped_shard += 1
+                            continue
                         markets.append(_market_from_dict(m, ev_title))
                         mve_market_count += 1
                         page_active_count += 1
@@ -583,6 +1009,18 @@ def fetch_open_events_with_markets(client: Any) -> list:
             if not cursor:
                 break
 
+    if skipped_shard:
+        logging.warning(
+            "Skipped %d markets on trading-inactive exchange shards %s",
+            skipped_shard, sorted(inactive),
+        )
+    # Per-shard ingest counts are the only signal of which shards we actually
+    # saw markets on — load-bearing for diagnosing a coverage gap after a
+    # market category migrates to a new shard. Always logged, even single-shard.
+    logging.info(
+        "Ingested markets by shard: %s",
+        dict(sorted(Counter(m.exchange_index for m in markets).items())),
+    )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
@@ -743,7 +1181,12 @@ def find_same_title_pairs(
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
-    titles and therefore won't be grouped together.
+    titles and therefore won't be grouped together. The subtitle component is
+    sourced from the API's `yes_sub_title` field post-2026-08 drift (see
+    `_market_from_dict`) — it is the only intra-title discriminator, so without
+    it two DIFFERENT outcomes sharing one question title (e.g. two candidates
+    under "Who will the next Pope be?") on different event tickers would be
+    falsely paired as the same contract under the 95% co-resolution assumption.
 
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
@@ -925,6 +1368,16 @@ _MAX_BID_CENTS = 99
 # generations) risked cross-reading a cents array through the dollars parser, so
 # the pairing is enforced explicitly in _fetch_orderbook. Order matters within a
 # container too: the first candidate set whose BOTH keys are present wins.
+#
+# CONTEXT: Kalshi removed the legacy integer price fields from its REST/WS
+# payloads on 2026-03-12, and production serves `orderbook_fp` only — so the
+# `orderbook` container and its cents arrays are not expected on the wire today.
+# They are kept as SDK-shape-derived DEFENSE, not as a live code path: the pinned
+# SDK still models exactly those shapes, sandbox and future replays may serve
+# them, and the alternative to parsing them correctly is not "no code" but a
+# silently empty book (BS-12). Nothing here weakens the fail-closed rule — an
+# unknown container, or a known container matching none of its own candidate
+# sets, still returns None with a mismatch warning.
 _ORDERBOOK_SIDE_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "orderbook_fp": (
         ("yes_dollars", "no_dollars", _UNIT_DOLLARS),

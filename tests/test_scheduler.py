@@ -18,6 +18,7 @@ repo root.
 import json
 import logging
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -29,6 +30,7 @@ from kalshi_betting.config import (
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
+    SCHEDULER_JOB_TIMEOUT_SECONDS,
 )
 
 
@@ -372,3 +374,30 @@ class TestAtomicStateWrite:
         assert not (tmp_path / "scheduler_state.json.tmp").exists()
         state = json.loads((tmp_path / "scheduler_state.json").read_text())
         assert state["exit_code"] == 0
+
+
+class TestRunJob:
+    """Ported from main's test_scheduler.py: the argv/cwd/timeout contract of the
+    subprocess run_job() spawns. Its timeout and nonzero-exit cases are subsumed
+    by TestTimeoutExpiredHandling and TestRunJobExitCodeMapping above."""
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_run_job_uses_project_root_cwd_and_timeout(self, mock_run, tmp_path):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return _completed(EXIT_OK, stdout="ok")
+
+        mock_run.side_effect = fake_run
+        scheduler.run_job()
+
+        assert captured["argv"] == [
+            sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
+        ]
+        # PROJECT_ROOT is redirected to tmp_path by the autouse fixture, so this
+        # asserts run_job reads it live rather than freezing a module constant
+        assert captured["kwargs"]["cwd"] == str(tmp_path)
+        assert captured["kwargs"]["timeout"] == SCHEDULER_JOB_TIMEOUT_SECONDS
+
