@@ -4,20 +4,35 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Offline unit tests for kalshi_betting.auth — the shard-aware balance
-    parsing added when Kalshi scoped GET /portfolio/balance per exchange shard
-    (2026-08-13). Covers the dollar-string → floored-cents converter, the
-    tiered fallback chain in _balance_cents_by_shard (full breakdown ->
-    aggregate balance_dollars -> legacy integer cents), and verify_auth
-    end-to-end against a faked raw response.
+    Offline unit tests for kalshi_betting.auth — client construction (dev-key
+    fallback semantics) and the shard-aware balance parsing added when Kalshi
+    scoped GET /portfolio/balance per exchange shard (2026-08-13). Covers the
+    BS-19 fix (an eager .get() default crashed dev-only setups), the BS-10 fix
+    (verify_auth's modeled get_balance() raises pydantic ValidationError on
+    live 2026-07+ responses, so it reads the raw body instead), the
+    dollar-string -> floored-cents converter, the tiered fallback chain in
+    _balance_cents_by_shard (full breakdown -> aggregate balance_dollars ->
+    legacy integer cents), and verify_auth end-to-end against a faked raw
+    response.
 
 Dependencies:
-    Imports _balance_cents_by_shard, _dollar_str_to_cents, and verify_auth
-    from kalshi_betting.auth, and DEFAULT_EXCHANGE_INDEX from
-    kalshi_betting.config. Uses unittest.mock / SimpleNamespace to stand in for
-    the SDK client and its RESTResponse — no network access.
+    Imports build_client, verify_auth, _balance_cents_by_shard and
+    _dollar_str_to_cents from kalshi_betting.auth, and DEFAULT_EXCHANGE_INDEX
+    from kalshi_betting.config. Patches kalshi_betting.auth.SECRETS_FILE /
+    PEM_FILE / DEV_PEM_FILE (module-level names, imported directly from
+    config.py) with tmp_path fixture files, and patches
+    kalshi_betting.auth.KalshiClient with a MagicMock so no real client is
+    constructed. Uses unittest.mock / SimpleNamespace to stand in for the SDK
+    client and its RESTResponse — no network access.
 
 Notes:
+    build_client() monkey-patches cfg.api_key_id / cfg.private_key_pem onto a
+    real Configuration object (see the CLAUDE.md "KalshiClient monkey-patch
+    pattern" gotcha) — that pattern is intentional and must NOT be "fixed";
+    these tests patch KalshiClient itself instead, so Configuration is still
+    built for real (proving cfg.api_key_id/cfg.private_key_pem get set) but
+    never handed to a live client.
+
     The same-key-different-units trap is asserted explicitly: inside a
     balance_breakdown entry "balance" is a fixed-point DOLLAR STRING, while the
     TOP-LEVEL "balance" is legacy INTEGER CENTS. A test pins each.
@@ -31,17 +46,143 @@ Notes:
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
+from kalshi_betting import _http, auth
 from kalshi_betting.auth import (
     _balance_cents_by_shard,
     _dollar_str_to_cents,
     verify_auth,
 )
 from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX
+
+
+def _write_secrets(tmp_path, payload: dict):
+    """
+    Write a secrets.json-shaped fixture file and point auth.SECRETS_FILE at it.
+
+    Args:
+        tmp_path: pytest tmp_path fixture directory.
+        payload (dict): Contents to serialize as the secrets file.
+
+    Returns:
+        pathlib.Path: Path to the written file.
+    """
+    path = tmp_path / "secrets.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def balance_resp(status: int, body: dict) -> MagicMock:
+    """
+    Build a fake raw get_balance_without_preload_content response.
+
+    Mirrors the .status / .data pattern used by fetch_json_page and by the
+    fake responses in tests/test_http.py — the raw SDK variants return an
+    object with a .status int and a .data bytes body rather than a modeled
+    pydantic object.
+
+    Args:
+        status (int): HTTP status code.
+        body (dict): JSON-serializable response body.
+
+    Returns:
+        MagicMock: Object with .status and .data set.
+    """
+    resp = MagicMock()
+    resp.status = status
+    resp.data = json.dumps(body).encode("utf-8")
+    return resp
+
+
+class TestBuildClientDevKeyFallback:
+    """BS-19: dev_api_key is optional and must not be evaluated eagerly."""
+
+    def test_dev_only_secrets_builds_client(self, tmp_path, monkeypatch):
+        # Only dev_api_key present — the old eager .get() default evaluated
+        # secrets["Kalshi-api-key"] regardless, raising KeyError even though
+        # dev_api_key existed. This must now succeed.
+        _write_secrets(tmp_path, {"dev_api_key": "dev-key-123"})
+        pem = tmp_path / "kalshi_private_key.pem"
+        pem.write_text("prod-pem")
+        dev_pem = tmp_path / "kalshi_demo_private_key.pem"  # deliberately absent
+
+        monkeypatch.setattr(auth, "SECRETS_FILE", tmp_path / "secrets.json")
+        monkeypatch.setattr(auth, "PEM_FILE", pem)
+        monkeypatch.setattr(auth, "DEV_PEM_FILE", dev_pem)
+
+        fake_client_cls = MagicMock()
+        with patch.object(auth, "KalshiClient", fake_client_cls):
+            auth.build_client("dev")
+
+        # cfg is the sole positional/keyword arg passed to KalshiClient(...)
+        cfg = fake_client_cls.call_args.kwargs["configuration"]
+        assert cfg.api_key_id == "dev-key-123"
+        assert cfg.private_key_pem == "prod-pem"  # falls back to PEM_FILE (no dev PEM)
+
+    def test_missing_dev_key_falls_back_to_prod_key(self, tmp_path, monkeypatch):
+        # No dev_api_key at all — dev mode must fall back to Kalshi-api-key
+        # rather than raising.
+        _write_secrets(tmp_path, {"Kalshi-api-key": "prod-key-456"})
+        pem = tmp_path / "kalshi_private_key.pem"
+        pem.write_text("prod-pem")
+        dev_pem = tmp_path / "kalshi_demo_private_key.pem"
+
+        monkeypatch.setattr(auth, "SECRETS_FILE", tmp_path / "secrets.json")
+        monkeypatch.setattr(auth, "PEM_FILE", pem)
+        monkeypatch.setattr(auth, "DEV_PEM_FILE", dev_pem)
+
+        fake_client_cls = MagicMock()
+        with patch.object(auth, "KalshiClient", fake_client_cls):
+            auth.build_client("dev")
+
+        cfg = fake_client_cls.call_args.kwargs["configuration"]
+        assert cfg.api_key_id == "prod-key-456"
+
+    def test_neither_key_raises_keyerror(self, tmp_path, monkeypatch):
+        _write_secrets(tmp_path, {"some_other_field": "irrelevant"})
+        pem = tmp_path / "kalshi_private_key.pem"
+        pem.write_text("prod-pem")
+
+        monkeypatch.setattr(auth, "SECRETS_FILE", tmp_path / "secrets.json")
+        monkeypatch.setattr(auth, "PEM_FILE", pem)
+        monkeypatch.setattr(auth, "DEV_PEM_FILE", tmp_path / "no_such_dev.pem")
+
+        with pytest.raises(KeyError):
+            auth.build_client("dev")
+
+    def test_prod_mode_requires_kalshi_api_key(self, tmp_path, monkeypatch):
+        # dev_api_key present is irrelevant in prod mode — prod always requires
+        # Kalshi-api-key specifically.
+        _write_secrets(tmp_path, {"dev_api_key": "dev-key-123"})
+        pem = tmp_path / "kalshi_private_key.pem"
+        pem.write_text("prod-pem")
+
+        monkeypatch.setattr(auth, "SECRETS_FILE", tmp_path / "secrets.json")
+        monkeypatch.setattr(auth, "PEM_FILE", pem)
+
+        with pytest.raises(KeyError):
+            auth.build_client("prod")
+
+    def test_prod_mode_builds_client_with_kalshi_api_key(self, tmp_path, monkeypatch):
+        _write_secrets(tmp_path, {"Kalshi-api-key": "prod-key-789"})
+        pem = tmp_path / "kalshi_private_key.pem"
+        pem.write_text("prod-pem-text")
+
+        monkeypatch.setattr(auth, "SECRETS_FILE", tmp_path / "secrets.json")
+        monkeypatch.setattr(auth, "PEM_FILE", pem)
+
+        fake_client_cls = MagicMock()
+        with patch.object(auth, "KalshiClient", fake_client_cls):
+            auth.build_client("prod")
+
+        cfg = fake_client_cls.call_args.kwargs["configuration"]
+        assert cfg.api_key_id == "prod-key-789"
+        assert cfg.private_key_pem == "prod-pem-text"
+
 
 # The exact live body observed on this account 2026-08-14. Top-level "balance"
 # is integer cents; the breakdown entries carry dollar strings under "balance".
@@ -261,3 +402,41 @@ class TestUnparseableEntryBalanceWarns:
         assert out == {0: 1000}
         assert "shard 2" in caplog.text
         assert "NOT counted" in caplog.text
+
+
+class TestVerifyAuthRetryAndDrift:
+    """verify_auth's transport-level behaviour, distinct from the payload-shape
+    coverage in TestVerifyAuth above: the api_call_with_retry wrapper it goes
+    through, and the loud failure required of an unrecognized response shape.
+
+    Both cases assert the SHARD DICT return type — verify_auth is no longer
+    scalar-returning, so a 429 that recovers must yield {shard: cents}, not an
+    int."""
+
+    def test_retries_429_then_succeeds(self):
+        # A transient 429 on a read-only GET must be retried, not fatal —
+        # verify_auth is wrapped in api_call_with_retry (unlike order
+        # submission and read_shard_balances, both deliberately single-shot).
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            side_effect=[
+                balance_resp(429, {"error": "slow down"}),
+                balance_resp(200, {"balance": 100000}),
+            ]
+        )
+        with patch.object(_http.time, "sleep") as sleep:
+            assert auth.verify_auth(client) == {DEFAULT_EXCHANGE_INDEX: 100000}
+        assert client.get_balance_without_preload_content.call_count == 2
+        sleep.assert_called_once_with(2.0)
+
+    def test_unknown_shape_raises(self):
+        # No recognizable balance field at all — must fail loudly rather than
+        # silently returning a wrong number. _balance_cents_by_shard raises
+        # ValueError once every fallback tier has been exhausted.
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            return_value=balance_resp(200, {"totally_unexpected_field": 1})
+        )
+        with patch.object(_http.time, "sleep"):
+            with pytest.raises(ValueError):
+                auth.verify_auth(client)

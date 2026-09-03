@@ -10,13 +10,17 @@ Purpose:
     cycle: building an authenticated API client, fetching open markets, finding
     arbitrage candidate pairs, sizing trades via Kelly criterion, submitting batch
     orders to the Kalshi REST API, and writing results to Excel. This is the only
-    module that ties all other modules together in the live trading path.
+    module that ties all other modules together in the live trading path. The
+    process exit code communicates the run's outcome to the scheduler (a
+    separate subprocess) — see the EXIT_* constants in config.py (BS-14): an
+    unhandled exception still propagates to exit 1, same as always.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold and file paths), reporter.py (Excel output), scanner.py
-    (market fetching and pair detection), strategy.py (trade sizing and portfolio
-    selection), and trader.py (order execution). Entry point for
+    (balance threshold, exit-code contract, price-gap thresholds, and file
+    paths), reporter.py (Excel output), scanner.py (market fetching and pair
+    detection), strategy.py (trade sizing and portfolio selection), and
+    trader.py (order execution). Entry point for
     `python3 -m kalshi_betting.main`.
 
 Notes:
@@ -38,12 +42,17 @@ Notes:
 """
 import argparse
 import logging
+import logging.handlers
 import pathlib
+import sys
 
 from tabulate import tabulate
 
 from .auth import build_client, verify_auth
 from .config import (
+    EXIT_OK,
+    EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TRADES_NEED_ATTENTION,
     MIN_BALANCE_CENTS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -314,7 +323,7 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
         logging.info("Full shard coverage: shards %s scanned", sorted(shard_statuses))
 
 
-def _run_dev(client, args) -> None:
+def _run_dev(client, args) -> int:
     """
     Execute a full dev/sandbox mode scan and simulation.
 
@@ -329,6 +338,13 @@ def _run_dev(client, args) -> None:
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
+
+    Returns:
+        int: Always EXIT_OK — dev mode never submits real orders, so there is
+            no low-balance skip or manual-review outcome to distinguish.
+            Returned as an int (rather than None) for symmetry with _run_prod,
+            since main() dispatches to either and passes the result to
+            sys.exit().
     """
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
@@ -369,11 +385,17 @@ def _run_dev(client, args) -> None:
     candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
 
     if not candidate_pairs:
-        logging.info(_no_pairs_msg(sandbox=True))
+        # BS-26: write_dev_simulation() already logs "Dev simulation written: %s" —
+        # this line carries the qualifier (why the file is empty) instead of
+        # repeating the artifact path a second time. The thresholds come from
+        # _no_pairs_msg so they cannot drift out of sync with config.py.
+        logging.info(
+            "%s Simulation file will contain headers only.",
+            _no_pairs_msg(sandbox=True),
+        )
         # Write an empty simulation file so the run is still recorded
-        out = write_dev_simulation([], [], sandbox_balance_cents)
-        logging.info("Dev simulation written (empty): %s", out)
-        return
+        write_dev_simulation([], [], sandbox_balance_cents)
+        return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the virtual balance
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
@@ -386,11 +408,14 @@ def _run_dev(client, args) -> None:
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        logging.info("No executable arbitrage trades found.")
+        # BS-26: qualifier only — write_dev_simulation() logs the "written" line itself.
+        logging.info(
+            "No executable arbitrage trades found — simulation file will "
+            "contain candidates only."
+        )
         # Write a simulation file showing candidates even though no trades were sized
-        out = write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
-        logging.info("Dev simulation written (candidates only): %s", out)
-        return
+        write_dev_simulation([], candidate_pairs, sandbox_balance_cents)
+        return EXIT_OK
 
     _print_portfolio(portfolio, "Simulated")
 
@@ -398,12 +423,14 @@ def _run_dev(client, args) -> None:
     # Returns TradeResult objects with status="simulated" — no API orders are placed
     results = execute_trades(client, portfolio, dry_run=True)
 
-    # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all candidates
-    out = write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
-    logging.info("Dev simulation written: %s", out)
+    # Write the simulation Excel file: Sheet 1 = simulated trades, Sheet 2 = all
+    # candidates. write_dev_simulation() logs "Dev simulation written: %s" itself
+    # (BS-26) — don't duplicate that line here.
+    write_dev_simulation(results, candidate_pairs, sandbox_balance_cents)
+    return EXIT_OK
 
 
-def _run_prod(client, args) -> None:
+def _run_prod(client, args) -> int:
     """
     Execute a full production run using the real Kalshi account.
 
@@ -419,6 +446,15 @@ def _run_prod(client, args) -> None:
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
+
+    Returns:
+        int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
+            account balance is below MIN_BALANCE_CENTS (no scan attempted).
+            EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
+            results has status "rollback_failed" or "manual_review" — either
+            means a human must check the account/trade log. EXIT_OK for every
+            other path, including dry-run, no candidate pairs, no executable
+            trades, and all-pairs-failed-pre-execution-check.
     """
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
@@ -437,7 +473,7 @@ def _run_prod(client, args) -> None:
             balance_cents / 100,
             MIN_BALANCE_CENTS / 100,
         )
-        return
+        return EXIT_SKIPPED_LOW_BALANCE
 
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
@@ -481,7 +517,7 @@ def _run_prod(client, args) -> None:
 
     if not candidate_pairs:
         logging.info(_no_pairs_msg())
-        return
+        return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
@@ -495,7 +531,7 @@ def _run_prod(client, args) -> None:
 
     if not portfolio:
         logging.info("No executable arbitrage trades found.")
-        return
+        return EXIT_OK
 
     _print_portfolio(portfolio, "Selected")
 
@@ -503,7 +539,7 @@ def _run_prod(client, args) -> None:
     portfolio = pre_execution_check(client, portfolio)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
-        return
+        return EXIT_OK
 
     # On the legacy order path, drop statically-unroutable specs BEFORE any
     # collateral is planned — otherwise real, non-idempotent transfers would
@@ -512,7 +548,11 @@ def _run_prod(client, args) -> None:
     portfolio = drop_legacy_unroutable(portfolio)
     if not portfolio:
         logging.info("No selected pair is routable by the configured order path.")
-        return
+        # EXIT_OK, never a bare return: sys.exit(None) exits 0 silently, which
+        # is the right CODE here (a clean no-trade run) but only by accident —
+        # the exit-code contract (BS-14) requires every _run_prod path to name
+        # its code explicitly.
+        return EXIT_OK
 
     # Move collateral to the shards the selected trades draw from — sizing is
     # portfolio-wide, but each order settles against its own shard's balance.
@@ -525,7 +565,8 @@ def _run_prod(client, args) -> None:
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        return
+        # EXIT_OK explicitly — see the routability short-circuit above
+        return EXIT_OK
 
     # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
@@ -545,8 +586,9 @@ def _run_prod(client, args) -> None:
     # write fails (e.g. the file is open in Excel), dump every result to the log
     # so the record of real fills is never lost, then re-raise.
     try:
-        out = append_to_prod_log(results, balance_cents / 100, balance_after)
-        logging.info("Trade log updated: %s", out)
+        # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
+        # itself (BS-26) — don't duplicate that line here.
+        append_to_prod_log(results, balance_cents / 100, balance_after)
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
@@ -564,25 +606,32 @@ def _run_prod(client, args) -> None:
 
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
-    else:
-        n_ok       = sum(1 for r in results if r.status == "executed")
-        n_rolled   = sum(1 for r in results if r.status == "rolled_back")
-        n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-        # "manual_review" means leg B's fill state was undetermined and no
-        # automated rollback was attempted — just as urgent as an orphaned
-        # rollback failure, so it's counted in the same manual-review alert.
-        n_unknown  = sum(1 for r in results if r.status == "manual_review")
-        logging.info(
-            "Submitted %d of %d order pair(s) successfully. %d rolled back, "
-            "%d rollback failure(s), %d unknown fill state(s).",
-            n_ok, len(results), n_rolled, n_orphaned, n_unknown,
+        return EXIT_OK
+
+    n_ok       = sum(1 for r in results if r.status == "executed")
+    n_rolled   = sum(1 for r in results if r.status == "rolled_back")
+    n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
+    # "manual_review" means leg B's fill state was undetermined and no
+    # automated rollback was attempted — just as urgent as an orphaned
+    # rollback failure, so it's counted in the same manual-review alert.
+    n_unknown  = sum(1 for r in results if r.status == "manual_review")
+    logging.info(
+        "Submitted %d of %d order pair(s) successfully. %d rolled back, "
+        "%d rollback failure(s), %d unknown fill state(s).",
+        n_ok, len(results), n_rolled, n_orphaned, n_unknown,
+    )
+    if n_orphaned or n_unknown:
+        logging.critical(
+            "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
+            "UNDETERMINED fill state — manual review required (see trade log).",
+            n_orphaned, n_unknown,
         )
-        if n_orphaned or n_unknown:
-            logging.critical(
-                "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
-                "UNDETERMINED fill state — manual review required (see trade log).",
-                n_orphaned, n_unknown,
-            )
+        # Surface via the process exit code too (BS-14) — the scheduler reads
+        # this, not the log file, and needs to distinguish "trades happened
+        # but need a human to check" from a clean run.
+        return EXIT_TRADES_NEED_ATTENTION
+
+    return EXIT_OK
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:
@@ -596,6 +645,13 @@ def _setup_logging(log_path: pathlib.Path) -> None:
     from a test or an import that doesn't go on to log anything — does not
     touch disk; the file is only created on the first emitted record.
 
+    The file handler ROTATES (BS-25): a scheduler daemon runs this process
+    weekly forever, and a plain FileHandler would grow kalshi_arb.log without
+    bound (see backtest.py's kalshi_backtest.log for the failure mode that
+    motivated this). 5MB across 3 backups is logging infrastructure sized for
+    this CLI's own verbosity, not a strategy constant, so it stays inline here
+    rather than moving to config.py.
+
     Args:
         log_path (pathlib.Path): Path to the log file to append to.
 
@@ -608,7 +664,9 @@ def _setup_logging(log_path: pathlib.Path) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_path, delay=True),
+            logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=3, delay=True,
+            ),
         ],
     )
 
@@ -620,7 +678,17 @@ def main() -> None:
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days), configures logging, builds the appropriate Kalshi
     client, and dispatches to _run_dev (sandbox simulation) or _run_prod
-    (real account trading).
+    (real account trading). Exits the process via sys.exit() with the
+    dispatched run's return code (see the EXIT_* constants in config.py,
+    BS-14) so a caller that only sees the process exit status — the
+    scheduler, which runs this as a subprocess — can distinguish a clean run
+    from a low-balance skip or a run with trades needing manual review. An
+    unhandled exception is not caught here and propagates to the normal
+    interpreter exit code 1.
+
+    Returns:
+        None: This function never returns to its caller — it always ends by
+            calling sys.exit(code), which raises SystemExit.
     """
     parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
     parser.add_argument(
@@ -647,12 +715,24 @@ def main() -> None:
     # persistent log file (later inspection, scheduler-spawned runs)
     _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
 
+    if args.mode == "dev" and args.dry_run:
+        # _run_dev always calls execute_trades(dry_run=True) regardless of
+        # args.dry_run (dev never submits real orders), so --dry-run has no
+        # effect in dev mode. Logged (not parser.error'd) after basicConfig so
+        # it lands in kalshi_arb.log for anyone diagnosing "why didn't
+        # --dry-run change anything" after the fact.
+        logging.warning("--dry-run is inert in dev mode — dev never submits orders")
+
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
     if args.mode == "dev":
-        _run_dev(client, args)
+        code = _run_dev(client, args)
     else:
-        _run_prod(client, args)
+        code = _run_prod(client, args)
+
+    # Only sys.exit() communicates the outcome to a subprocess caller (the
+    # scheduler) — a bare return here would always look like exit 0.
+    sys.exit(code)
 
 
 if __name__ == "__main__":

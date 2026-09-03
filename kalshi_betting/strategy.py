@@ -44,7 +44,10 @@ class TradeSpec:
             execution — select_portfolio() budgets against this value.
         min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds:
             x * (1 - nA - pB). Always > 0 for trades that reach execution.
-        profit_ratio (float): Return on cost: (1 - nA - pB) / (nA + pB).
+        profit_ratio (float): Return on cost, net of the continuous fee
+            approximation: ((1 - nA - pB) - fee_per_pair_approx(nA, pB)) /
+            (nA + pB). This is "b" in the Kelly formula below (see
+            compute_trade()'s net_spread/profit_ratio computation).
         days_to_close (int): Calendar days until the later-closing market resolves. >= 1.
         monthly_profit_ratio (float): Profit ratio normalized to a 30-day period:
             profit_ratio * 30 / days_to_close. Used for portfolio ranking.
@@ -276,9 +279,13 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
 
     Ticker-conflict filter: once a spec is chosen, both of its market tickers are
     marked used and no later spec that touches either ticker is selected. This
-    prevents a single market from being a leg in two overlapping pairs, matching
-    the "one active position per ticker" invariant that get_held_tickers enforces
-    across runs and that the backtester enforces in its Pass-2 filter.
+    prevents a single market from being a leg in two overlapping pairs within one
+    run. Across runs the same invariant is enforced by scanner.get_held_tickers(),
+    but only for as long as a position is OPEN: it queries positions with
+    count_filter="position", so a ticker drops out of the held set once its market
+    settles and may legitimately be entered again afterwards. The backtester's
+    Pass-2 filter mirrors exactly that — it blocks a ticker until its trade's exit
+    date and releases it there.
 
     At equal monthly profit ratios, same_title pairs rank above time_series because
     the same-title guarantee is simpler (identical questions must co-resolve) and

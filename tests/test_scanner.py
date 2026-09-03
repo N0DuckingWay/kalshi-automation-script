@@ -14,6 +14,7 @@ from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX, INCLUDE_MVE_MARKETS
 from kalshi_betting.scanner import (
     CandidatePair,
     PriceRange,
+    _bids_to_ask_levels,
     _fetch_orderbook,
     _market_from_dict,
     _parse_price_ranges,
@@ -507,12 +508,13 @@ def _orderbook_payload_client(payload: dict):
 
 
 class TestFetchOrderbookKeyMapping:
-    """_fetch_orderbook supports exactly one matched key generation:
-    orderbook_fp -> yes_dollars/no_dollars. A container whose matched side keys
-    are missing is a potential API-shape mismatch — logged and treated as
-    unavailable (None), never read through whatever side keys happen to be there.
-    The legacy `orderbook` container (integer-cent yes/no arrays, removed from the
-    API 2026-03-12) is unsupported and must fail closed loudly."""
+    """_fetch_orderbook must couple the container key to its OWN candidate side-key
+    sets: orderbook_fp -> yes_dollars/no_dollars (dollars); orderbook ->
+    yes_dollars/no_dollars (dollars) or the SDK-aliased legacy true/false arrays
+    (integer cents, converted to dollars before parsing). A null/empty container is
+    an empty book; a non-empty container matching none of its own sets is a
+    potential API-shape mismatch — logged and treated as unavailable (None), never
+    cross-read against the other generation."""
 
     def test_current_format_parses(self):
         # orderbook_fp container with dollar-string side arrays (the live shape)
@@ -521,41 +523,87 @@ class TestFetchOrderbookKeyMapping:
         ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CURRENT")
         assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
 
-    def test_legacy_orderbook_container_fails_closed(self, caplog):
-        # The legacy `orderbook` container is no longer a recognized generation:
-        # it must return None and name the response keys, not parse its
-        # integer-cent arrays as dollars.
-        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
+    def test_orderbook_container_dollar_keys_parse(self):
+        # The SDK's Orderbook model REQUIRES yes_dollars/no_dollars even under the
+        # plain `orderbook` container — that shape must parse identically.
+        payload = {"orderbook": {"yes_dollars": [["0.50", "10"]],
+                                 "no_dollars": [["0.40", "5"]]}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-OB-DOLLARS")
+        assert ob == {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}
+
+    def test_orderbook_container_legacy_cent_keys_convert_to_dollars(self, caplog):
+        # The legacy integer-cent arrays are aliased "true"/"false" by the SDK.
+        # A 45c YES bid must become a 0.45 dollar bid -> NO ask at 0.55, and
+        # NOTHING may be silently dropped (cents through the dollars parser would
+        # yield 1-45 = -44 and be discarded with no warning at all).
+        payload = {"orderbook": {"true": [[45, 100], [40, 50]],
+                                 "false": [[30, 20]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTS")
+        assert ob == {"yes": [[0.45, 100], [0.40, 50]], "no": [[0.30, 20]]}
+        assert caplog.text == ""
+        # Downstream complement: YES bid 0.45 -> NO ask 0.55 at the same qty
+        assert _bids_to_ask_levels(ob["yes"]) == [(0.55, 100.0), (0.60, 50.0)]
+
+    def test_orderbook_container_legacy_cent_string_prices_convert(self):
+        # Cents may arrive as strings ("45"); still integral cents, still converted
+        payload = {"orderbook": {"true": [["45", "100"]], "false": []}}
+        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTSTR")
+        assert ob == {"yes": [[0.45, "100"]], "no": []}
+
+    def test_malformed_cent_level_is_dropped_with_warning(self, caplog):
+        # 4500 is not a whole cent in [1, 99] — the level is dropped LOUDLY,
+        # naming the ticker and the raw value; valid levels still come through.
+        payload = {"orderbook": {"true": [[45, 100], [4500, 7]], "false": []}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-BADCENTS")
+        assert ob == {"yes": [[0.45, 100]], "no": []}
+        assert "legacy cents array" in caplog.text
+        assert "MKT-BADCENTS" in caplog.text
+        assert "4500" in caplog.text
+
+    def test_orderbook_container_with_removed_yes_no_keys_is_a_mismatch(self, caplog):
+        # Regression for BS-03: `orderbook` + yes/no was never a real SDK shape
+        # (the model aliases the legacy arrays as true/false). It is no longer a
+        # recognized generation, so it must fail closed rather than parse.
+        payload = {"orderbook": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-LEGACY")
         assert ob is None
-        assert "No usable orderbook" in caplog.text
+        assert "Potential orderbook key mismatch" in caplog.text
         assert "MKT-LEGACY" in caplog.text
-        assert "orderbook" in caplog.text
-
-    def test_legacy_cents_never_reach_dollar_parser(self):
-        # A legacy cents bid of 35 would parse as an ask of 1.0 - 35 = -34.0 and
-        # be dropped by the price-range check, yielding a silently EMPTY book.
-        # Fail-closed (None) is the required outcome — never a parsed book, and
-        # never an empty-but-successful one.
-        payload = {"orderbook": {"yes": [[35, 100]], "no": [[40, 50]]}}
-        ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-CENTS")
-        assert ob is None
-        # Guard the same thing end-to-end: no ask levels are derivable, so the
-        # pair is marked non-tradeable rather than sized off a phantom book.
-        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
-        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
-        assert enriched.tradeable is False
 
     def test_mixed_generation_keys_return_none_and_warn(self, caplog):
-        # orderbook_fp container but with the legacy generation's side keys —
-        # must not be read; returns None and logs a key-mismatch warning.
-        payload = {"orderbook_fp": {"yes": [["0.50", "10"]], "no": [["0.40", "5"]]}}
+        # orderbook_fp container but with the OTHER generation's side keys —
+        # must not cross-read; returns None and logs a key-mismatch warning.
+        payload = {"orderbook_fp": {"true": [[50, 10]], "false": [[40, 5]]}}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-MIXED")
         assert ob is None
         assert "Potential orderbook key mismatch" in caplog.text
         assert "MKT-MIXED" in caplog.text
+
+    def test_unrecognized_side_keys_return_none_and_warn(self, caplog):
+        # A non-empty dict container matching NEITHER candidate set fails closed
+        payload = {"orderbook": {"bids_yes": [["0.50", "10"]]}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NOSET")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+
+    def test_non_dict_container_returns_none_and_warns(self, caplog):
+        # A container that is present and non-empty but is not a dict at all
+        # (here a bare list of levels) can't be probed for side keys. It must
+        # fail closed exactly like an unrecognized key set, and the warning
+        # names the TYPE rather than a key list — the branch that logs
+        # type(ob).__name__ instead of sorted(ob.keys()).
+        payload = {"orderbook_fp": [["0.50", "10"]]}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NOTDICT")
+        assert ob is None
+        assert "Potential orderbook key mismatch" in caplog.text
+        assert "MKT-NOTDICT" in caplog.text
+        assert "list" in caplog.text
 
     def test_empty_and_null_sides_are_not_a_mismatch(self, caplog):
         # Side keys present but empty ([]) or null map to empty sides, NOT a
@@ -566,13 +614,22 @@ class TestFetchOrderbookKeyMapping:
         assert ob == {"yes": [], "no": []}
         assert "key mismatch" not in caplog.text
 
-    def test_non_dict_container_returns_none_and_warns(self, caplog):
-        # Container key present but its value is not a dict (e.g. null) — fail closed.
+    def test_null_container_is_an_empty_book(self, caplog):
+        # BS-28: container key present but null — that is a book with no resting
+        # bids at all, not an API shape change. Empty book, no warning.
         payload = {"orderbook_fp": None}
         with caplog.at_level(logging.WARNING):
             ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-NULLC")
-        assert ob is None
-        assert "Potential orderbook key mismatch" in caplog.text
+        assert ob == {"yes": [], "no": []}
+        assert caplog.text == ""
+
+    def test_empty_dict_container_is_an_empty_book(self, caplog):
+        # Same for an empty-dict container, under either generation
+        payload = {"orderbook": {}}
+        with caplog.at_level(logging.WARNING):
+            ob = _fetch_orderbook(_orderbook_payload_client(payload), "MKT-EMPTYC")
+        assert ob == {"yes": [], "no": []}
+        assert caplog.text == ""
 
     def test_unknown_container_key_returns_none_and_warns(self, caplog):
         # No recognized container key at all — log the actual response keys so a
@@ -750,6 +807,90 @@ class TestFetchOpenEventsMveStatusFilter:
         calls = client.get_multivariate_events_without_preload_content.call_count
         assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
 
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_pull_bails_after_consecutive_pages_with_no_active_markets(self, caplog):
+        # Regression (sandbox, live 2026-08): the bail-out counter used to
+        # reset on RAW nested-market count regardless of status. The MVE
+        # listing can serve thousands of pages whose nested markets are all
+        # non-active (closed/settled) — those pages must NOT reset the
+        # counter, or the bail-out never fires (observed live: 4,600+ pages
+        # flat at the same appended-market count with no bound). An endless
+        # supply of pages that each carry several non-active nested markets
+        # must still bail after exactly MVE_MAX_EMPTY_PAGES pages.
+        from itertools import count
+
+        from kalshi_betting.config import MVE_MAX_EMPTY_PAGES
+
+        def endless_inactive_mve_pages(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"MVE {n}", "markets": [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                    _raw_market(f"MVE-CLS-{n}-B", "Option B", status="closed"),
+                ]}],
+                cursor=f"CUR-{n}",
+            )
+        counter = count()
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=endless_inactive_mve_pages
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert markets == []
+        calls = client.get_multivariate_events_without_preload_content.call_count
+        assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
+        assert "no active nested" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_page_with_one_active_market_resets_bailout_counter(self):
+        # Mixed case: a page containing one ACTIVE market among otherwise
+        # inactive ones must reset the empty-page counter, so pagination
+        # continues past it rather than counting toward the bail-out.
+        from itertools import count
+
+        from kalshi_betting.config import MVE_MAX_EMPTY_PAGES
+
+        RESET_PAGE_INDEX = 3  # 0-indexed page that contains the one active market
+
+        def mve_pages_with_one_active(**kwargs):
+            n = next(counter)
+            if n == RESET_PAGE_INDEX:
+                mkts = [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                    _raw_market(f"MVE-ACT-{n}-B", "Option B", status="active"),
+                ]
+            else:
+                mkts = [
+                    _raw_market(f"MVE-SET-{n}-A", "Option A", status="settled"),
+                ]
+            return _raw_page([{"title": f"MVE {n}", "markets": mkts}], cursor=f"CUR-{n}")
+        counter = count()
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=mve_pages_with_one_active
+        )
+
+        markets = fetch_open_events_with_markets(client)
+
+        # The active market from the reset page must be present.
+        assert {m.ticker for m in markets} == {f"MVE-ACT-{RESET_PAGE_INDEX}-B"}
+        # Pagination must have continued past RESET_PAGE_INDEX: total calls
+        # equal RESET_PAGE_INDEX + 1 (pages before/including the reset) plus
+        # another full MVE_MAX_EMPTY_PAGES run of inactive-only pages after it
+        # before the bail-out fires again.
+        calls = client.get_multivariate_events_without_preload_content.call_count
+        assert calls == RESET_PAGE_INDEX + 1 + MVE_MAX_EMPTY_PAGES, (
+            f"expected the counter to reset at page {RESET_PAGE_INDEX}, "
+            f"then bail after another {MVE_MAX_EMPTY_PAGES} pages; got {calls} calls"
+        )
+
     def test_non_2xx_raises_for_retry_helper(self):
         # The raw-response SDK variants do NOT raise on HTTP errors, so
         # _fetch_json_page must convert non-2xx statuses into ApiException —
@@ -767,6 +908,147 @@ class TestFetchOpenEventsMveStatusFilter:
 
         with pytest.raises(ApiException):
             fetch_open_events_with_markets(client)
+
+    def test_standard_events_progress_logged_at_cadence(self, caplog):
+        # A silent multi-page fetch is indistinguishable from a hang (BS-13):
+        # a live dev-mode run paged 125,538 markets in 13m27s with zero log
+        # lines. A ~60-page fetch must emit progress lines at the configured
+        # cadence, not just a final summary.
+        from itertools import count
+
+        from kalshi_betting.config import SCANNER_PROGRESS_LOG_EVERY_PAGES
+
+        n_pages = 2 * SCANNER_PROGRESS_LOG_EVERY_PAGES + 10
+        counter = count()
+
+        def paged_events(**kwargs):
+            n = next(counter)
+            cursor = f"CUR-{n}" if n < n_pages - 1 else None
+            return _raw_page(
+                [{"title": f"E{n}", "markets": [_raw_market(f"T{n}", f"Q {n}")]}],
+                cursor=cursor,
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=paged_events)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.INFO):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == n_pages
+        progress_lines = [
+            r.message for r in caplog.records
+            if "Open-events fetch" in r.message and "pages" in r.message
+        ]
+        assert len(progress_lines) >= 2, f"expected >=2 progress lines, got {progress_lines}"
+        assert all("markets" in line for line in progress_lines)
+
+    def test_standard_events_stuck_cursor_stops_pagination(self, caplog):
+        # The cursor is a keyset position — a page handing back the exact
+        # cursor we just requested with already proves the server isn't
+        # advancing. One repeat must stop the loop rather than spin forever.
+        page1 = _raw_page(
+            [{"title": "E1", "markets": [_raw_market("PAGE1", "Q one")]}], cursor="CUR-STUCK"
+        )
+        page2 = _raw_page(
+            [{"title": "E2", "markets": [_raw_market("PAGE2", "Q two")]}], cursor="CUR-STUCK"
+        )
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=[page1, page2])
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # Only the two pages fetched before the guard fired — a third call
+        # would raise StopIteration against the side_effect list, which
+        # would fail this test on its own.
+        assert {m.ticker for m in markets} == {"PAGE1", "PAGE2"}
+        assert client.get_events_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_pagination_unions_pages(self):
+        # get_held_tickers previously had no multi-page test coverage at all.
+        from kalshi_betting.scanner import get_held_tickers
+
+        page1 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-1", "position_fp": "3"}],
+                "cursor": "CUR-2",
+            }).encode(),
+        )
+        page2 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-2", "position_fp": "-1"}],
+                "cursor": None,
+            }).encode(),
+        )
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[page1, page2])
+
+        assert get_held_tickers(client) == {"HELD-1", "HELD-2"}
+        assert client.get_positions_without_preload_content.call_count == 2
+
+    def test_get_held_tickers_stuck_cursor_stops_and_warns(self, caplog):
+        from kalshi_betting.scanner import get_held_tickers
+
+        page1 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-1", "position_fp": "3"}],
+                "cursor": "CUR-STUCK",
+            }).encode(),
+        )
+        page2 = SimpleNamespace(
+            status=200,
+            data=json.dumps({
+                "market_positions": [{"ticker": "HELD-2", "position_fp": "-1"}],
+                "cursor": "CUR-STUCK",
+            }).encode(),
+        )
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[page1, page2])
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        # Partial results from both fetched pages are kept, not discarded.
+        assert held == {"HELD-1", "HELD-2"}
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_stuck_cursor_stops_pagination(self, caplog):
+        page1 = _raw_page(
+            [{"title": "MVE E1", "markets": [_raw_market("MVE-1", "Q one")]}],
+            cursor="CUR-STUCK",
+        )
+        page2 = _raw_page(
+            [{"title": "MVE E2", "markets": [_raw_market("MVE-2", "Q two")]}],
+            cursor="CUR-STUCK",
+        )
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            side_effect=[page1, page2]
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert {m.ticker for m in markets} == {"MVE-1", "MVE-2"}
+        assert client.get_multivariate_events_without_preload_content.call_count == 2
+        assert "cursor did not advance" in caplog.text
+        assert "MVE events fetch" in caplog.text
 
 
 class TestShardIndex:

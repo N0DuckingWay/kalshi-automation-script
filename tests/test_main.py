@@ -6,32 +6,49 @@ Last edited by: Zachary Hoffman
 Purpose:
     Offline tests for kalshi_betting.main — the live-pipeline orchestrator's
     pure helpers (_truncate, _format_deadline, _dedup_pairs,
-    _compute_trade_specs, _no_pairs_msg), its logging setup (_setup_logging),
-    and end-to-end "live-shape replay" runs of _run_dev/_run_prod against a
-    MagicMock client wired with CURRENT-generation (2026-08+) Kalshi payload
-    shapes — dollar-string prices, yes_sub_title, orderbook_fp books,
+    _compute_trade_specs, _no_pairs_msg), its logging setup (_setup_logging,
+    including the BS-25 rotating file handler), its process exit-code contract
+    (BS-14), and end-to-end "live-shape replay" runs of _run_dev/_run_prod
+    against a MagicMock client wired with CURRENT-generation (2026-08+) Kalshi
+    payload shapes — dollar-string prices, yes_sub_title, orderbook_fp books,
     shard-aware balance_breakdown, position_fp positions, V2 order responses —
     the closest offline substitute for a live smoke test.
 
+    On the exit-code half: _run_prod / _run_dev return an int outcome code and
+    main() propagates it to the OS via sys.exit(), so the scheduler (a separate
+    subprocess, see scheduler.run_job) can distinguish a clean run from a
+    low-balance skip or a run whose trades need manual review.
+
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
-    plus config constants asserted against. All Kalshi API interaction is
-    mocked at the HTTP boundary (raw-response mocks and rest_client.request);
-    reporter Excel writers are patched out so no files are written.
+    plus config constants asserted against. The live-shape replays mock all
+    Kalshi API interaction at the HTTP boundary (raw-response mocks and
+    rest_client.request); the exit-code tests mock the heavy collaborators
+    (auth, scanner, strategy, trader, reporter) at their main-module import
+    sites per project policy. Reporter Excel writers are patched out so no
+    files are written, and PROJECT_ROOT is redirected to tmp_path wherever
+    main() configures logging, so the real kalshi_arb.log / trade_log.xlsx are
+    never touched.
 
 Notes:
     The V2 live-execution replays run with dry_run=False against the config
     default ORDER_API_VERSION="v2" — deliberately not monkeypatched, so they
     prove the default path. Order responses are generated from each request's
     own submitted count, so the tests don't depend on exact Kelly sizing.
+
+    verify_auth() returns dict[int, int] (exchange_index -> cents), never a
+    scalar — every mock of it here must return a dict, and _run_prod sizes on
+    sum(...) of it.
 """
 import json
 import logging
+import logging.handlers
 import pathlib
 import re
+import sys
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -39,6 +56,11 @@ from kalshi_betting import main
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import trader as trader_mod
 from kalshi_betting.config import (
+    DEFAULT_EXCHANGE_INDEX,
+    EXIT_OK,
+    EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TRADES_NEED_ATTENTION,
+    MIN_BALANCE_CENTS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     ORDER_API_VERSION,
@@ -46,6 +68,7 @@ from kalshi_betting.config import (
     TRANSFER_PATH,
     V2_ORDER_PATH,
 )
+from kalshi_betting.reporter import TradeResult
 
 
 def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
@@ -147,7 +170,9 @@ class TestSetupLogging:
 
             handler_types = [type(h) for h in root.handlers]
             assert logging.StreamHandler in handler_types
-            assert logging.FileHandler in handler_types
+            # RotatingFileHandler, not a plain FileHandler (BS-25) — a
+            # scheduler daemon runs this weekly forever, so the log must rotate
+            assert logging.handlers.RotatingFileHandler in handler_types
             # Exactly one of each — basicConfig should not have added extras
             assert sum(1 for h in root.handlers if type(h) is logging.StreamHandler) == 1
             assert sum(1 for h in root.handlers if isinstance(h, logging.FileHandler)) == 1
@@ -418,11 +443,31 @@ def _orderbook_side_effect(ticker: str) -> SimpleNamespace:
 
 def _positions_side_effect(held_payload: dict, lookup_map: dict):
     """Dispatches get_positions_without_preload_content calls: a "ticker"
-    kwarg means trader._position_count's per-ticker ambiguity lookup;
-    otherwise it's scanner.get_held_tickers' paginated listing."""
+    kwarg means trader._position_count's per-ticker lookup; otherwise it's
+    scanner.get_held_tickers' paginated listing.
+
+    A lookup_map value may be a single payload (every read of that ticker sees
+    it) or a LIST of payloads consumed in order, which is what models a
+    position CHANGING across reads. trader attributes an ambiguous fill by
+    DELTA, never by the absolute holding, so a leg whose fill must read as
+    "filled" needs a baseline read (taken before either order is submitted)
+    followed by a post-exception read that differs by exactly the leg's count.
+    The last entry of a list repeats once exhausted."""
+    sequences = {t: list(v) for t, v in lookup_map.items() if isinstance(v, list)}
+
     def _effect(**kwargs):
         if "ticker" in kwargs:
-            payload = lookup_map.get(kwargs["ticker"], {"market_positions": []})
+            ticker = kwargs["ticker"]
+            if ticker in sequences:
+                seq = sequences[ticker]
+                payload = seq.pop(0) if len(seq) > 1 else seq[0]
+            else:
+                payload = lookup_map.get(ticker, {"market_positions": []})
+            # A callable entry is resolved at read time, so a payload can be
+            # derived from what was actually submitted rather than hardcoding
+            # a count the Kelly sizing might change
+            if callable(payload):
+                payload = payload()
         else:
             payload = held_payload
         return _raw_json_response(payload)
@@ -872,16 +917,39 @@ class TestRunProdLiveV2Replay:
         order_side_effect=None,
         dry_run: bool = False,
     ):
-        # After a filled NO buy the exchange reports a NEGATIVE (short-YES)
-        # position on the leg-A ticker — that sign is what trader's first-fill
-        # backstop verifies before leg B is submitted, so the replay account
-        # must model it or every pair would stop at manual_review.
+        # trader's first-fill backstop judges the V2 NO-leg mapping by how the
+        # leg-A position MOVED across the fill, not by its absolute sign, so
+        # the replay account must model a CHANGE: flat on the baseline read
+        # (taken before either order is submitted), then short by exactly the
+        # contracts leg A bought. A single static payload would give a delta of
+        # 0 and stop every pair at manual_review. The moved count is read back
+        # from the submitted body rather than hardcoded, so it can't drift out
+        # of step with Kelly sizing.
+        submitted: dict = {}
+        base_orders = (
+            order_side_effect if order_side_effect is not None
+            else _order_side_effect(fill_pattern)
+        )
+
+        def recording_orders(verb, url, headers=None, body=None):
+            # First body per ticker is that leg's opening order; a later
+            # rollback on the same ticker must not overwrite it.
+            if TRANSFER_PATH not in url and isinstance(body, dict):
+                submitted.setdefault(body["ticker"], body["count"])
+            return base_orders(verb, url, headers=headers, body=body)
+
         lookups = {
-            _TICKER_SAME_EXP: {
-                "market_positions": [
-                    {"ticker": _TICKER_SAME_EXP, "position_fp": "-12.00"}
-                ]
-            },
+            _TICKER_SAME_EXP: [
+                {"market_positions": []},
+                lambda: {
+                    "market_positions": [
+                        {
+                            "ticker": _TICKER_SAME_EXP,
+                            "position_fp": f"-{submitted.get(_TICKER_SAME_EXP, '0')}",
+                        }
+                    ]
+                },
+            ],
         }
         lookups.update(position_lookup_responses or {})
         client = _live_shape_client(
@@ -889,10 +957,7 @@ class TestRunProdLiveV2Replay:
             balance_payload=balance_payload,
             balance_payload_after=balance_payload_after,
             same_cheap_shard=same_cheap_shard,
-            order_side_effect=(
-                order_side_effect if order_side_effect is not None
-                else _order_side_effect(fill_pattern)
-            ),
+            order_side_effect=recording_orders,
             position_lookup_responses=lookups,
         )
         captured: dict = {}
@@ -940,9 +1005,11 @@ class TestRunProdLiveV2Replay:
         rollback_body = calls[2].kwargs["body"]
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
-        # Replay markets use the default $0.01 grid, so the finest-grid
-        # rollback target floors to the highest cent-grid level
-        assert rollback_body["price"] == "0.9900"
+        # The unwind is LOSS-FLOORED, not a flat top-of-grid bid: leg A's
+        # scanned NO entry is 0.45, so the floor is 45 - 12 = 33c and the bid
+        # cap is its YES-book mirror, 1 - 0.33 = 0.67, already on the replay
+        # markets' default $0.01 grid and well under the 0.99 top-of-grid clamp
+        assert rollback_body["price"] == "0.6700"
 
         assert captured["results"][0].status == "rolled_back"
         client.create_order_without_preload_content.assert_not_called()
@@ -955,13 +1022,35 @@ class TestRunProdLiveV2Replay:
         client.create_order_without_preload_content.assert_not_called()
 
     def test_run_prod_live_v2_error_response_routes_to_position_lookup(self, monkeypatch):
+        # Record what each order actually asked for, so the modelled position
+        # move can be leg B's OWN count rather than a hardcoded number that
+        # would silently drift with Kelly sizing.
+        submitted: list = []
+        base_orders = _order_side_effect(["full", "error"])
+
+        def recording_orders(verb, url, headers=None, body=None):
+            if TRANSFER_PATH not in url:
+                submitted.append(body["count"])
+            return base_orders(verb, url, headers=headers, body=body)
+
         client, captured = self._run(
             monkeypatch,
             ["full", "error"],
+            order_side_effect=recording_orders,
             position_lookup_responses={
-                _TICKER_SAME_CHEAP: {
-                    "market_positions": [{"ticker": _TICKER_SAME_CHEAP, "position_fp": "12.00"}]
-                },
+                # Delta semantics: the baseline read (taken before leg A is
+                # submitted) must show FLAT, and the post-exception read must
+                # show exactly the contracts leg B bought. A single static
+                # payload would give a delta of 0 — a confirmed non-fill —
+                # and roll leg A back, the opposite of what this pins.
+                _TICKER_SAME_CHEAP: [
+                    {"market_positions": []},
+                    lambda: {
+                        "market_positions": [
+                            {"ticker": _TICKER_SAME_CHEAP, "position_fp": submitted[1]}
+                        ]
+                    },
+                ],
             },
         )
 
@@ -1085,3 +1174,470 @@ class TestRunProdLiveV2Replay:
         assert "No selected pair could be funded on its exchange shard" in caplog.text
         assert client.rest_client.request.call_count == 0
         client.create_order_without_preload_content.assert_not_called()
+
+
+def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:
+    """Minimal stand-in for the argparse.Namespace _run_prod/_run_dev read."""
+    return SimpleNamespace(dry_run=dry_run, max_horizon_days=max_horizon_days)
+
+
+def make_spec() -> SimpleNamespace:
+    """Minimal TradeSpec-like stub with concrete (non-Mock) scalar fields.
+
+    print_pairs_table / _print_portfolio format several fields with a format
+    spec (e.g. f"{pair.pA:.2%}") — a bare MagicMock's default __format__
+    support is unreliable, so pair/spec fields are plain SimpleNamespace
+    values instead of auto-attributing MagicMocks.
+    """
+    pair = SimpleNamespace(
+        pair_type="time_series",
+        market_a=SimpleNamespace(
+            ticker="TICK-A", title="Market A", subtitle="", close_time=None,
+            exchange_index=DEFAULT_EXCHANGE_INDEX,
+        ),
+        market_b=SimpleNamespace(
+            ticker="TICK-B", title="Market B", subtitle="", close_time=None,
+            exchange_index=DEFAULT_EXCHANGE_INDEX,
+        ),
+        pA=0.60,
+        pB=0.30,
+        nA=0.40,
+        tradeable=True,
+        canonical_title="Test pair",
+    )
+    return SimpleNamespace(
+        pair=pair,
+        x=5,
+        y=5,
+        total_cost=2.0,
+        # Per-leg fee-inclusive costs — trader._required_cents_by_shard reads
+        # these to total the collateral each shard must hold before execution
+        cost_with_fees_a=1.0,
+        cost_with_fees_b=1.0,
+        min_payoff=0.50,
+        profit_ratio=0.10,
+        monthly_profit_ratio=0.20,
+        kelly_fraction=0.10,
+        kelly_p=0.60,
+    )
+
+
+class TestRunProdExitCodes:
+    @patch("kalshi_betting.main.verify_auth")
+    def test_low_balance_returns_skip_code(self, mock_verify_auth):
+        # Balance below MIN_BALANCE_CENTS must short-circuit before any scan —
+        # the bare `return` this used to be silently exited 0.
+        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+        client = MagicMock()
+
+        code = main._run_prod(client, _args())
+
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        assert code == 10
+
+    @patch("kalshi_betting.main.append_to_prod_log")
+    @patch("kalshi_betting.main.execute_trades")
+    @patch("kalshi_betting.main.pre_execution_check")
+    @patch("kalshi_betting.main.select_portfolio")
+    @patch("kalshi_betting.main.compute_trade")
+    @patch("kalshi_betting.main.enrich_with_orderbook_prices")
+    @patch("kalshi_betting.main.find_same_title_pairs")
+    @patch("kalshi_betting.main.find_time_series_pairs")
+    @patch("kalshi_betting.main.filter_markets_within_horizon")
+    @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
+    @patch("kalshi_betting.main.fetch_open_events_with_markets")
+    @patch("kalshi_betting.main.get_held_tickers")
+    @patch("kalshi_betting.main.verify_auth")
+    def test_manual_review_result_returns_attention_code(
+        self,
+        mock_verify_auth,
+        mock_held,
+        mock_fetch,
+        mock_shard_statuses,
+        mock_filter_horizon,
+        mock_find_ts,
+        mock_find_st,
+        mock_enrich,
+        mock_compute,
+        mock_select,
+        mock_pre_exec,
+        mock_execute,
+        mock_append_log,
+    ):
+        # Two verify_auth calls: pre-trade balance, then post-trade balance
+        # for the log's separator row.
+        mock_verify_auth.side_effect = [
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+        ]
+        mock_held.return_value = set()
+        mock_fetch.return_value = []
+        mock_filter_horizon.side_effect = lambda markets, days: markets
+        mock_find_ts.return_value = []
+        spec = make_spec()
+        mock_find_st.return_value = [spec.pair]
+        mock_enrich.return_value = [spec.pair]
+        mock_compute.return_value = spec
+        mock_select.return_value = [spec]
+        mock_pre_exec.side_effect = lambda client, portfolio: portfolio
+        mock_execute.return_value = [
+            TradeResult(spec=spec, status="manual_review", error="position lookup failed"),
+        ]
+        mock_append_log.return_value = "trade_log.xlsx"
+
+        client = MagicMock()
+        code = main._run_prod(client, _args(dry_run=False))
+
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        assert code == 20
+
+    @patch("kalshi_betting.main.append_to_prod_log")
+    @patch("kalshi_betting.main.execute_trades")
+    @patch("kalshi_betting.main.pre_execution_check")
+    @patch("kalshi_betting.main.select_portfolio")
+    @patch("kalshi_betting.main.compute_trade")
+    @patch("kalshi_betting.main.enrich_with_orderbook_prices")
+    @patch("kalshi_betting.main.find_same_title_pairs")
+    @patch("kalshi_betting.main.find_time_series_pairs")
+    @patch("kalshi_betting.main.filter_markets_within_horizon")
+    @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
+    @patch("kalshi_betting.main.fetch_open_events_with_markets")
+    @patch("kalshi_betting.main.get_held_tickers")
+    @patch("kalshi_betting.main.verify_auth")
+    def test_clean_dry_run_returns_ok_code(
+        self,
+        mock_verify_auth,
+        mock_held,
+        mock_fetch,
+        mock_shard_statuses,
+        mock_filter_horizon,
+        mock_find_ts,
+        mock_find_st,
+        mock_enrich,
+        mock_compute,
+        mock_select,
+        mock_pre_exec,
+        mock_execute,
+        mock_append_log,
+    ):
+        mock_verify_auth.side_effect = [
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+        ]
+        mock_held.return_value = set()
+        mock_fetch.return_value = []
+        mock_filter_horizon.side_effect = lambda markets, days: markets
+        mock_find_ts.return_value = []
+        spec = make_spec()
+        mock_find_st.return_value = [spec.pair]
+        mock_enrich.return_value = [spec.pair]
+        mock_compute.return_value = spec
+        mock_select.return_value = [spec]
+        mock_pre_exec.side_effect = lambda client, portfolio: portfolio
+        mock_execute.return_value = [TradeResult(spec=spec, status="simulated")]
+        mock_append_log.return_value = "trade_log.xlsx"
+
+        client = MagicMock()
+        code = main._run_prod(client, _args(dry_run=True))
+
+        assert code == EXIT_OK
+        assert code == 0
+
+    @patch("kalshi_betting.main.verify_auth")
+    def test_no_qualifying_pairs_returns_ok_code(self, mock_verify_auth):
+        # No-pairs / no-executable-trades paths must also resolve to EXIT_OK,
+        # not just the low-balance and post-execution paths.
+        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: 100_000}
+        with (
+            patch("kalshi_betting.main.get_held_tickers", return_value=set()),
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+        ):
+            code = main._run_prod(MagicMock(), _args())
+
+        assert code == EXIT_OK
+
+
+class TestRunDevExitCode:
+    def test_run_dev_returns_ok_code(self):
+        client = MagicMock()
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+
+
+class TestMainEntryPoint:
+    @patch("kalshi_betting.main.write_dev_simulation")
+    @patch("kalshi_betting.main.enrich_with_orderbook_prices")
+    @patch("kalshi_betting.main.find_same_title_pairs")
+    @patch("kalshi_betting.main.find_time_series_pairs")
+    @patch("kalshi_betting.main.filter_markets_within_horizon")
+    @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
+    @patch("kalshi_betting.main.fetch_open_events_with_markets")
+    @patch("kalshi_betting.main.build_client")
+    def test_main_dev_mode_exits_ok(
+        self,
+        mock_build_client,
+        mock_fetch,
+        mock_shard_statuses,
+        mock_filter_horizon,
+        mock_find_ts,
+        mock_find_st,
+        mock_enrich,
+        mock_write_sim,
+        tmp_path,
+        monkeypatch,
+    ):
+        mock_build_client.return_value = MagicMock()
+        mock_fetch.return_value = []
+        mock_filter_horizon.side_effect = lambda m, d: m
+        mock_find_ts.return_value = []
+        mock_find_st.return_value = []
+        mock_enrich.return_value = []
+        mock_write_sim.return_value = "dev_sim.xlsx"
+
+        # main() configures logging with a FileHandler under PROJECT_ROOT —
+        # point that at tmp_path so this test never touches the real
+        # repo-root kalshi_arb.log.
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "dev"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            main.main()
+
+        assert exc_info.value.code == EXIT_OK
+
+    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.build_client")
+    def test_main_prod_mode_low_balance_exits_skip_code(
+        self, mock_build_client, mock_verify_auth, tmp_path, monkeypatch,
+    ):
+        mock_build_client.return_value = MagicMock()
+        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "prod"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            main.main()
+
+        assert exc_info.value.code == EXIT_SKIPPED_LOW_BALANCE
+        assert exc_info.value.code == 10
+
+
+def _fake_write_dev_simulation(results, candidate_pairs, balance_cents):
+    """Stand-in for reporter.write_dev_simulation() that reproduces its one
+    real log line (reporter.py:544, "Dev simulation written: %s") so the
+    BS-26 tests below can assert main._run_dev's caller side does not log a
+    duplicate of it on any exit path.
+    """
+    logging.info("Dev simulation written: %s", "dev_sim.xlsx")
+    return "dev_sim.xlsx"
+
+
+class TestDevSimulationLoggedOnce:
+    """BS-26: write_dev_simulation() already logs "Dev simulation written: %s"
+    itself — main._run_dev must not repeat that line (with or without an
+    "(empty)"/"(candidates only)" qualifier) on any of its three exit paths.
+    """
+
+    def test_empty_candidate_pairs_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+    def test_empty_portfolio_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        pair = make_spec().pair
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[pair]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[pair]),
+            patch("kalshi_betting.main.compute_trade", return_value=None),
+            patch("kalshi_betting.main.select_portfolio", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+    def test_full_run_logs_written_once(self, caplog):
+        caplog.set_level(logging.INFO)
+        client = MagicMock()
+        spec = make_spec()
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[spec.pair]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[spec.pair]),
+            patch("kalshi_betting.main.compute_trade", return_value=spec),
+            patch("kalshi_betting.main.select_portfolio", return_value=[spec]),
+            patch(
+                "kalshi_betting.main.execute_trades",
+                return_value=[TradeResult(spec=spec, status="simulated")],
+            ),
+            patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
+        ):
+            code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+
+        assert code == EXIT_OK
+        assert caplog.text.count("Dev simulation written:") == 1
+
+
+class TestLoggingRotation:
+    """BS-25: kalshi_arb.log must rotate (5MB x 3 backups) instead of growing
+    unbounded — a scheduler daemon re-runs this process weekly forever.
+
+    Targets _setup_logging() directly rather than main(): logging.basicConfig()
+    is a no-op once the root logger already has handlers (pytest installs its
+    own), so the root logger is cleared first to actually exercise the handler
+    configuration.
+    """
+
+    def test_setup_logging_file_handler_rotates(self, tmp_path):
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        root.handlers = []
+        try:
+            main._setup_logging(tmp_path / "kalshi_arb.log")
+
+            file_handlers = [
+                h for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers) == 1
+            handler = file_handlers[0]
+            assert handler.maxBytes == 5 * 1024 * 1024
+            assert handler.backupCount == 3
+            # A plain FileHandler would satisfy isinstance(h, FileHandler) too,
+            # so pin the concrete type — that is the whole point of BS-25
+            assert type(handler) is logging.handlers.RotatingFileHandler
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved_handlers
+            root.level = saved_level
+
+    def test_main_installs_the_rotating_handler(self, tmp_path, monkeypatch):
+        # End-to-end: main() must route through _setup_logging, so the
+        # rotating handler is what a real run actually gets.
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        for h in saved_handlers:
+            root.removeHandler(h)
+
+        try:
+            monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+            monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "dev"])
+            with (
+                patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+                patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+                patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+                patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+                patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+                patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+                patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
+            ):
+                with pytest.raises(SystemExit):
+                    main.main()
+
+            file_handlers = [
+                h for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers) == 1
+        finally:
+            # Close whatever main() attached so tmp_path teardown isn't blocked
+            # by an open file handle on any platform, then restore the root
+            # logger exactly as pytest had it configured.
+            for h in root.handlers[:]:
+                h.close()
+                root.removeHandler(h)
+            for h in saved_handlers:
+                root.addHandler(h)
+            root.setLevel(saved_level)
+
+
+class TestDryRunInertInDev:
+    """BS-32: --dry-run has no effect in dev mode (dev always simulates), so
+    main() logs a warning naming that rather than leaving it silently
+    ignored.
+    """
+
+    def test_dev_dry_run_logs_inert_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING)
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "dev", "--dry-run"])
+
+        with (
+            patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
+            patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
+            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
+            patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main.main()
+
+        assert exc_info.value.code == EXIT_OK
+        assert "--dry-run is inert in dev mode" in caplog.text
+
+    def test_prod_dry_run_does_not_log_inert_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING)
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "prod", "--dry-run"])
+
+        with (
+            patch("kalshi_betting.main.build_client", return_value=MagicMock()),
+            patch(
+                "kalshi_betting.main.verify_auth",
+                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+            ),
+        ):
+            with pytest.raises(SystemExit):
+                main.main()
+
+        assert "--dry-run is inert in dev mode" not in caplog.text
+
+
+def test_exit_code_constants_distinct():
+    # Guard against a future accidental collision between the three codes —
+    # the scheduler's log-level mapping depends on them being distinguishable.
+    assert len({EXIT_OK, EXIT_SKIPPED_LOW_BALANCE, EXIT_TRADES_NEED_ATTENTION}) == 3

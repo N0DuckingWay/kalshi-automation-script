@@ -24,6 +24,7 @@ Notes:
     data (e.g. network unavailable), the benchmark section degrades gracefully
     and shows only the strategy equity curve.
 """
+import html
 import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -91,13 +92,24 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
         tuple[float, date | None]: A pair of (max_drawdown, trough_date) where
             max_drawdown is the largest fractional decline from any prior peak
             (expressed as a negative number, e.g. -0.15 for a 15% drawdown),
-            and trough_date is the index label at the trough or None if unavailable.
+            and trough_date is the index label at the trough. Returns (0.0, None)
+            if equity is empty or entirely NaN, or if the drawdown series itself
+            is entirely NaN (e.g. an all-zero equity curve, where every point
+            divides 0 by a running peak of 0) — there is no trough to report.
     """
+    # idxmin() raises ValueError on an empty or all-NaN Series rather than
+    # returning None, so that case must be handled before calling it.
+    if equity.empty or equity.isna().all():
+        return 0.0, None
     rolling_max = equity.cummax()
     dd = (equity - rolling_max) / rolling_max
+    # An all-zero (or zero-peaked) curve makes every element 0/0 → NaN, so the
+    # emptiness check above is not sufficient: re-check AFTER the division so
+    # this function is total for any numeric input.
+    if dd.isna().all():
+        return 0.0, None
     max_dd = float(dd.min())
-    idx = dd.idxmin()
-    when = idx if idx is not None else None
+    when = dd.idxmin()
     return max_dd, when
 
 
@@ -532,9 +544,13 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
             str: An HTML <tr>...</tr> string with entry date, title, pair type,
                 contract count, total cost, and profit/return.
         """
+        # title_a is Kalshi-controlled (market question text) and rendered
+        # into raw HTML below — escape it so a market title can't inject
+        # markup or break out of the <td>.
+        safe_title = html.escape(t.title_a[:40])
         return (f"<tr style='background:{color}'>"
                 f"<td>{t.entry_date}</td>"
-                f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{t.title_a[:40]}</td>"
+                f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{safe_title}</td>"
                 f"<td>{t.pair_type}</td>"
                 f"<td>{t.n}</td>"
                 f"<td>${t.total_cost:.2f}</td>"
@@ -604,7 +620,9 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     fig_kelly = go.Figure(go.Scatter(
         x=kelly_fracs, y=actual_fracs, mode="markers",
         marker={"color": _COLORS["strategy"], "size": 7, "opacity": 0.6},
-        text=[t.title_a[:40] for t in trades],
+        # title_a is Kalshi-controlled and Plotly's hover text renders an HTML
+        # subset — escape it the same as the table row above (_trow).
+        text=[html.escape(t.title_a[:40]) for t in trades],
     ))
     fig_kelly.add_trace(go.Scatter(
         x=[0, max(kelly_fracs + [0.01]) * 1.1],

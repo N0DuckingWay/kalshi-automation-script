@@ -25,7 +25,7 @@ Purpose:
     STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is on by default
     (config.ORDER_API_VERSION = "v2") and does not wait for this probe. What
     backstops it instead is trader._confirm_v2_no_mapping(), which checks the
-    very same position sign on the first live V2 NO fill of a process — but
+    very same position MOVEMENT on the first live V2 NO fill of a process — but
     that check pays for its evidence with a REAL trade-sized position, while
     this probe buys the identical evidence for ~1c. If either mapping step
     FAILS, set config.ORDER_API_VERSION = "legacy" to hold the bot on the
@@ -571,7 +571,7 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     Verify fill-or-kill kill semantics (and the ask's price-cap direction).
 
     Submits an ask at the highest tradeable level of the market's own grid
-    (trader._v2_rollback_price — one tick below 1). An ask's limit is the
+    (trader._v2_top_of_grid_price — one tick below 1). An ask's limit is the
     MINIMUM proceeds accepted per contract, so demanding almost the full dollar
     to sell one YES is above any realistic resting bid and the order cannot
     fill. Two things are proven at once: that a FoK that cannot fill comes back
@@ -607,7 +607,7 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
 
     # Top of the market's own grid, via the same helper the live rollback uses:
     # the highest tradeable level (e.g. "0.9900" on a whole-cent market).
-    price_str = trader._format_price(trader._v2_rollback_price(market))
+    price_str = trader._format_price(trader._v2_top_of_grid_price(market))
 
     # "Unfillable" is only true while no resting YES bid meets the limit. On a
     # near-settled market the top bid can sit AT the top of the grid — the ask

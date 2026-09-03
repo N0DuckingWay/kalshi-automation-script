@@ -11,8 +11,17 @@ secrets.json
 *.xlsx
 ~$*.xlsx
 
+# Reporter lock/tmp sidecars (BS-18): the sidecar lock file coordinates
+# concurrent writers to trade_log.xlsx; the .tmp file is the atomic-save
+# staging file, briefly present during a save and renamed away immediately
+# after (neither matches *.xlsx since their real extension is .lock/.tmp).
+*.xlsx.lock
+*.xlsx.tmp
+
 # Bot output
 *.log
+scheduler_state.json
+scheduler_state.json.tmp
 # Rotated/suffixed logs (kalshi_backtest.log.prev, .1, .2026-08-03 …) — these do
 # NOT match *.log, so without this a `git add -A` sweeps them into a commit.
 *.log.*

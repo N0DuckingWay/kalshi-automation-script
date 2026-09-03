@@ -2,12 +2,29 @@
 import gzip
 import json
 import logging
+from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from kalshi_betting import historical
+
+
+def _read_slice_file(path) -> list[dict]:
+    """Read a day-slice file's records with no help from historical.py.
+
+    Understands both on-disk formats so slice-content assertions stay
+    independent of which writer produced the file (legacy single JSON document
+    vs. streamed "jsonl-v1" lines).
+    """
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    head = json.loads(lines[0])
+    if "markets" in head:
+        return json.loads("\n".join(lines))["markets"]
+    return [json.loads(line) for line in lines[1:] if line.strip()]
 
 
 def _raw_resp(payload: dict) -> SimpleNamespace:
@@ -301,6 +318,108 @@ class TestEventTitlesCache:
         assert result["E1"] == "Fresh Title"
         assert client2.get_events_without_preload_content.call_count >= 1
 
+    def test_corrupt_cache_is_treated_as_miss(self, isolated_cache, monkeypatch, caplog):
+        # A truncated accumulator (interrupted write from an older build, OOM
+        # kill mid-run) must read back as "no cache", not crash the backtest
+        # before it has issued a single request.
+        isolated_cache.write_text('{"E1": "Half A Titl')
+        client = _make_client_with_event_pages(non_mve_pages=[[("E1", "Recovered Title")]])
+        _patch_single_event_lookups(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, {"E1"})
+
+        assert result == {"E1": "Recovered Title"}
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # And the damaged file is replaced by a well-formed one.
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Recovered Title"}
+
+    def test_no_cache_run_preserves_unrelated_disk_titles(self, isolated_cache, monkeypatch):
+        # BS-09: the on-disk map is a cross-run ACCUMULATOR. A --no-cache run
+        # resolves its own tickers from scratch, but must not wipe titles other
+        # runs paid a round trip each for.
+        _patch_single_event_lookups(monkeypatch)
+        client1 = _make_client_with_event_pages(non_mve_pages=[[("E1", "Title One")]])
+        historical._load_or_build_event_titles(client1, {"E1"})
+
+        client2 = _make_client_with_event_pages(non_mve_pages=[[("E2", "Title Two")]])
+        result = historical._load_or_build_event_titles(client2, {"E2"}, use_cache=False)
+
+        # This run's return value covers only this run's tickers...
+        assert result == {"E2": "Title Two"}
+        # ...but the accumulator on disk keeps both.
+        assert json.loads(isolated_cache.read_text()) == {
+            "E1": "Title One", "E2": "Title Two",
+        }
+
+    def test_fresh_non_empty_title_wins_over_disk(self, isolated_cache, monkeypatch):
+        # A re-resolved title is the newer truth — it must overwrite the disk
+        # value, otherwise --no-cache could never correct a stale title.
+        _patch_single_event_lookups(monkeypatch)
+        isolated_cache.write_text(json.dumps({"E1": "Stale Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[[("E1", "Fresh Title")]])
+
+        result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+
+        assert result["E1"] == "Fresh Title"
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Fresh Title"}
+
+    def test_fresh_poison_pill_does_not_clobber_disk_title(self, isolated_cache, monkeypatch):
+        # A failed lookup / cap-skipped ticker resolves to "" for THIS run, but
+        # "" is an absence of information — it must never overwrite a real
+        # title an earlier run resolved.
+        isolated_cache.write_text(json.dumps({"E1": "Good Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+
+        assert result == {"E1": ""}  # this run genuinely could not resolve it
+        assert json.loads(isolated_cache.read_text()) == {"E1": "Good Title"}
+
+    def test_fresh_poison_pill_stored_for_ticker_unknown_to_disk(self, isolated_cache,
+                                                                 monkeypatch):
+        # Poison-pill semantics survive the merge: an unresolvable ticker disk
+        # has never seen is still recorded as "", so later runs don't re-pay
+        # the failing round trip.
+        isolated_cache.write_text(json.dumps({"E1": "Good Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
+
+        result = historical._load_or_build_event_titles(client, {"NEW-1"}, use_cache=False)
+
+        assert result == {"NEW-1": ""}
+        assert fallback.call_count == 1
+        assert json.loads(isolated_cache.read_text()) == {
+            "E1": "Good Title", "NEW-1": "",
+        }
+        # The pill is honored on the next cached run — no repeat lookup.
+        client2 = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback2 = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
+        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {
+            "E1": "Good Title", "NEW-1": "",
+        }
+        assert fallback2.call_count == 0
+
+    def test_listing_pages_request_market_page_size_limit(self, isolated_cache, monkeypatch):
+        # BS-22: both bulk listing loops used to hardcode limit=200 rather than
+        # importing the shared MARKET_PAGE_SIZE constant. Assert the kwargs
+        # actually sent match the constant itself (not just today's value of
+        # 200), so a future change to MARKET_PAGE_SIZE stays honored here.
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("E1", "Event One")]], mve_pages=[[("E2", "MVE Two")]],
+        )
+        historical._load_or_build_event_titles(client, {"E1", "E2"})
+
+        events_calls = client.get_events_without_preload_content.call_args_list
+        mve_calls = client.get_multivariate_events_without_preload_content.call_args_list
+        assert events_calls, "status listing was never called"
+        assert mve_calls, "MVE listing was never called"
+        for call in events_calls:
+            assert call.kwargs["limit"] == historical.MARKET_PAGE_SIZE
+        for call in mve_calls:
+            assert call.kwargs["limit"] == historical.MARKET_PAGE_SIZE
+
 
 def _raw_market_dict(**overrides) -> dict:
     """A raw market JSON dict as the current API sends it (ISO time strings,
@@ -421,14 +540,18 @@ class TestMarketToDict:
 
 
 class TestFetchAllSettledMarkets:
-    def test_archive_early_stop_and_dict_output(self, tmp_path, monkeypatch):
-        # The /historical/markets archive ignores settlement-time filters and
-        # is paged newest-first; the sequential walk must stop once a page
-        # predates start_date instead of walking the multi-million-market
-        # archive. These fake pages use opaque cursors and records without
-        # created_time, so the sharded path's synthesis check fails and the
-        # fetch exercises the sequential fallback — the path this early-stop
-        # rule lives on. Also verifies dicts flow through to the cached format.
+    def test_archive_pages_past_barren_page_and_dict_output(self, tmp_path, monkeypatch):
+        # The /historical/markets archive ignores settlement-time filters, so
+        # the sequential walk needs SOME stop rule or it walks the whole
+        # multi-million-market archive. BS-02: that rule is no longer "the
+        # first page whose newest-created record predates start_date" — the
+        # archive is created-ordered, so such a page proves nothing about
+        # deeper ones. The walk pages past it (up to ARCHIVE_MAX_BARREN_PAGES
+        # consecutive unproductive pages) and still collects the long-lived
+        # market behind it. These fake pages use opaque cursors and records
+        # without created_time, so the sharded path's synthesis check fails and
+        # the fetch exercises the sequential fallback — the path this stop rule
+        # lives on. Also verifies dicts flow through to the cached format.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
         monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
         from datetime import date
@@ -439,22 +562,25 @@ class TestFetchAllSettledMarkets:
                     "yes_bid_dollars": "0.38", "close_time": settled,
                     "settlement_ts": settled, "status": "finalized"}
 
-        # Archive pages newest-first: page1 in-window, page2 predates start_date
-        # entirely (cursor still set — the early stop must ignore it), then the
-        # live endpoint returns one post-cutoff market.
+        # Archive pages newest-CREATED first: page1 in-window, page2 predates
+        # start_date entirely (barren — but not a stop signal), page3 holds a
+        # long-lived in-window settler and ends the chain; then the live
+        # endpoint returns one post-cutoff market.
         pages = {
             "cutoff": {"market_settled_ts": "2026-03-01T00:00:00Z"},
             "hist1": {"markets": [market("IN-WINDOW", "2026-02-15T00:00:00Z")], "cursor": "C2"},
             "hist2": {"markets": [market("TOO-OLD", "2026-01-01T00:00:00Z")], "cursor": "C3"},
+            "hist3": {"markets": [market("LONGLIVED", "2026-02-20T00:00:00Z")], "cursor": None},
         }
         calls = {"hist": 0}
+        by_cursor = {"C2": pages["hist2"], "C3": pages["hist3"]}
 
         def fake_signed_get(client, path, **params):
             if path.endswith("/historical/cutoff"):
                 return _raw_resp(pages["cutoff"])
             assert path.endswith("/historical/markets")
             calls["hist"] += 1
-            return _raw_resp(pages["hist2"] if params.get("cursor") == "C2" else pages["hist1"])
+            return _raw_resp(by_cursor.get(params.get("cursor"), pages["hist1"]))
 
         monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
         live = MagicMock()
@@ -465,18 +591,60 @@ class TestFetchAllSettledMarkets:
         out = historical.fetch_all_settled_markets(
             MagicMock(), live, start_date=date(2026, 2, 1), use_cache=False,
         )
-        # 3 archive calls: 1 synthesis probe (fails — opaque cursor), then the
-        # sequential walk's page 1 and page 2. Early stop: page 2 (all
-        # pre-start) is fetched, detected, and pagination halts even though
-        # its cursor points at a page 3.
-        assert calls["hist"] == 3
+        # 4 archive calls: 1 synthesis probe (fails — opaque cursor), then the
+        # sequential walk's three pages. Page 2 is barren but its cursor is
+        # followed (one barren page is far below ARCHIVE_MAX_BARREN_PAGES);
+        # page 3's null cursor is what ends the walk.
+        assert calls["hist"] == 4
         tickers = {m["ticker"] for m in out}
-        assert tickers == {"IN-WINDOW", "RECENT"}
+        assert tickers == {"IN-WINDOW", "LONGLIVED", "RECENT"}
         # Output dicts carry the exact cached format
         m = next(mm for mm in out if mm["ticker"] == "IN-WINDOW")
         assert m["yes_ask_dollars"] == "0.40"
         assert m["settlement_ts"] == "2026-02-15T00:00:00Z"
         assert m["event_title"] == ""
+
+    def test_corrupt_assembled_cache_falls_through_to_refetch(self, tmp_path, monkeypatch,
+                                                              caplog):
+        # BS-08: a truncated assembled cache (the multi-hour fetch's final
+        # write, historically interrupted by OOM kills) must read back as a
+        # miss and refetch, not raise before a single request is issued.
+        from datetime import date
+
+        cache_dir = tmp_path / "cache"
+        monkeypatch.setattr(historical, "CACHE_DIR", cache_dir)
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "settled_markets_2026-02-01.json").write_text('[{"ticker": "T1"')
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(return_value=_raw_resp({
+            "markets": [{"ticker": "RECENT", "event_ticker": "EV", "title": "Q",
+                         "result": "yes", "yes_ask_dollars": "0.40",
+                         "no_ask_dollars": "0.60", "yes_bid_dollars": "0.38",
+                         "close_time": "2026-03-05T00:00:00Z",
+                         "settlement_ts": "2026-03-05T00:00:00Z",
+                         "status": "finalized"}],
+            "cursor": None,
+        }))
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2026, 2, 1), use_cache=True,
+            )
+
+        assert {m["ticker"] for m in out} == {"RECENT"}
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # The damaged file is replaced by a well-formed one for the next run.
+        assert json.loads(
+            (cache_dir / "settled_markets_2026-02-01.json").read_text()
+        ) == out
 
     def test_live_sweep_bounds_min_settled_ts_to_start_date(self, tmp_path, monkeypatch):
         # Regression: min_settled_ts used to be hardcoded to cutoff_ts, so a
@@ -541,6 +709,62 @@ class TestFetchAllSettledMarkets:
         seen_min_ts = [kwargs["min_settled_ts"] for _, kwargs
                        in live.get_markets_without_preload_content.call_args_list]
         assert min(seen_min_ts) == expected_min_ts
+
+    def test_start_date_at_or_after_cutoff_warns(self, tmp_path, monkeypatch, caplog):
+        # BS-11: a start_date at/after the archive cutoff means every market
+        # in the window is live-era, and live-era markets 404 on the historical
+        # candlesticks endpoint (see the CLAUDE.md "Backtest windows must
+        # start BEFORE the archive cutoff" gotcha) — so the window is
+        # structurally 0-trade no matter what this fetch returns. This is a
+        # WARN, not an abort: the fetch must still run to completion.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2026, 7, 6), use_cache=False,
+            )
+
+        # Warn, never abort — the fetch still completes and returns normally.
+        assert out == []
+        assert any("archive cutoff" in r.getMessage() for r in caplog.records
+                   if r.levelname == "WARNING")
+
+    def test_start_date_before_cutoff_does_not_warn(self, tmp_path, monkeypatch, caplog):
+        # The common case (default start_date 2024-01-01, cutoff far later)
+        # must not trip the new warning.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            assert path.endswith("/historical/markets")
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        live = MagicMock()
+        live.get_markets_without_preload_content = MagicMock(
+            return_value=_raw_resp({"markets": [], "cursor": None})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2024, 1, 1), use_cache=False,
+            )
+
+        assert not any("archive cutoff" in r.getMessage() for r in caplog.records
+                       if r.levelname == "WARNING")
 
 
 # ─── Sharded-fetch fakes ──────────────────────────────────────────────────────
@@ -653,29 +877,62 @@ def _install_sharded_fakes(monkeypatch, tmp_path, archive, cutoff_iso):
     monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
 
 
-def _old_semantics_expected(archive_markets, live_markets, start_ts, cutoff_ts,
-                            page_size=3):
-    """Oracle: the ticker set the ORIGINAL sequential implementation returns —
-    walk the archive newest-first with the settlement early-stop rule, then
-    sweep the live endpoint from max(cutoff_ts, start_ts)."""
-    expected = set()
-    walk = sorted(archive_markets, key=_created_key, reverse=True)
-    for page_start in range(0, len(walk), page_size):
-        page = walk[page_start: page_start + page_size]
-        for m in page:
+def _expected_in_window(archive_markets, live_markets, start_ts, cutoff_ts):
+    """Oracle: ground truth computed DIRECTLY from the fixture records — every
+    binary market that settled inside the backtest window, whichever endpoint
+    serves it.
+
+    Deliberately not a re-implementation of the page walk. The previous oracle
+    replayed the walk's own early-stop rule, so it shared BS-02's bug (it
+    sorted by created_time DESC but stopped on a settlement comparison) and the
+    parity tests could never disagree with the code they were checking. Ground
+    truth here is a plain predicate over the fixture, so a walk that drops a
+    record now fails the test.
+
+    Archive side: result in ("yes", "no") and start_ts <= settle < cutoff_ts.
+    Live side: result in ("yes", "no") and settle >= max(cutoff_ts, start_ts) —
+    the live endpoint does not serve pre-cutoff settlements at all.
+    """
+    def _binary_settles_in(markets, lo, hi):
+        out = set()
+        for m in markets:
+            if m["result"] not in ("yes", "no"):
+                continue
             settle = historical._iso_epoch(m["settlement_ts"])
-            if (m["result"] in ("yes", "no") and settle is not None
-                    and start_ts <= settle < cutoff_ts):
-                expected.add(m["ticker"])
-        newest = historical._iso_epoch(page[0]["settlement_ts"])
-        if newest is not None and newest < start_ts:
-            break
-    live_min = max(cutoff_ts, start_ts)
-    for m in live_markets:
-        settle = historical._iso_epoch(m["settlement_ts"])
-        if m["result"] in ("yes", "no") and settle is not None and settle >= live_min:
-            expected.add(m["ticker"])
+            if settle is None:
+                continue
+            if lo <= settle and (hi is None or settle < hi):
+                out.add(m["ticker"])
+        return out
+
+    expected = _binary_settles_in(archive_markets, start_ts, cutoff_ts)
+    expected |= _binary_settles_in(live_markets, max(cutoff_ts, start_ts), None)
     return expected
+
+
+class _PagedArchive:
+    """Serves a fixed list of hand-built pages in order, ignoring the cursor.
+
+    Both archive walks are strictly linear (one cursor chain, no jumps once
+    started), so call N is page N. Used where the page BOUNDARIES themselves
+    are the thing under test — the stop rule counts pages, so the fixture has
+    to control exactly which records share one.
+    """
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = 0
+
+    def page(self, **_):
+        idx = self.calls
+        self.calls += 1
+        assert idx < len(self.pages), (
+            f"page {idx} requested — the walk paged past every page the "
+            f"fixture defines"
+        )
+        # Always advertise a next page: the stop rule, not exhaustion, is what
+        # must end the walk (the last page's cursor still points onward).
+        return {"markets": self.pages[idx], "cursor": f"CUR{idx + 1}"}
 
 
 class TestShardedFetch:
@@ -696,7 +953,16 @@ class TestShardedFetch:
         # multiple pages per day, a created_time tie, a non-binary result, a
         # record with no settlement_ts, a long-lived market created BEFORE
         # start_date settling inside the window (tail territory), and
-        # fast-settled pre-start markets that trigger the early stop.
+        # fast-settled pre-start markets.
+        #
+        # BS-02 arrangement (load-bearing): the five PRE* records sit between
+        # start_date and LONGLIVED in created order so that — at page_size 3,
+        # in BOTH the tail walk and the top-down sequential walk — LONGLIVED
+        # lands on the page immediately AFTER a page whose records all settled
+        # before the window. The old "stop when page[0] settled pre-window"
+        # rule therefore provably drops LONGLIVED on both paths; the
+        # barren-page rule finds it. Changing the count or the created_time
+        # ordering of the PRE* records breaks that alignment.
         archive = [
             # day 2026-06-09 (top day, 4 records → 2 pages at page_size 3)
             _mk_raw_market("A1", "2026-06-09T20:00:00.500000Z", "2026-06-09T22:00:00Z"),
@@ -712,9 +978,17 @@ class TestShardedFetch:
             _mk_raw_market("C1", "2026-06-06T08:00:00Z", "2026-06-06T09:00:00Z"),
             # day 2026-06-05 (bottom slice, record at the exact day boundary)
             _mk_raw_market("D1", "2026-06-05T00:00:00Z", "2026-06-05T02:00:00Z"),
-            # tail: created before start_date but settled inside the window
+            # Short-lived pre-window settlers created just below start_date:
+            # these fill the barren page that used to end both walks.
+            _mk_raw_market("PRE1", "2026-06-04T23:50:00Z", "2026-06-04T23:55:00Z"),
+            _mk_raw_market("PRE2", "2026-06-04T23:45:00Z", "2026-06-04T23:50:00Z"),
+            _mk_raw_market("PRE3", "2026-06-04T23:40:00Z", "2026-06-04T23:45:00Z"),
+            _mk_raw_market("PRE4", "2026-06-04T23:35:00Z", "2026-06-04T23:40:00Z"),
+            _mk_raw_market("PRE5", "2026-06-04T23:30:00Z", "2026-06-04T23:35:00Z"),
+            # tail: created before start_date but settled inside the window —
+            # reachable only by paging PAST the all-pre-window page above
             _mk_raw_market("LONGLIVED", "2026-06-04T23:00:00Z", "2026-06-06T10:00:00Z"),
-            # pre-start fast markets: settle before start → early stop fodder
+            # more pre-start fast markets below it
             _mk_raw_market("OLD1", "2026-06-04T20:00:00Z", "2026-06-04T21:00:00Z"),
             _mk_raw_market("OLD2", "2026-06-04T10:00:00Z", "2026-06-04T11:00:00Z"),
             _mk_raw_market("OLD3", "2026-06-03T10:00:00Z", "2026-06-03T11:00:00Z"),
@@ -743,18 +1017,168 @@ class TestShardedFetch:
         live = _FakeLive(live_markets)
         out = self._run(monkeypatch, tmp_path, archive, live)
 
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
         assert {m["ticker"] for m in out} == expected
-        assert "LONGLIVED" in expected  # the tail case is actually exercised
+        # BS-02: the long-lived tail settler must be in the RESULT, not merely
+        # in the oracle's set — it sits behind an all-pre-window page that the
+        # old early-stop rule never paged past.
+        assert "LONGLIVED" in {m["ticker"] for m in out}
         # No duplicate tickers despite deliberately overlapping slice boundaries
         assert len(out) == len({m["ticker"] for m in out})
         # Compact dict format survives the day store round-trip
         a1 = next(m for m in out if m["ticker"] == "A1")
         assert a1["open_time"] == "2026-06-09T20:00:00.500000Z"
         assert a1["yes_ask_dollars"] == "0.40"
+
+    def test_tail_keeps_longlived_settlement_past_barren_page(self, tmp_path,
+                                                              monkeypatch):
+        # BS-02, headline regression. The archive is ordered by created_time,
+        # so page[0] is only the newest-CREATED record — its settlement time
+        # says nothing about the rest of the page, let alone deeper pages. The
+        # old rule stopped both walks at the first page whose page[0] settled
+        # pre-window, which (most markets being short-lived) fires almost
+        # immediately and silently drops long-lived in-window settlers.
+        # LONGLIVED is positioned one page BEHIND such a page in both walks.
+        archive_markets, live_markets = self._fixture_markets()
+
+        # Sharded path — the tail walk below created_time == start_date.
+        out = self._run(monkeypatch, tmp_path / "sharded",
+                        _FakeArchive(archive_markets), _FakeLive(live_markets))
+        assert "LONGLIVED" in {m["ticker"] for m in out}
+
+        # Sequential fallback — same rule, same fixture, top-down walk.
+        # Opaque cursors defeat cursor synthesis, forcing the fallback.
+        out_seq = self._run(monkeypatch, tmp_path / "sequential",
+                            _FakeArchive(archive_markets, opaque_cursors=True),
+                            _FakeLive(live_markets))
+        assert "LONGLIVED" in {m["ticker"] for m in out_seq}
+
+    def test_tail_progress_logs_under_its_own_label(self, tmp_path, monkeypatch,
+                                                    caplog):
+        # CLAUDE.md: progress labels are load-bearing for diagnosis. The tail is
+        # a SERIAL walk, but it used to share the day-slice pool's progress
+        # object, so its pages logged as "[sharded]" — a stalled tail was
+        # indistinguishable in the log from a stalled (parallel) slice pool.
+        captured = {}
+        real_tail = historical._fetch_archive_tail
+
+        def spy(hist_client, start_ts, cutoff_ts, hist_kwargs, progress):
+            captured["progress"] = progress
+            return real_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+
+        monkeypatch.setattr(historical, "_fetch_archive_tail", spy)
+        archive_markets, live_markets = self._fixture_markets()
+        self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                  _FakeLive(live_markets))
+
+        progress = captured["progress"]
+        # The tail really did page through this progress object...
+        assert progress.pages > 0
+        # ...and it is not the day-slice pool's counter (a shared object would
+        # already be carrying the slice pages).
+        with caplog.at_level(logging.INFO):
+            # _FetchProgress only logs every 100 pages, so drive it to the next
+            # boundary and read the label off the line it emits.
+            for _ in range(100 - progress.pages % 100):
+                progress.tick(0)
+        lines = [r.getMessage() for r in caplog.records if "pages scanned" in r.getMessage()]
+        assert lines
+        assert all("Historical archive [tail]" in ln for ln in lines)
+        assert not any("[sharded]" in ln for ln in lines)
+
+    def test_tail_stops_at_the_absolute_page_cap(self, monkeypatch, caplog):
+        # The barren rule only bounds depth PAST the last productive page: every
+        # page here holds an in-window settlement, so the counter never rises
+        # and only ARCHIVE_TAIL_MAX_PAGES ends this serial, uncached walk.
+        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_PAGES", 3)
+        pages = [
+            # Created before start_date, settling inside the window → every page
+            # is "productive", so the barren counter stays at 0 throughout.
+            [_mk_raw_market(f"LL{i}", f"2026-06-04T2{i}:00:00Z",
+                            "2026-06-06T10:00:00Z")]
+            for i in range(3)
+        ] + [
+            # Beyond the cap: must never be requested (_PagedArchive asserts).
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        with caplog.at_level(logging.WARNING):
+            kept, calls = self._walk_paged(
+                monkeypatch, historical._fetch_archive_tail, pages,
+            )
+        assert kept == {"LL0", "LL1", "LL2"}
+        assert calls == 3
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+
+    def _walk_paged(self, monkeypatch, walk, pages):
+        """Run one archive walk against hand-built pages; return (kept, calls)."""
+        paged = _PagedArchive(pages)
+        monkeypatch.setattr(
+            historical, "_signed_raw_get",
+            lambda client, path, **params: _raw_resp(paged.page(**params)),
+        )
+        start_ts = self._ts(self.START + "T00:00:00+00:00")
+        cutoff_ts = self._ts(self.CUTOFF)
+        if walk is historical._fetch_archive_tail:
+            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000},
+                        historical._FetchProgress("test tail"))
+        else:
+            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000})
+        return {m["ticker"] for m in kept}, paged.calls
+
+    @pytest.mark.parametrize("walk", [
+        historical._fetch_archive_tail,
+        historical._fetch_archive_sequential,
+    ])
+    def test_archive_walk_stops_after_max_barren_pages(self, monkeypatch, walk):
+        # No exact stop rule exists on a created-ordered walk, so the walks are
+        # bounded by productivity instead: ARCHIVE_MAX_BARREN_PAGES consecutive
+        # pages with zero in-window settlements ends the walk. Deeper pages
+        # must never be requested (_PagedArchive asserts if they are).
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 3)
+        pages = [
+            # Productive page: resets/holds the counter at 0.
+            [_mk_raw_market("NEAR", "2026-06-04T23:00:00Z", "2026-06-06T00:00:00Z")],
+            # Three consecutive barren pages → counter reaches the cap.
+            [_mk_raw_market("PB1", "2026-06-04T22:00:00Z", "2026-06-04T22:30:00Z")],
+            [_mk_raw_market("PB2", "2026-06-04T21:00:00Z", "2026-06-04T21:30:00Z")],
+            [_mk_raw_market("PB3", "2026-06-04T20:00:00Z", "2026-06-04T20:30:00Z")],
+            # Beyond the cap: an in-window settler the walk must NOT reach.
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        assert kept == {"NEAR"}
+        assert calls == 4  # the fourth barren-capped page is the last fetched
+
+    @pytest.mark.parametrize("walk", [
+        historical._fetch_archive_tail,
+        historical._fetch_archive_sequential,
+    ])
+    def test_barren_counter_is_consecutive_and_result_agnostic(self, monkeypatch, walk):
+        # Two things at once: the counter RESETS on a productive page (so the
+        # bound is consecutive, not cumulative), and productivity is judged on
+        # ANY in-window settlement — the reset page here holds only a VOIDED
+        # market, which neither walk keeps. Pages full of voided (or, in the
+        # tail, day-sliced) records must not spuriously trip the counter.
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 2)
+        pages = [
+            [_mk_raw_market("NEAR", "2026-06-04T23:00:00Z", "2026-06-06T00:00:00Z")],
+            [_mk_raw_market("PB1", "2026-06-04T22:00:00Z", "2026-06-04T22:30:00Z")],
+            # Kept by neither walk, but proof the walk is still in productive
+            # created-time territory → counter back to 0.
+            [_mk_raw_market("VOIDED", "2026-06-04T21:00:00Z", "2026-06-06T05:00:00Z",
+                            result="void")],
+            [_mk_raw_market("PB2", "2026-06-04T20:00:00Z", "2026-06-04T20:30:00Z")],
+            [_mk_raw_market("PB3", "2026-06-04T19:00:00Z", "2026-06-04T19:30:00Z")],
+            # Never reached: the cap is hit on the page above.
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        assert kept == {"NEAR"}
+        assert calls == 5
 
     def test_second_run_reuses_day_slices(self, tmp_path, monkeypatch):
         archive_markets, live_markets = self._fixture_markets()
@@ -772,6 +1196,12 @@ class TestShardedFetch:
         assert live.calls < cold_live_calls
         assert (tmp_path / "cache" / "archive_days").exists()
         assert (tmp_path / "cache" / "live_days").exists()
+        # BS-15: the fetch workers persist through _DayStreamWriter, so every
+        # slice they wrote is in the streamed format — and run 2 proves those
+        # files are what the reuse prescan accepts.
+        for path in (tmp_path / "cache").glob("*_days/*.json.gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                assert json.loads(fh.readline())["meta"]["format"] == "jsonl-v1"
 
     def test_interrupted_run_resumes_from_day_slices(self, tmp_path, monkeypatch):
         # Serialize the workers so the interruption point is deterministic:
@@ -797,7 +1227,7 @@ class TestShardedFetch:
         archive.fail_after = None
         archive.calls = 0
         out = self._run(monkeypatch, tmp_path / "warm", archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -813,7 +1243,7 @@ class TestShardedFetch:
         archive = _FakeArchive(archive_markets, opaque_cursors=True)
         live = _FakeLive(live_markets)
         out = self._run(monkeypatch, tmp_path, archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -842,7 +1272,7 @@ class TestShardedFetch:
         out2 = historical.fetch_all_settled_markets(
             MagicMock(), empty_live, start_date=date(2026, 6, 5), use_cache=False,
         )
-        assert {m["ticker"] for m in out2} == _old_semantics_expected(
+        assert {m["ticker"] for m in out2} == _expected_in_window(
             archive_markets + live_markets, [],
             self._ts(self.START + "T00:00:00+00:00"), self._ts(new_cutoff),
         )
@@ -858,8 +1288,8 @@ class TestShardedFetch:
         real_load = historical._day_store_load
         loads: list[str] = []
 
-        def counting_load(path, expect_meta):
-            result = real_load(path, expect_meta)
+        def counting_load(path, expect_meta, keep=None):
+            result = real_load(path, expect_meta, keep)
             if result is not None:
                 loads.append(str(path))
             return result
@@ -917,8 +1347,7 @@ class TestShardedFetch:
         assert slices
         stored = set()
         for path in slices:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                stored |= {m["ticker"] for m in json.load(fh)["markets"]}
+            stored |= {m["ticker"] for m in _read_slice_file(path)}
         dropped = {m["ticker"] for m in out_full if not pred(m)}
         assert dropped & stored, "filtered-out records must still be on disk"
 
@@ -985,7 +1414,7 @@ class TestShardedFetch:
             out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
                             _FakeLive(live_markets))
 
-        assert {m["ticker"] for m in out} == _old_semantics_expected(
+        assert {m["ticker"] for m in out} == _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -1022,14 +1451,18 @@ class TestShardedFetch:
         # The pool was torn down with cancel_futures, not drained.
         assert any(c["cancel_futures"] and not c["wait"] for c in recorded), recorded
         # And the fallback still produced the correct, complete result.
-        assert {m["ticker"] for m in out} == _old_semantics_expected(
+        assert {m["ticker"] for m in out} == _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
 
     def test_slice_progress_reports_position_and_eta(self, tmp_path, monkeypatch, caplog):
         # Each completed slice logs N/M plus a rate and ETA, so a multi-hour
-        # fetch reports how far along it actually is.
+        # fetch reports how far along it actually is. This fixture completes
+        # its handful of slices essentially instantly, so the observed rate
+        # is always comfortably above the 0.1 slices/min cutoff — the
+        # "fast" branch, rendered as slices/min. See
+        # test_slow_slice_progress_reports_slices_per_hour for the other branch.
         archive_markets, live_markets = self._fixture_markets()
         with caplog.at_level(logging.INFO):
             self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
@@ -1038,9 +1471,28 @@ class TestShardedFetch:
                        if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
         assert slice_lines
         assert all("ETA" in line and "slices/min" in line for line in slice_lines)
+        assert all("slices/hour" not in line for line in slice_lines)
         # Counter runs 1..N over the days actually fetched, never exceeding N.
         total = len(slice_lines)
         assert slice_lines[-1].split("complete")[0].strip().endswith(f"{total}/{total}")
+
+    def test_slow_slice_progress_reports_slices_per_hour(self, monkeypatch, caplog):
+        # BS-27: at rate < 0.1 slices/min, "%.1f slices/min" rounds to "0.0"
+        # beside a perfectly finite ETA — reads as broken math, not "just
+        # slow". Below that threshold the rate must render as slices/hour
+        # instead; "0.0 slices/min" must never appear. Call the logger
+        # directly with a huge elapsed time so the rate is controlled exactly,
+        # rather than relying on real wall-clock slowness in a test.
+        started = 0.0
+        monkeypatch.setattr(historical.time, "monotonic", lambda: 100_000.0)
+        with caplog.at_level(logging.INFO):
+            historical._log_slice_progress("Archive day slices", 1, 1000, 0, 5, started)
+        lines = [r.getMessage() for r in caplog.records
+                 if "Archive day slices:" in r.getMessage() and "complete" in r.getMessage()]
+        assert lines
+        assert "slices/hour" in lines[0]
+        assert "0.0 slices/min" not in lines[0]
+        assert "ETA" in lines[0]
 
     def test_live_ignoring_max_settled_ts_falls_back(self, tmp_path, monkeypatch):
         # If the live endpoint stops honoring max_settled_ts, every window
@@ -1050,7 +1502,7 @@ class TestShardedFetch:
         archive = _FakeArchive(archive_markets)
         live = _FakeLive(live_markets, ignore_max=True)
         out = self._run(monkeypatch, tmp_path, archive, live)
-        expected = _old_semantics_expected(
+        expected = _expected_in_window(
             archive_markets, live_markets,
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
@@ -1120,6 +1572,9 @@ class TestProgressLabels:
         source = inspect.getsource(historical)
         assert 'Historical archive [sharded]' in source
         assert 'Historical archive [sequential]' in source
+        # The tail is a third distinct phase, serial and uncached — its pages
+        # must not be attributed to the parallel day-slice pool.
+        assert 'Historical archive [tail]' in source
         assert 'Live settled sweep [windowed]' in source
         assert 'Live settled sweep [sequential]' in source
         # No un-suffixed variant left behind.
@@ -1177,6 +1632,352 @@ class TestDayStore:
         with gzip.open(legacy, "wt", encoding="utf-8") as fh:
             json.dump({"meta": meta, "markets": markets}, fh)
         assert historical._day_store_load(legacy, meta) == markets
+
+
+class TestPruneStaleLiveDays:
+    """BS-32: once Kalshi advances the archive cutoff, every day that now
+    lies entirely before it is served (and cached) exclusively via
+    archive_days/ from then on — the old live_days/ slice for that day is
+    never read again by any future run and must be pruned."""
+
+    def _day_ts(self, iso_date: str) -> int:
+        d = date.fromisoformat(iso_date)
+        return int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
+
+    def _write_fake_slice(self, day_lo: int) -> Path:
+        path = historical._day_store_path("live_days", day_lo)
+        meta = {"kind": "live_settled_day", "cutoff_ts": 0,
+                "include_mve": True, "complete": True}
+        historical._day_store_save(path, meta, [{"ticker": "T1"}])
+        return path
+
+    def test_prunes_only_fully_pre_cutoff_days(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        # Cutoff at noon on the 15th: the 14th is entirely archive-covered,
+        # the 15th itself still has an afternoon that's live-only, the 16th
+        # is entirely still live.
+        cutoff_ts = self._day_ts("2026-08-15") + 12 * 3600
+
+        pre_cutoff = self._write_fake_slice(self._day_ts("2026-08-14"))
+        straddling = self._write_fake_slice(self._day_ts("2026-08-15"))
+        post_cutoff = self._write_fake_slice(self._day_ts("2026-08-16"))
+
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 1
+        assert not pre_cutoff.exists()
+        assert straddling.exists()
+        assert post_cutoff.exists()
+        assert any("Pruned 1 stale pre-cutoff live day slice" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_missing_live_days_dir_is_a_noop(self, tmp_path, monkeypatch, caplog):
+        # Fresh cache dir, or nothing fetched into live_days/ yet.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts=99_999_999_999)
+        assert pruned == 0
+        assert not any("Pruned" in r.getMessage() for r in caplog.records)
+
+    def test_no_stale_days_logs_nothing(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        cutoff_ts = self._day_ts("2026-08-15")
+        kept = self._write_fake_slice(self._day_ts("2026-08-16"))
+
+        with caplog.at_level(logging.INFO):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 0
+        assert kept.exists()
+        assert not any("Pruned" in r.getMessage() for r in caplog.records)
+
+    def test_unlink_failure_is_logged_and_does_not_raise(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        cutoff_ts = self._day_ts("2026-08-20")
+        stale = self._write_fake_slice(self._day_ts("2026-08-14"))
+
+        real_unlink = Path.unlink
+
+        def failing_unlink(self, *a, **k):
+            if self == stale:
+                raise OSError("permission denied")
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+        with caplog.at_level(logging.WARNING):
+            pruned = historical._prune_stale_live_days(cutoff_ts)
+
+        assert pruned == 0
+        assert stale.exists()
+        assert any("Failed to prune stale live-day slice" in r.getMessage()
+                   for r in caplog.records)
+
+
+class TestDayStreamWriter:
+    """BS-15: day slices are streamed out in chunks so no fetch worker ever
+    holds a whole UTC day (millions of records at 2026-08 volumes) in memory.
+
+    The streamed "jsonl-v1" format and the legacy single-document format must
+    both stay readable — hundreds of MB of legacy slices already sit in
+    backtest_cache/ and refetching them costs hours.
+    """
+
+    META = {"kind": "archive_created_day", "cutoff_ts": 100,
+            "include_mve": True, "complete": True}
+
+    @staticmethod
+    def _markets(n: int) -> list[dict]:
+        return [{"ticker": f"T{i}", "result": "yes", "open_time": None} for i in range(n)]
+
+    def test_jsonl_roundtrip_preserves_order(self, tmp_path):
+        # Record order IS the contract: the server returns each window
+        # newest-first and the caller's ticker dedup is first-wins, so a
+        # reordering writer would silently change which duplicate survives.
+        path = tmp_path / "2026-06-09.json.gz"
+        markets = self._markets(5)
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(markets[:2])
+            writer.write_records(markets[2:])
+            assert writer.commit() == 5
+        assert historical._day_store_load(path, self.META) == markets
+        # Line framing is real JSONL, not an implementation detail of ours
+        assert _read_slice_file(path) == markets
+
+    def test_jsonl_meta_carries_format_tag(self, tmp_path):
+        path = tmp_path / "2026-06-09.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.commit()
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            head = json.loads(fh.readline())
+        assert head["meta"]["format"] == "jsonl-v1"
+        # The tag rides along inside meta, so identity gating is unaffected
+        assert all(head["meta"][k] == v for k, v in self.META.items())
+
+    def test_empty_day_is_meta_only_and_loads_as_zero_records(self, tmp_path):
+        # Routing edge: a meta-only file whole-parses as a perfectly good JSON
+        # dict, so routing on "did json.loads succeed" would call this legacy
+        # and report no markets key. It must route on CONTENT and load as [].
+        path = tmp_path / "2026-06-07.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.commit()
+        assert historical._day_store_load(path, self.META) == []
+        # ...and specifically not None, which would mean "refetch this day"
+        assert historical._day_store_load(path, self.META) is not None
+
+    def test_legacy_dict_slice_still_loads(self, tmp_path):
+        # Written the way every pre-BS-15 slice on disk was written.
+        path = tmp_path / "legacy.json.gz"
+        markets = self._markets(3)
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": self.META, "markets": markets}, fh)
+        assert historical._day_store_load(path, self.META) == markets
+        # Legacy empty day too — the other empty-file routing case
+        empty = tmp_path / "legacy_empty.json.gz"
+        with gzip.open(empty, "wt", encoding="utf-8") as fh:
+            json.dump({"meta": self.META, "markets": []}, fh)
+        assert historical._day_store_load(empty, self.META) == []
+
+    def test_meta_mismatch_rejects_both_formats(self, tmp_path):
+        drifted = {**self.META, "cutoff_ts": 200}
+        jsonl = tmp_path / "jsonl.json.gz"
+        with historical._DayStreamWriter(jsonl, self.META) as writer:
+            writer.write_records(self._markets(2))
+            writer.commit()
+        legacy = tmp_path / "legacy.json.gz"
+        historical._day_store_save(legacy, self.META, self._markets(2))
+
+        assert historical._day_store_load(jsonl, drifted) is None
+        assert historical._day_store_load(legacy, drifted) is None
+        # Sanity: both load fine under the matching expectation
+        assert historical._day_store_load(jsonl, self.META)
+        assert historical._day_store_load(legacy, self.META)
+
+    def test_abort_leaves_no_visible_file(self, tmp_path):
+        # The atomicity contract: an interrupted worker must not publish a
+        # partial slice that a later run would trust as complete.
+        path = tmp_path / "2026-06-09.json.gz"
+        with pytest.raises(RuntimeError):
+            with historical._DayStreamWriter(path, self.META) as writer:
+                writer.write_records(self._markets(2))
+                raise RuntimeError("worker died mid-day")
+        assert not path.exists()
+        assert not list(tmp_path.glob("*.tmp"))
+        assert historical._day_store_load(path, self.META) is None
+
+    def test_truncated_jsonl_is_a_whole_slice_miss(self, tmp_path):
+        # A slice cut mid-record must fail entirely (→ refetch), never return
+        # the records that happened to survive.
+        path = tmp_path / "2026-06-09.json.gz"
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(self._markets(4))
+            writer.commit()
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        cut = raw[: raw.rindex(b"\n", 0, len(raw) - 1) + 25]  # mid-line
+        with gzip.open(path, "wb") as fh:
+            fh.write(cut)
+        assert historical._day_store_load(path, self.META) is None
+
+    def test_keep_predicate_filters_during_load(self, tmp_path):
+        # Pushed down so a multi-million-record day is never materialized just
+        # to be filtered afterwards; must equal filtering the full list.
+        path = tmp_path / "2026-06-09.json.gz"
+        markets = self._markets(6)
+        with historical._DayStreamWriter(path, self.META) as writer:
+            writer.write_records(markets)
+            writer.commit()
+
+        def keep(m):
+            return m["ticker"] in ("T1", "T4")
+
+        assert historical._day_store_load(path, self.META, keep) == [
+            m for m in markets if keep(m)
+        ]
+        # The same equality must hold for legacy slices
+        legacy = tmp_path / "legacy.json.gz"
+        historical._day_store_save(legacy, self.META, markets)
+        assert historical._day_store_load(legacy, self.META, keep) == [
+            m for m in markets if keep(m)
+        ]
+        # _discard_all is the prescan's "parse but retain nothing" probe
+        assert historical._day_store_load(path, self.META, historical._discard_all) == []
+
+    def test_worker_chunks_a_large_day(self, tmp_path, monkeypatch):
+        # The point of BS-15: the worker's buffer is bounded by the chunk size,
+        # not by how big the day is. Verified through the real worker with a
+        # small chunk — emit must fire repeatedly, never once at the end.
+        from datetime import UTC, datetime
+
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+
+        day_lo = int(datetime(2026, 6, 9, tzinfo=UTC).timestamp())
+        page_size = 2
+        pages = [
+            {"markets": [_mk_raw_market(f"T{i}", "2026-06-09T12:00:00Z",
+                                        "2026-06-09T13:00:00Z")
+                         for i in range(p * page_size, (p + 1) * page_size)],
+             "cursor": "next"}
+            for p in range(5)
+        ]
+        pages.append({"markets": [], "cursor": None})
+        calls = iter(pages)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: next(calls))
+
+        batches: list[int] = []
+        real_write = historical._DayStreamWriter.write_records
+
+        def spy_write(self, batch):
+            batches.append(len(batch))
+            real_write(self, batch)
+
+        monkeypatch.setattr(historical._DayStreamWriter, "write_records", spy_write)
+
+        count = historical._fetch_and_store_archive_day(
+            MagicMock(), day_lo, {"limit": 1000},
+            historical._FetchProgress("test"), self.META,
+        )
+
+        assert count == 10
+        # More than one flush, and no buffer grew past the chunk size plus the
+        # page in flight (flushes land on page boundaries, so that — not the
+        # size of the day — is the worker's memory bound).
+        assert len(batches) > 1
+        assert max(batches) <= 3 + page_size
+        assert sum(batches) == 10
+        # The published slice is complete and in fetch order
+        path = historical._day_store_path("archive_days", day_lo)
+        loaded = historical._day_store_load(path, self.META)
+        assert [m["ticker"] for m in loaded] == [f"T{i}" for i in range(10)]
+
+    def test_no_emit_returns_the_list_unchanged(self, tmp_path, monkeypatch):
+        # The frontier day and the sequential fallbacks rely on the
+        # list-returning behavior — chunking must be strictly opt-in.
+        pages = [
+            {"markets": [_mk_raw_market("F1", "2026-06-12T01:00:00Z",
+                                        "2026-06-12T02:00:00Z")],
+             "cursor": None},
+        ]
+        calls = iter(pages)
+        monkeypatch.setattr(
+            historical, "api_call_with_retry",
+            lambda fn, *a, **k: next(calls),
+        )
+        out = historical._fetch_live_window(
+            MagicMock(), 0, None, historical._FetchProgress("test"),
+        )
+        assert isinstance(out, list)
+        assert [m["ticker"] for m in out] == ["F1"]
+
+
+class TestJsonCacheDurability:
+    """BS-08: the plain-JSON cache helpers must fail safe, not fail loud.
+
+    These caches are written at the end of multi-hour fetches that have
+    historically been killed by OOM and SIGKILL, so a half-written file is a
+    realistic on-disk state. Reads treat it as a miss; writes can never produce
+    it in the first place.
+    """
+
+    def test_missing_file_is_a_miss(self, tmp_path):
+        assert historical._load_json_cache(tmp_path / "nope.json") is None
+
+    def test_roundtrip(self, tmp_path):
+        path = tmp_path / "sub" / "cache.json"  # parent dirs created on save
+        historical._save_json_cache(path, {"a": [1, 2]})
+        assert historical._load_json_cache(path) == {"a": [1, 2]}
+
+    def test_corrupt_file_is_a_miss_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "cache.json"
+        path.write_text('[{"ticker": "T1"')  # truncated mid-write
+        with caplog.at_level(logging.WARNING):
+            assert historical._load_json_cache(path) is None
+        assert any("Corrupt JSON cache" in r.getMessage() and "cache.json" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_leftover_tmp_without_real_file_is_a_miss(self, tmp_path):
+        # A run killed between the tmp write and the rename leaves only the
+        # sidecar. The real path is still absent, so this is a plain miss —
+        # the partial tmp must never be read as if it were the cache.
+        path = tmp_path / "cache.json"
+        path.with_name(path.name + ".tmp").write_text('[{"ticker": "T1"')
+        assert historical._load_json_cache(path) is None
+
+    def test_serializer_failure_leaves_no_partial_file(self, tmp_path):
+        # json.dumps calls default=str for unserializable values; this one
+        # explodes there, i.e. mid-save.
+        class _Boom:
+            def __str__(self):
+                raise RuntimeError("serializer blew up")
+
+        path = tmp_path / "cache.json"
+        historical._save_json_cache(path, {"good": 1})
+        with pytest.raises(RuntimeError):
+            historical._save_json_cache(path, {"bad": _Boom()})
+        # The previously good file is intact — no truncation in place.
+        assert historical._load_json_cache(path) == {"good": 1}
+
+    def test_write_crash_never_reaches_the_real_path(self, tmp_path, monkeypatch):
+        # Simulate the disk-full / SIGKILL case: half the bytes land, then the
+        # write raises. With tmp+replace, the damaged bytes are confined to the
+        # sidecar and the real path never becomes visible-but-truncated.
+        real_write_text = Path.write_text
+
+        def half_then_die(self, data, *args, **kwargs):
+            real_write_text(self, data[: len(data) // 2])
+            raise OSError("no space left on device")
+
+        path = tmp_path / "cache.json"
+        monkeypatch.setattr(Path, "write_text", half_then_die)
+        with pytest.raises(OSError):
+            historical._save_json_cache(path, {"ticker": "T1", "candles": [1, 2, 3]})
+        monkeypatch.undo()
+
+        assert not path.exists()
+        assert historical._load_json_cache(path) is None
 
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
@@ -1276,6 +2077,48 @@ class TestFetchCandlesticks:
         assert out[0]["yes_ask_close"] == pytest.approx(0.55)
         assert out[0]["no_ask_close"] == pytest.approx(0.47)
 
+    def test_malformed_candle_dropped_and_logged(self, tmp_path, monkeypatch, caplog):
+        # BS-23: a malformed candle used to be silently swallowed by a bare
+        # `except: pass`, so a thinned series was cached as if it were
+        # complete with no visible signal. One good candle + one unparseable
+        # candle (yes_ask.close is not a number) must keep the good candle,
+        # drop the bad one, and log exactly what was dropped.
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        payload = {"candlesticks": [
+            {"end_period_ts": 1_700_000_000,
+             "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}},
+            {"end_period_ts": 1_700_003_600,
+             "yes_ask": {"close": "not-a-number"}, "yes_bid": {"close": "0.50"}},
+        ]}
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(return_value=_raw_resp(payload)))
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+
+        assert len(out) == 1
+        assert out[0]["ts"] == 1_700_000_000
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("T1" in w and "dropped 1/2 malformed candles" in w for w in warnings)
+
+    def test_clean_candle_series_logs_no_drop_warning(self, tmp_path, monkeypatch, caplog):
+        # The flip side of the malformed-candle test: a fully clean series
+        # must never emit the drop warning (dropped == 0 is silent).
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000)
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+
+        assert len(out) == 1
+        assert not any("dropped" in r.getMessage() for r in caplog.records)
+
     def test_cache_hit_skips_api_when_window_covered(self, tmp_path, monkeypatch):
         # A second request for a window already covered by the cached window
         # must not hit the API again.
@@ -1344,6 +2187,30 @@ class TestFetchCandlesticks:
         )
         assert fetch.call_count == 1
         assert out[0]["ts"] == 1_700_000_000
+
+    def test_corrupt_cache_falls_through_to_refetch(self, tmp_path, monkeypatch, caplog):
+        # BS-08: the per-ticker cache read used to be a bare json.loads OUTSIDE
+        # the fetch try-block, so one truncated file raised straight out of a
+        # candlestick worker thread and killed the whole backtest. A damaged
+        # file must behave exactly like a cache miss.
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        (candles_dir / "T1.json").write_text(
+            '{"open_ts": 0, "close_ts": 1000, "period_interval": 60, "candles": [{"ts"'
+        )
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+            )
+
+        assert fetch.call_count == 1
+        assert out[0]["ts"] == 1_700_000_000
+        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        # The refetch rewrites the file in the current tagged format.
+        assert json.loads((candles_dir / "T1.json").read_text())["candles"] == out
 
     def test_use_cache_false_still_persists_fetch_to_disk(self, tmp_path, monkeypatch):
         # Regression: use_cache=False (--no-cache) must still refresh the disk

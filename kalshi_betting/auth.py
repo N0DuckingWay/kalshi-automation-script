@@ -93,7 +93,9 @@ def build_client(mode: str) -> KalshiClient:
     Raises:
         FileNotFoundError: If secrets.json or the PEM file do not exist at the
             paths defined in config.py.
-        KeyError: If "Kalshi-api-key" is missing from secrets.json in prod mode.
+        KeyError: If "Kalshi-api-key" is missing from secrets.json in prod
+            mode, or if BOTH "dev_api_key" and "Kalshi-api-key" are missing
+            in dev mode (dev_api_key alone is sufficient).
         json.JSONDecodeError: If secrets.json cannot be parsed as JSON.
     """
     raw = SECRETS_FILE.read_text().strip()
@@ -109,7 +111,14 @@ def build_client(mode: str) -> KalshiClient:
         pem_text = PEM_FILE.read_text()
     else:
         url      = SANDBOX_URL
-        key_id   = secrets.get("dev_api_key", secrets["Kalshi-api-key"])
+        # Lazy fallback: dev_api_key is optional; only require the prod key
+        # when the dev key is absent (a .get() default is evaluated eagerly,
+        # so `secrets.get("dev_api_key", secrets["Kalshi-api-key"])` raised
+        # KeyError in dev mode even when dev_api_key WAS present)
+        if "dev_api_key" in secrets:
+            key_id = secrets["dev_api_key"]
+        else:
+            key_id = secrets["Kalshi-api-key"]
         pem_file = DEV_PEM_FILE if DEV_PEM_FILE.exists() else PEM_FILE
         pem_text = pem_file.read_text()
 
@@ -258,6 +267,14 @@ def verify_auth(client: KalshiClient) -> dict[int, int]:
     select_portfolio()) must explicitly sum(...) the returned dict; a dual
     API here would invite a future caller to size against a single shard's
     balance instead of the portfolio-wide total.
+
+    Uses the raw-response variant + JSON parsing, same as trader._position_count
+    and scanner.get_held_tickers: the pinned SDK's GetBalanceResponse model
+    types balance/portfolio_value/updated_ts as legacy StrictInt fields, which
+    is the same field class that already drifted away for markets, positions,
+    and orders (see the CLAUDE.md API-drift gotcha) — the modeled get_balance
+    call is the last one of those still standing and would raise pydantic
+    ValidationError on a live response that no longer sends them.
 
     Args:
         client (KalshiClient): An authenticated client produced by build_client().

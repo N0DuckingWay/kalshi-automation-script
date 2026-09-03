@@ -59,6 +59,7 @@ from .config import (
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SCANNER_PROGRESS_LOG_EVERY_PAGES,
     fee_per_pair_approx,
     min_price_diff_for_gap,
 )
@@ -443,6 +444,7 @@ def get_held_tickers(client: Any) -> set:
     """
     held: set = set()
     cursor: str | None = None
+    pages = 0
     while True:
         kwargs: dict = {"limit": POSITION_PAGE_SIZE, "count_filter": "position"}
         # Include cursor for pages after the first to continue pagination
@@ -452,6 +454,7 @@ def get_held_tickers(client: Any) -> set:
         data = api_call_with_retry(
             fetch_json_page, client.get_positions_without_preload_content, **kwargs
         )
+        pages += 1
         for pos in data.get("market_positions") or []:
             ticker = pos.get("ticker") or ""
             try:
@@ -467,7 +470,21 @@ def get_held_tickers(client: Any) -> set:
                 # If we can't parse the position, be conservative and treat it as held
                 if ticker:
                     held.add(ticker)
-        cursor = data.get("cursor")
+        if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+            logging.info("Positions fetch: %d pages, %d held tickers so far", pages, len(held))
+        new_cursor = data.get("cursor")
+        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
+        # the exact cursor we just used is already proof the server isn't
+        # advancing — one more page would come back identical forever, same
+        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and new_cursor == cursor:
+            logging.warning(
+                "Positions fetch: cursor did not advance on page %d — "
+                "stopping pagination to avoid an infinite loop",
+                pages,
+            )
+            break
+        cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
@@ -861,6 +878,7 @@ def fetch_open_events_with_markets(
     skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
+    pages = 0
     while True:
         kwargs: dict = {
             "status": "open",
@@ -874,6 +892,7 @@ def fetch_open_events_with_markets(
         data = api_call_with_retry(
             fetch_json_page, client.get_events_without_preload_content, **kwargs
         )
+        pages += 1
         for ev in data.get("events") or []:
             ev_title = ev.get("title") or ""
             for m in ev.get("markets") or []:
@@ -894,7 +913,21 @@ def fetch_open_events_with_markets(
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it
                 markets.append(_market_from_dict(m, ev_title))
-        cursor = data.get("cursor")
+        if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+            logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
+        new_cursor = data.get("cursor")
+        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
+        # the exact cursor we just used already proves the server isn't
+        # advancing — one more page would come back identical forever. Same
+        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and new_cursor == cursor:
+            logging.warning(
+                "Open-events fetch: cursor did not advance on page %d — "
+                "stopping pagination to avoid an infinite loop",
+                pages,
+            )
+            break
+        cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
             break
@@ -904,11 +937,16 @@ def fetch_open_events_with_markets(
     if INCLUDE_MVE_MARKETS:
         cursor = None
         # The MVE listing is effectively unbounded (hundreds of thousands of
-        # auto-generated collection events) and currently returns no nested
-        # markets at all, so the pull bails out after MVE_MAX_EMPTY_PAGES
-        # consecutive marketless pages instead of paging for hours. Pages that
-        # contain markets reset the counter.
+        # auto-generated collection events), so the pull bails out after
+        # MVE_MAX_EMPTY_PAGES consecutive unproductive pages instead of paging
+        # for hours. A page is "productive" only if it contributes at least one
+        # ACTIVE nested market — a page can be full of nested markets that are
+        # all closed/settled/determined (observed live in sandbox: thousands of
+        # such pages in a row), and those must NOT reset the counter, or the
+        # bail-out never fires. Pages that contribute active markets reset it.
         empty_pages = 0
+        mve_pages = 0
+        mve_market_count = 0
         while True:
             kwargs = {"limit": MARKET_PAGE_SIZE, "with_nested_markets": True}
             if cursor:
@@ -918,8 +956,9 @@ def fetch_open_events_with_markets(
                 client.get_multivariate_events_without_preload_content,
                 **kwargs,
             )
+            mve_pages += 1
             events = data.get("events") or []
-            page_market_count = sum(len(ev.get("markets") or []) for ev in events)
+            page_active_count = 0
             for ev in events:
                 ev_title = ev.get("title") or ""
                 for m in ev.get("markets") or []:
@@ -935,19 +974,38 @@ def fetch_open_events_with_markets(
                             skipped_shard += 1
                             continue
                         markets.append(_market_from_dict(m, ev_title))
-            if page_market_count == 0:
+                        mve_market_count += 1
+                        page_active_count += 1
+            if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
+                logging.info(
+                    "MVE events fetch: %d pages, %d markets so far", mve_pages, mve_market_count
+                )
+            if page_active_count == 0:
                 empty_pages += 1
                 if empty_pages >= MVE_MAX_EMPTY_PAGES:
                     logging.warning(
-                        "MVE fetch: %d consecutive pages with no nested markets — "
-                        "stopping the MVE pull early (the API currently returns "
-                        "none; the listing itself is effectively unbounded)",
+                        "MVE fetch: %d consecutive pages with no active nested "
+                        "markets — stopping the MVE pull early (nested markets "
+                        "may still be present but none are active/usable; the "
+                        "listing itself is effectively unbounded)",
                         empty_pages,
                     )
                     break
             else:
                 empty_pages = 0
-            cursor = data.get("cursor")
+            new_cursor = data.get("cursor")
+            # Stuck-cursor guard: the cursor is a keyset position, so a single
+            # repeat of the cursor we just used already proves the server
+            # isn't advancing — same bounded-scan idiom as the empty-pages
+            # bail-out just above.
+            if new_cursor and new_cursor == cursor:
+                logging.warning(
+                    "MVE events fetch: cursor did not advance on page %d — "
+                    "stopping pagination to avoid an infinite loop",
+                    mve_pages,
+                )
+                break
+            cursor = new_cursor
             if not cursor:
                 break
 
@@ -1283,44 +1341,157 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     return levels
 
 
-# Supported wire format for the orderbook response: the container key pairs with
-# its OWN side keys and units. Only the current generation is supported — the live
-# API returns the book under `orderbook_fp` with dollar-string bid arrays.
+# Unit tags for an orderbook side-key candidate set. Dollar sets carry bid prices
+# as 0-1 dollar strings (parsed straight by _bids_to_ask_levels); cents sets carry
+# integer cents and MUST be converted to dollars before that parser sees them.
+_UNIT_DOLLARS = "dollars"
+_UNIT_CENTS = "cents"
+
+# Valid inclusive bounds for an integer-cent bid price on the legacy arrays. A
+# level outside this range is not a price Kalshi can quote (0 and 100 are the
+# settled extremes), so it signals a unit/shape drift rather than a real bid.
+_MIN_BID_CENTS = 1
+_MAX_BID_CENTS = 99
+
+# Matched wire-format generations for the orderbook response: each container key
+# owns an ordered tuple of candidate (yes_key, no_key, unit) side-key sets, and a
+# container is NEVER read with another container's sets. Verified against the
+# pinned SDK's models/orderbook.py:
+#   * `orderbook_fp` — live-observed only (absent from the SDK entirely); serves
+#     `yes_dollars`/`no_dollars` dollar-string bid arrays. This is what production
+#     receives today, so its handling must stay behaviour-identical.
+#   * `orderbook` — the SDK-modeled container. Its model REQUIRES
+#     `yes_dollars`/`no_dollars` (dollar strings) and aliases the legacy integer-cent
+#     arrays as `"true"`/`"false"` — never `"yes"`/`"no"`, which this table wrongly
+#     assumed before. Both shapes are accepted, dollars first, cents second.
+# Resolving container and side keys independently (a plain `or` across both
+# generations) risked cross-reading a cents array through the dollars parser, so
+# the pairing is enforced explicitly in _fetch_orderbook. Order matters within a
+# container too: the first candidate set whose BOTH keys are present wins.
 #
-# The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays) is
-# deliberately NOT listed: Kalshi removed every legacy integer price field from
-# its REST/WS payloads on 2026-03-12, and _bids_to_ask_levels parses entries as
-# dollars unconditionally, so a cents bid of 35 would become an ask of -34.0 and
-# be silently dropped by the price-range check — an empty book with no warning.
-# Omitting it routes any legacy-shaped (or otherwise unknown) container to the
-# loud no-usable-orderbook path in _fetch_orderbook, which fails closed and names
-# the response keys. The container-key-presence selection and matched-side-key
-# enforcement below stay in place: they still guard against a future unknown
-# generation being cross-read through this generation's dollar parser.
-_ORDERBOOK_SIDE_KEYS: dict[str, tuple[str, str]] = {
-    "orderbook_fp": ("yes_dollars", "no_dollars"),
+# CONTEXT: Kalshi removed the legacy integer price fields from its REST/WS
+# payloads on 2026-03-12, and production serves `orderbook_fp` only — so the
+# `orderbook` container and its cents arrays are not expected on the wire today.
+# They are kept as SDK-shape-derived DEFENSE, not as a live code path: the pinned
+# SDK still models exactly those shapes, sandbox and future replays may serve
+# them, and the alternative to parsing them correctly is not "no code" but a
+# silently empty book (BS-12). Nothing here weakens the fail-closed rule — an
+# unknown container, or a known container matching none of its own candidate
+# sets, still returns None with a mismatch warning.
+_ORDERBOOK_SIDE_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "orderbook_fp": (
+        ("yes_dollars", "no_dollars", _UNIT_DOLLARS),
+    ),
+    "orderbook": (
+        ("yes_dollars", "no_dollars", _UNIT_DOLLARS),
+        ("true", "false", _UNIT_CENTS),
+    ),
 }
+
+
+def _coerce_int_cents(value: Any) -> int | None:
+    """
+    Coerce one raw legacy-array bid price to an integer number of cents.
+
+    Accepts a genuine int, an integral float (45.0), or a string spelling either
+    ("45", "45.0"). Anything fractional, non-numeric, or boolean is rejected —
+    a fractional "cent" means the array is really carrying dollars and must not
+    be multiplied through the cents path.
+
+    Args:
+        value (Any): Raw price element from a legacy `true`/`false` bid level.
+
+    Returns:
+        int | None: The value as whole cents, or None if it is not an integral
+            number (which the caller treats as a malformed level).
+    """
+    # bool is an int subclass; True would silently become 1 cent
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except ValueError:
+            return None
+        return int(num) if num.is_integer() else None
+    return None
+
+
+def _cents_bids_to_dollar_bids(ticker: str, side_key: str, bids_raw: list) -> list:
+    """
+    Convert one legacy integer-cent bid array to the dollar form the parser expects.
+
+    _bids_to_ask_levels is dollars-only by contract: it computes 1 - price, so a
+    cents value fed to it straight yields a wildly negative ask that its own
+    range check silently discards — a full cents book would parse as an empty
+    book with no warning at all. This converts cents to dollars first and drops
+    (loudly) any level whose price is not a whole cent in [1, 99], so a unit
+    drift surfaces as a warning naming the offending value instead of silence.
+
+    Args:
+        ticker (str): Market ticker, for the drop warning.
+        side_key (str): The side key being converted ("true"/"false"), for the
+            drop warning.
+        bids_raw (list): Raw bid levels, each expected as [price_cents, qty].
+
+    Returns:
+        list: [[price_dollars, qty], ...] in the original order, with malformed
+            levels omitted. Returns [] when every level was malformed.
+    """
+    converted: list = []
+    for entry in bids_raw:
+        try:
+            raw_price = entry[0]
+            qty = entry[1]
+        except (TypeError, IndexError, KeyError):
+            logging.warning(
+                "Dropping malformed legacy cents array level for %s side '%s': %r "
+                "(level is not a [price, qty] pair)",
+                ticker,
+                side_key,
+                entry,
+            )
+            continue
+        cents = _coerce_int_cents(raw_price)
+        if cents is None or not (_MIN_BID_CENTS <= cents <= _MAX_BID_CENTS):
+            logging.warning(
+                "Dropping malformed legacy cents array level for %s side '%s': price %r "
+                "is not a whole cent in [%d, %d]",
+                ticker,
+                side_key,
+                raw_price,
+                _MIN_BID_CENTS,
+                _MAX_BID_CENTS,
+            )
+            continue
+        converted.append([cents / 100.0, qty])
+    return converted
 
 
 def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
     """
     Fetch the order book for a market.
 
-    Only the current matched key generation is supported (see
-    _ORDERBOOK_SIDE_KEYS): the `orderbook_fp` container with
-    `yes_dollars`/`no_dollars` dollar-string bid arrays. The container key selects
-    which side keys are expected, and once a container is found its matched side
-    keys MUST be present (either may be empty or null for a side with no resting
-    bids); a container whose matched side keys are absent, or which is not even a
-    dict, signals a Kalshi API shape change and is treated as a hard failure
-    rather than silently reading some other generation's keys.
+    The book arrives under one of two matched key generations (see
+    _ORDERBOOK_SIDE_KEYS). The container key strictly selects which side-key sets
+    are eligible — generations are never mixed:
 
-    The legacy `orderbook` container (integer-cent `yes`/`no` bid arrays, removed
-    from the API on 2026-03-12) is deliberately unsupported: it is not a
-    recognized container key, so it falls through to the no-usable-orderbook
-    warning and returns None. That is intentional — the dollars parser would
-    misread cent bids as out-of-range asks and hand back an empty book with no
-    warning at all.
+      * `orderbook_fp` (what production receives today) → `yes_dollars`/`no_dollars`
+        dollar-string bid arrays.
+      * `orderbook` (the SDK-modeled container) → `yes_dollars`/`no_dollars` dollar
+        strings if present, else the legacy `true`/`false` INTEGER-CENT arrays,
+        which are converted to dollars here before any parsing.
+
+    A container present but null or empty (`{}`) is an empty book — a market with
+    no resting bids, not a shape change. A container that is a non-empty dict but
+    matches none of its own candidate side-key sets (or is some other non-dict
+    value) signals a Kalshi API shape change and fails closed with a "potential
+    orderbook key mismatch" warning, rather than cross-reading another
+    generation's keys (which could feed a cents array through the dollars parser).
 
     Args:
         client (Any): Authenticated KalshiClient exposing the raw-response
@@ -1328,11 +1499,12 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
         ticker (str): Market ticker whose order book to fetch.
 
     Returns:
-        dict | None: {'yes': [[price_str, qty_str], ...], 'no': [...]} where 'yes'
-            is YES bids and 'no' is NO bids, or None on failure. Returns None when
-            no recognized container key is present, when the selected container is
-            not a dict, or when the container's matched side keys are missing (a
-            potential key mismatch — logged as such).
+        dict | None: {'yes': [[price, qty], ...], 'no': [...]} where 'yes' is YES
+            bids and 'no' is NO bids and every price is in DOLLARS (dollar-string
+            levels pass through untouched; cents levels are converted). Returns
+            None when no recognized container key is present, or when the selected
+            container matches none of its candidate side-key sets (a potential key
+            mismatch — logged as such).
     """
     try:
         # Raw-response call: the live API returns only the orderbook_fp key,
@@ -1358,27 +1530,54 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             )
             return None
         ob = data[container_key]
-        yes_key, no_key = _ORDERBOOK_SIDE_KEYS[container_key]
-        if not isinstance(ob, dict) or yes_key not in ob or no_key not in ob:
-            # Container present but its matched side keys are absent (or it is not
-            # even a dict). This is a potential key mismatch — the container and
-            # side keys have drifted out of sync, or Kalshi changed the response
-            # shape. Fail closed instead of guessing at whatever side keys ARE
-            # present (which could feed a cents array through the dollars parser).
+        # The container->side-key mapping below is validated against the pinned
+        # SDK's documented Orderbook shapes (models/orderbook.py) by
+        # TestFetchOrderbookKeyMapping in tests/test_scanner.py, which exercises
+        # every generation, unit, and degenerate container this branch handles.
+        if ob is None or ob == {}:
+            # Container present but carries no book at all. That is a market with
+            # no resting bids on either side, NOT a shape change — return an empty
+            # book so the mismatch warning stays reserved for genuine drift.
+            return {"yes": [], "no": []}
+        selected = None
+        if isinstance(ob, dict):
+            # First candidate set whose BOTH keys are present wins; a set is only
+            # ever taken whole, so units can never be inferred from the wrong keys.
+            selected = next(
+                (
+                    keys
+                    for keys in _ORDERBOOK_SIDE_KEYS[container_key]
+                    if keys[0] in ob and keys[1] in ob
+                ),
+                None,
+            )
+        if selected is None:
+            # Container present and non-empty but matches none of ITS OWN candidate
+            # side-key sets (or is not even a dict). This is a potential key
+            # mismatch — the container and side keys have drifted out of sync, or
+            # Kalshi changed the response shape. Fail closed instead of
+            # cross-reading another generation's keys (which could feed a cents
+            # array through the dollars parser).
             logging.warning(
-                "Potential orderbook key mismatch for %s: container '%s' present but its "
-                "expected side keys %s are missing (got %s) — check for bugs or changes to "
-                "Kalshi's API",
+                "Potential orderbook key mismatch for %s: container '%s' present but matches "
+                "none of its expected side-key sets %s (got %s) — check for bugs or changes "
+                "to Kalshi's API",
                 ticker,
                 container_key,
-                (yes_key, no_key),
+                [(y, n) for y, n, _ in _ORDERBOOK_SIDE_KEYS[container_key]],
                 sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__,
             )
             return None
+        yes_key, no_key, unit = selected
         # Matched side keys are guaranteed present; a side with no resting bids
         # arrives as null or [] and must read as an empty (not missing) side.
         yes_raw = list(ob[yes_key] or [])
         no_raw  = list(ob[no_key] or [])
+        if unit == _UNIT_CENTS:
+            # Convert to dollars HERE — _bids_to_ask_levels is dollars-only, and
+            # cents fed through it parse as an empty book with no warning at all
+            yes_raw = _cents_bids_to_dollar_bids(ticker, yes_key, yes_raw)
+            no_raw  = _cents_bids_to_dollar_bids(ticker, no_key, no_raw)
         return {"yes": yes_raw, "no": no_raw}
     except Exception as exc:
         logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)

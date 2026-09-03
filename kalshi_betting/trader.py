@@ -10,10 +10,14 @@ Purpose:
     market B) only if leg A filled. Both buy legs are price-protected against a
     book that moved since the pre-execution check, so such an order is killed
     instead of filling at a loss. If leg B fails, a rollback order is immediately
-    submitted to unwind leg A, and the rollback's own fill status is verified —
-    an unfilled rollback is reported as status="rollback_failed" (orphaned
-    position, manual review). Multiple pairs are executed concurrently via
-    ThreadPoolExecutor so no pair waits for another to complete.
+    submitted to unwind leg A. That unwind is itself LOSS-FLOORED on both order
+    paths — never an unpriced market order — at leg A's scanned entry less
+    config.ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, so a collapsed book kills the
+    unwind instead of realizing an unbounded loss; the rollback's own fill
+    status is verified either way, and an unfilled rollback is reported as
+    status="rollback_failed" (orphaned position, manual review). Multiple pairs
+    are executed concurrently via ThreadPoolExecutor so no pair waits for
+    another to complete.
 
     Two order paths exist, selected by config.ORDER_API_VERSION:
       "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
@@ -34,7 +38,15 @@ Purpose:
 
     An exception from either submission path does NOT prove the order was
     rejected (a timeout can land after the fill), so exception paths consult the
-    actual account position for the ticker before classifying the outcome.
+    actual account position for the ticker before classifying the outcome. The
+    check is a DELTA, never an absolute holding: baseline snapshots for both
+    tickers are taken up front, before either order is submitted (so no blocking
+    call sits in the unhedged window between leg A's fill and leg B's
+    submission), and each is compared against a reading taken after the
+    exception, so the decision reflects what this order did rather than what the
+    account happens to hold (an unrelated pre-existing holding in the same
+    ticker used to read as "our leg filled", and an unrelated absence used to
+    read as "our leg didn't").
 
     pre_execution_check() re-fetches order books for each spec in the portfolio
     concurrently and drops any whose prices have moved since the scan, reducing
@@ -52,16 +64,18 @@ Purpose:
 
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
-    CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page plus
-    signed_request_json from _http.py. Imports validate_pair_price and
+    CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page,
+    signed_request_json plus api_call_with_retry from _http.py (the retry
+    wrapper is used ONLY for the read-only position lookups, never for order
+    submission or the transfer POST). Imports validate_pair_price and
     tick_size_for_price from scanner.py, read_shard_balances from auth.py (the shard-aware
     balance re-read the transfer settle-poll needs), and ORDER_API_VERSION,
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
-    TRANSFER_PATH, TRANSFER_POLL_INTERVAL_SECONDS,
-    TRANSFER_SETTLE_TIMEOUT_SECONDS, V2_ORDER_PATH and
-    V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by main.py after
-    select_portfolio() selects the final trade list. Depends on the KalshiClient
-    produced by auth.py.
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
+    TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
+    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by
+    main.py after select_portfolio() selects the final trade list. Depends on
+    the KalshiClient produced by auth.py.
 
 Notes:
     Do NOT add retry logic to order submission, on EITHER path, NOR to the
@@ -70,9 +84,19 @@ Notes:
     price and creating an unhedged directional position; the transfer endpoint
     is not idempotent, so a retried transfer moves the money twice.
     _submit_order calls fetch_json_page directly and _submit_order_v2 /
-    _execute_transfer call signed_request_json directly; none may ever be
-    wrapped in api_call_with_retry (which this module deliberately does not even
-    import).
+    _execute_transfer call signed_request_json directly; none of those three may
+    ever be wrapped in api_call_with_retry.
+
+    The read-only position lookups in _position_count ARE retried, and that
+    asymmetry is the rule, not an oversight: they are read-only GETs, so a
+    transient 429 there cannot duplicate a trade — but it CAN escalate an
+    otherwise-resolvable ambiguity into a rollback or manual_review. Do not
+    "unify" _position_count with the submission paths in either direction. The
+    one read that is deliberately NOT retried is _confirm_v2_no_mapping's, via
+    _position_count_once: it sits inside the unhedged window between leg A's
+    fill and leg B's submission, where ~62s of backoff is worse than an
+    unproven mapping (which merely proceeds unlatched). Both readers share one
+    parse, _read_position, so only the retry policy differs.
 
     Money units in this module: contract prices are DOLLARS (float, or Decimal
     on the V2 price path), balances and order costs are integer CENTS, and the
@@ -82,10 +106,12 @@ Notes:
 
     The V2 NO-leg mapping (an `ask` on the YES book opening a NO position) is
     doc-derived and cannot be proven offline, so the FIRST V2 leg-A fill of
-    each process is checked against the account's signed position
-    (_confirm_v2_no_mapping): a non-negative sign disproves the mapping and
-    stops the pair at "manual_review" with leg B unsubmitted and leg A
-    deliberately left in place. A process-lifetime latch
+    each process is checked against the account's signed position DELTA across
+    that fill (_confirm_v2_no_mapping): any movement other than -spec.x
+    disproves the mapping and stops the pair at "manual_review" with leg B
+    unsubmitted and leg A deliberately left in place. It is a delta, never an
+    absolute sign — an unrelated holding in the same ticker would otherwise
+    both fake a disproof and mask a real one. A process-lifetime latch
     (_V2_NO_MAPPING_CONFIRMED) keeps the cost at one extra positions read per
     run.
 
@@ -121,13 +147,15 @@ from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
 
-from ._http import fetch_json_page, signed_request_json
+from ._http import api_call_with_retry, fetch_json_page, signed_request_json
 from .auth import read_shard_balances
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+    TRADER_MAX_WORKERS,
     TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS,
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
@@ -137,6 +165,14 @@ from .config import (
 from .reporter import TradeResult
 from .scanner import tick_size_for_price, validate_pair_price
 from .strategy import TradeSpec
+
+# Tolerance for comparing position deltas against whole-contract expectations.
+# Contract counts are always whole numbers on the wire, but the API now sends
+# them as the `position_fp` STRING, which _position_count parses with float() —
+# so an exact `delta == -spec.x` comparison would be at the mercy of decimal
+# round-tripping. Any real mismatch is at least one whole contract, many orders
+# of magnitude above this epsilon.
+_DELTA_EPS = 1e-6
 
 # Side each order leg takes on Kalshi's SINGLE YES order book, where every
 # order is quoted in YES terms:
@@ -191,6 +227,12 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     Kalshi rejects (FoK) any fill that would cost more, so a book that moved
     against us since the pre-execution check cannot fill at a guaranteed loss.
 
+    The product is rounded to 6 decimals before the ceiling, the same idiom as
+    config.fee_leg_exact(): binary float noise (7 * 0.07 * 100 =
+    49.000000000000006) would otherwise ceil to an extra cent and LOOSEN the
+    cap. Removing that cent tightens price protection — the cap can only ever
+    become stricter than before, never more permissive.
+
     Args:
         count (int): Number of contracts on this leg. >= 1.
         price_dollars (float): Scanned per-contract price in dollars (0, 1).
@@ -198,7 +240,41 @@ def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
     Returns:
         int: Maximum total cost in cents for the order.
     """
-    return math.ceil(count * price_dollars * 100) + count * BUY_MAX_COST_SLIPPAGE_CENTS
+    # Round before the ceiling so float noise can't buy the order an extra cent
+    # of headroom; this TIGHTENS the cap (stricter price protection).
+    return (
+        math.ceil(round(count * price_dollars * 100, 6))
+        + count * BUY_MAX_COST_SLIPPAGE_CENTS
+    )
+
+
+def _rollback_floor_cents(spec: TradeSpec) -> int:
+    """
+    Minimum acceptable per-contract NO sale price (cents) for a leg-A unwind.
+
+    The unwind is a fill-or-kill LIMIT sell rather than a market sell, so a book
+    that has collapsed since leg A filled kills the order instead of realizing
+    an unbounded loss. The floor is leg A's scanned NO entry price less
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, clamped into the API's valid limit
+    price range (1..99 cents inclusive) — an entry near either extreme would
+    otherwise produce a price the exchange rejects outright.
+
+    A killed unwind leaves the leg-A position open, which _rollback_leg_a
+    reports as status="rollback_failed" for manual review: the same outcome an
+    unfilled market unwind already produced, now with a bounded loss instead of
+    whatever the book happened to offer.
+
+    Args:
+        spec (TradeSpec): The trade being unwound. Uses spec.pair.nA, leg A's
+            scanned NO entry price in dollars (0, 1).
+
+    Returns:
+        int: Limit price in cents, always within [1, 99].
+    """
+    # round() BEFORE int: nA is a cent-quantized book price carried as a float,
+    # so int() alone would truncate 0.57 stored as 0.5699999999999998 to 56.
+    entry_cents = int(round(spec.pair.nA * 100))
+    return max(1, min(99, entry_cents - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT))
 
 
 def _legacy_routable(spec: TradeSpec) -> bool:
@@ -419,36 +495,95 @@ def _v2_limit_price(leg: str, scanned_price_dollars: float, market: Any) -> Deci
     return min(max(price, bottom_tick), Decimal("1") - top_tick)
 
 
-def _v2_rollback_price(market: Any) -> Decimal:
+def _v2_top_of_grid_price(market: Any) -> Decimal:
     """
-    Compute the aggressive limit price for a V2 reduce-only unwind bid.
+    Highest tradeable bid level on one market's own tick grid, in dollars.
 
-    The legacy path unwound with a type="market" order carrying no price cap;
-    V2 has no market type, so the emulation is a fill-or-kill bid at the
-    HIGHEST TRADEABLE LEVEL of this market's own grid — it crosses any resting
-    ask the way the market order did. That level depends on the tick regime:
-    0.99 on a linear-cent grid, 0.999 on deci-cent, 0.9999 on a
-    centi-cent edge band. A flat 0.99 (valid only on the coarsest grid) would
-    fail to cross asks resting in (0.99, 1) on sub-cent regimes, turning an
-    unwind the legacy market order always filled into a structurally killed
-    FoK and an orphaned position.
+    config.V2_ROLLBACK_BID_PRICE_DOLLARS is the finest-grid target ($0.0001
+    ticks); this floors it onto the grid of the band that contains it — floor,
+    not ceiling, because rounding up would leave the open unit interval (1 is a
+    settlement value, not a tradeable level). The result is 0.99 on a
+    linear-cent grid, 0.999 on deci-cent, 0.9999 on a centi-cent edge band.
 
-    config.V2_ROLLBACK_BID_PRICE_DOLLARS is the finest-grid target; it is
-    FLOORED onto the grid of the band containing it — floor, not ceiling,
-    because rounding up would leave the open unit interval (1 is a settlement
-    value, not a tradeable level).
+    Split out of _v2_rollback_price so the top-of-grid level has ONE definition:
+    the rollback uses it as the upper clamp on its loss-floored bid, and the
+    human-run V2 probe's unfillable-ask step submits at exactly this level.
+    (Named without the module reference on purpose — a pipeline module must
+    stay textually as well as structurally free of that tool; a test asserts
+    it.) A flat 0.99 would fail to cross asks resting in (0.99, 1) on sub-cent
+    regimes.
 
     Args:
-        market (Any): The market whose position is being unwound. Any object
-            exposing price_level_structure / price_ranges.
+        market (Any): The market whose grid to use. Any object exposing
+            price_level_structure / price_ranges.
 
     Returns:
-        Decimal: The highest valid bid level on this market's grid at the top
-            of the book.
+        Decimal: The highest valid price level on this market's grid.
     """
     target = Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS)
     tick = tick_size_for_price(market, float(target))
     return (target / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+
+
+def _v2_rollback_price(spec: TradeSpec) -> Decimal:
+    """
+    Compute the LOSS-FLOORED limit price for a V2 reduce-only unwind bid.
+
+    The legacy path unwinds with a floored fill-or-kill LIMIT sell at
+    _rollback_floor_cents(spec) — leg A's scanned NO entry less
+    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT. V2 has no market type and no sell
+    side on the single YES book: a held NO position is a short YES, so the
+    unwind is a YES BUY and the very same bound becomes a bid CEILING, since
+    paying MORE for the YES buy-back is exactly what losing more on the unwind
+    means. The two paths therefore express one bound:
+
+        legacy floor (NO sell)  =  floor_cents / 100
+        V2 cap      (YES bid)   =  1 - floor_cents / 100
+
+    A book that has collapsed past the bound kills the FoK on either path
+    rather than realizing an unbounded loss; the orphaned leg-A position then
+    surfaces as status="rollback_failed" for manual review.
+
+    Two roundings, both deliberate:
+
+      * The cap is CEILING-quantized onto the grid of the band that actually
+        contains it (the band-edge re-quantization idiom from _v2_limit_price;
+        Kalshi's nested grids make the snap a no-op when the price lands in a
+        finer band). Ceiling loosens the loss bound by strictly under one
+        destination-band tick. That direction is chosen on purpose: a
+        floor-quantized off-grid cap would sit BELOW every valid level in its
+        band and structurally kill the unwind — the exact orphaned-position
+        failure this whole path exists to avoid — whereas sub-tick slack costs
+        at most a fraction of a cent per contract.
+      * config.V2_ROLLBACK_BID_PRICE_DOLLARS is the top-of-grid CLAMP, FLOORED
+        onto its band (floor, not ceiling, because rounding up would leave the
+        open unit interval — 1 is a settlement value, not a tradeable level).
+        It binds when leg A's entry is low enough that 1 - floor exceeds the
+        highest tradeable level, and it is grid-aware for the same reason
+        _v2_limit_price's clamp is: the top level is 0.99 on a linear-cent
+        grid, 0.999 on deci-cent, 0.9999 on a centi-cent edge band. A flat 0.99
+        would fail to cross asks resting in (0.99, 1) on sub-cent regimes.
+
+    Args:
+        spec (TradeSpec): The trade whose leg A is being unwound. Uses
+            spec.pair.nA (leg A's scanned NO entry, dollars) for the loss floor
+            and spec.pair.market_a for the tick grid.
+
+    Returns:
+        Decimal: The bid price in dollars — a valid grid point, no higher than
+            the loss-floored cap and no higher than the market's top tradeable
+            level.
+    """
+    market = spec.pair.market_a
+    # Same bound as the legacy limit sell, mirrored onto the YES book: a NO
+    # sale at floor cents is a YES buy-back at (1 - floor) dollars
+    cap = Decimal("1") - Decimal(_rollback_floor_cents(spec)) / Decimal("100")
+    # Re-quantize onto the grid of the band the cap actually sits in — ceiling,
+    # because a floored off-grid cap would sit below every level in its band
+    # and kill the unwind outright (see docstring)
+    cap = _ceil_to_tick(cap, tick_size_for_price(market, float(cap)))
+    # Top-of-grid clamp: the highest level this market can actually quote
+    return min(cap, _v2_top_of_grid_price(market))
 
 
 def _format_price(p: Decimal) -> str:
@@ -574,17 +709,18 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
     A held NO position is a short YES, so closing it is a YES BUY — a BID, not
     a sell. reduce_only guarantees the order can only close existing exposure,
     so it is safe to submit even when leg A's fill state is ambiguous (it cannot
-    open a new position). V2 has no "market" type, so a bid at the highest
-    tradeable level of this market's own grid (_v2_rollback_price) is what
-    emulates the legacy market unwind: it crosses any resting ask, giving the
-    fill_or_kill order the same chance of filling the old market order had. The
-    bid/reduce-only semantics here are part of the mapping to verify at the
-    first live unwind.
+    open a new position). V2 has no "market" type, so the bid carries the SAME
+    bounded-loss protection the legacy limit sell does: _v2_rollback_price caps
+    it at 1 - (leg A's scanned entry less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT),
+    clamped by this market's own top tradeable level. A book that collapsed
+    since leg A filled kills the fill_or_kill order instead of buying the YES
+    short back at any price. The bid/reduce-only semantics here are part of the
+    mapping to verify at the first live unwind.
 
     Args:
         spec (TradeSpec): The trade whose leg A must be unwound. Uses
-            spec.pair.market_a for the ticker, tick grid and exchange shard,
-            and spec.x for the count.
+            spec.pair.nA and spec.pair.market_a for the floored bid price, the
+            ticker and exchange shard, and spec.x for the count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -594,9 +730,9 @@ def _build_rollback_order_v2(spec: TradeSpec) -> dict:
         # Client-generated idempotency key — see _build_no_order_v2
         "client_order_id": str(uuid.uuid4()),
         "side": _V2_LEG_SIDE["close_no"],
-        # Highest tradeable level on THIS market's grid — emulates the legacy
-        # capless market-order unwind (see _v2_rollback_price)
-        "price": _format_price(_v2_rollback_price(spec.pair.market_a)),
+        # Loss-floored bid cap on THIS market's grid — the same bounded-loss
+        # protection the legacy limit sell carries (see _v2_rollback_price)
+        "price": _format_price(_v2_rollback_price(spec)),
         "count": _format_count(spec.x),
         "time_in_force": "fill_or_kill",
         # Market A's own shard — the unwind must route to the same shard the
@@ -765,12 +901,19 @@ def _build_rollback_order_any(spec: TradeSpec) -> Any:
     """
     Build the leg-A unwind order for the configured API version.
 
+    Both paths carry the SAME bounded-loss protection, expressed in each
+    endpoint's own terms: neither is ever an unpriced market order, because
+    an unpriced unwind of a collapsed book realizes an unbounded loss.
+    See _rollback_floor_cents (the shared bound) and _v2_rollback_price (its
+    YES-book mirror).
+
     Args:
         spec (TradeSpec): The trade whose leg A must be unwound.
 
     Returns:
-        Any: A V2 reduce-only bid body when config.ORDER_API_VERSION is "v2",
-            otherwise a legacy reduce-only market sell CreateOrderRequest.
+        Any: A V2 reduce-only floored bid body when config.ORDER_API_VERSION is
+            "v2", otherwise a legacy reduce-only floored FoK limit sell
+            CreateOrderRequest.
     """
     if ORDER_API_VERSION == "v2":
         return _build_rollback_order_v2(spec)
@@ -778,7 +921,11 @@ def _build_rollback_order_any(spec: TradeSpec) -> Any:
         ticker=spec.pair.market_a.ticker,
         side="no",
         action="sell",
-        type="market",
+        # Limit, not market: only a limit order can carry a proceeds floor
+        type="limit",
+        # Floor the unwind: fill at >= (entry - max accepted loss) or not at
+        # all. See ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT in config.py.
+        no_price=_rollback_floor_cents(spec),
         count=spec.x,
         time_in_force="fill_or_kill",
         # Can only reduce an existing position — never opens a short even if
@@ -814,14 +961,15 @@ def _submit_any(client: Any, order: Any) -> str:
     return _submit_order(client, order)
 
 
-def _position_count(client: Any, ticker: str) -> float | None:
+def _read_position(client: Any, ticker: str) -> float:
     """
-    Fetch the signed contract position for one ticker, or None if the lookup fails.
+    Fetch and parse the signed contract position for one ticker, once.
 
-    Used to disambiguate order-submission exceptions: an exception does not
-    prove the order was rejected (a timeout can arrive after the fill), so the
-    account's actual position is the ground truth. Kalshi convention: negative
-    counts are NO contracts, positive counts are YES contracts.
+    The single place the positions wire format is decoded, so the retried
+    (_position_count) and single-shot (_position_count_once) readers can never
+    drift apart in how they interpret a page. This function performs exactly
+    ONE HTTP GET and does not swallow anything — its callers decide what a
+    failure means.
 
     Uses the raw-response variant + JSON parsing because the pinned SDK's
     MarketPosition model requires legacy integer fields the API stopped
@@ -831,28 +979,133 @@ def _position_count(client: Any, ticker: str) -> float | None:
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
+        ticker (str): Market ticker to look up; also the server-side filter, so
+            a single page is guaranteed to contain it if a position exists.
+
+    Returns:
+        float: Signed contract count (0 when the account holds nothing in this
+            ticker; may be fractional because position_fp is float-parsed).
+
+    Raises:
+        Exception: Any transport, HTTP (ApiException on non-2xx) or parse
+            error. Callers translate this into "state unknown".
+    """
+    data = fetch_json_page(
+        client.get_positions_without_preload_content, ticker=ticker
+    )
+    for pos in data.get("market_positions") or []:
+        if pos.get("ticker") == ticker:
+            # position_fp is the signed contract count the API now sends;
+            # fall back to the legacy integer field if it ever reappears
+            raw = pos.get("position_fp")
+            if raw is None:
+                raw = pos.get("position")
+            return float(raw)
+    return 0
+
+
+def _position_count_once(client: Any, ticker: str) -> float | None:
+    """
+    Single-shot, deliberately UNRETRIED signed position read for one ticker.
+
+    Same parse as _position_count (both go through _read_position) but with no
+    backoff at all: exactly one request, then success or None. It exists for
+    callers whose latency budget is bounded by something other than the read —
+    the same reasoning _await_transfer_settlement uses for its single-shot
+    balance reads. The one caller today is _confirm_v2_no_mapping, which runs
+    inside the window where leg A is filled and unhedged: api_call_with_retry
+    can hold a single call for ~62s of sleeps during a 429 storm, and because a
+    failing endpoint never latches the mapping, EVERY V2 trade in such a storm
+    would pay that stall with a naked leg-A position open. One failed read
+    costs the mapping check nothing (it proceeds unlatched and re-arms).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        ticker (str): Market ticker to look up.
+
+    Returns:
+        float | None: Signed contract count, or None when the single attempt
+            failed and the state is unknown.
+    """
+    try:
+        return _read_position(client, ticker)
+    except Exception as exc:
+        logging.warning(
+            "Single-shot position lookup failed for %s: %s", ticker, exc
+        )
+        return None
+
+
+def _position_count(client: Any, ticker: str) -> float | None:
+    """
+    Fetch the signed contract position for one ticker, or None if the lookup fails.
+
+    Used to disambiguate order-submission exceptions: an exception does not
+    prove the order was rejected (a timeout can arrive after the fill), so the
+    account's actual position is the ground truth. Kalshi convention: negative
+    counts are NO contracts, positive counts are YES contracts.
+
+    The returned number is the account's ABSOLUTE holding, which may include
+    contracts this bot never bought (an earlier run, or a manual trade).
+    Callers therefore never interpret a single reading: _execute_one snapshots
+    before and after each submission and attributes only the DELTA (see
+    _fill_delta). A single reading is meaningful only as a baseline.
+
+    Parsing and the wire-format quirks live in _read_position (the pinned SDK's
+    MarketPosition model can no longer deserialize live pages); this function
+    adds the retry policy on top of it.
+
+    The read goes through api_call_with_retry because it is a read-only GET:
+    the project's no-retry rule covers order submission only, and retrying a
+    GET cannot duplicate a trade. Without the retry a single transient 429 here
+    reads as "state unknown" and escalates a recoverable ambiguity into a
+    rollback or manual_review. The single-shot sibling _position_count_once is
+    for the one caller that cannot afford the backoff (see its docstring).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
         ticker (str): Market ticker to look up.
 
     Returns:
         float | None: Signed contract count (0 = confirmed no position; may be
-            fractional — callers only test zero/non-zero), or None when the
-            lookup itself failed and the state remains unknown.
+            fractional because position_fp is float-parsed), or None when the
+            lookup itself failed on every attempt and the state is unknown.
     """
     try:
-        # Filter server-side by ticker so a single page is guaranteed to contain it
-        data = fetch_json_page(client.get_positions_without_preload_content, ticker=ticker)
-        for pos in data.get("market_positions") or []:
-            if pos.get("ticker") == ticker:
-                # position_fp is the signed contract count the API now sends;
-                # fall back to the legacy integer field if it ever reappears
-                raw = pos.get("position_fp")
-                if raw is None:
-                    raw = pos.get("position")
-                return float(raw)
-        return 0
+        # Retried: read-only GET, so the no-retry rule (order submission only)
+        # does not apply, and a transient 429 must not be mistaken for
+        # "position unknown" — see _execute_one's ambiguity handling.
+        return api_call_with_retry(_read_position, client, ticker)
     except Exception as exc:
         logging.warning("Position lookup failed for %s: %s", ticker, exc)
         return None
+
+
+def _fill_delta(before: float | None, after: float | None) -> float | None:
+    """
+    Signed position change attributable to one order, or None if unknown.
+
+    The account's absolute position is not evidence about a specific order —
+    it may already hold contracts in the same ticker from an earlier run or a
+    manual trade. The change across the submission is, provided both readings
+    succeeded. Either reading being None (the lookup failed after retries)
+    makes the delta unknowable, and the caller must treat that as unknown
+    state rather than as zero.
+
+    Args:
+        before (float | None): Signed position immediately before submission,
+            or None if that lookup failed.
+        after (float | None): Signed position after the ambiguous submission,
+            or None if that lookup failed.
+
+    Returns:
+        float | None: after - before, or None when either snapshot is missing.
+            Deltas produced by real fills are whole contracts, but callers
+            compare with _DELTA_EPS because position_fp is float-parsed.
+    """
+    if before is None or after is None:
+        return None
+    return after - before
 
 
 def _submit_order(client: Any, order: CreateOrderRequest) -> str:
@@ -869,6 +1122,9 @@ def _submit_order(client: Any, order: CreateOrderRequest) -> str:
 
     Deliberately NOT wrapped in api_call_with_retry: retrying a FoK order
     could double-submit a leg at a different price (see module docstring).
+    _position_count in this same module IS wrapped — do not "unify" the two:
+    that asymmetry is the rule, not an oversight. A GET can be repeated
+    harmlessly; a state-changing POST cannot.
     fetch_json_page raises ApiException on non-2xx just like the modeled call
     did, so callers' exception handling is unchanged.
 
@@ -892,13 +1148,27 @@ def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
     """
     Close the leg-A NO position to unwind a half-filled pair, verifying the fill.
 
-    The unwind is a reduce-only market sell on the legacy path and a reduce-only
-    aggressive bid on V2 (closing a NO position is buying back the YES short);
-    reduce_only guarantees either can only close an existing position, so it is
-    safe to submit even when leg A's fill state is ambiguous (it cannot open new
-    exposure). The rollback's own FoK status IS checked: an unfilled rollback
-    means the leg-A position is still open, which is reported as
-    status="rollback_failed" for manual review — never silently as "rolled_back".
+    The unwind is LOSS-FLOORED on BOTH order paths — never an unpriced market
+    order. An unpriced unwind has no proceeds floor at all (the SDK's
+    CreateOrderRequest exposes no such knob, and V2 has no market type), so a
+    book that collapsed between leg A's fill and the unwind would realize an
+    arbitrarily large loss. The bound is _rollback_floor_cents() — leg A's
+    scanned entry less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — expressed as:
+      * legacy: a fill-or-kill LIMIT sell at that NO price directly;
+      * V2:     a reduce-only YES BID (closing a NO position is buying back the
+                YES short) capped at 1 - floor, ceiling-quantized onto the
+                market's tick grid — see _v2_rollback_price.
+    Either way the unwind recovers at least that much per contract or does not
+    happen.
+
+    reduce_only guarantees either form can only close an existing position, so
+    it is safe to submit even when leg A's fill state is ambiguous (it cannot
+    open new exposure). The rollback's own FoK status IS checked: an unfilled
+    rollback — including one killed by the price floor — means the leg-A
+    position is still open, which is reported as status="rollback_failed" for
+    manual review, never silently as "rolled_back". That is the same path an
+    unfilled market unwind already took, so the caller's contract is unchanged;
+    only the loss is now bounded.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -908,10 +1178,12 @@ def _rollback_leg_a(client: Any, spec: TradeSpec, reason: str) -> TradeResult:
 
     Returns:
         TradeResult: status="rolled_back" when the unwind filled,
-            status="rollback_failed" when it did not fill or raised.
+            status="rollback_failed" when it did not fill (rejected, or killed
+            by the price floor) or raised.
     """
-    # Version-dispatched build: a reduce-only bid on V2, a reduce-only market
-    # sell on the legacy path — both close the leg-A NO position
+    # Version-dispatched build: a reduce-only floored bid on V2, a reduce-only
+    # floored limit sell on the legacy path — both close the leg-A NO position
+    # under the same ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT bound
     rollback = _build_rollback_order_any(spec)
     try:
         # Raw-response / signed submission — see _submit_order and
@@ -965,7 +1237,7 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
         return []
 
     valid = []
-    with ThreadPoolExecutor(max_workers=min(8, len(portfolio))) as pool:
+    with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(portfolio))) as pool:
         future_to_spec = {
             pool.submit(validate_pair_price, client, spec): spec for spec in portfolio
         }
@@ -1479,15 +1751,28 @@ def ensure_shard_collateral(
     return kept
 
 
-def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
+def _confirm_v2_no_mapping(
+    client: Any, spec: TradeSpec, before_a: float | None,
+) -> TradeResult | None:
     """
     Verify, once per process, that a filled V2 NO buy really opened a NO position.
 
     This is the runtime backstop on the one thing about the V2 order path that
     cannot be proven offline: _V2_LEG_SIDE's doc-derived hypothesis that an
     `ask` on the single YES book OPENS a NO position (a short YES IS a long
-    NO). Kalshi's positions ledger is signed, so the evidence is simply the
-    sign of the position after the fill — negative is NO, positive is YES.
+    NO). Kalshi's positions ledger is signed, so the evidence is how the
+    account's signed position MOVED across the fill: our x-contract NO buy must
+    push it by exactly -spec.x.
+
+    The evidence is the DELTA, never the absolute holding — the module's
+    standing rule (see _fill_delta). The absolute sign is not evidence about
+    this order: an account already long +100 YES on market A that buys 10 NO
+    nets +90, a positive reading that would have declared the mapping disproven
+    and stopped the pair at manual_review with a real unhedged leg A; and an
+    account already short -100 masks a genuinely wrong mapping, latching a
+    false confirmation for the rest of the process. Both directions are wrong,
+    so the baseline taken before leg A was submitted is passed in and the delta
+    is what is judged.
 
     Called by _execute_one() immediately after leg A's ("buy NO") FoK reports
     filled and BEFORE leg B is submitted, so a disproven mapping is caught with
@@ -1497,25 +1782,38 @@ def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
     rather than once per trade — it is a property of the exchange, not of a
     particular trade.
 
+    The position read here is _position_count_once — SINGLE-SHOT, never
+    retried, unlike every other position read in this module. It is the one
+    blocking call inside the window where leg A is filled and unhedged, and
+    api_call_with_retry's backoff can hold one call for ~62s of sleeps; worse,
+    a failing endpoint never latches, so in a 429 storm EVERY V2 trade would
+    pay that stall with a naked leg A. Same trade-off, and the same idiom, as
+    _await_transfer_settlement's single-shot balance reads: a failed read costs
+    nothing here, because "unknown" already means "proceed unlatched".
+
     Three outcomes:
-      * position < 0  -> hypothesis holds; latch it and proceed to leg B.
-      * position >= 0 -> hypothesis DISPROVEN live. Return a manual_review
+      * delta ~= -spec.x -> hypothesis holds; latch it and proceed to leg B.
+      * any other delta -> hypothesis DISPROVEN live. Return a manual_review
         result: leg B is not submitted (it would hedge a position we do not
         actually hold) and leg A is deliberately NOT auto-unwound, because the
         unwind is a bid resting on the SAME mapping hypothesis, so an
         automated unwind could double the error rather than reverse it. The
         rollback's reduce_only flag would make a wrong unwind fail safe into
         "rollback_failed", but a human — not the bot — must decide what to do
-        with a position whose very sign contradicts our model. This is the
-        module's standing manual_review philosophy: never act automatically on
-        a state we cannot model. Remedy: set config.ORDER_API_VERSION =
-        "legacy", the instant rollback to the endpoint whose side mapping is
-        already proven.
-      * lookup failed (None) -> unknown, NOT disproven. Warn and proceed
-        WITHOUT latching, so the next V2 NO fill re-arms the check. One flaky
-        positions read must not stall trading, and the fill itself was already
-        confirmed by the FoK response, so proceeding leaves the trade no more
-        ambiguous than it already was.
+        with a position that moved in a way our model cannot explain. This is
+        the module's standing manual_review philosophy: never act
+        automatically on a state we cannot model. Remedy: set
+        config.ORDER_API_VERSION = "legacy", the instant rollback to the
+        endpoint whose side mapping is already proven.
+      * delta unknown (None — either snapshot missing) -> unknown, NOT
+        disproven. Warn and proceed WITHOUT latching, so the next V2 NO fill
+        re-arms the check. One flaky positions read must not stall trading, and
+        the fill itself was already confirmed by the FoK response, so
+        proceeding leaves the trade no more ambiguous than it already was.
+
+    A delta of exactly zero gets one short pause and a re-read before being
+    judged: genuine disproof moves the position the wrong way, while a
+    momentarily unchanged ledger is usually read-after-write lag.
 
     Concurrency: execute_trades() runs pairs in parallel, so two trades can
     reach this before either latches — that costs a duplicate positions read
@@ -1525,7 +1823,12 @@ def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade whose leg A just filled; its
-            spec.pair.market_a ticker is the one looked up.
+            spec.pair.market_a ticker is the one looked up and spec.x is the
+            contract count the delta must match.
+        before_a (float | None): Market A's signed position as read BEFORE leg
+            A was submitted (_execute_one's up-front baseline), or None if that
+            baseline lookup failed — in which case no delta is knowable and the
+            check proceeds unlatched.
 
     Returns:
         TradeResult | None: None when the caller should proceed to leg B
@@ -1539,55 +1842,56 @@ def _confirm_v2_no_mapping(client: Any, spec: TradeSpec) -> TradeResult | None:
     if ORDER_API_VERSION != "v2" or _V2_NO_MAPPING_CONFIRMED:
         return None
     ticker = spec.pair.market_a.ticker
-    # Ground truth for the mapping: the account's own signed position
-    pos = _position_count(client, ticker)
-    if pos is None:
+    # Ground truth for the mapping: how the account's own signed position
+    # MOVED across the fill. Single-shot on purpose — see the docstring.
+    delta = _fill_delta(before_a, _position_count_once(client, ticker))
+    if delta is None:
         logging.warning(
-            "Could not verify the V2 NO-leg position sign on %s — proceeding"
+            "Could not verify the V2 NO-leg position delta on %s — proceeding"
             " unlatched; the leg-A fill itself was confirmed by the order"
             " response, and the check re-arms on the next V2 NO fill",
             ticker,
         )
         return None
-    if pos == 0:
-        # A read of exactly zero right after a confirmed fill is ambiguous:
-        # genuine disproof looks like a POSITIVE position (the ask opened YES
-        # exposure), while zero can simply be read-after-write lag in the
-        # positions ledger. One short pause and a re-read separates the two —
-        # without it, ledger lag on an unattended run would falsely halt the
-        # pair at manual_review with a real, unhedged leg-A position open.
+    if abs(delta) < _DELTA_EPS:
+        # A delta of exactly zero right after a confirmed fill is ambiguous:
+        # genuine disproof MOVES the position (the wrong way), while an
+        # unchanged ledger can simply be read-after-write lag. One short pause
+        # and a re-read separates the two — without it, ledger lag on an
+        # unattended run would falsely halt the pair at manual_review with a
+        # real, unhedged leg-A position open.
         time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
-        pos = _position_count(client, ticker)
-        if pos is None:
+        delta = _fill_delta(before_a, _position_count_once(client, ticker))
+        if delta is None:
             logging.warning(
-                "V2 NO-leg re-read failed on %s after a zero first read —"
+                "V2 NO-leg re-read failed on %s after a zero first delta —"
                 " proceeding unlatched; the check re-arms on the next fill",
                 ticker,
             )
             return None
-    if pos < 0:
+    if abs(delta + spec.x) < _DELTA_EPS:
         _V2_NO_MAPPING_CONFIRMED = True
         logging.info(
-            "V2 NO-leg mapping confirmed live: the NO buy produced a short-YES"
-            " (negative) position %s on %s — not re-checked this process",
-            pos, ticker,
+            "V2 NO-leg mapping confirmed live: the NO buy moved the position on"
+            " %s by %s (our %d NO buy, short-YES by Kalshi's signed convention)"
+            " — not re-checked this process",
+            ticker, delta, spec.x,
         )
         return None
     logging.critical(
-        "V2 NO-LEG MAPPING DISPROVEN on %s — leg A's ask did not produce a"
-        " negative YES position: expected negative NO exposure, got %s. NOT"
-        " submitting leg B and NOT auto-unwinding (the unwind is a bid resting"
-        " on the same disproven hypothesis, so it could double the error). A"
-        " human must flatten this account position; set"
-        " config.ORDER_API_VERSION = \"legacy\" to revert to the proven order"
-        " path.",
-        ticker, pos,
+        "V2 NO-LEG MAPPING DISPROVEN on %s — leg A's ask did not open NO"
+        " exposure: expected a position delta of %d, got %s. NOT submitting leg"
+        " B and NOT auto-unwinding (the unwind is a bid resting on the same"
+        " disproven hypothesis, so it could double the error). A human must"
+        " flatten this account position; set config.ORDER_API_VERSION ="
+        " \"legacy\" to revert to the proven order path.",
+        ticker, -spec.x, delta,
     )
     return TradeResult(
         spec=spec, status="manual_review",
         error=(
-            f"V2 NO-leg mapping disproven: position sign non-negative after"
-            f" NO-leg fill (position {pos} on {ticker}); leg B not submitted"
+            f"V2 NO-leg mapping disproven: position delta {delta} after the"
+            f" NO-leg fill on {ticker}, expected {-spec.x}; leg B not submitted"
             f" and leg A not unwound"
         ),
     )
@@ -1599,19 +1903,35 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     Submits leg A (NO on market A) first via fill_or_kill. If it fills, submits
     leg B (YES on market B) via fill_or_kill. If leg B fails, immediately submits
-    a reduce-only order closing the leg A contracts to unwind the position and
-    verifies that the rollback itself filled. Which endpoint each order goes to
-    is decided by config.ORDER_API_VERSION inside the _*_any dispatchers; every
-    status and safety rule below is identical on both paths.
+    a reduce-only, LOSS-FLOORED fill-or-kill order closing the leg A contracts to
+    unwind the position (see _rollback_leg_a) and verifies that the rollback
+    itself filled. Which endpoint each order goes to is decided by
+    config.ORDER_API_VERSION inside the _*_any dispatchers; every status and
+    safety rule below is identical on both paths.
 
     A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
     however, is ambiguous — the order may have filled before a timeout — so
-    exception paths check the account's actual position for the ticker:
-    leg A ambiguous with a position (or unknown state) is unwound; leg B
-    ambiguous with a confirmed position means the pair actually completed.
-    Leg B ambiguous with an UNKNOWN position (the lookup itself failed) is
-    never auto-rolled-back — an automated unwind could reverse a real fill
-    that we simply couldn't confirm — and is instead surfaced as
+    exception paths attribute the outcome by POSITION DELTA: baseline positions
+    for BOTH tickers are read up front, before any order is submitted, and are
+    compared with a reading taken after the exception. Only the change is
+    evidence about this order; the absolute holding is not, because the account
+    may already hold contracts in the same ticker from an earlier run or a
+    manual trade. Both baselines are taken before leg A precisely so that no
+    blocking network call sits between leg A's fill and leg B's submission —
+    that gap is the unhedged window.
+
+    Leg A ambiguous resolves as: delta 0 → confirmed non-fill, status="failed";
+    delta of exactly -spec.x (our NO buy) → unwind via _rollback_leg_a. Anything
+    else — the lookup failed, or the position moved by an amount this order
+    cannot explain — is status="manual_review" with NO automated unwind: a
+    reduce_only sell against a position this order may not own would liquidate
+    an unrelated holding.
+
+    Leg B ambiguous resolves as: delta of exactly +spec.y → the pair actually
+    completed, status="executed"; delta 0 → confirmed non-fill, roll leg A
+    back. Anything else — including an UNKNOWN state because the lookup itself
+    failed — is never auto-rolled-back (an automated unwind could reverse a
+    real fill we simply couldn't confirm) and is surfaced as
     status="manual_review" for a human to check the account.
 
     While the LEGACY order path is selected, a pair with a leg on a shard that
@@ -1621,7 +1941,8 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     body routes itself via its own market's exchange_index.
 
     On the V2 path the first leg-A fill of the process is also checked against
-    the account's position sign (see _confirm_v2_no_mapping) — a wrong sign
+    the account's position DELTA across that fill (see _confirm_v2_no_mapping,
+    which reuses the same up-front baseline) — any movement other than -spec.x
     disproves the unverified NO-leg mapping and stops the pair at
     "manual_review" before leg B is submitted.
 
@@ -1632,9 +1953,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: With status "executed", "failed", "rolled_back",
             "rollback_failed" (unwind did not fill — orphaned position needing
-            manual review), or "manual_review" (leg B's fill state could not be
-            determined, or the V2 NO-leg mapping was disproven — in both cases
-            no automated action was taken).
+            manual review), or "manual_review" (a leg's fill state could not be
+            attributed to this order, or the V2 NO-leg mapping was disproven —
+            in every such case no automated action was taken).
     """
     # Legacy-mode shard guard — must run before ANY order is built or sent.
     # Markets are tagged with their shard at ingest, but the legacy order
@@ -1665,7 +1986,26 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     mA_title = spec.pair.market_a.title or spec.pair.market_a.ticker
     mB_title = spec.pair.market_b.title or spec.pair.market_b.ticker
 
+    # Baselines for BOTH legs are read up front, before either order is
+    # submitted, so an ambiguous outcome is judged by how the position MOVED
+    # rather than by what the account happens to hold (which may predate this
+    # bot entirely). Leg B's baseline is equally valid here — it reads a
+    # different ticker, and no fill on market B can have happened yet — and
+    # taking it now means no RETRYABLE network call sits between leg A's fill
+    # and leg B's submission. Reading it after leg A filled put a retryable
+    # lookup (up to ~62s of backoff) inside the window where the account holds
+    # an unhedged NO position on market A. One exception, by design: on the V2
+    # path, until the NO-leg mapping latches, _confirm_v2_no_mapping does one
+    # SINGLE-SHOT (never retried, so bounded by a single request) position read
+    # in that window — the mapping cannot be proven any other way, and a
+    # single-shot read is the same bounded-wait idiom _await_transfer_settlement
+    # uses. It costs at most one round trip and disappears for the rest of the
+    # process once confirmed.
+    before_a = _position_count(client, spec.pair.market_a.ticker)
+    before_b = _position_count(client, spec.pair.market_b.ticker)
+
     # Submit leg A — NO on market A (version-dispatched; see _submit_any)
+    leg_a_error: str | None = None
     try:
         status_a = _submit_any(client, order_a)
         if status_a != "executed":
@@ -1679,32 +2019,72 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
                 error=f"Leg A FoK not filled: status={status_a}",
             )
     except Exception as e:
-        # Ambiguous: the order may have filled before the exception (e.g. a
-        # timeout after the fill). Consult the actual position before concluding.
-        held_a = _position_count(client, spec.pair.market_a.ticker)
-        if held_a == 0:
-            logging.error(
-                "Leg A submission failed for '%s' (no position confirmed): %s",
-                mA_title[:60], e,
-            )
-            return TradeResult(spec=spec, status="failed", error=f"Leg A error: {e}")
-        # Position exists — or lookup failed and the state is unknown. Unwind:
-        # the rollback is reduce_only, so it is harmless if nothing was filled.
-        logging.error(
-            "Leg A raised for '%s' but position=%s — unwinding: %s",
-            mA_title[:60], held_a, e,
-        )
-        return _rollback_leg_a(client, spec, f"Leg A ambiguous error: {e}")
+        leg_a_error = str(e)
 
-    # Leg A filled. On the V2 path only, and only until it has been confirmed
-    # once in this process, check that the fill really opened a NO position —
-    # a wrong sign disproves the unverified _V2_LEG_SIDE mapping, and the pair
-    # must stop here rather than hedge (or unwind) a position we do not hold.
-    backstop = _confirm_v2_no_mapping(client, spec)
+    # Disambiguation runs OUTSIDE the except block (mirroring leg B below) so
+    # the position lookup is not executed while leg A's exception is still the
+    # active one: anything raised in there would inherit it as __context__, and
+    # api_call_with_retry walks that chain — a fatal lookup error would be
+    # misread as transient and retried through the full backoff schedule
+    # (~62s) before this already-urgent decision could be made.
+    if leg_a_error is not None:
+        # Ambiguous: the order may have filled before the exception (e.g. a
+        # timeout after the fill). Attribute by delta against the baseline.
+        after_a = _position_count(client, spec.pair.market_a.ticker)
+        delta = _fill_delta(before_a, after_a)
+        if delta is not None and abs(delta) < _DELTA_EPS:
+            # Confirmed non-fill: the position did not move at all
+            logging.error(
+                "Leg A submission failed for '%s' (position unchanged — no fill): %s",
+                mA_title[:60], leg_a_error,
+            )
+            return TradeResult(
+                spec=spec, status="failed", error=f"Leg A error: {leg_a_error}",
+            )
+        if delta is not None and abs(delta + spec.x) < _DELTA_EPS:
+            # Moved by exactly -spec.x: our NO buy filled (NO contracts are
+            # negative by Kalshi convention). Unwind the now-unhedged leg.
+            logging.error(
+                "Leg A raised for '%s' but position moved by %s (our %d NO buy) —"
+                " unwinding: %s",
+                mA_title[:60], delta, spec.x, leg_a_error,
+            )
+            return _rollback_leg_a(
+                client, spec, f"Leg A ambiguous error: {leg_a_error}",
+            )
+        # Unknown (a snapshot failed) or unattributable (the position moved by
+        # an amount this order cannot explain — e.g. an unrelated trade landed
+        # in the snapshot window). Do NOT auto-trade against it: a reduce_only
+        # sell would liquidate a holding this order may not own.
+        logging.critical(
+            "Leg A raised for '%s' and the fill could NOT be attributed"
+            " (position delta=%s, expected 0 or %d) — NOT unwinding, since a"
+            " reduce-only sell could liquidate an unrelated position. Manual"
+            " review required: %s",
+            mA_title[:60], delta, -spec.x, leg_a_error,
+        )
+        return TradeResult(
+            spec=spec, status="manual_review",
+            error=f"Leg A ambiguous, delta={delta}: {leg_a_error}",
+        )
+
+    # Leg A is now a CONFIRMED fill (a clean "executed" status above, since
+    # every ambiguous outcome returned). On the V2 path only, and only until it
+    # has been confirmed once in this process, check that the fill really opened
+    # a NO position — a wrong sign disproves the unverified _V2_LEG_SIDE
+    # mapping, and the pair must stop here rather than hedge (or unwind) a
+    # position we do not hold. Placement is load-bearing: this must sit AFTER
+    # the leg-A baselines and delta block (so it never runs on an unconfirmed
+    # fill, and never displaces a baseline read) and BEFORE leg B is submitted
+    # (so a disproven mapping cannot leave a second real order behind). The
+    # leg-A baseline is handed in because the mapping is judged by the position
+    # DELTA across the fill, never by the absolute holding (see _fill_delta).
+    backstop = _confirm_v2_no_mapping(client, spec, before_a)
     if backstop is not None:
         return backstop
 
-    # Leg A filled — submit leg B — YES on market B (version-dispatched)
+    # Submit leg B — YES on market B (version-dispatched) against the baseline
+    # already taken above (see the up-front baseline comment).
     leg_b_error: str | None = None
     leg_b_ambiguous = False
     try:
@@ -1717,35 +2097,40 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     if leg_b_error:
         if leg_b_ambiguous:
-            # The exception may have arrived after the fill — check the position
-            # before rolling back leg A, or we'd reverse the unhedged exposure.
-            held_b = _position_count(client, spec.pair.market_b.ticker)
-            if held_b:  # non-zero and lookup succeeded → leg B actually filled
+            # The exception may have arrived after the fill — attribute by delta
+            # before rolling back leg A, or we'd reverse a completed hedge.
+            after_b = _position_count(client, spec.pair.market_b.ticker)
+            delta = _fill_delta(before_b, after_b)
+            if delta is not None and abs(delta - spec.y) < _DELTA_EPS:
+                # Moved by exactly +spec.y: our YES buy filled, pair complete
                 logging.warning(
-                    "Leg B raised for '%s' but position=%s — pair is complete: %s",
-                    mB_title[:60], held_b, leg_b_error,
+                    "Leg B raised for '%s' but position moved by %s (our %d YES buy)"
+                    " — pair is complete: %s",
+                    mB_title[:60], delta, spec.y, leg_b_error,
                 )
                 return TradeResult(
                     spec=spec, status="executed",
-                    error=f"Leg B ambiguous but position confirmed: {leg_b_error}",
+                    error=f"Leg B ambiguous but fill confirmed by position delta: {leg_b_error}",
                 )
-            if held_b is None:
-                # The position lookup itself failed, so leg B's fill state is
-                # genuinely unknown — it may have filled. Rolling back leg A
-                # here would be wrong if leg B actually did fill (we'd sell the
-                # hedge and be left with a naked YES position on B while the
-                # log says "rolled_back", implying flat). Do NOT auto-rollback;
+            if delta is None or abs(delta) >= _DELTA_EPS:
+                # Either the lookup failed (state genuinely unknown) or the
+                # position moved by an amount this order cannot explain. Rolling
+                # back leg A here would be wrong if leg B actually did fill (we'd
+                # sell the hedge and be left with a naked YES position on B while
+                # the log says "rolled_back", implying flat). Do NOT auto-rollback;
                 # surface for manual review instead.
                 logging.critical(
-                    "Leg B raised for '%s' and position lookup FAILED — fill "
-                    "state unknown, NOT auto-rolling-back leg A to avoid "
-                    "reversing a possible real fill. Manual review required: %s",
-                    mB_title[:60], leg_b_error,
+                    "Leg B raised for '%s' and the fill could NOT be attributed"
+                    " (position delta=%s, expected 0 or %d) — NOT auto-rolling-back"
+                    " leg A to avoid reversing a possible real fill. Manual review"
+                    " required: %s",
+                    mB_title[:60], delta, spec.y, leg_b_error,
                 )
                 return TradeResult(
                     spec=spec, status="manual_review",
-                    error=f"Leg B ambiguous and position lookup failed: {leg_b_error}",
+                    error=f"Leg B ambiguous, delta={delta}: {leg_b_error}",
                 )
+            # delta == 0 → confirmed non-fill; fall through to the rollback below
         logging.error(
             "Leg B (YES on '%s') failed after Leg A filled — attempting rollback: %s",
             mB_title[:60], leg_b_error,
@@ -1765,7 +2150,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     concurrently across specs.
 
     In live mode, each spec is handled by _execute_one(): leg A submitted first,
-    then leg B only if leg A filled, with rollback if leg B fails. All specs are
+    then leg B only if leg A filled, with a floored-limit rollback if leg B
+    fails. All specs are
     submitted concurrently via ThreadPoolExecutor so no pair waits on another.
 
     In dry_run mode, no orders are submitted. The function logs the intended trade
@@ -1783,10 +2169,11 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     Returns:
         list: List of TradeResult objects (from reporter.py), one per spec. Each
             result has status="executed" (both legs filled), "simulated" (dry run),
-            "failed" (leg A failed), "rolled_back" (leg B failed, leg A unwound),
-            "rollback_failed" (leg A unwind did not fill — orphaned position),
-            or "manual_review" (leg B's fill state could not be determined —
-            no automated rollback was attempted).
+            "failed" (leg A confirmed unfilled), "rolled_back" (leg B confirmed
+            unfilled, leg A unwound), "rollback_failed" (leg A unwind did not
+            fill — orphaned position), or "manual_review" (a leg's fill state
+            could not be attributed to this order — no automated order was
+            submitted in response).
     """
     # ThreadPoolExecutor(max_workers=0) raises ValueError, so short-circuit empty input
     if not specs:
@@ -1807,7 +2194,7 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             results.append(TradeResult(spec=spec, status="simulated"))
         return results
 
-    with ThreadPoolExecutor(max_workers=min(8, len(specs))) as pool:
+    with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
         futures = [pool.submit(_execute_one, client, spec) for spec in specs]
         results = [f.result() for f in futures]
 

@@ -44,6 +44,13 @@ Notes:
     to the original sequential walks if the API drifts. See
     fetch_all_settled_markets for the full contract.
 
+    Day-slice files come in two interchangeable formats: the legacy single
+    gzipped JSON document written by _day_store_save, and the streamed
+    "jsonl-v1" line format written by _DayStreamWriter (which is what the
+    fetch workers use, so no worker ever holds a whole UTC day — millions of
+    records at 2026-08 volumes — in memory). _day_store_load reads both; see
+    the day-store section for the routing rule.
+
     JSON parsing dominates the fetch's CPU time at current Kalshi volumes, so
     orjson is used when installed (optional `perf` extra) and the stdlib json
     module otherwise. This is purely a speed knob: orjson emits plain JSON, so
@@ -67,14 +74,18 @@ from urllib.parse import urlencode, urlparse
 from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
 from .config import (
+    ARCHIVE_MAX_BARREN_PAGES,
+    ARCHIVE_TAIL_MAX_PAGES,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
     INCLUDE_MVE_MARKETS,
+    MARKET_PAGE_SIZE,
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
     PROJECT_ROOT,
+    SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
 
@@ -320,32 +331,55 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
 
 def _load_json_cache(path: Path):
     """
-    Load and parse a JSON file from disk if it exists.
+    Load and parse a JSON file from disk if it exists, treating corruption as a miss.
+
+    A truncated or otherwise unreadable file is NOT an error: these caches are
+    written by multi-hour fetches that have historically been interrupted by
+    OOM kills and SIGKILLs, and the only safe interpretation of a half-written
+    file is "no cache" — same guarded-read philosophy as _day_store_load.
 
     Args:
         path (Path): Filesystem path to the JSON cache file.
 
     Returns:
-        Any: Parsed JSON content (typically a list or dict) if the file exists,
-            or None if the file does not exist.
+        Any: Parsed JSON content (typically a list or dict) if the file exists
+            and parses, or None if the file is absent, unreadable, or corrupt.
     """
-    if path.exists():
+    if not path.exists():
+        return None
+    try:
         return json.loads(path.read_text())
-    return None
+    except (OSError, ValueError):
+        # Truncated/corrupt file (interrupted write, OOM, SIGKILL — all
+        # documented past events for these multi-hour fetches) is a cache
+        # miss, not a crash.
+        logging.warning("Corrupt JSON cache %s — treating as cache miss", path)
+        return None
 
 
 def _save_json_cache(path: Path, data) -> None:
     """
-    Serialize data to JSON and write it to path, creating parent directories as needed.
+    Atomically serialize data to JSON at path, creating parent directories as needed.
 
-    Uses a default=str serializer to handle datetime objects that may appear in the data.
+    Uses a default=str serializer to handle datetime objects that may appear in
+    the data. The write goes to a sibling temp file that is then renamed over
+    the destination, so an interrupted run can never leave a truncated file
+    that a later run would read back and trust.
 
     Args:
         path (Path): Destination file path. Parent directories are created if absent.
         data: JSON-serializable data structure (list, dict, etc.) to write.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, default=str))
+    # Atomic tmp+replace, same idiom as _day_store_save. The tmp name is derived
+    # from the destination, so it is unique because cache paths themselves are
+    # unique (per-ticker for candlesticks, per-start-date for assembled settled
+    # markets) — the same path-uniqueness invariant that keeps the parallel
+    # candlestick fetch safe. Never introduce a fetch whose cache path is shared
+    # across workers.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, default=str))
+    tmp.replace(path)
 
 
 def _load_or_build_event_titles(
@@ -378,6 +412,15 @@ def _load_or_build_event_titles(
     Results are persisted to _EVENT_TITLES_CACHE so subsequent runs are essentially
     free. Tickers that cannot be resolved — lookup failed, or skipped by the cap —
     are stored as empty strings (poison pill) so we do not retry them every run.
+
+    The on-disk cache is a cross-run ACCUMULATOR and is written as a MERGE, so a
+    single run (in particular a `--no-cache` run, which resolves from scratch)
+    can never wipe titles other runs paid for. Merge rule: disk entries are
+    preserved; a fresh non-empty title wins over the disk value; a fresh "" —
+    the poison pill from a failed lookup or the fallback cap — NEVER clobbers a
+    non-empty disk title, but a fresh "" for a ticker unknown to disk IS stored
+    (poison-pill semantics preserved).
+
     An unresolved ticker is not an error: the caller groups those markets by
     market title alone, which is exactly what a failed lookup has always done.
 
@@ -386,15 +429,24 @@ def _load_or_build_event_titles(
             (e.g. the client from build_prod_live_client()).
         event_tickers (set[str]): The set of event_ticker values whose titles
             we need. May contain hundreds or thousands of entries.
-        use_cache (bool): If True, load existing cache from disk first. If False,
-            re-fetch all titles. The on-disk cache is written either way.
+        use_cache (bool): If True, seed resolution from the on-disk accumulator.
+            If False, start empty so this run's tickers are genuinely re-fetched.
+            The on-disk accumulator is read (for the merge) and rewritten either
+            way — a `--no-cache` run refreshes its own tickers without discarding
+            titles it did not ask about.
 
     Returns:
-        dict[str, str]: Mapping event_ticker → event_title. Tickers that could
-            not be resolved map to "". Caller treats those markets as ungrouped
-            (effectively MVE-excluded).
+        dict[str, str]: Mapping event_ticker → event_title for THIS run's
+            resolution (the merged accumulator is only written to disk, not
+            returned). Tickers that could not be resolved map to "". Caller
+            treats those markets as ungrouped (effectively MVE-excluded).
     """
-    cached: dict[str, str] = (_load_json_cache(_EVENT_TITLES_CACHE) or {}) if use_cache else {}
+    # Always read the accumulator: even when use_cache is False and it must not
+    # seed resolution, it is needed at save time so this run's writes MERGE with
+    # (rather than replace) titles earlier runs paid round trips for. Corrupt
+    # file → {} plus a warning, via the guarded loader.
+    disk_titles: dict[str, str] = _load_json_cache(_EVENT_TITLES_CACHE) or {}
+    cached: dict[str, str] = dict(disk_titles) if use_cache else {}
     missing = event_tickers - cached.keys()
     if not missing:
         return cached
@@ -416,7 +468,10 @@ def _load_or_build_event_titles(
         pages = 0
         barren = 0  # consecutive pages that resolved nothing
         while True:
-            kwargs: dict = {"status": status, "limit": 200}
+            # Events-listing page cap (MARKET_PAGE_SIZE, 200) — a different,
+            # smaller cap than the /historical & /markets endpoints' 1000 (see
+            # the hist_kwargs comment in fetch_all_settled_markets).
+            kwargs: dict = {"status": status, "limit": MARKET_PAGE_SIZE}
             if cursor:
                 kwargs["cursor"] = cursor
             data = api_call_with_retry(
@@ -462,7 +517,8 @@ def _load_or_build_event_titles(
         cursor = None
         barren = 0
         for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
-            kwargs = {"limit": 200}
+            # Same events-listing page cap as the status-listing loop above.
+            kwargs = {"limit": MARKET_PAGE_SIZE}
             if cursor:
                 kwargs["cursor"] = cursor
             data = api_call_with_retry(
@@ -550,8 +606,18 @@ def _load_or_build_event_titles(
                                  "(ETA %s)", done, len(to_look_up),
                                  _format_duration(remaining))
 
-    _save_json_cache(_EVENT_TITLES_CACHE, cached)
-    logging.info("Event titles resolved: %d cached entries", len(cached))
+    # Merge into the on-disk accumulator rather than overwriting it: disk entries
+    # are preserved, a fresh non-empty title wins over the disk value, and a
+    # fresh "" (poison pill from a failed lookup or the fallback cap) never
+    # clobbers a non-empty disk title — but a fresh "" for a ticker disk has
+    # never seen IS stored, so poison-pill semantics survive.
+    merged = dict(disk_titles)
+    for tkr, title in cached.items():
+        if title or not merged.get(tkr):
+            merged[tkr] = title
+    _save_json_cache(_EVENT_TITLES_CACHE, merged)
+    logging.info("Event titles resolved: %d this run, %d cached entries on disk",
+                 len(cached), len(merged))
     return cached
 
 
@@ -803,6 +869,12 @@ def _log_slice_progress(label: str, done: int, total: int, day_lo: int,
     per-slice line the only feedback is a page counter that says nothing about
     how far along the run actually is.
 
+    Rate units are adaptive: a slow multi-hour fetch (e.g. a handful of
+    slices per hour) rendered at "%.1f slices/min" rounds to "0.0" beside a
+    perfectly finite ETA, which reads as broken math rather than "just slow".
+    Below 0.1 slices/min the rate is shown as slices/hour instead; the ETA
+    calculation itself is unchanged either way.
+
     Args:
         label (str): Phase name, e.g. "Archive day slices".
         done (int): Slices completed so far, including this one.
@@ -814,11 +886,16 @@ def _log_slice_progress(label: str, done: int, total: int, day_lo: int,
     elapsed = max(time.monotonic() - started, 1e-9)
     rate = done / elapsed  # slices per second
     eta = (total - done) / rate if rate > 0 else 0.0
+    rate_per_min = rate * 60
+    if rate_per_min >= 0.1:
+        rate_str = f"{rate_per_min:.1f} slices/min"
+    else:
+        rate_str = f"{rate * 3600:.1f} slices/hour"
     logging.info(
-        "%s: %d/%d complete (%s: %d markets, %.1f slices/min, ETA %s)",
+        "%s: %d/%d complete (%s: %d markets, %s, ETA %s)",
         label, done, total,
         datetime.fromtimestamp(day_lo, tz=UTC).date().isoformat(),
-        markets, rate * 60, _format_duration(eta),
+        markets, rate_str, _format_duration(eta),
     )
 
 
@@ -844,6 +921,76 @@ def _format_duration(seconds: float) -> str:
 
 # ─── Day-slice disk store ─────────────────────────────────────────────────────
 
+# Day slices exist in TWO on-disk formats, both first-class and both readable:
+#
+#   legacy dict  — one gzipped JSON document {"meta": {...}, "markets": [...]}.
+#                  Written by _day_store_save. Hundreds of MB of these already
+#                  sit in backtest_cache/, so they must keep loading forever.
+#   "jsonl-v1"   — gzipped JSON Lines: line 1 is {"meta": {..., "format":
+#                  "jsonl-v1"}}, every later line is ONE compact market dict.
+#                  Written incrementally by _DayStreamWriter so a fetch worker
+#                  never holds a whole UTC day (millions of records) in RAM.
+#
+# The tag lives inside the meta block, which is otherwise pass-through, so an
+# expect_meta identity check is unaffected by its presence.
+_SLICE_FORMAT_JSONL = "jsonl-v1"
+
+
+def _discard_all(_record: dict) -> bool:
+    """
+    `keep` predicate that retains nothing, for validity probes.
+
+    The phase prescans load every candidate slice purely to decide whether it
+    is reusable; passing this means a streamed slice is still fully parsed (so
+    a corrupt one is still detected) without materializing a single record.
+
+    Args:
+        _record (dict): The record under consideration; ignored.
+
+    Returns:
+        bool: Always False.
+    """
+    return False
+
+
+def _slice_dumps(obj) -> bytes:
+    """
+    Serialize one day-slice JSON value to UTF-8 bytes.
+
+    Uses orjson when the optional `perf` extra is installed (this runs over tens
+    of millions of records per full-history fetch), otherwise the stdlib. Both
+    emit plain JSON with no embedded newlines outside string escapes, which is
+    what makes the JSON Lines framing safe either way.
+
+    Args:
+        obj: Any JSON-serializable value (a meta block or a market dict).
+
+    Returns:
+        bytes: Compact UTF-8 JSON, with no trailing newline.
+    """
+    if _HAVE_ORJSON:
+        return orjson.dumps(obj)
+    return json.dumps(obj).encode("utf-8")
+
+
+def _slice_loads(raw: bytes):
+    """
+    Parse one day-slice JSON document (a whole legacy payload, or one JSONL line).
+
+    Args:
+        raw (bytes): UTF-8 JSON bytes.
+
+    Returns:
+        Any: The parsed value.
+
+    Raises:
+        ValueError: If the bytes are not valid JSON. orjson raises
+            JSONDecodeError, which subclasses ValueError, so callers can catch
+            the one exception type regardless of which parser is installed.
+    """
+    return orjson.loads(raw) if _HAVE_ORJSON else json.loads(raw)
+
+
 def _day_store_path(store: str, day_lo: int) -> Path:
     """
     Compute the on-disk path for one day-slice file.
@@ -860,9 +1007,81 @@ def _day_store_path(store: str, day_lo: int) -> Path:
     return CACHE_DIR / store / f"{day}.json.gz"
 
 
-def _day_store_load(path: Path, expect_meta: dict) -> list[dict] | None:
+def _prune_stale_live_days(cutoff_ts: int) -> int:
+    """
+    Delete live_days/ slices whose whole UTC day now lies at/before the cutoff.
+
+    When Kalshi advances the archive cutoff, every settlement in a day that
+    now lies entirely before the new cutoff migrates from the live endpoint
+    into the archive — that day's records are, from then on, only ever served
+    (and cached) via backtest_cache/archive_days/. Its old
+    backtest_cache/live_days/<day>.json.gz slice is never read again by any
+    future run (_fetch_live_phase only ever requests days at/after
+    max(cutoff_ts, start_ts)): it is pure dead disk that only grows across
+    repeated cutoff advances if nothing cleans it up. This is disk hygiene
+    only — deleting a slice loses no data, since the same day is fetched and
+    cached again as an archive slice regardless.
+
+    Filenames follow the _day_store_path convention (CACHE_DIR/live_days/
+    <YYYY-MM-DD>.json.gz, one file per UTC day); the day's lower bound is
+    parsed back out of the filename rather than tracked separately.
+
+    Args:
+        cutoff_ts (int): Unix timestamp of the current archive/live boundary
+            (market_settled_ts from /historical/cutoff).
+
+    Returns:
+        int: Number of slice files actually deleted.
+    """
+    store_dir = CACHE_DIR / "live_days"
+    if not store_dir.exists():
+        # Nothing fetched yet (or a fresh cache dir) — nothing to prune.
+        return 0
+    pruned = 0
+    for path in sorted(store_dir.glob("*.json.gz")):
+        day_str = path.name[: -len(".json.gz")]
+        try:
+            day = date.fromisoformat(day_str)
+        except ValueError:
+            # Not one of our day-slice filenames — leave it alone.
+            continue
+        day_lo = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+        if day_lo + 86400 > cutoff_ts:
+            # Day extends up to or past the cutoff — still (partly) live-only.
+            continue
+        try:
+            path.unlink()
+            pruned += 1
+        except OSError as e:
+            # Best-effort cleanup: a locked/already-gone file isn't fatal to
+            # the fetch, just leaves a byte or two of dead disk behind.
+            logging.warning("Failed to prune stale live-day slice %s: %s", path, e)
+    if pruned:
+        logging.info("Pruned %d stale pre-cutoff live day slice(s)", pruned)
+    return pruned
+
+
+def _day_store_load(
+    path: Path,
+    expect_meta: dict,
+    keep: Callable[[dict], bool] | None = None,
+) -> list[dict] | None:
     """
     Load a day-slice file if it exists and its metadata matches expectations.
+
+    Reads BOTH slice formats (see the format note above): the legacy single
+    JSON document and the streamed "jsonl-v1" line format. Routing is done on
+    file CONTENT, never on whether a whole-file parse succeeds — an empty
+    "jsonl-v1" day is a lone meta line, which parses perfectly well as a JSON
+    document, so a "did json.loads work?" test would misclassify it as legacy
+    and silently report every empty day as having no meta match.
+
+    The JSONL path parses one line at a time and applies `keep` per record, so
+    a 4.8M-record day is never materialized in full just to be filtered down
+    afterwards. Any malformed line, unreadable file, or meta mismatch fails the
+    WHOLE slice (returns None → the caller refetches the day); a partially
+    decodable slice is never returned, which is the same all-or-nothing
+    contract the single-document format always had.
 
     Args:
         path (Path): File path from _day_store_path().
@@ -870,10 +1089,15 @@ def _day_store_load(path: Path, expect_meta: dict) -> list[dict] | None:
             exactly (e.g. cutoff_ts, include_mve, complete). A mismatch means
             the file was written under different fetch conditions and must be
             ignored (the caller refetches the day).
+        keep (Callable[[dict], bool] | None): Optional per-record predicate.
+            Records for which it returns False are discarded as they are read
+            and never retained. Applying it here is equivalent to filtering the
+            returned list afterwards — order and membership are identical.
 
     Returns:
-        list[dict] | None: The slice's compact market dicts, or None when the
-            file is absent, unreadable, or written under different conditions.
+        list[dict] | None: The slice's compact market dicts (filtered by `keep`
+            when given), or None when the file is absent, unreadable, or
+            written under different conditions.
     """
     if not path.exists():
         return None
@@ -881,29 +1105,72 @@ def _day_store_load(path: Path, expect_meta: dict) -> list[dict] | None:
         # Read as bytes so the orjson and stdlib parsers take the same input.
         # Both accept UTF-8 bytes, and slices are plain JSON either way.
         with gzip.open(path, "rb") as fh:
-            raw = fh.read()
-        payload = orjson.loads(raw) if _HAVE_ORJSON else json.loads(raw)
-    except (OSError, ValueError):
+            first_line = fh.readline()
+            try:
+                head = _slice_loads(first_line)
+            except ValueError:
+                # Not a self-contained first line. The only way our own writers
+                # produce this is a corrupt file, but a legacy slice written by
+                # some other tool could be pretty-printed across lines, so fall
+                # through to the whole-document parse below rather than
+                # declaring the file dead.
+                head = None
+            if isinstance(head, dict) and "markets" not in head:
+                # JSONL: a dict first line WITHOUT a "markets" key is the meta
+                # line (the tag is checked below for the log, not for routing —
+                # the absence of "markets" is the discriminator, and it holds
+                # for the meta-only empty-day file too).
+                meta = head.get("meta") or {}
+                if any(meta.get(k) != v for k, v in expect_meta.items()):
+                    return None
+                records: list[dict] = []
+                for line in fh:
+                    # Streaming, one record at a time: this is what keeps the
+                    # load side of a multi-million-record day bounded.
+                    if not line.strip():
+                        continue
+                    record = _slice_loads(line)
+                    if keep is None or keep(record):
+                        records.append(record)
+                return records
+            rest = fh.read()
+        payload = head if (head is not None and not rest.strip()) else _slice_loads(
+            first_line + rest
+        )
+    except (OSError, EOFError, ValueError):
+        # EOFError: gzip raises it for a stream truncated before its end-of-
+        # stream marker — the same "interrupted write" class as a short read.
+        return None
+    if not isinstance(payload, dict):
         return None
     meta = payload.get("meta") or {}
     if any(meta.get(k) != v for k, v in expect_meta.items()):
         return None
-    return payload.get("markets") or []
+    markets = payload.get("markets") or []
+    if keep is None:
+        return markets
+    return [m for m in markets if keep(m)]
 
 
 def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
     """
-    Atomically persist one completed day slice to disk.
+    Atomically persist one completed day slice in the LEGACY single-document format.
 
     Written gzip-compressed (the settled-market history is tens of millions of
     records; plain JSON would be ~10x larger) via a temp file + rename so an
     interrupted run can never leave a truncated file that a later run would
     trust.
 
-    Serialized with orjson when available (this runs once per day slice over
-    ~200k records, so it is a hot path), otherwise the stdlib json module. Both
-    produce plain JSON, so a slice written by one is readable by the other —
-    existing caches stay valid regardless of which is installed.
+    Serialized with orjson when available, otherwise the stdlib json module.
+    Both produce plain JSON, so a slice written by one is readable by the other
+    — existing caches stay valid regardless of which is installed.
+
+    Deliberately still writes the legacy format rather than "jsonl-v1": it is
+    handed a fully-materialized list anyway, so it gains nothing from
+    streaming, and keeping it means the legacy format stays a first-class,
+    exercised write path for the hundreds of MB of legacy slices already on
+    disk. The fetch workers use _DayStreamWriter instead, because they are
+    exactly the callers that must NOT hold a whole day in memory.
 
     Args:
         path (Path): Destination path from _day_store_path().
@@ -913,13 +1180,139 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     payload = {"meta": meta, "markets": markets}
-    if _HAVE_ORJSON:
-        with gzip.open(tmp, "wb", compresslevel=1) as fh:
-            fh.write(orjson.dumps(payload))
-    else:
-        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as fh:
-            json.dump(payload, fh)
+    with gzip.open(tmp, "wb", compresslevel=1) as fh:
+        fh.write(_slice_dumps(payload))
     tmp.replace(path)
+
+
+class _DayStreamWriter:
+    """
+    Incremental writer for one "jsonl-v1" day slice.
+
+    Exists so a fetch worker never accumulates a whole UTC day of records: at
+    2026-08 volumes a single day reaches ~4.4–4.8M compact market dicts, and
+    holding one per worker sawtoothed RSS to 7.89 GB on a 16 GB host (live
+    telemetry, 2026-08-31). The worker instead hands over batches of at most
+    SETTLED_FETCH_CHUNK_RECORDS records, which are serialized and compressed
+    straight into the file and then dropped.
+
+    Atomicity contract is identical to _day_store_save: everything is written
+    to `<path>.tmp` and only renamed into place by commit(), so the visible
+    file is either absent or complete — a later run can never trust a slice
+    that was cut short by a crash, an OOM kill, or a cancelled worker.
+
+    Record ORDER is preserved exactly as written, which is load-bearing: the
+    server returns each window newest-settled first, and the caller's ticker
+    dedup at merge time is first-wins over newest-day-first assembly. Reordering
+    or interleaving batches would silently change which duplicate wins.
+
+    Usable as a context manager; leaving the block without a successful
+    commit() aborts, so an exception mid-fetch removes the temp file.
+    """
+
+    def __init__(self, path: Path, meta: dict):
+        """
+        Open the temp file and write the meta line.
+
+        Args:
+            path (Path): Final destination path from _day_store_path().
+            meta (dict): Metadata block from _day_store_meta(); the
+                "jsonl-v1" format tag is added here so callers cannot forget it.
+
+        Raises:
+            OSError: If the destination directory or temp file cannot be opened.
+        """
+        self._path = path
+        self._tmp = path.with_name(path.name + ".tmp")
+        self._committed = False
+        self._records = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = gzip.open(self._tmp, "wb", compresslevel=1)
+        try:
+            # Meta first: a reader routes and gates on this line alone, without
+            # touching the (potentially millions of) record lines behind it.
+            self._fh.write(
+                _slice_dumps({"meta": {**meta, "format": _SLICE_FORMAT_JSONL}}) + b"\n"
+            )
+        except BaseException:
+            self.abort()
+            raise
+
+    def write_records(self, batch: list[dict]) -> None:
+        """
+        Append one batch of records, in order, as JSON lines.
+
+        The batch is serialized line by line rather than joined into one big
+        buffer, so peak memory stays bounded by the batch itself.
+
+        Args:
+            batch (list[dict]): Compact market dicts (see _market_to_dict).
+                The caller may reuse or discard the list immediately after.
+
+        Raises:
+            OSError: On a write failure; the caller must abort() the writer.
+        """
+        write = self._fh.write
+        for record in batch:
+            write(_slice_dumps(record) + b"\n")
+        self._records += len(batch)
+
+    def commit(self) -> int:
+        """
+        Close the temp file and atomically publish it at the final path.
+
+        Returns:
+            int: Total records written to this slice.
+
+        Raises:
+            OSError: If the final flush or the rename fails; the slice is then
+                left unpublished (the day refetches next run).
+        """
+        self._fh.close()
+        self._tmp.replace(self._path)
+        self._committed = True
+        return self._records
+
+    def abort(self) -> None:
+        """
+        Close and delete the temp file, leaving no visible slice behind.
+
+        Safe to call more than once and after a failed commit; never raises,
+        because it runs on the error path where the original exception must
+        survive.
+        """
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        try:
+            self._tmp.unlink()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "_DayStreamWriter":
+        """
+        Returns:
+            _DayStreamWriter: This writer.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """
+        Abort unless commit() already published the slice.
+
+        Args:
+            exc_type: Exception class, or None on a clean exit.
+            exc: Exception instance, or None.
+            tb: Traceback, or None.
+
+        Returns:
+            bool: Always False — exceptions are never suppressed (a worker
+                failure must reach the pool so the phase can fall back).
+        """
+        if not self._committed:
+            self.abort()
+        return False
 
 
 def _day_store_meta(lo: int, expect_meta: dict) -> dict:
@@ -968,9 +1361,11 @@ def _assemble_day_slices(
         expect_meta (dict): Reuse-gating keys the slices must still match.
         keep (Callable[[dict], bool] | None): Optional predicate applied per
             record as slices are read, so records the caller would discard
-            anyway are never retained. Purely a memory optimization — the
-            caller re-applies the same predicate during merge. The slice FILES
-            are never filtered; they stay complete for other start dates.
+            anyway are never retained. Pushed down into _day_store_load so that
+            for streamed "jsonl-v1" slices the rejected records are never even
+            materialized. Purely a memory optimization — the caller re-applies
+            the same predicate during merge. The slice FILES are never
+            filtered; they stay complete for other start dates.
 
     Returns:
         list[dict]: Compact market dicts, newest day first.
@@ -983,13 +1378,10 @@ def _assemble_day_slices(
     records: list[dict] = []
     for lo in sorted(day_los, reverse=True):
         path = _day_store_path(store, lo)
-        slice_records = _day_store_load(path, expect_meta)
+        slice_records = _day_store_load(path, expect_meta, keep)
         if slice_records is None:
             raise _ShardedFetchUnsupported(f"day slice disappeared or corrupted: {path}")
-        if keep is None:
-            records.extend(slice_records)
-        else:
-            records.extend(m for m in slice_records if keep(m))
+        records.extend(slice_records)
     return records
 
 
@@ -1032,7 +1424,8 @@ def _fetch_archive_day(
     day_hi: int,
     hist_kwargs: dict,
     progress: _FetchProgress,
-) -> list[dict]:
+    emit: Callable[[list[dict]], None] | None = None,
+) -> list[dict] | int:
     """
     Fetch every settled binary market whose created_time falls in [day_lo, day_hi).
 
@@ -1048,10 +1441,18 @@ def _fetch_archive_day(
         day_hi (int): Slice upper bound, epoch seconds (exclusive).
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
         progress (_FetchProgress): Shared page counter for log output.
+        emit (Callable[[list[dict]], None] | None): Optional sink for chunked
+            output. When given, records are handed over in batches of at most
+            SETTLED_FETCH_CHUNK_RECORDS (plus a final partial batch) and the
+            internal buffer is cleared each time, so the day is never held in
+            memory; the return value is then the record COUNT. When None, the
+            full list is accumulated and returned — the original behavior, kept
+            for the frontier day and the sequential fallbacks.
 
     Returns:
-        list[dict]: Compact market dicts (created within the slice, binary
-            result, settlement_ts present), newest created_time first.
+        list[dict] | int: Compact market dicts (created within the slice,
+            binary result, settlement_ts present), newest created_time first —
+            or, when `emit` is given, the number of records emitted.
 
     Raises:
         _ShardedFetchUnsupported: If the synthesized cursor lands above day_hi
@@ -1059,6 +1460,7 @@ def _fetch_archive_day(
     """
     cursor = _encode_archive_cursor(day_hi, 0, _CURSOR_TICKER_SENTINEL)
     kept: list[dict] = []
+    total = 0
     first_page = True
     while True:
         data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
@@ -1076,7 +1478,7 @@ def _fetch_archive_day(
                 )
         first_page = False
         oldest_created = None
-        kept_before = len(kept)
+        page_kept = 0
         for m in page:
             created = _iso_epoch(m.get("created_time"))
             if created is None:
@@ -1090,12 +1492,25 @@ def _fetch_archive_day(
             # plus nested mve_selected_legs) for millions of records is what
             # caused the multi-minute GC/memory stalls in the old fetch.
             kept.append(_market_to_dict(m))
-        progress.tick(len(kept) - kept_before)
+            page_kept += 1
+        total += page_kept
+        # Unchanged accounting: one tick per page, carrying that page's keeps.
+        progress.tick(page_kept)
+        if emit is not None and len(kept) >= SETTLED_FETCH_CHUNK_RECORDS:
+            # Hand the buffer over and drop it: this is what bounds a worker's
+            # memory at (chunk size) instead of (whole UTC day).
+            emit(kept)
+            kept = []
         cursor = data.get("cursor")
         # Stop once the page bottom crossed below the slice (deeper pages are
         # older still), the archive is exhausted, or the server sent nothing.
         if not cursor or not page or (oldest_created is not None and oldest_created < day_lo):
-            return kept
+            break
+    if emit is None:
+        return kept
+    if kept:
+        emit(kept)
+    return total
 
 
 def _fetch_archive_tail(
@@ -1110,19 +1525,37 @@ def _fetch_archive_tail(
 
     The archive is ordered by created_time, not settlement time, so markets
     CREATED before start_date can still SETTLE inside the backtest window
-    (long-lived markets). The sequential walk caught those by keeping any
-    in-window settlement it passed until its settlement-based early stop
-    fired; this tail reproduces exactly that behavior — page downward from
-    created_time == start_ts, keep in-window settlements, and stop at the
-    first page whose newest record settled before start_ts (the original
-    early-stop rule).
+    (long-lived markets). The per-day slices cover everything created on or
+    after start_date; this tail is what collects those older-created records,
+    paging downward from created_time == start_ts.
+
+    Stop rule: no EXACT one exists on a created-ordered walk, because a market
+    created arbitrarily early can still settle in-window. The walk therefore
+    stops after ARCHIVE_MAX_BARREN_PAGES CONSECUTIVE pages that contain no
+    in-window settlement at all (or when the archive runs out of pages). It
+    deliberately does NOT stop at the first page whose newest-created record
+    settled pre-window: that record's settlement says nothing about the rest
+    of the page or about deeper pages, and since most markets are short-lived
+    such a page shows up almost immediately — the old rule killed the tail
+    after one or two pages and silently dropped long-lived in-window settlers.
+
+    That barren rule only bounds depth PAST the last productive page, though: a
+    single long-dated in-window settlement resets the counter, so the walk is
+    additionally capped at ARCHIVE_TAIL_MAX_PAGES total pages. This tail is
+    serial (one 1000-record request at a time) and is never persisted as a day
+    slice, so it is re-paid on every run — an unbounded version can crawl most
+    of created-time history. Hitting the cap logs a WARNING and truncates.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
         start_ts (int): Backtest window start, epoch seconds (UTC midnight).
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
-        progress (_FetchProgress): Shared page counter for log output.
+        progress (_FetchProgress): Page counter for log output. The caller
+            passes a progress object labeled for the TAIL specifically — these
+            pages are not day-slice pages, and CLAUDE.md's progress-label rule
+            means a shared "[sharded]" label would make a stalled tail
+            indistinguishable in the log from a stalled day-slice pool.
 
     Returns:
         list[dict]: Compact market dicts created before start_ts that settled
@@ -1135,9 +1568,12 @@ def _fetch_archive_tail(
     cursor = _encode_archive_cursor(start_ts, 0, _CURSOR_TICKER_SENTINEL)
     kept: list[dict] = []
     first_page = True
+    barren = 0
+    pages = 0
     while True:
         data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
                                cursor=cursor, **hist_kwargs)
+        pages += 1
         page = data.get("markets") or []
         if first_page and page:
             newest = _iso_epoch(page[0].get("created_time"))
@@ -1164,13 +1600,35 @@ def _fetch_archive_tail(
         next_cursor = data.get("cursor")
         if not next_cursor or not page:
             return kept
-        # Original early-stop rule: once even the newest record on a page
-        # settled before start_ts, deeper pages hold nothing collectible.
-        newest_settle = _iso_epoch(page[0].get("settlement_ts"))
-        if newest_settle is not None and newest_settle < start_ts:
+        # Productivity bail-out (see the stop-rule note in the docstring).
+        # Judged on ANY in-window settlement on the page, deliberately
+        # independent of the result/created_time keep filters above: a page
+        # made entirely of voided markets, or of records skipped because they
+        # belong to a day slice, still proves the walk is in productive
+        # created-time territory and must not trip the counter.
+        page_in_window = any(
+            s is not None and start_ts <= s < cutoff_ts
+            for s in (_iso_epoch(m.get("settlement_ts")) for m in page)
+        )
+        barren = 0 if page_in_window else barren + 1
+        if barren >= ARCHIVE_MAX_BARREN_PAGES:
             logging.info(
-                "Historical archive tail page predates the backtest window — "
-                "stopping pagination early"
+                "Historical archive tail: %d consecutive pages with no in-window "
+                "settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping pagination",
+                barren,
+            )
+            return kept
+        # Absolute depth backstop: the barren rule above only bounds depth past
+        # the last PRODUCTIVE page, so one long-dated in-window settlement
+        # resets it and the serial, uncached tail keeps crawling.
+        if pages >= ARCHIVE_TAIL_MAX_PAGES:
+            logging.warning(
+                "Historical archive tail: reached the %d-page cap "
+                "(ARCHIVE_TAIL_MAX_PAGES) after walking %d pages below "
+                "created_time == start_date — stopping. Very long-lived markets "
+                "created deeper than this that settle inside the window may be "
+                "missed; raise ARCHIVE_TAIL_MAX_PAGES if a run needs them.",
+                ARCHIVE_TAIL_MAX_PAGES, pages,
             )
             return kept
         cursor = next_cursor
@@ -1186,11 +1644,16 @@ def _fetch_archive_sequential(
     Original sequential archive walk — the sharding fallback path.
 
     Pages the archive from the top with the server-provided cursor chain,
-    keeping every binary market that settled within [start_ts, cutoff_ts),
-    and stops at the first page whose newest record settled before start_ts.
-    Relies only on documented pagination behavior, so it works even if the
-    cursor format drifts. Slow (one serial request per 1000 records) but
-    always correct.
+    keeping every binary market that settled within [start_ts, cutoff_ts).
+    Relies only on documented pagination behavior (never on cursor synthesis),
+    so it works even if the cursor format drifts — that is what makes it a
+    safe fallback. Slow: one serial request per 1000 records.
+
+    Completeness is bounded, not exact. The archive is ordered by created_time,
+    so a market created arbitrarily early can settle in-window and no page
+    proves that deeper pages hold nothing. The walk therefore stops after
+    ARCHIVE_MAX_BARREN_PAGES consecutive pages with no in-window settlement —
+    the same rule as _fetch_archive_tail, and for the same reason.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
@@ -1204,6 +1667,7 @@ def _fetch_archive_sequential(
     selected: list[dict] = []
     cursor = None
     page_no = 0
+    barren = 0
     while True:
         kwargs: dict = dict(hist_kwargs)
         # Include cursor for pages after the first to continue pagination
@@ -1228,17 +1692,24 @@ def _fetch_archive_sequential(
         # A None or empty cursor signals the last page
         if not cursor:
             break
-        # The archive walk must stop once a page lies entirely before the
-        # backtest window — the archive ignores settlement-time filters
-        # server-side, so without this the loop pages the full multi-million-
-        # market archive no matter how recent start_date is. The newest market
-        # on the page is its first entry; if even that predates start_ts,
-        # every later page is older still.
-        newest_epoch = _iso_epoch(page_markets[0].get("settlement_ts")) if page_markets else None
-        if newest_epoch is not None and newest_epoch < start_ts:
+        # The walk must be bounded somehow — the archive ignores settlement-time
+        # filters server-side, so without a stop rule the loop pages the full
+        # multi-million-market archive no matter how recent start_date is. It is
+        # ordered by created_time, though, so no page proves deeper pages are
+        # unproductive; bail out on sustained unproductiveness instead. Judged
+        # on ANY in-window settlement, independent of the result filter above,
+        # so a run of all-voided pages can't spuriously trip the counter.
+        page_in_window = any(
+            s is not None and start_ts <= s < cutoff_ts
+            for s in (_iso_epoch(m.get("settlement_ts")) for m in page_markets)
+        )
+        barren = 0 if page_in_window else barren + 1
+        if barren >= ARCHIVE_MAX_BARREN_PAGES:
             logging.info(
-                "Historical archive page predates the backtest window — "
-                "stopping pagination early"
+                "Historical archive [sequential]: %d consecutive pages with no "
+                "in-window settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping "
+                "pagination",
+                barren,
             )
             break
     return selected
@@ -1255,10 +1726,16 @@ def _fetch_and_store_archive_day(
     Worker task: fetch one archive created-day slice and persist it.
 
     Runs entirely inside the pool thread and returns only a count, so the
-    slice's records are freed as soon as the file is written and never cross
-    back to the main thread. This also moves gzip compression and JSON
-    serialization off the main thread — zlib releases the GIL, so that work
-    genuinely overlaps other workers.
+    slice's records are freed as soon as they are written and never cross back
+    to the main thread. This also moves gzip compression and JSON serialization
+    off the main thread — zlib releases the GIL, so that work genuinely
+    overlaps other workers.
+
+    Records are STREAMED into the slice file in chunks rather than collected
+    and saved at the end: a 2026-08 UTC day holds millions of markets, and one
+    full day per worker is what drove RSS to 7.89 GB on a 16 GB host. The
+    writer publishes the file only on commit(), so an interrupted worker leaves
+    no partial slice for a later run to trust.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
@@ -1274,17 +1751,19 @@ def _fetch_and_store_archive_day(
         _ShardedFetchUnsupported: Propagated from _fetch_archive_day when the
             server ignores a synthesized cursor or omits created_time.
     """
-    day_markets = _fetch_archive_day(
-        hist_client, day_lo, day_lo + _DAY_SECONDS, hist_kwargs, progress
-    )
-    # Persist as soon as the day completes so an interrupted run resumes here
-    # instead of refetching, then drop the records — assembly re-reads them.
-    _day_store_save(
+    # Persisted incrementally as the day is fetched, so an interrupted run
+    # resumes at day granularity instead of refetching, and nothing is retained
+    # for the caller — assembly re-reads the file.
+    with _DayStreamWriter(
         _day_store_path("archive_days", day_lo),
         _day_store_meta(day_lo, expect_meta),
-        day_markets,
-    )
-    return len(day_markets)
+    ) as writer:
+        count = _fetch_archive_day(
+            hist_client, day_lo, day_lo + _DAY_SECONDS, hist_kwargs, progress,
+            emit=writer.write_records,
+        )
+        writer.commit()
+    return int(count)
 
 
 def _fetch_archive_phase(
@@ -1304,9 +1783,11 @@ def _fetch_archive_phase(
     slice as soon as the day completes, so an interrupted fetch resumes at day
     granularity instead of restarting the multi-hour walk.
 
-    Slice records are never accumulated in memory: workers return only counts
-    and the final list is streamed back off disk by _assemble_day_slices (see
-    there for why — a ~900-day window otherwise runs to tens of GB).
+    Slice records are never accumulated in memory: a worker streams its records
+    into its slice file in chunks and returns only a count, and the final list
+    is streamed back off disk by _assemble_day_slices (see there for why — a
+    ~900-day window otherwise runs to tens of GB, and a single 2026-08 day is
+    itself millions of records).
 
     Slice files are stamped with the cutoff_ts they were fetched under and are
     ONLY reused while the stamp matches the current cutoff: when Kalshi
@@ -1364,11 +1845,14 @@ def _fetch_archive_phase(
         # Only day identities are tracked here, never their records: the
         # prescan's loaded slices are discarded and re-read at assembly. That
         # costs one extra decode of the reused days but keeps peak memory
-        # independent of how many days the window spans.
+        # independent of how many days the window spans. _discard_all makes
+        # that literal — a streamed slice is fully parsed (so corruption is
+        # still caught) but nothing is retained from it.
         on_disk: list[int] = []
         to_fetch: list[int] = []
         for lo in day_los:
-            if _day_store_load(_day_store_path("archive_days", lo), expect_meta) is not None:
+            if _day_store_load(_day_store_path("archive_days", lo), expect_meta,
+                               _discard_all) is not None:
                 on_disk.append(lo)
             else:
                 to_fetch.append(lo)
@@ -1407,7 +1891,13 @@ def _fetch_archive_phase(
 
         # Long-lived markets created before start_date but settling inside the
         # window — same records the sequential walk picked up past start_ts.
-        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+        # Its own progress object, labeled "[tail]": these pages are a serial
+        # walk, not day-slice pages, and sharing the "[sharded]" counter made a
+        # slow tail read in the log as a slow (parallel) slice pool — exactly
+        # the label ambiguity CLAUDE.md calls load-bearing for diagnosis.
+        tail_progress = _FetchProgress("Historical archive [tail]")
+        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs,
+                                   tail_progress)
 
         return _assemble_day_slices("archive_days", on_disk, expect_meta, keep), tail
     except _ShardedFetchUnsupported as exc:
@@ -1426,7 +1916,8 @@ def _fetch_live_window(
     win_lo: int,
     win_hi: int | None,
     progress: _FetchProgress,
-) -> list[dict]:
+    emit: Callable[[list[dict]], None] | None = None,
+) -> list[dict] | int:
     """
     Fetch settled binary markets from the live endpoint for one settled-time window.
 
@@ -1440,17 +1931,25 @@ def _fetch_live_window(
         win_hi (int | None): Window upper bound (max_settled_ts), or None for
             the open-ended frontier window that runs to "now".
         progress (_FetchProgress): Shared page counter for log output.
+        emit (Callable[[list[dict]], None] | None): Optional sink for chunked
+            output — see _fetch_archive_day for the full contract. When given,
+            batches of at most SETTLED_FETCH_CHUNK_RECORDS are handed over and
+            the buffer is dropped, and the return value is the record COUNT.
+            The frontier window and the sequential fallback pass None and get
+            the accumulated list, which is the original behavior.
 
     Returns:
-        list[dict]: Compact market dicts with a binary result and a
+        list[dict] | int: Compact market dicts with a binary result and a
             settlement_ts (no settlement-window filtering beyond the server's;
-            the caller applies the backtest window).
+            the caller applies the backtest window) — or, when `emit` is given,
+            the number of records emitted.
 
     Raises:
         _ShardedFetchUnsupported: If the first page contains a settlement
             far above win_hi, i.e. the server stopped honoring max_settled_ts.
     """
     kept: list[dict] = []
+    total = 0
     cursor = None
     first_page = True
     while True:
@@ -1467,7 +1966,7 @@ def _fetch_live_window(
             fetch_json_page, live_client.get_markets_without_preload_content, **kwargs
         )
         page = data.get("markets") or []
-        kept_before = len(kept)
+        page_kept = 0
         for m in page:
             settle = _iso_epoch(m.get("settlement_ts"))
             if settle is None or m.get("result") not in ("yes", "no"):
@@ -1478,11 +1977,23 @@ def _fetch_live_window(
                 # every window would re-walk the whole range.
                 raise _ShardedFetchUnsupported("live endpoint ignored max_settled_ts")
             kept.append(_market_to_dict(m))
+            page_kept += 1
         first_page = False
-        progress.tick(len(kept) - kept_before)
+        total += page_kept
+        # Unchanged accounting: one tick per page, carrying that page's keeps.
+        progress.tick(page_kept)
+        if emit is not None and len(kept) >= SETTLED_FETCH_CHUNK_RECORDS:
+            # Bounded buffer — see _fetch_archive_day for the rationale.
+            emit(kept)
+            kept = []
         cursor = data.get("cursor")
         if not cursor or not page:
-            return kept
+            break
+    if emit is None:
+        return kept
+    if kept:
+        emit(kept)
+    return total
 
 
 def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
@@ -1538,9 +2049,11 @@ def _fetch_and_store_live_window(
     Worker task: fetch one fully-elapsed live settled-day window and persist it.
 
     The archive-side counterpart is _fetch_and_store_archive_day; same
-    rationale (records freed in-thread, serialization off the main thread).
-    Only past days go through here — the frontier day is fetched directly and
-    deliberately never persisted, since it was captured mid-day.
+    rationale (records streamed out in chunks, freed in-thread, serialization
+    off the main thread). Only past days go through here — the frontier day is
+    fetched directly and deliberately never persisted, since it was captured
+    mid-day; it is therefore the one remaining place a whole (partial) day is
+    held in memory, and it is bounded by how much of today has elapsed.
 
     Args:
         live_client: KalshiClient from build_prod_live_client().
@@ -1555,15 +2068,19 @@ def _fetch_and_store_live_window(
         _ShardedFetchUnsupported: Propagated from _fetch_live_window when the
             server stops honoring max_settled_ts.
     """
-    day_markets = _fetch_live_window(live_client, day_lo, day_lo + _DAY_SECONDS, progress)
     # Fully-elapsed days are immutable, so persisting here lets later runs and
-    # interrupted-run resumes skip the day entirely.
-    _day_store_save(
+    # interrupted-run resumes skip the day entirely. Streamed in chunks; the
+    # file becomes visible only once the whole window completed.
+    with _DayStreamWriter(
         _day_store_path("live_days", day_lo),
         _day_store_meta(day_lo, expect_meta),
-        day_markets,
-    )
-    return len(day_markets)
+    ) as writer:
+        count = _fetch_live_window(
+            live_client, day_lo, day_lo + _DAY_SECONDS, progress,
+            emit=writer.write_records,
+        )
+        writer.commit()
+    return int(count)
 
 
 def _fetch_live_phase(
@@ -1583,8 +2100,10 @@ def _fetch_live_phase(
     window is deliberately never persisted: it was fetched mid-day and would
     otherwise be reused as if complete.
 
-    As on the archive side, past-day records are persisted in the worker and
-    streamed back off disk at assembly rather than accumulated in memory.
+    As on the archive side, past-day records are streamed into the slice file
+    in chunks inside the worker and read back off disk at assembly rather than
+    accumulated in memory. The frontier window is the one exception, since it
+    is never persisted — a partial day held in RAM.
 
     Falls back to _fetch_live_sequential if the server stops honoring
     max_settled_ts (detected per window by _fetch_live_window).
@@ -1622,7 +2141,8 @@ def _fetch_live_phase(
         on_disk: list[int] = []
         to_fetch: list[int] = []
         for lo in past_day_los:
-            if _day_store_load(_day_store_path("live_days", lo), expect_meta) is not None:
+            if _day_store_load(_day_store_path("live_days", lo), expect_meta,
+                               _discard_all) is not None:
                 on_disk.append(lo)
             else:
                 to_fetch.append(lo)
@@ -1775,9 +2295,29 @@ def fetch_all_settled_markets(
     cutoff    = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")
     cutoff_ts = int(datetime.fromisoformat(cutoff["market_settled_ts"]).timestamp())
 
+    # A start_date at/after the archive cutoff means every market this window
+    # could ever touch is post-cutoff — i.e. live-era. Live-era markets 404 on
+    # /historical/markets/{ticker}/candlesticks (see the CLAUDE.md "Backtest
+    # windows must start BEFORE the archive cutoff" gotcha), so _find_entry()
+    # can never get candles for either leg and the run is structurally 0-trade
+    # no matter how many markets this fetch returns. Warn only — never abort,
+    # since the fetch can still be useful (e.g. for cache warming) and a false
+    # positive here must not block a legitimate run.
+    if start_ts >= cutoff_ts:
+        logging.warning(
+            "start_date (%s) is at or after the archive cutoff (%s) — "
+            "post-cutoff markets 404 on the historical candlesticks endpoint, "
+            "so this window is structurally 0-trade",
+            start_date, datetime.fromtimestamp(cutoff_ts, tz=UTC).date(),
+        )
+
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
     # when False, the legacy "exclude" behaviour is preserved.
+    # 1000 is this endpoint family's own hard cap (verified live 2026-07-13),
+    # not MARKET_PAGE_SIZE (200) — that constant is the /events listing cap
+    # used by _load_or_build_event_titles. Different endpoint family, don't
+    # "fix" this to MARKET_PAGE_SIZE in a future sweep.
     hist_kwargs: dict = {"limit": 1000}
     if not INCLUDE_MVE_MARKETS:
         hist_kwargs["mve_filter"] = "exclude"
@@ -1820,6 +2360,12 @@ def fetch_all_settled_markets(
     logging.info("Historical endpoint: %d markets from %s", archive_count, start_date)
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
+    # Prune any live_days/ slices left over from a PRIOR cutoff before the
+    # sweep below reuses/repopulates the store — those days are now served by
+    # the archive and their old live-endpoint slices are dead disk (see
+    # _prune_stale_live_days). Cheap relative to the fetch itself; runs every
+    # call, not just when the cutoff has actually advanced.
+    _prune_stale_live_days(cutoff_ts)
     # min_settled_ts is honored server-side, so the sweep is bounded to
     # [live_min_ts, now) by the API itself; see _fetch_live_phase for why the
     # lower bound is max(cutoff_ts, start_ts) rather than bare cutoff_ts.
@@ -1945,8 +2491,11 @@ def fetch_candlesticks(
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CANDLES_DIR / f"{ticker}.json"
-    if use_cache and cache_path.exists():
-        cached = json.loads(cache_path.read_text())
+    if use_cache:
+        # Guarded loader: absent OR corrupt (a truncated file from an
+        # interrupted run) both read back as None, so a damaged cache falls
+        # through to a refetch instead of raising out of the worker thread.
+        cached = _load_json_cache(cache_path)
         # Legacy cache files are a bare list with no window metadata (or predate
         # the period_interval tag) — we can't confirm what range/granularity
         # they cover, so fall through and refetch. The refetch below re-saves
@@ -1979,7 +2528,9 @@ def fetch_candlesticks(
             period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
         )
         candles = []
-        for c in data.get("candlesticks") or []:
+        raw_candlesticks = data.get("candlesticks") or []
+        dropped = 0
+        for c in raw_candlesticks:
             try:
                 ya = c.get("yes_ask") or {}
                 yb = c.get("yes_bid") or {}
@@ -1988,6 +2539,12 @@ def fetch_candlesticks(
                 yes_ask = _candle_close(ya)
                 yes_bid = _candle_close(yb)
                 if yes_ask is None or yes_bid is None:
+                    # Counts as a DROP, not a silent skip: _candle_close
+                    # signals an unparseable/absent close by returning None
+                    # rather than raising, so without this the candle would
+                    # bypass the counter below and a thinned series would be
+                    # cached with no visible signal at all (BS-23).
+                    dropped += 1
                     continue
                 # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
                 no_ask  = 1.0 - yes_bid
@@ -1997,7 +2554,12 @@ def fetch_candlesticks(
                     "no_ask_close": max(0.01, min(0.99, no_ask)),
                 })
             except (ValueError, TypeError, AttributeError, KeyError):
-                pass
+                dropped += 1
+        if dropped:
+            # The drop happens before the cache write, so a thinned series is
+            # otherwise cached as if it were complete with no visible signal.
+            logging.warning("%s: dropped %d/%d malformed candles",
+                            ticker, dropped, len(raw_candlesticks))
         # Rate limit: sleep briefly after each call to avoid 429 responses
         time.sleep(rate_limit_sleep)
         # Only successful fetches are cached (tagged with the window and
