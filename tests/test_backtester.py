@@ -129,7 +129,7 @@ class TestExtractPairsCanonHandling:
         mB = _md("B1", "EVT-B", title="Republicans win majority",
                  event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
-        pairs = _extract_pairs(groups, "same_title")
+        pairs = _extract_pairs(groups)
         assert len(pairs) == 1
         _, _, canon, _ = pairs[0]
         assert canon == "Republicans win majority"
@@ -144,7 +144,7 @@ class TestExtractPairsCanonHandling:
         mB1 = _md("E2-A", "EVT2A", title="Trump", event_title="Person of the Year")
         mB2 = _md("E2-B", "EVT2B", title="Trump", event_title="Person of the Year")
         groups = _group_by_exact_title([mA1, mA2, mB1, mB2])
-        pairs = _extract_pairs(groups, "same_title")
+        pairs = _extract_pairs(groups)
         assert len(pairs) == 2
         canons = {canon for _, _, canon, _ in pairs}
         assert canons == {"Trump"}
@@ -190,7 +190,7 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
         mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
                                    "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
-        pairs = _extract_pairs(groups, "same_title")
+        pairs = _extract_pairs(groups)
         assert len(pairs) == 1
 
     def test_extract_pairs_time_series_handles_missing_fields(self):
@@ -203,7 +203,7 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
         mB = self._old_style_dict("B1", "EVT-B", "Will BTC exceed $80k by March 20, 2026",
                                    "2026-03-20T00:00:00Z")
         groups = _group_by_normalized_title([mA, mB])
-        pairs = _extract_pairs(groups, "time_series")
+        pairs = _extract_pairs(groups)
         assert len(pairs) == 1
 
 
@@ -921,7 +921,7 @@ class TestExtractPairsWindowedEquivalence:
         members = self._build_synthetic_group()
         groups = {"synthetic": members}
 
-        windowed = _extract_pairs(groups, "time_series")
+        windowed = _extract_pairs(groups)
         windowed_set = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
 
         margin_days = MAX_DEADLINE_GAP_DAYS + 1
@@ -934,7 +934,7 @@ class TestExtractPairsWindowedEquivalence:
     def test_boundary_probes_land_exactly_where_expected(self):
         members = self._build_synthetic_group()
         groups = {"synthetic": members}
-        windowed = _extract_pairs(groups, "time_series")
+        windowed = _extract_pairs(groups)
         pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
 
         assert frozenset(["REF", "PLUS30"]) in pair_tickers
@@ -943,20 +943,20 @@ class TestExtractPairsWindowedEquivalence:
 
     def test_cross_cluster_pairs_never_appear(self):
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        windowed = _extract_pairs({"synthetic": members})
         for a, b, _, _ in windowed:
             assert not (a["ticker"].startswith("A") and b["ticker"].startswith("B"))
             assert not (a["ticker"].startswith("B") and b["ticker"].startswith("A"))
 
     def test_same_event_ticker_pair_is_skipped(self):
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        windowed = _extract_pairs({"synthetic": members})
         pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
         assert frozenset(["SAMEEVT-1", "SAMEEVT-2"]) not in pair_tickers
 
     def test_missing_close_time_member_produces_no_pairs(self):
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members}, "time_series")
+        windowed = _extract_pairs({"synthetic": members})
         for a, b, _, _ in windowed:
             assert a["ticker"] != "NOCLOSE"
             assert b["ticker"] != "NOCLOSE"
@@ -1048,7 +1048,7 @@ class TestExtractPairsPerformanceSmoke:
         groups = {"synthetic-ladder": members}
 
         t0 = time.perf_counter()
-        pairs = _extract_pairs(groups, "time_series")
+        pairs = _extract_pairs(groups)
         elapsed = time.perf_counter() - t0
 
         assert elapsed < 30, f"windowed _extract_pairs took {elapsed:.1f}s for {n} members"

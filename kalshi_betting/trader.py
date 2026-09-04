@@ -189,11 +189,13 @@ _V2_LEG_SIDE: dict[str, str] = {
     "close_no": "bid",  # unwind held NO  -> reduce-only bid at an aggressive price
 }
 
-# Hard bounds for a V2 limit price, in dollars. Kalshi prices live in the open
-# unit interval — 0 and 1 are settlement values, not tradeable levels — and the
-# finest grid in any regime is $0.0001, so these are the extreme valid ticks.
+# Lowest valid V2 limit price, in dollars. Kalshi prices live in the open unit
+# interval — 0 and 1 are settlement values, not tradeable levels — and the
+# finest grid in any regime is $0.0001, so this is the extreme valid bottom
+# tick. The top of grid is not a module constant: it depends on the market's
+# own tick regime and is derived per market by _v2_top_of_grid_price() from
+# config.V2_ROLLBACK_BID_PRICE_DOLLARS.
 _V2_MIN_PRICE = Decimal("0.0001")
-_V2_MAX_PRICE = Decimal("0.9999")
 
 # Number of decimal places in a V2 dollar-string price. Four places exactly
 # represents every grid point of every known regime ($0.01 / $0.001 / $0.0001),
