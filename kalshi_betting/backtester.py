@@ -335,10 +335,14 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
-def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str, object]]:
+def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
     the two markets have different event_tickers. No price filtering at this stage.
+
+    The pair type is NOT a parameter: the shape of each group key (see below)
+    decides which sweep applies, and run_backtest() attaches the pair_type
+    label to each returned tuple itself.
 
     Group keys may be:
       - a string (normalized-title group from _group_by_normalized_title), or
@@ -362,11 +366,23 @@ def _extract_pairs(groups: dict, pair_type: str) -> list[tuple[dict, dict, str, 
     unparseable close_time are dropped from this sweep (group-local only —
     _group_by_exact_title's same-title groups are untouched), because
     _find_entry() unconditionally requires close_time on both legs and
-    returns None immediately without it, regardless of pair_type.
+    returns None immediately without it, regardless of pair type.
 
     3-tuple-keyed (same-title) groups have no deadline-gap concept, so they
     stay naive — the eligibility prefilter (_can_ever_enter, applied in
     run_backtest before grouping) keeps these groups small in practice.
+
+    Args:
+        groups (dict): Mapping of group key -> list of market dicts (the
+            compact historical._market_to_dict form). Keys are either a
+            normalized-title string (time-series groups) or an
+            (event_title, title, subtitle) 3-tuple (same-title groups).
+
+    Returns:
+        list[tuple[dict, dict, str, object]]: One (market_a, market_b,
+            canonical_title, group_key) tuple per candidate pair, in group
+            iteration order. Empty if no group has two members on different
+            event_tickers.
     """
     pairs = []
     for key, members in groups.items():
@@ -873,8 +889,8 @@ def run_backtest(
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
-    ts_pairs     = _extract_pairs(ts_groups,   "time_series")
-    same_pairs   = _extract_pairs(same_groups, "same_title")
+    ts_pairs     = _extract_pairs(ts_groups)
+    same_pairs   = _extract_pairs(same_groups)
 
     logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))
 

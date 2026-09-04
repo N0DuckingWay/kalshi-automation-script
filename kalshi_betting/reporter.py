@@ -83,8 +83,6 @@ _TRADE_COLUMNS = [
 _HEADER_FILL_PROD = PatternFill("solid", fgColor="1F4E79")   # dark blue for prod
 _HEADER_FILL_DEV  = PatternFill("solid", fgColor="375623")   # dark green for dev
 _HEADER_FONT      = Font(bold=True, color="FFFFFF", size=11)
-_SUBHEADER_FILL   = PatternFill("solid", fgColor="D6E4F7")   # light blue
-_SUBHEADER_FONT   = Font(bold=True, color="1F4E79", size=10)
 _THIN_BORDER      = Border(
     bottom=Side(style="thin", color="BFBFBF"),
 )
