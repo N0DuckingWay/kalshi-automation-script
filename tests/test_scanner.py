@@ -1147,7 +1147,7 @@ class TestFetchShardStatuses:
             "intra_exchange_transfers_active": True, "description": "Main",
         }
         assert statuses[1]["trading_active"] is False
-        # Read by the collateral-transfer path in a later commit
+        # Read by trader.ensure_shard_collateral()
         assert statuses[1]["intra_exchange_transfers_active"] is False
 
     def test_string_exchange_index_is_coerced_to_int_key(self):

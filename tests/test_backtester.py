@@ -6,8 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# historical.py imports kalshi_python_sync.api.historical_api softly (the
-# module is absent in some SDK builds), so backtester.py is always importable
+# backtester.py imports no SDK module directly (historical.py reaches every
+# /historical route through its own _signed_raw_get, since the pinned SDK has
+# no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
 from kalshi_betting import backtester
 from kalshi_betting.backtester import (

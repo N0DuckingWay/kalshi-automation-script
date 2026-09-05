@@ -14,7 +14,8 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
 Dependencies:
-    Imports BacktestTrade from backtester.py and PROJECT_ROOT from config.py.
+    Imports BacktestTrade from backtester.py, and PROJECT_ROOT,
+    SAME_TITLE_CO_RESOLVE_PROB, and fee_per_pair_approx() from config.py.
     Uses plotly, numpy, pandas, and yfinance (all external). Called by backtest.py
     after run_backtest() completes.
 

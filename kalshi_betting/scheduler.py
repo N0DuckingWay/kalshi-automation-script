@@ -15,9 +15,13 @@ Purpose:
     for the next scheduled fire.
 
 Dependencies:
-    Imports PROJECT_ROOT from config.py. Spawns kalshi_betting.main as a subprocess
-    (via sys.executable) rather than importing it directly, to isolate run-time
-    errors and capture stdout/stderr separately. Entry point for
+    Imports PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS, and the EXIT_OK /
+    EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION exit-code constants
+    from config.py — the EXIT_* imports are what let run_job() map the
+    subprocess's exit code to a distinct log level/message (BS-14) rather than
+    treating every nonzero code identically. Spawns kalshi_betting.main as a
+    subprocess (via sys.executable) rather than importing it directly, to
+    isolate run-time errors and capture stdout/stderr separately. Entry point for
     `python3 -m kalshi_betting.scheduler`.
 
 Notes:
@@ -250,8 +254,9 @@ def run_job() -> None:
     nonzero exit, timeout, or OSError (BS-17). See this module's Notes for
     why claiming happens up front.
 
-    Logs stdout on success and stderr + exit code on failure so every run is
-    traceable in kalshi_arb.log. The subprocess's exit code is mapped to a
+    Logs stdout unconditionally (whether the run succeeded or failed) and logs
+    stderr + exit code additionally on failure, so every run is traceable in
+    kalshi_arb.log. The subprocess's exit code is mapped to a
     distinct log level/message per the EXIT_* contract in config.py (BS-14):
     a low-balance skip and a run with trades needing manual review are no
     longer indistinguishable from a clean run in this log — previously the

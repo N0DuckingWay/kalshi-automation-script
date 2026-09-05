@@ -8,7 +8,8 @@ Purpose:
     implements a two-path arbitrage strategy on the Kalshi prediction market
     platform: it finds pairs of correlated contracts where one leg is mispriced
     relative to the other, sizes trades using the Kelly criterion, submits
-    batch orders to the Kalshi REST API, and logs results to Excel. A separate
+    fill-or-kill orders leg-by-leg to the Kalshi REST API (there is no batch
+    order endpoint), and logs results to Excel. A separate
     backtest pipeline replays the same strategy on historical settled markets
     and generates an interactive HTML performance dashboard.
 

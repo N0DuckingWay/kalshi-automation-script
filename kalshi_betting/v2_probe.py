@@ -8,7 +8,7 @@ Purpose:
     trading pipeline and must be invoked by a human, deliberately, from a
     terminal:
 
-        python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step <name>] [--yes]
+        python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step <name>] [--dest-shard N] [--yes]
 
     It exists to verify, for about one cent, the one thing about the V2 order
     path that cannot be proven offline. The V2 order path in trader.py is
@@ -78,7 +78,11 @@ Notes:
 
     EXIT CODES: 0 = the executed step PASSED, 1 = something FAILED, 2 =
     NEUTRAL (the step could not be run to a conclusion — no fill, no liquidity,
-    aborted at the prompt, or a skipped transfer step). Only a 0 from BOTH
+    the OPENING confirmation was declined, or a skipped transfer step). A
+    prompt declined once a position is already open (e.g. the unfillable-ask
+    step's closing confirmation) is scored FAIL, not NEUTRAL — declining to
+    close a real open position is not a neutral outcome, and the printed
+    message tells the operator to flatten it manually. Only a 0 from BOTH
     mapping steps (--step no-mapping and --step unfillable-ask) is evidence
     that the V2 order path may be trusted to run unsupervised.
 """
@@ -390,9 +394,13 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
 
     Returns:
         str: _PASS only when the position went negative AND came back to zero;
-            _FAIL on any contrary evidence, an error, or a position left open;
-            _NEUTRAL when the step never reached a verdict (no liquidity, no
-            fill, or the operator declined at the prompt).
+            _FAIL on any contrary evidence, an error, or a position left open —
+            this includes declining the SECOND (closing) confirmation, since a
+            real position is open by then and declining to close it is not a
+            neutral outcome; _NEUTRAL only when the step never reached a
+            verdict with no position at risk (no liquidity, no fill, or
+            declining the FIRST (opening) confirmation, before any order was
+            submitted).
     """
     print("\n===== STEP: no-mapping (the V2 NO-leg mapping gate) =====")
 
@@ -587,9 +595,10 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
 
     Returns:
         str: _PASS when the order came back with zero filled, the full count
-            remaining, and the account still flat; _FAIL if anything filled or
-            the response/position disagrees; _NEUTRAL if the operator declined
-            or the market could not be read.
+            remaining, and the account still flat; _FAIL if anything filled,
+            the response/position disagrees, or the market could not be read
+            at all (no market means no order was even attempted); _NEUTRAL
+            only if the operator declined the interactive confirmation.
     """
     print("\n===== STEP: unfillable-ask (fill-or-kill kill semantics) =====")
 
@@ -680,7 +689,7 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     return _PASS
 
 
-def _transfer_leg(client: Any, source: int, dest: int, label: str):
+def _transfer_leg(client: Any, source: int, dest: int, label: str) -> str | None | bool:
     """
     Execute one leg of the transfer round trip and report its id.
 

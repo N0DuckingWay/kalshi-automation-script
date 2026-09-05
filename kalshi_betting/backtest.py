@@ -42,7 +42,9 @@ def main() -> None:
     --max-horizon-days), configures logging, constructs historical and live
     Kalshi API clients, runs the full backtest simulation via run_backtest(),
     and generates an interactive HTML dashboard via generate_dashboard().
-    Prints a summary table of key metrics to stdout on completion.
+    Logs a summary table of key metrics to kalshi_backtest.log on completion
+    (this module installs only a RotatingFileHandler, no console handler, so
+    nothing reaches stdout).
     """
     parser = argparse.ArgumentParser(
         description=(

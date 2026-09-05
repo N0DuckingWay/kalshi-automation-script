@@ -13,9 +13,17 @@ Purpose:
     files on disk so re-runs do not re-fetch from the API.
 
 Dependencies:
-    Imports build_client from auth.py and PROJECT_ROOT from config.py. Exports
-    build_historical_client(), build_prod_live_client(), fetch_all_settled_markets(),
-    fetch_candlesticks(), and infer_category() — all called by backtester.py.
+    Imports build_client from auth.py; api_call_with_retry and fetch_json_page
+    from _http.py; and PROJECT_ROOT plus a dozen-plus tuning constants
+    (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
+    SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES, ARCHIVE_TAIL_MAX_PAGES,
+    EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
+    EVENT_TITLE_LISTING_MAX_BARREN_PAGES, CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    INCLUDE_MVE_MARKETS, PROD_URL) from config.py. Exports
+    build_historical_client() and build_prod_live_client(), both called by
+    backtest.py (NOT backtester.py, which never builds its own clients); and
+    fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
+    all called by backtester.py.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -260,7 +268,7 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         dict: A flat dictionary with keys: ticker, event_ticker, event_title,
             title, subtitle, result, yes_ask_dollars, no_ask_dollars,
             yes_bid_dollars, open_time, close_time, settlement_ts, status,
-            price_level_structure, price_ranges.
+            price_level_structure, price_ranges, exchange_index.
             Note: open_time is a new field (added alongside the backtester's
             eligibility prefilter) — cache files written before this change
             don't have it and will read back as None until refreshed with
@@ -1945,8 +1953,13 @@ def _fetch_live_window(
             the number of records emitted.
 
     Raises:
-        _ShardedFetchUnsupported: If the first page contains a settlement
-            far above win_hi, i.e. the server stopped honoring max_settled_ts.
+        _ShardedFetchUnsupported: If ANY record on the first page settles
+            more than an hour above win_hi, i.e. the server stopped honoring
+            max_settled_ts. The check runs for every record while page 1 is
+            being processed (first_page only flips to False once that whole
+            page is done), not just the page's first record — but since
+            results arrive newest-settled-first, the first record is usually
+            the one that actually trips it.
     """
     kept: list[dict] = []
     total = 0
@@ -1972,8 +1985,11 @@ def _fetch_live_window(
             if settle is None or m.get("result") not in ("yes", "no"):
                 continue
             if first_page and win_hi is not None and settle > win_hi + 3600:
-                # Results are newest-first; a first record an hour past the
-                # requested ceiling means max_settled_ts is being ignored and
+                # This fires for ANY record on page 1 that's an hour past the
+                # ceiling, not only page[0] (first_page stays True for the
+                # whole page, not just its first record) — but results are
+                # newest-first, so page[0] is usually the one that trips it.
+                # Either way it means max_settled_ts is being ignored and
                 # every window would re-walk the whole range.
                 raise _ShardedFetchUnsupported("live endpoint ignored max_settled_ts")
             kept.append(_market_to_dict(m))
@@ -2264,11 +2280,11 @@ def fetch_all_settled_markets(
             event_title, title, subtitle, result ("yes" | "no"), yes_ask_dollars,
             no_ask_dollars, yes_bid_dollars, open_time, close_time (ISO str),
             settlement_ts (ISO str), status, price_level_structure,
-            price_ranges. Only includes markets with a non-null settlement_ts
-            and a binary result; tickers are unique. See _market_to_dict for
-            the per-key notes (subtitle now falls back to yes_sub_title;
-            price_level_structure/price_ranges are unread groundwork that older
-            cache records lack entirely).
+            price_ranges, exchange_index. Only includes markets with a
+            non-null settlement_ts and a binary result; tickers are unique.
+            See _market_to_dict for the per-key notes (subtitle now falls
+            back to yes_sub_title; price_level_structure/price_ranges are
+            unread groundwork that older cache records lack entirely).
     """
     if (prefilter is None) != (prefilter_tag is None):
         raise ValueError(
@@ -2422,8 +2438,11 @@ def _candle_close(side: dict) -> float | None:
         side (dict): A candle's "yes_ask" or "yes_bid" sub-dict.
 
     Returns:
-        float | None: Closing price in dollars, or None when neither field is
-            present/parseable (caller skips the candle).
+        float | None: Closing price in dollars. None when close_dollars is
+            absent (None/"") AND close is also absent/unparseable, OR when
+            close_dollars IS present but fails to parse as a float — that
+            case does NOT fall through to close; a present-but-malformed
+            preferred field is treated as a parse failure, not as absence.
     """
     for key in ("close_dollars", "close"):
         raw = side.get(key)

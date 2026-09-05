@@ -13,9 +13,18 @@ Purpose:
     a daily equity curve. Results feed into dashboard.py for visualization.
 
 Dependencies:
-    Imports normalize_title from scanner.py; fee helpers from config.py; market
-    fetching and candlestick functions from historical.py. Exports BacktestTrade
-    (consumed by dashboard.py) and run_backtest() (called by backtest.py).
+    Imports normalize_title from scanner.py; fee helpers (fee_leg_exact,
+    fee_per_pair_approx, min_price_diff_for_gap) plus BUDGET_FRACTION,
+    CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
+    MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
+    and SETTLED_PREFILTER_CACHE_TAG from config.py; fetch_all_settled_markets(),
+    fetch_candlesticks(), and infer_category() from historical.py. Also
+    depends on pandas (external) for the equity-curve DataFrame. Does NOT
+    import strategy.py — Kelly sizing and portfolio selection are
+    re-implemented inline against the same config.py constants, so a change
+    to either sizing formula must be made in both places to keep live/backtest
+    parity. Exports BacktestTrade (consumed by dashboard.py) and run_backtest()
+    (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -34,7 +43,7 @@ Notes:
     Before grouping, run_backtest() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
-    have a daily candle at-or-before that Monday (i.e. opened by then). A
+    have an hourly candle at-or-before that Monday (i.e. opened by then). A
     market whose [open_time, close_time - 1 day] window contains no such
     Monday can never appear in any entered pair, as either leg, in either pair
     type — dropping it up front avoids materializing it into any group at all.
@@ -244,7 +253,7 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
     entered pair, as either leg, of either pair type?
 
     _find_entry() only opens a trade at a Monday-09:00-UTC checkpoint inside
-    [start_date, min(close_a, close_b) - 1 day], and requires a daily candle
+    [start_date, min(close_a, close_b) - 1 day], and requires an hourly candle
     at-or-before that Monday for BOTH legs — which requires each market to
     have opened on or before it. So a market whose own
     [open_time, close_time - 1 day] window contains no Monday on/after
@@ -299,6 +308,14 @@ def _pair_key(m: dict) -> str:
 
     Falls back to the bare title when event_title is missing (older cache files
     or non-MVE markets).
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+
+    Returns:
+        str: "{event_title} | {title}" when event_title is present, otherwise
+            just the title (falling back to subtitle, then ticker, if the
+            market has no title).
     """
     event_title = m.get("event_title") or ""
     title = m.get("title") or m.get("subtitle") or m.get("ticker", "")
@@ -308,10 +325,20 @@ def _pair_key(m: dict) -> str:
 
 
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
-    """Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
+    """
+    Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
 
     Three-element key: the event_title component prevents cross-event option-label
     collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+
+    Args:
+        markets (list[dict]): Market dicts in the compact historical._market_to_dict
+            form.
+
+    Returns:
+        dict[tuple, list[dict]]: Mapping of (event_title, title, subtitle) ->
+            member markets, for groups with >= 2 members and at least one of
+            title/subtitle non-empty. Single-member groups are dropped.
     """
     groups: dict = defaultdict(list)
     for m in markets:
@@ -324,7 +351,18 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
 
 
 def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
-    """Group markets by date-stripped combined key (event_title + title) for time-series pair detection."""
+    """
+    Group markets by date-stripped combined key (event_title + title) for time-series pair detection.
+
+    Args:
+        markets (list[dict]): Market dicts in the compact historical._market_to_dict
+            form.
+
+    Returns:
+        dict[str, list[dict]]: Mapping of normalized (event_title + title) key
+            -> member markets, for groups with >= 2 members. A market whose
+            key normalizes to an empty string is dropped.
+    """
     groups: dict = defaultdict(list)
     for m in markets:
         # _pair_key combines event_title + market title before normalization so that
@@ -475,8 +513,12 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     Find the most recent candlestick at or before a given Unix timestamp.
 
     Candles are assumed to be sorted ascending by their "ts" field. Returns the
-    last candle whose end_period_ts is <= ts, or None if no such candle exists.
-    This is used to read the closing price on or before a given Monday snapshot.
+    last candle whose "ts" is <= ts, or None if no such candle exists. ("ts" is
+    derived from the API's end_period_ts when the candle is fetched — see
+    historical.fetch_candlesticks — so this is equivalently "at or before the
+    candle's period end", just read off the dict's own key rather than the
+    wire field name.) This is used to read the closing price on or before a
+    given Monday snapshot.
 
     Args:
         candles (list[dict]): List of candle dicts with a "ts" key (unix timestamp).
@@ -509,10 +551,13 @@ def _find_entry(
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
 
-    Scans weekly Monday snapshots from the backtest start date up to one calendar
-    year before the earlier of the two market close dates. At each Monday, reads
-    the candlestick prices, applies the price gap, price-sum, and fee filters from
-    the live trading logic, and returns the entry data for the first qualifying week.
+    Scans weekly Monday snapshots up to (not including) the day before the
+    earlier of the two market close dates. The scan's start is the LATER of
+    the backtest start date and one calendar year before that end point — the
+    one-year figure bounds how far back the window can reach, it does not
+    describe where the window ends. At each Monday, reads the candlestick
+    prices, applies the price gap, price-sum, and fee filters from the live
+    trading logic, and returns the entry data for the first qualifying week.
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract, and an
@@ -811,12 +856,23 @@ def run_backtest(
             applies no cap, matching current behavior. Passed straight through
             to _find_entry() for each candidate pair.
 
-    Returns (trades, equity_df) where equity_df has columns:
-      [date, portfolio_value, daily_return]
+    Returns:
+        tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
+            trades is one BacktestTrade per entered pair, in entry-date order
+            (empty if none were ever entered). equity_df has columns
+            [date, portfolio_value, daily_return], one row per day, flat at
+            initial_balance if trades is empty.
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — this is
+            treated as a real defect (a market that should never have reached
+            this stage), not degraded into "no price history".
 
     Note:
         Before any network call, this function checks whether [start_date,
-        today - 1 day] contains at least one Monday 09:00 UTC checkpoint (the
+        today] contains at least one Monday 09:00 UTC checkpoint (the
         only kind _find_entry() can ever act on). If not, no trade can ever
         be entered regardless of what the fetch would return, so the fetch is
         skipped entirely and this returns the same empty-result shape as the
@@ -1021,8 +1077,12 @@ def run_backtest(
         })
 
     # Keep only the single best candidate per title group — mirrors the live
-    # scanners, which keep one pair per normalized-title / exact-title group so
-    # the portfolio isn't flooded with near-identical correlated positions.
+    # scanners' CONCEPT (one pair per normalized-title / exact-title group so
+    # the portfolio isn't flooded with near-identical correlated positions),
+    # not their tie-break rule: the live scanners rank by tradeable-first then
+    # largest price gap (scanner.py's group_pairs.sort), while this ranks by
+    # largest entry_monthly_ratio — a different quantity, chosen here because
+    # entry-time expected return is what Pass 2 below sizes and orders on.
     # Dedup on the FULL group_key (which includes event_title for same_title
     # groups), not the display-only canon — two unrelated events sharing an
     # option label (e.g. "Trump" in two different events) have the same canon
@@ -1044,9 +1104,18 @@ def run_backtest(
 
     # ── Pass 2: chronological cash-constrained greedy selection ───────────────
     # Walk entries in date order, maintaining a running cash balance: each trade
-    # is Kelly-sized against the cash available at its entry (like the live bot
-    # sizing against the current account balance), and settlement receipts return
-    # to cash on their exit dates. A ticker-conflict filter mirrors the live
+    # is Kelly-sized against the cash available AT ITS OWN ENTRY DATE, which
+    # already reflects every earlier trade's cost and every settled trade's
+    # receipt. This is NOT what the live bot does: main._run_prod sizes every
+    # candidate in one run against that run's single opening-balance snapshot
+    # (compute_trade(pair, balance_cents) with one fixed balance_cents for the
+    # whole scan), then greedily fits them by decrementing a local budget —
+    # it never re-reads the account balance mid-run. The backtest's per-checkpoint
+    # resizing is deliberately more permissive (a later trade can draw on an
+    # earlier trade's settled profit within the same backtest), so a backtest
+    # Kelly fraction is not directly comparable to a single live run's sizing.
+    # Settlement receipts return to cash on their exit dates. A ticker-conflict
+    # filter mirrors the live
     # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
     # rule comes from scanner.get_held_tickers(), which queries positions with
     # count_filter="position" — so a ticker leaves the held set once its market

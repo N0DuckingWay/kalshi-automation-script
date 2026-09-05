@@ -14,11 +14,14 @@ Purpose:
     import.
 
 Dependencies:
-    No project imports — this module is a leaf so scanner.py, trader.py, and
-    historical.py can import from it without introducing cycles. Imports
-    ApiException from the kalshi_python_sync SDK to re-raise raw-response
-    HTTP errors with the same exception types the modeled calls used, and
-    (optionally) urllib3's exception types to recognize transport-level drops.
+    No project imports — this module is a leaf so auth.py, scanner.py,
+    trader.py, and historical.py can all import from it without introducing
+    cycles (the standalone, human-run verification CLI kept deliberately
+    outside the pipeline's import graph also imports from here — see
+    CLAUDE.md's pipeline-isolation rule). Imports ApiException from the
+    kalshi_python_sync SDK to re-raise raw-response HTTP errors with the same
+    exception types the modeled calls used, and (optionally) urllib3's
+    exception types to recognize transport-level drops.
 
 Notes:
     The Kalshi SDK's ApiException exposes .status; requests-based errors expose
@@ -163,7 +166,7 @@ def _is_transient_network_error(exc: BaseException) -> bool:
     return False
 
 
-def _check_and_parse(resp: Any) -> dict:
+def _check_and_parse(resp: Any) -> Any:
     """
     Apply the status check and JSON parse shared by every raw-response call.
 
@@ -179,7 +182,10 @@ def _check_and_parse(resp: Any) -> dict:
             .data attribute or a .read() method for the body bytes.
 
     Returns:
-        dict: The parsed JSON response body.
+        Any: The parsed JSON response body — a `dict` for every Kalshi
+            endpoint response observed in practice, but the underlying JSON
+            parser (orjson.loads or the stdlib json.loads) doesn't enforce
+            that, so the type is not narrowed to `dict` here.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
@@ -238,11 +244,14 @@ def signed_request_json(
     """
     Perform a signed request of any HTTP method against an arbitrary API path.
 
-    The pinned SDK has no generated method for several routes the bot needs
-    (the /historical archive, and the V2 order endpoint
-    /portfolio/events/orders this is groundwork for), and its modeled calls
-    deserialize through response models that live API drift keeps breaking.
-    This helper signs the request the way every SDK call is signed (KalshiAuth:
+    The pinned SDK has no generated method for the V2 order endpoint
+    (/portfolio/events/orders, used by trader._submit_order_v2) or the
+    intra-exchange collateral transfer endpoint (used by
+    trader._execute_transfer), and its modeled calls deserialize through
+    response models that live API drift keeps breaking. (The /historical
+    archive is reached through a separate, dedicated helper,
+    historical._signed_raw_get, not this function.) This helper signs the
+    request the way every SDK call is signed (KalshiAuth:
     RSA-PSS over timestamp + method + path — method-agnostic, query string
     stripped, body NOT part of the signature), executes it with the client's own
     rest client, and applies the shared status-check + JSON-parse contract.

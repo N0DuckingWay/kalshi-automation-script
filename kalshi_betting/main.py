@@ -8,8 +8,9 @@ Purpose:
     Parses command-line arguments to select dev (sandbox simulation) or prod
     (real-money trading) mode, then coordinates the full scan-size-execute-log
     cycle: building an authenticated API client, fetching open markets, finding
-    arbitrage candidate pairs, sizing trades via Kelly criterion, submitting batch
-    orders to the Kalshi REST API, and writing results to Excel. This is the only
+    arbitrage candidate pairs, sizing trades via Kelly criterion, submitting
+    fill-or-kill orders leg-by-leg to the Kalshi REST API, and writing results
+    to Excel. This is the only
     module that ties all other modules together in the live trading path. The
     process exit code communicates the run's outcome to the scheduler (a
     separate subprocess) — see the EXIT_* constants in config.py (BS-14): an
@@ -436,7 +437,8 @@ def _run_prod(client, args) -> int:
 
     Verifies authentication, reads the live account balance, fetches currently
     held positions to exclude them from scanning, discovers arbitrage candidates,
-    sizes trades using Kelly criterion, and submits batch orders. Results are
+    sizes trades using Kelly criterion, and submits fill-or-kill orders
+    leg-by-leg. Results are
     appended to the persistent trade_log.xlsx file. In dry_run mode (--dry-run
     flag), all steps run normally except order submission — the log still records
     rows with status="simulated".

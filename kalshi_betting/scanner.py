@@ -682,8 +682,8 @@ def fetch_shard_statuses(client: Any) -> dict | None:
             statuses[idx] = {
                 "trading_active": bool(entry.get("trading_active")),
                 "exchange_active": bool(entry.get("exchange_active")),
-                # Read by the collateral-transfer path in a later commit; kept
-                # here so the parsed shape doesn't have to change then.
+                # Read by trader.ensure_shard_collateral() to refuse moving
+                # funds to or from a shard where transfers are disabled.
                 "intra_exchange_transfers_active": bool(
                     entry.get("intra_exchange_transfers_active")
                 ),
@@ -1064,6 +1064,19 @@ def find_time_series_pairs(
     hedge against it. That's the time-series independence assumption CLAUDE.md flags,
     and why same-title pairs (no deadline gap, simpler co-resolution model) are
     preferred over time-series ones wherever both exist.
+
+    Args:
+        client (Any): Authenticated KalshiClient, used only when markets is None.
+        held_tickers (set | None): Tickers to exclude (currently-held positions).
+            None or empty means exclude nothing.
+        markets (list | None): Pre-fetched ApiMarket list to scan. When None,
+            fetches all open markets via fetch_open_events_with_markets(client).
+
+    Returns:
+        list: CandidatePair objects, one per normalized-title group that
+            produced a pair, each carrying pair_type="time_series". Empty if
+            no group has two markets on different event_tickers within the
+            deadline-gap cap.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the caller
@@ -1190,6 +1203,18 @@ def find_same_title_pairs(
 
     Filters: different event_ticker (to exclude multi-choice options), both actively
     priced (1%-99%), not in held_tickers. One best pair per title group.
+
+    Args:
+        markets (list): ApiMarket objects to scan (already fetched by the
+            caller — unlike find_time_series_pairs, this function never
+            fetches).
+        held_tickers (set | None): Tickers to exclude (currently-held
+            positions). None or empty means exclude nothing.
+
+    Returns:
+        list: CandidatePair objects, one per (event_title, title, subtitle)
+            group that produced a pair, each carrying pair_type="same_title".
+            Empty if no group has two markets on different event_tickers.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
@@ -1291,7 +1316,15 @@ def _pair_orderbooks(
     min(remaining_no, remaining_yes) contracts and emit (yes_price, no_price, qty).
     Contracts left over in one book with no counterpart in the other are dropped.
 
-    Returns [(yes_price, no_price, qty), ...].
+    Args:
+        no_levels (list[tuple[float, float]]): (price, quantity) levels for
+            market A's NO ask, ascending by price.
+        yes_levels (list[tuple[float, float]]): (price, quantity) levels for
+            market B's YES ask, ascending by price.
+
+    Returns:
+        list[tuple[float, float, float]]: (yes_price, no_price, qty) tuples,
+            one per matched quantity slice. Empty if either input is empty.
     """
     pairs: list[tuple[float, float, float]] = []
     i, j = 0, 0
@@ -1320,12 +1353,19 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     """
     Convert bid levels to ask levels via the complement price (1 − P).
 
-    bids_raw: [[price_str, qty_str], ...] sorted descending by price.
-    Returns: [(ask_price, qty), ...] sorted ascending (cheapest ask first).
-
     Applies to both sides: YES bid at P → NO ask at (1−P);
                            NO bid at P → YES ask at (1−P).
     Descending bids naturally yield ascending asks after the complement.
+
+    Args:
+        bids_raw (list): [[price_str, qty_str], ...] sorted descending by
+            price, as parsed from the orderbook payload.
+
+    Returns:
+        list[tuple[float, float]]: [(ask_price, qty), ...] sorted ascending
+            (cheapest ask first). A level whose complement price falls outside
+            [_MIN_ACTIVE_PRICE, _MAX_ACTIVE_PRICE] or whose qty is <= 0 is
+            dropped; a malformed entry (bad price/qty string) is skipped.
     """
     levels = []
     for entry in bids_raw:
@@ -1589,11 +1629,14 @@ def _pair_max_sum(pair: Any) -> float:
     Return the maximum allowed yes_price + no_price sum for one pair's orderbook
     depth levels — the complement of the pair's minimum price-gap threshold.
 
-    same_title pairs use the flat 5% threshold (sum <= 0.95). time_series pairs
-    use the deadline-gap-tiered threshold: sum <= 0.85 when the deadlines are
-    <= 15 days apart, sum <= 0.70 for 16-30 days. market_a is always the
-    earlier-closing leg for time_series pairs (guaranteed by the sort in
-    find_time_series_pairs), so the gap is non-negative.
+    same_title pairs use the flat SAME_TITLE_MIN_PRICE_DIFF threshold
+    (sum <= 1 - SAME_TITLE_MIN_PRICE_DIFF). time_series pairs use the
+    deadline-gap-tiered threshold from min_price_diff_for_gap() (sum <=
+    1 - MIN_PRICE_DIFF_SHORT_GAP when the deadlines are <= SHORT_DEADLINE_GAP_DAYS
+    apart, sum <= 1 - MIN_PRICE_DIFF_LONG_GAP for wider gaps up to
+    MAX_DEADLINE_GAP_DAYS). market_a is always the earlier-closing leg for
+    time_series pairs (guaranteed by the sort in find_time_series_pairs), so
+    the gap is non-negative.
 
     Args:
         pair (CandidatePair): The pair whose ceiling is needed.
@@ -1615,13 +1658,22 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
     pairs whose combined price meets the pair's gap threshold (see
     _pair_max_sum):
 
-      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF (0.95)
+      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
       time_series: yes_price + no_price <= 1 - min_price_diff_for_gap(gap)
-                   (0.85 for deadline gaps <= 15 days, 0.70 for 16-30 days)
 
     nA and pB are replaced with weighted-average fill prices over qualifying
     contracts. max_contracts is set to the total qualifying count. Pairs with
     no qualifying contracts are marked tradeable=False.
+
+    Args:
+        client (Any): Authenticated KalshiClient used to fetch each pair's
+            order books (cached per ticker across the whole call).
+        pairs (list): CandidatePair objects to enrich. A pair already marked
+            tradeable=False is passed through unchanged.
+
+    Returns:
+        list: One CandidatePair per input pair, in the same order, with nA/pB/
+            tradeable/max_contracts replaced by depth-validated values.
     """
     # Cache order books by ticker to avoid fetching the same book twice
     # when the same market appears in multiple pairs
@@ -1668,8 +1720,9 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         paired     = _pair_orderbooks(no_levels, yes_levels)
 
         # Keep only contract pairs where the combined fill price leaves the required
-        # gap: same_title requires ≥5% (sum ≤ 0.95); time_series requires the
-        # deadline-gap-tiered 15%/30% (sum ≤ 0.85 / 0.70)
+        # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
+        # the deadline-gap-tiered threshold from min_price_diff_for_gap() — see
+        # _pair_max_sum for the exact per-tier ceilings.
         max_sum    = _pair_max_sum(pair)
         qualifying = [
             (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum

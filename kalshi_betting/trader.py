@@ -273,8 +273,12 @@ def _rollback_floor_cents(spec: TradeSpec) -> int:
     Returns:
         int: Limit price in cents, always within [1, 99].
     """
-    # round() BEFORE int: nA is a cent-quantized book price carried as a float,
-    # so int() alone would truncate 0.57 stored as 0.5699999999999998 to 56.
+    # round() BEFORE int: this bound is deliberately cent-quantized regardless
+    # of the market's own tick grid, and spec.pair.nA is generally NOT a clean
+    # cent value by the time it reaches here — scanner.enrich_with_orderbook_prices
+    # replaces the raw best-ask with a depth-weighted average across qualifying
+    # book levels, so nA can land anywhere in (0, 1) as a float (e.g. rounding
+    # to 0.57 as 0.5699999999999998), which int() alone would truncate to 56.
     entry_cents = int(round(spec.pair.nA * 100))
     return max(1, min(99, entry_cents - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT))
 
@@ -559,12 +563,18 @@ def _v2_rollback_price(spec: TradeSpec) -> Decimal:
         at most a fraction of a cent per contract.
       * config.V2_ROLLBACK_BID_PRICE_DOLLARS is the top-of-grid CLAMP, FLOORED
         onto its band (floor, not ceiling, because rounding up would leave the
-        open unit interval — 1 is a settlement value, not a tradeable level).
-        It binds when leg A's entry is low enough that 1 - floor exceeds the
-        highest tradeable level, and it is grid-aware for the same reason
-        _v2_limit_price's clamp is: the top level is 0.99 on a linear-cent
-        grid, 0.999 on deci-cent, 0.9999 on a centi-cent edge band. A flat 0.99
-        would fail to cross asks resting in (0.99, 1) on sub-cent regimes.
+        open unit interval — 1 is a settlement value, not a tradeable level),
+        applied via min(cap, _v2_top_of_grid_price(market)). It is grid-aware
+        for the same reason _v2_limit_price's clamp is: the top level is 0.99
+        on a linear-cent grid, 0.999 on deci-cent, 0.9999 on a centi-cent edge
+        band — a flat 0.99 would fail to cross asks resting in (0.99, 1) on
+        sub-cent regimes. With ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT's current
+        value and _rollback_floor_cents' [1, 99]-cent clamp, floor_cents can
+        never go below 1, so cap = 1 - floor_cents/100 can never exceed 0.99 —
+        i.e. this clamp is a defensive invariant that cannot actually bind
+        today (0.99 is already <= every regime's top-of-grid level); it exists
+        so a future change to the floor's bound or clamp range can't silently
+        push the cap above a tradeable level.
 
     Args:
         spec (TradeSpec): The trade whose leg A is being unwound. Uses
@@ -1003,7 +1013,7 @@ def _read_position(client: Any, ticker: str) -> float:
             if raw is None:
                 raw = pos.get("position")
             return float(raw)
-    return 0
+    return 0.0
 
 
 def _position_count_once(client: Any, ticker: str) -> float | None:
@@ -1617,11 +1627,15 @@ def ensure_shard_collateral(
         in-flight transfer ids ("money is in flight"), and only the trades
         needing a still-unfunded shard are dropped.
 
-    In practice this is currently a no-op: while every selected market's legs
-    and all account funds sit on config.DEFAULT_EXCHANGE_INDEX, no shard is ever
-    short and the zero-deficit fast path returns immediately. It exists so the
-    funding path is already in place — and already exercised by that fast path —
-    from the first run on which a trade routes off shard 0.
+    This is genuinely live, not a placeholder for a future migration: Kalshi
+    moved all combo/MVE markets to shard 1, crypto to shard 2, and
+    tennis/baseball to shard 3 (see the exchange-sharding gotcha in
+    CLAUDE.md), so a selected portfolio spanning shards — and an account
+    balance concentrated on one shard — is the normal case today, not an
+    edge case. The zero-deficit fast path still returns immediately with no
+    API calls whenever a run's selected legs happen to already sit on a
+    funded shard; it is a fast path for that case, not evidence collateral
+    movement is inactive in general.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
