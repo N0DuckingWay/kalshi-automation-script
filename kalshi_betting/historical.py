@@ -1054,7 +1054,7 @@ def _prune_stale_live_days(cutoff_ts: int) -> int:
             # Not one of our day-slice filenames — leave it alone.
             continue
         day_lo = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
-        if day_lo + 86400 > cutoff_ts:
+        if day_lo + _DAY_SECONDS > cutoff_ts:
             # Day extends up to or past the cutoff — still (partly) live-only.
             continue
         try:

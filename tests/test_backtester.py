@@ -1201,6 +1201,29 @@ class TestFetchCandlesParallel:
             _fetch_candles_parallel(MagicMock(), self._needed(8),
                                     date(2026, 1, 1), True)
 
+    def test_candlestick_progress_denominator_counts_only_fetched_tickers(
+        self, monkeypatch, caplog,
+    ):
+        # C6: 5 of the 56 needed tickers have no close_time and are resolved
+        # to [] without ever entering `work`, so only 51 tickers actually pass
+        # through a worker. The progress line's denominator must reflect that
+        # (len(work)), not len(needed_tickers) (56) — the old bug meant the
+        # counter could never reach its own denominator whenever any ticker
+        # was skipped.
+        needed = self._needed(51)
+        for i in range(5):
+            needed[f"NOCLOSE{i:02d}"] = {"ticker": f"NOCLOSE{i:02d}", "close_time": None}
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *_a, **_k: [])
+
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+        assert any(m.endswith("50 / 51") for m in messages)
+        assert not any("50 / 56" in m for m in messages)
+
     def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
         # Same guarantee end-to-end: the three existing run_backtest fixtures
         # rely on an unknown ticker raising KeyError out of the whole run as a

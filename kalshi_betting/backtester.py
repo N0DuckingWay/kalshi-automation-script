@@ -87,6 +87,10 @@ from .historical import (
 )
 from .scanner import normalize_title
 
+# Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
+# rather than importing a private name.
+_DAY_SECONDS = 86_400
+
 # ─── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -861,7 +865,7 @@ def _fetch_candles_parallel(
             candles_by_ticker[ticker] = []
             continue
         # close_ts: one day past market close to include the final candle
-        close_ts = int(close_dt.timestamp()) + 86400
+        close_ts = int(close_dt.timestamp()) + _DAY_SECONDS
         work.append((ticker, close_ts))
 
     if work:
@@ -879,8 +883,13 @@ def _fetch_candles_parallel(
                     candles_by_ticker[futures[future]] = future.result()
                     done += 1
                     if done % 50 == 0:
+                        # Denominator is len(work), not len(needed_tickers): tickers
+                        # with a missing/unparseable close_time never enter `work`
+                        # (they're resolved to [] above without a worker), so
+                        # `done` can never reach len(needed_tickers) whenever any
+                        # were skipped.
                         logging.info("  Candlestick progress: %d / %d",
-                                     done, len(needed_tickers))
+                                     done, len(work))
             except BaseException:
                 # Same tear-down as historical.py's fetch pools: without it the
                 # executor's __exit__ drains every still-queued ticker (hours of
