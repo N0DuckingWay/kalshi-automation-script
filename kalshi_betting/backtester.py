@@ -28,8 +28,12 @@ Dependencies:
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
-    (prices, dates, Kelly fraction — no sizing) and keeps only the best entry per
-    title group, mirroring the live scanners' one-pair-per-group rule. Pass 2 walks
+    (prices, dates, Kelly fraction — no sizing), keeps only the best entry per
+    title group (mirroring the live scanners' one-pair-per-group rule), and then
+    drops any time-series candidate whose ticker pair was also found as a
+    same-title candidate — the same preference main._dedup_pairs applies live,
+    since the same-title co-resolution model does not rest on the time-series
+    independence assumption. Pass 2 walks
     entries in chronological order (priority-ordered within a date using the
     ENTRY-TIME expected return, never realized results), maintains a running cash
     balance — sizing each trade against the cash available at entry and releasing
@@ -371,6 +375,55 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
+    """
+    Drop time-series candidates whose ticker pair was also found as a same-title candidate.
+
+    Mirrors main._dedup_pairs on the live path: when both scanners detect the
+    same two markets, the same-title pair is kept because its co-resolution
+    model is simpler (identical questions must co-resolve) and does not rest on
+    the time-series independence assumption — see CLAUDE.md, "Pair dedup prefers
+    same-title", and the same_title > time_series tie-break in
+    strategy.select_portfolio(). Duplicate identity is the frozenset of the two
+    tickers, so a pair discovered with its legs in the opposite order still
+    matches.
+
+    This has to happen in Pass 1, not Pass 2: Pass 2's ticker-conflict filter
+    only prevents both copies being OPEN at the same time. Whenever the
+    same-title copy is skipped there for sizing reasons (n < 1, or a
+    non-positive expected payoff), it never claims the tickers, so the
+    time-series duplicate is entered instead — a candidate the live pipeline
+    would never have had at all.
+
+    Args:
+        candidates (list[dict]): Pass 1 candidate dicts, each carrying
+            "pair_type" ("same_title" or "time_series") and the "mA"/"mB"
+            market dicts (which carry "ticker").
+
+    Returns:
+        list[dict]: Every same-title candidate plus every time-series candidate
+            whose ticker pair is not already covered by a same-title candidate,
+            in the input's original order.
+    """
+    same_title_keys = {
+        frozenset((c["mA"]["ticker"], c["mB"]["ticker"]))
+        for c in candidates
+        if c["pair_type"] == "same_title"
+    }
+    kept = [
+        c for c in candidates
+        if c["pair_type"] == "same_title"
+        or frozenset((c["mA"]["ticker"], c["mB"]["ticker"])) not in same_title_keys
+    ]
+    dropped = len(candidates) - len(kept)
+    if dropped:
+        logging.info(
+            "Dropped %d time-series candidate(s) already covered by a same-title candidate",
+            dropped,
+        )
+    return kept
 
 
 def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
@@ -858,7 +911,9 @@ def run_backtest(
       4. Fetch hourly candlesticks for every ticker appearing in a potential
          pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS threads.
       5. Find the first Monday where the pair was tradeable at the threshold;
-         keep only the best entry per title group (live one-pair-per-group rule).
+         keep only the best entry per title group (live one-pair-per-group
+         rule), then drop any time-series candidate whose ticker pair was also
+         found as a same-title candidate (live main._dedup_pairs rule).
       6. Walk entries chronologically with a running cash balance: Kelly-size
          each trade against the cash available at entry, and record actual P&L
          from settlement outcomes.
@@ -1116,6 +1171,14 @@ def run_backtest(
         if cur is None or c["entry_monthly_ratio"] > cur["entry_monthly_ratio"]:
             best_by_group[key] = c
     candidates = list(best_by_group.values())
+
+    # Cross-type dedup, mirroring main._dedup_pairs on the live path: the same
+    # two tickers can be discovered by BOTH groupings, and the live pipeline
+    # keeps only the same-title copy (simpler co-resolution model). Must run
+    # here rather than relying on Pass 2's ticker-conflict filter, which only
+    # stops both copies being open at once — not the time-series copy being
+    # entered whenever the same-title one is skipped for sizing reasons.
+    candidates = _drop_cross_type_duplicates(candidates)
 
     # Chronological order for the cash simulation; within one entry date, take
     # the best ENTRY-TIME expected return first (same_title preferred at ties,

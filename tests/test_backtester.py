@@ -1326,3 +1326,123 @@ class TestRunBacktestFeasibilityPreCheck:
                      start_date=date(2026, 8, 26), initial_balance=1000.0)
 
         assert called == [True]
+
+
+class TestDropCrossTypeDuplicates:
+    """Pass 1 must not carry the same ticker pair as both a same-title and a
+    time-series candidate — the live pipeline never does (main._dedup_pairs)."""
+
+    def test_drop_cross_type_duplicates_prefers_same_title(self, caplog):
+        same = {"pair_type": "same_title",
+                "mA": {"ticker": "X"}, "mB": {"ticker": "Y"}}
+        # Same two tickers as `same`, but discovered in the OPPOSITE leg order:
+        # the frozenset key must still recognise it as the same pair.
+        dupe = {"pair_type": "time_series",
+                "mA": {"ticker": "Y"}, "mB": {"ticker": "X"}}
+        other = {"pair_type": "time_series",
+                 "mA": {"ticker": "P"}, "mB": {"ticker": "Q"}}
+
+        with caplog.at_level("INFO"):
+            result = backtester._drop_cross_type_duplicates([same, dupe, other])
+
+        # Input order is preserved and only the cross-type duplicate is dropped
+        assert result == [same, other]
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+        assert any("Dropped 1 time-series candidate(s) already covered" in m
+                   for m in messages), messages
+
+    def test_no_duplicates_logs_nothing_and_returns_input_order(self, caplog):
+        same = {"pair_type": "same_title",
+                "mA": {"ticker": "X"}, "mB": {"ticker": "Y"}}
+        other = {"pair_type": "time_series",
+                 "mA": {"ticker": "P"}, "mB": {"ticker": "Q"}}
+
+        with caplog.at_level("INFO"):
+            result = backtester._drop_cross_type_duplicates([other, same])
+
+        assert result == [other, same]
+        assert not any("already covered by a same-title candidate" in r.getMessage()
+                       for r in caplog.records)
+
+
+class TestRunBacktestCrossTypeDedup:
+    """End-to-end proof that run_backtest applies the cross-type dedup (C4).
+
+    Fixture shape: two markets sharing an identical (event_title, title,
+    subtitle) — so _group_by_exact_title pairs them as same_title — whose
+    titles therefore also normalize to one key, so _group_by_normalized_title
+    pairs the SAME two tickers as time_series. Distinct close dates 7 days
+    apart keep the time-series copy inside the short (<= 15 day) tier, so it
+    genuinely qualifies at the 15% threshold rather than being filtered out
+    by _find_entry.
+    """
+
+    _MARKETS = [
+        {"ticker": "DA", "event_ticker": "EA", "event_title": "EV",
+         "title": "Q", "subtitle": "", "result": "yes",
+         "close_time": "2026-02-01T00:00:00+00:00",
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        {"ticker": "DB", "event_ticker": "EB", "event_title": "EV",
+         "title": "Q", "subtitle": "", "result": "yes",
+         "close_time": "2026-02-08T00:00:00+00:00",
+         "settlement_ts": "2026-02-08T12:00:00+00:00"},
+    ]
+    # pA - pB = 0.25 clears both the 5% same-title and the 15% short-gap
+    # time-series threshold, and nA + pB = 0.55 <= 0.85 satisfies the
+    # short-tier sum ceiling. DA's book is deliberately WIDE (yes 0.60 /
+    # no 0.20): on a tight book (nA == 1 - pA) the time-series independence
+    # probability 1 - pA*(1 - pB) always yields a non-positive Kelly fraction,
+    # so the time-series copy would be dropped in Pass 1 before the dedup under
+    # test ever sees it.
+    _CANDLES = {
+        "DA": [_candle(_MONDAY_TS, 0.60, 0.20)],
+        "DB": [_candle(_MONDAY_TS, 0.35, 0.65)],
+    }
+
+    def test_fixture_lands_in_both_groupings(self):
+        # The whole test rests on this pair being discovered twice, so assert it
+        # directly rather than trusting the grouping helpers to stay aligned.
+        assert len(_group_by_exact_title(self._MARKETS)) == 1
+        assert len(_group_by_normalized_title(self._MARKETS)) == 1
+        assert len(_extract_pairs(_group_by_exact_title(self._MARKETS))) == 1
+        assert len(_extract_pairs(_group_by_normalized_title(self._MARKETS))) == 1
+
+    def test_time_series_duplicate_is_dropped_before_pass_two(self, monkeypatch):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._MARKETS)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: self._CANDLES[ticker])
+
+        real = backtester._drop_cross_type_duplicates
+        seen: dict = {}
+
+        def _spy(candidates):
+            seen["in"] = list(candidates)
+            out = real(candidates)
+            seen["out"] = list(out)
+            return out
+
+        monkeypatch.setattr(backtester, "_drop_cross_type_duplicates", _spy)
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+
+        key = frozenset({"DA", "DB"})
+
+        def _typed(cands, pair_type):
+            return [c for c in cands
+                    if c["pair_type"] == pair_type
+                    and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
+
+        # Pass 1 really does produce BOTH copies of this ticker pair — without
+        # that, the dedup under test would be vacuous.
+        assert len(_typed(seen["in"], "same_title")) == 1
+        assert len(_typed(seen["in"], "time_series")) == 1
+        # ...and only the same-title copy survives into Pass 2.
+        assert len(_typed(seen["out"], "same_title")) == 1
+        assert _typed(seen["out"], "time_series") == []
+
+        assert len(trades) == 1
+        assert trades[0].pair_type == "same_title"
