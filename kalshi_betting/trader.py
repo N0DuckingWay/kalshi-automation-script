@@ -2188,8 +2188,9 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             "failed" (leg A confirmed unfilled), "rolled_back" (leg B confirmed
             unfilled, leg A unwound), "rollback_failed" (leg A unwind did not
             fill — orphaned position), or "manual_review" (a leg's fill state
-            could not be attributed to this order — no automated order was
-            submitted in response).
+            could not be attributed to this order, or an exception escaped the
+            worker — no automated order was submitted in response). The list is
+            in SUBMISSION order: results[i] corresponds to specs[i].
     """
     # ThreadPoolExecutor(max_workers=0) raises ValueError, so short-circuit empty input
     if not specs:
@@ -2211,7 +2212,43 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
         return results
 
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
-        futures = [pool.submit(_execute_one, client, spec) for spec in specs]
-        results = [f.result() for f in futures]
+        future_to_spec = {pool.submit(_execute_one, client, spec): spec for spec in specs}
+        results = []
+        # Collect per-future so one worker's exception cannot discard every other
+        # pair's TradeResult — including confirmed real fills. A list
+        # comprehension over .result() re-raised out of execute_trades, and the
+        # caller (main._run_prod) reads results only AFTER this returns: the
+        # Excel rows, the CRITICAL manual-review summary and the
+        # EXIT_TRADES_NEED_ATTENTION exit code were all lost with it. The pool's
+        # `with` block still waits for every worker, so the OTHER pairs' orders
+        # and rollbacks have already completed by the time we get here — this
+        # only preserves the record, it never changes what is bought or sold.
+        # The dict preserves insertion (submission) order, which is the order
+        # the caller pairs results[i] with specs[i] in.
+        for future, spec in future_to_spec.items():
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                # The raising pair's own fill state is unattributable (it may
+                # have filled leg A and died before leg B or the rollback), so
+                # no order is submitted in response — an unwind could reverse a
+                # real fill, the same reasoning behind every other
+                # manual_review case in _execute_one.
+                logging.critical(
+                    "Unhandled exception executing '%s' (A=%s B=%s) — fill state "
+                    "UNKNOWN, manual review required: %r",
+                    spec.pair.canonical_title,
+                    spec.pair.market_a.ticker,
+                    spec.pair.market_b.ticker,
+                    exc,
+                    exc_info=True,
+                )
+                results.append(
+                    TradeResult(
+                        spec=spec,
+                        status="manual_review",
+                        error=f"Unhandled exception in _execute_one: {exc!r}",
+                    )
+                )
 
     return results

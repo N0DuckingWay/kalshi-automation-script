@@ -108,9 +108,10 @@ class TradeResult:
             itself did not fill (orphaned position requiring manual review), or
             "manual_review" if a leg's fill state could not be attributed to
             this order (the position lookup failed, the position moved by an
-            unexplained amount, or — on the V2 path — the NO-leg mapping was
-            disproven after leg A filled) and no automated order was submitted
-            in response.
+            unexplained amount, the NO-leg mapping was disproven after leg A
+            filled on the V2 path, or an unhandled exception escaped the pair's
+            worker thread in execute_trades) and no automated order was
+            submitted in response.
         error (Optional[str]): Error message when the leg(s) involved required
             explanation — every non-"executed"/"simulated" status always sets
             this, and "executed" also sets it in the one case where leg B was
