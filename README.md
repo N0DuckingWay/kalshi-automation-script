@@ -191,6 +191,7 @@ falls back to `kalshi_private_key.pem` when it's absent.
   kalshi_demo_private_key.pem     ← Optional sandbox RSA private key
   trade_log.xlsx                  ← Persistent production trade log (auto-created)
   kalshi_arb.log                  ← Live bot log file (auto-created)
+  kalshi_scheduler.log            ← Weekly daemon's own log (auto-created; rotates 5 MB x 3)
   kalshi_backtest.log             ← Backtest log file (auto-created)
   scheduler_state.json            ← Scheduler's claimed-slot record (auto-created)
   backtest_dashboard_<ts>.html    ← Backtest HTML dashboard (auto-created per run)
@@ -350,6 +351,8 @@ python3 -m kalshi_betting.scheduler
 ```
 
 Runs the production bot every Monday at 09:00 (local time) in a blocking loop, each run spawned as a `python3 -m kalshi_betting.main --mode prod` subprocess and killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` (3600s). The log also prints the equivalent `crontab` entry if you prefer cron.
+
+The daemon logs to its own `kalshi_scheduler.log` (and the console), deliberately separate from `kalshi_arb.log`, which the spawned run writes and rotates — a second process holding an open handle on a rotated file would keep writing into the renamed backup.
 
 **Slot record and startup catch-up.** Each run claims its Monday-09:00 slot in `scheduler_state.json` (repo root) *before* spawning the subprocess and finalizes the record — `finished_at`, `exit_code` — on every exit path, including timeout and spawn failure. On startup, the daemon compares the most recent Monday-09:00 slot against that record: if the slot has **no** recorded attempt (daemon not running when it came around — never started, crashed, host rebooted, mid-deploy), it runs a catch-up job immediately rather than waiting up to a week for the next Monday. A slot whose recorded attempt merely *failed* is not retried; only a slot with no attempt at all triggers catch-up.
 

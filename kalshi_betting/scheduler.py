@@ -7,7 +7,9 @@ Purpose:
     Provides a long-running daemon that automatically invokes the production
     arbitrage bot every Monday at 09:00 local time. Uses the `schedule` library
     to register the job and a polling loop with 60-second sleep intervals to
-    check for pending jobs. Also prints the equivalent cron job command to the
+    check for pending jobs. The daemon logs to its own kalshi_scheduler.log
+    (and the console), separate from the kalshi_arb.log its subprocess writes
+    and rotates. Also prints the equivalent cron job command to the
     log for users who prefer cron over a Python daemon. Persists the most
     recently satisfied run slot to scheduler_state.json so a daemon restart
     can detect and catch up on a Monday 09:00 slot that was missed while the
@@ -29,6 +31,15 @@ Notes:
     trade, valid prod credentials must be present in secrets.json and the PEM key
     file. If you want the scheduler to run at a different time or interval, edit
     the `schedule.every().monday.at("09:00")` call in main().
+
+    Log file (C2): the daemon writes to PROJECT_ROOT / "kalshi_scheduler.log"
+    (rotating, 5MB x 3), NOT to kalshi_arb.log. kalshi_arb.log belongs to the
+    spawned main.py subprocess, which rotates it; a long-lived daemon holding
+    an open handle on that file would keep appending to the renamed backup
+    after every rotation, so its own lines would vanish from the live log.
+    Operator-facing messages that point at kalshi_arb.log / trade_log.xlsx
+    stay correct — that is still where the bot's own lines and trade records
+    go.
 
     The Monday 09:00 schedule fires in HOST-LOCAL time (the `schedule` library
     reads the system clock, no timezone conversion) — this is deliberate,
@@ -68,6 +79,7 @@ Notes:
 """
 import json
 import logging
+import logging.handlers
 import pathlib
 import subprocess
 import sys
@@ -88,6 +100,15 @@ from .config import (
 # Schema version for scheduler_state.json — bump if the record shape changes
 # so a future reader can distinguish old files instead of guessing.
 _STATE_SCHEMA_VERSION = 1
+
+# The daemon's own log file, deliberately NOT kalshi_arb.log: that file is
+# rotated by the main.py subprocess this daemon spawns, and a second process
+# holding an open FileHandler on it keeps writing into the renamed backup
+# (kalshi_arb.log.1) after each rotation — its lines silently disappear from
+# the live log. A module-level constant is fine here (unlike
+# _state_file_path()) because main() resolves it once at daemon startup and
+# nothing in the tests needs it redirected.
+_SCHEDULER_LOG_PATH = PROJECT_ROOT / "kalshi_scheduler.log"
 
 
 def _state_file_path() -> Path:
@@ -254,14 +275,19 @@ def run_job() -> None:
     nonzero exit, timeout, or OSError (BS-17). See this module's Notes for
     why claiming happens up front.
 
-    Logs stdout unconditionally (whether the run succeeded or failed) and logs
-    stderr + exit code additionally on failure, so every run is traceable in
-    kalshi_arb.log. The subprocess's exit code is mapped to a
-    distinct log level/message per the EXIT_* contract in config.py (BS-14):
-    a low-balance skip and a run with trades needing manual review are no
-    longer indistinguishable from a clean run in this log — previously the
-    only signal was a WARNING inside kalshi_arb.log that this scheduler
-    process never reads.
+    Logs the subprocess's stdout unconditionally (whether the run succeeded or
+    failed). Its stderr is logged only on the catch-all failure branch (an
+    exit code that is none of EXIT_OK / EXIT_SKIPPED_LOW_BALANCE /
+    EXIT_TRADES_NEED_ATTENTION) and on TimeoutExpired; the
+    EXIT_TRADES_NEED_ATTENTION and EXIT_SKIPPED_LOW_BALANCE branches log their
+    message without stderr. All of that re-logged output lands in THIS
+    daemon's log (kalshi_scheduler.log), while the bot's own log lines go to
+    kalshi_arb.log through the subprocess's own handler. The exit code is
+    mapped to a distinct log level/message per the EXIT_* contract in
+    config.py (BS-14): a low-balance skip and a run with trades needing manual
+    review are no longer indistinguishable from a clean run in this log —
+    previously the only signal was a WARNING inside kalshi_arb.log that this
+    scheduler process never reads.
 
     A subprocess.TimeoutExpired's stdout/stderr are decoded before logging
     (BS-16 — see _decode()), and both streams are logged (stderr, the hung
@@ -360,13 +386,24 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
 
 def _setup_logging(log_path: pathlib.Path) -> None:
     """
-    Configure root logging with both a console handler and a file handler.
+    Configure root logging with both a console handler and a rotating file
+    handler.
 
-    main.py has a twin of this helper (kalshi_betting.main._setup_logging).
-    The two are deliberately duplicated rather than shared: scheduler.py must
-    not import main.py (scheduler spawns main as an isolated subprocess so a
-    crash in one run can't take down the daemon — importing main directly
-    would defeat that isolation and create a needless coupling).
+    Same SHAPE as kalshi_betting.main._setup_logging (console + rotating file,
+    delay=True) but pointed at a DIFFERENT file (_SCHEDULER_LOG_PATH): the
+    daemon must never share a handle on a file its own subprocess rotates —
+    after main.py's RotatingFileHandler renames kalshi_arb.log, this
+    long-lived process would keep writing into the renamed backup. It is still
+    not imported from main.py, for the process-isolation reason stated there:
+    scheduler.py spawns main as an isolated subprocess so a crash in one run
+    can't take down the daemon, and importing main directly would defeat that
+    isolation and create a needless coupling.
+
+    The file handler ROTATES for the same reason main.py's does: this daemon
+    runs forever, and a plain FileHandler would grow the log without bound.
+    5MB across 3 backups is logging infrastructure sized for this daemon's own
+    verbosity, not a strategy constant, so it stays inline here rather than
+    moving to config.py — exactly as main.py's does.
 
     Args:
         log_path (pathlib.Path): Path to the log file to append to.
@@ -380,7 +417,9 @@ def _setup_logging(log_path: pathlib.Path) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_path, delay=True),
+            logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=3, delay=True,
+            ),
         ],
     )
 
@@ -398,7 +437,9 @@ def main() -> None:
     was added will always trigger an immediate prod run, since
     scheduler_state.json does not yet exist on that first start.
     """
-    _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
+    # The daemon logs to its OWN file — see _SCHEDULER_LOG_PATH for why it
+    # must not share kalshi_arb.log with the subprocess that rotates it.
+    _setup_logging(_SCHEDULER_LOG_PATH)
 
     # BS-17: catch up on a missed run before registering future ones, so a
     # daemon that was offline across a scheduled Monday 09:00 doesn't wait
