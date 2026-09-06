@@ -13,14 +13,27 @@ Purpose:
     a daily equity curve. Results feed into dashboard.py for visualization.
 
 Dependencies:
-    Imports normalize_title from scanner.py; fee helpers from config.py; market
-    fetching and candlestick functions from historical.py. Exports BacktestTrade
-    (consumed by dashboard.py) and run_backtest() (called by backtest.py).
+    Imports normalize_title from scanner.py; fee helpers (fee_leg_exact,
+    fee_per_pair_approx, min_price_diff_for_gap) plus BUDGET_FRACTION,
+    CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
+    MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
+    and SETTLED_PREFILTER_CACHE_TAG from config.py; fetch_all_settled_markets(),
+    fetch_candlesticks(), and infer_category() from historical.py. Also
+    depends on pandas (external) for the equity-curve DataFrame. Does NOT
+    import strategy.py — Kelly sizing and portfolio selection are
+    re-implemented inline against the same config.py constants, so a change
+    to either sizing formula must be made in both places to keep live/backtest
+    parity. Exports BacktestTrade (consumed by dashboard.py) and run_backtest()
+    (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
-    (prices, dates, Kelly fraction — no sizing) and keeps only the best entry per
-    title group, mirroring the live scanners' one-pair-per-group rule. Pass 2 walks
+    (prices, dates, Kelly fraction — no sizing), keeps only the best entry per
+    title group (mirroring the live scanners' one-pair-per-group rule), and then
+    drops any time-series candidate whose ticker pair was also found as a
+    same-title candidate — the same preference main._dedup_pairs applies live,
+    since the same-title co-resolution model does not rest on the time-series
+    independence assumption. Pass 2 walks
     entries in chronological order (priority-ordered within a date using the
     ENTRY-TIME expected return, never realized results), maintains a running cash
     balance — sizing each trade against the cash available at entry and releasing
@@ -34,7 +47,7 @@ Notes:
     Before grouping, run_backtest() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
-    have a daily candle at-or-before that Monday (i.e. opened by then). A
+    have an hourly candle at-or-before that Monday (i.e. opened by then). A
     market whose [open_time, close_time - 1 day] window contains no such
     Monday can never appear in any entered pair, as either leg, in either pair
     type — dropping it up front avoids materializing it into any group at all.
@@ -73,6 +86,10 @@ from .historical import (
     infer_category,
 )
 from .scanner import normalize_title
+
+# Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
+# rather than importing a private name.
+_DAY_SECONDS = 86_400
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
@@ -244,7 +261,7 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
     entered pair, as either leg, of either pair type?
 
     _find_entry() only opens a trade at a Monday-09:00-UTC checkpoint inside
-    [start_date, min(close_a, close_b) - 1 day], and requires a daily candle
+    [start_date, min(close_a, close_b) - 1 day], and requires an hourly candle
     at-or-before that Monday for BOTH legs — which requires each market to
     have opened on or before it. So a market whose own
     [open_time, close_time - 1 day] window contains no Monday on/after
@@ -299,6 +316,14 @@ def _pair_key(m: dict) -> str:
 
     Falls back to the bare title when event_title is missing (older cache files
     or non-MVE markets).
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+
+    Returns:
+        str: "{event_title} | {title}" when event_title is present, otherwise
+            just the title (falling back to subtitle, then ticker, if the
+            market has no title).
     """
     event_title = m.get("event_title") or ""
     title = m.get("title") or m.get("subtitle") or m.get("ticker", "")
@@ -308,10 +333,20 @@ def _pair_key(m: dict) -> str:
 
 
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
-    """Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
+    """
+    Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
 
     Three-element key: the event_title component prevents cross-event option-label
     collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+
+    Args:
+        markets (list[dict]): Market dicts in the compact historical._market_to_dict
+            form.
+
+    Returns:
+        dict[tuple, list[dict]]: Mapping of (event_title, title, subtitle) ->
+            member markets, for groups with >= 2 members and at least one of
+            title/subtitle non-empty. Single-member groups are dropped.
     """
     groups: dict = defaultdict(list)
     for m in markets:
@@ -324,7 +359,18 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
 
 
 def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
-    """Group markets by date-stripped combined key (event_title + title) for time-series pair detection."""
+    """
+    Group markets by date-stripped combined key (event_title + title) for time-series pair detection.
+
+    Args:
+        markets (list[dict]): Market dicts in the compact historical._market_to_dict
+            form.
+
+    Returns:
+        dict[str, list[dict]]: Mapping of normalized (event_title + title) key
+            -> member markets, for groups with >= 2 members. A market whose
+            key normalizes to an empty string is dropped.
+    """
     groups: dict = defaultdict(list)
     for m in markets:
         # _pair_key combines event_title + market title before normalization so that
@@ -333,6 +379,55 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
+    """
+    Drop time-series candidates whose ticker pair was also found as a same-title candidate.
+
+    Mirrors main._dedup_pairs on the live path: when both scanners detect the
+    same two markets, the same-title pair is kept because its co-resolution
+    model is simpler (identical questions must co-resolve) and does not rest on
+    the time-series independence assumption — see CLAUDE.md, "Pair dedup prefers
+    same-title", and the same_title > time_series tie-break in
+    strategy.select_portfolio(). Duplicate identity is the frozenset of the two
+    tickers, so a pair discovered with its legs in the opposite order still
+    matches.
+
+    This has to happen in Pass 1, not Pass 2: Pass 2's ticker-conflict filter
+    only prevents both copies being OPEN at the same time. Whenever the
+    same-title copy is skipped there for sizing reasons (n < 1, or a
+    non-positive expected payoff), it never claims the tickers, so the
+    time-series duplicate is entered instead — a candidate the live pipeline
+    would never have had at all.
+
+    Args:
+        candidates (list[dict]): Pass 1 candidate dicts, each carrying
+            "pair_type" ("same_title" or "time_series") and the "mA"/"mB"
+            market dicts (which carry "ticker").
+
+    Returns:
+        list[dict]: Every same-title candidate plus every time-series candidate
+            whose ticker pair is not already covered by a same-title candidate,
+            in the input's original order.
+    """
+    same_title_keys = {
+        frozenset((c["mA"]["ticker"], c["mB"]["ticker"]))
+        for c in candidates
+        if c["pair_type"] == "same_title"
+    }
+    kept = [
+        c for c in candidates
+        if c["pair_type"] == "same_title"
+        or frozenset((c["mA"]["ticker"], c["mB"]["ticker"])) not in same_title_keys
+    ]
+    dropped = len(candidates) - len(kept)
+    if dropped:
+        logging.info(
+            "Dropped %d time-series candidate(s) already covered by a same-title candidate",
+            dropped,
+        )
+    return kept
 
 
 def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
@@ -475,8 +570,12 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     Find the most recent candlestick at or before a given Unix timestamp.
 
     Candles are assumed to be sorted ascending by their "ts" field. Returns the
-    last candle whose end_period_ts is <= ts, or None if no such candle exists.
-    This is used to read the closing price on or before a given Monday snapshot.
+    last candle whose "ts" is <= ts, or None if no such candle exists. ("ts" is
+    derived from the API's end_period_ts when the candle is fetched — see
+    historical.fetch_candlesticks — so this is equivalently "at or before the
+    candle's period end", just read off the dict's own key rather than the
+    wire field name.) This is used to read the closing price on or before a
+    given Monday snapshot.
 
     Args:
         candles (list[dict]): List of candle dicts with a "ts" key (unix timestamp).
@@ -509,17 +608,24 @@ def _find_entry(
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
 
-    Scans weekly Monday snapshots from the backtest start date up to one calendar
-    year before the earlier of the two market close dates. At each Monday, reads
-    the candlestick prices, applies the price gap, price-sum, and fee filters from
-    the live trading logic, and returns the entry data for the first qualifying week.
+    Scans weekly Monday snapshots up to (not including) the day before the
+    earlier of the two market close dates. The scan's start is the LATER of
+    the backtest start date and one calendar year before that end point — the
+    one-year figure bounds how far back the window can reach, it does not
+    describe where the window ends. At each Monday, reads the candlestick
+    prices, applies the price gap, price-sum, and fee filters from the live
+    trading logic, and returns the entry data for the first qualifying week.
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract, and an
         entry requires pA − pB >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the earlier contract priced higher is the anomaly. A pricier later
-        contract is normal term structure and is never traded.
+        contract is normal term structure and is never traded. The deadline gap
+        driving that tier (and the 30-day cutoff) is timedelta.days on the two
+        close_time datetimes, exactly as the live scanner computes it — not
+        calendar-date subtraction, which counts a day boundary the live path
+        does not.
       - same_title: market A is canonicalized per Monday as the more expensive
         side (the two contracts ask the identical question, so direction is
         price-only).
@@ -576,12 +682,30 @@ def _find_entry(
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
         # Deadline gap is loop-invariant: pairs more than 30 days apart are too
-        # weakly correlated for the time-series assumption to hold reliably
-        gap_days = (close_b - close_a).days
+        # weakly correlated for the time-series assumption to hold reliably.
+        # Measure it on the close_time DATETIMES, not the dates parsed above:
+        # timedelta.days floors, while calendar-date subtraction counts day
+        # boundaries, so the two disagree by up to a day whenever the closes
+        # straddle midnight (2026-02-01T23:00Z vs 2026-02-17T01:00Z is gap 15
+        # live but 16 by date). That one day flips both the tier boundary and
+        # the 30-day cutoff, so a backtest that is supposed to replay the live
+        # strategy must use the live arithmetic.
+        dt_a = _parse_iso_datetime(mA.get("close_time"))
+        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        try:
+            # Identical arithmetic to scanner.find_time_series_pairs /
+            # scanner._pair_max_sum: timedelta.days on tz-aware datetimes
+            gap_days = (dt_b - dt_a).days
+        except TypeError:
+            # A naive/aware mix (only reachable from a hand-edited cache) can't
+            # be subtracted; fall back to the dates rather than raising, per
+            # this file's "can't parse it = unknown, not an error" convention
+            gap_days = (close_b - close_a).days
         if gap_days > MAX_DEADLINE_GAP_DAYS:
             return None
         # Tier the required price gap by deadline distance (15% for gaps
-        # <= 15 days, 30% for 16-30 days) — mirrors scanner.find_time_series_pairs
+        # <= 15 days, 30% for 16-30 days) — the same tiering, computed off the
+        # same gap arithmetic, as scanner.find_time_series_pairs
         threshold = min_price_diff_for_gap(gap_days)
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold
@@ -741,7 +865,7 @@ def _fetch_candles_parallel(
             candles_by_ticker[ticker] = []
             continue
         # close_ts: one day past market close to include the final candle
-        close_ts = int(close_dt.timestamp()) + 86400
+        close_ts = int(close_dt.timestamp()) + _DAY_SECONDS
         work.append((ticker, close_ts))
 
     if work:
@@ -759,8 +883,13 @@ def _fetch_candles_parallel(
                     candles_by_ticker[futures[future]] = future.result()
                     done += 1
                     if done % 50 == 0:
+                        # Denominator is len(work), not len(needed_tickers): tickers
+                        # with a missing/unparseable close_time never enter `work`
+                        # (they're resolved to [] above without a worker), so
+                        # `done` can never reach len(needed_tickers) whenever any
+                        # were skipped.
                         logging.info("  Candlestick progress: %d / %d",
-                                     done, len(needed_tickers))
+                                     done, len(work))
             except BaseException:
                 # Same tear-down as historical.py's fetch pools: without it the
                 # executor's __exit__ drains every still-queued ticker (hours of
@@ -791,7 +920,9 @@ def run_backtest(
       4. Fetch hourly candlesticks for every ticker appearing in a potential
          pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS threads.
       5. Find the first Monday where the pair was tradeable at the threshold;
-         keep only the best entry per title group (live one-pair-per-group rule).
+         keep only the best entry per title group (live one-pair-per-group
+         rule), then drop any time-series candidate whose ticker pair was also
+         found as a same-title candidate (live main._dedup_pairs rule).
       6. Walk entries chronologically with a running cash balance: Kelly-size
          each trade against the cash available at entry, and record actual P&L
          from settlement outcomes.
@@ -811,12 +942,23 @@ def run_backtest(
             applies no cap, matching current behavior. Passed straight through
             to _find_entry() for each candidate pair.
 
-    Returns (trades, equity_df) where equity_df has columns:
-      [date, portfolio_value, daily_return]
+    Returns:
+        tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
+            trades is one BacktestTrade per entered pair, in entry-date order
+            (empty if none were ever entered). equity_df has columns
+            [date, portfolio_value, daily_return], one row per day, flat at
+            initial_balance if trades is empty.
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — this is
+            treated as a real defect (a market that should never have reached
+            this stage), not degraded into "no price history".
 
     Note:
         Before any network call, this function checks whether [start_date,
-        today - 1 day] contains at least one Monday 09:00 UTC checkpoint (the
+        today] contains at least one Monday 09:00 UTC checkpoint (the
         only kind _find_entry() can ever act on). If not, no trade can ever
         be entered regardless of what the fetch would return, so the fetch is
         skipped entirely and this returns the same empty-result shape as the
@@ -1021,8 +1163,12 @@ def run_backtest(
         })
 
     # Keep only the single best candidate per title group — mirrors the live
-    # scanners, which keep one pair per normalized-title / exact-title group so
-    # the portfolio isn't flooded with near-identical correlated positions.
+    # scanners' CONCEPT (one pair per normalized-title / exact-title group so
+    # the portfolio isn't flooded with near-identical correlated positions),
+    # not their tie-break rule: the live scanners rank by tradeable-first then
+    # largest price gap (scanner.py's group_pairs.sort), while this ranks by
+    # largest entry_monthly_ratio — a different quantity, chosen here because
+    # entry-time expected return is what Pass 2 below sizes and orders on.
     # Dedup on the FULL group_key (which includes event_title for same_title
     # groups), not the display-only canon — two unrelated events sharing an
     # option label (e.g. "Trump" in two different events) have the same canon
@@ -1035,6 +1181,14 @@ def run_backtest(
             best_by_group[key] = c
     candidates = list(best_by_group.values())
 
+    # Cross-type dedup, mirroring main._dedup_pairs on the live path: the same
+    # two tickers can be discovered by BOTH groupings, and the live pipeline
+    # keeps only the same-title copy (simpler co-resolution model). Must run
+    # here rather than relying on Pass 2's ticker-conflict filter, which only
+    # stops both copies being open at once — not the time-series copy being
+    # entered whenever the same-title one is skipped for sizing reasons.
+    candidates = _drop_cross_type_duplicates(candidates)
+
     # Chronological order for the cash simulation; within one entry date, take
     # the best ENTRY-TIME expected return first (same_title preferred at ties,
     # matching strategy.select_portfolio)
@@ -1044,9 +1198,18 @@ def run_backtest(
 
     # ── Pass 2: chronological cash-constrained greedy selection ───────────────
     # Walk entries in date order, maintaining a running cash balance: each trade
-    # is Kelly-sized against the cash available at its entry (like the live bot
-    # sizing against the current account balance), and settlement receipts return
-    # to cash on their exit dates. A ticker-conflict filter mirrors the live
+    # is Kelly-sized against the cash available AT ITS OWN ENTRY DATE, which
+    # already reflects every earlier trade's cost and every settled trade's
+    # receipt. This is NOT what the live bot does: main._run_prod sizes every
+    # candidate in one run against that run's single opening-balance snapshot
+    # (compute_trade(pair, balance_cents) with one fixed balance_cents for the
+    # whole scan), then greedily fits them by decrementing a local budget —
+    # it never re-reads the account balance mid-run. The backtest's per-checkpoint
+    # resizing is deliberately more permissive (a later trade can draw on an
+    # earlier trade's settled profit within the same backtest), so a backtest
+    # Kelly fraction is not directly comparable to a single live run's sizing.
+    # Settlement receipts return to cash on their exit dates. A ticker-conflict
+    # filter mirrors the live
     # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
     # rule comes from scanner.get_held_tickers(), which queries positions with
     # count_filter="position" — so a ticker leaves the held set once its market

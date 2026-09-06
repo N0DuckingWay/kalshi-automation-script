@@ -14,7 +14,9 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, and main.py.
+    scheduler.py, and main.py — plus the standalone, human-run verification
+    CLI kept deliberately outside the pipeline's import graph (see CLAUDE.md's
+    pipeline-isolation rule).
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -203,14 +205,19 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # This is NOT the price submitted. The submitted bid is the bounded-loss
 # ceiling derived from ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — (1 - floor/100),
 # ceiling-quantized onto the market's own tick grid — and this constant is only
-# the upper clamp applied to it (trader._v2_rollback_price). It matters because
-# a low-priced leg A can push the derived ceiling above the highest tradeable
-# level, and because it defines what "as aggressive as possible" means when the
-# clamp binds: this is the finest-grid target ($0.0001 ticks), floored onto the
-# grid of the market actually being unwound (0.99 on linear-cent, 0.999 on
-# deci-cent, 0.9999 on a centi-cent edge band) — a flat 0.99 would fail to
-# cross asks resting in (0.99, 1) on sub-cent regimes. Deliberately not "1" —
-# that is a settlement value, not a tradeable level.
+# the upper clamp applied to it (trader._v2_rollback_price, via
+# min(derived_cap, this_clamp)). With the current ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
+# value and _rollback_floor_cents' [1, 99]-cent range, the derived cap can
+# never exceed 0.99 — i.e. this clamp cannot actually bind today, since 0.99
+# is already <= every regime's top-of-grid level. It is kept as a defensive
+# invariant (a future change to the floor's bound could otherwise push the
+# cap above a tradeable level) and it defines what "as aggressive as
+# possible" means IF the clamp ever does bind: this is the finest-grid target
+# ($0.0001 ticks), floored onto the grid of the market actually being
+# unwound (0.99 on linear-cent, 0.999 on deci-cent, 0.9999 on a centi-cent
+# edge band) — a flat 0.99 would fail to cross asks resting in (0.99, 1) on
+# sub-cent regimes. Deliberately not "1" — that is a settlement value, not a
+# tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
 # The DEFAULT exchange shard. Kalshi partitions the exchange into parallel

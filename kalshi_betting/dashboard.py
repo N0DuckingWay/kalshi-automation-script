@@ -14,7 +14,8 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
 Dependencies:
-    Imports BacktestTrade from backtester.py and PROJECT_ROOT from config.py.
+    Imports BacktestTrade from backtester.py, and PROJECT_ROOT,
+    SAME_TITLE_CO_RESOLVE_PROB, and fee_per_pair_approx() from config.py.
     Uses plotly, numpy, pandas, and yfinance (all external). Called by backtest.py
     after run_backtest() completes.
 
@@ -813,7 +814,9 @@ def generate_dashboard(
         _section_benchmark(equity_df, start_date, initial_balance),
     ]
 
-    html = f"""<!DOCTYPE html>
+    # Named page_html (not `html`) so it can't shadow the `html` module used
+    # by the _section_* helpers above (html.escape()).
+    page_html = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -835,6 +838,6 @@ def generate_dashboard(
 </body>
 </html>"""
 
-    out_path.write_text(html, encoding="utf-8")
+    out_path.write_text(page_html, encoding="utf-8")
     logging.info("Dashboard written: %s", out_path)
     return out_path

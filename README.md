@@ -14,7 +14,7 @@ Kalshi markets are binary contracts that pay $1 if a question resolves YES and $
 - Both resolve YES: YES on B pays out, covering the NO on A cost
 - Both resolve NO: NO on A pays out, covering the YES on B cost
 
-**Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by more than 5%, the bot buys NO on the expensive one and YES on the cheap one. Since both contracts should co-resolve, the trade is essentially risk-free. The subtitle here is the outcome label that distinguishes markets sharing one question title (e.g. two candidate names under "Who will the next Pope be?"); the API stopped sending a `subtitle` field in 2026-08, so ingest now sources it from `yes_sub_title` — without that discriminator, two *different* outcomes would be paired as if they were the same contract.
+**Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by 5% or more, the bot buys NO on the expensive one and YES on the cheap one. Since both contracts should co-resolve, the trade is essentially risk-free. The subtitle here is the outcome label that distinguishes markets sharing one question title (e.g. two candidate names under "Who will the next Pope be?"); the API stopped sending a `subtitle` field in 2026-08, so ingest now sources it from `yes_sub_title` — without that discriminator, two *different* outcomes would be paired as if they were the same contract.
 
 The required price gap for time-series pairs is tiered by how far apart the two deadlines are: 15% for deadlines ≤ 15 days apart, 30% for 16–30 days — wider gaps need a bigger edge because the correlation between the two dates is weaker. Deadlines more than 30 days apart are never considered. See `min_price_diff_for_gap()` in `config.py` for the exact thresholds.
 
@@ -29,19 +29,25 @@ In both cases, Kalshi charges a taker fee per contract leg. The bot only execute
 ```
 secrets.json + PEM key
         |
-    auth.py  ←───────────────────────┐
-        |                            |
-    config.py (constants)            |
-        |                            |
-    _http.py (retry + raw-response fetch, used by auth/scanner/historical/trader)
-        |                            |
-        ↓                            |
-    scanner.py ──→ strategy.py ──→ trader.py
-        |                |              |
-        |            reporter.py ←──────┘
+        ↓
+config.py (constants), _http.py (retry + raw-response fetch)
+  — both leaves: neither imports another project module —
         |
+        ↓
+    auth.py, scanner.py
+        |
+        ↓
+    strategy.py
+        |
+        ↓
+    reporter.py
+        |
+        ↓
+    trader.py ──→ auth.py (also imports read_shard_balances directly)
+        |
+        ↓
     main.py  (orchestrates live trading pipeline)
-    scheduler.py (weekly daemon → calls main.py)
+    scheduler.py (weekly daemon → calls main.py as a subprocess)
 
 
     historical.py ──→ backtester.py ──→ dashboard.py
@@ -49,18 +55,26 @@ secrets.json + PEM key
                     backtest.py (CLI entry)
 
     (historical.py also imports auth.py's build_client for its own client
-     builders; backtester.py also imports scanner.py's normalize_title for
-     title-based pair grouping)
+     builders, and _http.py directly for its raw signed GETs; backtester.py
+     also imports scanner.py's normalize_title for title-based pair grouping)
+
+    v2_probe.py — standalone, human-run verification CLI; imports
+    auth.py/config.py/_http.py/scanner.py/trader.py, imported by NOTHING
+    in the pipeline
 ```
 
 ### Live Trading Data Flow
+
+Step order below is `_run_prod`'s; `_run_dev` skips `get_held_tickers` entirely (no
+sandbox positions) and so calls `fetch_shard_statuses` first instead.
 
 ```
 main.py
   ├─ auth.build_client()           — authenticate with Kalshi API
   ├─ auth.verify_auth()            — read the per-shard balance breakdown (prod only; gate and size on the sum)
-  ├─ scanner.fetch_shard_statuses() — read GET /exchange/status per-shard trading/transfer flags (fail-soft)
   ├─ scanner.get_held_tickers()    — fetch currently-held positions (prod only) so we skip re-entering them
+  ├─ scanner.fetch_shard_statuses() — read GET /exchange/status per-shard trading/transfer flags (fail-soft)
+  ├─ scanner.inactive_shard_indexes() — derive the trading-inactive shard set from the statuses above
   ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged (attaches event titles for MVE grouping; drops only markets on trading-inactive shards)
   ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts)
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
@@ -71,8 +85,10 @@ main.py
   ├─ strategy.compute_trade()      — Kelly sizing per pair
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
+  ├─ trader.drop_legacy_unroutable() — legacy path only: drop specs with a leg off the default shard BEFORE any money moves
   ├─ trader.ensure_shard_collateral() — move funds onto the shards the selected legs settle against (prod; dry-run only plans)
   ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg to the V2 order endpoint, each leg routed to its own market's shard (parallel across pairs, rollback on partial fill)
+  ├─ auth.verify_auth()            — re-read the post-trade balance for the Excel log (falls back to the pre-trade balance if this read fails)
   └─ reporter.append_to_prod_log() — write results to trade_log.xlsx
 ```
 
@@ -101,7 +117,7 @@ backtest.py (CLI)
 | `__init__.py` | Package initializer. No exports; marks the directory as the `kalshi_betting` package. |
 | `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths) and the two fee helper functions used throughout the codebase. |
 | `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
-| `_http.py` | Shared HTTP helpers used across the package: `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission calls it directly). |
+| `_http.py` | Shared HTTP helpers used across the package (auth, scanner, historical, trader, and v2_probe): `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission and the collateral transfer call it directly). |
 | `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. |
 | `strategy.py` | Applies the Kelly criterion to size each trade, computes minimum guaranteed profit and monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
 | `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg) via the Kalshi API, with automatic rollback of a filled leg A if leg B doesn't fill. Multiple pairs execute concurrently. Submission goes to the V2 order endpoint by default and to the retained legacy endpoint when `config.ORDER_API_VERSION` is flipped — see "Order API version" below. |
@@ -112,6 +128,7 @@ backtest.py (CLI)
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments, builds the historical API clients, calls `backtester.run_backtest()` then `dashboard.generate_dashboard()`, and logs a summary. |
+| `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Never imported by the pipeline. |
 
 ### Order API version
 
@@ -161,35 +178,47 @@ kalshi_private_key.pem
 
 (Same directory as `secrets.json`, i.e. the project root defined by `PROJECT_ROOT` in `config.py`.)
 
+Optionally, place a separate sandbox private key at `kalshi_demo_private_key.pem`
+in the same directory. `auth.py` uses it for dev-mode signing when present and
+falls back to `kalshi_private_key.pem` when it's absent.
+
 ### Key files at a glance
 
 ```
 <project root>/
-  secrets.json              ← API key IDs
-  kalshi_private_key.pem    ← RSA private key for request signing
-  trade_log.xlsx            ← Persistent production trade log (auto-created)
-  kalshi_arb.log            ← Live bot log file (auto-created)
-  kalshi_backtest.log       ← Backtest log file (auto-created)
-  backtest_cache/           ← Disk cache for historical data
-    settled_markets_*.json  ← Assembled market list, keyed by start date (and by
-                              eligibility-filter tag when the backtester filters
-                              during assembly, so subsets never mix with full lists)
-    archive_days/           ← Per-created-day archive slices (incremental/resumable)
-    live_days/              ← Per-settled-day recent-market slices (incremental/resumable)
-    candlesticks/           ← Per-ticker hourly price series
-  kalshi_betting/           ← Python package
+  secrets.json                    ← API key IDs
+  kalshi_private_key.pem          ← RSA private key for request signing
+  kalshi_demo_private_key.pem     ← Optional sandbox RSA private key
+  trade_log.xlsx                  ← Persistent production trade log (auto-created)
+  kalshi_arb.log                  ← Live bot log file (auto-created)
+  kalshi_scheduler.log            ← Weekly daemon's own log (auto-created; rotates 5 MB x 3)
+  kalshi_backtest.log             ← Backtest log file (auto-created)
+  scheduler_state.json            ← Scheduler's claimed-slot record (auto-created)
+  backtest_dashboard_<ts>.html    ← Backtest HTML dashboard (auto-created per run)
+  backtest_cache/                ← Disk cache for historical data
+    settled_markets_*.json        ← Assembled market list, keyed by start date (and by
+                                    eligibility-filter tag when the backtester filters
+                                    during assembly, so subsets never mix with full lists)
+    event_titles.json             ← Cross-run event-title accumulator (merged, not overwritten)
+    archive_days/                 ← Per-created-day archive slices (incremental/resumable)
+    live_days/                    ← Per-settled-day recent-market slices (incremental/resumable)
+    candlesticks/                 ← Per-ticker hourly price series
+  kalshi_betting/                 ← Python package
 ```
 
 ---
 
 ## Run Commands
 
-CLI runs now echo log output to the terminal as well as `kalshi_arb.log`.
+`main.py` and `scheduler.py` echo log output to the terminal as well as their log
+file. `backtest.py` does not: it installs only a `RotatingFileHandler` on
+`kalshi_backtest.log`, so a backtest run's progress is visible only by tailing
+that file, not in the terminal that launched it.
 
 ### Live V2 order-mapping probe (~1 cent of real money)
 
 ```bash
-python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|transfer] [--yes]
+python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|transfer] [--dest-shard N] [--yes]
 ```
 
 Human-run verification of the V2 order path's NO-leg mapping (an `ask` must open a NO
@@ -222,7 +251,7 @@ python3 -m kalshi_betting.main --mode dev --sandbox-balance 5000
 python3 -m kalshi_betting.main --mode prod
 ```
 
-Fetches the live account balance, scans real markets, submits batch orders, and appends results to `trade_log.xlsx`.
+Fetches the live account balance, scans real markets, submits fill-or-kill orders leg-by-leg, and appends results to `trade_log.xlsx`.
 
 ### Production dry-run (discover trades but don't submit)
 
@@ -268,7 +297,7 @@ after the cutoff have no historical candlestick data, so a window starting after
 it produces no trades regardless of how many pairs it finds.
 
 **Feasibility pre-check (BS-11).** Before any network call, `run_backtest()`
-checks whether the `[--start-date, yesterday]` window contains at least one
+checks whether the `[--start-date, today]` window contains at least one
 Monday-09:00-UTC entry checkpoint (the only time the replay ever enters a
 trade). If not, it logs a warning and returns the same empty result the
 zero-trade path already produces — instead of spending minutes fetching
@@ -308,7 +337,7 @@ the constant if a run needs them).
 Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
 parallel workers, one independent request per ticker. Cache files are keyed per
 ticker, so workers never contend for a path and any ticker already on disk is
-skipped. Fetched sequentially this step ran at roughly 4 tickers/sec, which made
+skipped. Fetched sequentially this step ran at roughly 4.3 tickers/sec, which made
 it the single largest cost of a backtest.
 
 Note that `--start-date` must fall before the Kalshi archive cutoff: candlestick
@@ -322,6 +351,8 @@ python3 -m kalshi_betting.scheduler
 ```
 
 Runs the production bot every Monday at 09:00 (local time) in a blocking loop, each run spawned as a `python3 -m kalshi_betting.main --mode prod` subprocess and killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` (3600s). The log also prints the equivalent `crontab` entry if you prefer cron.
+
+The daemon logs to its own `kalshi_scheduler.log` (and the console), deliberately separate from `kalshi_arb.log`, which the spawned run writes and rotates — a second process holding an open handle on a rotated file would keep writing into the renamed backup.
 
 **Slot record and startup catch-up.** Each run claims its Monday-09:00 slot in `scheduler_state.json` (repo root) *before* spawning the subprocess and finalizes the record — `finished_at`, `exit_code` — on every exit path, including timeout and spawn failure. On startup, the daemon compares the most recent Monday-09:00 slot against that record: if the slot has **no** recorded attempt (daemon not running when it came around — never started, crashed, host rebooted, mid-deploy), it runs a catch-up job immediately rather than waiting up to a week for the next Monday. A slot whose recorded attempt merely *failed* is not retried; only a slot with no attempt at all triggers catch-up.
 

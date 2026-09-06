@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import IO
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -95,15 +96,27 @@ class TradeResult:
 
     Attributes:
         spec (TradeSpec): The trade specification that was executed or simulated.
-        status (str): Execution outcome — "executed" for a real submitted order,
-            "simulated" for a dry-run or dev-mode run, "failed" for a submission error,
-            "rolled_back" if leg A filled but leg B failed and leg A was unwound,
-            "rollback_failed" if the leg A unwind itself did not fill (orphaned
-            position requiring manual review), or "manual_review" if leg B's fill
-            state could not be determined (position lookup failed) and no
-            automated rollback was attempted to avoid reversing a possible real fill.
-        error (Optional[str]): Error message if status is "failed", "rolled_back",
-            "rollback_failed", or "manual_review", otherwise None.
+        status (str): Execution outcome — "executed" for a real submitted order
+            (leg A and leg B both confirmed filled, OR leg B was ambiguous but a
+            position-delta check confirmed the fill — see error below),
+            "simulated" for a dry-run or dev-mode run, "failed" for a leg A that
+            is confirmed unfilled (a clean FoK rejection, an error with an
+            attributable zero delta, or — on the legacy order path — a spec
+            refused before submission because a leg sits off the routable
+            shard), "rolled_back" if leg A filled but leg B is confirmed
+            unfilled and leg A's unwind filled, "rollback_failed" if that unwind
+            itself did not fill (orphaned position requiring manual review), or
+            "manual_review" if a leg's fill state could not be attributed to
+            this order (the position lookup failed, the position moved by an
+            unexplained amount, the NO-leg mapping was disproven after leg A
+            filled on the V2 path, or an unhandled exception escaped the pair's
+            worker thread in execute_trades) and no automated order was
+            submitted in response.
+        error (Optional[str]): Error message when the leg(s) involved required
+            explanation — every non-"executed"/"simulated" status always sets
+            this, and "executed" also sets it in the one case where leg B was
+            ambiguous but its fill was confirmed by position delta (the error
+            text says so). None only when nothing needed explaining.
     """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated" | "rolled_back" | "rollback_failed" | "manual_review"
@@ -112,7 +125,17 @@ class TradeResult:
 
 
 def _apply_header_row(ws, fill: PatternFill) -> None:
-    """Write and style the column header row."""
+    """
+    Write and style the column header row.
+
+    Args:
+        ws: The openpyxl worksheet to write the header into.
+        fill (PatternFill): Background fill for the header row (prod vs dev
+            use different colors — see _HEADER_FILL_PROD / _HEADER_FILL_DEV).
+
+    Returns:
+        None
+    """
     for col_idx, (header, width) in enumerate(_TRADE_COLUMNS, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font  = _HEADER_FONT
@@ -200,7 +223,16 @@ def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
 
 
 def _apply_number_formats(ws, row_idx: int) -> None:
-    """Apply currency/percentage formats to numeric columns."""
+    """
+    Apply currency/percentage formats to a single data row's numeric columns.
+
+    Args:
+        ws: The openpyxl worksheet containing the row.
+        row_idx (int): 1-indexed row number to format.
+
+    Returns:
+        None
+    """
     # Columns: pA=9, pB=10, nA=11, TotalCost=14, MinProfit=15, ProfitRatio=16
     for col in (9, 10, 11):
         ws.cell(row=row_idx, column=col).number_format = "0.00%"
@@ -259,7 +291,7 @@ def _write_trade_rows(ws, results: list, run_ts: datetime) -> None:
         _apply_number_formats(ws, row_idx)
 
 
-def _acquire_lock(lock_path: Path):
+def _acquire_lock(lock_path: Path) -> IO | None:
     """
     Acquire an exclusive advisory lock on lock_path, polling up to _LOCK_TIMEOUT_SECONDS.
 

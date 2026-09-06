@@ -17,6 +17,7 @@ repo root.
 """
 import json
 import logging
+import logging.handlers
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -401,3 +402,56 @@ class TestRunJob:
         assert captured["kwargs"]["cwd"] == str(tmp_path)
         assert captured["kwargs"]["timeout"] == SCHEDULER_JOB_TIMEOUT_SECONDS
 
+
+class TestSetupLogging:
+    """The daemon's own logging setup (C2).
+
+    scheduler._setup_logging used to install a plain logging.FileHandler on
+    PROJECT_ROOT / "kalshi_arb.log" — the very file its main.py subprocess
+    rotates with a RotatingFileHandler. A long-lived daemon holding an open
+    handle on that inode keeps writing into the renamed kalshi_arb.log.1 after
+    every rotation, so its lines silently vanish from the live log. The daemon
+    now logs to its own kalshi_scheduler.log, and rotates it itself.
+    """
+
+    def test_setup_logging_uses_rotating_file_handler(self, tmp_path):
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        root.handlers = []
+        try:
+            log_path = tmp_path / "x.log"
+            scheduler._setup_logging(log_path)
+
+            handler_types = [type(h) for h in root.handlers]
+            assert logging.StreamHandler in handler_types
+            # Rotating, not plain: this daemon runs forever, so its own log
+            # must be bounded exactly like main.py's is (BS-25's reasoning).
+            assert logging.handlers.RotatingFileHandler in handler_types
+            # Exactly one of each — basicConfig should not have added extras
+            assert sum(1 for h in root.handlers if type(h) is logging.StreamHandler) == 1
+            assert sum(1 for h in root.handlers if isinstance(h, logging.FileHandler)) == 1
+
+            rotating = next(
+                h for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            )
+            # Same 5 MB x 3 sizing as main._setup_logging.
+            assert rotating.maxBytes == 5 * 1024 * 1024
+            assert rotating.backupCount == 3
+
+            # delay=True: the file must not be created until a record is emitted
+            assert not log_path.exists()
+            logging.getLogger("test_setup_logging").info("trigger the delayed file open")
+            assert log_path.exists()
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved_handlers
+            root.level = saved_level
+
+    def test_scheduler_logs_to_its_own_file(self):
+        # The whole point of C2: a file this process alone owns, never the one
+        # the spawned main.py subprocess rotates out from under it.
+        assert scheduler._SCHEDULER_LOG_PATH.name == "kalshi_scheduler.log"
+        assert scheduler._SCHEDULER_LOG_PATH.name != "kalshi_arb.log"

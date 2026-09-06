@@ -40,6 +40,7 @@ from kalshi_betting.config import (
     TRANSFER_PATH,
     V2_ORDER_PATH,
 )
+from kalshi_betting.reporter import TradeResult
 from kalshi_betting.scanner import PriceRange
 from kalshi_betting.trader import (
     _await_transfer_settlement,
@@ -69,6 +70,7 @@ from kalshi_betting.trader import (
     _v2_rollback_price,
     _v2_top_of_grid_price,
     ensure_shard_collateral,
+    execute_trades,
 )
 
 # Tick grids used by the V2 price-math tests, mirroring the regimes named by
@@ -1976,3 +1978,62 @@ class TestSettleAwaitTargeting:
             )
         assert kept == []
         assert "MONEY IS IN FLIGHT" not in caplog.text
+
+
+class TestExecuteTradesWorkerIsolation:
+    """execute_trades must return one TradeResult per spec, in SUBMISSION order,
+    even when one worker thread raises.
+
+    The pool's `with` block already waits for every worker, so orders and
+    rollbacks complete regardless; what a swallowed exception destroys is the
+    RECORD — the Excel rows, the CRITICAL manual-review alert, and the
+    EXIT_TRADES_NEED_ATTENTION exit code main._run_prod derives from these
+    statuses.
+    """
+
+    @staticmethod
+    def _specs() -> list:
+        """Three specs whose leg-A tickers are distinct, so a fake worker can
+        single one out (make_spec pins the same TICK-A/TICK-B on every spec)."""
+        specs = []
+        for i in (1, 2, 3):
+            spec = make_spec(title=f"pair {i}")
+            spec.pair.market_a.ticker = f"TICK-A{i}"
+            spec.pair.market_b.ticker = f"TICK-B{i}"
+            specs.append(spec)
+        return specs
+
+    def test_execute_trades_isolates_one_raising_worker(self, monkeypatch, caplog):
+        specs = self._specs()
+
+        def fake(client, spec):
+            if spec.pair.market_a.ticker == "TICK-A2":
+                raise RuntimeError("boom")
+            return TradeResult(spec=spec, status="executed")
+
+        monkeypatch.setattr(trader, "_execute_one", fake)
+        with caplog.at_level(logging.CRITICAL, logger="root"):
+            results = execute_trades(MagicMock(), specs, dry_run=False)
+
+        assert len(results) == 3
+        # Submission order is the caller's contract: reporter rows and the
+        # summary counts pair results[i] with specs[i].
+        assert [r.spec for r in results] == specs
+        assert results[0].status == "executed"
+        assert results[2].status == "executed"
+        assert results[1].status == "manual_review"
+        assert "boom" in results[1].error
+
+        criticals = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert len(criticals) == 1
+        assert "TICK-A2" in criticals[0].getMessage()
+
+    def test_execute_trades_all_ok_unchanged(self, monkeypatch):
+        specs = self._specs()
+        monkeypatch.setattr(
+            trader, "_execute_one",
+            lambda client, spec: TradeResult(spec=spec, status="executed"),
+        )
+        results = execute_trades(MagicMock(), specs, dry_run=False)
+        assert [r.spec for r in results] == specs
+        assert {r.status for r in results} == {"executed"}

@@ -12,11 +12,14 @@ Purpose:
     Kalshi API receives a KalshiClient produced by this module.
 
 Dependencies:
-    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, and
+    Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, DEV_PEM_FILE, and
     DEFAULT_EXCHANGE_INDEX from config.py, and api_call_with_retry /
     fetch_json_page from _http.py. build_client() is called by main.py,
-    historical.py, and (indirectly) backtest.py. verify_auth() is called by
-    main.py to confirm credentials and read balance.
+    historical.py, and (indirectly) backtest.py. verify_auth() and
+    read_shard_balances() are called by main.py and trader.py. (The
+    standalone, human-run verification CLI kept deliberately outside the
+    pipeline's import graph also calls all three — see CLAUDE.md's
+    pipeline-isolation rule.)
 
 Notes:
     KalshiClient does NOT accept api_key_id and private_key_pem as constructor
@@ -308,7 +311,9 @@ def verify_auth(client: KalshiClient) -> dict[int, int]:
 
 def read_shard_balances(client: KalshiClient) -> dict[int, int]:
     """
-    Single-shot per-shard balance read — no retry, no backoff, no logging.
+    Single-shot per-shard balance read — no retry, no backoff, and no logging
+    of its own (the shared _balance_cents_by_shard parse it calls may still
+    emit a WARNING on a malformed or unparseable balance_breakdown).
 
     The bounded-poll variant of verify_auth(): trader._await_transfer_settlement
     re-reads the balance every TRANSFER_POLL_INTERVAL_SECONDS against a
@@ -330,5 +335,11 @@ def read_shard_balances(client: KalshiClient) -> dict[int, int]:
     Raises:
         ApiException: On a non-2xx status.
         ValueError: If the response body carries no parseable balance field.
+        Exception: Any other exception raised by the underlying HTTP client
+            (e.g. a network error) — this function has no retry budget to
+            absorb one, so a transient failure surfaces immediately. The
+            caller (trader._await_transfer_settlement) catches bare
+            Exception here and treats it as "nothing observed", never as
+            success.
     """
     return _balance_cents_by_shard(fetch_json_page(client.get_balance_without_preload_content))

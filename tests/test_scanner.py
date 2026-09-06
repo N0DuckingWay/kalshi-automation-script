@@ -16,6 +16,7 @@ from kalshi_betting.scanner import (
     PriceRange,
     _bids_to_ask_levels,
     _fetch_orderbook,
+    _filter_active_markets,
     _market_from_dict,
     _parse_price_ranges,
     _shard_index,
@@ -1147,7 +1148,7 @@ class TestFetchShardStatuses:
             "intra_exchange_transfers_active": True, "description": "Main",
         }
         assert statuses[1]["trading_active"] is False
-        # Read by the collateral-transfer path in a later commit
+        # Read by trader.ensure_shard_collateral()
         assert statuses[1]["intra_exchange_transfers_active"] is False
 
     def test_string_exchange_index_is_coerced_to_int_key(self):
@@ -1757,3 +1758,85 @@ class TestFetchShardStatusesEmptyBreakdown:
             )
         )
         assert fetch_shard_statuses(client) is None
+
+
+class TestFilterActiveMarketsCloseTimeGuard:
+    """A market whose close_time failed to parse must be dropped at the shared
+    entry filter, not carried into the finders where a None deadline crashes
+    the close_time sort, the orderbook ceiling, and strategy.compute_trade()."""
+
+    @staticmethod
+    def _bad_close_time_market(ticker: str, event_ticker: str):
+        """Build an otherwise-active market whose close_time is None.
+
+        _mock_market's `close_time or datetime(...)` default turns a None
+        argument back into a real datetime, so the field is cleared after
+        construction to reproduce _market_from_dict's unparseable-date output.
+
+        Args:
+            ticker (str): Ticker for the stand-in market.
+            event_ticker (str): Parent event ticker for the stand-in market.
+
+        Returns:
+            SimpleNamespace: Active-priced market with close_time set to None.
+        """
+        m = _mock_market(ticker=ticker, event_ticker=event_ticker, title="Will BTC exceed $80k")
+        m.close_time = None
+        return m
+
+    def test_filter_active_markets_drops_none_close_time_with_one_warning(self, caplog):
+        good_1 = _mock_market(ticker="G1", event_ticker="E1", yes_ask=0.40, no_ask=0.60)
+        good_2 = _mock_market(ticker="G2", event_ticker="E2", yes_ask=0.30, no_ask=0.70)
+        bad = self._bad_close_time_market("B1", "E3")
+
+        with caplog.at_level(logging.WARNING, logger="root"):
+            kept = _filter_active_markets([good_1, bad, good_2])
+
+        assert [m.ticker for m in kept] == ["G1", "G2"]
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "missing/unparseable close_time" in r.getMessage()
+        ]
+        assert len(warnings) == 1, f"Expected exactly one summary WARNING; got {warnings}"
+        assert "Skipped 1 markets with missing/unparseable close_time" in warnings[0].getMessage()
+
+    def test_filter_active_markets_silent_when_no_bad_close_times(self, caplog):
+        markets = [
+            _mock_market(ticker="G1", event_ticker="E1"),
+            _mock_market(ticker="G2", event_ticker="E2"),
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="root"):
+            kept = _filter_active_markets(markets)
+
+        assert [m.ticker for m in kept] == ["G1", "G2"]
+        assert not [
+            r for r in caplog.records
+            if "missing/unparseable close_time" in r.getMessage()
+        ], "No warning may be emitted when every market has a close_time"
+
+    def test_find_time_series_pairs_ignores_member_with_none_close_time(self):
+        # Three markets sharing one date-stripped title on three event tickers:
+        # two good ones that qualify as a 15%-tier pair, plus one whose
+        # close_time is None. The sort in find_time_series_pairs used to raise
+        # TypeError comparing None against a datetime.
+        early_close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = _mock_market(
+            ticker="EARLY", event_ticker="EVT-A",
+            title="Will BTC exceed $80k",
+            yes_ask=0.50, no_ask=0.50,
+            close_time=early_close,
+        )
+        mB = _mock_market(
+            ticker="LATE", event_ticker="EVT-B",
+            title="Will BTC exceed $80k",
+            yes_ask=0.30, no_ask=0.70,
+            close_time=early_close + timedelta(days=10),
+        )
+        bad = self._bad_close_time_market("NOCLOSE", "EVT-C")
+
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, bad, mB])
+
+        assert len(pairs) == 1, f"Expected exactly one pair from the two good markets; got {pairs}"
+        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"EARLY", "LATE"}

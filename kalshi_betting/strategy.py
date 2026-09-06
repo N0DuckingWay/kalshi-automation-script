@@ -14,8 +14,18 @@ Purpose:
 Dependencies:
     Imports BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, and fee helpers from
     config.py. Imports CandidatePair from scanner.py. Exports TradeSpec (consumed
-    by trader.py and reporter.py) and select_portfolio() (called by main.py and
-    backtester.py).
+    by trader.py and reporter.py), compute_trade() and select_portfolio() (both
+    called by main.py). backtester.py does NOT import this module — it
+    re-implements Kelly sizing and portfolio selection inline against the same
+    config.py constants and fee helpers, so a change to either sizing formula
+    must be made in both places to keep live/backtest parity.
+
+Notes:
+    compute_trade() returns None for the ordinary no-edge/no-budget cases, but
+    see its own Raises section for the one input it does NOT handle by
+    returning None: a pair whose market_a or market_b has close_time=None. The
+    scanner guarantees that can't happen for pairs it produced — only a
+    CandidatePair built outside scanner.py (e.g. in a test) can carry one.
 """
 import logging
 from dataclasses import dataclass
@@ -42,8 +52,10 @@ class TradeSpec:
         total_cost_with_fees (float): total_cost plus the exact ceiling-rounded
             taker fee for both legs. This is the real cash the trade consumes at
             execution — select_portfolio() budgets against this value.
-        min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds:
-            x * (1 - nA - pB). Always > 0 for trades that reach execution.
+        min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds,
+            net of exact ceiling-rounded taker fees on both legs:
+            x * (1 - nA - pB) - fee_leg_exact(x, nA) - fee_leg_exact(x, pB).
+            Always > 0 for trades that reach execution.
         profit_ratio (float): Return on cost, net of the continuous fee
             approximation: ((1 - nA - pB) - fee_per_pair_approx(nA, pB)) /
             (nA + pB). This is "b" in the Kelly formula below (see
@@ -100,6 +112,15 @@ def _kelly_p(pair: CandidatePair) -> float:
     appropriate than market prices. This prior is calibrated for binary contracts and
     applies equally to MVE option markets once cross-event collisions are eliminated by
     the event_title component of the grouping key.
+
+    Args:
+        pair (CandidatePair): The candidate pair. Uses pair.pair_type to select
+            the model and, for time_series, pair.pA/pair.pB as the probability
+            inputs.
+
+    Returns:
+        float: Probability of profit, in (0, 1), used as "p" in compute_trade()'s
+            Kelly formula.
     """
     if pair.pair_type == "time_series":
         return 1.0 - pair.pA * (1.0 - pair.pB)
@@ -142,7 +163,15 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
             - The exact minimum payoff at the computed n is zero or negative.
 
     Raises:
-        None: All error conditions are handled by returning None.
+        AttributeError/TypeError: If either market_a.close_time or
+            market_b.close_time is None (a market whose close_time failed to
+            parse). Every other invalid or unprofitable input is handled by
+            returning None; this one case is not, because it cannot arise from
+            scanner-produced pairs: scanner._filter_active_markets drops every
+            market with a missing/unparseable close_time, and both
+            find_time_series_pairs and find_same_title_pairs call it first. A
+            None close_time can therefore only reach here on a CandidatePair
+            constructed outside the scanner (e.g. in a test).
     """
     if not pair.tradeable:
         return None
@@ -217,8 +246,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     total_cost_with_fees = total_cost + fee_no + fee_yes
 
     # Per-leg cash requirements — same terms and fee calls as total_cost_with_fees,
-    # just not summed together. The collateral transfer planner (later commit) uses
-    # these to fund each leg's own exchange shard rather than the pair total.
+    # just not summed together. trader.ensure_shard_collateral() uses these to
+    # fund each leg's own exchange shard rather than the pair total.
     cost_with_fees_a = n * nA + fee_no
     cost_with_fees_b = n * pB + fee_yes
 
