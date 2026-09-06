@@ -564,7 +564,11 @@ def _find_entry(
         entry requires pA − pB >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the earlier contract priced higher is the anomaly. A pricier later
-        contract is normal term structure and is never traded.
+        contract is normal term structure and is never traded. The deadline gap
+        driving that tier (and the 30-day cutoff) is timedelta.days on the two
+        close_time datetimes, exactly as the live scanner computes it — not
+        calendar-date subtraction, which counts a day boundary the live path
+        does not.
       - same_title: market A is canonicalized per Monday as the more expensive
         side (the two contracts ask the identical question, so direction is
         price-only).
@@ -621,12 +625,30 @@ def _find_entry(
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
         # Deadline gap is loop-invariant: pairs more than 30 days apart are too
-        # weakly correlated for the time-series assumption to hold reliably
-        gap_days = (close_b - close_a).days
+        # weakly correlated for the time-series assumption to hold reliably.
+        # Measure it on the close_time DATETIMES, not the dates parsed above:
+        # timedelta.days floors, while calendar-date subtraction counts day
+        # boundaries, so the two disagree by up to a day whenever the closes
+        # straddle midnight (2026-02-01T23:00Z vs 2026-02-17T01:00Z is gap 15
+        # live but 16 by date). That one day flips both the tier boundary and
+        # the 30-day cutoff, so a backtest that is supposed to replay the live
+        # strategy must use the live arithmetic.
+        dt_a = _parse_iso_datetime(mA.get("close_time"))
+        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        try:
+            # Identical arithmetic to scanner.find_time_series_pairs /
+            # scanner._pair_max_sum: timedelta.days on tz-aware datetimes
+            gap_days = (dt_b - dt_a).days
+        except TypeError:
+            # A naive/aware mix (only reachable from a hand-edited cache) can't
+            # be subtracted; fall back to the dates rather than raising, per
+            # this file's "can't parse it = unknown, not an error" convention
+            gap_days = (close_b - close_a).days
         if gap_days > MAX_DEADLINE_GAP_DAYS:
             return None
         # Tier the required price gap by deadline distance (15% for gaps
-        # <= 15 days, 30% for 16-30 days) — mirrors scanner.find_time_series_pairs
+        # <= 15 days, 30% for 16-30 days) — the same tiering, computed off the
+        # same gap arithmetic, as scanner.find_time_series_pairs
         threshold = min_price_diff_for_gap(gap_days)
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold

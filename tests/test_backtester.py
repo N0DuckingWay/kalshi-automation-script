@@ -329,6 +329,42 @@ class TestFindEntryTieredThreshold:
                             "same_title", date(2026, 1, 1))
         assert entry is not None
 
+    def test_gap_tier_uses_datetime_arithmetic_like_live_scanner(self):
+        # The deadline gap must be measured the way scanner.find_time_series_pairs
+        # measures it: timedelta.days on the tz-aware close_time DATETIMES, which
+        # floors. Feb 1 23:00Z -> Feb 17 01:00Z is 15 days 2 hours, so the live
+        # gap is 15 -> the SHORT (15%) tier. Calendar-date subtraction would
+        # count 16 boundaries and wrongly apply the long (30%) tier.
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": "2026-02-01T23:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": "2026-02-17T01:00:00+00:00"}
+        # 25% price gap: clears the short tier (>= 0.15) but not the long one
+        # (>= 0.30); nA + pB = 0.75 <= 0.85, the short tier's price-sum ceiling.
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.35, 0.65)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+
+    def test_max_gap_cutoff_uses_datetime_arithmetic_like_live_scanner(self):
+        # Same disagreement at the MAX_DEADLINE_GAP_DAYS (30) cutoff. Feb 1
+        # 23:00Z -> Mar 4 01:00Z is 30 days 2 hours (Feb 2026 has 28 days), so
+        # the live gap is exactly 30 — allowed, long tier. Calendar-date
+        # subtraction counts 31 and rejects the pair outright.
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": "2026-02-01T23:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": "2026-03-04T01:00:00+00:00"}
+        # 40% price gap clears the long tier (>= 0.30); nA + pB = 0.60 <= 0.70.
+        candles_early = [_candle(_MONDAY_TS, 0.70, 0.30)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+
 
 class TestFindEntryHorizon:
     """_find_entry's optional max_horizon_days caps how far the later-closing
