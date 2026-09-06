@@ -136,7 +136,7 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 
 **Use `@dataclass` for all data transfer objects.** Existing: `CandidatePair`, `ApiMarket`, `PriceRange`, `TradeSpec`, `TradeResult`, `BacktestTrade`. Never use a plain dict when a dataclass fits.
 
-**Return `None` for validation failures; don't raise.** `compute_trade()` returns `None` when there's no edge. `find_time_series_pairs()` skips bad markets silently. Only raise for truly unexpected errors.
+**Return `None` for validation failures; don't raise.** `compute_trade()` returns `None` when there's no edge. Both finders drop markets with a missing/unparseable `close_time` in the shared `scanner._filter_active_markets()` they each call first — reported as one summary WARNING carrying the count (silent at zero), since a `None` deadline would otherwise crash the close-time sort, `_pair_max_sum()`, and `compute_trade()` — and skip the rest of the bad markets silently. Only raise for truly unexpected errors.
 
 **Two-stage fee calculation:**
 1. `fee_per_pair_approx(nA, pB)` — continuous approximation; use during pair *filtering* before the integer contract count `n` is known.

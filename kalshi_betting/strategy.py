@@ -23,7 +23,9 @@ Dependencies:
 Notes:
     compute_trade() returns None for the ordinary no-edge/no-budget cases, but
     see its own Raises section for the one input it does NOT handle by
-    returning None: a pair whose market_a or market_b has close_time=None.
+    returning None: a pair whose market_a or market_b has close_time=None. The
+    scanner guarantees that can't happen for pairs it produced — only a
+    CandidatePair built outside scanner.py (e.g. in a test) can carry one.
 """
 import logging
 from dataclasses import dataclass
@@ -164,9 +166,12 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         AttributeError/TypeError: If either market_a.close_time or
             market_b.close_time is None (a market whose close_time failed to
             parse). Every other invalid or unprofitable input is handled by
-            returning None; this one case is not, because find_time_series_pairs
-            and find_same_title_pairs are assumed to have already dropped any
-            market with an unparseable close_time before it reaches here.
+            returning None; this one case is not, because it cannot arise from
+            scanner-produced pairs: scanner._filter_active_markets drops every
+            market with a missing/unparseable close_time, and both
+            find_time_series_pairs and find_same_title_pairs call it first. A
+            None close_time can therefore only reach here on a CandidatePair
+            constructed outside the scanner (e.g. in a test).
     """
     if not pair.tradeable:
         return None

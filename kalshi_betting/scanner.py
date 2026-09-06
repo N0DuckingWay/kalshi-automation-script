@@ -349,12 +349,21 @@ def display_title(market: Any) -> str:
 
 def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
     """
-    Filter markets to those that are actively priced and not already held.
+    Filter markets to those that are actively priced, deadline-known, and not
+    already held.
 
     A market is considered actively priced when its YES ask is between 1¢ and 99¢.
     Markets at 0¢ or 100¢ are effectively settled or completely illiquid — trading
     them offers no edge. Markets whose tickers are in excluded_tickers are already
-    held in the portfolio and must not be traded again.
+    held in the portfolio and must not be traded again. A market whose close_time
+    is None (missing or unparseable in the API payload, see _market_from_dict) is
+    also dropped here: this filter is the first thing both find_time_series_pairs
+    and find_same_title_pairs call, and every downstream consumer treats
+    close_time as a real datetime — the close_time sort and deadline-gap
+    arithmetic in the finders, _pair_max_sum's tiered ceiling, and
+    strategy.compute_trade's days-to-close normalization all raise on None.
+    Dropping such markets keeps the finders' "skip bad markets, don't raise"
+    contract.
 
     Args:
         markets (list): List of Kalshi market API objects to filter.
@@ -362,13 +371,22 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
             no tickers are excluded.
 
     Returns:
-        list: Subset of markets that have a parseable YES ask in [0.01, 0.99]
-            and whose ticker is not in excluded_tickers.
+        list: Subset of markets that have a non-None close_time and a parseable
+            YES ask in [0.01, 0.99], and whose ticker is not in
+            excluded_tickers. Markets with a missing/unparseable close_time are
+            dropped and reported once as a single summary WARNING with the count
+            (silent when none were dropped).
     """
     excluded = excluded_tickers or set()
     active = []
+    missing_close_time = 0
     for m in markets:
         if m.ticker in excluded:
+            continue
+        # An unknown deadline can't be sorted, gap-tiered, or Kelly-normalized;
+        # count it for one summary warning rather than logging per market.
+        if getattr(m, "close_time", None) is None:
+            missing_close_time += 1
             continue
         try:
             ya = float(m.yes_ask_dollars)
@@ -377,6 +395,11 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
                 active.append(m)
         except (ValueError, TypeError):
             pass
+    if missing_close_time:
+        # Same silent-at-zero idiom as the trading-inactive shard skip count.
+        logging.warning(
+            "Skipped %d markets with missing/unparseable close_time", missing_close_time
+        )
     return active
 
 
