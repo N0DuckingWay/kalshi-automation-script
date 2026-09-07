@@ -100,7 +100,9 @@ LARGE_GROUP_WARN_THRESHOLD    = 1000
 # When True, markets are grouped by (event_title + market_title) so cross-event
 # option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive
 # into a same-title or time-series pair. When False, mve_filter="exclude" is passed
-# to all market-fetch APIs and the bot operates only on binary events.
+# to all market-fetch APIs, the backtester's MVE event-title listing is skipped,
+# and the bot operates only on binary events. Event titles are still resolved for
+# binary events in both modes, so live and backtest grouping keys match.
 INCLUDE_MVE_MARKETS           = True
 
 # Kalshi taker fee rate. The exact per-leg fee is:

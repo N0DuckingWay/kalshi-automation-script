@@ -404,7 +404,8 @@ def _load_or_build_event_titles(
     fetch the title mapping separately via the events endpoint.
 
     Two-tier resolution to keep API calls bounded:
-      1. Bulk pull events (settled, closed, open) and their multivariate counterparts.
+      1. Bulk pull events (settled, closed, open) and — only when
+         INCLUDE_MVE_MARKETS is True — their multivariate counterparts.
          For most backtests this covers nearly every event_ticker in a few hundred
          paginated calls.
       2. For any tickers still unresolved (very old archived events that have aged
@@ -521,7 +522,9 @@ def _load_or_build_event_titles(
     # MVE_TITLE_LOOKUP_MAX_PAGES; tickers not found by then fall through to the
     # bounded per-ticker lookup below instead of paging for hours.
     # Raw-response for the same nullable-category reason as above.
-    if missing:
+    # Only worth paging when MVE markets can be in the wanted set at all —
+    # with INCLUDE_MVE_MARKETS off every market fetch excluded them upstream.
+    if missing and INCLUDE_MVE_MARKETS:
         cursor = None
         barren = 0
         for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
@@ -2394,15 +2397,21 @@ def fetch_all_settled_markets(
 
     # ── Attach event titles ───────────────────────────────────────────────────
     # Collect unique event_tickers and look up their titles in one batch so the
-    # backtester can build (event_title + market_title) grouping keys. Skipped
-    # entirely when MVE is excluded, since the live scanner's combined-key logic
-    # wouldn't change anything for binary-only markets.
-    titles: dict[str, str] = {}
-    if INCLUDE_MVE_MARKETS:
-        unique_tickers = {m.get("event_ticker") for m in selected.values()
-                          if m.get("event_ticker")}
-        logging.info("Resolving event titles for %d unique event_tickers", len(unique_tickers))
-        titles = _load_or_build_event_titles(live_client, unique_tickers, use_cache=use_cache)
+    # backtester can build (event_title + market_title) grouping keys — for
+    # binary markets too: the live scanner attaches _event_title to EVERY
+    # market regardless of INCLUDE_MVE_MARKETS (scanner._market_from_dict on
+    # the binary listing path of fetch_open_events_with_markets), so the
+    # same-title key is (event_title, title, subtitle) live in both modes.
+    # Resolving only when MVE is on made the flag silently collapse the
+    # backtester's key to (title, subtitle) and pair binary markets live
+    # keeps apart. The flag now gates only the MVE-listing phase inside
+    # _load_or_build_event_titles (no MVE ticker can be wanted when every
+    # market fetch passed mve_filter="exclude").
+    unique_tickers = {m.get("event_ticker") for m in selected.values()
+                      if m.get("event_ticker")}
+    logging.info("Resolving event titles for %d unique event_tickers", len(unique_tickers))
+    # Resolve event_ticker -> title so grouping keys match the live scanner's
+    titles = _load_or_build_event_titles(live_client, unique_tickers, use_cache=use_cache)
 
     all_markets: list[dict] = list(selected.values())
     if titles:

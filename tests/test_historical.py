@@ -554,6 +554,8 @@ class TestFetchAllSettledMarkets:
         # lives on. Also verifies dicts flow through to the cached format.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
         monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+        # Title resolution is not under test here (live is a bare MagicMock).
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", lambda *a, **k: {})
         from datetime import date
 
         def market(tkr, settled):
@@ -614,6 +616,8 @@ class TestFetchAllSettledMarkets:
         cache_dir = tmp_path / "cache"
         monkeypatch.setattr(historical, "CACHE_DIR", cache_dir)
         monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+        # Title resolution is not under test here (live is a bare MagicMock).
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", lambda *a, **k: {})
         cache_dir.mkdir(parents=True)
         (cache_dir / "settled_markets_2026-02-01.json").write_text('[{"ticker": "T1"')
 
@@ -645,6 +649,49 @@ class TestFetchAllSettledMarkets:
         assert json.loads(
             (cache_dir / "settled_markets_2026-02-01.json").read_text()
         ) == out
+
+    def test_event_titles_resolved_when_mve_excluded(self, tmp_path, monkeypatch,
+                                                     isolated_cache):
+        # E2: INCLUDE_MVE_MARKETS=False must narrow WHICH markets are fetched,
+        # never how the remaining ones are grouped. The live scanner attaches
+        # every market's parent event title in both modes
+        # (scanner._market_from_dict on the binary listing path), so skipping
+        # event-title resolution here collapsed the backtester's same-title key
+        # from (event_title, title, subtitle) to (title, subtitle) and paired
+        # binary markets under different events that live keeps apart.
+        # The MVE *listing* phase is the only thing the flag may gate.
+        from datetime import date
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                return _raw_resp({"market_settled_ts": "2026-03-01T00:00:00Z"})
+            return _raw_resp({"markets": [], "cursor": None})
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+
+        # Bulk (non-MVE) events listing resolves EV; the MVE listing must not run.
+        live = _make_client_with_event_pages([[("EV", "Event EV")]])
+        live.get_markets_without_preload_content = MagicMock(return_value=_raw_resp({
+            "markets": [{"ticker": "RECENT", "event_ticker": "EV", "title": "Q",
+                         "result": "yes", "yes_ask_dollars": "0.40",
+                         "no_ask_dollars": "0.60", "yes_bid_dollars": "0.38",
+                         "close_time": "2026-03-05T00:00:00Z",
+                         "settlement_ts": "2026-03-05T00:00:00Z",
+                         "status": "finalized"}],
+            "cursor": None,
+        }))
+
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), live, start_date=date(2026, 2, 1), use_cache=False,
+        )
+
+        assert [m["ticker"] for m in out] == ["RECENT"]
+        assert out[0]["event_title"] == "Event EV"
+        # No MVE ticker can be wanted when every market fetch excluded them.
+        assert live.get_multivariate_events_without_preload_content.call_count == 0
 
     def test_live_sweep_bounds_min_settled_ts_to_start_date(self, tmp_path, monkeypatch):
         # Regression: min_settled_ts used to be hardcoded to cutoff_ts, so a
