@@ -1801,7 +1801,8 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
 
     Returns True only if qualifying depth >= spec.x contracts remain at the
     pair's gap threshold. A False result means prices have moved since the
-    scan and the trade should be skipped.
+    scan and the trade should be skipped. Every False return is logged here,
+    once, at WARNING, with its reason — callers must not log the drop again.
 
     Args:
         client: Authenticated KalshiClient from auth.build_client().
@@ -1817,7 +1818,7 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
 
     if ob_a is None or ob_b is None:
         logging.warning(
-            "Pre-execution orderbook unavailable for '%s' — skipping",
+            "Pre-execution orderbook unavailable for '%s' — dropping",
             pair.canonical_title,
         )
         return False
@@ -1831,8 +1832,11 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
     qualifying = [(yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum]
 
     if not qualifying:
-        logging.info(
-            "Pre-execution check failed for '%s' — gap no longer qualifies",
+        # WARNING, not INFO: this is a SELECTED trade being dropped seconds
+        # before submission. This is the single log line for the drop —
+        # pre_execution_check deliberately does not log a second one.
+        logging.warning(
+            "Pre-execution check failed for '%s' — gap no longer qualifies; dropping",
             pair.canonical_title,
         )
         return False
@@ -1840,8 +1844,8 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
     # Require enough depth to fill our full intended contract count via FoK
     total_qty = sum(qty for _, _, qty in qualifying)
     if total_qty < spec.x:
-        logging.info(
-            "Pre-execution check failed for '%s' — only %.1f contracts at gap (need %d)",
+        logging.warning(
+            "Pre-execution check failed for '%s' — only %.1f contracts at gap (need %d); dropping",
             pair.canonical_title, total_qty, spec.x,
         )
         return False

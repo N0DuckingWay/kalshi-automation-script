@@ -1235,7 +1235,9 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
     Fetches both order books for each spec in parallel and drops any whose gap
     threshold is no longer met or whose available depth is less than the intended
     contract count. This reduces the window between price observation and order
-    submission, lowering the chance of submitting against a stale price.
+    submission, lowering the chance of submitting against a stale price. Each
+    drop is logged once, with its reason, by validate_pair_price (or by the
+    exception handler here); this function adds only a summary count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1267,11 +1269,11 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
                 continue
             if ok:
                 valid.append(spec)
-            else:
-                logging.warning(
-                    "Pre-execution price check failed for '%s' — dropping from portfolio",
-                    spec.pair.canonical_title,
-                )
+            # A False result was already logged, with its reason, by
+            # validate_pair_price — don't log the same drop a second time.
+    logging.info(
+        "Pre-execution check: %d of %d pair(s) still qualify", len(valid), len(portfolio),
+    )
     return valid
 
 
