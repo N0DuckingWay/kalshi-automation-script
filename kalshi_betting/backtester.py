@@ -36,12 +36,14 @@ Notes:
     independence assumption. Pass 2 walks
     entries in chronological order (priority-ordered within a date using the
     ENTRY-TIME expected return, never realized results), maintains a running cash
-    balance — sizing each trade against the cash available at entry and releasing
-    settlement receipts on exit dates — and applies a greedy ticker-conflict filter
+    balance — sizing every candidate of an entry date against that checkpoint's
+    opening balance, admitting them greedily against the running cash (mirroring
+    main._run_prod + strategy.select_portfolio) and releasing settlement receipts
+    on exit dates — and applies a greedy ticker-conflict filter
     so each market ticker appears in at most one OPEN trade at a time (the ticker
     is released on its trade's exit date, alongside the cash). This mirrors the
-    live bot's Kelly sizing against the current balance and its one-active-
-    position-per-ticker rule: get_held_tickers() reads positions with
+    live bot's Kelly sizing against one per-run balance snapshot and its
+    one-active-position-per-ticker rule: get_held_tickers() reads positions with
     count_filter="position", so a settled ticker leaves the blocked set live too.
 
     Before grouping, run_backtest() filters markets through _can_ever_enter(),
@@ -138,8 +140,10 @@ class BacktestTrade:
             guaranteed floor (e.g. both markets resolved favorably); negative only
             in the loss scenario.
         holding_days (int): Calendar days between entry_date and exit_date. Always >= 1.
-        balance_at_entry (float): Simulated cash balance in dollars immediately
-            before this trade's entry deduction — the base the Kelly budget used.
+        balance_at_entry (float): Simulated cash balance in dollars at the OPEN
+            of this trade's entry-date checkpoint — the base the Kelly budget
+            was sized against, shared by every trade entering that same date
+            (mirroring the single balance read at the top of a live run).
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -165,7 +169,7 @@ class BacktestTrade:
     expected_payoff: float  # n * (1 - nA - pB) minus fees — the guaranteed NET floor
     slippage: float         # profit - expected_payoff
     holding_days: int
-    balance_at_entry: float  # simulated cash available when the trade was sized
+    balance_at_entry: float  # checkpoint opening balance the Kelly budget used
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str) -> float:
@@ -924,8 +928,10 @@ def run_backtest(
          rule), then drop any time-series candidate whose ticker pair was also
          found as a same-title candidate (live main._dedup_pairs rule).
       6. Walk entries chronologically with a running cash balance: Kelly-size
-         each trade against the cash available at entry, and record actual P&L
-         from settlement outcomes.
+         every candidate of an entry date against that checkpoint's opening
+         balance, admit it only while its fee-inclusive cost still fits the
+         running cash (mirroring main._run_prod + strategy.select_portfolio),
+         and record actual P&L from settlement outcomes.
       7. Build an equity curve from the trade timeline.
 
     Args:
@@ -1081,7 +1087,7 @@ def run_backtest(
         pA, pB, nA = entry["pA"], entry["pB"], entry["nA"]
         entry_date = entry["entry_date"]
 
-        # ── Kelly fraction (sizing happens in Pass 2 against running cash) ────
+        # ── Kelly fraction (sizing happens in Pass 2 against the checkpoint) ──
         # Compute the net spread after the continuous fee approximation
         net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
         profit_ratio_entry = net_spread / (nA + pB) if net_spread > 0 else 0.0
@@ -1197,18 +1203,18 @@ def run_backtest(
     )
 
     # ── Pass 2: chronological cash-constrained greedy selection ───────────────
-    # Walk entries in date order, maintaining a running cash balance: each trade
-    # is Kelly-sized against the cash available AT ITS OWN ENTRY DATE, which
-    # already reflects every earlier trade's cost and every settled trade's
-    # receipt. This is NOT what the live bot does: main._run_prod sizes every
-    # candidate in one run against that run's single opening-balance snapshot
-    # (compute_trade(pair, balance_cents) with one fixed balance_cents for the
-    # whole scan), then greedily fits them by decrementing a local budget —
-    # it never re-reads the account balance mid-run. The backtest's per-checkpoint
-    # resizing is deliberately more permissive (a later trade can draw on an
-    # earlier trade's settled profit within the same backtest), so a backtest
-    # Kelly fraction is not directly comparable to a single live run's sizing.
-    # Settlement receipts return to cash on their exit dates. A ticker-conflict
+    # Walk entries in date order, maintaining a running cash balance. Sizing
+    # mirrors main._run_prod exactly: every candidate on a given entry date
+    # (one Monday checkpoint = one live run) is Kelly-sized against that
+    # checkpoint's OPENING balance — the cash after that day's settlement
+    # receipts have returned, i.e. what verify_auth would report at the top
+    # of the run — and then admitted greedily, in the same order
+    # select_portfolio uses, only while its fee-inclusive cost still fits the
+    # RUNNING cash (select_portfolio's `total_cost_with_fees > available`).
+    # Sizing later same-day trades off the running cash instead (the old
+    # behaviour) made every trade after the first on a busy Monday smaller
+    # than live would make it. Settlement receipts return to cash on their
+    # exit dates. A ticker-conflict
     # filter mirrors the live
     # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
     # rule comes from scanner.get_held_tickers(), which queries positions with
@@ -1219,6 +1225,10 @@ def run_backtest(
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
     cash = initial_balance
+    # Opening balance of the checkpoint currently being walked — the Kelly
+    # base for every candidate entering on that date (see comment above).
+    checkpoint_date: date | None = None
+    checkpoint_cash = cash
     pending_exits: list[tuple[date, float]] = []  # (exit_date, settlement receipt)
     # (exit_date, ticker) for every leg of a still-open trade — the release
     # ledger for active_tickers, kept alongside pending_exits so cash and
@@ -1243,6 +1253,13 @@ def run_backtest(
         active_tickers.difference_update(tk for ed, tk in active_until if ed <= d)
         active_until = [(ed, tk) for ed, tk in active_until if ed > d]
 
+        if d != checkpoint_date:
+            # First candidate of a new checkpoint: receipts for this date have
+            # just been returned above, so this is the balance a live run
+            # starting today would read and size everything against.
+            checkpoint_date = d
+            checkpoint_cash = cash
+
         mA, mB = c["mA"], c["mB"]
         # Skip if either ticker is still committed to a trade that hasn't settled
         if mA["ticker"] in active_tickers or mB["ticker"] in active_tickers:
@@ -1250,8 +1267,9 @@ def run_backtest(
 
         nA, pB = c["nA"], c["pB"]
 
-        # Kelly sizing against the cash available NOW, not the initial balance
-        budget = cash * c["kelly_f_capped"]
+        # Kelly sizing against the checkpoint's opening balance (live:
+        # compute_trade(pair, balance_cents) with one balance for the run)
+        budget = checkpoint_cash * c["kelly_f_capped"]
         n = int(budget / (nA + pB))
         if n < 1:
             # Kelly budget can't afford one contract — live compute_trade skips too
@@ -1279,6 +1297,9 @@ def run_backtest(
         expected_payoff = n * (1.0 - nA - pB) - fees
         if expected_payoff <= 0:
             continue
+        # Greedy fit against the RUNNING cash — select_portfolio's admission
+        # rule; a spec that no longer fits is skipped, later cheaper ones may
+        # still be admitted.
         if total_cost + fees > cash:
             continue
 
@@ -1318,7 +1339,7 @@ def run_backtest(
             expected_payoff=expected_payoff,
             slippage=slippage,
             holding_days=c["holding_days"],
-            balance_at_entry=cash,
+            balance_at_entry=checkpoint_cash,
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit

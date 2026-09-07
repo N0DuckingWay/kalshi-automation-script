@@ -1469,3 +1469,92 @@ class TestRunBacktestCrossTypeDedup:
 
         assert len(trades) == 1
         assert trades[0].pair_type == "same_title"
+
+
+class TestCheckpointOpeningBalanceSizing:
+    """Pass 2 must size every candidate of one entry date against that
+    checkpoint's OPENING balance (live: one verify_auth read per run feeding
+    every compute_trade call), then admit greedily against the running cash
+    (live: strategy.select_portfolio's decrementing budget)."""
+
+    # Two same-title pairs whose only qualifying Monday is 2026-01-05. Distinct
+    # event_titles ("EV1"/"EV2") keep them in separate (event_title, title,
+    # subtitle) groups, so Pass 1's best-per-group filter keeps both.
+    @staticmethod
+    def _markets():
+        out = []
+        for n, ev in ((1, "EV1"), (2, "EV2")):
+            out.append({"ticker": f"S{n}A", "event_ticker": f"E{n}A", "event_title": ev,
+                        "title": f"Q{n}", "subtitle": "", "result": "yes",
+                        "close_time": "2026-02-01T00:00:00+00:00",
+                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
+            out.append({"ticker": f"S{n}B", "event_ticker": f"E{n}B", "event_title": ev,
+                        "title": f"Q{n}", "subtitle": "", "result": "yes",
+                        "close_time": "2026-02-01T00:00:00+00:00",
+                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
+        return out
+
+    # Identical prices for both pairs: expensive leg yes 0.60 / no 0.40, cheap
+    # leg yes 0.35 — a 0.25 gap, so both clear SAME_TITLE_MIN_PRICE_DIFF and
+    # both land on the same capped Kelly fraction.
+    @staticmethod
+    def _candles():
+        return {
+            "S1A": [_candle(_MONDAY_TS, 0.60, 0.40)],
+            "S1B": [_candle(_MONDAY_TS, 0.35, 0.65)],
+            "S2A": [_candle(_MONDAY_TS, 0.60, 0.40)],
+            "S2B": [_candle(_MONDAY_TS, 0.35, 0.65)],
+        }
+
+    def _patch(self, monkeypatch):
+        markets, candles = self._markets(), self._candles()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+    def test_same_day_trades_are_sized_off_the_checkpoint_opening_balance(self, monkeypatch):
+        # Both pairs enter on the same Monday. Live would size BOTH against the
+        # one balance read at the top of the run, so both must get the same n
+        # and record the same balance_at_entry — the second must not be shrunk
+        # by the first's cost.
+        self._patch(monkeypatch)
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+
+        assert len(trades) == 2
+        assert {t.entry_date for t in trades} == {date(2026, 1, 5)}
+        assert trades[0].n == trades[1].n
+        for t in trades:
+            assert t.balance_at_entry == pytest.approx(1000.0)
+            # Each trade's fee-inclusive outlay fits the Kelly budget taken off
+            # the CHECKPOINT balance, not off whatever cash was left.
+            assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
+
+    def test_greedy_fit_skips_rather_than_shrinks(self, monkeypatch):
+        # With the real BUDGET_FRACTION (0.20) two same-day trades always fit
+        # (0.2 + 0.2 < 1), so the greedy-skip branch is unreachable. Raise the
+        # cap to 0.60 for this test only — backtester imports the constant by
+        # value (`from .config import BUDGET_FRACTION`), so patching the module
+        # attribute is what Pass 1's `min(BUDGET_FRACTION, kelly_f)` reads.
+        monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.60)
+        self._patch(monkeypatch)
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+
+        # The first trade takes ~60% of the balance; the second, sized off the
+        # same checkpoint balance, no longer fits the ~40% left. select_portfolio
+        # SKIPS such a spec — it never shrinks it to fit.
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.kelly_fraction == pytest.approx(0.60)
+        assert t.balance_at_entry == pytest.approx(1000.0)
+        assert t.total_cost + t.fees <= 1000.0 * 0.60 + 1e-9
+        # Not shrunk: it is still the full-size trade the checkpoint budget buys.
+        assert t.total_cost + t.fees > 1000.0 * 0.50
