@@ -494,6 +494,31 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
         assert validate_pair_price(client, spec) is True
 
+    def test_validate_pair_price_logs_gap_rejection_at_warning(self, caplog):
+        # Same rejecting fixture as test_validate_pair_price_rejects_long_gap_at_old_ceiling
+        # (0.45 + 0.35 = 0.80 exceeds the 20-day-gap ceiling of 0.70, so this hits
+        # the "gap no longer qualifies" branch, not the depth branch). The drop must
+        # be logged exactly once, at WARNING, with "; dropping" appended — this is
+        # the one log line for the drop; pre_execution_check must not log a second.
+        pair = _ts_candidate(gap_days=20, pA=0.65, pB=0.35, nA=0.45)
+        spec = SimpleNamespace(pair=pair, x=10)
+        client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(client, spec) is False
+
+        matching = [
+            r for r in caplog.records
+            if "gap no longer qualifies; dropping" in r.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
+
+        info_drops = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and "gap no longer qualifies" in r.getMessage()
+        ]
+        assert info_drops == []
+
 
 def _orderbook_payload_client(payload: dict):
     """Mock KalshiClient whose orderbook endpoint returns `payload` (serialized to

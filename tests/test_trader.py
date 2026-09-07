@@ -71,6 +71,7 @@ from kalshi_betting.trader import (
     _v2_top_of_grid_price,
     ensure_shard_collateral,
     execute_trades,
+    pre_execution_check,
 )
 
 # Tick grids used by the V2 price-math tests, mirroring the regimes named by
@@ -2037,3 +2038,69 @@ class TestExecuteTradesWorkerIsolation:
         results = execute_trades(MagicMock(), specs, dry_run=False)
         assert [r.spec for r in results] == specs
         assert {r.status for r in results} == {"executed"}
+
+
+class TestPreExecutionCheckLogging:
+    """pre_execution_check must not log a second, reason-less line for a drop
+    already logged (with its reason) by validate_pair_price — and must emit
+    one INFO summary of how many selected pairs still qualify."""
+
+    def test_each_drop_logged_once_with_summary(self, monkeypatch, caplog):
+        keep = make_spec(title="keep me")
+        drop = make_spec(title="drop me")
+
+        def fake_validate(client, spec):
+            if spec.pair.canonical_title == "drop me":
+                logging.warning(
+                    "Pre-execution check failed for '%s' — gap no longer qualifies; dropping",
+                    spec.pair.canonical_title,
+                )
+                return False
+            return True
+
+        monkeypatch.setattr(trader, "validate_pair_price", fake_validate)
+
+        with caplog.at_level(logging.INFO, logger=""):
+            result = pre_execution_check(MagicMock(), [keep, drop])
+
+        assert result == [keep]
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        drop_warnings = [r for r in warnings if "drop me" in r.getMessage()]
+        assert len(drop_warnings) == 1
+
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        summary = [
+            r for r in infos
+            if r.getMessage() == "Pre-execution check: 1 of 2 pair(s) still qualify"
+        ]
+        assert len(summary) == 1
+
+    def test_exception_path_still_logs_and_drops(self, monkeypatch, caplog):
+        keep = make_spec(title="keep me")
+        drop = make_spec(title="drop me")
+
+        def fake_validate(client, spec):
+            if spec.pair.canonical_title == "drop me":
+                raise RuntimeError("boom")
+            return True
+
+        monkeypatch.setattr(trader, "validate_pair_price", fake_validate)
+
+        with caplog.at_level(logging.INFO, logger=""):
+            result = pre_execution_check(MagicMock(), [keep, drop])
+
+        assert result == [keep]
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        drop_warnings = [
+            r for r in warnings if "raised" in r.getMessage() and "drop me" in r.getMessage()
+        ]
+        assert len(drop_warnings) == 1
+
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        summary = [
+            r for r in infos
+            if r.getMessage() == "Pre-execution check: 1 of 2 pair(s) still qualify"
+        ]
+        assert len(summary) == 1
