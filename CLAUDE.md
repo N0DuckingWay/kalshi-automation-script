@@ -12,7 +12,7 @@ The bot finds two types of mispriced binary contract pairs on Kalshi, sizes posi
 
 **Same-title pairs:** Two contracts with identical title + subtitle on different event tickers. Any divergence of 5% or more is anomalous (the code rejects `pA - pB < SAME_TITLE_MIN_PRICE_DIFF`, i.e. `>=` qualifies, not a strict `>`); the bot exploits it assuming 95% co-resolution probability. The subtitle is the intra-title outcome discriminator and is sourced from the API's `yes_sub_title` field (see the subtitle-drift gotcha below) — it is load-bearing, not cosmetic.
 
-**Multivariate (MVE) markets:** Both pair types include MVE markets (option markets within a multi-choice event, e.g. "Trump" inside "2024 Election Winner") when `INCLUDE_MVE_MARKETS=True` in `config.py`. Pairs are grouped by `event_title + market_title` (see `scanner.pair_key`) so option labels like "Trump" or "Above $80k" can't false-positive across unrelated events. Set `INCLUDE_MVE_MARKETS=False` to fall back to binary-only behaviour.
+**Multivariate (MVE) markets:** Both pair types include MVE markets (option markets within a multi-choice event, e.g. "Trump" inside "2024 Election Winner") when `INCLUDE_MVE_MARKETS=True` in `config.py`. Pairs are grouped by `event_title + market_title` (see `scanner.pair_key`) so option labels like "Trump" or "Above $80k" can't false-positive across unrelated events. Set `INCLUDE_MVE_MARKETS=False` to fall back to binary-only behaviour. With the flag off, event titles are still resolved and attached in both the scanner and the backtester — the flag narrows which markets are fetched, never how the remaining ones are grouped.
 
 ---
 
