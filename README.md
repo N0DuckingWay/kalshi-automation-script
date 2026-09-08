@@ -28,11 +28,11 @@ Until September 2026 the time-series strategy traded the opposite way round: it 
 
 What that means for anyone reading the outputs:
 
-- **Sizing.** The Kelly sizer models the probability of profit as `1 − k × (later YES price − earlier YES price)`, with `k = TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75` in `config.py`: the bot believes 75% of the market-implied in-between probability ("prices converge by 25%"). At `k = 1` — taking the market at face value — or under an independence model, Kelly is zero or negative for every pair and the strategy never trades, so `k` is what makes it fire at all; it is a hand-set operator estimate. With `k = 0.75` the Kelly fraction sits well below the `BUDGET_FRACTION` cap (20%) for typical gaps (about 6% at the minimum short-tier gap, about 19% at a 0.30 gap), so Kelly itself sizes and differentiates pairs and the cap only binds for gaps of roughly 0.40 or more; a wide order book drives Kelly negative and the pair is skipped. Because a pricier later contract is normal term structure, far more time-series candidates qualify than before.
+- **Sizing.** The Kelly sizer models the probability of profit as `1 − k × (later YES price − earlier YES price)`, with `k = TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75` in `config.py`: the bot believes 75% of the market-implied in-between probability ("prices converge by 25%"). At `k = 1` — taking the market at face value — or under an independence model, Kelly is zero or negative for every pair and the strategy never trades, so `k` is what makes it fire at all; it is a hand-set operator estimate. With `k = 0.75` the Kelly fraction sits well below the `BUDGET_FRACTION` cap (20%) for typical gaps (about 6% at the minimum short-tier gap, about 19% at a 0.30 gap), so Kelly itself sizes and differentiates pairs and the cap only binds for gaps of roughly 0.40 or more; a wide order book drives Kelly negative and the pair is skipped. Because a pricier later contract is normal term structure, far more time-series candidates qualify than before. `k` is no longer only a hand-set guess — it is now *measurable* against settled history: see [Backtest](#backtest) for `--interval-discount` and the dashboard's empirical-`k` report. The live bot still only ever reads the `config.py` constant; nothing writes the measured value back.
 - **Trade log.** `trade_log.xlsx` keeps its 18 columns, but new workbooks head the count columns "x — A leg" / "y — B leg" and the profit column "Profit if won ($)" (an existing workbook keeps its old header row) and every row's Notes cell is prefixed `[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]]` so the side traded on each market is explicit. For time-series rows the "nA (NO ask)" column is the earlier contract's best NO ask for reference only — the traded NO price is the `nB` in the Notes prefix. The dev-simulation candidates sheet gains an "nB (NO ask)" column, and the live pairs table logged by `main.py` gains an "nB (NO)" column and labels its profit column "Profit (win)".
 - **Backtest.** Each `BacktestTrade` records `entry_nB`; a time-series trade's profit is negative only in the in-between outcome. Any candidate whose settlement violates the cumulative-deadline premise (earlier YES, later NO) is skipped rather than paid, and the run logs one warning with the count — Kalshi does list snapshot-style markets ("on <date>"), the live scanner cannot tell them apart from cumulative ones by price, and this counter is the only signal that the title grouping admitted such a pair. Existing backtest caches need no refresh.
 - **Not updated.** `kalshi_bot_flowchart.pdf` predates this change (it shows the old `|pA − pB|` filter) and has not been regenerated; `BUG_SWEEP_FINDINGS.md` is a dated record and is left as-is.
-- **Next step (deferred).** Calibrate `k` from settled history instead of setting it by hand: a backtest override flag, an empirical comparison of the realised in-between rate against the market-implied gap per gap-size bucket, and an optional sweep reporting equity curve and drawdown per `k`. Fractional-contract sizing remains deferred as well.
+- **Calibrating `k` from settled history (shipped 2026-09).** `backtest.py --interval-discount K` overrides `k` for one backtest run (the live bot is untouched — it never passes an override, so it always reads the `config.py` constant); the backtest also measures the *empirical* `k` — the realised in-between rate divided by the mean market-implied gap, pooled and per deadline-gap bucket — logs it, and reports it in the dashboard's new "Interval Discount (k) Calibration" section, which also lets you switch the equity curve between every `k` in the swept grid (`--no-sweep` to skip the extra re-simulation passes). This is a recommendation only: nothing writes the measured value back to `config.py`. Fractional-contract sizing remains deferred.
 
 ---
 
@@ -113,14 +113,15 @@ main.py
 backtest.py (CLI)
   ├─ historical.build_historical_client()    — prod API client for archives
   ├─ historical.build_prod_live_client()     — prod API client for recent data
-  ├─ backtester.run_backtest()
-  │    ├─ historical.fetch_all_settled_markets() — market metadata
-  │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
-  │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers)
-  │    ├─ _find_entry()                          — first tradeable Monday per pair
-  │    ├─ Kelly sizing + P&L from outcomes
-  │    └─ _build_equity_curve()                 — daily portfolio value
-  └─ dashboard.generate_dashboard()         — write HTML report
+  ├─ backtester.run_backtest_sweep()         — run_backtest() is the plain two-tuple wrapper other callers use
+  │    ├─ _prepare_entries()                      — k-independent; runs once no matter how many k's are simulated
+  │    │    ├─ historical.fetch_all_settled_markets() — market metadata
+  │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
+  │    │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers)
+  │    │    └─ _find_entry()                          — first tradeable Monday per pair
+  │    ├─ _interval_calibration()                 — empirical k_hat, once, from the k-independent entries
+  │    └─ _simulate_at_discount()  — once per swept k: Kelly gate, dedup, P&L from outcomes, _build_equity_curve()
+  └─ dashboard.generate_dashboard()          — write HTML report, incl. the k-selector section
 ```
 
 ---
@@ -141,8 +142,8 @@ backtest.py (CLI)
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
 | `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester (candlesticks are fetched in parallel across tickers and cached per ticker, so workers never share a cache file and a repeat run re-reads them from disk). |
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve. |
-| `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, calibration analysis, trade diagnostics, and an S&P 500 benchmark comparison. |
-| `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments, builds the historical API clients, calls `backtester.run_backtest()` then `dashboard.generate_dashboard()`, and logs a summary. |
+| `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, trade diagnostics, and an S&P 500 benchmark comparison. |
+| `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount` and `--no-sweep`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
 | `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Never imported by the pipeline. |
 
 ### Order API version
@@ -305,16 +306,28 @@ Options:
 python3 -m kalshi_betting.backtest --start-date 2023-01-01 --balance 50000
 python3 -m kalshi_betting.backtest --no-cache   # rebuild the assembled market list
 python3 -m kalshi_betting.backtest --max-horizon-days 14
+python3 -m kalshi_betting.backtest --interval-discount 0.60   # override k for this run only
+python3 -m kalshi_betting.backtest --no-sweep   # skip the k-grid re-simulation (single-point dashboard selector)
 ```
 
 `--start-date` should predate the Kalshi archive cutoff. Markets that settled
 after the cutoff have no historical candlestick data, so a window starting after
 it produces no trades regardless of how many pairs it finds.
 
-**Feasibility pre-check (BS-11).** Before any network call, `run_backtest()`
+`--interval-discount K` (`0 <= K <= 1`) overrides the time-series interval
+discount `k` for this backtest run only — it never reaches live trading, which
+always reads `config.TIME_SERIES_INTERVAL_PROB_DISCOUNT`. Omit it (the
+default) to run at the configured value. `--no-sweep` skips the extra
+re-simulation across `config.INTERVAL_DISCOUNT_SWEEP`; the empirical-`k`
+calibration measurement and its log/dashboard report are unaffected by either
+flag — see the sizing bullet under [Strategy change (2026-09)](#strategy-change-2026-09)
+and CLAUDE.md for the full mechanism.
+
+**Feasibility pre-check (BS-11).** Before any network call, `_prepare_entries()`
+— the preparation step shared by `run_backtest()` and `run_backtest_sweep()` —
 checks whether the `[--start-date, today]` window contains at least one
 Monday-09:00-UTC entry checkpoint (the only time the replay ever enters a
-trade). If not, it logs a warning and returns the same empty result the
+trade). If not, it logs a warning and the run returns the same empty result the
 zero-trade path already produces — instead of spending minutes fetching
 millions of settled-market records into a cache that was always going to
 produce zero trades. `historical.py` separately warns (without aborting) when

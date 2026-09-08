@@ -102,8 +102,12 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # market overstates it by a quarter; prices will converge by 25%". It is an
 # operator-tunable ESTIMATE, not a measured quantity: at 1.0 (take the market at
 # face value) the Kelly fraction is <= 0 for every candidate and the strategy
-# never fires; smaller values size more aggressively. Calibrating it from the
-# backtester is a deferred follow-up (see CLAUDE.md, "Strategy change (2026-09)").
+# never fires; smaller values size more aggressively. Measure it against
+# settled history with `backtest.py --interval-discount K` (overrides k for
+# that backtest run only; this constant is what live sizing always reads) and
+# read the dashboard's "Interval Discount (k) Calibration" section, or the
+# calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
+# calibration (2026-09 follow-up)" for the full mechanism.
 TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 
 # Grid of k values backtester.run_backtest_sweep() re-simulates so the dashboard
