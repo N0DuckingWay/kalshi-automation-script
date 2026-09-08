@@ -19,15 +19,17 @@ Dependencies:
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
-    SETTLED_PREFILTER_CACHE_TAG and TIME_SERIES_INTERVAL_PROB_DISCOUNT from
+    SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS and
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT from
     config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py. Also
     depends on pandas (external) for the equity-curve DataFrame. Does NOT
     import strategy.py — Kelly sizing and portfolio selection are
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
-    parity. Exports BacktestTrade and SweepPoint (BacktestTrade is consumed by
-    dashboard.py) and run_backtest() (called by backtest.py).
+    parity. Exports BacktestTrade, SweepPoint, IntervalCalibrationBucket and
+    IntervalCalibration (BacktestTrade is consumed by dashboard.py) and
+    run_backtest() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -60,6 +62,15 @@ Notes:
     with the resolved discount. That split exists so one preparation pass can
     feed many discounts; run_backtest() calls the tail once with k=None, which
     config.time_series_profit_prob resolves to the live sizer's constant.
+
+    _interval_calibration() measures the EMPIRICAL discount from the same
+    k-independent prologue output — the realised in-between rate divided by
+    the mean market-implied gap, pooled and per deadline-gap band — and
+    _log_interval_calibration() reports it. Because it reads _prepare_entries()
+    rather than _simulate_at_discount(), it is never filtered by the Kelly
+    gate, which is what stops the estimate confirming whatever k produced it.
+    It is a RECOMMENDATION ONLY: nothing here writes config.py, and live
+    sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     Before grouping, _prepare_entries() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
@@ -106,6 +117,7 @@ from .config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG,
+    SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -122,6 +134,28 @@ from .scanner import leg_sides, normalize_title
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
 _DAY_SECONDS = 86_400
+
+# Deadline-gap bands the interval-discount calibration report groups its
+# candidates into, as inclusive (lo, hi) day counts; the row label is derived
+# from the pair, so the numbers exist exactly once. Reporting only — nothing
+# sizes, prices or filters on these bands.
+#
+# The edges come from config wherever config defines one, so a band can never
+# straddle the price tier it is labelled with: the short tier ends at
+# SHORT_DEADLINE_GAP_DAYS and _find_entry rejects any pair beyond
+# MAX_DEADLINE_GAP_DAYS, so every band's tier is min_price_diff_for_gap of its
+# own upper edge. The short tier is split at 7 days purely so the report can
+# show whether the empirical discount drifts WITHIN a tier — one row per tier
+# could not reveal that.
+_CALIBRATION_GAP_BANDS: tuple[tuple[int, int], ...] = (
+    (0, 7),
+    (8, SHORT_DEADLINE_GAP_DAYS),
+    (SHORT_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS),
+)
+
+# Label of the calibration's all-bands row. Not a gap band, so it carries no
+# single price tier (see IntervalCalibrationBucket.tier).
+_CALIBRATION_POOLED_LABEL = "POOLED"
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
@@ -267,6 +301,100 @@ class SweepPoint:
     k: float
     trades: list[BacktestTrade]
     equity_df: pd.DataFrame
+
+
+@dataclass
+class IntervalCalibrationBucket:
+    """
+    One row of the interval-discount calibration report.
+
+    A bucket is either one deadline-gap band from _CALIBRATION_GAP_BANDS or
+    the pooled all-bands row. Every field is a measurement over the candidates
+    in that bucket; nothing here is written back to config.py.
+
+    Attributes:
+        label (str): Row label — "<lo>-<hi>d" for a gap band, or
+            _CALIBRATION_POOLED_LABEL ("POOLED") for the all-bands row.
+        tier (float): The minimum YES-gap tier config.min_price_diff_for_gap
+            returns for this band (0.15 or 0.30). The pooled row spans every
+            band and therefore has no single tier: it carries 0.0, which the
+            report renders as "-". Read `tier <= 0` as "not a single band",
+            never as a real threshold.
+        n (int): Candidates in the bucket. Can be 0 on the pooled row when
+            every time-series candidate was a premise violation (empty gap
+            bands are omitted from IntervalCalibration.buckets entirely).
+        realised_rate (float): Fraction of the bucket that actually settled
+            in-between (earlier NO, later YES) — the event the time-series bet
+            loses on. 0.0 when n is 0.
+        mean_implied (float): Mean market-implied in-between mass (pB - pA) at
+            entry across the bucket. 0.0 when n is 0.
+        empirical_k (float | None): realised_rate / mean_implied — the
+            fraction of the market-implied in-between mass that actually
+            materialized, i.e. the empirical counterpart of
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. None when mean_implied
+            is not positive (including the n == 0 case), since the ratio is
+            undefined rather than zero.
+    """
+    label: str
+    tier: float
+    n: int
+    realised_rate: float
+    mean_implied: float
+    empirical_k: float | None
+
+
+@dataclass
+class IntervalCalibration:
+    """
+    The empirical interval-discount report for one backtest window.
+
+    Produced by _interval_calibration() from _prepare_entries()' output, so it
+    is INDEPENDENT of the interval discount k: it is computed once and is
+    valid for every point of a sweep, which is why it hangs off BacktestSweep
+    rather than off any single SweepPoint.
+
+    Attributes:
+        pooled (IntervalCalibrationBucket): The all-bands row, labelled
+            _CALIBRATION_POOLED_LABEL. Its empirical_k is the single number
+            the report recommends comparing against
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+        buckets (list[IntervalCalibrationBucket]): One row per deadline-gap
+            band that had at least one candidate, in ascending gap order.
+            Empty bands are omitted rather than reported as zero-width rows.
+        excluded_premise_violations (int): Time-series candidates dropped from
+            the denominator because they settled earlier-YES/later-NO, which
+            is impossible for a cumulative-deadline pair. This is NOT the same
+            number as _simulate_at_discount()'s `premise_violations` counter:
+            that one is k-dependent (it counts only candidates that already
+            passed the Kelly gate) while this one counts over the whole
+            k-independent population, so this is generally the LARGER of the
+            two. Neither is a bug in the other — see _interval_calibration().
+    """
+    pooled: IntervalCalibrationBucket
+    buckets: list[IntervalCalibrationBucket]
+    excluded_premise_violations: int
+
+
+@dataclass
+class _TimeSeriesOutcome:
+    """
+    One time-series candidate reduced to the three numbers calibration needs.
+
+    Internal to _interval_calibration()/_calibration_bucket(); never returned
+    to a caller.
+
+    Attributes:
+        gap_days (int | None): Deadline gap the pair's price tier was selected
+            from, carried out of _find_entry. None only if a time-series entry
+            somehow reached here without one, in which case the observation
+            still counts in the pooled row but lands in no gap band.
+        implied (float): Market-implied in-between mass at entry, pB - pA.
+        in_between (bool): Whether the pair actually settled in-between
+            (earlier NO, later YES) — the time-series bet's only loss cell.
+    """
+    gap_days: int | None
+    implied: float
+    in_between: bool
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -1680,6 +1808,238 @@ def _simulate_at_discount(
 
     equity_df = _build_equity_curve(trades, start_date, initial_balance)
     return SweepPoint(k=effective_k, trades=trades, equity_df=equity_df)
+
+
+# ─── Interval-discount calibration ────────────────────────────────────────────
+
+def _calibration_bucket(
+    label: str,
+    tier: float,
+    observations: list[_TimeSeriesOutcome],
+) -> IntervalCalibrationBucket:
+    """
+    Reduce a set of time-series observations to one calibration report row.
+
+    Computes the realised in-between rate, the mean market-implied in-between
+    mass, and their ratio — the empirical interval discount k_hat, i.e. how
+    much of the mass the market priced actually materialized.
+
+    Args:
+        label (str): Row label for the bucket ("0-7d", "POOLED", ...).
+        tier (float): Price tier for the bucket, or 0.0 for the pooled row,
+            which spans every tier (see IntervalCalibrationBucket.tier).
+        observations (list[_TimeSeriesOutcome]): The bucket's candidates. May
+            be empty, which yields a zeroed row rather than a division error.
+
+    Returns:
+        IntervalCalibrationBucket: The row. empirical_k is None whenever
+            mean_implied is not strictly positive — with a zero (or, from
+            reporting-only clamping, negative) implied mass the ratio is
+            undefined, and reporting it as 0.0 would read as "the market
+            overstated everything" rather than "not measurable".
+    """
+    n = len(observations)
+    if n == 0:
+        # Reachable only for the pooled row (empty gap bands are dropped by
+        # the caller), when every time-series candidate was a premise
+        # violation. Report the shape rather than dividing by zero.
+        return IntervalCalibrationBucket(
+            label=label, tier=tier, n=0,
+            realised_rate=0.0, mean_implied=0.0, empirical_k=None,
+        )
+
+    realised_rate = sum(1 for o in observations if o.in_between) / n
+    mean_implied  = sum(o.implied for o in observations) / n
+    empirical_k   = realised_rate / mean_implied if mean_implied > 0 else None
+    return IntervalCalibrationBucket(
+        label=label, tier=tier, n=n,
+        realised_rate=realised_rate, mean_implied=mean_implied,
+        empirical_k=empirical_k,
+    )
+
+
+def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None:
+    """
+    Measure the empirical interval discount k over the prepared entries.
+
+    The time-series bet loses exactly one settlement cell: the event first
+    happens BETWEEN the two deadlines (earlier NO, later YES). The market
+    prices that cell at pB - pA; config.time_series_profit_prob believes only
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT of it. This function measures the
+    fraction that actually materialized:
+
+        k_hat = P(earlier NO, later YES) / mean(pB - pA)
+
+    pooled and per deadline-gap band, so an operator can compare the hand-set
+    constant against what the history did.
+
+    The population is deliberately k-INDEPENDENT: it reads _prepare_entries()'
+    output directly, NOT _simulate_at_discount()'s surviving candidates, so it
+    is NOT filtered by the Kelly gate. Filtering by Kelly would make the
+    estimate circular — the in-between rate would be measured only among the
+    pairs the CURRENT k already liked, so a wrong k would confirm itself.
+    Being k-independent also means one computation is valid for every point of
+    a sweep, which is why BacktestSweep holds one of these rather than each
+    SweepPoint holding its own.
+
+    Two properties of the population to keep in mind when reading the number:
+
+      - Premise violations (earlier YES, later NO) are excluded from the
+        denominator entirely. Such a pair is not a cumulative-deadline pair at
+        all, so it is neither an in-between event nor a valid non-event, and
+        leaving it in would bias the rate in an arbitrary direction. They are
+        counted separately on the result. That count is NOT the same quantity
+        as _simulate_at_discount()'s `premise_violations`, whose WARNING is
+        emitted per simulated discount: that counter sits AFTER the Kelly
+        gate, so it sees only Kelly-passing candidates and is generally
+        SMALLER than this one. Two different populations, two different names,
+        neither a bug in the other.
+      - It is conditional on the strategy's own entry filters — only pairs
+        whose gap already cleared its tier ever produced an entry. That is a
+        feature, not a sampling flaw: it is exactly the conditional
+        distribution the live sizer faces, so k_hat is the right number to
+        compare TIME_SERIES_INTERVAL_PROB_DISCOUNT against.
+
+    Args:
+        raw_entries (list[dict]): _prepare_entries() output — one record per
+            pair that produced an entry. Same-title records are ignored: they
+            price on the fixed co-resolution prior and have no in-between cell
+            or deadline gap at all.
+
+    Returns:
+        IntervalCalibration | None: The report, or None when there is nothing
+            to report — no time-series candidate produced a usable
+            observation AND none was excluded as a premise violation (the
+            codebase's return-None-on-nothing-to-say convention, which lets
+            the caller stay silent rather than logging an empty table).
+    """
+    observations: list[_TimeSeriesOutcome] = []
+    excluded = 0
+
+    for rec in raw_entries:
+        # Same-title pairs have no in-between cell and no deadline gap — the
+        # discount being calibrated does not appear in their model at all.
+        if rec["pair_type"] != "time_series":
+            continue
+
+        entry = rec["entry"]
+        mA, mB = entry["mA"], entry["mB"]
+        outcome_a = mA.get("result", "")
+        outcome_b = mB.get("result", "")
+
+        # A missing or non-binary settlement cannot be classified as
+        # in-between or not, so it can be neither numerator nor denominator.
+        if outcome_a not in ("yes", "no") or outcome_b not in ("yes", "no"):
+            continue
+
+        # Earlier YES with later NO is impossible for a cumulative-deadline
+        # pair: the grouping admitted a non-cumulative one. Excluded from the
+        # denominator and counted for the report.
+        if outcome_a == "yes" and outcome_b == "no":
+            excluded += 1
+            continue
+
+        observations.append(_TimeSeriesOutcome(
+            # Carried out of _find_entry rather than recomputed, so a
+            # candidate is always bucketed under the very gap its price tier
+            # and the MAX_DEADLINE_GAP_DAYS cutoff were applied on.
+            gap_days=entry["gap_days"],
+            implied=entry["pB"] - entry["pA"],
+            in_between=(outcome_a == "no" and outcome_b == "yes"),
+        ))
+
+    if not observations and not excluded:
+        # Nothing measurable and nothing excluded — a same-title-only (or
+        # empty) run. None keeps the caller silent instead of printing an
+        # all-zero table.
+        return None
+
+    buckets: list[IntervalCalibrationBucket] = []
+    for lo, hi in _CALIBRATION_GAP_BANDS:
+        band = [o for o in observations
+                if o.gap_days is not None and lo <= o.gap_days <= hi]
+        if not band:
+            # Omit empty bands rather than emitting an all-zero row.
+            continue
+        buckets.append(_calibration_bucket(
+            f"{lo}-{hi}d",
+            # Never hardcode the 0.15/0.30 tiers: read them from the same
+            # helper _find_entry and the live scanner select with. A band
+            # never straddles the tier boundary (see _CALIBRATION_GAP_BANDS),
+            # so its upper edge names the whole band's tier.
+            min_price_diff_for_gap(hi),
+            band,
+        ))
+
+    # 0.0 tier: the pooled row spans every band, so it has no single tier.
+    pooled = _calibration_bucket(_CALIBRATION_POOLED_LABEL, 0.0, observations)
+    return IntervalCalibration(
+        pooled=pooled,
+        buckets=buckets,
+        excluded_premise_violations=excluded,
+    )
+
+
+def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
+    """
+    Log the interval-discount calibration report.
+
+    Split from _interval_calibration() the same way scanner.check_shard_coverage
+    (pure comparison) is split from main._log_shard_coverage (decides how
+    loudly to report): the measurement stays testable and reusable without log
+    noise, and this decides the presentation. Follows the file's summary-line
+    idiom — silent when there is nothing to report (calibration is None, i.e.
+    no time-series candidate), and the premise-violation line is silent at
+    zero.
+
+    The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
+    config.py, and the live sizer keeps reading
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT regardless of what this prints;
+    acting on it is a deliberate human edit.
+
+    Args:
+        calibration (IntervalCalibration | None): _interval_calibration()'s
+            result. None logs nothing at all.
+
+    Returns:
+        None
+    """
+    if calibration is None:
+        return
+
+    logging.info(
+        "Interval-discount calibration (k_hat = realised in-between rate / "
+        "market-implied gap)"
+    )
+    logging.info("  %-14s%4s%9s%12s%11s%10s",
+                 "bucket", "tier", "n", "realised", "implied", "k_hat")
+
+    for b in [*calibration.buckets, calibration.pooled]:
+        # tier <= 0 marks the pooled row, which spans every tier and so has no
+        # single one to print (IntervalCalibrationBucket.tier).
+        tier_txt = "-" if b.tier <= 0 else f"{b.tier:.2f}"
+        k_txt = "-" if b.empirical_k is None else f"{b.empirical_k:.3f}"
+        logging.info("  %-14s%4s%9d%12.4f%11.4f%10s",
+                     b.label, tier_txt, b.n, b.realised_rate, b.mean_implied, k_txt)
+
+    pooled_k = calibration.pooled.empirical_k
+    logging.info(
+        "  Configured k = %.3f (config.TIME_SERIES_INTERVAL_PROB_DISCOUNT) | "
+        "pooled empirical k_hat = %s",
+        # The CONFIG constant, not any sweep point's override: this line
+        # compares the measurement against what live sizing actually reads.
+        TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+        "-" if pooled_k is None else f"{pooled_k:.3f}",
+    )
+    logging.info("  Recommendation only — config.py is never written by the backtester.")
+
+    if calibration.excluded_premise_violations:
+        # Summary-line idiom: silent at zero.
+        logging.info(
+            "  Excluded %d premise violation(s) (earlier YES / later NO) from "
+            "the denominator.",
+            calibration.excluded_premise_violations,
+        )
 
 
 def run_backtest(

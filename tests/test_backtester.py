@@ -20,6 +20,8 @@ from kalshi_betting.backtester import (
     _find_entry,
     _group_by_exact_title,
     _group_by_normalized_title,
+    _interval_calibration,
+    _log_interval_calibration,
     _pair_key,
     _parse_iso_date,
     _parse_iso_datetime,
@@ -32,6 +34,7 @@ from kalshi_betting.config import (
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
+    min_price_diff_for_gap,
     time_series_profit_prob,
 )
 from kalshi_betting.scanner import CandidatePair
@@ -1857,3 +1860,261 @@ class TestRunBacktestTimeSeriesFlow:
         assert backtester._prepare_entries(
             MagicMock(), MagicMock(), today + timedelta(days=1), True, None
         ) is None
+
+    def _prepared(self, monkeypatch, result_a, result_b, eb_yes=None, eb_no=None):
+        # _run installs the fixture's fetch monkeypatches and leaves them in
+        # force, so the prologue below replays exactly the same markets and
+        # candles run_backtest just consumed (the idiom
+        # test_default_k_equals_explicit_config_k already uses).
+        self._run(monkeypatch, result_a, result_b, eb_yes=eb_yes, eb_no=eb_no)
+        return backtester._prepare_entries(
+            MagicMock(), MagicMock(), date(2026, 1, 1), True, None
+        )
+
+    def test_calibration_is_k_independent(self, monkeypatch):
+        # The in-between cell: this pair is exactly what the discount models.
+        raw = self._prepared(monkeypatch, "no", "yes")
+
+        # Simulating at two very different discounts must not disturb the
+        # measurement — the population comes from the k-independent prologue,
+        # never from a simulation's surviving candidates.
+        before = _interval_calibration(raw)
+        backtester._simulate_at_discount(raw, date(2026, 1, 1), 10_000.0, k=0.40)
+        backtester._simulate_at_discount(raw, date(2026, 1, 1), 10_000.0, k=1.00)
+        after = _interval_calibration(raw)
+        assert before == after
+
+    def test_calibration_counts_a_pair_the_kelly_gate_rejects(self, monkeypatch):
+        # k = 1.00 takes the market at face value, so Kelly is <= 0 and the
+        # simulation enters nothing — yet the pair still settled in-between and
+        # must stay in the denominator. Filtering the population by Kelly is
+        # what would make the estimate circular.
+        raw = self._prepared(monkeypatch, "no", "yes")
+        at_default = backtester._simulate_at_discount(raw, date(2026, 1, 1), 10_000.0)
+        at_face_value = backtester._simulate_at_discount(
+            raw, date(2026, 1, 1), 10_000.0, k=1.00)
+        assert len(at_default.trades) == 1
+        assert at_face_value.trades == []
+
+        calib = _interval_calibration(raw)
+        assert calib.pooled.n == 1
+        assert calib.pooled.realised_rate == pytest.approx(1.0)
+        assert calib.pooled.mean_implied == pytest.approx(self._PB - self._PA)
+
+    def test_calibration_buckets_the_fixture_under_its_own_tier(self, monkeypatch):
+        # 13-day gap => the 8-15d band, at the short tier _find_entry filtered
+        # it under. The gap rides out of _find_entry, so the report can never
+        # bucket a pair under a gap it was not actually filtered by.
+        raw = self._prepared(monkeypatch, "no", "no")
+        calib = _interval_calibration(raw)
+        assert [b.label for b in calib.buckets] == ["8-15d"]
+        assert calib.buckets[0].tier == min_price_diff_for_gap(13)
+        assert calib.buckets[0].n == 1
+        assert calib.buckets[0].realised_rate == pytest.approx(0.0)
+
+    def test_premise_count_is_larger_than_the_k_dependent_warning(
+        self, monkeypatch, caplog,
+    ):
+        # The two premise-violation counts are different quantities. The wide
+        # later book (nB 0.50) drives Kelly negative, so _simulate_at_discount
+        # never reaches its premise check and its WARNING stays silent — while
+        # the k-independent calibration still excludes and counts the pair.
+        with caplog.at_level("WARNING"):
+            raw = self._prepared(monkeypatch, "yes", "no", eb_no=0.50)
+        assert not any("cumulative-deadline premise" in r.getMessage()
+                       for r in caplog.records)
+
+        calib = _interval_calibration(raw)
+        assert calib.excluded_premise_violations == 1
+        # Excluded from the denominator entirely — neither an in-between event
+        # nor a valid non-event.
+        assert calib.pooled.n == 0
+        assert calib.pooled.empirical_k is None
+        assert calib.buckets == []
+
+
+def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series"):
+    """Build one _prepare_entries record shaped as _interval_calibration reads it."""
+    return {
+        "pair_type": pair_type,
+        "canon": "canon",
+        "group_key": "group",
+        "entry": {
+            "entry_date": date(2026, 1, 5),
+            "pA": pA, "pB": pB, "nA": 1.0 - pA, "nB": 1.0 - pB,
+            "mA": {"ticker": "A", "result": result_a},
+            "mB": {"ticker": "B", "result": result_b},
+            "gap_days": gap_days,
+        },
+    }
+
+
+class TestIntervalCalibration:
+    """_interval_calibration: the k-independent empirical-discount measurement."""
+
+    def test_returns_none_without_time_series_candidates(self):
+        # Summary-line idiom: nothing to say, so the caller stays silent
+        # rather than logging an all-zero table.
+        assert _interval_calibration([]) is None
+        assert _interval_calibration([
+            _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title"),
+        ]) is None
+
+    def test_non_binary_outcomes_are_ignored_entirely(self):
+        # An unsettled or voided leg can be classified neither as in-between
+        # nor as a valid non-event, so it is neither numerator nor denominator
+        # nor a premise violation.
+        assert _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "", "yes"),
+            _cal_entry(3, 0.10, 0.70, "no", "void"),
+        ]) is None
+
+    def test_known_arithmetic_over_one_band(self):
+        # Four candidates, all with gaps inside the 0-7d band. Implied gaps
+        # 0.60 / 0.40 / 0.50 / 0.50 => mean 0.50; exactly one settled
+        # in-between (earlier NO, later YES) => realised rate 0.25; so the
+        # empirical discount is 0.25 / 0.50 = 0.50 — the market priced twice
+        # the in-between mass that materialized.
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes"),   # in-between  (0.60)
+            _cal_entry(5, 0.20, 0.60, "yes", "yes"),  # by A        (0.40)
+            _cal_entry(0, 0.25, 0.75, "no", "no"),    # never by B  (0.50)
+            _cal_entry(7, 0.30, 0.80, "no", "no"),    # never by B  (0.50)
+        ])
+        assert calib.excluded_premise_violations == 0
+        assert [b.label for b in calib.buckets] == ["0-7d"]
+
+        band = calib.buckets[0]
+        assert band.n == 4
+        assert band.realised_rate == pytest.approx(0.25)
+        assert band.mean_implied == pytest.approx(0.50)
+        assert band.empirical_k == pytest.approx(0.50)
+        assert band.tier == min_price_diff_for_gap(7)
+
+        # One band only, so pooled repeats it — with no single tier of its own
+        pooled = calib.pooled
+        assert pooled.label == "POOLED"
+        assert (pooled.n, pooled.realised_rate) == (4, pytest.approx(0.25))
+        assert pooled.empirical_k == pytest.approx(0.50)
+        assert pooled.tier == 0.0
+
+    def test_bands_are_split_at_the_config_tier_boundary(self):
+        # 0-7d and 8-15d share the short tier; 16-30d takes the long one. The
+        # tiers come from config.min_price_diff_for_gap, never a literal.
+        calib = _interval_calibration([
+            _cal_entry(7, 0.10, 0.30, "no", "no"),
+            _cal_entry(8, 0.10, 0.30, "no", "no"),
+            _cal_entry(15, 0.10, 0.30, "no", "no"),
+            _cal_entry(16, 0.10, 0.50, "no", "no"),
+            _cal_entry(MAX_DEADLINE_GAP_DAYS, 0.10, 0.50, "no", "no"),
+        ])
+        assert [(b.label, b.n, b.tier) for b in calib.buckets] == [
+            ("0-7d", 1, min_price_diff_for_gap(7)),
+            ("8-15d", 2, min_price_diff_for_gap(15)),
+            ("16-30d", 2, min_price_diff_for_gap(MAX_DEADLINE_GAP_DAYS)),
+        ]
+        assert calib.buckets[0].tier == calib.buckets[1].tier   # same tier
+        assert calib.buckets[2].tier > calib.buckets[1].tier    # long-gap tier
+        assert calib.pooled.n == 5
+
+    def test_empty_bands_are_omitted(self):
+        calib = _interval_calibration([_cal_entry(20, 0.10, 0.50, "no", "yes")])
+        assert [b.label for b in calib.buckets] == ["16-30d"]
+        assert calib.pooled.n == 1
+        assert calib.pooled.realised_rate == pytest.approx(1.0)
+
+    def test_premise_violations_leave_the_denominator(self):
+        # Earlier YES with later NO is not a cumulative-deadline pair at all:
+        # counted separately, and absent from both numerator and denominator.
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes"),
+            _cal_entry(3, 0.10, 0.70, "yes", "no"),
+            _cal_entry(3, 0.10, 0.70, "yes", "no"),
+        ])
+        assert calib.excluded_premise_violations == 2
+        assert calib.pooled.n == 1
+        assert calib.pooled.realised_rate == pytest.approx(1.0)
+
+    def test_all_premise_violations_still_reports_the_count(self):
+        # Nothing measurable, but the exclusion count is the whole diagnostic:
+        # every time-series pair the grouping found was non-cumulative.
+        calib = _interval_calibration([_cal_entry(3, 0.10, 0.70, "yes", "no")])
+        assert calib.excluded_premise_violations == 1
+        assert calib.buckets == []
+        assert (calib.pooled.n, calib.pooled.realised_rate) == (0, 0.0)
+        assert calib.pooled.mean_implied == 0.0
+        assert calib.pooled.empirical_k is None
+
+    def test_non_positive_implied_mass_yields_no_ratio(self):
+        # Undefined, not zero: reporting 0.0 would read as "the market
+        # overstated everything" rather than "not measurable". Unreachable
+        # from a real entry (the tier requires pB - pA >= 0.15), but reporting
+        # code must not divide by zero.
+        calib = _interval_calibration([_cal_entry(3, 0.50, 0.50, "no", "no")])
+        assert calib.pooled.n == 1
+        assert calib.pooled.mean_implied == pytest.approx(0.0)
+        assert calib.pooled.empirical_k is None
+
+    def test_gap_days_none_still_counts_in_pooled(self):
+        # Defensive: a time-series entry always carries a gap, but if one ever
+        # arrived without it the observation must not vanish from the pooled
+        # measurement just because it fits no band.
+        calib = _interval_calibration([_cal_entry(None, 0.10, 0.70, "no", "yes")])
+        assert calib.buckets == []
+        assert calib.pooled.n == 1
+        assert calib.pooled.empirical_k == pytest.approx(1.0 / 0.60)
+
+
+class TestLogIntervalCalibration:
+    """The report's presentation: silent when there is nothing to say."""
+
+    @staticmethod
+    def _messages(caplog):
+        return [r.getMessage() for r in caplog.records]
+
+    def test_none_logs_nothing(self, caplog):
+        with caplog.at_level("INFO"):
+            _log_interval_calibration(None)
+        assert caplog.records == []
+
+    def test_report_lines(self, caplog):
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes"),
+            _cal_entry(5, 0.20, 0.60, "yes", "yes"),
+            _cal_entry(0, 0.25, 0.75, "no", "no"),
+            _cal_entry(7, 0.30, 0.80, "no", "no"),
+        ])
+        with caplog.at_level("INFO"):
+            _log_interval_calibration(calib)
+        msgs = self._messages(caplog)
+
+        assert msgs[0].startswith("Interval-discount calibration")
+        assert "k_hat" in msgs[1] and "realised" in msgs[1] and "implied" in msgs[1]
+        # One row per band, then the pooled row
+        assert msgs[2].split() == ["0-7d", "0.15", "4", "0.2500", "0.5000", "0.500"]
+        assert msgs[3].split() == ["POOLED", "-", "4", "0.2500", "0.5000", "0.500"]
+        assert f"{TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in msgs[4]
+        assert "pooled empirical k_hat = 0.500" in msgs[4]
+        # The standing rule: this is advice, not an edit
+        assert any("config.py is never written" in m for m in msgs)
+        # Summary-line idiom: silent at zero exclusions
+        assert not any("premise violation" in m for m in msgs)
+
+    def test_premise_exclusions_are_reported_when_non_zero(self, caplog):
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes"),
+            _cal_entry(3, 0.10, 0.70, "yes", "no"),
+        ])
+        with caplog.at_level("INFO"):
+            _log_interval_calibration(calib)
+        excluded = [m for m in self._messages(caplog) if "premise violation" in m]
+        assert len(excluded) == 1
+        assert "Excluded 1 premise violation(s)" in excluded[0]
+
+    def test_unmeasurable_pooled_row_renders_a_dash(self, caplog):
+        calib = _interval_calibration([_cal_entry(3, 0.10, 0.70, "yes", "no")])
+        with caplog.at_level("INFO"):
+            _log_interval_calibration(calib)
+        msgs = self._messages(caplog)
+        assert msgs[2].split() == ["POOLED", "-", "0", "0.0000", "0.0000", "-"]
+        assert "pooled empirical k_hat = -" in msgs[3]
