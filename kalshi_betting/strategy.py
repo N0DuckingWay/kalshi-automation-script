@@ -8,17 +8,28 @@ Purpose:
     using the Kelly criterion, then selects a portfolio subset that fits within
     the available account balance. The Kelly fraction determines how much of the
     balance to allocate to each pair based on the implied edge and the probability
-    that the trade is profitable. Both time-series and same-title pairs use
-    different probability models to reflect how correlated their outcomes are.
+    that the trade is profitable. The two pair types use different probability
+    models: a same-title pair is a near-arbitrage priced on the fixed
+    SAME_TITLE_CO_RESOLVE_PROB co-resolution prior, while a time-series pair is
+    a directional bet (YES on the earlier contract, NO on the later) priced on
+    config.time_series_profit_prob — a discounted version of the market-implied
+    probability that the event first happens between the two deadlines, which
+    is the trade's single loss scenario.
 
 Dependencies:
-    Imports BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, and fee helpers from
-    config.py. Imports CandidatePair from scanner.py. Exports TradeSpec (consumed
-    by trader.py and reporter.py), compute_trade() and select_portfolio() (both
+    Imports BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, time_series_profit_prob
+    and the fee helpers from config.py. Imports CandidatePair, leg_prices and
+    leg_sides from scanner.py — leg_prices() is the only mapping from a pair's
+    four quoted prices to the two prices its legs actually cost, and every
+    cost, fee and payoff here is computed on those; leg_sides() only names
+    the sides in the log line. Exports TradeSpec (consumed by
+    trader.py and reporter.py), compute_trade() and select_portfolio() (both
     called by main.py). backtester.py does NOT import this module — it
     re-implements Kelly sizing and portfolio selection inline against the same
-    config.py constants and fee helpers, so a change to either sizing formula
-    must be made in both places to keep live/backtest parity.
+    config.py constants, fee helpers and probability model, so a change to
+    either sizing formula must be made in both places to keep live/backtest
+    parity (the shared config.time_series_profit_prob is what keeps the
+    time-series probability itself from drifting).
 
 Notes:
     compute_trade() returns None for the ordinary no-edge/no-budget cases, but
@@ -26,58 +37,85 @@ Notes:
     returning None: a pair whose market_a or market_b has close_time=None. The
     scanner guarantees that can't happen for pairs it produced — only a
     CandidatePair built outside scanner.py (e.g. in a test) can carry one.
+
+    TradeSpec.cost_with_fees_a is always MARKET_A's leg cost and
+    cost_with_fees_b is MARKET_B's, whatever side each leg buys — the
+    collateral planner (trader._required_cents_by_shard) pairs them with
+    market_a/market_b.exchange_index. The trader submits the NO leg first
+    (market_a for same_title, market_b for time_series); that ordering lives
+    in trader._ordered_legs, not here.
 """
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact, fee_per_pair_approx
-from .scanner import CandidatePair
+from .config import (
+    BUDGET_FRACTION,
+    SAME_TITLE_CO_RESOLVE_PROB,
+    fee_leg_exact,
+    fee_per_pair_approx,
+    time_series_profit_prob,
+)
+from .scanner import CandidatePair, leg_prices, leg_sides
 
 
 @dataclass
 class TradeSpec:
     """
-    Fully computed trade specification for an arbitrage pair, ready for execution.
+    Fully computed trade specification for a candidate pair, ready for execution.
 
     Encodes both the trade parameters (contract counts, costs, payoff) and the
     Kelly-sizing metadata used to rank and select trades for the portfolio.
+    Throughout, "price_a"/"price_b" are the LEG prices from
+    scanner.leg_prices(pair): (nA, pB) for a same-title pair (NO on market_a,
+    YES on market_b) and (pA, nB) for a time-series pair (YES on market_a, NO on
+    market_b).
 
     Attributes:
-        pair (CandidatePair): The underlying arbitrage candidate this trade is based on.
-        x (int): Number of NO contracts to buy on market A. Always equals y.
-        y (int): Number of YES contracts to buy on market B. Always equals x.
-        total_cost (float): Total dollar cost of the contracts: x * (nA + pB).
+        pair (CandidatePair): The underlying candidate this trade is based on.
+        x (int): Number of contracts to buy on market A (NO for same_title, YES
+            for time_series — see scanner.leg_sides). Always equals y.
+        y (int): Number of contracts to buy on market B (YES for same_title, NO
+            for time_series). Always equals x.
+        total_cost (float): Total dollar cost of the contracts: x * (price_a + price_b).
             Excludes taker fees — used for reporting.
         total_cost_with_fees (float): total_cost plus the exact ceiling-rounded
             taker fee for both legs. This is the real cash the trade consumes at
             execution — select_portfolio() budgets against this value.
-        min_payoff (float): Guaranteed minimum dollar profit if the arbitrage holds,
-            net of exact ceiling-rounded taker fees on both legs:
-            x * (1 - nA - pB) - fee_leg_exact(x, nA) - fee_leg_exact(x, pB).
-            Always > 0 for trades that reach execution.
-        profit_ratio (float): Return on cost, net of the continuous fee
-            approximation: ((1 - nA - pB) - fee_per_pair_approx(nA, pB)) /
-            (nA + pB). This is "b" in the Kelly formula below (see
+        min_payoff (float): Dollar profit in a win scenario, net of exact
+            ceiling-rounded taker fees on both legs:
+            x * (1 - price_a - price_b) - fee_leg_exact(x, price_a) - fee_leg_exact(x, price_b).
+            For a same_title pair this is the profit floor whenever the two
+            questions co-resolve (both legs settle, one pays). For a time_series
+            pair it is the profit in EITHER win scenario — event by A's deadline
+            (YES-on-A pays) or never by B's (NO-on-B pays) — while the in-between
+            scenario (A=NO, B=YES) loses total_cost_with_fees in full. Always > 0
+            for trades that reach execution; the field name is kept for the
+            reporter/trader consumers.
+        profit_ratio (float): Return on cost in a win scenario, net of the
+            continuous fee approximation:
+            ((1 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)) /
+            (price_a + price_b). This is "b" in the Kelly formula below (see
             compute_trade()'s net_spread/profit_ratio computation).
         days_to_close (int): Calendar days until the later-closing market resolves. >= 1.
         monthly_profit_ratio (float): Profit ratio normalized to a 30-day period:
             profit_ratio * 30 / days_to_close. Used for portfolio ranking.
-        kelly_p (float): Probability of profit used in the Kelly formula. For time_series
-            pairs this is the independence-model estimate; for same_title it is the fixed
-            SAME_TITLE_CO_RESOLVE_PROB prior. Range: (0, 1).
+        kelly_p (float): Probability of profit used in the Kelly formula. For
+            time_series pairs this is config.time_series_profit_prob(pA, pB) —
+            one minus the discounted market-implied in-between probability; for
+            same_title it is the fixed SAME_TITLE_CO_RESOLVE_PROB prior. Range: (0, 1].
         kelly_fraction (float): Kelly fraction capped at BUDGET_FRACTION (20%). This is the
             fraction of account balance allocated to this trade.
-        cost_with_fees_a (float): Leg A's own cash requirement: x * nA + that leg's
-            exact ceiling-rounded taker fee (fee_leg_exact(x, nA)). Used by the collateral
-            transfer planner to fund leg A's exchange shard. Invariant:
-            cost_with_fees_a + cost_with_fees_b == total_cost_with_fees (same terms, same
-            fee calls). Defaults to 0.0 for TradeSpec constructions that don't populate it.
-        cost_with_fees_b (float): Leg B's own cash requirement: y * pB + that leg's
-            exact ceiling-rounded taker fee (fee_leg_exact(y, pB)). Used by the collateral
-            transfer planner to fund leg B's exchange shard. Invariant:
-            cost_with_fees_a + cost_with_fees_b == total_cost_with_fees (same terms, same
-            fee calls). Defaults to 0.0 for TradeSpec constructions that don't populate it.
+        cost_with_fees_a (float): MARKET_A's leg cash requirement, whatever side
+            that leg buys: x * price_a + that leg's exact ceiling-rounded taker fee
+            (fee_leg_exact(x, price_a)). Used by the collateral transfer planner to
+            fund market_a's exchange shard. Invariant: cost_with_fees_a +
+            cost_with_fees_b == total_cost_with_fees (same terms, same fee calls).
+            Defaults to 0.0 for TradeSpec constructions that don't populate it.
+        cost_with_fees_b (float): MARKET_B's leg cash requirement: y * price_b +
+            that leg's exact ceiling-rounded taker fee (fee_leg_exact(y, price_b)).
+            Used by the collateral transfer planner to fund market_b's exchange
+            shard. Same invariant and default as cost_with_fees_a.
     """
     pair: CandidatePair
     x: int
@@ -90,8 +128,9 @@ class TradeSpec:
     monthly_profit_ratio: float
     kelly_p: float            # probability of profit used in Kelly formula
     kelly_fraction: float     # capped Kelly fraction used for sizing
-    # Per-leg cash requirements, used by the collateral transfer planner to fund each
-    # leg's shard; invariant: cost_with_fees_a + cost_with_fees_b == total_cost_with_fees
+    # Per-MARKET cash requirements (market_a / market_b, whatever side each leg
+    # buys), used by the collateral transfer planner to fund each market's shard;
+    # invariant: cost_with_fees_a + cost_with_fees_b == total_cost_with_fees
     # (same terms, same fee calls). Defaulted so existing constructions don't break.
     cost_with_fees_a: float = 0.0
     cost_with_fees_b: float = 0.0
@@ -99,12 +138,28 @@ class TradeSpec:
 
 def _kelly_p(pair: CandidatePair) -> float:
     """
-    Probability that the pair results in a profit (i.e. NOT the A=YES, B=NO loss scenario).
+    Probability that the pair results in a profit, per the pair type's model.
 
-    time_series: p = 1 - pA*(1-pB) under independence. Markets ask about the same
-    underlying variable at different future times — they're correlated but A=YES does NOT
-    structurally guarantee B=YES (e.g. price snapshot markets, rate decisions per meeting).
-    Market prices are the best available signal for P(A=YES, B=NO).
+    time_series: p = config.time_series_profit_prob(pair.pA, pair.pB), i.e.
+    1 - k * (pB - pA) with k = TIME_SERIES_INTERVAL_PROB_DISCOUNT. The trade
+    (YES on the earlier contract, NO on the later) has three settlement cells:
+    event by A's deadline (A=YES, hence B=YES; YES-on-A pays), never by B's
+    (A=NO, B=NO; NO-on-B pays), and in between (A=NO, B=YES; total loss).
+    A=YES/B=NO is impossible for a cumulative-deadline pair. The YES-ask gap
+    pB - pA is the market-implied probability of the loss cell; the model
+    believes only the fraction k of it. At k = 1 (take the market at face
+    value) Kelly is <= 0 for every pair and nothing trades — the edge exists
+    only if the market systematically overstates the in-between probability.
+
+    Inputs after enrichment: pair.pA is the depth-weighted YES fill on A
+    (enrich_with_orderbook_prices writes the time-series leg prices back to
+    pA/nB) while pair.pB is still the scan-time best YES ask on B. A worse YES
+    fill therefore raises pA, which shrinks the modelled gap (raising p) and
+    shrinks the edge (raising the cost) together — a second-order effect that
+    moves in the conservative direction on the sizing that matters. The gap is
+    kept on YES asks (pB - pA) rather than on the executable spread because
+    the YES-ask gap is the smaller, more conservative estimate of the mass the
+    market assigns to the loss cell.
 
     same_title: p = SAME_TITLE_CO_RESOLVE_PROB — fixed prior for markets confirmed to ask
     the exact same question (matching event_title + title + subtitle, see scanner.pair_key).
@@ -119,48 +174,61 @@ def _kelly_p(pair: CandidatePair) -> float:
             inputs.
 
     Returns:
-        float: Probability of profit, in (0, 1), used as "p" in compute_trade()'s
+        float: Probability of profit, in (0, 1], used as "p" in compute_trade()'s
             Kelly formula.
     """
     if pair.pair_type == "time_series":
-        return 1.0 - pair.pA * (1.0 - pair.pB)
+        # Single shared definition of the time-series model — backtester and
+        # dashboard call the same helper so the three sizers cannot drift
+        return time_series_profit_prob(pair.pA, pair.pB)
     return SAME_TITLE_CO_RESOLVE_PROB
 
 
 def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     """
-    Compute a Kelly-sized trade specification for a guaranteed-arbitrage pair.
+    Compute a Kelly-sized trade specification for a candidate pair.
 
     Applies the Kelly criterion to determine the optimal fraction of the account
     balance to allocate, then derives the integer contract count and verifies that
-    the exact net profit (after ceiling-rounded per-leg fees) remains positive.
+    the exact win-scenario profit (after ceiling-rounded per-leg fees) remains
+    positive. All costs, fees and payoffs are computed on the LEG prices
+    (price_a, price_b) = scanner.leg_prices(pair): (nA, pB) for same_title,
+    (pA, nB) for time_series.
 
     Kelly formula used:
-        b = net_spread / (nA + pB)   [net profit per dollar risked]
-        f* = p - (1-p)/b             [optimal Kelly fraction]
+        b = net_spread / (price_a + price_b)   [net profit per dollar risked]
+        f* = p - (1-p)/b                        [optimal Kelly fraction]
         f_capped = min(BUDGET_FRACTION, f*)
 
-    Where net_spread = (1 − nA − pB) − fee_per_pair_approx(nA, pB).
+    Where net_spread = (1 − price_a − price_b) − fee_per_pair_approx(price_a, price_b)
+    and p comes from _kelly_p (the co-resolution prior for same_title; the
+    discounted in-between model for time_series). For a time-series pair the
+    result is a directional bet: f* is only positive when the modelled loss
+    probability k * (pB - pA) is small enough relative to b, and a wide book
+    (large price_a + price_b for the same YES-ask gap) drives it negative.
 
     Args:
-        pair (CandidatePair): The candidate arbitrage pair. Must have tradeable=True.
-            Uses pair.nA and pair.pB (depth-weighted fill prices from scanner.py)
-            and pair.max_contracts (qualifying order book depth, 0 = uncapped).
+        pair (CandidatePair): The candidate pair. Must have tradeable=True.
+            Uses the leg prices from scanner.leg_prices() (depth-weighted fill
+            prices after scanner.enrich_with_orderbook_prices), pair.pA/pair.pB
+            for the time-series probability model, and pair.max_contracts
+            (qualifying order book depth, 0 = uncapped).
         balance_cents (int): Current account balance in cents. Used to convert the
             Kelly fraction to a dollar budget for contract sizing.
 
     Returns:
         Optional[TradeSpec]: A fully specified trade including contract count n,
-            total cost, minimum guaranteed payoff, time-normalized monthly return,
-            Kelly metadata, and each leg's own fee-inclusive cash requirement
-            (cost_with_fees_a, cost_with_fees_b — used by the collateral transfer
-            planner to fund each leg's exchange shard). Returns None if:
+            total cost, win-scenario payoff (min_payoff), time-normalized monthly
+            return, Kelly metadata, and each market's own fee-inclusive cash
+            requirement (cost_with_fees_a for market_a, cost_with_fees_b for
+            market_b — used by the collateral transfer planner to fund each
+            leg's exchange shard). Returns None if:
             - The pair is not tradeable.
-            - The prices are out of the valid (0, 1) range.
+            - Either leg price is out of the valid (0, 1) range.
             - The net spread is zero or negative after fees.
             - The Kelly fraction is zero or negative (no edge).
             - The Kelly budget cannot afford a single contract pair.
-            - The exact minimum payoff at the computed n is zero or negative.
+            - The exact win-scenario payoff at the computed n is zero or negative.
 
     Raises:
         AttributeError/TypeError: If either market_a.close_time or
@@ -176,21 +244,23 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     if not pair.tradeable:
         return None
 
-    nA, pB = pair.nA, pair.pB
+    # The two prices the legs actually cost — which of the pair's four quotes
+    # they are depends on the pair type; leg_prices is the single source of truth
+    price_a, price_b = leg_prices(pair)
 
-    # Validate that both prices are in the open interval (0, 1).
+    # Validate that both leg prices are in the open interval (0, 1).
     # Edge cases at 0 or 1 indicate a settled market and would break the fee formula.
-    if pB <= 0.0 or pB >= 1.0 or nA <= 0.0 or nA >= 1.0:
+    if price_b <= 0.0 or price_b >= 1.0 or price_a <= 0.0 or price_a >= 1.0:
         return None
 
     # Subtract the continuous fee approximation from the gross spread to get the
     # net edge. A zero or negative net_spread means the trade costs more than it pays.
-    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
     if net_spread <= 0:
         return None
 
     # profit_ratio is the net return per dollar invested — this is "b" in the Kelly formula
-    profit_ratio = net_spread / (nA + pB)
+    profit_ratio = net_spread / (price_a + price_b)
 
     # Compute the probability that the trade is profitable using the appropriate model
     p = _kelly_p(pair)
@@ -209,7 +279,7 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
 
     # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
-    n = int(budget_dollars / (nA + pB))
+    n = int(budget_dollars / (price_a + price_b))
     if n < 1:
         # The Kelly budget can't afford even one contract pair — forcing n=1
         # would silently exceed both the Kelly fraction and BUDGET_FRACTION
@@ -220,36 +290,40 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         n = min(n, pair.max_contracts)
 
     # Compute exact ceiling-rounded fees for the final integer n. budget_dollars
-    # above only covers the contract cost (n * (nA + pB)) — fees are added on
-    # top, so the straight n from that division can push total_cost_with_fees
-    # slightly past the capped Kelly budget. Shrink n until the fee-inclusive
-    # cost actually fits, so the real cash consumed never exceeds what the
-    # Kelly fraction (and BUDGET_FRACTION) allowed.
-    fee_no  = fee_leg_exact(n, nA)
-    fee_yes = fee_leg_exact(n, pB)
-    while n > 0 and n * (nA + pB) + fee_no + fee_yes > budget_dollars:
+    # above only covers the contract cost (n * (price_a + price_b)) — fees are
+    # added on top, so the straight n from that division can push
+    # total_cost_with_fees slightly past the capped Kelly budget. Shrink n until
+    # the fee-inclusive cost actually fits, so the real cash consumed never
+    # exceeds what the Kelly fraction (and BUDGET_FRACTION) allowed.
+    fee_a = fee_leg_exact(n, price_a)
+    fee_b = fee_leg_exact(n, price_b)
+    while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
         n -= 1
-        fee_no  = fee_leg_exact(n, nA)
-        fee_yes = fee_leg_exact(n, pB)
+        fee_a = fee_leg_exact(n, price_a)
+        fee_b = fee_leg_exact(n, price_b)
     if n < 1:
         # Fees ate the entire Kelly budget — no contract count fits
         return None
 
-    # Verify the guaranteed minimum payoff is positive after exact fees.
-    # At very small n the ceiling rounding can eat the entire profit margin.
-    min_payoff = n * (1.0 - nA - pB) - fee_no - fee_yes
+    # Verify the win-scenario payoff is positive after exact fees. At very
+    # small n the ceiling rounding can eat the entire profit margin. (For a
+    # time-series pair this is the profit in either win cell, not a floor —
+    # the in-between cell loses the whole stake.)
+    min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
     if min_payoff <= 0:
         return None
 
-    total_cost = n * (nA + pB)
+    total_cost = n * (price_a + price_b)
     # Fees are cash out the door at execution — the portfolio budget must cover them
-    total_cost_with_fees = total_cost + fee_no + fee_yes
+    total_cost_with_fees = total_cost + fee_a + fee_b
 
-    # Per-leg cash requirements — same terms and fee calls as total_cost_with_fees,
-    # just not summed together. trader.ensure_shard_collateral() uses these to
-    # fund each leg's own exchange shard rather than the pair total.
-    cost_with_fees_a = n * nA + fee_no
-    cost_with_fees_b = n * pB + fee_yes
+    # Per-MARKET cash requirements — same terms and fee calls as
+    # total_cost_with_fees, just not summed together. cost_with_fees_a is
+    # market_a's leg and cost_with_fees_b is market_b's, whatever side each
+    # buys: trader.ensure_shard_collateral() pairs them with each market's own
+    # exchange shard rather than funding the pair total on one shard.
+    cost_with_fees_a = n * price_a + fee_a
+    cost_with_fees_b = n * price_b + fee_b
 
     # Compute the number of calendar days until the later-closing market resolves.
     # This is used to normalize the profit ratio to a monthly (30-day) figure for ranking.
@@ -266,11 +340,18 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     # Scale the profit ratio to a 30-day equivalent to fairly compare short and long positions
     monthly_profit_ratio = profit_ratio * 30.0 / days_to_close
 
+    # Name the sides in the log so a time-series line (YES on A at pA, NO on B
+    # at nB) is never misread as the same-title NO/YES layout
+    side_a, side_b = leg_sides(pair.pair_type)
     logging.info(
-        "Trade computed: %s [%s] | p=%.2f kelly=%.1f%% n=%d cost=$%.2f "
-        "profit_ratio=%.2f%% monthly=%.2f%%",
+        "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f kelly=%.1f%% n=%d "
+        "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%",
         pair.canonical_title,
         pair.pair_type,
+        side_a.upper(),
+        price_a,
+        side_b.upper(),
+        price_b,
         p,
         kelly_fraction_capped * 100,
         n,
@@ -317,8 +398,10 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
     date and releases it there.
 
     At equal monthly profit ratios, same_title pairs rank above time_series because
-    the same-title guarantee is simpler (identical questions must co-resolve) and
-    does not depend on an independence-model probability estimate.
+    a same-title pair is a near-arbitrage (identical questions must co-resolve, so
+    one leg pays whenever they do) while a time-series pair is a directional bet
+    on the market overstating the in-between probability — the same preference
+    main._dedup_pairs applies when both scanners find the same ticker pair.
 
     Args:
         specs (list): List of TradeSpec objects produced by compute_trade(), one

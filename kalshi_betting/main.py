@@ -4,27 +4,38 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Top-level orchestration for the Kalshi arbitrage bot's live trading pipeline.
-    Parses command-line arguments to select dev (sandbox simulation) or prod
-    (real-money trading) mode, then coordinates the full scan-size-execute-log
-    cycle: building an authenticated API client, fetching open markets, finding
-    arbitrage candidate pairs, sizing trades via Kelly criterion, submitting
-    fill-or-kill orders leg-by-leg to the Kalshi REST API, and writing results
-    to Excel. This is the only
-    module that ties all other modules together in the live trading path. The
-    process exit code communicates the run's outcome to the scheduler (a
-    separate subprocess) — see the EXIT_* constants in config.py (BS-14): an
-    unhandled exception still propagates to exit 1, same as always.
+    Top-level orchestration for the Kalshi Arbitrage Bot's live trading
+    pipeline. Parses command-line arguments to select dev (sandbox simulation)
+    or prod (real-money trading) mode, then coordinates the full
+    scan-size-execute-log cycle: building an authenticated API client,
+    fetching open markets, finding candidate pairs under the bot's two pair
+    strategies — same-title pairs (one question listed twice with divergent
+    prices; a near-arbitrage on co-resolution) and time-series pairs (one
+    question at two deadlines, a directional bet that the market overstates
+    the chance the event first happens between them) — sizing trades via the
+    Kelly criterion, submitting fill-or-kill orders leg-by-leg to the Kalshi
+    REST API, and writing results to Excel. This is the only module that ties
+    all other modules together in the live trading path. The process exit
+    code communicates the run's outcome to the scheduler (a separate
+    subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
+    exception still propagates to exit 1, same as always.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
     (balance threshold, exit-code contract, price-gap thresholds, and file
-    paths), reporter.py (Excel output), scanner.py (market fetching and pair
-    detection), strategy.py (trade sizing and portfolio selection), and
+    paths), reporter.py (Excel output), scanner.py (market fetching, pair
+    detection, and leg_sides — the only source of truth for which side each
+    leg buys), strategy.py (trade sizing and portfolio selection), and
     trader.py (order execution). Entry point for
     `python3 -m kalshi_betting.main`.
 
 Notes:
+    Label rule for everything this module logs: "A"/"B" always mean
+    market_a/market_b, and the pairs table, _print_portfolio and the rescue
+    dump render legs in MARKET order (A then B) with the bought side next to
+    each count. The trader's own execution logs list legs in SUBMISSION order
+    (the NO leg first) — the two views describe the same trade.
+
     Both run modes read the exchange's per-shard status breakdown
     (scanner.fetch_shard_statuses) before fetching markets and pass the set of
     trading-inactive shards into the fetch. Markets on every other shard are
@@ -72,6 +83,7 @@ from .scanner import (
     find_time_series_pairs,
     get_held_tickers,
     inactive_shard_indexes,
+    leg_sides,
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import (
@@ -136,6 +148,14 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     """
     Log a summary of selected portfolio trades to the log file.
 
+    Legs are rendered in MARKET order (A then B) with the side bought on each
+    market next to its count — e.g. "5× YES(A) + 5× NO(B)" for a time-series
+    pair, "5× NO(A) + 5× YES(B)" for a same-title pair. The sides come from
+    scanner.leg_sides, never from the pair type by hand. "profit if won" is
+    spec.min_payoff: the guaranteed floor for a same-title pair, and the
+    profit in either winning settlement of a time-series pair (event by A, or
+    never by B) — the in-between settlement loses the whole stake.
+
     Args:
         portfolio (list): List of TradeSpec objects representing the trades
             selected for execution.
@@ -147,12 +167,14 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     """
     logging.info("%s %d trade(s):", label, len(portfolio))
     for spec in portfolio:
+        # Which side each market's leg buys — the only source of truth for sides
+        side_a, side_b = leg_sides(spec.pair.pair_type)
         logging.info(
-            "  [%s] %s — %d× NO(A) + %d× YES(B) — "
-            "cost $%.2f, min profit $%.2f (%.1f%% return)",
+            "  [%s] %s — %d× %s(A) + %d× %s(B) — "
+            "cost $%.2f, profit if won $%.2f (%.1f%% return)",
             spec.pair.pair_type,
             spec.pair.canonical_title[:55],
-            spec.x, spec.y,
+            spec.x, side_a.upper(), spec.y, side_b.upper(),
             spec.total_cost, spec.min_payoff,
             spec.profit_ratio * 100,
         )
@@ -176,9 +198,10 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
         str: The fully formatted log message, ready to pass to logging.info().
     """
     thresholds = (
-        f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} "
-        f"deadline-gap-tiered time-series or ≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} "
-        "same-title price diff"
+        "time-series: later-closing leg priced "
+        f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
+        "earlier (deadline-gap-tiered), or same-title: "
+        f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff"
     )
     if sandbox:
         return f"No qualifying pairs found in sandbox ({thresholds})."
@@ -191,9 +214,12 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
 
     A duplicate is defined as any pair whose frozenset of {ticker_a, ticker_b} already
     exists in primary. This can occur when both the same-title scanner and the time-series
-    scanner detect the same two markets — in that case the same-title pair is preferred
-    because the co-resolution guarantee is simpler (identical questions must co-resolve)
-    and does not depend on an independence-model probability estimate. This matches the
+    scanner detect the same two markets (a zero-day deadline gap is a valid short-tier
+    gap, so two listings of one question can satisfy both finders) — in that case the
+    same-title pair is preferred because it is the near-arbitrage: identical questions
+    must co-resolve, so its payoff is a floor, whereas the time-series pair is a
+    directional bet whose sizing rests on the discounted-gap estimate of the
+    in-between probability (config.time_series_profit_prob). This matches the
     same_title > time_series tie-break already used by strategy.select_portfolio().
 
     Args:
@@ -226,9 +252,14 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     """
     Log a formatted table of all qualifying candidate pairs to the log file.
 
-    Displays market titles, each leg's exchange shard, deadlines, prices,
-    tradeability, and — for pairs selected in the portfolio — the computed
-    trade size, minimum profit, monthly return, and Kelly fraction.
+    Displays market titles, each leg's exchange shard, deadlines, prices —
+    both YES asks plus the NO ask of market B, which is the traded price of a
+    time-series pair's NO leg and reporting-only for a same-title pair —
+    tradeability, and, for pairs selected in the portfolio, the computed trade
+    (counts in MARKET order with the side bought on each market, from
+    scanner.leg_sides), the profit if won (spec.min_payoff: a guaranteed floor
+    for same-title, the profit in either winning settlement for time-series),
+    monthly return, and Kelly fraction.
 
     Args:
         candidate_pairs (list): All CandidatePair objects returned by the
@@ -244,7 +275,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     for pair in candidate_pairs:
         spec = display_specs.get(id(pair))
         if spec:
-            trade_str   = f"{spec.x}× NO(A) + {spec.y}× YES(B)"
+            # Sides rendered next to each count, in market order (A then B)
+            side_a, side_b = leg_sides(pair.pair_type)
+            trade_str   = f"{spec.x}× {side_a.upper()}(A) + {spec.y}× {side_b.upper()}(B)"
             profit_str  = f"${spec.min_payoff:.2f}"
             monthly_str = f"{spec.monthly_profit_ratio:.2%}/mo"
             kelly_str   = f"{spec.kelly_fraction:.1%} (p={spec.kelly_p:.2f})"
@@ -270,6 +303,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             _format_deadline(pair.market_b.close_time),
             f"{pair.pA:.2%}",
             f"{pair.pB:.2%}",
+            # The NO ask of market B — the traded NO-leg price of a time-series
+            # pair (depth-weighted after enrichment); reporting-only for same-title
+            f"{pair.nB:.2%}",
             "YES ✓" if pair.tradeable else "no",
             trade_str,
             profit_str,
@@ -282,8 +318,8 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
         "Market A", "Market B",
         "Shards",
         "A Deadline", "B Deadline",
-        "pA (YES)", "pB (YES)",
-        "Tradeable?", "Recommended Trade", "Min Profit", "Monthly Return", "Kelly",
+        "pA (YES)", "pB (YES)", "nB (NO)",
+        "Tradeable?", "Recommended Trade", "Profit (win)", "Monthly Return", "Kelly",
     ]
     table = tabulate(rows, headers=headers, tablefmt="rounded_outline")
     for line in table.splitlines():
@@ -411,7 +447,7 @@ def _run_dev(client, args) -> int:
     if not portfolio:
         # BS-26: qualifier only — write_dev_simulation() logs the "written" line itself.
         logging.info(
-            "No executable arbitrage trades found — simulation file will "
+            "No executable trades found — simulation file will "
             "contain candidates only."
         )
         # Write a simulation file showing candidates even though no trades were sized
@@ -436,12 +472,14 @@ def _run_prod(client, args) -> int:
     Execute a full production run using the real Kalshi account.
 
     Verifies authentication, reads the live account balance, fetches currently
-    held positions to exclude them from scanning, discovers arbitrage candidates,
-    sizes trades using Kelly criterion, and submits fill-or-kill orders
-    leg-by-leg. Results are
-    appended to the persistent trade_log.xlsx file. In dry_run mode (--dry-run
-    flag), all steps run normally except order submission — the log still records
-    rows with status="simulated".
+    held positions to exclude them from scanning, discovers candidate pairs
+    under both strategies (same-title near-arbitrage pairs and directional
+    time-series pairs), sizes trades using the Kelly criterion, and submits
+    fill-or-kill orders leg-by-leg (the NO leg first, then the YES leg — see
+    trader.execute_trades). Results are appended to the persistent
+    trade_log.xlsx file. In dry_run mode (--dry-run flag), all steps run
+    normally except order submission — the log still records rows with
+    status="simulated".
 
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
@@ -528,11 +566,11 @@ def _run_prod(client, args) -> int:
     # Map pair id → TradeSpec for fast lookup in the pairs table display
     display_specs = {id(s.pair): s for s in portfolio}
 
-    logging.info("Kalshi Arbitrage Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
+    logging.info("Kalshi Pair Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        logging.info("No executable arbitrage trades found.")
+        logging.info("No executable trades found.")
         return EXIT_OK
 
     _print_portfolio(portfolio, "Selected")
@@ -594,13 +632,17 @@ def _run_prod(client, args) -> int:
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
+            # Both counts are printed: x is market A's leg and y is market B's,
+            # and for a time-series pair the NO leg (the one that gets unwound)
+            # is market B's, so y is the count a human must reconcile first.
             logging.critical(
-                "  RESCUE | %s | %s | A=%s B=%s | x=%d cost=$%.2f | %s",
+                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d cost=$%.2f | %s",
                 r.status,
                 r.spec.pair.canonical_title,
                 r.spec.pair.market_a.ticker,
                 r.spec.pair.market_b.ticker,
                 r.spec.x,
+                r.spec.y,
                 r.spec.total_cost,
                 r.error or "",
             )
@@ -613,9 +655,14 @@ def _run_prod(client, args) -> int:
     n_ok       = sum(1 for r in results if r.status == "executed")
     n_rolled   = sum(1 for r in results if r.status == "rolled_back")
     n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-    # "manual_review" means leg B's fill state was undetermined and no
-    # automated rollback was attempted — just as urgent as an orphaned
-    # rollback failure, so it's counted in the same manual-review alert.
+    # "manual_review" means no automated order was submitted in response to
+    # an outcome the trader could not attribute: the NO leg's or the YES leg's
+    # fill state was undetermined (position lookup failed, or the position
+    # moved by an amount the order can't explain), or — on the V2 path — the
+    # NO-leg side mapping was disproven by the positions ledger after a
+    # confirmed NO-leg fill, leaving that leg in place and the YES leg
+    # unsubmitted. Every case is just as urgent as an orphaned rollback
+    # failure, so it's counted in the same manual-review alert.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "
@@ -675,7 +722,9 @@ def _setup_logging(log_path: pathlib.Path) -> None:
 
 def main() -> None:
     """
-    CLI entry point for the Kalshi arbitrage bot.
+    CLI entry point for the Kalshi Arbitrage Bot — the live pipeline that
+    scans for same-title near-arbitrage pairs and directional time-series
+    pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days), configures logging, builds the appropriate Kalshi
@@ -692,7 +741,15 @@ def main() -> None:
         None: This function never returns to its caller — it always ends by
             calling sys.exit(code), which raises SystemExit.
     """
-    parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Kalshi Arbitrage Bot — scans for two kinds of mispriced contract "
+            "pairs (same-title near-arbitrage pairs, and directional "
+            "time-series pairs betting against the market's implied chance "
+            "that an event first happens between two deadlines), sizes them "
+            "with the Kelly criterion, and submits fill-or-kill orders."
+        ),
+    )
     parser.add_argument(
         "--mode", choices=["dev", "prod"], default="dev",
         help="'dev' scans real sandbox markets and simulates; 'prod' uses real account",

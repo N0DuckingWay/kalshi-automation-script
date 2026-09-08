@@ -1,10 +1,25 @@
-"""Tests for strategy.py Kelly sizing and portfolio selection."""
+"""Tests for strategy.py Kelly sizing and portfolio selection.
+
+Time-series pairs buy YES on the earlier contract (market_a, at pA) and NO on
+the later one (market_b, at nB); same-title pairs buy NO on market_a (nA) and
+YES on market_b (pB). Every fixture therefore carries a REAL float nB — a
+MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
+"""
+import ast
+import inspect
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting.config import BUDGET_FRACTION, SAME_TITLE_CO_RESOLVE_PROB, fee_leg_exact
+from kalshi_betting import backtester, config, dashboard, strategy
+from kalshi_betting.config import (
+    BUDGET_FRACTION,
+    SAME_TITLE_CO_RESOLVE_PROB,
+    fee_leg_exact,
+    fee_per_pair_approx,
+    time_series_profit_prob,
+)
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
 
 
@@ -12,15 +27,21 @@ def make_pair(
     pA: float = 0.70,
     pB: float = 0.30,
     nA: float = 0.20,
+    nB: float = 0.65,
     tradeable: bool = True,
     pair_type: str = "same_title",
     max_contracts: int = 0,
 ) -> MagicMock:
-    """Factory for CandidatePair-like mocks; avoids importing the real dataclass."""
+    """Factory for CandidatePair-like mocks; avoids importing the real dataclass.
+
+    nB is set as a real float (never left to MagicMock auto-vivification):
+    scanner.leg_prices reads it directly for time-series pairs.
+    """
     pair = MagicMock()
     pair.pA = pA
     pair.pB = pB
     pair.nA = nA
+    pair.nB = nB
     pair.tradeable = tradeable
     pair.pair_type = pair_type
     pair.max_contracts = max_contracts
@@ -56,11 +77,37 @@ def make_spec(
     )
 
 
+# The plan's flow-through fixture: earlier YES ask 0.30, later YES ask 0.60 /
+# NO ask 0.40 (13-day gap in the backtester; the gap only picks the tier here).
+_TS_PA, _TS_PB, _TS_NA, _TS_NB = 0.30, 0.60, 0.70, 0.40
+
+
+def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
+    """Uncapped Kelly f* = p - (1-p)/b for a time-series pair, from the config
+    helpers alone — the oracle every sizer (strategy, dashboard, backtester)
+    must agree with."""
+    net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
+    b = net_spread / (pA + nB)
+    p = time_series_profit_prob(pA, pB)
+    return p - (1.0 - p) / b
+
+
 class TestKellyP:
-    def test_time_series_independence_model(self):
-        pair = make_pair(pA=0.70, pB=0.30, pair_type="time_series")
-        # p = 1 - pA * (1 - pB) = 1 - 0.7 * 0.7 = 0.51
-        assert _kelly_p(pair) == pytest.approx(1.0 - 0.70 * (1.0 - 0.30))
+    """Probability-of-profit models: the discounted market gap for time-series
+    (config.time_series_profit_prob) and the fixed co-resolution prior for
+    same-title."""
+
+    def test_time_series_discounted_gap_model(self):
+        pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
+        # p = 1 - k * (pB - pA) = 1 - 0.75 * 0.30 = 0.775
+        assert _kelly_p(pair) == pytest.approx(0.775)
+        assert _kelly_p(pair) == pytest.approx(time_series_profit_prob(0.30, 0.60))
+
+    def test_time_series_model_is_not_the_old_expression(self):
+        # The pre-2026-09 formula 1 - pA*(1-pB) modelled the impossible
+        # A=YES/B=NO cell; on this fixture it would read 0.88, not 0.775
+        pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
+        assert _kelly_p(pair) != pytest.approx(1.0 - 0.30 * (1.0 - 0.60))
 
     def test_same_title_fixed_prior(self):
         pair = make_pair(pA=0.80, pB=0.40, pair_type="same_title")
@@ -93,7 +140,15 @@ class TestComputeTrade:
         assert compute_trade(make_pair(nA=0.0), 100_000) is None
         assert compute_trade(make_pair(nA=1.0), 100_000) is None
 
-    def test_returns_trade_spec_for_valid_arbitrage(self):
+    def test_time_series_boundary_checks_use_leg_prices(self):
+        # For time_series the leg prices are pA/nB — a boundary nA or pB (not
+        # leg prices) must NOT reject, while a boundary pA or nB must
+        ok = make_pair(pA=0.30, pB=0.60, nA=0.0, nB=0.40, pair_type="time_series")
+        assert compute_trade(ok, 1_000_000) is not None
+        assert compute_trade(make_pair(pA=0.0, pB=0.60, nB=0.40, pair_type="time_series"), 1_000_000) is None
+        assert compute_trade(make_pair(pA=0.30, pB=0.60, nB=1.0, pair_type="time_series"), 1_000_000) is None
+
+    def test_returns_trade_spec_for_valid_same_title_pair(self):
         # same_title pair: p=0.95 fixed prior; nA=0.20+pB=0.30=0.50 < 1, wide spread gives positive Kelly
         pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
         result = compute_trade(pair, 100_000)
@@ -182,6 +237,167 @@ class TestComputeTrade:
         assert result.total_cost_with_fees <= budget_dollars + 1e-9
 
 
+class TestComputeTradeTimeSeries:
+    """The plan's flow-through fixture through compute_trade: YES on the
+    earlier contract at 0.30 and NO on the later at 0.40 (later YES ask 0.60),
+    $10,000 balance. Every expectation is derived from the config helpers in
+    the test, not hardcoded, except the contract count and the dollar figures
+    the plan pins."""
+
+    @staticmethod
+    def _pair(**overrides) -> MagicMock:
+        kwargs = {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB, "pair_type": "time_series"}
+        kwargs.update(overrides)
+        return make_pair(**kwargs)
+
+    def test_costs_are_on_the_leg_prices(self):
+        result = compute_trade(self._pair(), 1_000_000)
+        assert result is not None
+        x = result.x
+        assert result.y == x
+        # total_cost = x * (pA + nB), NOT x * (nA + pB) = x * 1.30
+        assert result.total_cost == pytest.approx(x * (_TS_PA + _TS_NB))
+        assert result.cost_with_fees_a == pytest.approx(x * _TS_PA + fee_leg_exact(x, _TS_PA))
+        assert result.cost_with_fees_b == pytest.approx(x * _TS_NB + fee_leg_exact(x, _TS_NB))
+        assert result.cost_with_fees_a + result.cost_with_fees_b == pytest.approx(
+            result.total_cost_with_fees
+        )
+
+    def test_kelly_p_and_fraction_from_config_helpers(self):
+        result = compute_trade(self._pair(), 1_000_000)
+        assert result is not None
+        assert result.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB))
+        assert result.kelly_p == pytest.approx(0.775)
+        expected_f = _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
+        # ~0.1884 — below the 20% cap, so Kelly (not the cap) sizes this pair
+        assert expected_f == pytest.approx(0.1884, abs=1e-4)
+        assert expected_f < BUDGET_FRACTION
+        assert result.kelly_fraction == pytest.approx(expected_f)
+
+    def test_flow_through_dollar_figures(self):
+        # Kelly budget 1884.08 → raw n 2691, shrunk by the fee loop to 2575:
+        # cost 1802.50, exact fees 37.86 + 43.26 = 81.12, cash out 1883.62,
+        # win-scenario profit 2575 * 0.30 - 81.12 = 691.38
+        result = compute_trade(self._pair(), 1_000_000)
+        assert result is not None
+        assert result.x == 2575
+        assert result.total_cost == pytest.approx(1802.50)
+        assert result.total_cost_with_fees == pytest.approx(1883.62)
+        assert result.min_payoff == pytest.approx(691.38)
+        assert result.total_cost_with_fees <= 10_000.0 * result.kelly_fraction + 1e-9
+
+    def test_min_payoff_is_the_win_scenario_profit(self):
+        # min_payoff = n * (1 - pA - nB) - exact fees; the in-between cell
+        # loses total_cost_with_fees in full (there is no floor for time_series)
+        result = compute_trade(self._pair(), 1_000_000)
+        assert result is not None
+        n = result.x
+        assert result.min_payoff == pytest.approx(
+            n * (1.0 - _TS_PA - _TS_NB) - fee_leg_exact(n, _TS_PA) - fee_leg_exact(n, _TS_NB)
+        )
+
+    def test_wide_later_book_returns_none(self):
+        # Same YES-ask gap, later NO ask 0.50 instead of 0.40: pA + nB = 0.80
+        # drives f* negative — Kelly says the market's in-between mass is not
+        # overstated enough to pay for the wider book
+        assert _ts_kelly_fraction(_TS_PA, _TS_PB, 0.50) < 0
+        assert compute_trade(self._pair(nB=0.50), 1_000_000) is None
+
+    def test_wide_gap_is_capped_at_budget_fraction(self):
+        # 0.30 → 0.70 with NO ask 0.30: f* ≈ 0.214 → capped to BUDGET_FRACTION
+        assert _ts_kelly_fraction(0.30, 0.70, 0.30) > BUDGET_FRACTION
+        result = compute_trade(self._pair(pB=0.70, nB=0.30), 1_000_000)
+        assert result is not None
+        assert result.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+
+    def test_respects_depth_cap(self):
+        result = compute_trade(self._pair(max_contracts=100), 1_000_000)
+        assert result is not None
+        assert result.x == 100
+        assert result.total_cost == pytest.approx(70.0)
+
+    def test_nA_and_pB_are_not_priced(self):
+        # Changing the reporting-only nA leaves every dollar figure untouched;
+        # pB only moves the probability (and hence the fraction / n)
+        base = compute_trade(self._pair(), 1_000_000)
+        other_nA = compute_trade(self._pair(nA=0.99), 1_000_000)
+        assert base is not None and other_nA is not None
+        assert (base.x, base.total_cost, base.min_payoff) == (
+            other_nA.x, other_nA.total_cost, other_nA.min_payoff
+        )
+
+
+def _function_calls(module, func_name: str, callee: str) -> bool:
+    """True when the named function in `module` contains a call to `callee`
+    (as a bare name or an attribute), found by AST walk of the module source."""
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    fn = sub.func
+                    name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                    if name == callee:
+                        return True
+            return False
+    raise AssertionError(f"{module.__name__}.{func_name} not found")
+
+
+class TestTimeSeriesKellyParity:
+    """The three sizers — strategy._kelly_p / compute_trade, dashboard._kelly_fraction
+    and backtester.run_backtest — must all price the time-series probability
+    through config.time_series_profit_prob, so the model cannot drift between
+    live sizing, the backtest and the dashboard."""
+
+    def test_kelly_p_equals_config_helper(self):
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nB=_TS_NB, pair_type="time_series")
+        assert _kelly_p(pair) == time_series_profit_prob(_TS_PA, _TS_PB)
+
+    def test_dashboard_fraction_equals_compute_trade_fraction(self):
+        dash = dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series")
+        assert dash == pytest.approx(_ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB))
+        live = compute_trade(
+            make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series"),
+            1_000_000,
+        )
+        assert live is not None
+        assert live.kelly_fraction == pytest.approx(dash)
+
+    def test_dashboard_fraction_uses_leg_prices_not_nA_pB(self):
+        # On this fixture nA + pB = 1.30 — the old leg mapping would return 0.0
+        # (no spread), not the ~0.1884 the live sizer computes
+        assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.18
+
+    def test_dashboard_same_title_unchanged(self):
+        # Same-title still prices nA + pB on the fixed prior; nB is ignored
+        expected_b = ((1.0 - 0.20 - 0.30) - fee_per_pair_approx(0.20, 0.30)) / 0.50
+        expected = SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) / expected_b
+        assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title") == pytest.approx(expected)
+        assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.99, "same_title") == pytest.approx(expected)
+
+    def test_discount_of_one_never_trades(self, monkeypatch):
+        # k = 1 (market-implied): p = 1 - (pB - pA) → f* < 0 for every pair;
+        # compute_trade returns None and the dashboard clamps to 0.0
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
+        assert _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB) < 0
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series")
+        assert compute_trade(pair, 1_000_000) is None
+        assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") == 0.0
+        # Also the wide-gap fixture that is capped under k = 0.75
+        assert compute_trade(make_pair(pA=0.30, pB=0.70, nA=0.70, nB=0.30, pair_type="time_series"), 1_000_000) is None
+
+    def test_ast_strategy_kelly_p_calls_helper(self):
+        assert _function_calls(strategy, "_kelly_p", "time_series_profit_prob")
+
+    def test_ast_dashboard_kelly_fraction_calls_helper(self):
+        assert _function_calls(dashboard, "_kelly_fraction", "time_series_profit_prob")
+
+    def test_ast_backtester_run_backtest_calls_helper(self):
+        # Lands with the backtester work package; until then this pins the
+        # contract that Pass 1 must call the shared helper directly
+        assert _function_calls(backtester, "run_backtest", "time_series_profit_prob")
+
+
 class TestSelectPortfolio:
     def test_empty_input(self):
         assert select_portfolio([], 100_000) == []
@@ -206,6 +422,7 @@ class TestSelectPortfolio:
         assert len(result) == 2
 
     def test_prefers_same_title_over_time_series_at_equal_return(self):
+        # Near-arbitrage (same-title) outranks the directional bet (time-series)
         ts = make_spec(monthly_profit_ratio=0.10, pair_type="time_series", total_cost=100.0)
         st = make_spec(monthly_profit_ratio=0.10, pair_type="same_title", total_cost=100.0)
         result = select_portfolio([ts, st], 100_000)

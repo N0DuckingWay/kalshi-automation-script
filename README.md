@@ -1,6 +1,6 @@
 # Kalshi Arbitrage Bot
 
-An automated arbitrage trading bot for the [Kalshi](https://kalshi.com) prediction market platform. The bot finds pairs of correlated prediction market contracts where one is mispriced relative to the other, sizes positions using the Kelly criterion, and submits fill-or-kill orders leg-by-leg to lock in a risk-free profit — with automatic rollback if the second leg doesn't fill. A separate backtesting pipeline replays the same strategy on the full history of settled Kalshi markets and generates an interactive HTML performance dashboard.
+An automated pair-trading bot for the [Kalshi](https://kalshi.com) prediction market platform. The bot finds pairs of related prediction market contracts where one is mispriced relative to the other, sizes positions using the Kelly criterion, and submits fill-or-kill orders leg-by-leg — with automatic rollback if the second leg doesn't fill. A separate backtesting pipeline replays the same strategy on the full history of settled Kalshi markets and generates an interactive HTML performance dashboard.
 
 ---
 
@@ -8,17 +8,31 @@ An automated arbitrage trading bot for the [Kalshi](https://kalshi.com) predicti
 
 Kalshi markets are binary contracts that pay $1 if a question resolves YES and $0 if it resolves NO. The bot exploits two specific pricing anomalies:
 
-**Time-series pairs:** Two contracts asking the same question at different deadlines (e.g. "Will BTC exceed $80k by March 2025?" and "Will BTC exceed $80k by June 2025?") should satisfy `P(A) <= P(B)` because the later deadline gives more time for the event to occur. When the earlier contract is priced *higher* than the later one by at least a required margin, the market is mispriced. The bot buys NO on the expensive (earlier) contract and YES on the cheap (later) contract. All three resolution scenarios are profitable:
+**Time-series pairs:** Two contracts asking the same question at different deadlines (e.g. "Will BTC exceed $80k by March 2025?" and "Will BTC exceed $80k by June 2025?"). The later deadline gives more time for the event to occur, so the later contract's YES price normally sits above the earlier one's — and the gap between the two YES prices is the market's implied probability that the event first happens *between* the two deadlines. When the later contract is priced *higher* than the earlier one by at least a required margin, the bot disputes that in-between probability: it buys YES on the earlier contract and NO on the later one. There are exactly three ways such a pair can settle:
 
-- A=YES before B resolves: B likely resolves YES too — both pay out
-- Both resolve YES: YES on B pays out, covering the NO on A cost
-- Both resolve NO: NO on A pays out, covering the YES on B cost
+- The event happens by the earlier deadline (both resolve YES): the YES on the earlier contract pays out — **win**
+- The event never happens by the later deadline (both resolve NO): the NO on the later contract pays out — **win**
+- The event happens in between (earlier NO, later YES): both legs expire worthless — the full stake is lost — **loss**
+
+The earlier contract resolving YES while the later resolves NO is impossible for a genuine cumulative-deadline pair ("by March" YES implies "by June" YES); the backtester treats a pair that settled that way as a premise violation — the title grouping mixed a snapshot market ("on <date>") with a cumulative one ("by <date>") — and excludes it with a counted warning rather than paying it. This trade is **not risk-free**: at market prices its expected value is zero minus fees, and it profits only if the market systematically overstates the in-between probability. The bot sizes it on the operator's estimate that 75% of the market-implied in-between probability is genuine (`TIME_SERIES_INTERVAL_PROB_DISCOUNT` in `config.py` — a hand-set estimate, not a measured quantity).
 
 **Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by 5% or more, the bot buys NO on the expensive one and YES on the cheap one. Since both contracts should co-resolve, the trade is essentially risk-free. The subtitle here is the outcome label that distinguishes markets sharing one question title (e.g. two candidate names under "Who will the next Pope be?"); the API stopped sending a `subtitle` field in 2026-08, so ingest now sources it from `yes_sub_title` — without that discriminator, two *different* outcomes would be paired as if they were the same contract.
 
-The required price gap for time-series pairs is tiered by how far apart the two deadlines are: 15% for deadlines ≤ 15 days apart, 30% for 16–30 days — wider gaps need a bigger edge because the correlation between the two dates is weaker. Deadlines more than 30 days apart are never considered. See `min_price_diff_for_gap()` in `config.py` for the exact thresholds.
+The required price gap for time-series pairs is tiered by how far apart the two deadlines are: 15% for deadlines ≤ 15 days apart, 30% for 16–30 days — wider gaps leave more room for the event to genuinely land between the two deadlines, so more of the market-implied in-between probability is real rather than mispricing, and a bigger gap must be demanded before disputing it. Deadlines more than 30 days apart are never considered. See `min_price_diff_for_gap()` in `config.py` for the exact thresholds.
 
 In both cases, Kalshi charges a taker fee per contract leg. The bot only executes trades where the profit margin exceeds all fees after applying order book depth to confirm the gap exists in real liquidity.
+
+### Strategy change (2026-09)
+
+Until September 2026 the time-series strategy traded the opposite way round: it fired when the *earlier* contract was priced higher than the later one, bought NO on the earlier and YES on the later, and described the result as a risk-free position with three profitable outcomes. That direction has been inverted, and the time-series bet is now a **directional trade, not an arbitrage**: the bot buys YES on the earlier contract and NO on the later one when the later is priced at least the required margin above the earlier, wins if the event happens by the earlier deadline or never happens by the later one, and loses the whole stake if it happens in between (see the three outcomes above). Same-title pairs are unchanged.
+
+What that means for anyone reading the outputs:
+
+- **Sizing.** The Kelly sizer models the probability of profit as `1 − k × (later YES price − earlier YES price)`, with `k = TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75` in `config.py`: the bot believes 75% of the market-implied in-between probability ("prices converge by 25%"). At `k = 1` — taking the market at face value — or under an independence model, Kelly is zero or negative for every pair and the strategy never trades, so `k` is what makes it fire at all; it is a hand-set operator estimate. With `k = 0.75` the Kelly fraction sits well below the `BUDGET_FRACTION` cap (20%) for typical gaps (about 6% at the minimum short-tier gap, about 19% at a 0.30 gap), so Kelly itself sizes and differentiates pairs and the cap only binds for gaps of roughly 0.40 or more; a wide order book drives Kelly negative and the pair is skipped. Because a pricier later contract is normal term structure, far more time-series candidates qualify than before.
+- **Trade log.** `trade_log.xlsx` keeps its 18 columns, but new workbooks head the count columns "x — A leg" / "y — B leg" and the profit column "Profit if won ($)" (an existing workbook keeps its old header row) and every row's Notes cell is prefixed `[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]]` so the side traded on each market is explicit. For time-series rows the "nA (NO ask)" column is the earlier contract's best NO ask for reference only — the traded NO price is the `nB` in the Notes prefix. The dev-simulation candidates sheet gains an "nB (NO ask)" column, and the live pairs table logged by `main.py` gains an "nB (NO)" column and labels its profit column "Profit (win)".
+- **Backtest.** Each `BacktestTrade` records `entry_nB`; a time-series trade's profit is negative only in the in-between outcome. Any candidate whose settlement violates the cumulative-deadline premise (earlier YES, later NO) is skipped rather than paid, and the run logs one warning with the count — Kalshi does list snapshot-style markets ("on <date>"), the live scanner cannot tell them apart from cumulative ones by price, and this counter is the only signal that the title grouping admitted such a pair. Existing backtest caches need no refresh.
+- **Not updated.** `kalshi_bot_flowchart.pdf` predates this change (it shows the old `|pA − pB|` filter) and has not been regenerated; `BUG_SWEEP_FINDINGS.md` is a dated record and is left as-is.
+- **Next step (deferred).** Calibrate `k` from settled history instead of setting it by hand: a backtest override flag, an empirical comparison of the realised in-between rate against the market-implied gap per gap-size bucket, and an optional sweep reporting equity curve and drawdown per `k`. Fractional-contract sizing remains deferred as well.
 
 ---
 
@@ -56,7 +70,8 @@ config.py (constants), _http.py (retry + raw-response fetch)
 
     (historical.py also imports auth.py's build_client for its own client
      builders, and _http.py directly for its raw signed GETs; backtester.py
-     also imports scanner.py's normalize_title for title-based pair grouping)
+     also imports scanner.py's normalize_title for title-based pair grouping
+     and leg_sides so settlement pays by the side each leg bought)
 
     v2_probe.py — standalone, human-run verification CLI; imports
     auth.py/config.py/_http.py/scanner.py/trader.py, imported by NOTHING
@@ -118,9 +133,9 @@ backtest.py (CLI)
 | `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths) and the two fee helper functions used throughout the codebase. |
 | `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
 | `_http.py` | Shared HTTP helpers used across the package (auth, scanner, historical, trader, and v2_probe): `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission and the collateral transfer call it directly). |
-| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. |
-| `strategy.py` | Applies the Kelly criterion to size each trade, computes minimum guaranteed profit and monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
-| `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg) via the Kalshi API, with automatic rollback of a filled leg A if leg B doesn't fill. Multiple pairs execute concurrently. Submission goes to the V2 order endpoint by default and to the retained legacy endpoint when `config.ORDER_API_VERSION` is flipped — see "Order API version" below. |
+| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades. |
+| `strategy.py` | Applies the Kelly criterion to size each trade, computes the profit floor for same-title pairs / the win-scenario profit for time-series pairs and the monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
+| `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg — the NO leg is `market_a` for a same-title pair and `market_b`, the later contract, for a time-series pair) via the Kalshi API, with automatic rollback of the filled NO leg if the YES leg doesn't fill. Multiple pairs execute concurrently. Submission goes to the V2 order endpoint by default and to the retained legacy endpoint when `config.ORDER_API_VERSION` is flipped — see "Order API version" below. |
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
@@ -134,7 +149,7 @@ backtest.py (CLI)
 
 `config.ORDER_API_VERSION` selects which Kalshi create-order endpoint `trader.py` submits through. The default `"v2"` posts to `/portfolio/events/orders`: a fill-or-kill **limit** order with a dollar-string price, a fixed-point contract count, a `bid`/`ask` side on the market's single YES book, and an explicit `exchange_index`. V2 has no "market" order type, so the limit price is itself the price protection — the scanned price rounded up onto the market's own tick grid plus `BUY_SLIPPAGE_TICKS` ticks, which is a cap the older integer-cent `buy_max_cost` field could not express once MVE/combo markets moved to sub-cent ticks.
 
-Setting it to `"legacy"` restores the original `/portfolio/orders` path (`CreateOrderRequest`, `type="market"`, integer-cent `buy_max_cost` via `BUY_MAX_COST_SLIPPAGE_CENTS`), which is retained unmodified purely as an instant rollback if the V2 request/response mapping misbehaves. Both paths share the same leg ordering, rollback logic, and result-status vocabulary, and neither ever retries a submission.
+Setting it to `"legacy"` restores the original `/portfolio/orders` path (`CreateOrderRequest`, `type="market"`, integer-cent `buy_max_cost` via `BUY_MAX_COST_SLIPPAGE_CENTS`), which is retained unmodified purely as an instant rollback if the V2 request/response mapping misbehaves. Both paths share the same leg ordering (the NO leg is always submitted first and is the leg that gets unwound — `trader._ordered_legs` decides which market that is for the pair type), rollback logic, and result-status vocabulary, and neither ever retries a submission.
 
 ---
 

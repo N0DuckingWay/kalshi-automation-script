@@ -5,20 +5,27 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Fetches all open Kalshi markets from the REST API and identifies pairs of
-    contracts that are candidates for arbitrage. Two detection paths exist:
-    (1) time-series pairs — contracts that ask the same question at different
-    deadlines, identified by stripping date tokens from their titles and
-    exact-matching the remainder; and (2) same-title pairs — contracts with
-    identical title and subtitle on different event tickers. Both paths then
-    check the live order book to replace best-ask prices with depth-weighted
-    fill prices and confirm the edge survives real liquidity.
+    contracts for the bot's two pair strategies: (1) time-series pairs —
+    contracts that ask the same question at different deadlines, identified by
+    stripping date tokens from their titles and exact-matching the remainder,
+    traded as a directional bet (YES on the earlier contract, NO on the later)
+    when the later contract is priced well above the earlier; and (2)
+    same-title pairs — contracts with identical title and subtitle on
+    different event tickers, traded as a near-arbitrage (NO on the pricier,
+    YES on the cheaper) when their prices diverge. Both paths then check the
+    live order book to replace best-ask prices with depth-weighted fill prices
+    and confirm the edge survives real liquidity.
 
 Dependencies:
-    Imports constants and fee helpers from config.py and the retry/raw-fetch
-    helpers from _http.py. Exports the CandidatePair and ApiMarket dataclasses
-    and scanning functions consumed by main.py, backtester.py, and (via
-    normalize_title) historical.py. Depends on the KalshiClient produced by
-    auth.py.
+    Imports constants, the leg-side tuples, and fee helpers from config.py and
+    the retry/raw-fetch helpers from _http.py. Exports the CandidatePair and
+    ApiMarket dataclasses, the leg helpers leg_sides()/leg_prices()/
+    deadline_gap_days() (the only source of truth for which side each leg
+    buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
+    main.py and backtester.py), and the scanning functions consumed by
+    main.py, backtester.py (which also imports normalize_title and
+    leg_sides), and (via normalize_title) historical.py. Depends on the
+    KalshiClient produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -58,8 +65,10 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
+    SAME_TITLE_LEG_SIDES,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
+    TIME_SERIES_LEG_SIDES,
     fee_per_pair_approx,
     min_price_diff_for_gap,
 )
@@ -232,32 +241,137 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
 @dataclass
 class CandidatePair:
     """
-    An arbitrage candidate consisting of two correlated markets with a detectable price gap.
+    A candidate pair of correlated markets with a detectable price gap.
+
+    Which side each leg buys, and therefore which two of the four quoted
+    prices are LEG prices, depends on pair_type — read them through
+    leg_sides() / leg_prices(), never by position:
+
+      same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
+                   market_b (the cheaper side) at pB. Both legs pay when the
+                   two identical questions co-resolve, so the trade is a
+                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB prior.
+      time_series: YES on market_a (the EARLIER-closing contract) at pA, NO on
+                   market_b (the later one) at nB. Three settlement cells
+                   exist: event by A's deadline (A=YES, hence B=YES; YES-on-A
+                   pays), never by B's (A=NO, B=NO; NO-on-B pays), or in
+                   between (A=NO, B=YES; both legs worthless — the one loss
+                   cell). A=YES with B=NO is impossible for a
+                   cumulative-deadline pair. This is a directional bet, not an
+                   arbitrage: it profits only if the market overstates the
+                   in-between probability (see config.time_series_profit_prob).
 
     Attributes:
-        market_a (Any): The market with the higher YES ask (the expensive side of the pair).
-        market_b (Any): The market with the lower YES ask (the cheap side of the pair).
-        pA (float): YES ask price of market A in dollars (cost to buy YES on A). Range: [0, 1].
-        pB (float): YES ask price of market B in dollars (cost to buy YES on B). Range: [0, 1].
-        nA (float): NO ask price of market A in dollars (cost to buy NO on A). Range: [0, 1].
-        tradeable (bool): True when nA + pB < 1 - fee_per_pair_approx(nA, pB) and pA > pB.
-            For time-series pairs this is only truly risk-free under the monotonicity
-            assumption that P(B) >= P(A) — see find_time_series_pairs for the scenario
-            this doesn't cover.
+        market_a (Any): same_title: the market with the higher YES ask (the
+            expensive side). time_series: the earlier-closing contract.
+        market_b (Any): same_title: the market with the lower YES ask (the
+            cheap side). time_series: the later-closing contract.
+        pA (float): YES ask price of market A in dollars (cost to buy YES on A).
+            Range: [0, 1]. A leg price for time_series; reporting-only for
+            same_title.
+        pB (float): YES ask price of market B in dollars (what a YES contract
+            on market B costs). Range: [0, 1]. A leg price for same_title; for
+            time_series it feeds the price-gap filter and the Kelly model but
+            is not a leg price.
+        nA (float): NO ask price of market A in dollars (what a NO contract on
+            market A costs). Range: [0, 1]. A leg price for same_title; reporting-only for
+            time_series (still read so the prod log's "nA (NO ask)" column
+            stays meaningful).
+        tradeable (bool): True when the two LEG prices sum to less than
+            1 - fee_per_pair_approx(leg prices) — i.e. a win scenario pays more
+            than the pair costs — and, for time_series, pB > pA. Neither pair
+            type's flag is a settlement guarantee: same-title rests on the
+            co-resolution prior, time-series on the in-between probability
+            being overstated.
         canonical_title (str): Grouping key used to identify the pair — normalized title for
             time-series pairs, raw title for same-title pairs.
         pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
             "same_title" for pairs with identical title/subtitle across different event tickers.
+        max_contracts (int): Qualifying contract count from the order book after
+            enrich_with_orderbook_prices(); 0 before enrichment (uncapped).
+        nB (float): NO ask price of market B in dollars (cost to buy NO on B).
+            Range: [0, 1]. A leg price for time_series; populated fail-soft
+            (0.0 when unparseable) for same_title, where it is reporting-only
+            and never priced.
     """
-    market_a: Any           # Market with higher YES ask (expensive side)
-    market_b: Any           # Market with lower YES ask (cheap side)
-    pA: float               # yes_ask_dollars of A (cost to buy YES on A)
-    pB: float               # yes_ask_dollars of B (cost to buy YES on B)
-    nA: float               # no_ask_dollars of A  (cost to buy NO on A)
-    tradeable: bool         # True when guaranteed arbitrage exists
+    market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER-closing contract
+    market_b: Any           # same_title: cheaper side by YES ask  | time_series: later-closing contract
+    pA: float               # yes_ask_dollars of A (cost to buy YES on A) — a LEG price for time_series
+    pB: float               # yes_ask_dollars of B (cost of a YES contract on B) — a LEG price for same_title
+    nA: float               # no_ask_dollars of A  (cost of a NO contract on A)  — a LEG price for same_title
+    tradeable: bool         # True when a win scenario pays more than the leg prices + approx fees
     canonical_title: str    # grouping key (normalized for time-series, raw for same-title)
     pair_type: str          # "time_series" | "same_title"
     max_contracts: int = 0  # qualifying contracts from order book (0 = not yet enriched)
+    nB: float = 0.0         # no_ask_dollars of B (cost to buy NO on B) — a LEG price for time_series; reporting-only for same_title
+
+
+def leg_sides(pair_type: str) -> tuple[str, str]:
+    """
+    Return which side each leg of a pair buys, as (side on market_a, side on market_b).
+
+    Time-series pairs buy YES on the earlier contract (market_a) and NO on the
+    later one (market_b); same-title pairs buy NO on the pricier contract
+    (market_a) and YES on the cheaper (market_b). Anything other than the exact
+    string "time_series" — including None or a test double's auto-attribute —
+    resolves to the same-title sides, so a pair whose type is unknown can never
+    be silently traded as the directional time-series bet.
+
+    Args:
+        pair_type (str): CandidatePair.pair_type — "time_series" or "same_title".
+
+    Returns:
+        tuple[str, str]: config.TIME_SERIES_LEG_SIDES for time-series pairs,
+            config.SAME_TITLE_LEG_SIDES otherwise. Each element is "yes" or "no".
+    """
+    if pair_type == "time_series":
+        return TIME_SERIES_LEG_SIDES
+    return SAME_TITLE_LEG_SIDES
+
+
+def leg_prices(pair: Any) -> tuple[float, float]:
+    """
+    Return the per-contract cost of the side actually bought on each leg.
+
+    This is the only mapping from a pair's four quoted prices to the two prices
+    the pipeline sizes, fees and submits against: (nA, pB) for a same-title pair
+    (NO on market_a, YES on market_b) and (pA, nB) for a time-series pair (YES on
+    market_a, NO on market_b). Reads nB directly rather than defaulting it — a
+    real CandidatePair always carries it, and a mock that lacks it should fail
+    loudly instead of pricing a leg at a placeholder.
+
+    Args:
+        pair (Any): A CandidatePair (or an object exposing pair_type, pA, pB,
+            nA and nB). pair_type is read fail-safe: anything other than
+            "time_series" is treated as same-title (see leg_sides).
+
+    Returns:
+        tuple[float, float]: (price of the leg on market_a, price of the leg on
+            market_b), dollars in (0, 1).
+    """
+    if getattr(pair, "pair_type", None) == "time_series":
+        return pair.pA, pair.nB
+    return pair.nA, pair.pB
+
+
+def deadline_gap_days(market_a: Any, market_b: Any) -> int:
+    """
+    Return the whole-day gap between two markets' deadlines, independent of order.
+
+    Uses timedelta.days on the close_time datetimes (the live scanner's
+    arithmetic, which the backtester mirrors) on the absolute difference, so
+    the result is the same whichever market is passed first. Both markets must
+    carry a real datetime close_time — callers run downstream of
+    _filter_active_markets, which drops markets without one.
+
+    Args:
+        market_a (Any): One leg's market, exposing a datetime close_time.
+        market_b (Any): The other leg's market, exposing a datetime close_time.
+
+    Returns:
+        int: abs(market_b.close_time - market_a.close_time).days, >= 0.
+    """
+    return abs(market_b.close_time - market_a.close_time).days
 
 
 def normalize_title(title: str) -> str:
@@ -778,7 +892,7 @@ def check_shard_coverage(
         data sources are out of sync, independent of money); account funds
         sitting on an unadvertised shard are logged as a warning, since funds
         alone (with no market activity to miss) are an accounting curiosity,
-        not a missed arbitrage opportunity. A `trading_active=False` advertised
+        not a missed trading opportunity. A `trading_active=False` advertised
         shard is never flagged at all — fetch_open_events_with_markets() drops
         its markets deliberately, and that drop already logs its own warning.
 
@@ -1054,7 +1168,7 @@ def find_time_series_pairs(
     markets: list | None = None,
 ) -> list:
     """
-    Find time-series arbitrage candidate pairs.
+    Find time-series candidate pairs (YES on the earlier contract, NO on the later).
 
     Grouping strategy: EXACT normalized-title matching over the combined
     `event_title + market_title` key (see `pair_key`). If two contracts differ
@@ -1066,27 +1180,35 @@ def find_time_series_pairs(
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
-      3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days)
-      4. pA - pB >= min_price_diff_for_gap(gap_days) — directional: the
-         earlier-closing contract (A) must be priced higher than the later
-         one (B), the anomaly this strategy exploits. The required gap is
-         tiered by deadline distance (15% when the deadlines are <= 15 days
-         apart, 30% for 16-30 days). A pricier later contract is normal term
-         structure and is never a candidate.
+      3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
+         order-independently by deadline_gap_days()
+      4. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
+         LATER-closing contract (B) must be priced higher than the earlier
+         one (A) by at least the tier (15% when the deadlines are <= 15 days
+         apart, 30% for 16-30 days). That gap is the market-implied
+         probability that the event first happens between the two deadlines;
+         the strategy disputes it. A pricier EARLIER contract is never a
+         candidate — there is no in-between mass to dispute.
 
     Per normalized title, keeps the single best pair (tradeable preferred, then
-    largest price gap) to avoid flooding the portfolio with dozens of similar pairs.
+    largest pB - pA) to avoid flooding the portfolio with dozens of similar pairs.
 
-    tradeable=True when nA + pB < 1 - fee_per_pair_approx(nA, pB) AND pA > pB. Buying
-    NO on A (earlier close) and YES on B (later close) is profitable in 3 of the 4
-    outcome combinations (A=NO/B=NO, A=YES/B=YES, A=NO/B=YES all pay out >= the cost).
-    The 4th, A=YES/B=NO — the underlying crosses the threshold by A's deadline and
-    falls back below it by B's — pays out $0 on both legs, a total loss of nA + pB.
-    This flag assumes that reversal has ~zero probability (P(B) >= P(A), i.e. the
-    later deadline is monotonically at least as likely to resolve YES); it does not
-    hedge against it. That's the time-series independence assumption CLAUDE.md flags,
-    and why same-title pairs (no deadline gap, simpler co-resolution model) are
-    preferred over time-series ones wherever both exist.
+    The legs are YES on A at pA and NO on B at nB, so tradeable=True when
+    pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
+    pair has exactly THREE settlement cells:
+      - event by A's deadline: A=YES, hence B=YES — YES-on-A pays $1, win;
+      - never by B's deadline: A=NO, B=NO — NO-on-B pays $1, win;
+      - in between: A=NO, B=YES — both legs worthless, the full stake
+        (pA + nB plus fees) is lost.
+    A=YES with B=NO cannot occur for a cumulative-deadline pair (YES by the
+    earlier deadline implies YES by the later one); the backtester excludes
+    and counts a pair that settled that way as a premise violation. The flag
+    therefore says a win pays more than the pair costs, NOT that the pair
+    cannot lose: this is a directional bet whose expected value is negative
+    at market prices unless the market overstates the in-between probability
+    (config.time_series_profit_prob). Same-title pairs (no deadline gap,
+    simpler co-resolution model) are preferred over time-series ones wherever
+    both exist.
 
     Args:
         client (Any): Authenticated KalshiClient, used only when markets is None.
@@ -1139,37 +1261,46 @@ def find_time_series_pairs(
                 if mA.event_ticker == mB.event_ticker:
                     continue
 
-                # Deadline gap check: pairs more than 30 days apart are too weakly
-                # correlated for the time-series arbitrage assumption to hold reliably
-                gap_days = (mB.close_time - mA.close_time).days
+                # Deadline gap check: past 30 days too much of the market-implied
+                # in-between probability is genuine for the trade to dispute it.
+                # Order-independent (same helper _pair_max_sum and the backtester use)
+                gap_days = deadline_gap_days(mA, mB)
                 if gap_days > MAX_DEADLINE_GAP_DAYS:
                     continue
 
                 try:
                     pA = float(mA.yes_ask_dollars)
                     pB = float(mB.yes_ask_dollars)
+                    # nA is NOT a leg price here — it is read so the prod log's
+                    # "nA (NO ask)" column stays meaningful (reporting only)
                     nA = float(mA.no_ask_dollars)
+                    # nB IS a leg price: the cost of the NO bought on the later contract
+                    nB = float(mB.no_ask_dollars)
                 except (ValueError, TypeError):
                     continue
 
                 # Enforce the minimum YES price difference required for time-series
                 # pairs, tiered by deadline gap (15% for gaps <= 15 days, 30% for
-                # 16-30 days — wider gaps mean weaker correlation, so more edge is
-                # required). Directional, not abs(): mA is always the earlier-closing
-                # contract (sorted above), and the tradeable arbitrage only exists
-                # when the EARLIER contract is priced higher (pA > pB) — that's the
-                # anomaly being exploited. A pricier later contract (pA < pB) is
-                # normal term structure, not a candidate, and using abs() here let
-                # such pairs through as untradeable placeholders that could still
-                # win the group's one-pair-per-title slot below. Mirrors the
-                # directional check in backtester._find_entry.
-                if pA - pB < min_price_diff_for_gap(gap_days):
+                # 16-30 days — a wider gap leaves more room for the event to land
+                # between the deadlines, so more of the market's in-between mass is
+                # genuine and a bigger gap is demanded before disputing it).
+                # Directional, not abs(): mA is always the earlier-closing contract
+                # (sorted above), and the bet only exists when the LATER contract is
+                # priced higher (pB > pA) — the gap is the market-implied in-between
+                # probability we dispute. A pricier earlier contract (pA > pB) has
+                # no in-between mass to dispute, is not a candidate, and using abs()
+                # here would let such pairs through as untradeable placeholders that
+                # could still win the group's one-pair-per-title slot below. Mirrors
+                # the directional check in backtester._find_entry.
+                if pB - pA < min_price_diff_for_gap(gap_days):
                     continue
 
-                # tradeable=True when buying NO on A and YES on B is guaranteed profitable
-                # in all three resolution scenarios (before exact fee computation).
+                # tradeable=True when a win scenario (YES-on-A or NO-on-B paying $1)
+                # covers both leg prices plus the approximate fees — the leg prices
+                # are pA and nB, not nA/pB. This is not a guarantee against the
+                # in-between loss cell; the pB > pA conjunct restates the direction.
                 # fee_per_pair_approx returns a continuous estimate of total taker fees.
-                tradeable = ((1.0 - nA - pB) > fee_per_pair_approx(nA, pB)) and (pA > pB)
+                tradeable = ((1.0 - pA - nB) > fee_per_pair_approx(pA, nB)) and (pB > pA)
 
                 group_pairs.append(
                     CandidatePair(
@@ -1181,6 +1312,7 @@ def find_time_series_pairs(
                         tradeable=tradeable,
                         canonical_title=norm_title,
                         pair_type="time_series",
+                        nB=nB,
                     )
                 )
 
@@ -1189,10 +1321,10 @@ def find_time_series_pairs(
 
         # Keep only the single best pair per normalized title group to avoid flooding
         # the portfolio with many near-identical positions. Tradeable pairs rank above
-        # non-tradeable ones; within each tier, the largest price gap wins. pA > pB is
-        # now guaranteed for every entry in group_pairs (see the directional filter
-        # above), so no abs() is needed.
-        group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
+        # non-tradeable ones; within each tier, the largest pB - pA (the disputed
+        # in-between probability) wins. pB > pA holds for every entry in group_pairs
+        # (see the directional filter above), so no abs() is needed.
+        group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
     logging.info(
@@ -1212,7 +1344,10 @@ def find_same_title_pairs(
     where the YES ask price differs by >= SAME_TITLE_MIN_PRICE_DIFF (5%).
 
     Both markets should resolve identically (same question), so buying NO on the
-    expensive market and YES on the cheap market is guaranteed profit when nA+pB<1.
+    expensive market and YES on the cheap market pays on at least one leg
+    whenever they co-resolve — a profit when nA+pB<1 (a near-arbitrage priced
+    on the SAME_TITLE_CO_RESOLVE_PROB prior). The legs are NO on market_a at nA
+    and YES on market_b at pB; nB is populated fail-soft for reporting only.
 
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
@@ -1256,7 +1391,7 @@ def find_same_title_pairs(
     candidate_pairs: list = []
     # members = all active markets that share this exact (event_title, title, subtitle)
     # key. Each entry is a separate market object from a different event — any two of
-    # them are candidates for a same-title arbitrage if their prices diverge.
+    # them are candidates for a same-title pair if their prices diverge.
     for (_event_title, title, subtitle), members in by_terms.items():
         # Use whichever of title or subtitle is non-empty as the display label
         raw_title = title or subtitle
@@ -1294,6 +1429,14 @@ def find_same_title_pairs(
                 except (ValueError, TypeError):
                     continue
 
+                # nB is reporting-only for a same-title pair (never priced or
+                # submitted), so an unparseable value must not cost a candidate:
+                # fail-soft to the dataclass default instead of `continue`.
+                try:
+                    nB = float(mB.no_ask_dollars)
+                except (ValueError, TypeError, AttributeError):
+                    nB = 0.0
+
                 # tradeable=True when buying NO on A and YES on B covers all costs.
                 # fee_per_pair_approx returns a continuous estimate of total taker fees.
                 tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)
@@ -1307,6 +1450,7 @@ def find_same_title_pairs(
                         tradeable=tradeable,
                         canonical_title=raw_title,
                         pair_type="same_title",
+                        nB=nB,
                     )
                 )
 
@@ -1333,17 +1477,20 @@ def _pair_orderbooks(
     yes_levels: list[tuple[float, float]],
 ) -> list[tuple[float, float, float]]:
     """
-    Merge-pair NO ask levels (market A) with YES ask levels (market B).
+    Merge-pair the NO leg's ask levels with the YES leg's ask levels.
 
     Both lists sorted ascending by price. Two-pointer sweep: at each step take
     min(remaining_no, remaining_yes) contracts and emit (yes_price, no_price, qty).
     Contracts left over in one book with no counterpart in the other are dropped.
+    Which market each side comes from is the caller's concern (see
+    _leg_ask_levels) — this sweep only knows "the NO leg" and "the YES leg".
 
     Args:
         no_levels (list[tuple[float, float]]): (price, quantity) levels for
-            market A's NO ask, ascending by price.
+            the NO leg's NO ask (whichever market that leg is on), ascending
+            by price.
         yes_levels (list[tuple[float, float]]): (price, quantity) levels for
-            market B's YES ask, ascending by price.
+            the YES leg's YES ask, ascending by price.
 
     Returns:
         list[tuple[float, float, float]]: (yes_price, no_price, qty) tuples,
@@ -1402,6 +1549,49 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
             continue
     levels.sort(key=lambda x: x[0])
     return levels
+
+
+def _leg_ask_levels(
+    pair: Any,
+    ob_a: dict,
+    ob_b: dict,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """
+    Derive the (NO leg, YES leg) ask levels a pair would consume from its two books.
+
+    Buying side S on a market consumes that market's OPPOSITE-side resting
+    bids: a NO buy fills against the YES bids (NO ask = 1 - YES bid) and a YES
+    buy fills against the NO bids (YES ask = 1 - NO bid), both via
+    _bids_to_ask_levels. Which market carries which leg comes from
+    leg_sides(pair.pair_type), so this is the single place the book sides are
+    chosen for enrich_with_orderbook_prices and validate_pair_price:
+
+      same_title  (NO on A, YES on B): NO asks from A's YES bids, YES asks
+                                       from B's NO bids — today's behaviour.
+      time_series (YES on A, NO on B): NO asks from B's YES bids, YES asks
+                                       from A's NO bids.
+
+    Args:
+        pair (Any): CandidatePair (or anything exposing pair_type) whose legs
+            are being priced.
+        ob_a (dict): market_a's parsed order book from _fetch_orderbook —
+            {"yes": [[price, qty], ...], "no": [...]} (bids, dollar strings).
+        ob_b (dict): market_b's parsed order book, same shape.
+
+    Returns:
+        tuple[list, list]: (no_levels, yes_levels), each an ascending
+            [(ask_price, qty), ...] list as produced by _bids_to_ask_levels —
+            exactly the two arguments _pair_orderbooks takes. Either may be
+            empty when the relevant side has no resting bids.
+    """
+    # Map each market to the side bought there; the only source of truth for
+    # which market carries the NO leg is config's side tuples via leg_sides
+    side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
+    if side_a == "no":
+        # NO on A consumes A's YES bids; YES on B consumes B's NO bids
+        return _bids_to_ask_levels(ob_a["yes"]), _bids_to_ask_levels(ob_b["no"])
+    # YES on A consumes A's NO bids; NO on B consumes B's YES bids
+    return _bids_to_ask_levels(ob_b["yes"]), _bids_to_ask_levels(ob_a["no"])
 
 
 # Unit tags for an orderbook side-key candidate set. Dollar sets carry bid prices
@@ -1632,7 +1822,7 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             )
             return None
         yes_key, no_key, unit = selected
-        # Matched side keys are guaranteed present; a side with no resting bids
+        # Matched side keys are always present; a side with no resting bids
         # arrives as null or [] and must read as an empty (not missing) side.
         yes_raw = list(ob[yes_key] or [])
         no_raw  = list(ob[no_key] or [])
@@ -1652,14 +1842,15 @@ def _pair_max_sum(pair: Any) -> float:
     Return the maximum allowed yes_price + no_price sum for one pair's orderbook
     depth levels — the complement of the pair's minimum price-gap threshold.
 
-    same_title pairs use the flat SAME_TITLE_MIN_PRICE_DIFF threshold
-    (sum <= 1 - SAME_TITLE_MIN_PRICE_DIFF). time_series pairs use the
-    deadline-gap-tiered threshold from min_price_diff_for_gap() (sum <=
-    1 - MIN_PRICE_DIFF_SHORT_GAP when the deadlines are <= SHORT_DEADLINE_GAP_DAYS
-    apart, sum <= 1 - MIN_PRICE_DIFF_LONG_GAP for wider gaps up to
-    MAX_DEADLINE_GAP_DAYS). market_a is always the earlier-closing leg for
-    time_series pairs (guaranteed by the sort in find_time_series_pairs), so
-    the gap is non-negative.
+    The sum is over the two LEG prices (the YES leg's YES ask plus the NO leg's
+    NO ask, whichever markets those sit on). same_title pairs use the flat
+    SAME_TITLE_MIN_PRICE_DIFF threshold (sum <= 1 - SAME_TITLE_MIN_PRICE_DIFF).
+    time_series pairs use the deadline-gap-tiered threshold from
+    min_price_diff_for_gap() (sum <= 1 - MIN_PRICE_DIFF_SHORT_GAP when the
+    deadlines are <= SHORT_DEADLINE_GAP_DAYS apart, sum <= 1 -
+    MIN_PRICE_DIFF_LONG_GAP for wider gaps up to MAX_DEADLINE_GAP_DAYS). The
+    gap comes from deadline_gap_days(), which is order-independent, so the
+    ceiling does not depend on which leg closes first.
 
     Args:
         pair (CandidatePair): The pair whose ceiling is needed.
@@ -1669,24 +1860,26 @@ def _pair_max_sum(pair: Any) -> float:
     """
     if pair.pair_type == "time_series":
         # Tier the ceiling by the same deadline gap used at candidate detection
-        gap_days = (pair.market_b.close_time - pair.market_a.close_time).days
+        gap_days = deadline_gap_days(pair.market_a, pair.market_b)
         return 1.0 - min_price_diff_for_gap(gap_days)
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
 
 def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
     """
-    For each tradeable pair, fetch both order books, pair NO asks (market A)
-    with YES asks (market B) using a merge sweep, then filter to only contract
-    pairs whose combined price meets the pair's gap threshold (see
-    _pair_max_sum):
+    For each tradeable pair, fetch both order books, pair the NO leg's asks
+    with the YES leg's asks using a merge sweep (the legs' markets and sides
+    come from _leg_ask_levels), then filter to only contract pairs whose
+    combined LEG price meets the pair's gap threshold (see _pair_max_sum):
 
       same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
       time_series: yes_price + no_price <= 1 - min_price_diff_for_gap(gap)
 
-    nA and pB are replaced with weighted-average fill prices over qualifying
-    contracts. max_contracts is set to the total qualifying count. Pairs with
-    no qualifying contracts are marked tradeable=False.
+    The two leg prices are replaced with weighted-average fill prices over
+    qualifying contracts — written back to nA/pB for a same-title pair and to
+    pA/nB for a time-series pair, leaving the other two quotes untouched.
+    max_contracts is set to the total qualifying count. Pairs with no
+    qualifying contracts are marked tradeable=False.
 
     Args:
         client (Any): Authenticated KalshiClient used to fetch each pair's
@@ -1695,8 +1888,9 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             tradeable=False is passed through unchanged.
 
     Returns:
-        list: One CandidatePair per input pair, in the same order, with nA/pB/
-            tradeable/max_contracts replaced by depth-validated values.
+        list: One CandidatePair per input pair, in the same order, with the
+            leg prices (nA/pB for same_title, pA/nB for time_series),
+            tradeable and max_contracts replaced by depth-validated values.
     """
     # Cache order books by ticker to avoid fetching the same book twice
     # when the same market appears in multiple pairs
@@ -1732,12 +1926,10 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             enriched.append(dc_replace(pair, tradeable=False))
             continue
 
-        # Convert YES bids of market A into NO ask levels (complement prices)
-        # because we are buying NO on market A — YES bids are the counterparties
-        no_levels  = _bids_to_ask_levels(ob_a["yes"])
-        # Convert NO bids of market B into YES ask levels (complement prices)
-        # because we are buying YES on market B — NO bids are the counterparties
-        yes_levels = _bids_to_ask_levels(ob_b["no"])
+        # Derive the ask levels each leg would consume — each buy fills against
+        # the OPPOSITE-side bids of ITS OWN market, and which market carries the
+        # NO leg depends on the pair type (see _leg_ask_levels)
+        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
 
         # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
         paired     = _pair_orderbooks(no_levels, yes_levels)
@@ -1761,28 +1953,38 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             continue
 
         total_qty = sum(qty for _, _, qty in qualifying)
-        # Compute depth-weighted average fill prices to replace the best-ask estimates
-        avg_pB    = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
-        avg_nA    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
+        # Compute depth-weighted average fill prices to replace the best-ask
+        # estimates — one per LEG (the YES leg's YES ask, the NO leg's NO ask)
+        avg_yes   = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
+        avg_no    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
 
         # Re-validate tradeability at the depth-weighted prices (the pair may still be
-        # unprofitable if all qualifying contracts are at the edge of the gap threshold)
-        new_tradeable = (1.0 - avg_nA - avg_pB) > fee_per_pair_approx(avg_nA, avg_pB)
+        # unprofitable if all qualifying contracts are at the edge of the gap threshold).
+        # Deliberately NO direction conjunct here (find_time_series_pairs adds
+        # pB > pA at scan time): every qualifying level already satisfies
+        # avg_yes + avg_no <= 1 - threshold, which implies an executable gap of
+        # at least the tier — a strictly stronger condition than the direction.
+        new_tradeable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
 
         if not new_tradeable:
             logging.info(
-                "Pair '%s' unprofitable after depth adjustment: avg_nA=%.3f avg_pB=%.3f",
-                pair.canonical_title, avg_nA, avg_pB,
+                "Pair '%s' unprofitable after depth adjustment: avg_no=%.3f avg_yes=%.3f",
+                pair.canonical_title, avg_no, avg_yes,
             )
 
-        # Replace best-ask prices and contract count with depth-accurate values;
-        # strategy.py will use these to compute the final Kelly-sized trade
+        # Replace the LEG prices and contract count with depth-accurate values,
+        # writing back to whichever fields are the leg prices for this pair type
+        # (nA/pB for same_title, pA/nB for time_series — the fields
+        # leg_prices() reads); strategy.py sizes the final Kelly trade on them
+        if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
+            leg_updates = {"pA": avg_yes, "nB": avg_no}
+        else:
+            leg_updates = {"nA": avg_no, "pB": avg_yes}
         enriched.append(dc_replace(
             pair,
-            nA=avg_nA,
-            pB=avg_pB,
             tradeable=new_tradeable,
             max_contracts=int(total_qty),
+            **leg_updates,
         ))
 
     tradeable_after = sum(1 for p in enriched if p.tradeable)
@@ -1823,8 +2025,9 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
         )
         return False
 
-    no_levels  = _bids_to_ask_levels(ob_a["yes"])
-    yes_levels = _bids_to_ask_levels(ob_b["no"])
+    # Same side selection as enrichment: each leg consumes its own market's
+    # opposite-side bids, and the NO leg's market depends on the pair type
+    no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
     paired     = _pair_orderbooks(no_levels, yes_levels)
     # Same per-pair gap ceiling used at scan time (deadline-gap-tiered for
     # time_series) — the trade must still qualify at execution time

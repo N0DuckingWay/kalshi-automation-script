@@ -24,7 +24,13 @@ from kalshi_betting.backtester import (
     _settlement_receipt,
     run_backtest,
 )
-from kalshi_betting.config import MAX_DEADLINE_GAP_DAYS, fee_leg_exact
+from kalshi_betting.config import (
+    BUDGET_FRACTION,
+    MAX_DEADLINE_GAP_DAYS,
+    fee_leg_exact,
+    fee_per_pair_approx,
+    time_series_profit_prob,
+)
 from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
 
@@ -209,14 +215,36 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
 
 
 class TestSettlementReceipt:
-    def test_payoff_table(self):
+    """_settlement_receipt pays n per leg whose market resolved to the side
+    that leg bought (scanner.leg_sides), so the table depends on pair type."""
+
+    def test_same_title_payoff_table(self):
         # n NO contracts on A + n YES contracts on B; each winning contract
         # pays exactly $1 — the receipt is independent of entry prices.
         n = 10
-        assert _settlement_receipt(n, "yes", "yes") == 10   # only B pays
-        assert _settlement_receipt(n, "no", "yes") == 20    # both pay
-        assert _settlement_receipt(n, "no", "no") == 10     # only A pays
-        assert _settlement_receipt(n, "yes", "no") == 0     # loss scenario
+        assert _settlement_receipt(n, "yes", "yes", "same_title") == 10   # only B pays
+        assert _settlement_receipt(n, "no", "yes", "same_title") == 20    # both pay
+        assert _settlement_receipt(n, "no", "no", "same_title") == 10     # only A pays
+        assert _settlement_receipt(n, "yes", "no", "same_title") == 0     # loss scenario
+
+    def test_time_series_three_cell_table(self):
+        # n YES on the earlier contract A + n NO on the later contract B.
+        # Exactly three cells exist for a cumulative-deadline pair.
+        n = 10
+        assert _settlement_receipt(n, "yes", "yes", "time_series") == 10  # event by A: YES on A pays
+        assert _settlement_receipt(n, "no", "no", "time_series") == 10    # never by B: NO on B pays
+        assert _settlement_receipt(n, "no", "yes", "time_series") == 0    # in between: loss cell
+
+    def test_time_series_premise_violation_raises(self):
+        # Earlier YES with later NO cannot happen for a cumulative-deadline
+        # pair — it is a premise violation, never a payout cell.
+        with pytest.raises(ValueError, match="premise violated"):
+            _settlement_receipt(10, "yes", "no", "time_series")
+
+    def test_unknown_pair_type_uses_same_title_sides(self):
+        # Mirrors scanner.leg_sides: anything but "time_series" is same-title,
+        # so an unknown label can never be paid as the directional bet.
+        assert _settlement_receipt(10, "no", "yes", "bogus") == 20
 
 
 def _candle(ts: int, yes_ask: float, no_ask: float) -> dict:
@@ -238,31 +266,57 @@ class TestFindEntryDirection:
               "close_time": "2026-02-14T00:00:00+00:00"}
         return mA, mB
 
-    def test_time_series_rejects_pricier_later_contract(self):
-        # Earlier cheap (0.30), later pricey (0.60): normal term structure —
-        # the live scanner never trades this direction (requires the EARLIER
-        # contract to be the expensive one), so the backtest must not either.
-        mA, mB = self._markets()
-        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
-        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        entry = _find_entry(candles_early, candles_late, mA, mB,
-                            "time_series", date(2026, 1, 1))
-        assert entry is None
-
-    def test_time_series_accepts_pricier_earlier_contract(self):
-        # Earlier pricey (pA=0.60, nA=0.40), later cheap (pB=0.30). At the
-        # 13-day deadline gap the short tier applies: price gap 0.30 >= 0.15,
-        # nA+pB = 0.70 <= 0.85, spread clears fees.
+    def test_time_series_rejects_pricier_earlier_contract(self):
+        # Earlier pricey (0.60), later cheap (0.30): the live scanner never
+        # trades this direction (the anomaly it disputes is the LATER contract
+        # priced higher), so the backtest must not either.
         mA, mB = self._markets()
         candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
         candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1))
+        assert entry is None
+
+    def test_time_series_accepts_pricier_later_contract(self):
+        # Earlier cheap (pA=0.30), later pricey (pB=0.60, nB=0.40). At the
+        # 13-day deadline gap the short tier applies: price gap 0.30 >= 0.15,
+        # leg prices pA+nB = 0.70 <= 0.85, spread clears fees.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
         assert entry is not None
-        # Market A must be the earlier-closing contract (the NO leg)
+        # Market A must be the earlier-closing contract (the YES leg)
         assert entry["mA"]["ticker"] == "EARLY"
-        assert entry["pA"] == pytest.approx(0.60)
-        assert entry["pB"] == pytest.approx(0.30)
+        assert entry["pA"] == pytest.approx(0.30)
+        assert entry["pB"] == pytest.approx(0.60)
+        assert entry["nA"] == pytest.approx(0.70)
+        assert entry["nB"] == pytest.approx(0.40)
+
+    def test_time_series_swaps_to_keep_a_as_the_earlier_contract(self):
+        # Same fixture with the markets passed in the opposite order: A must
+        # still come back as EARLY, with every quote following its market.
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        entry = _find_entry(candles_late, candles_early, mB, mA,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+        assert entry["mB"]["ticker"] == "LATE"
+        assert (entry["pA"], entry["nB"]) == pytest.approx((0.30, 0.40))
+
+    def test_time_series_wide_later_book_is_rejected_by_the_sum_ceiling(self):
+        # Same YES asks (gap 0.30 clears the tier) but the later NO ask is
+        # 0.60: the traded legs pA+nB = 0.90 exceed the short-tier ceiling of
+        # 0.85 — the ceiling is applied to the LEG prices, not to (nA, pB).
+        mA, mB = self._markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.60)]
+        entry = _find_entry(candles_early, candles_late, mA, mB,
+                            "time_series", date(2026, 1, 1))
+        assert entry is None
 
     def test_same_title_canonicalizes_by_price(self):
         # For same-title pairs, direction is price-only: A = expensive side.
@@ -273,6 +327,8 @@ class TestFindEntryDirection:
                             "same_title", date(2026, 1, 1))
         assert entry is not None
         assert entry["mA"]["ticker"] == "LATE"  # the pricier side becomes A
+        # The canonical B's NO ask is carried too (reporting only for same_title)
+        assert entry["nB"] == pytest.approx(0.47)
 
 
 class TestFindEntryTieredThreshold:
@@ -289,6 +345,9 @@ class TestFindEntryTieredThreshold:
         return mA, mB
 
     def _entry(self, gap_days: int, pA: float, pB: float):
+        # Tight books on both legs (NO ask = 1 - YES ask), so the traded leg
+        # prices pA + nB sum to exactly 1 - (pB - pA): the price-sum ceiling
+        # binds precisely when the gap is under the tier.
         mA, mB = self._markets(gap_days)
         candles_early = [_candle(_MONDAY_TS, pA, round(1.0 - pA, 4))]
         candles_late  = [_candle(_MONDAY_TS, pB, round(1.0 - pB, 4))]
@@ -296,28 +355,30 @@ class TestFindEntryTieredThreshold:
                            "time_series", date(2026, 1, 1))
 
     def test_short_gap_18pct_price_gap_accepted(self):
-        # 10-day deadline gap → 15% tier; pA=0.48/pB=0.30 (18% gap, nA+pB=0.82
-        # <= 0.85) qualifies
-        entry = self._entry(10, pA=0.48, pB=0.30)
+        # 10-day deadline gap → 15% tier; pA=0.30/pB=0.48 (18% gap, leg prices
+        # pA+nB = 0.30+0.52 = 0.82 <= 0.85) qualifies
+        entry = self._entry(10, pA=0.30, pB=0.48)
         assert entry is not None
         assert entry["mA"]["ticker"] == "EARLY"
+        assert entry["nB"] == pytest.approx(0.52)
 
     def test_long_gap_18pct_price_gap_rejected(self):
         # The SAME prices at a 20-day deadline gap fall under the 30% tier
-        # and must be rejected — this is exactly what the old flat 15%
-        # threshold would have (wrongly) accepted
-        assert self._entry(20, pA=0.48, pB=0.30) is None
+        # and must be rejected — this is exactly what a flat 15% threshold
+        # would (wrongly) accept
+        assert self._entry(20, pA=0.30, pB=0.48) is None
 
     def test_long_gap_38pct_price_gap_accepted(self):
-        # 20-day gap → 30% tier; pA=0.68/pB=0.30 (38% gap, nA+pB=0.62 <= 0.70)
-        # clears both the tiered threshold and the tiered price-sum ceiling
-        entry = self._entry(20, pA=0.68, pB=0.30)
+        # 20-day gap → 30% tier; pA=0.30/pB=0.68 (38% gap, leg prices pA+nB =
+        # 0.30+0.32 = 0.62 <= 0.70) clears both the tiered threshold and the
+        # tiered price-sum ceiling
+        entry = self._entry(20, pA=0.30, pB=0.68)
         assert entry is not None
 
     def test_over_max_gap_rejected_regardless_of_price(self):
         # 35-day deadline gap exceeds MAX_DEADLINE_GAP_DAYS — even a 40% price
         # gap never enters
-        assert self._entry(35, pA=0.70, pB=0.30) is None
+        assert self._entry(35, pA=0.30, pB=0.70) is None
 
     def test_same_title_ignores_deadline_gap(self):
         # same_title keeps the flat 5% threshold: a 6% divergence on markets
@@ -339,10 +400,11 @@ class TestFindEntryTieredThreshold:
               "close_time": "2026-02-01T23:00:00+00:00"}
         mB = {"ticker": "LATE", "event_ticker": "E2",
               "close_time": "2026-02-17T01:00:00+00:00"}
-        # 25% price gap: clears the short tier (>= 0.15) but not the long one
-        # (>= 0.30); nA + pB = 0.75 <= 0.85, the short tier's price-sum ceiling.
-        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        candles_late  = [_candle(_MONDAY_TS, 0.35, 0.65)]
+        # 25% price gap (later 0.60 over earlier 0.35): clears the short tier
+        # (>= 0.15) but not the long one (>= 0.30); leg prices pA + nB = 0.75
+        # <= 0.85, the short tier's price-sum ceiling.
+        candles_early = [_candle(_MONDAY_TS, 0.35, 0.65)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1))
         assert entry is not None
@@ -357,9 +419,10 @@ class TestFindEntryTieredThreshold:
               "close_time": "2026-02-01T23:00:00+00:00"}
         mB = {"ticker": "LATE", "event_ticker": "E2",
               "close_time": "2026-03-04T01:00:00+00:00"}
-        # 40% price gap clears the long tier (>= 0.30); nA + pB = 0.60 <= 0.70.
-        candles_early = [_candle(_MONDAY_TS, 0.70, 0.30)]
-        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        # 40% price gap (later 0.70 over earlier 0.30) clears the long tier
+        # (>= 0.30); leg prices pA + nB = 0.60 <= 0.70.
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.70, 0.30)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1))
         assert entry is not None
@@ -373,7 +436,8 @@ class TestFindEntryHorizon:
 
     def _markets(self):
         # Same 13-day-gap fixture as TestFindEntryDirection — close_a
-        # 2026-02-01, close_b 2026-02-14.
+        # 2026-02-01, close_b 2026-02-14; every case prices the later
+        # contract higher (0.60 over 0.30) so the price gap always qualifies.
         mA = {"ticker": "EARLY", "event_ticker": "E1",
               "close_time": "2026-02-01T00:00:00+00:00"}
         mB = {"ticker": "LATE", "event_ticker": "E2",
@@ -382,8 +446,8 @@ class TestFindEntryHorizon:
 
     def test_none_horizon_matches_unfiltered_behavior(self):
         mA, mB = self._markets()
-        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1), max_horizon_days=None)
         assert entry is not None
@@ -393,8 +457,8 @@ class TestFindEntryHorizon:
         # At the first Monday (Jan 5), close_b (Feb 14) is 40 days out — well
         # within a generous 60-day horizon, so entry is unaffected.
         mA, mB = self._markets()
-        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1), max_horizon_days=60)
         assert entry is not None
@@ -407,8 +471,8 @@ class TestFindEntryHorizon:
         # Monday. A single candle at _MONDAY_TS is found by _candle_at_or_before
         # for every later checkpoint too, so price qualifies throughout.
         mA, mB = self._markets()
-        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1), max_horizon_days=20)
         assert entry is not None
@@ -420,8 +484,8 @@ class TestFindEntryHorizon:
         # A 3-day horizon excludes every checkpoint in range, even though the
         # price gap would otherwise qualify at every one of them.
         mA, mB = self._markets()
-        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
-        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
         entry = _find_entry(candles_early, candles_late, mA, mB,
                             "time_series", date(2026, 1, 1), max_horizon_days=3)
         assert entry is None
@@ -676,6 +740,17 @@ class TestActiveTickerRelease:
     no earlier candle). Both candidates therefore contain TX, at different entry
     dates. TX settles before its close_time — an early determination, which is
     what makes re-entry on a shared ticker reachable at all.
+
+    Prices: TX yes 0.40 / no 0.60, TY yes 0.30 / no 0.70, TZ yes 0.75 / no
+    0.25. Same-title TX/TY: TX is the pricier side, gap 0.10 >= 0.05, legs
+    nA+pB = 0.60+0.30 = 0.90 <= 0.95. Time-series TX/TZ: TX is the earlier
+    contract and TZ (later) is priced 0.35 higher, clearing the 30% long-gap
+    tier; legs pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval
+    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.204 — positive, so
+    the pair really is entered. TX/TY as a time-series pair (13-day gap, TY
+    earlier at 0.30 vs TX 0.40) misses the 15% tier, and TY/TZ is 31 days
+    apart — beyond MAX_DEADLINE_GAP_DAYS — so TX/TZ is the only time-series
+    candidate.
     """
 
     _M2 = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
@@ -702,13 +777,13 @@ class TestActiveTickerRelease:
 
     def _run(self, monkeypatch, tx_settlement):
         candles = {
-            # TX: expensive YES with a cheap NO — clears the same-title gap
-            # against TY and the 30% long-gap tier against TZ
-            "TX": [_candle(_MONDAY_TS, 0.90, 0.05)],
-            "TY": [_candle(_MONDAY_TS, 0.70, 0.30)],
+            # TX: pricier than TY (same-title gap) yet cheaper than the
+            # later-closing TZ (time-series gap) — see the class docstring
+            "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
+            "TY": [_candle(_MONDAY_TS, 0.30, 0.70)],
             # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
             # enter until then
-            "TZ": [_candle(self._M2, 0.10, 0.90)],
+            "TZ": [_candle(self._M2, 0.75, 0.25)],
         }
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: self._markets(tx_settlement))
@@ -1410,16 +1485,16 @@ class TestRunBacktestCrossTypeDedup:
          "close_time": "2026-02-08T00:00:00+00:00",
          "settlement_ts": "2026-02-08T12:00:00+00:00"},
     ]
-    # pA - pB = 0.25 clears both the 5% same-title and the 15% short-gap
-    # time-series threshold, and nA + pB = 0.55 <= 0.85 satisfies the
-    # short-tier sum ceiling. DA's book is deliberately WIDE (yes 0.60 /
-    # no 0.20): on a tight book (nA == 1 - pA) the time-series independence
-    # probability 1 - pA*(1 - pB) always yields a non-positive Kelly fraction,
-    # so the time-series copy would be dropped in Pass 1 before the dedup under
-    # test ever sees it.
+    # DA (earlier, closes Feb 1) yes 0.30 / no 0.70; DB (later, Feb 8) yes
+    # 0.60 / no 0.40 — the flow-through fixture. Same-title copy: DB is the
+    # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
+    # Time-series copy: the later contract is priced 0.30 higher, clearing the
+    # 15% short-gap tier; legs pA+nB = 0.30+0.40 = 0.70 <= 0.85, and under the
+    # interval discount the Kelly fraction is ~0.188 — positive, so BOTH
+    # copies form in Pass 1 and the dedup under test is not vacuous.
     _CANDLES = {
-        "DA": [_candle(_MONDAY_TS, 0.60, 0.20)],
-        "DB": [_candle(_MONDAY_TS, 0.35, 0.65)],
+        "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+        "DB": [_candle(_MONDAY_TS, 0.60, 0.40)],
     }
 
     def test_fixture_lands_in_both_groupings(self):
@@ -1469,6 +1544,8 @@ class TestRunBacktestCrossTypeDedup:
 
         assert len(trades) == 1
         assert trades[0].pair_type == "same_title"
+        # The same-title copy canonicalizes A as the pricier side (DB)
+        assert (trades[0].ticker_a, trades[0].ticker_b) == ("DB", "DA")
 
 
 class TestCheckpointOpeningBalanceSizing:
@@ -1558,3 +1635,184 @@ class TestCheckpointOpeningBalanceSizing:
         assert t.total_cost + t.fees <= 1000.0 * 0.60 + 1e-9
         # Not shrunk: it is still the full-size trade the checkpoint budget buys.
         assert t.total_cost + t.fees > 1000.0 * 0.50
+
+
+class TestRunBacktestTimeSeriesFlow:
+    """End-to-end flow of a time-series pair through run_backtest.
+
+    Fixture (the plan's hand-picked illustrative numbers, not market data):
+    EA closes 2026-02-01 and EB 2026-02-14 (13-day gap, short tier, threshold
+    0.15), same event_title "EV", distinct event tickers, titles that
+    normalize to one key but are NOT exact-title equal (so no same-title copy
+    forms to dedup the pair away), open_time 2026-01-01, settlement = close +
+    12h. Candles at the first Monday: EA yes 0.30 / no 0.70, EB yes 0.60 / no
+    0.40. Balance $10,000.
+
+    Legs are YES on EA at 0.30 and NO on EB at 0.40: gap 0.30 >= 0.15, cost
+    0.70 <= 0.85, fee_approx 0.0315 < 0.30 => entry. Pass 1: net 0.2685,
+    b 0.3836, p = 1 - 0.75*0.30 = 0.775, f* = 0.1884 (below the 0.20 cap, so
+    Kelly sizes it). Pass 2: budget 1884.08 => raw n 2691, shrunk to 2575 by
+    the fee loop (cost 1802.50, exact fees 81.12, cash out 1883.62), win
+    profit 691.38. Settlement: event by EA => +691.38; never by EB =>
+    +691.38; in between => -1883.62; EA yes / EB no is a premise violation
+    and is excluded with a counted WARNING.
+    """
+
+    _PA, _NA = 0.30, 0.70   # EA (earlier) YES / NO ask
+    _PB, _NB = 0.60, 0.40   # EB (later) YES / NO ask
+
+    @staticmethod
+    def _markets(result_a: str, result_b: str) -> list[dict]:
+        return [
+            {"ticker": "EA", "event_ticker": "EVA", "event_title": "EV",
+             "title": "Team wins by February 1, 2026", "subtitle": "",
+             "result": result_a,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "EB", "event_ticker": "EVB", "event_title": "EV",
+             "title": "Team wins by February 14, 2026", "subtitle": "",
+             "result": result_b,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-14T00:00:00+00:00",
+             "settlement_ts": "2026-02-14T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch, result_a, result_b, eb_yes=None, eb_no=None):
+        eb_yes = self._PB if eb_yes is None else eb_yes
+        eb_no = self._NB if eb_no is None else eb_no
+        candles = {
+            "EA": [_candle(_MONDAY_TS, self._PA, self._NA)],
+            "EB": [_candle(_MONDAY_TS, eb_yes, eb_no)],
+        }
+        markets = self._markets(result_a, result_b)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    def test_fixture_is_a_time_series_group_only(self):
+        # The pair must be discovered by the normalized-title grouping and NOT
+        # by the exact-title one — otherwise the cross-type dedup would drop
+        # the very candidate this class exercises.
+        markets = self._markets("yes", "yes")
+        assert len(_group_by_normalized_title(markets)) == 1
+        assert _group_by_exact_title(markets) == {}
+
+    @staticmethod
+    def _expected_kelly(pA, nB, pB):
+        # p - (1 - p)/b computed from the config helpers, so this pins the
+        # model THROUGH run_backtest rather than a hardcoded number
+        net = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
+        b = net / (pA + nB)
+        p = time_series_profit_prob(pA, pB)
+        return p - (1.0 - p) / b
+
+    def _assert_entry_and_sizing(self, t):
+        assert t.pair_type == "time_series"
+        assert (t.ticker_a, t.ticker_b) == ("EA", "EB")
+        assert t.entry_date == date(2026, 1, 5)
+        assert t.exit_date == date(2026, 2, 14)
+        assert t.entry_pA == pytest.approx(self._PA)
+        assert t.entry_pB == pytest.approx(self._PB)
+        assert t.entry_nA == pytest.approx(self._NA)
+        assert t.entry_nB == pytest.approx(self._NB)
+        expected_f = self._expected_kelly(self._PA, self._NB, self._PB)
+        assert expected_f == pytest.approx(0.1884, abs=5e-4)
+        assert expected_f < BUDGET_FRACTION  # Kelly, not the cap, sized this pair
+        assert t.kelly_fraction == pytest.approx(expected_f)
+        assert t.balance_at_entry == pytest.approx(10_000.0)
+        assert t.n == 2575
+        # Sized on the LEG prices (pA + nB), never on (nA + pB)
+        assert t.total_cost == pytest.approx(2575 * (self._PA + self._NB))
+        assert t.total_cost == pytest.approx(1802.50)
+        assert t.fees == pytest.approx(
+            fee_leg_exact(2575, self._PA) + fee_leg_exact(2575, self._NB))
+        assert t.fees == pytest.approx(81.12)
+        assert t.total_cost + t.fees <= 10_000.0 * t.kelly_fraction + 1e-9
+        assert t.expected_payoff == pytest.approx(691.38)
+
+    def test_event_by_earlier_deadline_wins(self, monkeypatch):
+        # EA yes, EB yes: YES on EA pays n, NO on EB worthless
+        trades, equity = self._run(monkeypatch, "yes", "yes")
+        assert len(trades) == 1
+        t = trades[0]
+        self._assert_entry_and_sizing(t)
+        assert t.actual_payoff == pytest.approx(2575.0)
+        assert t.profit == pytest.approx(691.38)
+        assert t.slippage == pytest.approx(0.0, abs=1e-9)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+
+    def test_event_never_by_later_deadline_wins(self, monkeypatch):
+        # EA no, EB no: NO on EB pays n, YES on EA worthless
+        trades, equity = self._run(monkeypatch, "no", "no")
+        assert len(trades) == 1
+        t = trades[0]
+        self._assert_entry_and_sizing(t)
+        assert t.actual_payoff == pytest.approx(2575.0)
+        assert t.profit == pytest.approx(691.38)
+        assert t.slippage == pytest.approx(0.0, abs=1e-9)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+
+    def test_event_in_between_loses_the_full_stake(self, monkeypatch):
+        # EA no, EB yes: both legs worthless — the loss cell
+        trades, equity = self._run(monkeypatch, "no", "yes")
+        assert len(trades) == 1
+        t = trades[0]
+        self._assert_entry_and_sizing(t)
+        assert t.actual_payoff == pytest.approx(0.0)
+        assert t.profit == pytest.approx(-1883.62)
+        assert t.profit == pytest.approx(-(t.total_cost + t.fees))
+        assert t.slippage == pytest.approx(-1883.62 - 691.38)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1883.62)
+
+    def test_premise_violation_is_excluded_and_warned(self, monkeypatch, caplog):
+        # EA yes, EB no cannot happen for a cumulative-deadline pair: the
+        # candidate is excluded (never traded, never paid), counted once, and
+        # the equity curve stays flat.
+        with caplog.at_level("WARNING"):
+            trades, equity = self._run(monkeypatch, "yes", "no")
+        assert trades == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        premise = [w for w in warnings if "cumulative-deadline premise" in w]
+        assert len(premise) == 1
+        assert premise[0].startswith("Excluded 1 time-series candidate(s)")
+        assert "earlier YES, later NO" in premise[0]
+        assert "snapshot markets" in premise[0]
+        # Flat equity curve: nothing left and nothing came back
+        assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
+        assert equity["portfolio_value"].max() == pytest.approx(10_000.0)
+
+    def test_no_premise_violation_logs_nothing(self, monkeypatch, caplog):
+        # Summary-warning idiom: silent at zero
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch, "yes", "yes")
+        assert not any("cumulative-deadline premise" in r.getMessage()
+                       for r in caplog.records)
+
+    def test_wide_gap_is_capped_at_budget_fraction(self, monkeypatch):
+        # Later candle 0.70 / 0.30: gap 0.40, legs 0.60, p = 0.70 — the
+        # uncapped Kelly fraction is ~0.214, so BUDGET_FRACTION binds.
+        trades, _ = self._run(monkeypatch, "yes", "yes", eb_yes=0.70, eb_no=0.30)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.pair_type == "time_series"
+        assert t.entry_nB == pytest.approx(0.30)
+        uncapped = self._expected_kelly(self._PA, 0.30, 0.70)
+        assert uncapped == pytest.approx(0.214, abs=1e-3)
+        assert uncapped > BUDGET_FRACTION
+        assert t.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert t.total_cost + t.fees <= 10_000.0 * BUDGET_FRACTION + 1e-9
+
+    def test_wide_later_book_drives_kelly_negative_and_skips(self, monkeypatch):
+        # Same YES asks but the later NO ask is 0.50: legs pA+nB = 0.80 still
+        # clear the 0.85 ceiling, yet the edge no longer covers the modelled
+        # loss probability — Kelly < 0, so nothing is entered.
+        assert self._expected_kelly(self._PA, 0.50, self._PB) < 0
+        trades, equity = self._run(monkeypatch, "yes", "yes", eb_yes=0.60, eb_no=0.50)
+        assert trades == []
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0)

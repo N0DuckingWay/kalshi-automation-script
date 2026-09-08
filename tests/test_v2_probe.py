@@ -174,12 +174,37 @@ class TestBodyConstruction:
             ticker=TICKER, price_level_structure="", price_ranges=None, exchange_index=0,
         )
         body = v2_probe._no_buy_body(market, 0.41)
-        reference = trader._build_no_order_v2(v2_probe._probe_spec(market, 0.41))
+        reference = trader._build_no_order_v2(v2_probe._probe_leg(market, 0.41))
         # Everything except count (random client_order_id aside) is the
         # builder's own output — the probe verifies the real code.
         for key in ("ticker", "side", "price", "time_in_force", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
+        assert body["count"] == v2_probe.PROBE_COUNT_STR
+
+    def test_probe_leg_is_a_real_trader_leg(self):
+        # The probe hands the builders the SAME leg type the live path builds
+        # (trader._ordered_legs), so nothing about the probe body can come from
+        # a stand-in the builders would read differently.
+        market = SimpleNamespace(
+            ticker=TICKER, price_level_structure="", price_ranges=None, exchange_index=0,
+        )
+        leg = v2_probe._probe_leg(market, 0.41)
+        assert isinstance(leg, trader._Leg)
+        assert leg.market is market
+        assert (leg.side, leg.price_dollars, leg.count) == ("no", 0.41, 1)
+        assert leg.label == "NO on v2-probe"
+
+    def test_close_body_uses_the_real_rollback_builder_then_overrides_only_count(self):
+        market = SimpleNamespace(
+            ticker=TICKER, price_level_structure="", price_ranges=None, exchange_index=0,
+        )
+        body = v2_probe._no_close_body(market)
+        reference = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
+        for key in ("ticker", "side", "price", "time_in_force", "exchange_index",
+                    "reduce_only", "post_only"):
+            assert body[key] == reference[key]
+        assert body["reduce_only"] is True
         assert body["count"] == v2_probe.PROBE_COUNT_STR
 
 

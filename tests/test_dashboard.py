@@ -14,16 +14,38 @@ import pandas as pd
 import pytest
 
 from kalshi_betting.backtester import BacktestTrade
-from kalshi_betting.dashboard import _max_drawdown, _section_diagnostics, _section_risk
+from kalshi_betting.config import (
+    SAME_TITLE_CO_RESOLVE_PROB,
+    fee_leg_exact,
+    fee_per_pair_approx,
+    time_series_profit_prob,
+)
+from kalshi_betting.dashboard import (
+    _kelly_fraction,
+    _max_drawdown,
+    _section_diagnostics,
+    _section_risk,
+)
 
 _XSS_TITLE = "<script>alert(1)</script>Will BTC exceed $80k by December 2026 or later?"
 
 
-def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float = 5.0) -> BacktestTrade:
-    """Factory for a minimal valid BacktestTrade covering every field the
-    dashboard section builders under test read."""
-    total_cost = 4.75
-    fees = 0.10
+def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float | None = None) -> BacktestTrade:
+    """Factory for a coherent time-series BacktestTrade covering every field the
+    dashboard section builders under test read.
+
+    YES on the earlier contract at 0.30 and NO on the later at 0.40 (later YES
+    ask 0.60, earlier NO ask 0.70 — reporting only), n=5, settled in the
+    "event by A" win cell (A=YES, hence B=YES). _section_risk calls the
+    five-argument _kelly_fraction on these entry prices live.
+    """
+    n = 5
+    entry_pA, entry_pB, entry_nA, entry_nB = 0.30, 0.60, 0.70, 0.40
+    total_cost = n * (entry_pA + entry_nB)
+    fees = fee_leg_exact(n, entry_pA) + fee_leg_exact(n, entry_nB)
+    expected_payoff = n * (1.0 - entry_pA - entry_nB) - fees
+    if profit is None:
+        profit = expected_payoff
     return BacktestTrade(
         pair_type="time_series",
         ticker_a="TICK-A",
@@ -33,24 +55,59 @@ def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float = 5.0) -> B
         category="Crypto",
         entry_date=date(2026, 1, 5),
         exit_date=date(2026, 1, 12),
-        entry_pA=0.40,
-        entry_pB=0.35,
-        entry_nA=0.60,
-        n=5,
+        entry_pA=entry_pA,
+        entry_pB=entry_pB,
+        entry_nA=entry_nA,
+        entry_nB=entry_nB,
+        n=n,
         total_cost=total_cost,
         fees=fees,
-        outcome_a="no",
+        outcome_a="yes",
         outcome_b="yes",
-        actual_payoff=5.0,
+        actual_payoff=float(n),
         profit=profit,
         profit_ratio=profit / (total_cost + fees),
         monthly_profit_ratio=0.1,
         kelly_fraction=0.1,
-        expected_payoff=0.15,
-        slippage=profit - 0.15,
+        expected_payoff=expected_payoff,
+        slippage=profit - expected_payoff,
         holding_days=7,
         balance_at_entry=1000.0,
     )
+
+
+class TestKellyFraction:
+    """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
+    prices time-series pairs through config.time_series_profit_prob."""
+
+    def test_time_series_flow_through_fixture(self):
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1884
+        pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
+        net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
+        b = net_spread / (pA + nB)
+        p = time_series_profit_prob(pA, pB)
+        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(p - (1 - p) / b)
+        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1884, abs=1e-4)
+
+    def test_time_series_wide_book_clamps_to_zero(self):
+        assert _kelly_fraction(0.30, 0.70, 0.60, 0.50, "time_series") == 0.0
+
+    def test_same_title_prices_nA_pB_on_the_prior(self):
+        nA, pB = 0.20, 0.30
+        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+        b = net_spread / (nA + pB)
+        p = SAME_TITLE_CO_RESOLVE_PROB
+        assert _kelly_fraction(0.70, nA, pB, 0.65, "same_title") == pytest.approx(p - (1 - p) / b)
+
+    def test_risk_section_renders_time_series_trade(self):
+        # End-to-end through _section_risk: the scatter is built from the
+        # five-argument helper on the trade's own entry prices
+        equity_df = pd.DataFrame({
+            "date": [date(2026, 1, 5), date(2026, 1, 12)],
+            "portfolio_value": [1000.0, 1001.33],
+        })
+        html_out = _section_risk([make_trade()], equity_df, initial_balance=1000.0)
+        assert "Kelly Fraction vs Actual Fraction of Balance" in html_out
 
 
 class TestTitleEscaping:

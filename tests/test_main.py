@@ -210,12 +210,27 @@ class TestSetupLogging:
 #   Held Event / Held Question -> HELD-A (held in prod) / HELD-B — forms a
 #       tradeable pair in dev (no held-ticker filtering) but never in prod.
 #
+# Every market above shares ONE close time (_CLOSE), so no time-series pair
+# with a real deadline gap exists among them. Any zero-gap time-series copy
+# the finder produces for these same-title groups (a zero-day gap is a valid
+# short-tier gap) is dropped by main._dedup_pairs in favour of the same-title
+# entry, so the candidate set of every replay is the same-title set only.
+#
+# An OPT-IN fifth group (_live_shape_client(include_time_series=True)) adds
+# the 2026-09 time-series fixture — TS-EARLY (closes _CLOSE, YES 0.30) /
+# TS-LATE (closes 10 days later, YES 0.60 / NO 0.40) on distinct event
+# tickers whose titles differ ONLY by date, so the same-title scanner cannot
+# pair them and the time-series finder must. It defaults OFF because the
+# ingest census pins below ({0: 7, 1: 1} / {0: 7}) count the fixed set.
+#
 # The one tradeable pair's cheap leg can be moved onto another shard with
 # _live_shape_client(same_cheap_shard=...), which is what the cross-shard
 # routing and collateral-transfer replays use.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _CLOSE = "2026-12-01T00:00:00Z"
+# 10 days after _CLOSE — a short-tier deadline gap (<= SHORT_DEADLINE_GAP_DAYS)
+_CLOSE_LATE = "2026-12-11T00:00:00Z"
 
 _TICKER_SAME_EXP = "SAME-EXP"
 _TICKER_SAME_CHEAP = "SAME-CHEAP"
@@ -225,6 +240,13 @@ _TICKER_SHARD_A = "SHARD1-A"
 _TICKER_SHARD_B = "SHARD1-B"
 _TICKER_HELD_A = "HELD-A"
 _TICKER_HELD_B = "HELD-B"
+_TICKER_TS_EARLY = "TS-EARLY"
+_TICKER_TS_LATE = "TS-LATE"
+# Titles differ only by their date token, so normalize_title collapses both
+# to the same key (a time-series group) while the exact-title same-title
+# grouping keeps them apart.
+_TITLE_TS_EARLY = "Will Z happen by December 1, 2026?"
+_TITLE_TS_LATE = "Will Z happen by December 11, 2026?"
 
 _TICK_PRICE_RANGES = [
     {"start": "0", "end": "0.01", "step": "0.0001"},
@@ -261,7 +283,7 @@ _LOW_BALANCE_PAYLOAD = {
 }
 
 # Everything on shard 0, nothing on shard 1 — the collateral-transfer replays
-# put the cheap leg on shard 1, so leg B's cash requirement is a pure deficit
+# put the cheap leg on shard 1, so market B's (the YES leg's) cash requirement is a pure deficit
 # that only an intra-exchange transfer out of shard 0's surplus can cover.
 _SHARD1_EMPTY_BALANCE = {
     "balance": 114,
@@ -353,17 +375,20 @@ def _mk_market(
     exchange_index: int = 0,
     price_level_structure: str = "",
     price_ranges: list | None = None,
+    close_time: str = _CLOSE,
 ) -> dict:
     """One raw market JSON dict in the current (2026-08+) wire shape: no
     "subtitle" key at all (only yes_sub_title), *_dollars price strings, and
-    an explicit exchange_index."""
+    an explicit exchange_index. `close_time` defaults to the shared _CLOSE so
+    the fixed market set never forms a deadline-gapped time-series pair; the
+    opt-in time-series group overrides it."""
     d = {
         "ticker": ticker,
         "event_ticker": event_ticker,
         "title": title,
         "yes_sub_title": sub,
         "status": "active",
-        "close_time": _CLOSE,
+        "close_time": close_time,
         "yes_ask_dollars": yes_ask,
         "no_ask_dollars": no_ask,
         "yes_bid_dollars": no_ask,
@@ -379,11 +404,14 @@ def _ev(title: str, market: dict) -> dict:
     return {"title": title, "markets": [market]}
 
 
-def _build_events(same_cheap_shard: int = 0) -> list:
+def _build_events(same_cheap_shard: int = 0, include_time_series: bool = False) -> list:
     """The fixed market set. `same_cheap_shard` moves the tradeable pair's
-    cheap leg (leg B) onto another exchange shard, which is what turns the
-    one selectable trade into a cross-shard one."""
-    return [
+    cheap leg (market B) onto another exchange shard, which is what turns the
+    one selectable trade into a cross-shard one. `include_time_series` appends
+    the opt-in later-pricier time-series pair (TS-EARLY / TS-LATE, 10-day
+    deadline gap) described in the suite header — off by default so the
+    ingest census pins on the fixed set stay exact."""
+    events = [
         _ev("Recurring Q", _mk_market(
             _TICKER_SAME_EXP, "EVT-EXP", "Will X happen?", "Outcome Main",
             "0.50", "0.45", price_level_structure="linear_cent",
@@ -419,18 +447,42 @@ def _build_events(same_cheap_shard: int = 0) -> list:
             "0.20", "0.75",
         )),
     ]
+    if include_time_series:
+        # The 2026-09 flow-through fixture: the LATER contract's YES ask (0.60)
+        # sits 0.30 above the earlier's (0.30) — a short-tier gap (10 days,
+        # threshold 15%) — so the bot buys YES on TS-EARLY at pA=0.30 and NO on
+        # TS-LATE at nB=0.40. Same event title, distinct event tickers.
+        events.extend([
+            _ev("TS Event", _mk_market(
+                _TICKER_TS_EARLY, "EVT-TS-EARLY", _TITLE_TS_EARLY, "Outcome",
+                "0.30", "0.70", price_level_structure="linear_cent",
+            )),
+            _ev("TS Event", _mk_market(
+                _TICKER_TS_LATE, "EVT-TS-LATE", _TITLE_TS_LATE, "Outcome",
+                "0.60", "0.40", price_level_structure="linear_cent",
+                close_time=_CLOSE_LATE,
+            )),
+        ])
+    return events
 
 
 def _raw_events_page(events: list, cursor: str | None = None) -> SimpleNamespace:
     return _raw_json_response({"events": events, "cursor": cursor})
 
 
-# Orderbook depth for the one tradeable pair: market A's YES bids complement
-# to a NO ask of 0.45 (matching nA above); market B's NO bids complement to a
-# YES ask of 0.20 (matching pB above) — see scanner._bids_to_ask_levels.
+# Orderbook depth for the one tradeable same-title pair: market A's YES bids
+# complement to a NO ask of 0.45 (matching nA above); market B's NO bids
+# complement to a YES ask of 0.20 (matching pB above) — see
+# scanner._bids_to_ask_levels. Buying side S on a market consumes that
+# market's OPPOSITE-side bids, so the opt-in time-series pair is the mirror
+# image: TS-EARLY (a YES buy) serves NO bids at 0.70 => YES asks 0.30 with an
+# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40
+# with an empty no side. 100 contracts each — the depth cap the replay pins.
 _ORDERBOOK_PAYLOADS = {
     _TICKER_SAME_EXP: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
     _TICKER_SAME_CHEAP: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
+    _TICKER_TS_EARLY: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.70", "100"]]}},
+    _TICKER_TS_LATE: {"orderbook_fp": {"yes_dollars": [["0.60", "100"]], "no_dollars": []}},
 }
 
 
@@ -542,6 +594,7 @@ def _live_shape_client(
     position_lookup_responses: dict | None = None,
     order_side_effect=None,
     mve_bailout: bool = False,
+    include_time_series: bool = False,
 ):
     """Build a MagicMock KalshiClient wired end-to-end with current-generation
     payload shapes over the fixed 4-group market set described above.
@@ -563,7 +616,7 @@ def _live_shape_client(
             broad except swallows it, and the run degrades to single-shard
             semantics (see test_unwired_exchange_status_degrades_to_single_shard).
         same_cheap_shard (int): exchange_index for the tradeable pair's cheap
-            leg (SAME-CHEAP / leg B). 0 (default) keeps the pair on one shard;
+            leg (SAME-CHEAP / market B, the YES leg). 0 (default) keeps the pair on one shard;
             1 makes it the cross-shard pair the routing and collateral replays
             need.
         include_held_position (bool): Whether the account holds HELD-A —
@@ -582,6 +635,10 @@ def _live_shape_client(
             When False (default), INCLUDE_MVE_MARKETS is turned off so the
             MVE loop is skipped entirely — the cleaner setup for every test
             that isn't specifically about the MVE bail-out.
+        include_time_series (bool): When True, the events page also carries
+            the opt-in later-pricier time-series pair (TS-EARLY / TS-LATE)
+            and the orderbook mock serves its depth. MUST default to False:
+            the ingest-census pins in the replays count the fixed set.
     """
     if mve_bailout:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", True)
@@ -592,7 +649,9 @@ def _live_shape_client(
     client = MagicMock()
 
     client.get_events_without_preload_content = MagicMock(
-        return_value=_raw_events_page(_build_events(same_cheap_shard=same_cheap_shard))
+        return_value=_raw_events_page(_build_events(
+            same_cheap_shard=same_cheap_shard, include_time_series=include_time_series,
+        ))
     )
     if mve_bailout:
         # A non-None cursor on every page means only the consecutive-empty-
@@ -766,6 +825,77 @@ class TestRunDevLiveShapeReplay:
         assert "trading-inactive" not in caplog.text
         assert "SHARD COVERAGE FAILURE" not in caplog.text
 
+    def test_run_dev_time_series_pair_flows_through_end_to_end(self, monkeypatch, caplog):
+        # The 2026-09 strategy: a LATER-closing contract priced well above the
+        # earlier one is the anomaly; the bot buys YES on the earlier (A) at
+        # pA and NO on the later (B) at nB. This replay drives the inverted
+        # finder, the mirrored orderbook enrichment (a YES buy consumes NO
+        # bids, a NO buy consumes YES bids), the discounted-gap Kelly model
+        # and the NO-first dry-run order log end-to-end on the flow-through
+        # fixture: pA 0.30, pB 0.60, nB 0.40, 10-day gap.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,  # unused in dev, harmless
+            include_time_series=True,
+        )
+        captured = _capture_dev_simulation(monkeypatch)
+
+        args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, args)
+
+        # The candidate: time_series, market_a is the EARLIER contract, prices
+        # are the depth-weighted leg prices written back by enrichment.
+        ts_pair = next(
+            p for p in captured["all_candidates"]
+            if p.market_a.ticker == _TICKER_TS_EARLY
+        )
+        assert ts_pair.pair_type == "time_series"
+        assert ts_pair.market_b.ticker == _TICKER_TS_LATE
+        assert ts_pair.pA == pytest.approx(0.30)
+        assert ts_pair.nB == pytest.approx(0.40)
+        assert ts_pair.tradeable
+
+        # The fixed same-title set still flows through alongside it.
+        assert any(
+            r.spec.pair.market_a.ticker == _TICKER_SAME_EXP
+            for r in captured["results"] if r.status == "simulated"
+        )
+
+        # Sized against the $1,000 sandbox balance at f* ~ 0.1884 the pair
+        # would buy 257 contracts; the 100-contract book depth caps it, so
+        # x == y == 100. total_cost = 100 x (0.30 + 0.40) = 70.00 and profit
+        # if won = 100 x (1 - 0.70) - exact fees (1.47 + 1.68) = 26.85.
+        ts_result = next(
+            r for r in captured["results"]
+            if r.spec.pair.market_a.ticker == _TICKER_TS_EARLY
+        )
+        assert ts_result.status == "simulated"
+        assert ts_result.spec.x == 100
+        assert ts_result.spec.y == 100
+        assert ts_result.spec.total_cost == pytest.approx(70.00)
+        assert ts_result.spec.min_payoff == pytest.approx(26.85)
+
+        # The dry-run order line lists legs in SUBMISSION order: the NO leg
+        # (the later market) first, then the YES leg (the earlier market).
+        dry_run_lines = [
+            rec.getMessage() for rec in caplog.records
+            if "[DRY RUN]" in rec.getMessage() and _TITLE_TS_EARLY in rec.getMessage()
+        ]
+        assert len(dry_run_lines) == 1, dry_run_lines
+        line = dry_run_lines[0]
+        assert "NO on" in line and "YES on" in line
+        assert line.index("NO on") < line.index("YES on")
+        assert line.index(_TITLE_TS_LATE) < line.index(_TITLE_TS_EARLY)
+
+        # The operator views render legs in MARKET order with the side next
+        # to each count: YES on A, NO on B.
+        assert "100× YES(A) + 100× NO(B)" in caplog.text
+
+        client.create_order_without_preload_content.assert_not_called()
+        assert client.rest_client.request.call_count == 0
+
 
 class TestRunProdDryRunLiveShapeReplay:
     def test_run_prod_dry_run_end_to_end_current_payload_shapes(self, monkeypatch, caplog):
@@ -918,10 +1048,10 @@ class TestRunProdLiveV2Replay:
         dry_run: bool = False,
     ):
         # trader's first-fill backstop judges the V2 NO-leg mapping by how the
-        # leg-A position MOVED across the fill, not by its absolute sign, so
+        # NO-leg position MOVED across the fill, not by its absolute sign, so
         # the replay account must model a CHANGE: flat on the baseline read
         # (taken before either order is submitted), then short by exactly the
-        # contracts leg A bought. A single static payload would give a delta of
+        # contracts the NO leg bought. A single static payload would give a delta of
         # 0 and stop every pair at manual_review. The moved count is read back
         # from the submitted body rather than hardcoded, so it can't drift out
         # of step with Kelly sizing.
@@ -1005,7 +1135,7 @@ class TestRunProdLiveV2Replay:
         rollback_body = calls[2].kwargs["body"]
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
-        # The unwind is LOSS-FLOORED, not a flat top-of-grid bid: leg A's
+        # The unwind is LOSS-FLOORED, not a flat top-of-grid bid: the NO leg's
         # scanned NO entry is 0.45, so the floor is 45 - 12 = 33c and the bid
         # cap is its YES-book mirror, 1 - 0.33 = 0.67, already on the replay
         # markets' default $0.01 grid and well under the 0.99 top-of-grid clamp
@@ -1023,7 +1153,7 @@ class TestRunProdLiveV2Replay:
 
     def test_run_prod_live_v2_error_response_routes_to_position_lookup(self, monkeypatch):
         # Record what each order actually asked for, so the modelled position
-        # move can be leg B's OWN count rather than a hardcoded number that
+        # move can be the YES leg's OWN count rather than a hardcoded number that
         # would silently drift with Kelly sizing.
         submitted: list = []
         base_orders = _order_side_effect(["full", "error"])
@@ -1038,11 +1168,11 @@ class TestRunProdLiveV2Replay:
             ["full", "error"],
             order_side_effect=recording_orders,
             position_lookup_responses={
-                # Delta semantics: the baseline read (taken before leg A is
+                # Delta semantics: the baseline read (taken before the NO leg is
                 # submitted) must show FLAT, and the post-exception read must
-                # show exactly the contracts leg B bought. A single static
+                # show exactly the contracts the YES leg bought. A single static
                 # payload would give a delta of 0 — a confirmed non-fill —
-                # and roll leg A back, the opposite of what this pins.
+                # and roll the NO leg back, the opposite of what this pins.
                 _TICKER_SAME_CHEAP: [
                     {"market_positions": []},
                     lambda: {
@@ -1054,14 +1184,14 @@ class TestRunProdLiveV2Replay:
             },
         )
 
-        # Leg A filled, leg B raised — exactly two order POSTs, no rollback.
+        # NO leg filled, YES leg raised — exactly two order POSTs, no rollback.
         assert client.rest_client.request.call_count == 2
 
         lookup_calls = [
             c for c in client.get_positions_without_preload_content.call_args_list
             if c.kwargs.get("ticker") == _TICKER_SAME_CHEAP
         ]
-        assert lookup_calls, "expected a position lookup for the leg-B ticker"
+        assert lookup_calls, "expected a position lookup for the YES-leg ticker"
 
         result = captured["results"][0]
         assert result.status == "executed"
@@ -1092,7 +1222,7 @@ class TestRunProdLiveV2Replay:
     def test_run_prod_dry_run_plans_but_never_posts_a_collateral_transfer(
         self, monkeypatch, caplog,
     ):
-        # Leg B sits on shard 1, which holds $0 — a genuine deficit. In dry-run
+        # The YES leg (market B) sits on shard 1, which holds $0 — a genuine deficit. In dry-run
         # the plan must be logged and NOTHING posted: not the transfer, not the
         # orders.
         with caplog.at_level(logging.INFO):
@@ -1189,6 +1319,11 @@ def make_spec() -> SimpleNamespace:
     support is unreliable, so pair/spec fields are plain SimpleNamespace
     values instead of auto-attributing MagicMocks.
     """
+    # A coherent time-series pair under the 2026-09 direction: the LATER
+    # contract (B) is priced above the earlier (pA=0.30 -> pB=0.60); the legs
+    # bought are YES on A at pA and NO on B at nB=0.40; nA=0.70 is A's
+    # reporting-only NO ask. nB is a REAL float: print_pairs_table renders it
+    # and scanner.leg_prices reads it directly (no getattr default).
     pair = SimpleNamespace(
         pair_type="time_series",
         market_a=SimpleNamespace(
@@ -1199,9 +1334,10 @@ def make_spec() -> SimpleNamespace:
             ticker="TICK-B", title="Market B", subtitle="", close_time=None,
             exchange_index=DEFAULT_EXCHANGE_INDEX,
         ),
-        pA=0.60,
-        pB=0.30,
-        nA=0.40,
+        pA=0.30,
+        pB=0.60,
+        nA=0.70,
+        nB=0.40,
         tradeable=True,
         canonical_title="Test pair",
     )

@@ -60,8 +60,12 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 BUDGET_FRACTION               = 0.20
 
 # Tiered minimum YES ask price difference for time-series pairs, keyed by the
-# deadline gap between the two legs. The wider the deadline gap, the weaker the
-# correlation assumption, so a larger price gap is required to justify the trade:
+# deadline gap between the two legs. The LATER-closing contract's YES ask must
+# exceed the earlier's by at least the tier: that gap is the market-implied
+# probability that the event first happens BETWEEN the two deadlines, which is
+# the trade's single loss scenario. A wider deadline gap leaves more time for
+# exactly that, so more of the market's in-between mass is genuine and a
+# bigger price gap is demanded before the strategy disputes it:
 #   gap <= SHORT_DEADLINE_GAP_DAYS (15 days)  -> MIN_PRICE_DIFF_SHORT_GAP (15%)
 #   gap 16..MAX_DEADLINE_GAP_DAYS  (30 days)  -> MIN_PRICE_DIFF_LONG_GAP  (30%)
 # Use min_price_diff_for_gap() below to pick the tier — never hardcode these.
@@ -81,9 +85,35 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
 # Maximum number of calendar days allowed between the deadlines of the two legs
-# in a time-series pair. Pairs with a larger gap are too far apart in time to
-# be reliably correlated.
+# in a time-series pair. The wider the gap, the more of the market-implied
+# in-between probability (the later YES ask minus the earlier) is genuine
+# rather than mispricing; past 30 days there is too much room for the event to
+# land between the deadlines for the trade to dispute the market's number.
 MAX_DEADLINE_GAP_DAYS         = 30
+
+# ── Time-series strategy model (2026-09 inversion) ────────────────────────────
+#
+# A time-series pair buys YES on the EARLIER-closing contract (market_a) and NO
+# on the LATER one (market_b) when the later contract's YES ask exceeds the
+# earlier's by at least the deadline-gap tier. The market-implied probability
+# that the event first happens BETWEEN the two deadlines is (pB - pA); that is
+# the trade's single loss scenario (earlier NO, later YES). This constant is the
+# fraction of that market-implied in-between mass we believe — 0.75 means "the
+# market overstates it by a quarter; prices will converge by 25%". It is an
+# operator-tunable ESTIMATE, not a measured quantity: at 1.0 (take the market at
+# face value) the Kelly fraction is <= 0 for every candidate and the strategy
+# never fires; smaller values size more aggressively. Calibrating it from the
+# backtester is a deferred follow-up (see CLAUDE.md, "Strategy change (2026-09)").
+TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
+
+# Which side each leg of a pair buys, as (side bought on market_a, side bought
+# on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
+# elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
+# cheaper (market_b). Time-series: YES on the earlier contract (market_a), NO on
+# the later (market_b). The trader always SUBMITS the NO leg first, whichever
+# market it sits on (see trader._ordered_legs).
+SAME_TITLE_LEG_SIDES  = ("no", "yes")
+TIME_SERIES_LEG_SIDES = ("yes", "no")
 
 # Minimum account balance in cents required to run the bot. Below $50 the bot
 # aborts to avoid wasting API calls when there is insufficient capital to trade.
@@ -129,15 +159,17 @@ TAKER_FEE_RATE                = 0.07
 # that switch is flipped back to "legacy" as a rollback.
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
-# Maximum accepted per-contract loss (cents) when unwinding leg A after a
-# failed leg B, relative to leg A's scanned NO entry price. The rollback is a
-# fill-or-kill LIMIT sell at (entry - this), so a book that has collapsed past
-# the floor kills the unwind instead of realizing an unbounded loss; the
-# orphaned position then surfaces as status="rollback_failed" for manual
-# review — the same path an unfilled market unwind already took.
+# Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
+# first-submitted leg: market_a for a same-title pair, market_b for a
+# time-series pair) after the YES leg failed, relative to the NO leg's scanned
+# NO entry price. The rollback is a fill-or-kill LIMIT sell at (entry - this),
+# so a book that has collapsed past the floor kills the unwind instead of
+# realizing an unbounded loss; the orphaned position then surfaces as
+# status="rollback_failed" for manual review — the same path an unfilled
+# market unwind already took.
 #
 # This allowance must cover the market's ENTIRE bid-ask spread, not just the
-# "acceptable loss": leg A entered at the NO ASK, but the unwind is a sell
+# "acceptable loss": the NO leg entered at the NO ASK, but the unwind is a sell
 # that only fills against the NO BID, so (NO ask - NO bid) — the spread
 # itself — is a floor on the loss even with zero adverse price movement.
 # Any adverse move since entry is additive on top of that spread. At 5 cents
@@ -151,7 +183,7 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 # sell price directly. On the V2 path a held NO position is a short YES, so the
 # unwind is a YES BUY and the same bound becomes a bid CEILING of
 # (1 - floor/100) dollars, ceiling-quantized onto the market's tick grid and
-# clamped by V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._v2_rollback_price).
+# clamped by V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._v2_rollback_price(no_leg)).
 ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 
 # Slippage allowance for the V2 order path, denominated in TICKS of the market's
@@ -201,15 +233,16 @@ ORDER_API_VERSION             = "v2"
 V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
-# bid that unwinds a filled leg A. On the single-YES-book model a held NO
-# position is a short YES, so closing it is a YES BUY (bid).
+# bid that unwinds a filled NO leg (market_a for same-title, market_b for
+# time-series — see trader._ordered_legs). On the single-YES-book model a held
+# NO position is a short YES, so closing it is a YES BUY (bid).
 #
 # This is NOT the price submitted. The submitted bid is the bounded-loss
 # ceiling derived from ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — (1 - floor/100),
 # ceiling-quantized onto the market's own tick grid — and this constant is only
-# the upper clamp applied to it (trader._v2_rollback_price, via
+# the upper clamp applied to it (trader._v2_rollback_price(no_leg), via
 # min(derived_cap, this_clamp)). With the current ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-# value and _rollback_floor_cents' [1, 99]-cent range, the derived cap can
+# value and _rollback_floor_cents(no_leg)'s [1, 99]-cent range, the derived cap can
 # never exceed 0.99 — i.e. this clamp cannot actually bind today, since 0.99
 # is already <= every regime's top-of-grid level. It is kept as a defensive
 # invariant (a future change to the floor's bound could otherwise push the
@@ -473,9 +506,13 @@ def min_price_diff_for_gap(gap_days: int) -> float:
     Return the minimum time-series YES price gap required for a deadline gap.
 
     Picks the price-gap tier for a time-series pair based on how many calendar
-    days separate the two legs' deadlines: gaps up to SHORT_DEADLINE_GAP_DAYS
-    (15 days, inclusive) require MIN_PRICE_DIFF_SHORT_GAP (15%); anything wider
-    requires MIN_PRICE_DIFF_LONG_GAP (30%). Callers must already have enforced
+    days separate the two legs' deadlines: the later leg's YES ask must exceed
+    the earlier's by MIN_PRICE_DIFF_SHORT_GAP (15%) when the deadlines are up
+    to SHORT_DEADLINE_GAP_DAYS (15 days, inclusive) apart, and by
+    MIN_PRICE_DIFF_LONG_GAP (30%) for anything wider. The gap is a distance,
+    not a direction — scanner.deadline_gap_days() computes it order-
+    independently, and the direction (later leg pricier) is enforced by the
+    caller's own filter. Callers must already have enforced
     gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
     does not reject over-cap gaps itself.
 
@@ -484,14 +521,43 @@ def min_price_diff_for_gap(gap_days: int) -> float:
             Range: 0..MAX_DEADLINE_GAP_DAYS (caller-enforced).
 
     Returns:
-        float: The minimum required YES ask price difference (dollars, 0-1).
+        float: The minimum required YES ask price difference (dollars, 0-1)
+            by which the later-closing leg must exceed the earlier one.
     """
     if gap_days <= SHORT_DEADLINE_GAP_DAYS:
         return MIN_PRICE_DIFF_SHORT_GAP
     return MIN_PRICE_DIFF_LONG_GAP
 
 
-def fee_per_pair_approx(nA: float, pB: float) -> float:
+def time_series_profit_prob(pA: float, pB: float) -> float:
+    """
+    Return the modelled probability that a time-series pair trade is profitable.
+
+    The trade (YES on the earlier contract at pA, NO on the later at ~1 - pB)
+    loses only when the event first happens BETWEEN the two deadlines — earlier
+    NO, later YES. The market-implied probability of that in-between scenario
+    is the YES-ask gap (pB - pA); the strategy disputes it, believing only
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT of that mass. So:
+
+        p = 1 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * max(0, pB - pA)
+
+    The gap is clamped at zero so a pair whose earlier contract is pricier
+    (never a candidate, but reachable from reporting code) models as riskless
+    rather than as a negative loss probability. This is the single definition
+    of the model — strategy._kelly_p, backtester.run_backtest and
+    dashboard._kelly_fraction all call it, so the three can never drift.
+
+    Args:
+        pA (float): YES ask of the earlier-closing contract, dollars in [0, 1].
+        pB (float): YES ask of the later-closing contract, dollars in [0, 1].
+
+    Returns:
+        float: Probability of profit in (0, 1] for a discount in [0, 1].
+    """
+    return 1.0 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * max(0.0, pB - pA)
+
+
+def fee_per_pair_approx(price_a: float, price_b: float) -> float:
     """
     Compute a continuous approximation of the total Kalshi taker fee for one pair trade.
 
@@ -500,12 +566,17 @@ def fee_per_pair_approx(nA: float, pB: float) -> float:
     approximation treats the contract count as a continuous quantity, making it
     suitable for threshold comparisons.
 
-    The formula is: TAKER_FEE_RATE * (nA*(1-nA) + pB*(1-pB)), which sums the
-    quadratic fee contribution from the NO leg (market A) and the YES leg (market B).
+    The formula is: TAKER_FEE_RATE * (price_a*(1-price_a) + price_b*(1-price_b)),
+    which sums the quadratic fee contribution of the two legs. It is symmetric
+    in its arguments and side-agnostic: pass the per-contract cost of whatever
+    side each leg buys — (nA, pB) for a same-title pair, (pA, nB) for a
+    time-series pair, i.e. exactly scanner.leg_prices(pair).
 
     Args:
-        nA (float): NO ask price of market A in dollars. Range: (0, 1).
-        pB (float): YES ask price of market B in dollars. Range: (0, 1).
+        price_a (float): Cost in dollars of the side bought on the first leg.
+            Range: (0, 1).
+        price_b (float): Cost in dollars of the side bought on the second leg.
+            Range: (0, 1).
 
     Returns:
         float: Approximate total taker fee per contract pair (in dollars).
@@ -515,7 +586,7 @@ def fee_per_pair_approx(nA: float, pB: float) -> float:
             be used for filtering: final validation always re-checks with
             fee_leg_exact() so an underestimated fee cannot admit a bad trade.
     """
-    return TAKER_FEE_RATE * (nA * (1.0 - nA) + pB * (1.0 - pB))
+    return TAKER_FEE_RATE * (price_a * (1.0 - price_a) + price_b * (1.0 - price_b))
 
 
 def fee_leg_exact(n: int, p: float) -> float:
@@ -527,10 +598,13 @@ def fee_leg_exact(n: int, p: float) -> float:
     continuous approximation. Use this function once the final contract count n is
     known (e.g. in strategy.py and backtester.py).
 
+    Side-agnostic, like fee_per_pair_approx(): p is the cost of the side the
+    leg actually buys, whichever market and side that is.
+
     Args:
         n (int): Number of contracts for this leg. Should be >= 1.
-        p (float): Price in dollars for this leg (YES price for the YES leg,
-            NO price for the NO leg). Range: (0, 1).
+        p (float): Price in dollars of the side bought on this leg (the YES ask
+            for a YES buy, the NO ask for a NO buy). Range: (0, 1).
 
     Returns:
         float: Taker fee in dollars, rounded up to the nearest cent.
