@@ -2346,16 +2346,25 @@ def _build_equity_curve(
 
     Returns:
         pd.DataFrame: DataFrame with one row per calendar day from start_date to
-            today (UTC), with columns:
+            today (UTC) — and, when start_date is itself in the future, exactly
+            one row for start_date — with columns:
             - "date" (date): Calendar date.
             - "portfolio_value" (float): Cumulative portfolio value in dollars.
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
+            Never zero rows: a column-less DataFrame would violate this contract
+            and crash the "daily_return" assignment below, as well as every
+            .iloc[0]/.iloc[-1] read in dashboard.py.
     """
     # entry_date and exit_date come from UTC-derived timestamps, so use UTC today
     # here as well — otherwise `date.today()` in a non-UTC timezone can drop or add
     # a day around the boundary and misalign the equity curve.
     today = datetime.now(UTC).date()
-    dates = [start_date + timedelta(days=i) for i in range((today - start_date).days + 1)]
+    # Floored at 1: a start_date after today (reachable through run_backtest /
+    # run_backtest_sweep, whose Monday-feasibility short-circuit builds an empty
+    # curve for whatever window it was handed) makes the raw span zero or
+    # negative, leaving pd.DataFrame([]) with no columns at all.
+    span_days = max((today - start_date).days + 1, 1)
+    dates = [start_date + timedelta(days=i) for i in range(span_days)]
 
     # Accumulate cash inflows and outflows per date
     cash_changes: dict[date, float] = defaultdict(float)
