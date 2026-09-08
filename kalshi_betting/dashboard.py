@@ -601,7 +601,10 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
 
     # ── KPI cards ────────────────────────────────────────────────────────────
     pooled_k = cal.pooled.empirical_k if cal is not None else None
-    kpi_parts = [_kpi("Configured k", f"{configured_k:.3f}", "#2196F3")]
+    # Labelled for the RUN, not for config.py: on an --interval-discount run
+    # this is the override. Calling it "configured" would misattribute the
+    # override to config.py, which this feature never writes.
+    kpi_parts = [_kpi("k used (this run)", f"{configured_k:.3f}", "#2196F3")]
     if pooled_k is None:
         kpi_parts.append(_kpi("Pooled empirical k̂", "—"))
         kpi_parts.append(_kpi("k̂ − k", "—"))
@@ -717,13 +720,18 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     fig.update_layout(
         title=f"Equity Curve at interval discount k = {points[primary_idx].k:.2f}",
         yaxis_title="Portfolio Value ($)", xaxis_title="Date",
+        # The title is left-aligned, so the selector is anchored to the RIGHT
+        # and the top margin is widened to give both their own room: anchored
+        # left at the default margin, the dropdown rendered on top of the
+        # title text (verified in a browser before this was corrected).
+        margin={"t": 90},
         updatemenus=[{
             "type": "dropdown",
             "buttons": buttons,
             "active": primary_idx,
             "direction": "down",
             "showactive": True,
-            "x": 0.0, "xanchor": "left", "y": 1.18, "yanchor": "top",
+            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
         }],
     )
 

@@ -264,7 +264,10 @@ class TestSectionIntervalDiscount:
                               calibration=_calibration())
         out = _section_interval_discount(sweep)
 
-        assert "Configured k" in out and "0.750" in out
+        # Labelled for the run, not for config.py — on an --interval-discount
+        # run this number is the override, which config.py never receives.
+        assert "k used (this run)" in out and "0.750" in out
+        assert "Configured k" not in out
         assert "Pooled empirical k̂" in out and "0.600" in out
         # Delta = 0.600 - 0.750
         assert "-0.150" in out
