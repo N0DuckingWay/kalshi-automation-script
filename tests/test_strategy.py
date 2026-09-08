@@ -345,9 +345,9 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
 
 class TestTimeSeriesKellyParity:
     """The three sizers — strategy._kelly_p / compute_trade, dashboard._kelly_fraction
-    and backtester.run_backtest — must all price the time-series probability
-    through config.time_series_profit_prob, so the model cannot drift between
-    live sizing, the backtest and the dashboard."""
+    and the backtester (run_backtest -> _simulate_at_discount) — must all price
+    the time-series probability through config.time_series_profit_prob, so the
+    model cannot drift between live sizing, the backtest and the dashboard."""
 
     def test_kelly_p_equals_config_helper(self):
         pair = make_pair(pA=_TS_PA, pB=_TS_PB, nB=_TS_NB, pair_type="time_series")
@@ -392,10 +392,13 @@ class TestTimeSeriesKellyParity:
     def test_ast_dashboard_kelly_fraction_calls_helper(self):
         assert _function_calls(dashboard, "_kelly_fraction", "time_series_profit_prob")
 
-    def test_ast_backtester_run_backtest_calls_helper(self):
-        # Lands with the backtester work package; until then this pins the
-        # contract that Pass 1 must call the shared helper directly
-        assert _function_calls(backtester, "run_backtest", "time_series_profit_prob")
+    def test_ast_backtester_prices_through_helper(self):
+        # Pass 1's k-dependent scoring moved into _simulate_at_discount when the
+        # calibration sweep landed. The invariant is unchanged — the backtester
+        # must price time-series through the shared config helper and never
+        # reimplement the formula — so it is pinned as a two-link chain.
+        assert _function_calls(backtester, "_simulate_at_discount", "time_series_profit_prob")
+        assert _function_calls(backtester, "run_backtest", "_simulate_at_discount")
 
 
 class TestSelectPortfolio:

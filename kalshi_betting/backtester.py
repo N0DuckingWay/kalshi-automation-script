@@ -19,14 +19,15 @@ Dependencies:
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
-    and SETTLED_PREFILTER_CACHE_TAG from config.py; fetch_all_settled_markets(),
+    SETTLED_PREFILTER_CACHE_TAG and TIME_SERIES_INTERVAL_PROB_DISCOUNT from
+    config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py. Also
     depends on pandas (external) for the equity-curve DataFrame. Does NOT
     import strategy.py — Kelly sizing and portfolio selection are
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
-    parity. Exports BacktestTrade (consumed by dashboard.py) and run_backtest()
-    (called by backtest.py).
+    parity. Exports BacktestTrade and SweepPoint (BacktestTrade is consumed by
+    dashboard.py) and run_backtest() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -50,7 +51,17 @@ Notes:
     one-active-position-per-ticker rule: get_held_tickers() reads positions with
     count_filter="position", so a settled ticker leaves the blocked set live too.
 
-    Before grouping, run_backtest() filters markets through _can_ever_enter(),
+    run_backtest() itself is a thin wrapper: the work is split at the
+    interval-discount boundary into _prepare_entries() (the k-independent
+    prologue — fetch, prefilter, grouping, pair extraction, candlesticks and
+    the _find_entry sweep, which contains no probability model at all) and
+    _simulate_at_discount() (everything that reads k — the Kelly gate, the
+    dedups, Pass 2 and the equity curve), which returns a SweepPoint stamped
+    with the resolved discount. That split exists so one preparation pass can
+    feed many discounts; run_backtest() calls the tail once with k=None, which
+    config.time_series_profit_prob resolves to the live sizer's constant.
+
+    Before grouping, _prepare_entries() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
     have an hourly candle at-or-before that Monday (i.e. opened by then). A
@@ -95,6 +106,7 @@ from .config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG,
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -225,6 +237,36 @@ class BacktestTrade:
     # concept) and for any trade constructed without it (test fixtures).
     # Reporting only — nothing sizes, prices or settles on this field.
     deadline_gap_days: int | None = None
+
+
+@dataclass
+class SweepPoint:
+    """
+    One complete simulation of the prepared entries at one interval discount.
+
+    Returned by _simulate_at_discount(). Deliberately carries NO derived
+    presentation metrics (total return, max drawdown, Sharpe): dashboard.py
+    imports FROM this module, so importing its _max_drawdown()/_sharpe()
+    helpers back here would be a circular import and a layering violation.
+    Every such metric is computable from equity_df by the dashboard, using the
+    helpers it already owns.
+
+    Attributes:
+        k (float): The RESOLVED interval discount this point was simulated at
+            — never None. When _simulate_at_discount() was called with k=None
+            (the "no override" sentinel, which config.time_series_profit_prob
+            resolves at call time), this is
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, the value the live
+            sizer reads.
+        trades (list[BacktestTrade]): One record per entered pair, in
+            entry-date order; empty if nothing was ever entered.
+        equity_df (pd.DataFrame): Daily equity curve with columns
+            [date, portfolio_value, daily_return], flat at the initial balance
+            when trades is empty.
+    """
+    k: float
+    trades: list[BacktestTrade]
+    equity_df: pd.DataFrame
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -1065,58 +1107,46 @@ def _fetch_candles_parallel(
 
 # ─── Main backtest loop ───────────────────────────────────────────────────────
 
-def run_backtest(
+def _prepare_entries(
     hist_client: Any,
     live_client,
-    start_date: date = date(2024, 1, 1),
-    initial_balance: float = 10_000.0,
-    use_cache: bool = True,
-    max_horizon_days: int | None = None,
-) -> tuple[list[BacktestTrade], pd.DataFrame]:
+    start_date: date,
+    use_cache: bool,
+    max_horizon_days: int | None,
+) -> list[dict] | None:
     """
-    Replay both pair strategies on all settled Kalshi markets from start_date.
+    Run the half of the backtest that does not depend on the interval discount.
 
-    Algorithm:
-      1. Fetch all settled markets since start_date.
-      2. Drop markets that provably can never enter any pair (_can_ever_enter).
-      3. Group into potential time-series and same-title pairs (metadata only).
-      4. Fetch hourly candlesticks for every ticker appearing in a potential
-         pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS threads.
-      5. Find the first Monday where the pair was tradeable at the threshold;
-         exclude (and count, with one summary WARNING) any time-series
-         candidate whose settlement was earlier-YES/later-NO — impossible for
-         a cumulative-deadline pair, so a premise violation rather than a
-         payout; keep only the best entry per title group (live
-         one-pair-per-group rule), then drop any time-series candidate whose
-         ticker pair was also found as a same-title candidate (live
-         main._dedup_pairs rule).
-      6. Walk entries chronologically with a running cash balance: Kelly-size
-         every candidate of an entry date against that checkpoint's opening
-         balance, admit it only while its fee-inclusive cost still fits the
-         running cash (mirroring main._run_prod + strategy.select_portfolio),
-         and record actual P&L from settlement outcomes.
-      7. Build an equity curve from the trade timeline.
+    Everything here — the Monday-feasibility pre-check, the settled-market
+    fetch, the eligibility prefilter, both groupings, pair extraction, the
+    candlestick fetch and the _find_entry sweep — is driven purely by prices,
+    dates and thresholds. _find_entry applies no probability model at all, so
+    none of this changes when the time-series interval discount k changes.
+    Separating it out lets _simulate_at_discount() be re-run at many discounts
+    over one expensive, network-bound preparation pass.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
         live_client: Client passed through to fetch_all_settled_markets.
         start_date (date): Earliest settlement date to include.
-        initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
             scanner.filter_markets_within_horizon on the live path, but relative
             to each simulated checkpoint rather than real-world now: at a given
             Monday checkpoint, a pair can only enter if the later-closing leg
-            closes within max_horizon_days of THAT checkpoint. None (default)
-            applies no cap, matching current behavior. Passed straight through
-            to _find_entry() for each candidate pair.
+            closes within max_horizon_days of THAT checkpoint. None applies no
+            cap. Passed straight through to _find_entry() for each pair.
 
     Returns:
-        tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
-            trades is one BacktestTrade per entered pair, in entry-date order
-            (empty if none were ever entered). equity_df has columns
-            [date, portfolio_value, daily_return], one row per day, flat at
-            initial_balance if trades is empty.
+        list[dict] | None: One record per pair that produced an entry, in scan
+            order (time-series pairs first, then same-title), each shaped
+            {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
+            where "entry" is _find_entry()'s return dict (which already carries
+            the possibly-swapped mA/mB). An empty list means no pair was ever
+            tradeable. Returns None — the codebase's
+            return-None-on-validation-failure convention — when the Monday
+            feasibility pre-check fails, a "no simulation is possible in this
+            window at all" signal distinct from "nothing entered".
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -1124,17 +1154,7 @@ def run_backtest(
             was not properly excluded by the eligibility prefilter — this is
             treated as a real defect (a market that should never have reached
             this stage), not degraded into "no price history".
-
-    Note:
-        Before any network call, this function checks whether [start_date,
-        today] contains at least one Monday 09:00 UTC checkpoint (the
-        only kind _find_entry() can ever act on). If not, no trade can ever
-        be entered regardless of what the fetch would return, so the fetch is
-        skipped entirely and this returns the same empty-result shape as the
-        zero-trade path ([], an equity curve flat at initial_balance) with a
-        WARNING logged.
     """
-    logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
     # Feasibility pre-check, BEFORE any network call: a trade can only ever be
     # entered at a Monday 09:00 UTC checkpoint. If [start_date, today] contains
@@ -1158,10 +1178,12 @@ def run_backtest(
             "trade can ever be entered; skipping the fetch entirely",
             start_date, feasibility_end,
         )
-        # Same empty-result shape the zero-trade path at the bottom of this
-        # function already produces, so backtest.py / generate_dashboard need
-        # no changes to handle this early-exit.
-        return [], _build_equity_curve([], start_date, initial_balance)
+        # None rather than an empty list so the caller can tell "no simulation
+        # is possible in this window" apart from "nothing was ever tradeable".
+        # run_backtest turns it into the same empty-result shape the zero-trade
+        # path already produces, so backtest.py / generate_dashboard need no
+        # changes to handle this early-exit.
+        return None
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
@@ -1224,15 +1246,14 @@ def run_backtest(
 
     logging.info("Candlestick fetch complete.")
 
-    # ── Pass 1: collect all tradeable entries (no sizing, no conflict filter) ──
+    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
+    # _find_entry applies price and deadline thresholds only — it holds no
+    # probability model — so this sweep yields identical entries at every
+    # interval discount and is run exactly once, ahead of any sizing.
 
     # Combine both pair types for the scan loop
     all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
-    candidates = []
-    # Time-series candidates that settled earlier-YES/later-NO — impossible
-    # for a cumulative-deadline pair, so the grouping admitted a
-    # non-cumulative one. Counted here, reported once after the loop.
-    premise_violations = 0
+    raw_entries: list[dict] = []
 
     for (mA_orig, mB_orig, canon, group_key), pair_type in all_pairs:
         candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
@@ -1247,6 +1268,90 @@ def run_backtest(
         )
         if entry is None:
             continue
+
+        # Carry the group identity alongside the entry: _simulate_at_discount
+        # needs canon/group_key for the one-pair-per-group dedup, while mA/mB
+        # already ride inside the entry dict.
+        raw_entries.append({
+            "pair_type": pair_type,
+            "canon": canon,
+            "group_key": group_key,
+            "entry": entry,
+        })
+
+    logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
+    return raw_entries
+
+
+def _simulate_at_discount(
+    raw_entries: list[dict],
+    start_date: date,
+    initial_balance: float,
+    k: float | None = None,
+) -> SweepPoint:
+    """
+    Size, select and settle prepared entries at one interval discount.
+
+    This is the half of the backtest that depends on k, the time-series
+    interval discount: the Kelly gate, the settlement-outcome and
+    cumulative-deadline-premise checks, the one-pair-per-group dedup, the
+    cross-type dedup, and the chronological cash-constrained Pass 2 that
+    produces the trades and the equity curve. Same-title candidates are
+    unaffected by k — they price on the fixed co-resolution prior — but they
+    still share the cash and the ticker-conflict filter with the time-series
+    ones, so the whole selection has to be replayed per discount rather than
+    merely re-scored.
+
+    Statement order inside the candidate loop is load-bearing and is preserved
+    exactly as it stood before this function was extracted: the Kelly gate runs
+    BEFORE the outcome-validity and premise-violation checks, so
+    premise_violations counts only candidates that already passed Kelly — which
+    makes that count itself k-dependent. Likewise the one-pair-per-group dedup
+    runs after the Kelly gate, so a different k can change which candidate wins
+    its group. Both are intended; do not reorder or hoist them.
+
+    Args:
+        raw_entries (list[dict]): _prepare_entries() output — one record per
+            pair that produced an entry.
+        start_date (date): First date of the equity curve.
+        initial_balance (float): Simulated starting cash balance in dollars.
+        k (float | None): Interval-discount override in [0, 1], handed to
+            config.time_series_profit_prob for every time-series candidate.
+            None (default) means "no override", which that helper resolves at
+            call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
+            the live sizer reads — so the default path prices exactly as it
+            always has.
+
+    Returns:
+        SweepPoint: The trades (in entry-date order, empty if none entered) and
+            the daily equity curve produced at this discount, stamped with the
+            RESOLVED k — never None.
+    """
+    # The discount actually in force, recorded on the result so no caller has
+    # to re-derive it from the None sentinel.
+    effective_k = TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k
+
+    # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
+    candidates = []
+    # Time-series candidates that settled earlier-YES/later-NO — impossible
+    # for a cumulative-deadline pair, so the grouping admitted a
+    # non-cumulative one. Counted here, reported once after the loop.
+    #
+    # This counter is k-DEPENDENT by construction: the Kelly gate below runs
+    # BEFORE the premise check, so only candidates that already passed Kelly
+    # reach it. That statement order is preserved exactly as it stood before
+    # this function was extracted (a test pins the resulting count in the
+    # WARNING) — do not reorder the two.
+    premise_violations = 0
+
+    for rec in raw_entries:
+        # Group identity and the _find_entry result, exactly as recorded by
+        # _prepare_entries — mA/mB inside the entry may have been swapped
+        # there to canonicalize which leg is A.
+        pair_type = rec["pair_type"]
+        canon     = rec["canon"]
+        group_key = rec["group_key"]
+        entry     = rec["entry"]
 
         # Unpack entry — mA/mB may have been swapped inside _find_entry to canonicalize
         mA = entry["mA"]
@@ -1267,8 +1372,13 @@ def run_backtest(
         # in-between mass, 1 - k * (pB - pA), from config.time_series_profit_prob
         # — the single definition strategy._kelly_p and dashboard._kelly_fraction
         # also call, so the three can never drift (called directly by name here;
-        # a test pins that). same_title: the fixed co-resolution prior.
-        p = time_series_profit_prob(pA, pB) if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB
+        # a test pins the two-link chain run_backtest -> _simulate_at_discount
+        # -> the helper). k is this function's override, and None — what
+        # run_backtest passes — is the sentinel the helper resolves to
+        # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, so the default path prices
+        # exactly as live sizing does. same_title: the fixed co-resolution prior.
+        p = (time_series_profit_prob(pA, pB, k=k)
+             if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
         q = 1.0 - p
 
         # Kelly formula: f* = p - q/b; negative means no edge
@@ -1569,7 +1679,104 @@ def run_backtest(
     )
 
     equity_df = _build_equity_curve(trades, start_date, initial_balance)
-    return trades, equity_df
+    return SweepPoint(k=effective_k, trades=trades, equity_df=equity_df)
+
+
+def run_backtest(
+    hist_client: Any,
+    live_client,
+    start_date: date = date(2024, 1, 1),
+    initial_balance: float = 10_000.0,
+    use_cache: bool = True,
+    max_horizon_days: int | None = None,
+) -> tuple[list[BacktestTrade], pd.DataFrame]:
+    """
+    Replay both pair strategies on all settled Kalshi markets from start_date.
+
+    Thin composition of the backtest's two halves, at the interval discount
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (i.e. exactly what the live sizer
+    uses): _prepare_entries() does the k-independent work and
+    _simulate_at_discount(..., k=None) does the k-dependent work.
+
+    Algorithm (unchanged; the step split between the two helpers is noted):
+      1. Fetch all settled markets since start_date.                [prepare]
+      2. Drop markets that provably can never enter (_can_ever_enter). [prepare]
+      3. Group into potential time-series and same-title pairs.     [prepare]
+      4. Fetch hourly candlesticks for every ticker appearing in a
+         potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
+         threads.                                                   [prepare]
+      5. Find the first Monday where the pair was tradeable at the
+         threshold.                                                 [prepare]
+      6. Kelly-gate each entry; exclude (and count, with one summary
+         WARNING) any time-series candidate whose settlement was
+         earlier-YES/later-NO — impossible for a cumulative-deadline
+         pair, so a premise violation rather than a payout; keep only
+         the best entry per title group (live one-pair-per-group rule),
+         then drop any time-series candidate whose ticker pair was also
+         found as a same-title candidate (live main._dedup_pairs rule).
+                                                                   [simulate]
+      7. Walk entries chronologically with a running cash balance: Kelly-size
+         every candidate of an entry date against that checkpoint's opening
+         balance, admit it only while its fee-inclusive cost still fits the
+         running cash (mirroring main._run_prod + strategy.select_portfolio),
+         and record actual P&L from settlement outcomes.            [simulate]
+      8. Build an equity curve from the trade timeline.             [simulate]
+
+    Args:
+        hist_client (Any): Signed client for the historical archive/live endpoints.
+        live_client: Client passed through to fetch_all_settled_markets.
+        start_date (date): Earliest settlement date to include.
+        initial_balance (float): Simulated starting cash balance in dollars.
+        use_cache (bool): Whether to reuse the disk-cached assembled market list.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
+            scanner.filter_markets_within_horizon on the live path, but relative
+            to each simulated checkpoint rather than real-world now: at a given
+            Monday checkpoint, a pair can only enter if the later-closing leg
+            closes within max_horizon_days of THAT checkpoint. None (default)
+            applies no cap, matching current behavior. Passed straight through
+            to _find_entry() for each candidate pair.
+
+    Returns:
+        tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
+            trades is one BacktestTrade per entered pair, in entry-date order
+            (empty if none were ever entered). equity_df has columns
+            [date, portfolio_value, daily_return], one row per day, flat at
+            initial_balance if trades is empty.
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — this is
+            treated as a real defect (a market that should never have reached
+            this stage), not degraded into "no price history".
+
+    Note:
+        Before any network call, _prepare_entries() checks whether [start_date,
+        today] contains at least one Monday 09:00 UTC checkpoint (the only kind
+        _find_entry() can ever act on). If not, no trade can ever be entered
+        regardless of what the fetch would return, so the fetch is skipped
+        entirely, that helper returns None, and this returns the same
+        empty-result shape as the zero-trade path ([], an equity curve flat at
+        initial_balance) with a WARNING logged.
+    """
+    logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
+
+    # The k-independent half: fetch, group, pair and locate each pair's first
+    # tradeable Monday. None means the feasibility pre-check failed.
+    raw_entries = _prepare_entries(
+        hist_client, live_client, start_date, use_cache, max_horizon_days
+    )
+    if raw_entries is None:
+        # Same empty-result shape the zero-trade path produces, so backtest.py
+        # and generate_dashboard need no special case for this early-exit.
+        return [], _build_equity_curve([], start_date, initial_balance)
+
+    # The k-dependent half, at the config discount: k=None is the "no override"
+    # sentinel config.time_series_profit_prob resolves to
+    # TIME_SERIES_INTERVAL_PROB_DISCOUNT, so this prices exactly as the live
+    # sizer does.
+    point = _simulate_at_discount(raw_entries, start_date, initial_balance, k=None)
+    return point.trades, point.equity_df
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────

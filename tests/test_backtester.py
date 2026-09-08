@@ -1,9 +1,11 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import time
+from dataclasses import astuple
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 # backtester.py imports no SDK module directly (historical.py reaches every
@@ -27,6 +29,7 @@ from kalshi_betting.backtester import (
 from kalshi_betting.config import (
     BUDGET_FRACTION,
     MAX_DEADLINE_GAP_DAYS,
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
     time_series_profit_prob,
@@ -1816,3 +1819,41 @@ class TestRunBacktestTimeSeriesFlow:
         trades, equity = self._run(monkeypatch, "yes", "yes", eb_yes=0.60, eb_no=0.50)
         assert trades == []
         assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0)
+
+    def test_default_k_equals_explicit_config_k(self, monkeypatch):
+        """The k-boundary extraction is result-identical.
+
+        run_backtest (which passes k=None) and _simulate_at_discount called
+        with k set explicitly to the config constant must produce the same
+        trades and the same equity curve — proving the None sentinel resolves
+        to TIME_SERIES_INTERVAL_PROB_DISCOUNT at call time, and that lifting
+        the k-independent prologue (_prepare_entries) out of Pass 1 changed no
+        outcome.
+        """
+        trades, equity = self._run(monkeypatch, "yes", "yes")
+        assert len(trades) == 1  # the fixture really did enter a trade
+
+        # _run's monkeypatches are still in force, so the prologue replays the
+        # very same fixture markets and candles run_backtest just consumed.
+        raw_entries = backtester._prepare_entries(
+            MagicMock(), MagicMock(), date(2026, 1, 1), True, None
+        )
+        point = backtester._simulate_at_discount(
+            raw_entries, date(2026, 1, 1), 10_000.0,
+            k=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+        )
+
+        assert point.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in trades]
+        pd.testing.assert_frame_equal(point.equity_df, equity)
+
+    def test_prepare_entries_returns_none_when_no_monday_exists(self, monkeypatch):
+        # The feasibility short-circuit is now a None sentinel on the prologue
+        # (distinguishing "no simulation is possible" from "nothing entered"),
+        # which run_backtest turns back into the empty-result shape.
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must be skipped"))
+        today = date.today()
+        assert backtester._prepare_entries(
+            MagicMock(), MagicMock(), today + timedelta(days=1), True, None
+        ) is None
