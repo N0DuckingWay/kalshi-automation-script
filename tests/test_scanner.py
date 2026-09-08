@@ -10,17 +10,24 @@ from unittest.mock import MagicMock
 import pytest
 
 from kalshi_betting import scanner
-from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX, INCLUDE_MVE_MARKETS
+from kalshi_betting.config import (
+    DEFAULT_EXCHANGE_INDEX,
+    INCLUDE_MVE_MARKETS,
+    SAME_TITLE_LEG_SIDES,
+    TIME_SERIES_LEG_SIDES,
+)
 from kalshi_betting.scanner import (
     CandidatePair,
     PriceRange,
     _bids_to_ask_levels,
     _fetch_orderbook,
     _filter_active_markets,
+    _leg_ask_levels,
     _market_from_dict,
     _parse_price_ranges,
     _shard_index,
     check_shard_coverage,
+    deadline_gap_days,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -28,6 +35,8 @@ from kalshi_betting.scanner import (
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
+    leg_prices,
+    leg_sides,
     normalize_title,
     pair_key,
     tick_size_for_price,
@@ -263,35 +272,36 @@ class TestTimeSeriesGrouping:
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
         assert pairs == [], f"Expected no pairs across unrelated MVE events; got {pairs}"
 
-    def test_pricier_later_contract_is_not_a_candidate(self):
-        # Regression: the price-gap filter used to be abs(pA - pB) >= threshold,
-        # which let a pair through (as untradeable) when the LATER-closing
-        # contract was priced higher — normal term structure, not the anomaly
-        # this strategy exploits (the arbitrage only exists when the EARLIER
-        # contract is priced higher). Such a pair must not be a candidate at
-        # all, directional only: pA - pB >= min_price_diff_for_gap(gap_days).
+    def test_pricier_earlier_contract_is_not_a_candidate(self):
+        # The price-gap filter is directional: pB - pA >= threshold, where B
+        # is the LATER-closing contract. A pricier EARLIER contract carries no
+        # market-implied in-between probability for the strategy to dispute,
+        # so it must not be a candidate at all (not even as an untradeable
+        # placeholder that could win the group's one-pair slot).
         from datetime import UTC, datetime
-        mA = _mock_market(  # earlier-closing, CHEAPER — normal term structure
+        mA = _mock_market(  # earlier-closing, PRICIER — nothing to dispute
             ticker="EARLY", event_ticker="EVT-A",
             title="Will BTC exceed $80k",
-            yes_ask=0.20, no_ask=0.80,
+            yes_ask=0.45, no_ask=0.55,
             close_time=datetime(2026, 3, 1, tzinfo=UTC),
         )
-        mB = _mock_market(  # later-closing, more expensive
+        mB = _mock_market(  # later-closing, cheaper
             ticker="LATE", event_ticker="EVT-B",
             title="Will BTC exceed $80k",
-            yes_ask=0.45, no_ask=0.55,
+            yes_ask=0.20, no_ask=0.80,
             close_time=datetime(2026, 3, 20, tzinfo=UTC),
         )
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
-        assert pairs == [], f"Pricier later contract must not be a candidate; got {pairs}"
+        assert pairs == [], f"Pricier earlier contract must not be a candidate; got {pairs}"
 
 
-def _ts_pair_markets(*, gap_days: int, pA: float, pB: float):
+def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = None):
     """Build an earlier/later mock market pair sharing a title, gap_days apart.
 
-    The earlier market carries YES ask pA (NO ask 1-pA) and the later one pB,
-    so pA - pB is the directional price gap seen by find_time_series_pairs.
+    The earlier market carries YES ask pA (NO ask 1-pA) and the later one YES
+    ask pB with NO ask nB (default 1-pB, a tight book), so pB - pA is the
+    directional price gap seen by find_time_series_pairs and (pA, nB) are
+    the two LEG prices (YES on EARLY, NO on LATE).
     """
     from datetime import UTC, datetime, timedelta
     early_close = datetime(2026, 3, 1, tzinfo=UTC)
@@ -304,15 +314,17 @@ def _ts_pair_markets(*, gap_days: int, pA: float, pB: float):
     mB = _mock_market(
         ticker="LATE", event_ticker="EVT-B",
         title="Will BTC exceed $80k",
-        yes_ask=pB, no_ask=round(1.0 - pB, 4),
+        yes_ask=pB, no_ask=round(1.0 - pB, 4) if nB is None else nB,
         close_time=early_close + timedelta(days=gap_days),
     )
     return mA, mB
 
 
 class TestTimeSeriesTieredThreshold:
-    """The minimum price gap is tiered by deadline gap: 15% for gaps <= 15
-    days, 30% for 16-30 days, and gaps > 30 days are never candidates."""
+    """The minimum price gap (later YES ask minus earlier YES ask) is tiered
+    by deadline gap: 15% for gaps <= 15 days, 30% for 16-30 days, and gaps
+    > 30 days are never candidates. Every fixture has the LATER contract
+    pricier (pB > pA) except the direction test."""
 
     def _scan(self, gap_days, pA, pB):
         mA, mB = _ts_pair_markets(gap_days=gap_days, pA=pA, pB=pB)
@@ -320,46 +332,68 @@ class TestTimeSeriesTieredThreshold:
 
     def test_short_gap_20pct_price_gap_accepted(self):
         # 10-day deadline gap → 15% tier; a 20% price gap qualifies
-        pairs = self._scan(10, pA=0.50, pB=0.30)
+        pairs = self._scan(10, pA=0.30, pB=0.50)
         assert len(pairs) == 1
         assert pairs[0].market_a.ticker == "EARLY"
+        assert pairs[0].market_b.ticker == "LATE"
+
+    def test_candidate_carries_leg_price_nB_and_reporting_nA(self):
+        # nB (LATE's NO ask) is the NO leg's price; nA (EARLY's NO ask) is still
+        # read so the prod log's "nA (NO ask)" column stays meaningful.
+        [pair] = self._scan(10, pA=0.30, pB=0.50)
+        assert pair.pA == pytest.approx(0.30)
+        assert pair.pB == pytest.approx(0.50)
+        assert pair.nB == pytest.approx(0.50)
+        assert pair.nA == pytest.approx(0.70)
+        # Tight book: pA + nB = 0.80 leaves 0.20 above fees → tradeable
+        assert pair.tradeable is True
+        assert leg_prices(pair) == (pytest.approx(0.30), pytest.approx(0.50))
 
     def test_short_gap_10pct_price_gap_rejected(self):
         # 10-day deadline gap → 15% tier; a 10% price gap is below it
-        assert self._scan(10, pA=0.40, pB=0.30) == []
+        assert self._scan(10, pA=0.30, pB=0.40) == []
 
     def test_long_gap_18pct_price_gap_rejected(self):
         # 20-day deadline gap → 30% tier; 18% would have passed the old flat
         # 15% threshold but must now be rejected
-        assert self._scan(20, pA=0.48, pB=0.30) == []
+        assert self._scan(20, pA=0.30, pB=0.48) == []
 
     def test_long_gap_35pct_price_gap_accepted(self):
         # 20-day deadline gap → 30% tier; a 35% price gap clears it
-        pairs = self._scan(20, pA=0.65, pB=0.30)
+        pairs = self._scan(20, pA=0.30, pB=0.65)
         assert len(pairs) == 1
 
     def test_boundary_15_day_gap_uses_short_tier(self):
         # Exactly 15 days is inclusive in the 15% tier — 20% qualifies
-        pairs = self._scan(15, pA=0.50, pB=0.30)
+        pairs = self._scan(15, pA=0.30, pB=0.50)
         assert len(pairs) == 1
 
     def test_boundary_16_day_gap_uses_long_tier(self):
         # 16 days falls into the 30% tier — the same 20% gap now fails
-        assert self._scan(16, pA=0.50, pB=0.30) == []
+        assert self._scan(16, pA=0.30, pB=0.50) == []
 
     def test_boundary_30_day_gap_still_allowed(self):
         # 30 days is the maximum allowed deadline gap; 35% clears the 30% tier
-        pairs = self._scan(30, pA=0.65, pB=0.30)
+        pairs = self._scan(30, pA=0.30, pB=0.65)
         assert len(pairs) == 1
 
     def test_over_max_gap_rejected_regardless_of_price(self):
         # 35 days exceeds MAX_DEADLINE_GAP_DAYS — even a 40% price gap is out
-        assert self._scan(35, pA=0.70, pB=0.30) == []
+        assert self._scan(35, pA=0.30, pB=0.70) == []
 
-    def test_direction_still_rules_out_pricier_later_contract(self):
-        # 10-day gap, later contract pricier by 35%: magnitude alone never
-        # qualifies — the filter is directional (earlier must be expensive)
-        assert self._scan(10, pA=0.30, pB=0.65) == []
+    def test_direction_still_rules_out_pricier_earlier_contract(self):
+        # 10-day gap, EARLIER contract pricier by 35%: magnitude alone never
+        # qualifies — the filter is directional (the later leg must be pricier)
+        assert self._scan(10, pA=0.65, pB=0.30) == []
+
+    def test_wide_later_book_is_candidate_but_untradeable(self):
+        # A 30% YES-ask gap qualifies as a candidate, but with LATE's NO ask
+        # at 0.75 the legs cost pA + nB = 1.05 — no win scenario covers that,
+        # so the pair is carried as untradeable (visible in the dev sheet).
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.60, nB=0.75)
+        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert pair.tradeable is False
+        assert pair.nB == pytest.approx(0.75)
 
     def test_same_event_ticker_never_pairs(self):
         # Two options inside the same multi-choice event share an event_ticker
@@ -418,91 +452,138 @@ class TestTimeSeriesTieredThreshold:
         assert len(pairs) == 1
 
 
-def _orderbook_client(*, nA_fill: float, pB_fill: float, qty: int = 100):
-    """Mock KalshiClient whose order books offer depth at exactly one level.
+def _raw_book_response(ob: dict) -> SimpleNamespace:
+    """Wrap one orderbook_fp side dict as a raw *_without_preload_content response.
 
-    Buying NO on A consumes YES bids of A (NO ask = 1 - YES bid), and buying
-    YES on B consumes NO bids of B (YES ask = 1 - NO bid) — so a YES bid of
-    (1 - nA_fill) on A and a NO bid of (1 - pB_fill) on B yield qualifying
-    depth priced at exactly nA_fill + pB_fill. Responses use the raw
-    orderbook_fp JSON wire format (the SDK's modeled orderbook response can't
-    deserialize live payloads anymore).
+    Responses use the raw orderbook_fp JSON wire format (the SDK's modeled
+    orderbook response can't deserialize live payloads anymore).
+    """
+    payload = {"orderbook_fp": ob}
+    return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
+
+
+def _ts_orderbook_client(*, pA_fill: float, nB_fill: float, qty: int = 100):
+    """Mock KalshiClient serving TIME-SERIES-shaped depth at exactly one level.
+
+    A time-series pair buys YES on EARLY and NO on LATE. Buying YES on EARLY
+    consumes EARLY's NO bids (YES ask = 1 - NO bid) and buying NO on LATE
+    consumes LATE's YES bids (NO ask = 1 - YES bid) — so a NO bid of
+    (1 - pA_fill) on EARLY and a YES bid of (1 - nB_fill) on LATE yield
+    qualifying depth priced at exactly pA_fill + nB_fill. The opposite sides
+    are left empty so a wrong-side read shows up as "no depth".
     """
     def fake_orderbook(ticker):
-        if ticker == "EARLY":  # market A — YES bids become NO ask levels
-            ob = {"yes_dollars": [[str(round(1.0 - nA_fill, 4)), str(qty)]],
-                  "no_dollars": []}
-        else:                  # market B — NO bids become YES ask levels
+        if ticker == "EARLY":  # market A — NO bids become YES ask levels
             ob = {"yes_dollars": [],
-                  "no_dollars": [[str(round(1.0 - pB_fill, 4)), str(qty)]]}
-        payload = {"orderbook_fp": ob}
-        return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
+                  "no_dollars": [[str(round(1.0 - pA_fill, 4)), str(qty)]]}
+        else:                  # market B — YES bids become NO ask levels
+            ob = {"yes_dollars": [[str(round(1.0 - nB_fill, 4)), str(qty)]],
+                  "no_dollars": []}
+        return _raw_book_response(ob)
 
     client = MagicMock()
     client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
     return client
 
 
-def _ts_candidate(*, gap_days: int, pA: float, pB: float, nA: float) -> CandidatePair:
-    """Build a time_series CandidatePair whose legs close gap_days apart."""
-    mA, mB = _ts_pair_markets(gap_days=gap_days, pA=pA, pB=pB)
+def _st_orderbook_client(*, nA_fill: float, pB_fill: float, qty: int = 100, ticker_a: str = "A1"):
+    """Mock KalshiClient serving SAME-TITLE-shaped depth at exactly one level.
+
+    A same-title pair buys NO on A and YES on B. Buying NO on A consumes A's
+    YES bids (NO ask = 1 - YES bid) and buying YES on B consumes B's NO bids
+    (YES ask = 1 - NO bid) — so a YES bid of (1 - nA_fill) on ticker_a and a
+    NO bid of (1 - pB_fill) on every other ticker yield qualifying depth
+    priced at exactly nA_fill + pB_fill. This is the book shape the scanner
+    read for EVERY pair before the 2026-09 time-series inversion.
+    """
+    def fake_orderbook(ticker):
+        if ticker == ticker_a:  # market A — YES bids become NO ask levels
+            ob = {"yes_dollars": [[str(round(1.0 - nA_fill, 4)), str(qty)]],
+                  "no_dollars": []}
+        else:                   # market B — NO bids become YES ask levels
+            ob = {"yes_dollars": [],
+                  "no_dollars": [[str(round(1.0 - pB_fill, 4)), str(qty)]]}
+        return _raw_book_response(ob)
+
+    client = MagicMock()
+    client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
+    return client
+
+
+def _ts_candidate(
+    *, gap_days: int, pA: float, pB: float, nB: float, nA: float | None = None,
+) -> CandidatePair:
+    """Build a time_series CandidatePair whose legs close gap_days apart.
+
+    (pA, nB) are the leg prices (YES on EARLY, NO on LATE); nA defaults to the
+    tight complement 1 - pA and is reporting-only for this pair type.
+    """
+    mA, mB = _ts_pair_markets(gap_days=gap_days, pA=pA, pB=pB, nB=nB)
     return CandidatePair(
         market_a=mA, market_b=mB,
-        pA=pA, pB=pB, nA=nA,
+        pA=pA, pB=pB, nA=round(1.0 - pA, 4) if nA is None else nA,
         tradeable=True,
         canonical_title="will btc exceed $80k",
         pair_type="time_series",
+        nB=nB,
     )
 
 
 class TestOrderbookCeilingTieredByDeadlineGap:
     """enrich_with_orderbook_prices and validate_pair_price must apply the
-    deadline-gap-tiered price-sum ceiling (0.85 for gaps <= 15 days, 0.70 for
-    16-30 days), not the old flat 1 - 15% = 0.85."""
+    deadline-gap-tiered LEG-price-sum ceiling (0.85 for gaps <= 15 days, 0.70
+    for 16-30 days), not the old flat 1 - 15% = 0.85.
+
+    The fixtures use a deliberately WIDE later book: with a tight nB = 1 - pB
+    the leg sum is exactly 1 - (pB - pA), which is always <= the ceiling once
+    the pair has passed the gap filter, so the ceiling could never bind."""
 
     def test_long_gap_depth_at_075_sum_marked_untradeable(self):
-        # 20-day gap → ceiling 0.70. Depth priced at 0.45 + 0.30 = 0.75 would
-        # have passed the old flat 0.85 ceiling but must now disqualify.
-        pair = _ts_candidate(gap_days=20, pA=0.65, pB=0.30, nA=0.45)
-        client = _orderbook_client(nA_fill=0.45, pB_fill=0.30)
+        # 20-day gap → ceiling 0.70. Leg depth priced at pA 0.30 + nB 0.45 =
+        # 0.75 would have passed the old flat 0.85 ceiling but must disqualify.
+        pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.45)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is False
 
     def test_short_gap_depth_at_080_sum_qualifies(self):
-        # 10-day gap → ceiling 0.85. Depth priced at 0.45 + 0.35 = 0.80 qualifies
-        # and the pair picks up the depth-weighted fill prices.
-        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
-        client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
+        # 10-day gap → ceiling 0.85. Leg depth priced at 0.30 + 0.50 = 0.80
+        # qualifies and the pair picks up the depth-weighted fill prices in
+        # the LEG fields (pA/nB) — nA/pB are not leg prices and stay put.
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is True
         assert enriched.max_contracts == 100
-        assert enriched.nA == pytest.approx(0.45)
-        assert enriched.pB == pytest.approx(0.35)
+        assert enriched.pA == pytest.approx(0.30)
+        assert enriched.nB == pytest.approx(0.50)
+        assert enriched.nA == pair.nA
+        assert enriched.pB == pair.pB
 
     def test_validate_pair_price_rejects_long_gap_at_old_ceiling(self):
         # Pre-execution re-check applies the same tiered ceiling: a 20-day-gap
-        # pair whose remaining depth sums to 0.80 no longer qualifies.
-        pair = _ts_candidate(gap_days=20, pA=0.65, pB=0.35, nA=0.45)
+        # pair whose remaining leg depth sums to 0.80 no longer qualifies.
+        pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         assert validate_pair_price(client, spec) is False
 
     def test_validate_pair_price_accepts_short_gap_at_same_depth(self):
         # Identical depth passes for a 10-day-gap pair (ceiling 0.85)
-        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         assert validate_pair_price(client, spec) is True
 
     def test_validate_pair_price_logs_gap_rejection_at_warning(self, caplog):
         # Same rejecting fixture as test_validate_pair_price_rejects_long_gap_at_old_ceiling
-        # (0.45 + 0.35 = 0.80 exceeds the 20-day-gap ceiling of 0.70, so this hits
+        # (0.30 + 0.50 = 0.80 exceeds the 20-day-gap ceiling of 0.70, so this hits
         # the "gap no longer qualifies" branch, not the depth branch). The drop must
         # be logged exactly once, at WARNING, with "; dropping" appended — this is
         # the one log line for the drop; pre_execution_check must not log a second.
-        pair = _ts_candidate(gap_days=20, pA=0.65, pB=0.35, nA=0.45)
+        pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _orderbook_client(nA_fill=0.45, pB_fill=0.35)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         with caplog.at_level(logging.INFO):
             assert validate_pair_price(client, spec) is False
 
@@ -518,6 +599,247 @@ class TestOrderbookCeilingTieredByDeadlineGap:
             if r.levelno == logging.INFO and "gap no longer qualifies" in r.getMessage()
         ]
         assert info_drops == []
+
+
+class TestTimeSeriesEnrichmentSides:
+    """A time-series pair buys YES on EARLY (consuming EARLY's NO bids) and NO
+    on LATE (consuming LATE's YES bids); enrichment must read those sides and
+    write the fills back to pA/nB — the fields leg_prices() reads."""
+
+    def test_leg_ask_levels_time_series_reads_b_yes_bids_and_a_no_bids(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        ob_a = {"yes": [["0.29", "7"]], "no": [["0.68", "5"]]}   # NO bid 0.68 → YES ask 0.32
+        ob_b = {"yes": [["0.58", "9"]], "no": [["0.39", "3"]]}   # YES bid 0.58 → NO ask 0.42
+        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
+        assert no_levels == [(pytest.approx(0.42), 9.0)]
+        assert yes_levels == [(pytest.approx(0.32), 5.0)]
+
+    def test_leg_ask_levels_same_title_reads_a_yes_bids_and_b_no_bids(self):
+        pair = SimpleNamespace(pair_type="same_title")
+        ob_a = {"yes": [["0.55", "7"]], "no": [["0.40", "5"]]}   # YES bid 0.55 → NO ask 0.45
+        ob_b = {"yes": [["0.20", "9"]], "no": [["0.69", "3"]]}   # NO bid 0.69 → YES ask 0.31
+        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
+        assert no_levels == [(pytest.approx(0.45), 7.0)]
+        assert yes_levels == [(pytest.approx(0.31), 3.0)]
+
+    def test_leg_ask_levels_unknown_pair_type_uses_same_title_sides(self):
+        # Fail-safe like leg_sides: None / a bogus type / a bare namespace with
+        # no pair_type all read the same-title sides
+        ob_a = {"yes": [["0.55", "7"]], "no": []}
+        ob_b = {"yes": [], "no": [["0.69", "3"]]}
+        for pair in (SimpleNamespace(), SimpleNamespace(pair_type=None), SimpleNamespace(pair_type="bogus")):
+            no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
+            assert no_levels == [(pytest.approx(0.45), 7.0)]
+            assert yes_levels == [(pytest.approx(0.31), 3.0)]
+
+    def test_enrichment_writes_fills_to_pA_nB_and_leaves_nA_pB(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.max_contracts == 40
+        assert enriched.pA == pytest.approx(0.32)
+        assert enriched.nB == pytest.approx(0.42)
+        # Not leg prices for this pair type — must be byte-identical to the input
+        assert enriched.nA == pair.nA
+        assert enriched.pB == pair.pB
+        assert leg_prices(enriched) == (pytest.approx(0.32), pytest.approx(0.42))
+
+    def test_same_title_shaped_books_yield_no_depth_for_time_series(self):
+        # The pre-inversion book shape (EARLY YES bids, LATE NO bids) is the
+        # wrong side for both time-series legs — enrichment must find no depth
+        # rather than pricing the legs off the wrong side of each book.
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        client = _st_orderbook_client(nA_fill=0.70, pB_fill=0.60, ticker_a="EARLY")
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is False
+        assert enriched.max_contracts == 0
+        # Same for the pre-execution re-check
+        spec = SimpleNamespace(pair=pair, x=1)
+        assert validate_pair_price(client, spec) is False
+
+    def test_depth_short_of_spec_count_fails_validate(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, qty=9)
+        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=10)) is False
+        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=9)) is True
+
+
+class TestSameTitleEnrichmentByteIdentity:
+    """Same-title behaviour must not change with the time-series inversion:
+    NO on A still consumes A's YES bids, YES on B still consumes B's NO bids,
+    and the fills still land in nA/pB with pA/nB untouched."""
+
+    @staticmethod
+    def _pair() -> CandidatePair:
+        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
+        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
+        return CandidatePair(
+            market_a=mA, market_b=mB,
+            pA=0.55, pB=0.30, nA=0.45,
+            tradeable=True,
+            canonical_title="Q",
+            pair_type="same_title",
+            nB=0.70,
+        )
+
+    def test_enrichment_writes_fills_to_nA_pB_and_leaves_pA_nB(self):
+        pair = self._pair()
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.max_contracts == 100
+        assert enriched.nA == pytest.approx(0.44)
+        assert enriched.pB == pytest.approx(0.31)
+        assert enriched.pA == pair.pA
+        assert enriched.nB == pair.nB
+        assert leg_prices(enriched) == (pytest.approx(0.44), pytest.approx(0.31))
+
+    def test_ceiling_is_flat_five_percent(self):
+        # 0.50 + 0.46 = 0.96 > 0.95 — the same-title ceiling, no deadline tiering
+        pair = self._pair()
+        client = _st_orderbook_client(nA_fill=0.50, pB_fill=0.46)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is False
+        client_ok = _st_orderbook_client(nA_fill=0.50, pB_fill=0.45)
+        [enriched_ok] = enrich_with_orderbook_prices(client_ok, [pair])
+        assert enriched_ok.tradeable is True
+
+    def test_validate_pair_price_same_title(self):
+        pair = self._pair()
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
+        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=100)) is True
+        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=101)) is False
+
+    def test_time_series_shaped_books_yield_no_depth_for_same_title(self):
+        # The inverse of the time-series wrong-shape test: a same-title pair
+        # served time-series-shaped books (A NO bids, B YES bids) finds nothing.
+        pair = self._pair()
+
+        def fake_orderbook(ticker):
+            if ticker == "A1":
+                ob = {"yes_dollars": [], "no_dollars": [["0.56", "100"]]}
+            else:
+                ob = {"yes_dollars": [["0.69", "100"]], "no_dollars": []}
+            return _raw_book_response(ob)
+
+        client = MagicMock()
+        client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is False
+
+
+class TestTimeSeriesBestPairPerGroup:
+    def test_group_of_three_keeps_largest_later_minus_earlier_gap(self):
+        # Three contracts on one normalized title, all within the short tier:
+        # EARLY→MID gap 0.20 and EARLY→LATE gap 0.30 both qualify, MID→LATE
+        # (0.10) does not. One pair per group survives — the largest pB - pA.
+        early_close = datetime(2026, 3, 1, tzinfo=UTC)
+        markets = [
+            _mock_market(ticker="EARLY", event_ticker="EVT-A", title="Will BTC exceed $80k",
+                         yes_ask=0.30, no_ask=0.70, close_time=early_close),
+            _mock_market(ticker="MID", event_ticker="EVT-M", title="Will BTC exceed $80k",
+                         yes_ask=0.50, no_ask=0.50, close_time=early_close + timedelta(days=5)),
+            _mock_market(ticker="LATE", event_ticker="EVT-B", title="Will BTC exceed $80k",
+                         yes_ask=0.60, no_ask=0.40, close_time=early_close + timedelta(days=10)),
+        ]
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+        assert len(pairs) == 1
+        [pair] = pairs
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("EARLY", "LATE")
+        assert pair.pB - pair.pA == pytest.approx(0.30)
+        assert pair.nB == pytest.approx(0.40)
+        assert pair.tradeable is True
+
+    def test_tradeable_pair_outranks_wider_untradeable_gap(self):
+        # A wide-book later contract (NO ask 0.80) has the bigger YES-ask gap
+        # but no win scenario covers pA + nB = 1.10; the narrower tradeable
+        # pair wins the group's slot.
+        early_close = datetime(2026, 3, 1, tzinfo=UTC)
+        markets = [
+            _mock_market(ticker="EARLY", event_ticker="EVT-A", title="Will BTC exceed $80k",
+                         yes_ask=0.30, no_ask=0.70, close_time=early_close),
+            _mock_market(ticker="MID", event_ticker="EVT-M", title="Will BTC exceed $80k",
+                         yes_ask=0.50, no_ask=0.50, close_time=early_close + timedelta(days=5)),
+            _mock_market(ticker="WIDE", event_ticker="EVT-W", title="Will BTC exceed $80k",
+                         yes_ask=0.70, no_ask=0.80, close_time=early_close + timedelta(days=10)),
+        ]
+        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("EARLY", "MID")
+        assert pair.tradeable is True
+
+
+class TestLegHelpers:
+    """leg_sides / leg_prices / deadline_gap_days are the cross-module contract
+    for which side each leg buys and what it costs."""
+
+    def test_leg_sides_time_series(self):
+        assert leg_sides("time_series") == TIME_SERIES_LEG_SIDES == ("yes", "no")
+
+    def test_leg_sides_same_title(self):
+        assert leg_sides("same_title") == SAME_TITLE_LEG_SIDES == ("no", "yes")
+
+    def test_leg_sides_fail_safe_to_same_title(self):
+        # None, a bogus string, and a MagicMock auto-attribute all resolve to
+        # the same-title sides — an unknown pair type must never be traded as
+        # the directional time-series bet
+        assert leg_sides(None) == SAME_TITLE_LEG_SIDES
+        assert leg_sides("bogus") == SAME_TITLE_LEG_SIDES
+        assert leg_sides(MagicMock().pair_type) == SAME_TITLE_LEG_SIDES
+
+    def test_leg_prices_time_series_real_pair(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        assert leg_prices(pair) == (0.30, 0.40)
+
+    def test_leg_prices_same_title_real_pair(self):
+        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
+        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
+        pair = CandidatePair(
+            market_a=mA, market_b=mB, pA=0.55, pB=0.30, nA=0.45,
+            tradeable=True, canonical_title="Q", pair_type="same_title", nB=0.70,
+        )
+        assert leg_prices(pair) == (0.45, 0.30)
+
+    def test_leg_prices_simple_namespace(self):
+        ts = SimpleNamespace(pair_type="time_series", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        st = SimpleNamespace(pair_type="same_title", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        untyped = SimpleNamespace(pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        assert leg_prices(ts) == (0.30, 0.40)
+        assert leg_prices(st) == (0.70, 0.60)
+        assert leg_prices(untyped) == (0.70, 0.60)
+
+    def test_leg_prices_reads_nB_directly(self):
+        # No getattr default: a time-series stub without nB must fail loudly
+        # rather than price the NO leg at a placeholder
+        stub = SimpleNamespace(pair_type="time_series", pA=0.30, pB=0.60, nA=0.70)
+        with pytest.raises(AttributeError):
+            leg_prices(stub)
+
+    def test_deadline_gap_days_is_symmetric(self):
+        mA = SimpleNamespace(close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = SimpleNamespace(close_time=datetime(2026, 3, 21, tzinfo=UTC))
+        assert deadline_gap_days(mA, mB) == 20
+        assert deadline_gap_days(mB, mA) == 20
+
+    def test_deadline_gap_days_whole_days_23h_to_01h(self):
+        # 2026-03-01 23:00Z → 2026-03-17 01:00Z is 15 days 2 hours: .days == 15,
+        # so this pair sits in the short tier (inclusive boundary) either way round
+        mA = SimpleNamespace(close_time=datetime(2026, 3, 1, 23, 0, tzinfo=UTC))
+        mB = SimpleNamespace(close_time=datetime(2026, 3, 17, 1, 0, tzinfo=UTC))
+        assert deadline_gap_days(mA, mB) == 15
+        assert deadline_gap_days(mB, mA) == 15
+
+    def test_deadline_gap_days_zero_for_same_close(self):
+        m = SimpleNamespace(close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        assert deadline_gap_days(m, m) == 0
+
+    def test_scanner_and_ceiling_share_the_gap(self):
+        # _pair_max_sum tiers off the same order-independent gap the finder
+        # used, so a 16-day pair gets the long-tier ceiling from either side
+        pair = _ts_candidate(gap_days=16, pA=0.30, pB=0.65, nB=0.40)
+        assert scanner._pair_max_sum(pair) == pytest.approx(0.70)
+        swapped = dataclasses.replace(pair, market_a=pair.market_b, market_b=pair.market_a)
+        assert scanner._pair_max_sum(swapped) == pytest.approx(0.70)
 
 
 def _orderbook_payload_client(payload: dict):
@@ -670,7 +992,7 @@ class TestFetchOrderbookKeyMapping:
     def test_mismatch_marks_pair_untradeable(self):
         # End-to-end: a mismatched orderbook makes enrich_with_orderbook_prices
         # mark the pair non-tradeable (both legs resolve to None depth).
-        pair = _ts_candidate(gap_days=10, pA=0.65, pB=0.35, nA=0.45)
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         payload = {"orderbook_fp": {"yes": [["0.55", "100"]], "no": [["0.65", "100"]]}}
         [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
         assert enriched.tradeable is False
@@ -1843,20 +2165,21 @@ class TestFilterActiveMarketsCloseTimeGuard:
 
     def test_find_time_series_pairs_ignores_member_with_none_close_time(self):
         # Three markets sharing one date-stripped title on three event tickers:
-        # two good ones that qualify as a 15%-tier pair, plus one whose
-        # close_time is None. The sort in find_time_series_pairs used to raise
-        # TypeError comparing None against a datetime.
+        # two good ones that qualify as a 15%-tier pair (later contract pricier
+        # by 20%), plus one whose close_time is None. The sort in
+        # find_time_series_pairs used to raise TypeError comparing None against
+        # a datetime.
         early_close = datetime(2026, 3, 1, tzinfo=UTC)
         mA = _mock_market(
             ticker="EARLY", event_ticker="EVT-A",
             title="Will BTC exceed $80k",
-            yes_ask=0.50, no_ask=0.50,
+            yes_ask=0.30, no_ask=0.70,
             close_time=early_close,
         )
         mB = _mock_market(
             ticker="LATE", event_ticker="EVT-B",
             title="Will BTC exceed $80k",
-            yes_ask=0.30, no_ask=0.70,
+            yes_ask=0.50, no_ask=0.50,
             close_time=early_close + timedelta(days=10),
         )
         bad = self._bad_close_time_market("NOCLOSE", "EVT-C")

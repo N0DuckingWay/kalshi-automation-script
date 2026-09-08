@@ -55,13 +55,14 @@ Notes:
     neither the V2 order endpoint nor exchange sharding, so a sandbox "pass"
     would prove nothing about the mapping this probe exists to verify.
 
-    COUNT OVERRIDE. trader's builders read the whole-contract count from
-    TradeSpec (rendered "<n>.00") because the bot sizes in whole contracts. The
-    probe wants the V2 minimum of 0.01 contracts, so _no_buy_body() /
-    _no_close_body() build the body through the real builders on a minimal
-    spec-shaped stand-in and then override the one field — see the loud comment
-    there. trader.py is deliberately NOT modified for the probe's benefit: the
-    thing being verified must stay byte-identical to the thing that will run.
+    COUNT OVERRIDE. trader's builders read the whole-contract count from the
+    trader._Leg they are handed (rendered "<n>.00") because the bot sizes in
+    whole contracts. The probe wants the V2 minimum of 0.01 contracts, so
+    _no_buy_body() / _no_close_body() build the body through the real builders
+    on a real _Leg (_probe_leg: side "no", count 1) and then override the one
+    field — see the loud comment there. trader.py is deliberately NOT modified
+    for the probe's benefit: the thing being verified must stay byte-identical
+    to the thing that will run.
 
     SUBMISSION AND FILL READING. trader._submit_order_v2 classifies fills
     against `int(Decimal(body["count"]))`, which truncates the probe's
@@ -91,7 +92,6 @@ import json
 import logging
 import sys
 from decimal import Decimal
-from types import SimpleNamespace
 from typing import Any
 
 from . import auth, config, scanner, trader
@@ -207,25 +207,29 @@ def _fetch_market(client: Any, ticker: str) -> tuple:
     return raw, scanner._market_from_dict(raw, "")
 
 
-def _probe_spec(market: Any, no_price: float) -> SimpleNamespace:
+def _probe_leg(market: Any, no_price: float) -> trader._Leg:
     """
-    Build the minimal TradeSpec-shaped stand-in trader's builders read.
+    Build the trader._Leg the probe hands to trader's V2 order builders.
 
-    Only the attributes _build_no_order_v2 / _build_rollback_order_v2 actually
-    touch are provided: pair.market_a (ticker, tick grid, exchange shard),
-    pair.nA (the scanned NO price), and x (the whole-contract count — a
-    placeholder, immediately overridden; see _no_buy_body).
+    The builders take a _Leg rather than a TradeSpec, so the probe constructs
+    the real thing rather than a stand-in: `market` (ticker, tick grid,
+    exchange shard — exactly what _build_no_order_v2 /
+    _build_rollback_order_v2 read), side "no" (the probe verifies the NO-leg
+    mapping and nothing else), `price_dollars` = the scanned NO price, `count`
+    1 (a whole-contract placeholder, immediately overridden — see
+    _no_buy_body) and a fixed "NO on v2-probe" label.
 
     Args:
         market (Any): The scanner.ApiMarket the probe trades.
         no_price (float): Scanned NO price in dollars, from the order book.
 
     Returns:
-        SimpleNamespace: The spec stand-in.
+        trader._Leg: The NO leg for the probe's order.
     """
-    return SimpleNamespace(
-        pair=SimpleNamespace(market_a=market, nA=no_price, canonical_title="v2-probe"),
-        x=1,
+    # Cross-module: the same leg type the live path builds in _ordered_legs,
+    # so the builders below cannot tell the probe from a real trade
+    return trader._Leg(
+        market=market, side="no", price_dollars=no_price, count=1, label="NO on v2-probe",
     )
 
 
@@ -245,9 +249,10 @@ def _no_buy_body(market: Any, no_price: float) -> dict:
     Returns:
         dict: The request body, identical to the live path's except for count.
     """
-    body = trader._build_no_order_v2(_probe_spec(market, no_price))
+    # Cross-module: the real NO-leg builder, fed a real _Leg (see _probe_leg)
+    body = trader._build_no_order_v2(_probe_leg(market, no_price))
     # !!! DELIBERATE OVERRIDE — DO NOT "FIX" THIS BY CHANGING trader.py !!!
-    # The builders read a whole-contract count from TradeSpec and render
+    # The builders read a whole-contract count from the _Leg and render
     # "<n>.00" because the bot sizes in whole contracts. The probe wants the V2
     # fractional minimum of 0.01 contracts (~one cent of exposure), which that
     # contract cannot express. Overriding the one field here keeps trader.py —
@@ -267,7 +272,9 @@ def _no_close_body(market: Any) -> dict:
         dict: The request body — trader._build_rollback_order_v2's output with
             only the count overridden (see _no_buy_body for why).
     """
-    body = trader._build_rollback_order_v2(_probe_spec(market, 0.5))
+    # Cross-module: the real unwind builder on a _Leg whose entry (0.5) only
+    # sets the loss floor of a bid the probe wants to fill regardless
+    body = trader._build_rollback_order_v2(_probe_leg(market, 0.5))
     body["count"] = PROBE_COUNT_STR
     return body
 

@@ -4,7 +4,7 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Command-line entry point for the Kalshi arbitrage backtester. Parses CLI
+    Command-line entry point for the Kalshi backtester. Parses CLI
     arguments (start date, initial balance, cache behavior), configures logging
     to kalshi_backtest.log, constructs the necessary API clients, delegates the
     full backtest simulation to backtester.run_backtest(), and then calls
@@ -36,7 +36,7 @@ from .historical import build_historical_client, build_prod_live_client
 
 def main() -> None:
     """
-    CLI entry point for the Kalshi arbitrage backtester.
+    CLI entry point for the Kalshi backtester.
 
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days), configures logging, constructs historical and live

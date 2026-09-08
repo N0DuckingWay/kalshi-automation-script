@@ -1,4 +1,5 @@
-"""Tests for config.py fee helpers and PROJECT_ROOT."""
+"""Tests for config.py fee helpers, the time-series probability model, the
+leg-side tuples, and PROJECT_ROOT."""
 import math
 import pathlib
 
@@ -10,11 +11,15 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
+    SAME_TITLE_LEG_SIDES,
     SHORT_DEADLINE_GAP_DAYS,
     TAKER_FEE_RATE,
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+    TIME_SERIES_LEG_SIDES,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
+    time_series_profit_prob,
 )
 
 
@@ -82,20 +87,80 @@ class TestFeeLegExact:
 
 class TestFeePairApprox:
     def test_formula_matches_definition(self):
-        nA, pB = 0.35, 0.45
-        expected = TAKER_FEE_RATE * (nA * (1 - nA) + pB * (1 - pB))
-        assert fee_per_pair_approx(nA, pB) == pytest.approx(expected)
+        price_a, price_b = 0.35, 0.45
+        expected = TAKER_FEE_RATE * (price_a * (1 - price_a) + price_b * (1 - price_b))
+        assert fee_per_pair_approx(price_a, price_b) == pytest.approx(expected)
 
     def test_is_underestimate_vs_exact(self):
         # The approximation should be <= the sum of two exact leg fees at n=1,
         # because ceiling rounding always rounds up.
-        for nA, pB in [(0.3, 0.4), (0.2, 0.5), (0.45, 0.35)]:
-            approx = fee_per_pair_approx(nA, pB)
-            exact_sum = fee_leg_exact(1, nA) + fee_leg_exact(1, pB)
-            assert approx <= exact_sum + 1e-9, f"approx {approx} > exact {exact_sum} for nA={nA} pB={pB}"
+        for price_a, price_b in [(0.3, 0.4), (0.2, 0.5), (0.45, 0.35)]:
+            approx = fee_per_pair_approx(price_a, price_b)
+            exact_sum = fee_leg_exact(1, price_a) + fee_leg_exact(1, price_b)
+            assert approx <= exact_sum + 1e-9, (
+                f"approx {approx} > exact {exact_sum} for price_a={price_a} price_b={price_b}"
+            )
 
     def test_symmetric(self):
         assert fee_per_pair_approx(0.3, 0.4) == pytest.approx(fee_per_pair_approx(0.4, 0.3))
+
+    def test_side_agnostic_keyword_names(self):
+        # The parameters are leg-neutral (price_a/price_b): the same formula
+        # prices a same-title pair on (nA, pB) and a time-series pair on (pA, nB)
+        assert fee_per_pair_approx(price_a=0.30, price_b=0.40) == pytest.approx(
+            fee_per_pair_approx(0.30, 0.40)
+        )
+
+
+class TestTimeSeriesProfitProb:
+    """p = 1 - k * max(0, pB - pA): one minus the believed fraction k of the
+    market-implied probability that the event first happens between the two
+    deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair)."""
+
+    def test_flow_through_fixture(self):
+        # pA 0.30, pB 0.60 → gap 0.30 → p = 1 - 0.75 * 0.30 = 0.775
+        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.775)
+
+    def test_matches_definition_from_constant(self):
+        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.30, 0.70)]:
+            expected = 1.0 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * (pB - pA)
+            assert time_series_profit_prob(pA, pB) == pytest.approx(expected)
+
+    def test_clamps_to_one_when_earlier_is_pricier(self):
+        # A pricier earlier contract is never a candidate; reachable only from
+        # reporting code, where it must model as riskless, not as p > 1
+        assert time_series_profit_prob(0.60, 0.30) == 1.0
+        assert time_series_profit_prob(0.50, 0.50) == 1.0
+
+    def test_discount_of_one_is_market_implied(self, monkeypatch):
+        # k = 1 takes the market at face value: p = 1 - (pB - pA). Under this
+        # model Kelly is <= 0 for every pair (see test_strategy's parity class).
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
+        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.70)
+
+    def test_discount_of_zero_ignores_the_gap(self, monkeypatch):
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.0)
+        assert time_series_profit_prob(0.30, 0.60) == 1.0
+
+    def test_discount_constant_value_and_range(self):
+        # The user's conservative choice ("prices converge by 25%") — pinned so
+        # a silent retune is visible in review; must stay inside [0, 1]
+        assert TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
+        assert 0.0 <= TIME_SERIES_INTERVAL_PROB_DISCOUNT <= 1.0
+
+
+class TestLegSideTuples:
+    def test_same_title_buys_no_on_a_yes_on_b(self):
+        assert SAME_TITLE_LEG_SIDES == ("no", "yes")
+
+    def test_time_series_buys_yes_on_earlier_no_on_later(self):
+        assert TIME_SERIES_LEG_SIDES == ("yes", "no")
+
+    def test_each_pair_type_has_exactly_one_no_leg(self):
+        # The trader submits "the NO leg" first and unwinds it — every pair
+        # type must have exactly one, and one YES leg to hedge it
+        for sides in (SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES):
+            assert sorted(sides) == ["no", "yes"]
 
 
 class TestMinPriceDiffForGap:

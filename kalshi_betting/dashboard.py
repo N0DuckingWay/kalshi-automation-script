@@ -15,9 +15,12 @@ Purpose:
 
 Dependencies:
     Imports BacktestTrade from backtester.py, and PROJECT_ROOT,
-    SAME_TITLE_CO_RESOLVE_PROB, and fee_per_pair_approx() from config.py.
-    Uses plotly, numpy, pandas, and yfinance (all external). Called by backtest.py
-    after run_backtest() completes.
+    SAME_TITLE_CO_RESOLVE_PROB, fee_per_pair_approx() and
+    time_series_profit_prob() from config.py — the latter is the single
+    definition of the time-series Kelly probability shared with strategy.py
+    and backtester.py, so the Kelly scatter here shows the same fraction the
+    live sizer computes. Uses plotly, numpy, pandas, and yfinance (all
+    external). Called by backtest.py after run_backtest() completes.
 
 Notes:
     The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
@@ -37,7 +40,12 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import BacktestTrade
-from .config import PROJECT_ROOT, SAME_TITLE_CO_RESOLVE_PROB, fee_per_pair_approx
+from .config import (
+    PROJECT_ROOT,
+    SAME_TITLE_CO_RESOLVE_PROB,
+    fee_per_pair_approx,
+    time_series_profit_prob,
+)
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
@@ -49,7 +57,8 @@ def _sharpe(daily_returns: pd.Series, rf: float = 0.0) -> float:
 
     Args:
         daily_returns (pd.Series): Series of daily fractional returns (e.g. 0.01 for 1%).
-        rf (float): Annual risk-free rate as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
+        rf (float): Annual hurdle rate (the T-bill "rf" term of the Sharpe
+            formula) as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
 
     Returns:
         float: Annualized Sharpe ratio. Returns 0.0 if the standard deviation is zero.
@@ -68,7 +77,8 @@ def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
 
     Args:
         daily_returns (pd.Series): Series of daily fractional returns.
-        rf (float): Annual risk-free rate as a decimal. Defaults to 0.0.
+        rf (float): Annual hurdle rate (the T-bill "rf" term) as a decimal.
+            Defaults to 0.0.
 
     Returns:
         float: Annualized Sortino ratio. Returns 0.0 if there are no negative excess returns.
@@ -163,29 +173,48 @@ def _log_loss(trades: list[BacktestTrade]) -> float:
     return float(np.mean(losses)) if losses else 0.0
 
 
-def _kelly_fraction(pA: float, nA: float, pB: float, pair_type: str) -> float:
+def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str) -> float:
     """
-    Uncapped Kelly fraction f* = p - (1-p)/b for the combined arbitrage trade.
+    Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
 
     Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
     shows the same theoretical Kelly the live sizer would compute (before the
-    BUDGET_FRACTION cap). Returns 0.0 when there is no edge.
+    BUDGET_FRACTION cap). The legs are mapped exactly like scanner.leg_prices:
+    a same_title pair costs nA + pB (NO on A, YES on B) and is priced on the
+    SAME_TITLE_CO_RESOLVE_PROB prior; a time_series pair costs pA + nB (YES on
+    the earlier contract A, NO on the later contract B) and is priced on
+    config.time_series_profit_prob(pA, pB) — one minus the discounted
+    market-implied probability of the single loss cell (A=NO, B=YES; the event
+    first happens between the deadlines). The two win cells are event by A
+    (A=YES, hence B=YES) and never by B (A=NO, B=NO); A=YES/B=NO is impossible
+    for a cumulative-deadline pair. Returns 0.0 when there is no edge.
 
     Args:
-        pA (float): YES ask price of market A at entry.
-        nA (float): NO ask price of market A at entry.
-        pB (float): YES ask price of market B at entry.
-        pair_type (str): "time_series" or "same_title" — selects the probability model.
+        pA (float): YES ask price of market A at entry (a leg price for time_series).
+        nA (float): NO ask price of market A at entry (a leg price for same_title).
+        pB (float): YES ask price of market B at entry (a leg price for same_title;
+            feeds the probability model for time_series).
+        nB (float): NO ask price of market B at entry (a leg price for time_series).
+        pair_type (str): "time_series" or "same_title" — selects the leg prices
+            and the probability model; anything else is treated as same_title,
+            matching scanner.leg_sides.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
     """
-    cost = nA + pB
-    net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
+    if pair_type == "time_series":
+        price_a, price_b = pA, nB
+        # Shared definition with strategy._kelly_p / backtester.run_backtest so
+        # the dashboard can never show a Kelly the live sizer would not compute
+        p = time_series_profit_prob(pA, pB)
+    else:
+        price_a, price_b = nA, pB
+        p = SAME_TITLE_CO_RESOLVE_PROB
+    cost = price_a + price_b
+    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
     if cost <= 0 or net_spread <= 0:
         return 0.0
     b = net_spread / cost
-    p = SAME_TITLE_CO_RESOLVE_PROB if pair_type == "same_title" else (1.0 - pA * (1.0 - pB))
     q = 1.0 - p
     return max(0.0, p - q / b)
 
@@ -389,7 +418,10 @@ def _section_decomposition(trades: list[BacktestTrade]) -> str:
     ))
     fig_cat.update_layout(title="P&L by Category ($)", xaxis_title="P&L ($)")
 
-    # Entry price bucket
+    # Entry price bucket. entry_pA is market A's YES ask at entry for both pair
+    # types, but its meaning differs: for a time_series row it is the price
+    # actually PAID for the YES leg on the earlier contract, while for a
+    # same_title row it is the pricier side's quote (the NO leg costs nA).
     bins   = [0, 0.20, 0.40, 0.60, 0.80, 1.01]
     labels = ["<20¢", "20–40¢", "40–60¢", "60–80¢", ">80¢"]
     df["price_bucket"] = pd.cut(df["entry_pA"], bins=bins, labels=labels)
@@ -525,7 +557,10 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     slippages = [t.slippage for t in trades]
     fig_slip = go.Figure(go.Histogram(x=slippages, nbinsx=20,
                                       marker_color="#7986CB"))
-    fig_slip.update_layout(title="Slippage Distribution (Actual − Expected Payoff, $)",
+    # "Expected" is the win-scenario payoff: the co-resolution floor for a
+    # same-title trade, the profit of either win cell for a time-series one —
+    # so a time-series loss cell shows as large negative slippage, never positive
+    fig_slip.update_layout(title="Slippage Distribution (Actual − Win-Scenario Payoff, $)",
                             xaxis_title="Slippage ($)", yaxis_title="Count")
 
     # Best and worst trades table
@@ -612,7 +647,11 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     # Kelly vs actual sizing scatter. The actual fraction uses the simulated
     # balance at each trade's entry (the base its Kelly budget was computed
     # from) — dividing by the initial balance would distort as equity drifts.
-    kelly_fracs = [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.pair_type) for t in trades]
+    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair type
+    kelly_fracs = [
+        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type)
+        for t in trades
+    ]
     actual_fracs = [
         (t.total_cost + t.fees) / t.balance_at_entry if t.balance_at_entry > 0 else 0.0
         for t in trades
@@ -737,6 +776,11 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     strat_sharpe = _sharpe(equity_df["daily_return"])
     strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
 
+    # "Kalshi Arbitrage Strategy" / "Kalshi Arbitrage Backtest" (here, the
+    # bold-row match below, and the page <title>/<h1>) are the PRODUCT NAME,
+    # kept deliberately after the 2026-09 time-series inversion — the row name
+    # here is string-matched by the table renderer below, so both must agree.
+    # They are not a claim that the time-series leg is an arbitrage.
     bench_rows.insert(0, {
         "name":   "Kalshi Arbitrage Strategy",
         "return": f"{strat_ret:+.1%}",

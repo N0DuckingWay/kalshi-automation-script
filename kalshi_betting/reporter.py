@@ -13,9 +13,11 @@ Purpose:
     frozen header rows — is applied via openpyxl.
 
 Dependencies:
-    Imports display_title from scanner.py and TradeSpec from strategy.py. Imports
-    PROJECT_ROOT from config.py. Exports the TradeResult dataclass (consumed by
-    trader.py) and the two public write functions (consumed by main.py).
+    Imports display_title and leg_sides (which side each leg buys, rendered
+    into the Notes prefix) from scanner.py and TradeSpec from strategy.py.
+    Imports PROJECT_ROOT from config.py. Exports the TradeResult dataclass
+    (consumed by trader.py) and the two public write functions (consumed by
+    main.py).
 
 Notes:
     The TradeResult dataclass is defined here (not in trader.py) because reporter.py
@@ -29,6 +31,18 @@ Notes:
     lock cannot be acquired within _LOCK_TIMEOUT_SECONDS, this run's rows are never
     silently dropped — they're written to a standalone timestamped fallback file
     instead of touching the shared log. See BS-18 in CLAUDE.md's bug-sweep history.
+
+    Header rows are written only when a workbook is CREATED (_append_locked on
+    its first run, _write_fallback_log always, write_dev_simulation always), so
+    the 2026-09 strategy change — which renamed the x/y headers to the
+    side-neutral "x — A leg" / "y — B leg" and the profit column to
+    "Profit if won ($)" — shows up in new workbooks and fallback files, while
+    an existing shared trade_log.xlsx keeps
+    its old header row untouched. Column COUNT and order are unchanged (18), so
+    old and new rows line up; the per-row Notes prefix
+    ("[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=0.xxxx]] ") is what tells a
+    reader which side each count bought and, for a time-series row, the traded
+    NO-leg price — the retained "nA (NO ask)" column is reporting-only there.
 """
 import fcntl
 import logging
@@ -44,7 +58,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .config import PROJECT_ROOT
-from .scanner import display_title
+from .scanner import display_title, leg_sides
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
@@ -72,10 +86,13 @@ _TRADE_COLUMNS = [
     ("pA (YES ask)",      13),
     ("pB (YES ask)",      13),
     ("nA (NO ask)",       13),
-    ("x — NO on A",       12),
-    ("y — YES on B",      13),
+    # Side-neutral: x is the count on market A and y on market B whatever side
+    # each bought (NO/YES for same-title, YES/NO for time-series) — the row's
+    # Notes prefix names the sides. An existing workbook keeps its old headers.
+    ("x — A leg",         12),
+    ("y — B leg",         13),
     ("Total Cost ($)",    14),
-    ("Min Profit ($)",    14),
+    ("Profit if won ($)", 14),
     ("Profit Ratio (%)",  16),
     ("Status",            12),
     ("Notes",             30),
@@ -96,27 +113,33 @@ class TradeResult:
 
     Attributes:
         spec (TradeSpec): The trade specification that was executed or simulated.
-        status (str): Execution outcome — "executed" for a real submitted order
-            (leg A and leg B both confirmed filled, OR leg B was ambiguous but a
-            position-delta check confirmed the fill — see error below),
-            "simulated" for a dry-run or dev-mode run, "failed" for a leg A that
-            is confirmed unfilled (a clean FoK rejection, an error with an
-            attributable zero delta, or — on the legacy order path — a spec
-            refused before submission because a leg sits off the routable
-            shard), "rolled_back" if leg A filled but leg B is confirmed
-            unfilled and leg A's unwind filled, "rollback_failed" if that unwind
-            itself did not fill (orphaned position requiring manual review), or
-            "manual_review" if a leg's fill state could not be attributed to
-            this order (the position lookup failed, the position moved by an
-            unexplained amount, the NO-leg mapping was disproven after leg A
-            filled on the V2 path, or an unhandled exception escaped the pair's
-            worker thread in execute_trades) and no automated order was
-            submitted in response.
+        status (str): Execution outcome, described in terms of the two
+            SUBMISSION legs — the NO leg is submitted first and is the one that
+            gets unwound (market_a for a same-title pair, market_b for a
+            time-series pair), then the YES leg (see trader._ordered_legs).
+            "executed" for a real submitted order (NO leg and YES leg both
+            confirmed filled, OR the YES leg was ambiguous but a position-delta
+            check confirmed the fill — see error below), "simulated" for a
+            dry-run or dev-mode run, "failed" for a NO leg that is confirmed
+            unfilled (a clean FoK rejection, an error with an attributable zero
+            delta, or — on the legacy order path — a spec refused before
+            submission because a leg sits off the routable shard),
+            "rolled_back" if the NO leg filled but the YES leg is confirmed
+            unfilled and the NO leg's unwind filled, "rollback_failed" if that
+            unwind itself did not fill (orphaned position requiring manual
+            review), or "manual_review" if a leg's fill state could not be
+            attributed to this order (the position lookup failed, the position
+            moved by an unexplained amount, the NO-leg side mapping was
+            disproven after the NO leg filled on the V2 path, or an unhandled
+            exception escaped the pair's worker thread in execute_trades) and
+            no automated order was submitted in response.
         error (Optional[str]): Error message when the leg(s) involved required
-            explanation — every non-"executed"/"simulated" status always sets
-            this, and "executed" also sets it in the one case where leg B was
-            ambiguous but its fill was confirmed by position delta (the error
-            text says so). None only when nothing needed explaining.
+            explanation, worded as "NO leg …"/"YES leg …" — every
+            non-"executed"/"simulated" status always sets this, and "executed"
+            also sets it in the one case where the YES leg was ambiguous but
+            its fill was confirmed by position delta (the error text says so).
+            None only when nothing needed explaining. _result_to_row prefixes
+            it with the pair type and sides in the Excel Notes cell.
     """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated" | "rolled_back" | "rollback_failed" | "manual_review"
@@ -151,7 +174,15 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     Serialize a TradeResult to a flat list matching the _TRADE_COLUMNS column order.
 
     Extracts all fields needed for one Excel data row, formatting prices as rounded
-    floats and datetimes as "YYYY-MM-DD" strings.
+    floats and datetimes as "YYYY-MM-DD" strings. Columns are in MARKET order
+    (A then B): x is market A's count and y is market B's, whatever side each
+    bought. The Notes cell carries a prefix naming the pair type, the side
+    bought on each market (from scanner.leg_sides) and, for a time-series pair,
+    the traded NO-leg price nB — "[time_series: YES A / NO B nB=0.4000] " or
+    "[same_title: NO A / YES B] " — followed by result.error (if any). That
+    prefix is what disambiguates rows in a workbook whose header row predates
+    the side-neutral x/y headers, and it is the only place nB is recorded (the
+    "nA (NO ask)" column is reporting-only for a time-series row).
 
     Args:
         result (TradeResult): The trade result to serialize.
@@ -165,6 +196,15 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     pair = spec.pair
     mA   = display_title(pair.market_a)
     mB   = display_title(pair.market_b)
+    # Which side each market's leg bought — the only source of truth for sides
+    side_a, side_b = leg_sides(pair.pair_type)
+    # nB is a traded leg price only for time-series pairs; for same-title it
+    # is reporting-only and would just be noise in the Notes cell
+    nb_note = f" nB={pair.nB:.4f}" if pair.pair_type == "time_series" else ""
+    notes = (
+        f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}] "
+        + (result.error or "")
+    )
 
     def fmt_dt(dt) -> str:
         return dt.strftime("%Y-%m-%d") if dt else ""
@@ -187,7 +227,7 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
         round(spec.min_payoff, 2),
         round(spec.profit_ratio, 4),
         result.status,
-        result.error or "",
+        notes,
     ]
 
 
@@ -209,7 +249,7 @@ def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
         "executed":        "E2EFDA",   # light green
         "simulated":       "EBF3FB",   # light blue
         "failed":          "FCE4D6",   # light red/orange
-        "rolled_back":     "FFF2CC",   # light yellow — leg A unwound, no net position
+        "rolled_back":     "FFF2CC",   # light yellow — NO leg unwound, no net position
         "rollback_failed": "F4B7B4",   # strong red — orphaned position, manual review
         "manual_review":   "F4B7B4",   # strong red — fill state unknown, manual review
     }
@@ -233,7 +273,8 @@ def _apply_number_formats(ws, row_idx: int) -> None:
     Returns:
         None
     """
-    # Columns: pA=9, pB=10, nA=11, TotalCost=14, MinProfit=15, ProfitRatio=16
+    # Columns: pA=9, pB=10, nA=11, TotalCost=14, ProfitIfWon=15, ProfitRatio=16
+    # (indices unchanged by the 2026-09 header renames — still 18 columns)
     for col in (9, 10, 11):
         ws.cell(row=row_idx, column=col).number_format = "0.00%"
     for col in (14, 15):
@@ -538,12 +579,16 @@ def write_dev_simulation(
 
     # ── Sheet 2: All Candidates ────────────────────────────
     ws_cands = wb.create_sheet("All Candidates")
+    # nB is the traded NO-leg price of a time-series pair (reporting-only for
+    # same-title); "Price Diff" is the gap each finder actually tested — the
+    # later leg's premium pB − pA for time-series, pA − pB for same-title.
     cand_headers = [
         ("Pair Type", 14),
         ("Market A", 45), ("Ticker A", 18),
         ("Market B", 45), ("Ticker B", 18),
         ("A Deadline", 12), ("B Deadline", 12),
         ("pA (YES ask)", 13), ("pB (YES ask)", 13), ("nA (NO ask)", 13),
+        ("nB (NO ask)", 13),
         ("Price Diff", 12), ("Tradeable?", 12),
     ]
     for col_idx, (header, width) in enumerate(cand_headers, start=1):
@@ -557,7 +602,10 @@ def write_dev_simulation(
 
     for pair in all_candidates:
         row_idx = ws_cands.max_row + 1
-        diff    = pair.pA - pair.pB
+        # The gap the finder tested: a time-series candidate needs the LATER
+        # contract's YES ask above the earlier's; a same-title candidate needs
+        # market_a (the pricier side) above market_b
+        diff    = pair.pB - pair.pA if pair.pair_type == "time_series" else pair.pA - pair.pB
         row_data = [
             pair.pair_type,
             display_title(pair.market_a), pair.market_a.ticker,
@@ -567,6 +615,7 @@ def write_dev_simulation(
             round(pair.pA, 4),
             round(pair.pB, 4),
             round(pair.nA, 4),
+            round(pair.nB, 4),
             round(diff, 4),
             "YES" if pair.tradeable else "no",
         ]
@@ -580,8 +629,9 @@ def write_dev_simulation(
         for col in range(1, len(cand_headers) + 1):
             ws_cands.cell(row=row_idx, column=col).fill = row_fill
 
-        # Format price columns (shifted right by 1 due to new Pair Type column)
-        for col in (8, 9, 10, 11):
+        # Format the five price columns as percentages: pA=8, pB=9, nA=10,
+        # nB=11, Price Diff=12 (1-based; Pair Type occupies column 1)
+        for col in (8, 9, 10, 11, 12):
             ws_cands.cell(row=row_idx, column=col).number_format = "0.00%"
 
     wb.save(out_path)
