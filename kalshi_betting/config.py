@@ -106,6 +106,15 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # backtester is a deferred follow-up (see CLAUDE.md, "Strategy change (2026-09)").
 TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 
+# Grid of k values backtester.run_backtest_sweep() re-simulates so the dashboard
+# can offer a k selector without a re-run. Spans "size very aggressively" (0.40)
+# through "take the market at face value" (1.00, where Kelly is <= 0 for every
+# pair and nothing trades — the boundary is informative, so it stays in). Each
+# point costs one extra sizing+selection pass over already-fetched candidates;
+# the market fetch and candlestick fetch happen once regardless.
+INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
+                           0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
 # elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
@@ -529,7 +538,7 @@ def min_price_diff_for_gap(gap_days: int) -> float:
     return MIN_PRICE_DIFF_LONG_GAP
 
 
-def time_series_profit_prob(pA: float, pB: float) -> float:
+def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> float:
     """
     Return the modelled probability that a time-series pair trade is profitable.
 
@@ -547,14 +556,23 @@ def time_series_profit_prob(pA: float, pB: float) -> float:
     of the model — strategy._kelly_p, backtester.run_backtest and
     dashboard._kelly_fraction all call it, so the three can never drift.
 
+    The optional k overrides that constant for one call. It exists ONLY for the
+    backtester's calibration sweep (backtester.run_backtest_sweep): the live
+    sizer (strategy._kelly_p) never passes it, so live sizing always reads the
+    config constant. It is resolved at call time rather than bound as a default
+    argument, so tests that monkeypatch the constant still take effect.
+
     Args:
         pA (float): YES ask of the earlier-closing contract, dollars in [0, 1].
         pB (float): YES ask of the later-closing contract, dollars in [0, 1].
+        k (float | None): Interval-discount override in [0, 1]. None (default)
+            reads TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     Returns:
         float: Probability of profit in (0, 1] for a discount in [0, 1].
     """
-    return 1.0 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * max(0.0, pB - pA)
+    discount = TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k
+    return 1.0 - discount * max(0.0, pB - pA)
 
 
 def fee_per_pair_approx(price_a: float, price_b: float) -> float:

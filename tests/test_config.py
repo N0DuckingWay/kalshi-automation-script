@@ -148,6 +148,29 @@ class TestTimeSeriesProfitProb:
         assert TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
         assert 0.0 <= TIME_SERIES_INTERVAL_PROB_DISCOUNT <= 1.0
 
+    def test_explicit_k_overrides_the_constant(self):
+        # The backtester's calibration sweep passes one k per simulation; the
+        # override must win over the config constant — 1 - 0.50 * 0.30 = 0.85 —
+        # without mutating it, since the live sizer keeps reading it.
+        assert time_series_profit_prob(0.30, 0.60, k=0.50) == pytest.approx(0.85)
+        assert time_series_profit_prob(0.30, 0.60, k=1.0) == pytest.approx(0.70)
+        assert config.TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
+
+    def test_k_none_is_identical_to_omitting_it(self):
+        # None is the sentinel for "read the config constant", so the sweep's
+        # default point and the live sizer's override-free call must agree
+        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.60, 0.30)]:
+            assert time_series_profit_prob(pA, pB, k=None) == time_series_profit_prob(pA, pB)
+
+    def test_constant_read_at_call_time_and_only_when_k_is_omitted(self, monkeypatch):
+        # The None sentinel must resolve inside the body rather than binding at
+        # def time: a monkeypatched constant still governs an override-free
+        # call (1 - 0.50 * 0.30 = 0.85)...
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.50)
+        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.85)
+        # ...and is ignored entirely once k is supplied (1 - 0.75 * 0.30)
+        assert time_series_profit_prob(0.30, 0.60, k=0.75) == pytest.approx(0.775)
+
 
 class TestLegSideTuples:
     def test_same_title_buys_no_on_a_yes_on_b(self):
