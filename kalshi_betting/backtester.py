@@ -186,6 +186,13 @@ class BacktestTrade:
             of this trade's entry-date checkpoint — the base the Kelly budget
             was sized against, shared by every trade entering that same date
             (mirroring the single balance read at the top of a live run).
+        deadline_gap_days (int | None): Calendar days between the two legs'
+            close_times, carried out of _find_entry (which selected the price
+            tier and applied the MAX_DEADLINE_GAP_DAYS cutoff on exactly this
+            number) rather than recomputed. None for same_title, which has no
+            deadline-gap concept, and for any trade constructed without it
+            (test fixtures). Reporting only — nothing sizes, prices or settles
+            on this field.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -213,6 +220,11 @@ class BacktestTrade:
     slippage: float         # profit - expected_payoff
     holding_days: int
     balance_at_entry: float  # checkpoint opening balance the Kelly budget used
+    # Calendar days between the two legs' close_times, carried out of
+    # _find_entry rather than recomputed. None for same_title (no deadline-gap
+    # concept) and for any trade constructed without it (test fixtures).
+    # Reporting only — nothing sizes, prices or settles on this field.
+    deadline_gap_days: int | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -766,10 +778,15 @@ def _find_entry(
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
-            (float), "nA" (float), "nB" (float), "mA" (dict), "mB" (dict) for
-            the first qualifying Monday — all four quotes of the canonicalized
-            A and B (YES ask and NO ask of each), of which _leg_prices_for
-            picks the two that were actually traded.
+            (float), "nA" (float), "nB" (float), "mA" (dict), "mB" (dict),
+            "gap_days" (int | None) for the first qualifying Monday — all four
+            quotes of the canonicalized A and B (YES ask and NO ask of each),
+            of which _leg_prices_for picks the two that were actually traded.
+            "gap_days" is the loop-invariant deadline gap the price tier and
+            the MAX_DEADLINE_GAP_DAYS cutoff were applied on, carried out for
+            reporting so a report cannot bucket a pair under a gap it was not
+            filtered by; it is None for same_title, which has no deadline-gap
+            concept.
             Returns None if no qualifying Monday was found in the scan window, or
             if either leg's close_time is missing or unparseable (no scan window
             can be derived, so the pair is simply not enterable).
@@ -832,6 +849,10 @@ def _find_entry(
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold
         threshold = SAME_TITLE_MIN_PRICE_DIFF
+        # No deadline gap to report for same_title. The time_series branch
+        # above assigns gap_days on both its try and except paths, so this is
+        # the only branch where the name would otherwise be unbound below.
+        gap_days = None
 
     for ts in _monday_timestamps(scan_start, scan_end):
         entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
@@ -915,6 +936,11 @@ def _find_entry(
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA, "nB": nB,
             "mA": mA_i, "mB": mB_i,
+            # The gap the tier above was selected from, carried out so the
+            # calibration report buckets each pair under exactly the gap it
+            # was filtered by. None for same_title. Reporting only — every
+            # decision this value drives was already made above.
+            "gap_days": gap_days,
         }
 
     return None
@@ -1327,6 +1353,9 @@ def run_backtest(
             "holding_days": holding_days,
             "title_a": title_a,
             "title_b": title_b,
+            # Carried straight from _find_entry (None for same_title) so the
+            # recorded trade reports the same gap the tier was chosen from
+            "gap_days": entry["gap_days"],
         })
 
     if premise_violations:
@@ -1519,6 +1548,7 @@ def run_backtest(
             slippage=slippage,
             holding_days=c["holding_days"],
             balance_at_entry=checkpoint_cash,
+            deadline_gap_days=c["gap_days"],
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
