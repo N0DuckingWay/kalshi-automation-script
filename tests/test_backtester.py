@@ -1434,6 +1434,73 @@ class TestRunBacktestFeasibilityPreCheck:
         assert called == [True]
 
 
+class TestEquityCurveFutureStartDate:
+    """A start_date after today (UTC) leaves _build_equity_curve's day span
+    zero or negative. It used to build pd.DataFrame([]) — a frame with no
+    columns at all — and then raise KeyError: 'portfolio_value' on the very
+    next line, so the documented empty-result shape was unreachable through
+    the public API.
+
+    TestRunBacktestFeasibilityPreCheck cannot catch this: it freezes
+    `backtester.date.today()`, which drives the Monday pre-check but NOT
+    _build_equity_curve's own `datetime.now(UTC).date()`, so its windows are
+    always non-empty. These tests use a genuinely future start_date instead of
+    freezing anything, so both clocks agree it is ahead of today.
+    """
+
+    # Comfortably ahead of both `date.today()` (local tz) and UTC today, so
+    # the window is empty no matter which side of midnight the suite runs on.
+    _FUTURE_START = datetime.now(UTC).date() + timedelta(days=30)
+
+    def _fetch_should_not_be_called(self, monkeypatch):
+        monkeypatch.setattr(
+            backtester, "fetch_all_settled_markets",
+            lambda *a, **k: pytest.fail("fetch must be skipped for a future window"),
+        )
+
+    def test_build_equity_curve_emits_one_row_for_a_future_start(self):
+        df = backtester._build_equity_curve([], self._FUTURE_START, 1234.0)
+
+        assert list(df.columns) == ["date", "portfolio_value", "daily_return"]
+        assert len(df) == 1
+        assert df["date"].iloc[0] == self._FUTURE_START
+        assert df["portfolio_value"].iloc[0] == pytest.approx(1234.0)
+        # No prior day to compare against, so the single row's return is flat.
+        assert df["daily_return"].iloc[0] == pytest.approx(0.0)
+
+    def test_run_backtest_returns_the_empty_shape_for_a_future_start(self, monkeypatch):
+        self._fetch_should_not_be_called(monkeypatch)
+
+        trades, equity = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._FUTURE_START, initial_balance=2000.0,
+        )
+
+        assert trades == []
+        assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
+        # Flat at initial_balance, as run_backtest's docstring promises — and
+        # readable by .iloc, which dashboard.py depends on.
+        assert equity["portfolio_value"].iloc[0] == pytest.approx(2000.0)
+        assert equity["portfolio_value"].iloc[-1] == pytest.approx(2000.0)
+
+    def test_run_backtest_sweep_returns_the_empty_shape_for_a_future_start(self, monkeypatch):
+        # run_backtest_sweep reaches the same curve through its own
+        # short-circuit (one empty point via _simulate_at_discount).
+        self._fetch_should_not_be_called(monkeypatch)
+
+        result = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._FUTURE_START, initial_balance=2000.0,
+        )
+
+        assert result.points == [result.primary]
+        assert result.primary.trades == []
+        assert result.calibration is None
+        assert list(result.primary.equity_df.columns) == [
+            "date", "portfolio_value", "daily_return"]
+        assert result.primary.equity_df["portfolio_value"].iloc[-1] == pytest.approx(2000.0)
+
+
 class TestDropCrossTypeDuplicates:
     """Pass 1 must not carry the same ticker pair as both a same-title and a
     time-series candidate — the live pipeline never does (main._dedup_pairs)."""
