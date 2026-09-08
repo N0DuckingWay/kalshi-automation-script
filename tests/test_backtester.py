@@ -27,9 +27,11 @@ from kalshi_betting.backtester import (
     _parse_iso_datetime,
     _settlement_receipt,
     run_backtest,
+    run_backtest_sweep,
 )
 from kalshi_betting.config import (
     BUDGET_FRACTION,
+    INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
@@ -2118,3 +2120,184 @@ class TestLogIntervalCalibration:
         msgs = self._messages(caplog)
         assert msgs[2].split() == ["POOLED", "-", "0", "0.0000", "0.0000", "-"]
         assert "pooled empirical k_hat = -" in msgs[3]
+
+
+class TestRunBacktestSweep:
+    """run_backtest_sweep: one preparation pass, many discounts, one calibration.
+
+    Drives TestRunBacktestTimeSeriesFlow's pinned fixture (EA/EB, 13-day gap,
+    YES asks 0.30/0.60, NO asks 0.70/0.40) rather than copying its numbers, so
+    the sweep can never be measured against a second, drifting copy of them.
+    """
+
+    _START = date(2026, 1, 1)
+
+    @staticmethod
+    def _patch(monkeypatch, result_a="yes", result_b="yes"):
+        flow = TestRunBacktestTimeSeriesFlow
+        markets = flow._markets(result_a, result_b)
+        candles = {
+            "EA": [_candle(_MONDAY_TS, flow._PA, flow._NA)],
+            "EB": [_candle(_MONDAY_TS, flow._PB, flow._NB)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+    def _sweep(self, monkeypatch, result_a="yes", result_b="yes", **kwargs):
+        self._patch(monkeypatch, result_a, result_b)
+        return run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._START, initial_balance=10_000.0, **kwargs,
+        )
+
+    def test_grid_always_contains_the_effective_k(self, monkeypatch):
+        # No override: the primary sits at the config discount, which is also
+        # a standard grid point, so the grid is the standard one.
+        result = self._sweep(monkeypatch)
+        assert result.primary.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert [p.k for p in result.points] == sorted(
+            set(INTERVAL_DISCOUNT_SWEEP) | {TIME_SERIES_INTERVAL_PROB_DISCOUNT})
+        # points is ascending, and primary is the SAME object in it — not an
+        # equal copy that could drift from it
+        assert [p.k for p in result.points] == sorted(p.k for p in result.points)
+        assert any(p is result.primary for p in result.points)
+
+    def test_off_grid_override_gets_its_own_exact_point(self, monkeypatch):
+        # 0.62 is not on the standard grid: it must appear at exactly 0.62,
+        # not be rounded to the nearest standard point.
+        result = self._sweep(monkeypatch, interval_discount=0.62)
+        assert result.primary.k == 0.62
+        assert 0.62 in [p.k for p in result.points]
+        assert len(result.points) == len(INTERVAL_DISCOUNT_SWEEP) + 1
+        assert any(p is result.primary for p in result.points)
+
+    def test_on_grid_override_is_not_duplicated(self, monkeypatch):
+        # An override that already sits on the grid must not add a second
+        # point at the same k — the union is a set, not a concatenation.
+        on_grid = INTERVAL_DISCOUNT_SWEEP[0]
+        result = self._sweep(monkeypatch, interval_discount=on_grid)
+        assert result.primary.k == on_grid
+        assert len(result.points) == len(INTERVAL_DISCOUNT_SWEEP)
+        assert [p.k for p in result.points].count(on_grid) == 1
+
+    def test_sweep_false_yields_one_point(self, monkeypatch):
+        result = self._sweep(monkeypatch, sweep=False)
+        assert result.points == [result.primary]
+        assert result.primary.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert len(result.primary.trades) == 1
+
+    def test_sweep_false_still_honours_the_override(self, monkeypatch):
+        result = self._sweep(monkeypatch, interval_discount=0.50, sweep=False)
+        assert [p.k for p in result.points] == [0.50]
+
+    def test_primary_reproduces_run_backtest(self, monkeypatch):
+        # The whole blast-radius promise: run_backtest is unchanged, and the
+        # sweep's primary is the same simulation by a different door.
+        self._patch(monkeypatch)
+        trades, equity = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._START, initial_balance=10_000.0,
+        )
+        result = self._sweep(monkeypatch, sweep=False)
+        assert [astuple(t) for t in result.primary.trades] == [
+            astuple(t) for t in trades]
+        pd.testing.assert_frame_equal(result.primary.equity_df, equity)
+
+    def test_preparation_and_calibration_run_once(self, monkeypatch):
+        # The expensive, network-bound half must not be repeated per discount;
+        # the calibration must not either, because it is k-independent.
+        self._patch(monkeypatch)
+        calls = {"prepare": 0, "calibrate": 0, "simulate": 0}
+        real = {
+            "prepare": backtester._prepare_entries,
+            "calibrate": backtester._interval_calibration,
+            "simulate": backtester._simulate_at_discount,
+        }
+
+        def counted(name):
+            def wrapper(*a, **kw):
+                calls[name] += 1
+                return real[name](*a, **kw)
+            return wrapper
+
+        monkeypatch.setattr(backtester, "_prepare_entries", counted("prepare"))
+        monkeypatch.setattr(backtester, "_interval_calibration", counted("calibrate"))
+        monkeypatch.setattr(backtester, "_simulate_at_discount", counted("simulate"))
+
+        result = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._START, initial_balance=10_000.0,
+        )
+        assert calls["prepare"] == 1
+        assert calls["calibrate"] == 1
+        # Once per grid point — the primary is simulated once and then reused,
+        # never re-run at its own k.
+        assert calls["simulate"] == len(result.points)
+
+    def test_override_actually_bites_across_the_grid(self, monkeypatch):
+        # k = 1.00 takes the market's in-between mass at face value, which
+        # drives Kelly <= 0 for every time-series pair — the sharpest proof
+        # that k is threaded all the way through the simulation.
+        result = self._sweep(monkeypatch)
+        by_k = {p.k: p for p in result.points}
+        assert len(by_k[TIME_SERIES_INTERVAL_PROB_DISCOUNT].trades) == 1
+        assert by_k[1.00].trades == []
+
+    def test_calibration_is_attached_and_kelly_independent(self, monkeypatch):
+        # The in-between cell. The pair is counted in the calibration whatever
+        # any point's Kelly gate did with it.
+        result = self._sweep(monkeypatch, result_a="no", result_b="yes")
+        calib = result.calibration
+        assert calib is not None
+        assert calib.pooled.n == 1
+        assert calib.pooled.realised_rate == pytest.approx(1.0)
+        assert calib.excluded_premise_violations == 0
+        assert [b.label for b in calib.buckets] == ["8-15d"]
+
+    def test_calibration_is_none_without_time_series_candidates(self, monkeypatch):
+        # A premise-violating pair is excluded from the denominator, but the
+        # exclusion itself is still worth reporting.
+        result = self._sweep(monkeypatch, result_a="yes", result_b="no")
+        assert result.calibration.excluded_premise_violations == 1
+        assert result.calibration.pooled.n == 0
+        assert result.primary.trades == []
+
+    # An infeasible window, frozen exactly as TestRunBacktestFeasibilityPreCheck
+    # does it: Tuesday start, same-week Friday "today", so [Tue, Fri] holds no
+    # Monday checkpoint at all.
+    _INFEASIBLE_START = date(2026, 8, 25)   # Tuesday
+    _INFEASIBLE_TODAY = date(2026, 8, 28)   # Friday, same week
+
+    def _infeasible(self, monkeypatch, **kwargs):
+        frozen = type("FrozenDate", (TestRunBacktestFeasibilityPreCheck._FrozenDate,),
+                      {"_fixed": self._INFEASIBLE_TODAY})
+        monkeypatch.setattr(backtester, "date", frozen)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must be skipped"))
+        return run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=self._INFEASIBLE_START, initial_balance=10_000.0, **kwargs,
+        )
+
+    def test_feasibility_short_circuit_yields_one_empty_point(self, monkeypatch):
+        # No Monday checkpoint exists, so nothing can be simulated at ANY
+        # discount. The caller still gets the normal shape — one point, a flat
+        # curve — so no special case is needed downstream.
+        result = self._infeasible(monkeypatch)
+        assert result.points == [result.primary]
+        assert result.primary.trades == []
+        assert result.primary.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert result.calibration is None
+        assert list(result.primary.equity_df.columns) == [
+            "date", "portfolio_value", "daily_return"]
+        assert result.primary.equity_df["portfolio_value"].max() == pytest.approx(10_000.0)
+        assert result.primary.equity_df["portfolio_value"].min() == pytest.approx(10_000.0)
+
+    def test_feasibility_short_circuit_reports_the_override(self, monkeypatch):
+        # Even with nothing to simulate, the empty point must carry the k the
+        # caller asked for — a report reading primary.k must not be told 0.75.
+        result = self._infeasible(monkeypatch, interval_discount=0.62)
+        assert result.primary.k == 0.62
+        assert result.points == [result.primary]

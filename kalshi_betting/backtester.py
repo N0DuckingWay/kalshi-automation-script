@@ -18,6 +18,7 @@ Dependencies:
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
+    INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS and
     TIME_SERIES_INTERVAL_PROB_DISCOUNT from
@@ -27,9 +28,10 @@ Dependencies:
     import strategy.py — Kelly sizing and portfolio selection are
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
-    parity. Exports BacktestTrade, SweepPoint, IntervalCalibrationBucket and
-    IntervalCalibration (BacktestTrade is consumed by dashboard.py) and
-    run_backtest() (called by backtest.py).
+    parity. Exports BacktestTrade, SweepPoint, IntervalCalibrationBucket,
+    IntervalCalibration and BacktestSweep (BacktestTrade is consumed by
+    dashboard.py) plus run_backtest() and run_backtest_sweep() (called by
+    backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -72,6 +74,13 @@ Notes:
     It is a RECOMMENDATION ONLY: nothing here writes config.py, and live
     sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
+    run_backtest_sweep() is the entry point that exposes all of that:
+    one preparation pass, one calibration, and one _simulate_at_discount()
+    per discount on config.INTERVAL_DISCOUNT_SWEEP (unioned with the
+    caller's own, so the primary is always an exact grid member), returned
+    as a BacktestSweep. run_backtest() is untouched by it — same signature,
+    same two-tuple — so every existing caller keeps working.
+
     Before grouping, _prepare_entries() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
@@ -112,6 +121,7 @@ import pandas as pd
 from .config import (
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
+    INTERVAL_DISCOUNT_SWEEP,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
     SAME_TITLE_CO_RESOLVE_PROB,
@@ -373,6 +383,36 @@ class IntervalCalibration:
     pooled: IntervalCalibrationBucket
     buckets: list[IntervalCalibrationBucket]
     excluded_premise_violations: int
+
+
+@dataclass
+class BacktestSweep:
+    """
+    Everything one backtest run produces across every interval discount.
+
+    Returned by run_backtest_sweep(). One preparation pass (the expensive,
+    network-bound half) feeds every point here, so the whole aggregate costs
+    one fetch plus one sizing/selection pass per swept discount.
+
+    Attributes:
+        primary (SweepPoint): The point at the effective discount — the run's
+            actual result, and the one a caller that wants a single answer
+            should read. It is the SAME object as the matching entry of
+            points, never a copy. There is deliberately no separate primary_k
+            field: primary.k already carries the resolved discount, and a
+            second copy could disagree with it.
+        points (list[SweepPoint]): One point per swept discount, ascending by
+            k, always including primary. A single-element list when sweeping
+            is off or the run was infeasible.
+        calibration (IntervalCalibration | None): The empirical-discount
+            measurement over this window, or None when there was no
+            time-series candidate to measure. It hangs off the sweep rather
+            than off any point because it is k-independent — one measurement
+            valid for all of them (see _interval_calibration).
+    """
+    primary: SweepPoint
+    points: list[SweepPoint]
+    calibration: IntervalCalibration | None
 
 
 @dataclass
@@ -2137,6 +2177,149 @@ def run_backtest(
     # sizer does.
     point = _simulate_at_discount(raw_entries, start_date, initial_balance, k=None)
     return point.trades, point.equity_df
+
+
+def run_backtest_sweep(
+    hist_client: Any,
+    live_client,
+    start_date: date = date(2024, 1, 1),
+    initial_balance: float = 10_000.0,
+    use_cache: bool = True,
+    max_horizon_days: int | None = None,
+    interval_discount: float | None = None,
+    sweep: bool = True,
+) -> BacktestSweep:
+    """
+    Replay both pair strategies at one interval discount, or at a grid of them.
+
+    The richer sibling of run_backtest(): same simulation, but it also returns
+    the empirical-discount calibration and, by default, one full re-simulation
+    per discount on config.INTERVAL_DISCOUNT_SWEEP so a report can offer a k
+    selector without a re-run. run_backtest() is unchanged and remains the
+    two-tuple entry point for every existing caller; this is what backtest.py
+    calls when it needs the sweep payload.
+
+    The expensive half runs ONCE: _prepare_entries() (fetch, prefilter,
+    grouping, pair extraction, candlesticks, the _find_entry sweep) holds no
+    probability model, so its output is identical at every discount.
+    _interval_calibration() is computed once from that same output for the
+    same reason. Only _simulate_at_discount() — Kelly gate, dedups, Pass 2,
+    equity curve — is repeated per k, and it must be a full re-simulation
+    rather than a re-score: the Kelly gate precedes the one-pair-per-group
+    dedup, so a different k changes which candidate wins its group, and every
+    surviving candidate then competes for the same simulated cash.
+
+    The primary point is simulated with the caller's interval_discount passed
+    through verbatim, sentinel included, so with no override it prices exactly
+    as run_backtest() does (k=None is resolved inside
+    config.time_series_profit_prob at call time). Its resolved k is then read
+    back off the point and unioned into the sweep grid, so the primary is
+    always an EXACT grid member — an --interval-discount 0.62 run gets a grid
+    entry at exactly 0.62 rather than the nearest standard point — and it is
+    the same object in points, never a re-simulated copy.
+
+    This function never writes config.py. The calibration it reports is a
+    recommendation for a human to act on, and live sizing keeps reading
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here.
+
+    Args:
+        hist_client (Any): Signed client for the historical archive/live endpoints.
+        live_client: Client passed through to fetch_all_settled_markets.
+        start_date (date): Earliest settlement date to include.
+        initial_balance (float): Simulated starting cash balance in dollars.
+        use_cache (bool): Whether to reuse the disk-cached assembled market list.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap, passed
+            straight through to _prepare_entries(). None applies no cap.
+        interval_discount (float | None): Interval discount for the primary
+            point, in [0, 1]. None (default) means "no override", which
+            resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
+            live sizing reads.
+        sweep (bool): When True (default), also simulate every discount in
+            config.INTERVAL_DISCOUNT_SWEEP. When False, points holds the
+            primary alone — the escape hatch for a full-history run where the
+            extra passes are not worth their time.
+
+    Returns:
+        BacktestSweep: primary (the effective-discount result), points
+            (ascending by k, always containing primary) and calibration (None
+            when no time-series candidate was measurable).
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — a real
+            defect rather than a ticker with no price history.
+
+    Note:
+        When _prepare_entries()'s Monday feasibility pre-check fails, no
+        simulation is possible at any discount: the result is a sweep holding
+        one empty point (built by the same _simulate_at_discount() call every
+        other point comes from, over an empty entry list, so its shape and its
+        resolved k cannot drift from a real one) and calibration=None. Callers
+        therefore need no special case for that path.
+    """
+    logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
+
+    # The k-independent half — one fetch, one pairing, one entry sweep, reused
+    # by every point below. None means the feasibility pre-check failed.
+    raw_entries = _prepare_entries(
+        hist_client, live_client, start_date, use_cache, max_horizon_days
+    )
+    if raw_entries is None:
+        # Nothing can be simulated at any discount. Build the empty point
+        # through the normal path (an empty entry list yields no trades and a
+        # flat curve) so it resolves the discount sentinel and shapes its
+        # equity curve exactly as every other point does.
+        empty = _simulate_at_discount(
+            [], start_date, initial_balance, k=interval_discount
+        )
+        return BacktestSweep(primary=empty, points=[empty], calibration=None)
+
+    # Measured from the k-independent entries, so it is valid for every point
+    # below and is never filtered by any point's Kelly gate.
+    calibration = _interval_calibration(raw_entries)
+    # Reported here rather than inside the measurement, mirroring the
+    # check_shard_coverage / _log_shard_coverage split: silent when there was
+    # nothing to measure.
+    _log_interval_calibration(calibration)
+
+    # The run's actual result. interval_discount is handed over verbatim —
+    # including the None sentinel — so a no-override run prices identically to
+    # run_backtest().
+    primary = _simulate_at_discount(
+        raw_entries, start_date, initial_balance, k=interval_discount
+    )
+    # Read the RESOLVED discount back off the point rather than re-deriving it
+    # from the sentinel: one resolution, so the grid membership below cannot
+    # disagree with the point it is supposed to contain.
+    effective_k = primary.k
+
+    # Union rather than "nearest point": the primary must be an exact member,
+    # so an override that is not on the standard grid still gets its own
+    # entry. sorted() gives the ascending order BacktestSweep.points promises.
+    grid = sorted(set(INTERVAL_DISCOUNT_SWEEP) | {effective_k}) if sweep else [effective_k]
+
+    if len(grid) > 1:
+        logging.info(
+            "Re-simulating %d prepared entries at %d interval discounts (primary k = %.3f)",
+            len(raw_entries), len(grid), effective_k,
+        )
+
+    points: list[SweepPoint] = []
+    for i, point_k in enumerate(grid, start=1):
+        if point_k == effective_k:
+            # Already simulated; reuse the object so BacktestSweep.primary and
+            # its entry in points are the same point, not two equal ones.
+            points.append(primary)
+            continue
+        # Each _simulate_at_discount below logs its own trade count with no k
+        # attached, so name the discount first or a swept log is unreadable.
+        logging.info("Sweeping interval discount %d/%d: k = %.2f", i, len(grid), point_k)
+        points.append(_simulate_at_discount(
+            raw_entries, start_date, initial_balance, k=point_k
+        ))
+
+    return BacktestSweep(primary=primary, points=points, calibration=calibration)
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────
