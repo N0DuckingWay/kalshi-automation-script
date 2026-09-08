@@ -5,28 +5,37 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Generates a self-contained interactive HTML performance dashboard from the
-    results of a backtest run. Assembles six sections — portfolio performance
+    results of a backtest run. Assembles seven sections — portfolio performance
     (equity curve, Sharpe, drawdown), returns decomposition (by month, category,
-    entry price), calibration analysis (Brier score, reliability diagram), trade-
+    entry price), calibration analysis (Brier score, reliability diagram),
+    interval-discount (k) calibration (empirical k-hat plus a native Plotly
+    dropdown that switches the equity curve between the swept k values), trade-
     level diagnostics (distribution, slippage, best/worst trades), risk metrics
     (Kelly sizing scatter, capital deployment), and benchmark comparison (S&P 500
     via yfinance) — into a single HTML file with embedded Plotly charts. The file
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
 Dependencies:
-    Imports BacktestTrade from backtester.py, and PROJECT_ROOT,
+    Imports BacktestSweep and BacktestTrade from backtester.py, and PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
     live sizer computes. Uses plotly, numpy, pandas, and yfinance (all
-    external). Called by backtest.py after run_backtest() completes.
+    external). Called by backtest.py after run_backtest_sweep() completes.
 
 Notes:
     The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
     connection is required to view the charts. If yfinance fails to fetch S&P 500
     data (e.g. network unavailable), the benchmark section degrades gracefully
     and shows only the strategy equity curve.
+
+    The interval-discount section's k selector is a NATIVE Plotly `updatemenus`
+    dropdown over one trace per swept k — no extra dependency and no hand-rolled
+    JavaScript, so it works inside the same self-contained page every other
+    chart renders into. Its scope is deliberately that one section: the other
+    six always reflect the run's primary k (the CLI's --interval-discount, or
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed).
 """
 import html
 import logging
@@ -39,7 +48,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 from plotly.subplots import make_subplots
 
-from .backtester import BacktestTrade
+from .backtester import BacktestSweep, BacktestTrade
 from .config import (
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
@@ -173,7 +182,8 @@ def _log_loss(trades: list[BacktestTrade]) -> float:
     return float(np.mean(losses)) if losses else 0.0
 
 
-def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str) -> float:
+def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
+                    k: float | None = None) -> float:
     """
     Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
 
@@ -189,6 +199,11 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str) 
     (A=YES, hence B=YES) and never by B (A=NO, B=NO); A=YES/B=NO is impossible
     for a cumulative-deadline pair. Returns 0.0 when there is no edge.
 
+    The optional k must be whatever interval discount the plotted trades were
+    actually SIZED at (backtester.SweepPoint.k). Leaving it None on a run that
+    passed --interval-discount would plot the config-constant Kelly against
+    trades sized at the override — a wrong chart, not merely a missing feature.
+
     Args:
         pA (float): YES ask price of market A at entry (a leg price for time_series).
         nA (float): NO ask price of market A at entry (a leg price for same_title).
@@ -198,15 +213,20 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str) 
         pair_type (str): "time_series" or "same_title" — selects the leg prices
             and the probability model; anything else is treated as same_title,
             matching scanner.leg_sides.
+        k (float | None): Interval-discount override in [0, 1] handed straight to
+            config.time_series_profit_prob. None (default) means "no override",
+            which that helper resolves at call time to
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value live sizing
+            reads. Ignored for same_title, which prices on a fixed prior.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
     """
     if pair_type == "time_series":
         price_a, price_b = pA, nB
-        # Shared definition with strategy._kelly_p / backtester.run_backtest so
-        # the dashboard can never show a Kelly the live sizer would not compute
-        p = time_series_profit_prob(pA, pB)
+        # Shared definition with strategy._kelly_p / backtester._simulate_at_discount
+        # so the dashboard can never show a Kelly the live sizer would not compute
+        p = time_series_profit_prob(pA, pB, k=k)
     else:
         price_a, price_b = nA, pB
         p = SAME_TITLE_CO_RESOLVE_PROB
@@ -525,7 +545,267 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     )
 
 
-# ─── Section 4: Trade-Level Diagnostics ──────────────────────────────────────
+# ─── Section 4: Interval Discount (k) Calibration ────────────────────────────
+
+def _section_interval_discount(sweep: BacktestSweep | None) -> str:
+    """
+    Build the "Interval Discount (k) Calibration" HTML section.
+
+    Reports how the hand-set time-series interval discount k compares with what
+    the replayed history actually did, and lets the reader switch the equity
+    curve between every k the run simulated. Three parts:
+
+      1. KPI cards — the run's configured (effective) k, the pooled empirical
+         k-hat, and the delta between them.
+      2. The calibration table — one row per deadline-gap bucket plus the
+         pooled row, showing n, the realised in-between rate, the mean
+         market-implied gap, and that bucket's k-hat.
+      3. The k selector — ONE Plotly figure holding an equity trace per swept
+         k, switched by a native `updatemenus` dropdown (no extra dependency,
+         no hand-rolled JS) — followed by a table of each k's trade count,
+         total return, max drawdown and Sharpe, computed from that point's own
+         equity curve with this module's existing _max_drawdown/_sharpe.
+
+    Deliberately named for the interval discount rather than "calibration"
+    alone: _section_calibration already exists and means price calibration
+    (Brier / log loss), which is a different measurement entirely.
+
+    Takes the BacktestSweep whole rather than its parts — it already carries
+    .calibration, .points and .primary.k, and passing those separately would
+    create copies that could disagree with each other.
+
+    Scope limit: the dropdown drives THIS section only. Every other section
+    reflects the primary k, since return / drawdown / trade count is what one
+    actually compares k values on.
+
+    Args:
+        sweep (BacktestSweep | None): The sweep payload from
+            backtester.run_backtest_sweep(). None (or a sweep with no points)
+            renders the same short placeholder every other builder emits for
+            empty input — the case where the caller ran the plain
+            run_backtest() path and has no sweep to show.
+
+    Returns:
+        str: Self-contained HTML section string.
+    """
+    if sweep is None or not sweep.points:
+        return (_SECTION_STYLE.format(title="Interval Discount (k) Calibration")
+                + "<p>No interval-discount sweep for this run.</p>")
+
+    points = sweep.points
+    # The run's effective discount, read off the primary point rather than from
+    # config: on an --interval-discount run it is the override, and it is the k
+    # every OTHER section on this page was rendered at.
+    configured_k = sweep.primary.k
+    cal = sweep.calibration
+
+    # ── KPI cards ────────────────────────────────────────────────────────────
+    pooled_k = cal.pooled.empirical_k if cal is not None else None
+    # Labelled for the RUN, not for config.py: on an --interval-discount run
+    # this is the override. Calling it "configured" would misattribute the
+    # override to config.py, which this feature never writes.
+    kpi_parts = [_kpi("k used (this run)", f"{configured_k:.3f}", "#2196F3")]
+    if pooled_k is None:
+        kpi_parts.append(_kpi("Pooled empirical k̂", "—"))
+        kpi_parts.append(_kpi("k̂ − k", "—"))
+    else:
+        delta = pooled_k - configured_k
+        # p = 1 - k*(pB - pA), so a LARGER k is the more conservative belief.
+        # k̂ above the configured k means the in-between cell landed more often
+        # than the sizer assumed (it was sizing too big) — flag that red; a
+        # negative delta means the run was conservative.
+        kpi_parts.append(_kpi("Pooled empirical k̂", f"{pooled_k:.3f}", "#2196F3"))
+        kpi_parts.append(_kpi("k̂ − k", f"{delta:+.3f}",
+                              "#F44336" if delta > 0 else "#4CAF50"))
+    kpis = "".join(kpi_parts)
+
+    # ── Calibration table ────────────────────────────────────────────────────
+    if cal is None:
+        cal_table = ("<p style='font-family:sans-serif;font-size:14px;color:#616161;'>"
+                     "No time-series candidate was measurable in this window, so there "
+                     "is no empirical k̂ to report.</p>")
+    else:
+        def _crow(b) -> str:
+            """
+            Render one HTML table row for an IntervalCalibrationBucket.
+
+            Args:
+                b (backtester.IntervalCalibrationBucket): Bucket to display.
+
+            Returns:
+                str: An HTML <tr>...</tr> string with the bucket label, its
+                    price tier ("-" for the pooled row, which spans every
+                    band), candidate count, realised in-between rate, mean
+                    market-implied gap, and empirical k-hat ("-" when it could
+                    not be computed).
+            """
+            # label is the only free-text field rendered here; escape it the
+            # same way _trow escapes a Kalshi-controlled market title, so no
+            # future producer of a bucket can inject markup into the page.
+            safe_label = html.escape(b.label)
+            # tier <= 0 marks the pooled row: it spans every band and so has no
+            # single tier (backtester.IntervalCalibrationBucket.tier).
+            tier_txt = "-" if b.tier <= 0 else f"{b.tier:.2f}"
+            k_txt = "-" if b.empirical_k is None else f"{b.empirical_k:.3f}"
+            return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
+                    f"<td style='padding:6px 16px;'>{safe_label}</td>"
+                    f"<td style='padding:6px 16px;'>{tier_txt}</td>"
+                    f"<td style='padding:6px 16px;'>{b.n}</td>"
+                    f"<td style='padding:6px 16px;'>{b.realised_rate:.4f}</td>"
+                    f"<td style='padding:6px 16px;'>{b.mean_implied:.4f}</td>"
+                    f"<td style='padding:6px 16px;'>{k_txt}</td>"
+                    f"</tr>")
+
+        cal_table = """
+<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;
+              margin:16px 0; width:auto;">
+<tr style="background:#E3F2FD; font-weight:bold;">
+  <th style="padding:8px 16px;">Gap bucket</th>
+  <th style="padding:8px 16px;">Tier</th>
+  <th style="padding:8px 16px;">n</th>
+  <th style="padding:8px 16px;">Realised in-between rate</th>
+  <th style="padding:8px 16px;">Mean implied gap</th>
+  <th style="padding:8px 16px;">k&#770;</th>
+</tr>
+""" + "".join(_crow(b) for b in [*cal.buckets, cal.pooled]) + "</table>"
+
+        if cal.excluded_premise_violations:
+            # Summary-line idiom, silent at zero — mirrors _log_interval_calibration.
+            cal_table += (
+                f"<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                f"Excluded {cal.excluded_premise_violations} premise violation(s) "
+                f"(earlier YES / later NO) from the denominator.</p>"
+            )
+
+    cal_table += (
+        "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+        "Recommendation only — the backtester never writes config.py, and live "
+        "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
+    )
+
+    # ── The k selector: one trace per point, switched by a native dropdown ───
+    # points always contains primary as the SAME object (BacktestSweep), but a
+    # hand-built sweep may hold an equal copy — fall back to matching on k, and
+    # to the first point if even that fails, so the figure always has exactly
+    # one visible trace.
+    primary_idx = next(
+        (i for i, pt in enumerate(points)
+         if pt is sweep.primary or pt.k == sweep.primary.k),
+        0,
+    )
+
+    fig = go.Figure()
+    for i, pt in enumerate(points):
+        fig.add_trace(go.Scatter(
+            x=pt.equity_df["date"], y=pt.equity_df["portfolio_value"],
+            name=f"k = {pt.k:.2f}",
+            visible=(i == primary_idx),
+            line={"color": _COLORS["strategy"], "width": 2},
+        ))
+
+    # Plotly's own "update" method rewrites trace visibility and the title
+    # client-side, so the whole selector is static config in the serialized
+    # figure — nothing here needs a script of ours.
+    buttons = [
+        {
+            "label": f"k = {pt.k:.2f}",
+            "method": "update",
+            "args": [
+                {"visible": [j == i for j in range(len(points))]},
+                {"title": f"Equity Curve at interval discount k = {pt.k:.2f}"},
+            ],
+        }
+        for i, pt in enumerate(points)
+    ]
+    fig.update_layout(
+        title=f"Equity Curve at interval discount k = {points[primary_idx].k:.2f}",
+        yaxis_title="Portfolio Value ($)", xaxis_title="Date",
+        # The title is left-aligned, so the selector is anchored to the RIGHT
+        # and the top margin is widened to give both their own room: anchored
+        # left at the default margin, the dropdown rendered on top of the
+        # title text (verified in a browser before this was corrected).
+        margin={"t": 90},
+        updatemenus=[{
+            "type": "dropdown",
+            "buttons": buttons,
+            "active": primary_idx,
+            "direction": "down",
+            "showactive": True,
+            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
+        }],
+    )
+
+    # ── Sweep metrics table ──────────────────────────────────────────────────
+    def _srow(pt, is_primary: bool) -> str:
+        """
+        Render one HTML table row of per-k sweep metrics.
+
+        Computes total return, max drawdown and Sharpe from the point's OWN
+        equity curve, using this module's existing helpers exactly as
+        _section_performance calls them (_max_drawdown needs the date axis and
+        returns a (drawdown, trough_date) pair, not a scalar). The return base
+        is the curve's opening value, which is the run's initial balance unless
+        a trade entered on the very first day of the window.
+
+        Args:
+            pt (backtester.SweepPoint): One simulated interval discount.
+            is_primary (bool): True for the run's effective k — bolded, since
+                every other section on the page reflects that point.
+
+        Returns:
+            str: An HTML <tr>...</tr> string, or a row of "—" placeholders when
+                the point's equity curve is too short to measure.
+        """
+        eq = pt.equity_df
+        weight = "700" if is_primary else "400"
+        label = f"k = {pt.k:.2f}" + (" (primary)" if is_primary else "")
+        if eq.empty:
+            # Four unmeasurable cells: return, final balance, drawdown, Sharpe.
+            cells = "<td style='padding:6px 16px;'>—</td>" * 4
+            return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
+                    f"<td style='padding:6px 16px; font-weight:{weight}'>{label}</td>"
+                    f"<td style='padding:6px 16px;'>{len(pt.trades)}</td>{cells}</tr>")
+        opening = float(eq["portfolio_value"].iloc[0])
+        final = float(eq["portfolio_value"].iloc[-1])
+        total_return = (final - opening) / opening if opening else 0.0
+        # Same call shape as _section_performance: the date axis is what makes
+        # the trough label a calendar date, and the result is a 2-tuple.
+        max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
+        # A one-row curve has no pct_change to speak of; _sharpe returns 0.0 on
+        # a zero standard deviation, so no extra guard is needed here.
+        sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else 0.0
+        return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
+                f"<td style='padding:6px 16px; font-weight:{weight}'>{label}</td>"
+                f"<td style='padding:6px 16px;'>{len(pt.trades)}</td>"
+                f"<td style='padding:6px 16px;'>{total_return:+.1%}</td>"
+                f"<td style='padding:6px 16px;'>${final:,.2f}</td>"
+                f"<td style='padding:6px 16px;'>{max_dd:.1%}</td>"
+                f"<td style='padding:6px 16px;'>{sharpe:.2f}</td>"
+                f"</tr>")
+
+    sweep_table = """
+<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;
+              margin:16px 0; width:auto;">
+<tr style="background:#E8F5E9; font-weight:bold;">
+  <th style="padding:8px 16px;">Interval discount</th>
+  <th style="padding:8px 16px;">Trades</th>
+  <th style="padding:8px 16px;">Total Return</th>
+  <th style="padding:8px 16px;">Final Balance</th>
+  <th style="padding:8px 16px;">Max Drawdown</th>
+  <th style="padding:8px 16px;">Sharpe</th>
+</tr>
+""" + "".join(_srow(pt, i == primary_idx) for i, pt in enumerate(points)) + "</table>"
+
+    return (
+        _SECTION_STYLE.format(title="Interval Discount (k) Calibration")
+        + kpis
+        + cal_table
+        + _fig_html(fig, height=450)
+        + sweep_table
+    )
+
+
+# ─── Section 5: Trade-Level Diagnostics ──────────────────────────────────────
 
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     """
@@ -622,10 +902,10 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     )
 
 
-# ─── Section 5: Risk Metrics ──────────────────────────────────────────────────
+# ─── Section 6: Risk Metrics ──────────────────────────────────────────────────
 
 def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
-                  initial_balance: float) -> str:
+                  initial_balance: float, k: float | None = None) -> str:
     """
     Build the "Risk Metrics" HTML section.
 
@@ -636,6 +916,12 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
         trades (list[BacktestTrade]): Completed backtest trades for sizing analysis.
         equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value].
         initial_balance (float): Starting portfolio value in dollars.
+        k (float | None): The interval discount these trades were SIZED at,
+            passed through to _kelly_fraction so the scatter's x-axis is the
+            Kelly the run actually used. None (default) means "no override" and
+            resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — correct for
+            every run that did not pass --interval-discount, and wrong for one
+            that did, which is why the caller threads it.
 
     Returns:
         str: Self-contained HTML section string. Returns a "No trades" placeholder
@@ -647,9 +933,11 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     # Kelly vs actual sizing scatter. The actual fraction uses the simulated
     # balance at each trade's entry (the base its Kelly budget was computed
     # from) — dividing by the initial balance would distort as equity drifts.
-    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair type
+    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair
+    # type — plus the run's interval discount, so an --interval-discount run
+    # plots the Kelly its trades were actually sized at rather than the config one
     kelly_fracs = [
-        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type)
+        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type, k=k)
         for t in trades
     ]
     actual_fracs = [
@@ -706,7 +994,7 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     )
 
 
-# ─── Section 6: Benchmark Comparison ─────────────────────────────────────────
+# ─── Section 7: Benchmark Comparison ─────────────────────────────────────────
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
                         initial_balance: float) -> str:
@@ -824,23 +1112,44 @@ def generate_dashboard(
     equity_df: pd.DataFrame,
     start_date: date,
     initial_balance: float,
+    *,
+    sweep: BacktestSweep | None = None,
+    interval_discount: float | None = None,
 ) -> Path:
     """
-    Assemble all six dashboard sections into a single self-contained HTML file.
+    Assemble all seven dashboard sections into a single self-contained HTML file.
 
     Calls each _section_*() builder in order, concatenates the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag, then
     writes the file to PROJECT_ROOT. The output file is timestamped so multiple
     backtest runs can be compared without overwriting previous results.
 
+    The two sweep-related parameters are keyword-only WITH defaults, so the
+    existing four-argument positional call still works verbatim: omit both and
+    the page renders exactly as before, with the interval-discount section
+    showing the same kind of short placeholder every other builder emits for
+    empty input.
+
     Args:
-        trades (list[BacktestTrade]): Completed backtest trades from run_backtest().
-            May be empty, in which case all charts show placeholder messages.
+        trades (list[BacktestTrade]): Completed backtest trades from
+            run_backtest() (or run_backtest_sweep()'s primary point). May be
+            empty, in which case all charts show placeholder messages.
         equity_df (pd.DataFrame): Daily equity curve DataFrame with columns
             [date, portfolio_value, daily_return], produced by _build_equity_curve().
         start_date (date): Backtest start date shown in the page title and header.
         initial_balance (float): Starting portfolio value in dollars, used for
             return calculations and benchmark normalization.
+        sweep (BacktestSweep | None): The full sweep payload from
+            backtester.run_backtest_sweep(), rendered by the interval-discount
+            section. Passed whole rather than unpacked — it already carries the
+            calibration, every swept point and the primary k, and splitting it
+            would create copies that could disagree. None (default) renders that
+            section's placeholder.
+        interval_discount (float | None): The interval discount `trades` were
+            SIZED at, threaded into the Risk section's Kelly scatter. Separate
+            from `sweep` because that scatter needs it even on a run that
+            produced no sweep. None (default) means "no override" and resolves
+            to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     Returns:
         Path: Absolute path to the generated HTML file
@@ -853,8 +1162,12 @@ def generate_dashboard(
         _section_performance(equity_df, trades, start_date, initial_balance),
         _section_decomposition(trades),
         _section_calibration(trades),
+        # Takes the sweep whole (calibration + every point + the primary k)
+        _section_interval_discount(sweep),
         _section_diagnostics(trades),
-        _section_risk(trades, equity_df, initial_balance),
+        # k must be the discount these trades were sized at, or the Kelly
+        # scatter plots the config model against override-sized trades
+        _section_risk(trades, equity_df, initial_balance, k=interval_discount),
         _section_benchmark(equity_df, start_date, initial_balance),
     ]
 

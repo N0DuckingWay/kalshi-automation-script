@@ -5,31 +5,38 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Command-line entry point for the Kalshi backtester. Parses CLI
-    arguments (start date, initial balance, cache behavior), configures logging
-    to kalshi_backtest.log, constructs the necessary API clients, delegates the
-    full backtest simulation to backtester.run_backtest(), and then calls
+    arguments (--start-date, --balance, --no-cache, --max-horizon-days,
+    --interval-discount, --no-sweep), configures logging to
+    kalshi_backtest.log, constructs the necessary API clients, delegates the
+    full backtest simulation to backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report.
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion.
 
 Dependencies:
-    Imports run_backtest from backtester.py, generate_dashboard from dashboard.py,
-    and build_historical_client / build_prod_live_client from historical.py.
-    Imports PROJECT_ROOT from config.py. Entry point for
+    Imports run_backtest_sweep from backtester.py, generate_dashboard from
+    dashboard.py, and build_historical_client / build_prod_live_client from
+    historical.py. Imports PROJECT_ROOT from config.py. Entry point for
     `python3 -m kalshi_betting.backtest`.
 
 Notes:
     Historical data only exists on the production Kalshi API, so both API clients
     always use prod credentials regardless of what mode the live bot was run in.
     The backtest reads market data but never submits any orders.
+
+    --interval-discount overrides the time-series interval discount k for this
+    run ONLY. It never reaches live sizing: strategy._kelly_p calls
+    config.time_series_profit_prob with no override, so live trades always price
+    on config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. Nothing here writes config.py
+    — the calibration the run reports is a recommendation for a human to act on.
 """
 import argparse
 import logging
 import logging.handlers
 from datetime import date
 
-from .backtester import run_backtest
-from .config import PROJECT_ROOT
+from .backtester import run_backtest_sweep
+from .config import PROJECT_ROOT, TIME_SERIES_INTERVAL_PROB_DISCOUNT
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client
 
@@ -39,12 +46,17 @@ def main() -> None:
     CLI entry point for the Kalshi backtester.
 
     Parses command-line arguments (--start-date, --balance, --no-cache,
-    --max-horizon-days), configures logging, constructs historical and live
-    Kalshi API clients, runs the full backtest simulation via run_backtest(),
-    and generates an interactive HTML dashboard via generate_dashboard().
-    Logs a summary table of key metrics to kalshi_backtest.log on completion
-    (this module installs only a RotatingFileHandler, no console handler, so
-    nothing reaches stdout).
+    --max-horizon-days, --interval-discount, --no-sweep), configures logging,
+    constructs historical and live Kalshi API clients, runs the full backtest
+    simulation via run_backtest_sweep(), and generates an interactive HTML
+    dashboard via generate_dashboard(). Logs a summary table of key metrics to
+    kalshi_backtest.log on completion (this module installs only a
+    RotatingFileHandler, no console handler, so nothing reaches stdout).
+
+    The summary block reports the PRIMARY point of the sweep — the run at the
+    effective interval discount — so a default run's log output is identical to
+    what the plain run_backtest() path produced. The other swept discounts exist
+    only for the dashboard's k selector and the calibration report.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -69,9 +81,21 @@ def main() -> None:
         help="Only enter trades where the later-closing leg closes within DAYS "
              "of the simulated entry checkpoint (default: no limit)",
     )
+    parser.add_argument(
+        "--interval-discount", type=float, default=None, metavar="K",
+        help="Override the time-series interval discount k for this backtest "
+             "(0-1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
+             "the backtest only — the live sizer always reads config.py.",
+    )
+    parser.add_argument(
+        "--no-sweep", action="store_true",
+        help="Skip the k sweep; the dashboard's k selector will offer one value only",
+    )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
+    if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
+        parser.error("--interval-discount must be between 0 and 1")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -94,23 +118,36 @@ def main() -> None:
 
     use_cache = not args.no_cache
 
+    # Resolve --interval-discount's "no override" sentinel the same way
+    # run_backtest_sweep does, purely so the echo lands BEFORE a multi-hour
+    # fetch. result.primary.k below is the authoritative resolved copy and is
+    # what the dashboard is handed.
+    effective_k = (TIME_SERIES_INTERVAL_PROB_DISCOUNT if args.interval_discount is None
+                   else args.interval_discount)
+
     logging.info(
-        "Backtest config: start=%s | balance=$%.2f | cache=%s",
-        start_date, args.balance, "on" if use_cache else "off",
+        "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f",
+        start_date, args.balance, "on" if use_cache else "off", effective_k,
     )
 
     # Always uses prod API — historical data only exists there.
     hist_client = build_historical_client()  # authenticated prod KalshiClient for /historical raw GETs
     live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
 
-    trades, equity_df = run_backtest(
+    result = run_backtest_sweep(
         hist_client=hist_client,
         live_client=live_client,
         start_date=start_date,
         initial_balance=args.balance,
         use_cache=use_cache,
         max_horizon_days=args.max_horizon_days,
-    )  # returns tuple[list[BacktestTrade], pd.DataFrame] — trades and daily equity curve
+        interval_discount=args.interval_discount,
+        sweep=not args.no_sweep,
+    )  # returns BacktestSweep — primary point, one point per swept k, and the calibration
+    # Everything below reports the PRIMARY point, so the summary block and the
+    # dashboard's other six sections read exactly as they did before the sweep
+    # existed. The remaining points are consumed only by the k selector.
+    trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
         logging.info("No backtest trades found. Dashboard will show empty charts.")
@@ -128,7 +165,12 @@ def main() -> None:
 
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
     # don't duplicate that line here, just point the user at the file.
-    generate_dashboard(trades, equity_df, start_date, args.balance)
+    #
+    # sweep carries the calibration and every swept point for the k selector;
+    # interval_discount is the resolved k these trades were sized at, which the
+    # Risk section's Kelly scatter must price on
+    generate_dashboard(trades, equity_df, start_date, args.balance,
+                       sweep=result, interval_discount=result.primary.k)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
 
 
