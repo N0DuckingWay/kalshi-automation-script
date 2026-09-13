@@ -1215,6 +1215,10 @@ def _fetch_candles_parallel(
     prefiltered out) and must surface rather than be silently degraded into
     "this ticker has no prices".
 
+    Before returning, the tickers that resolved to an empty series are counted
+    and reported in ONE summary WARNING (silent at zero) — the per-run signal
+    that replaces reading hundreds of individual 404 lines (TS-02).
+
     Args:
         hist_client (Any): Historical KalshiClient, shared across worker
             threads (the same pattern historical.py's fetch pools use).
@@ -1294,6 +1298,21 @@ def _fetch_candles_parallel(
                 # work) before the error ever reaches the caller.
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
+
+    # Summarize the misses ONCE. On a post-cutoff window every ticker 404s
+    # (documented, and deliberately never cached), so the count is the useful
+    # signal — not one warning per ticker (TS-02). Counted off the RESULT dict
+    # rather than off caught exceptions, because fetch_candlesticks already
+    # fail-softs a failure to [] internally; deliberately outside the `if work`
+    # block so the tickers resolved to [] above for a missing or unparseable
+    # close_time are counted too.
+    empty = sum(1 for series in candles_by_ticker.values() if not series)
+    if empty:
+        logging.warning(
+            "Candlestick fetch: %d of %d tickers returned no candles "
+            "(post-cutoff tickers 404 by design and are never cached)",
+            empty, len(candles_by_ticker),
+        )
 
     return candles_by_ticker
 

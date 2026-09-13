@@ -1362,6 +1362,62 @@ class TestFetchCandlesParallel:
         assert any(m.endswith("50 / 51") for m in messages)
         assert not any("50 / 56" in m for m in messages)
 
+    @staticmethod
+    def _empty_summaries(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "returned no candles" in r.getMessage()]
+
+    def test_empty_series_are_summarized_once(self, monkeypatch, caplog):
+        # TS-02: on a post-cutoff window every ticker 404s and each failure
+        # logged its own warning. The count is the useful signal, and it is
+        # taken off the RESULT dict — fetch_candlesticks fail-softs a failure
+        # to [] internally, so there is no exception here to count.
+        needed = self._needed(3)
+        empties = {"T00", "T01"}
+        monkeypatch.setattr(
+            backtester, "fetch_candlesticks",
+            lambda _c, ticker, *_a, **_k: (
+                [] if ticker in empties else [_candle(_MONDAY_TS, 0.70, 0.32)]),
+        )
+
+        with caplog.at_level("WARNING"):
+            result = _fetch_candles_parallel(MagicMock(), needed,
+                                             date(2026, 1, 1), False)
+
+        assert sum(1 for s in result.values() if not s) == 2
+        msgs = self._empty_summaries(caplog)
+        assert len(msgs) == 1
+        assert "2 of 3 tickers returned no candles" in msgs[0]
+
+    def test_no_empty_series_logs_nothing(self, monkeypatch, caplog):
+        # Summary-warning idiom: silent at zero.
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *_a, **_k: [_candle(_MONDAY_TS, 0.70, 0.32)])
+        with caplog.at_level("WARNING"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3),
+                                    date(2026, 1, 1), False)
+        assert self._empty_summaries(caplog) == []
+
+    def test_summary_counts_tickers_that_never_reached_a_worker(
+        self, monkeypatch, caplog,
+    ):
+        # The summary sits OUTSIDE the `if work:` block on purpose: a ticker
+        # resolved to [] for a missing or unparseable close_time never enters
+        # `work`, but it is every bit as much a ticker with no prices.
+        needed = {
+            "GOOD": {"ticker": "GOOD", "close_time": "2026-02-01T00:00:00+00:00"},
+            "NOCLOSE": {"ticker": "NOCLOSE", "close_time": None},
+        }
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *_a, **_k: [_candle(_MONDAY_TS, 0.70, 0.32)])
+
+        with caplog.at_level("WARNING"):
+            _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        msgs = self._empty_summaries(caplog)
+        assert len(msgs) == 1
+        assert "1 of 2 tickers returned no candles" in msgs[0]
+
     def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
         # Same guarantee end-to-end: the three existing run_backtest fixtures
         # rely on an unknown ticker raising KeyError out of the whole run as a
