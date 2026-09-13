@@ -393,9 +393,10 @@ The daemon logs to its own `kalshi_scheduler.log` (and the console), deliberatel
 | `0`  | `EXIT_OK` — run completed (including a clean run that found no qualifying pairs) |
 | `10` | `EXIT_SKIPPED_LOW_BALANCE` — run skipped because the account balance was below the minimum |
 | `20` | `EXIT_TRADES_NEED_ATTENTION` — at least one trade came back `rollback_failed` or `manual_review`; **a human must check the account and trade log** |
+| `30` | `EXIT_NO_TRADEABLE_SHARDS` — every advertised exchange shard reported `trading_active=false` (an exchange-wide halt or maintenance window), so ingest dropped every market and **nothing was scanned**; deliberately distinct from `0`'s "scanned everything, found no edge" |
 | `1`  | Unhandled exception — the interpreter's default for a crash; not part of the contract above |
 
-The constants live in `config.py` (`EXIT_OK` / `EXIT_SKIPPED_LOW_BALANCE` / `EXIT_TRADES_NEED_ATTENTION`) and the scheduler maps each to a distinct log level and message, so a low-balance skip or a manual-review run is never logged as "completed successfully".
+The constants live in `config.py` (`EXIT_OK` / `EXIT_SKIPPED_LOW_BALANCE` / `EXIT_TRADES_NEED_ATTENTION` / `EXIT_NO_TRADEABLE_SHARDS`) and the scheduler maps each to a distinct log level and message, so a low-balance skip or a manual-review run is never logged as "completed successfully". Exit `30` additionally means the weekly slot was **not** satisfied: nothing was scanned, so the run must never count as the week's scan.
 
 ---
 

@@ -62,6 +62,7 @@ from tabulate import tabulate
 
 from .auth import build_client, verify_auth
 from .config import (
+    EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
@@ -335,7 +336,13 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
 
     A run must only ever CLAIM full coverage when every shard the exchange
     advertises was actually scanned; a missing shard is reported loudly but
-    never aborts the run — trading continues on whatever was covered.
+    never aborts the run — trading continues on whatever was covered. When NO
+    advertised shard was scannable (every one explicitly trading-inactive —
+    an exchange-wide halt), check_shard_coverage's two loops are empty and it
+    returns ([], []), which used to print the same "Full shard coverage" line
+    a healthy run prints (TS-01); that case now warns instead. A shard whose
+    trading_active is None (flag absent, TS-04) counts as scannable, matching
+    scanner.inactive_shard_indexes.
 
     Args:
         shard_statuses (dict | None): Return value of scanner.fetch_shard_statuses().
@@ -351,13 +358,29 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     # Pure comparison of advertised vs. observed shards; this function only
     # decides how loudly to log what check_shard_coverage found.
     critical, warnings = check_shard_coverage(shard_statuses, market_shards, balance_shards)
+    # Coverage may only be CLAIMED over shards that were scannable.
+    # check_shard_coverage deliberately skips trading-inactive shards (their
+    # ingest drop already warned), so an all-inactive exchange yields ([], [])
+    # — which read as success (TS-01). Only an explicit False is inactive;
+    # None (flag absent) is scannable, matching scanner.inactive_shard_indexes.
+    scannable = sorted(
+        idx for idx, st in shard_statuses.items() if st.get("trading_active") is not False
+    )
     for problem in critical:
         # Same severity channel as orphaned positions — this must never be missable.
         logging.critical("SHARD COVERAGE FAILURE: %s", problem)
     for problem in warnings:
         logging.warning("Shard coverage: %s", problem)
-    if not critical and not warnings:
-        logging.info("Full shard coverage: shards %s scanned", sorted(shard_statuses))
+    if not scannable:
+        logging.warning(
+            "Shard coverage NOT claimable: all %d advertised shards are "
+            "trading-inactive and 0 markets were ingested",
+            len(shard_statuses),
+        )
+    elif not critical and not warnings:
+        # Lists the shards actually scanned, not every advertised one — a
+        # funded-but-halted shard is no longer folded into "full".
+        logging.info("Full shard coverage: shards %s scanned", scannable)
 
 
 def _run_dev(client, args) -> int:
@@ -377,7 +400,11 @@ def _run_dev(client, args) -> int:
             max_horizon_days attributes.
 
     Returns:
-        int: Always EXIT_OK — dev mode never submits real orders, so there is
+        int: EXIT_NO_TRADEABLE_SHARDS when every advertised exchange shard is
+            trading-inactive, so ingest dropped every market and nothing could
+            be scanned (TS-01) — dev's code is not consumed by the scheduler,
+            but the two modes must not disagree about what a blind run is.
+            EXIT_OK otherwise: dev mode never submits real orders, so there is
             no low-balance skip or manual-review outcome to distinguish.
             Returned as an int (rather than None) for symmetry with _run_prod,
             since main() dispatches to either and passes the result to
@@ -406,6 +433,17 @@ def _run_dev(client, args) -> int:
     # there is no balance-shard set to compare against — pass empty and let
     # the market-coverage half of the check still catch a missing shard
     _log_shard_coverage(shard_statuses, {m.exchange_index for m in markets}, set())
+
+    # An exchange-wide halt drops every market at ingest, so there is nothing
+    # to simulate. Dev's exit code is not consumed by the scheduler, but the
+    # two modes must not disagree about what a blind run is (TS-01).
+    if shard_statuses and inactive_shards == set(shard_statuses):
+        logging.warning(
+            "Every advertised exchange shard is trading-inactive (%s) — nothing "
+            "can be scanned this run",
+            sorted(inactive_shards),
+        )
+        return EXIT_NO_TRADEABLE_SHARDS
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
@@ -490,6 +528,11 @@ def _run_prod(client, args) -> int:
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
             account balance is below MIN_BALANCE_CENTS (no scan attempted).
+            EXIT_NO_TRADEABLE_SHARDS if every advertised exchange shard is
+            trading-inactive, so ingest dropped every market and nothing was
+            scanned — deliberately distinct from EXIT_OK's "scanned
+            everything, found no edge", because the scheduler must not count
+            the weekly slot as satisfied by a blind run (TS-01).
             EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
             results has status "rollback_failed" or "manual_review" — either
             means a human must check the account/trade log. EXIT_OK for every
@@ -540,6 +583,18 @@ def _run_prod(client, args) -> int:
         {m.exchange_index for m in markets},
         {s for s, c in shard_balances.items() if c > 0},
     )
+
+    # An exchange-wide halt drops every market at ingest. That is not "no edge
+    # this week": return the dedicated code so scheduler.run_job never records
+    # the Monday slot as satisfied (TS-01). inactive_shard_indexes only ever
+    # returns advertised shards, so equality here means "every one of them".
+    if shard_statuses and inactive_shards == set(shard_statuses):
+        logging.warning(
+            "Every advertised exchange shard is trading-inactive (%s) — nothing "
+            "can be scanned this run",
+            sorted(inactive_shards),
+        )
+        return EXIT_NO_TRADEABLE_SHARDS
 
     markets           = [m for m in markets if m.ticker not in held_tickers]
 

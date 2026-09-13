@@ -57,6 +57,7 @@ from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import trader as trader_mod
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
+    EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
@@ -801,6 +802,34 @@ class TestRunDevLiveShapeReplay:
         # the ingest drop above already warned about it.
         assert "SHARD COVERAGE FAILURE" not in caplog.text
         assert "Shard coverage:" not in caplog.text
+        # ...but it is no longer folded into the full-coverage claim either:
+        # the line names the shards actually scanned (TS-01).
+        assert "Full shard coverage: shards [0] scanned" in caplog.text
+
+    def test_run_dev_all_shards_inactive_returns_blind_code(self, monkeypatch, caplog):
+        # Dev's exit code is not consumed by the scheduler, but the two modes
+        # must not disagree about what a blind run is (TS-01).
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, trading_active=False, description="Main"),
+                _status_entry(1, trading_active=False, description="Combos"),
+            ),
+        )
+        wrote: list = []
+        monkeypatch.setattr(main, "write_dev_simulation", lambda *a, **k: wrote.append(a))
+
+        args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            code = main._run_dev(client, args)
+
+        assert code == EXIT_NO_TRADEABLE_SHARDS
+        assert "Every advertised exchange shard is trading-inactive ([0, 1])" in caplog.text
+        assert "Shard coverage NOT claimable" in caplog.text
+        assert "Full shard coverage" not in caplog.text
+        assert not wrote, "a blind run must short-circuit before the simulation write"
 
     def test_unwired_exchange_status_degrades_to_single_shard(self, monkeypatch, caplog):
         # Every other test module's MagicMock client leaves
@@ -1001,6 +1030,92 @@ class TestRunProdDryRunLiveShapeReplay:
         assert "SHARD COVERAGE FAILURE" not in caplog.text
         assert "Shard coverage: advertised active shard 2" in caplog.text
         assert "may be legitimately empty" in caplog.text
+
+    def test_run_prod_all_shards_inactive_returns_blind_code(self, monkeypatch, caplog):
+        # TS-01: an exchange-wide halt (observed live 2026-09-03) makes ingest
+        # drop every market. The run used to find no pairs, log the same "Full
+        # shard coverage" line a healthy run logs, and exit 0 — so the
+        # scheduler counted the weekly slot as satisfied and the bot did not
+        # trade again for a week. It must now say so and exit 30.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, trading_active=False, description="Main"),
+                _status_entry(1, trading_active=False, description="Combos"),
+            ),
+        )
+        monkeypatch.setattr(
+            main, "append_to_prod_log", lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"),
+        )
+        enriched: list = []
+        monkeypatch.setattr(
+            main, "enrich_with_orderbook_prices",
+            lambda *a, **k: enriched.append(a) or [],
+        )
+        args = SimpleNamespace(dry_run=True, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, args)
+
+        assert code == EXIT_NO_TRADEABLE_SHARDS
+        assert "Every advertised exchange shard is trading-inactive ([0, 1])" in caplog.text
+        # The false all-clear this fixes: ([], []) from check_shard_coverage
+        # must never read as success.
+        assert "Full shard coverage" not in caplog.text
+        assert "Shard coverage NOT claimable" in caplog.text
+        assert not enriched, "a blind run must short-circuit before pair enrichment"
+
+    def test_run_prod_full_coverage_lists_only_scannable_shards(self, monkeypatch, caplog):
+        # A halted shard is no longer folded into the "full coverage" claim:
+        # the line names the shards actually scanned, so an operator reading it
+        # can tell a full ingest from a partial one (TS-01).
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(
+                _status_entry(0, description="Main"),
+                _status_entry(1, trading_active=False, description="Combos"),
+            ),
+        )
+        monkeypatch.setattr(
+            main, "append_to_prod_log", lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"),
+        )
+        args = SimpleNamespace(dry_run=True, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, args)
+
+        assert code == EXIT_OK, "one halted shard is not a blind run"
+        assert "Full shard coverage: shards [0] scanned" in caplog.text
+        assert "Full shard coverage: shards [0, 1] scanned" not in caplog.text
+
+    def test_run_prod_unknown_trading_flag_is_not_a_blind_run(self, monkeypatch, caplog):
+        # TS-04 x TS-01: a dropped trading_active field parses to None, which
+        # keeps every shard scannable — so this must NOT trip the all-inactive
+        # short-circuit (that would turn a drift event into a skipped week).
+        entries = [
+            {"exchange_index": 0, "exchange_active": True,
+             "intra_exchange_transfers_active": True, "description": "Main"},
+            {"exchange_index": 1, "exchange_active": True,
+             "intra_exchange_transfers_active": True, "description": "Combos"},
+        ]
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            exchange_status_payload=_status_payload(*entries),
+        )
+        monkeypatch.setattr(
+            main, "append_to_prod_log", lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"),
+        )
+        args = SimpleNamespace(dry_run=True, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, args)
+
+        assert code == EXIT_OK
+        assert "Every advertised exchange shard is trading-inactive" not in caplog.text
+        assert "Full shard coverage: shards [0, 1] scanned" in caplog.text
 
     def test_run_prod_aborts_below_min_balance(self, monkeypatch, caplog):
         client = _live_shape_client(monkeypatch, balance_payload=_LOW_BALANCE_PAYLOAD)
@@ -1774,6 +1889,12 @@ class TestDryRunInertInDev:
 
 
 def test_exit_code_constants_distinct():
-    # Guard against a future accidental collision between the three codes —
-    # the scheduler's log-level mapping depends on them being distinguishable.
-    assert len({EXIT_OK, EXIT_SKIPPED_LOW_BALANCE, EXIT_TRADES_NEED_ATTENTION}) == 3
+    # Guard against a future accidental collision between the codes — the
+    # scheduler's log-level mapping depends on them being distinguishable,
+    # and EXIT_NO_TRADEABLE_SHARDS additionally drives its retry (TS-01).
+    assert len({
+        EXIT_OK,
+        EXIT_SKIPPED_LOW_BALANCE,
+        EXIT_TRADES_NEED_ATTENTION,
+        EXIT_NO_TRADEABLE_SHARDS,
+    }) == 4

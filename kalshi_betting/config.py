@@ -325,7 +325,7 @@ SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 # generic pass/fail — a prod run skipped for insufficient balance used to exit
 # 0 just like a clean run, so the scheduler logged "Job completed successfully."
 # and the WARNING explaining why nothing happened was buried in a log the
-# scheduler never reads (BS-14). These three codes are shared between main.py
+# scheduler never reads (BS-14). These codes are shared between main.py
 # (which returns/exits them) and scheduler.py (which maps them to distinct log
 # levels/messages) — they live in config.py so both modules import the same
 # values instead of duplicating magic numbers. An unhandled exception in
@@ -334,6 +334,12 @@ SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 EXIT_OK                       = 0
 EXIT_SKIPPED_LOW_BALANCE      = 10
 EXIT_TRADES_NEED_ATTENTION    = 20
+# Every advertised shard reported trading_active=false (an exchange-wide halt
+# or maintenance window — observed live 2026-09-03 00:29 PDT), so ingest
+# dropped every market and NOTHING was scanned. Distinct from EXIT_OK's
+# "scanned everything, found no edge": scheduler.run_job maps this to a
+# WARNING, never counts the weekly slot as satisfied, and retries it (TS-01).
+EXIT_NO_TRADEABLE_SHARDS      = 30
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
