@@ -415,10 +415,13 @@ class TestCatchUp:
 
 
 class TestBlindRunRetry:
-    """TS-01: EXIT_NO_TRADEABLE_SHARDS means an exchange-wide halt dropped
-    every market at ingest, so the run scanned nothing. The bot trades only on
-    the weekly fire, so that slot must not count as satisfied — it is retried
-    hourly, a bounded number of times."""
+    """TS-01/VI-02: EXIT_NO_TRADEABLE_SHARDS means the run scanned nothing —
+    either an exchange-wide halt dropped every market at ingest, or the ingest
+    came back empty for a cause /exchange/status could not name. The scheduler
+    sees only the exit code, so its messages name both possibilities and point
+    at kalshi_arb.log, where main._blind_run_reason logged which one fired. The
+    bot trades only on the weekly fire, so that slot must not count as
+    satisfied — it is retried hourly, a bounded number of times."""
 
     @patch("kalshi_betting.scheduler.subprocess.run")
     def test_blind_exit_warns_and_registers_one_retry(self, mock_run, tmp_path, caplog):
@@ -429,11 +432,15 @@ class TestBlindRunRetry:
 
         matches = [
             r for r in caplog.records
-            if "every exchange shard was trading-inactive" in r.getMessage()
+            if "Job scanned nothing (exit 30)" in r.getMessage()
         ]
         assert len(matches) == 1
         assert matches[0].levelno == logging.WARNING
         assert "NOT satisfied" in matches[0].getMessage()
+        # The daemon has only the exit code, which no longer identifies one
+        # cause: the message must offer both and point at the log that does.
+        assert "the market ingest came back empty" in matches[0].getMessage()
+        assert "kalshi_arb.log" in matches[0].getMessage()
         assert f"attempt 1 of {SCHEDULER_BLIND_MAX_RETRIES}" in matches[0].getMessage()
         # Never the generic "Job failed" branch, and never "successfully".
         assert "Job failed" not in caplog.text
@@ -494,11 +501,15 @@ class TestBlindRunRetry:
 
         matches = [
             r for r in caplog.records
-            if "every exchange shard stayed" in r.getMessage()
+            if "Job scanned nothing on" in r.getMessage()
         ]
         assert len(matches) == 1
         assert matches[0].levelno == logging.ERROR
         assert f"{SCHEDULER_BLIND_MAX_RETRIES + 1} attempts" in matches[0].getMessage()
+        # Terminal message for the week: it must not assert the halt as fact
+        # when an empty ingest is equally possible behind exit 30.
+        assert "kept coming back empty" in matches[0].getMessage()
+        assert "kalshi_arb.log" in matches[0].getMessage()
         assert schedule.jobs == [], "the cap must stop the retry chain"
 
         state = json.loads((tmp_path / "scheduler_state.json").read_text())

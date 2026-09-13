@@ -79,18 +79,24 @@ Notes:
     feature was added will therefore always trigger an immediate prod run,
     since scheduler_state.json does not yet exist.
 
-    TS-01 blind-run retry: EXIT_NO_TRADEABLE_SHARDS (30) means every exchange
-    shard was trading-inactive, so ingest dropped every market and the run
-    scanned NOTHING — an exchange-wide maintenance window overlapping the
-    09:00 fire, observed live 2026-09-03. The bot trades only on the weekly
-    fire, so that used to cost the entire week while both logs said the run
-    succeeded. run_job() now registers a one-shot retry
-    (SCHEDULER_BLIND_RETRY_SECONDS out, at most SCHEDULER_BLIND_MAX_RETRIES
-    per slot) instead, and _maybe_catch_up() re-runs a slot whose recorded
-    attempt exited 30. The count is carried on run_job's `retries` argument
-    and persisted as the state file's optional "retries" key — the cap can
-    only be enforced there, because a retry that exits 30 again schedules its
-    own successor. A pre-existing state file has no such key and reads as 0.
+    TS-01/VI-02 blind-run retry: EXIT_NO_TRADEABLE_SHARDS (30) means the run
+    scanned NOTHING. main.py returns it for either of two causes (see
+    main._blind_run_reason): every advertised exchange shard was
+    trading-inactive, so ingest dropped every market — an exchange-wide
+    maintenance window overlapping the 09:00 fire, observed live 2026-09-03 —
+    or the market ingest came back empty for a cause /exchange/status could
+    not name, which is the case scanner.fetch_shard_statuses' fail-soft None
+    leaves undiagnosable. This daemon cannot tell the two apart from the exit
+    code alone; kalshi_arb.log carries the WARNING naming which one fired. The
+    bot trades only on the weekly fire, so that used to cost the entire week
+    while both logs said the run succeeded. run_job() now registers a one-shot
+    retry (SCHEDULER_BLIND_RETRY_SECONDS out, at most
+    SCHEDULER_BLIND_MAX_RETRIES per slot) instead, and _maybe_catch_up()
+    re-runs a slot whose recorded attempt exited 30. The count is carried on
+    run_job's `retries` argument and persisted as the state file's optional
+    "retries" key — the cap can only be enforced there, because a retry that
+    exits 30 again schedules its own successor. A pre-existing state file has
+    no such key and reads as 0.
     An hourly cadence bounded at four attempts covers a typical maintenance
     window while keeping the scan near its intended Monday-morning slot; a
     longer interval would trade on stale morning pricing.
@@ -324,10 +330,14 @@ def run_job(retries: int = 0) -> None:
     subprocess.run() itself (BS-31 — e.g. the interpreter can't be spawned)
     is logged with a specific message and does not escape this function.
 
-    EXIT_NO_TRADEABLE_SHARDS (TS-01) is the one code that does NOT satisfy the
-    weekly slot: an exchange-wide halt means nothing was scanned at all, and
-    the bot trades only on the weekly fire, so letting it stand would cost the
-    week. That branch registers a one-shot retry on the `schedule` library's
+    EXIT_NO_TRADEABLE_SHARDS (TS-01, VI-02) is the one code that does NOT
+    satisfy the weekly slot: it means nothing was scanned at all — an
+    exchange-wide halt, or an ingest that came back empty for a cause
+    /exchange/status could not name — and the bot trades only on the weekly
+    fire, so letting it stand would cost the week. Which of the two fired is
+    named in kalshi_arb.log by the subprocess, not here: this daemon sees only
+    the exit code, so its own messages must not claim one cause over the
+    other. That branch registers a one-shot retry on the `schedule` library's
     global scheduler, SCHEDULER_BLIND_RETRY_SECONDS out, and the retry
     re-enters this function with `retries` incremented. The cap lives HERE,
     not in the caller: a retried run that exits 30 again schedules its own
@@ -398,12 +408,17 @@ def run_job(retries: int = 0) -> None:
             "check kalshi_arb.log and trade_log.xlsx.",
         )
     elif result.returncode == EXIT_NO_TRADEABLE_SHARDS:
-        # Not a satisfied slot: nothing was scanned (TS-01).
+        # Not a satisfied slot: nothing was scanned (TS-01, VI-02). The exit
+        # code does not say WHICH cause fired, so neither does this message —
+        # the subprocess logs that sentence into kalshi_arb.log.
         if retries < SCHEDULER_BLIND_MAX_RETRIES:
             logging.warning(
-                "Job could not scan: every exchange shard was trading-inactive. "
-                "The weekly slot is NOT satisfied — retrying in %d s (attempt %d of %d).",
-                SCHEDULER_BLIND_RETRY_SECONDS, retries + 1, SCHEDULER_BLIND_MAX_RETRIES,
+                "Job scanned nothing (exit %d): every advertised exchange shard was "
+                "trading-inactive, or the market ingest came back empty — "
+                "kalshi_arb.log names which. The weekly slot is NOT satisfied — "
+                "retrying in %d s (attempt %d of %d).",
+                result.returncode, SCHEDULER_BLIND_RETRY_SECONDS,
+                retries + 1, SCHEDULER_BLIND_MAX_RETRIES,
             )
             # One-shot job on the schedule library's global scheduler; it
             # cancels itself when it fires (see _blind_retry), and the next
@@ -413,8 +428,10 @@ def run_job(retries: int = 0) -> None:
             )
         else:
             logging.error(
-                "Job could not scan on %d attempts: every exchange shard stayed "
-                "trading-inactive — giving up on this slot; check the exchange status.",
+                "Job scanned nothing on %d attempts: every advertised exchange shard "
+                "stayed trading-inactive, or the market ingest kept coming back empty "
+                "— giving up on this slot; check the exchange status and "
+                "kalshi_arb.log, which names the cause.",
                 retries + 1,
             )
     else:

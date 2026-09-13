@@ -386,6 +386,66 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
         logging.info("Full shard coverage: shards %s scanned", scannable)
 
 
+def _blind_run_reason(markets: list, shard_statuses, inactive_shards: set) -> str | None:
+    """
+    Decide whether this run scanned NOTHING at all, and name the reason.
+
+    The single definition of "blind run" for BOTH run modes, so dev and prod
+    can never silently disagree about what one is. A blind run is any run whose
+    market ingest yielded nothing to pair, and it must be reported with
+    EXIT_NO_TRADEABLE_SHARDS rather than EXIT_OK: EXIT_OK claims "scanned
+    everything, found no edge", which would let scheduler.run_job record the
+    weekly slot as satisfied by a run that never looked at a single book
+    (TS-01).
+
+    Two independent causes, checked in that order because the first is the
+    more specific diagnosis:
+
+    1. Every advertised exchange shard is trading-inactive (the exchange-wide
+       halt observed live 2026-09-03) — ingest dropped every market by design.
+       Kept as its OWN disjunct rather than folded into the census below,
+       because the two are not equivalent: a halt that still leaves one stray
+       market ingested (e.g. one tagged with a shard /exchange/status does not
+       advertise) would pass a census test while every advertised book is shut.
+    2. Ingest produced zero markets for any other reason — most importantly
+       when scanner.fetch_shard_statuses() returned None, which it does on ANY
+       internal failure (it is fail-soft by design, and correctly so). That
+       makes `shard_statuses` falsy, so cause 1 cannot fire, and an ingest that
+       came back empty used to exit EXIT_OK claiming a clean scan (VI-02).
+
+    This must be evaluated on the RAW ingest, before held-ticker or horizon
+    filtering: those filters legitimately empty the list on a healthy exchange
+    (`--max-horizon-days 1` on a quiet week), which is "no edge", not blind.
+
+    Args:
+        markets (list): The ApiMarket objects ingest produced, BEFORE any
+            held-ticker or horizon filtering.
+        shard_statuses (dict | None): Return value of
+            scanner.fetch_shard_statuses(). None (breakdown unavailable) makes
+            cause 1 unknowable, which is why cause 2 exists.
+        inactive_shards (set): Return value of
+            scanner.inactive_shard_indexes(shard_statuses) — only ever a subset
+            of the advertised shards, so equality with the advertised set means
+            "every one of them".
+
+    Returns:
+        str | None: A ready-to-log sentence naming which cause fired, or None
+            when the run actually scanned something and is not blind.
+
+    Raises:
+        Nothing. This is a pure comparison over already-fetched values; it
+        performs no I/O and swallows nothing.
+    """
+    if shard_statuses and inactive_shards == set(shard_statuses):
+        return (
+            f"Every advertised exchange shard is trading-inactive "
+            f"({sorted(inactive_shards)}) — nothing can be scanned this run"
+        )
+    if not markets:
+        return "Ingest produced zero markets — nothing can be scanned this run"
+    return None
+
+
 def _run_dev(client, args) -> int:
     """
     Execute a full dev/sandbox mode scan and simulation.
@@ -403,10 +463,16 @@ def _run_dev(client, args) -> int:
             max_horizon_days attributes.
 
     Returns:
-        int: EXIT_NO_TRADEABLE_SHARDS when every advertised exchange shard is
-            trading-inactive, so ingest dropped every market and nothing could
-            be scanned (TS-01) — dev's code is not consumed by the scheduler,
-            but the two modes must not disagree about what a blind run is.
+        int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
+            advertised exchange shard trading-inactive so ingest dropped every
+            market (TS-01), or an ingest that produced zero markets for any
+            other reason, including the one fetch_shard_statuses() cannot
+            diagnose because it failed fail-soft to None (VI-02); see
+            _blind_run_reason. Dev's code is not consumed by the scheduler,
+            but the two modes must not disagree about what a blind run is, so
+            a blind dev run short-circuits before write_dev_simulation exactly
+            as it does today — an empty simulation file is written for a run
+            that SCANNED and found no pairs, never for one that never looked.
             EXIT_OK otherwise: dev mode never submits real orders, so there is
             no low-balance skip or manual-review outcome to distinguish.
             Returned as an int (rather than None) for symmetry with _run_prod,
@@ -437,15 +503,12 @@ def _run_dev(client, args) -> int:
     # the market-coverage half of the check still catch a missing shard
     _log_shard_coverage(shard_statuses, {m.exchange_index for m in markets}, set())
 
-    # An exchange-wide halt drops every market at ingest, so there is nothing
-    # to simulate. Dev's exit code is not consumed by the scheduler, but the
-    # two modes must not disagree about what a blind run is (TS-01).
-    if shard_statuses and inactive_shards == set(shard_statuses):
-        logging.warning(
-            "Every advertised exchange shard is trading-inactive (%s) — nothing "
-            "can be scanned this run",
-            sorted(inactive_shards),
-        )
+    # A run that ingested nothing simulated nothing. Dev's exit code is not
+    # consumed by the scheduler, but the two modes must not disagree about what
+    # a blind run is, so both ask the same helper (TS-01, VI-02).
+    blind_reason = _blind_run_reason(markets, shard_statuses, inactive_shards)
+    if blind_reason:
+        logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Optional opt-in cap so both bet types only see markets closing within
@@ -531,11 +594,14 @@ def _run_prod(client, args) -> int:
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
             account balance is below MIN_BALANCE_CENTS (no scan attempted).
-            EXIT_NO_TRADEABLE_SHARDS if every advertised exchange shard is
-            trading-inactive, so ingest dropped every market and nothing was
-            scanned — deliberately distinct from EXIT_OK's "scanned
+            EXIT_NO_TRADEABLE_SHARDS if the run was blind — every advertised
+            exchange shard trading-inactive so ingest dropped every market
+            (TS-01), or an ingest that produced zero markets for any other
+            reason, including the one fetch_shard_statuses() cannot diagnose
+            because it failed fail-soft to None (VI-02); see
+            _blind_run_reason. Deliberately distinct from EXIT_OK's "scanned
             everything, found no edge", because the scheduler must not count
-            the weekly slot as satisfied by a blind run (TS-01).
+            the weekly slot as satisfied by a run that never looked at a book.
             EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
             results has status "rollback_failed" or "manual_review" — either
             means a human must check the account/trade log. EXIT_OK for every
@@ -587,16 +653,16 @@ def _run_prod(client, args) -> int:
         {s for s, c in shard_balances.items() if c > 0},
     )
 
-    # An exchange-wide halt drops every market at ingest. That is not "no edge
-    # this week": return the dedicated code so scheduler.run_job never records
-    # the Monday slot as satisfied (TS-01). inactive_shard_indexes only ever
-    # returns advertised shards, so equality here means "every one of them".
-    if shard_statuses and inactive_shards == set(shard_statuses):
-        logging.warning(
-            "Every advertised exchange shard is trading-inactive (%s) — nothing "
-            "can be scanned this run",
-            sorted(inactive_shards),
-        )
+    # An ingest that produced nothing scanned nothing — an exchange-wide halt
+    # dropping every market, or an empty ingest whose cause the status
+    # breakdown could not name. Either way that is not "no edge this week":
+    # return the dedicated code so scheduler.run_job never records the Monday
+    # slot as satisfied (TS-01, VI-02). Evaluated here, before the held-ticker
+    # and horizon filters below, so a filter that legitimately empties the list
+    # is never mistaken for a blind run.
+    blind_reason = _blind_run_reason(markets, shard_statuses, inactive_shards)
+    if blind_reason:
+        logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
     markets           = [m for m in markets if m.ticker not in held_tickers]

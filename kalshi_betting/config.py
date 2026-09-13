@@ -367,11 +367,16 @@ SCHEDULER_BLIND_MAX_RETRIES   = 4
 EXIT_OK                       = 0
 EXIT_SKIPPED_LOW_BALANCE      = 10
 EXIT_TRADES_NEED_ATTENTION    = 20
-# Every advertised shard reported trading_active=false (an exchange-wide halt
-# or maintenance window — observed live 2026-09-03 00:29 PDT), so ingest
-# dropped every market and NOTHING was scanned. Distinct from EXIT_OK's
-# "scanned everything, found no edge": scheduler.run_job maps this to a
-# WARNING, never counts the weekly slot as satisfied, and retries it (TS-01).
+# NOTHING was scanned this run. Two causes, both reported with this code
+# because the scheduler's decision is the same for either: every advertised
+# shard reported trading_active=false (an exchange-wide halt or maintenance
+# window — observed live 2026-09-03 00:29 PDT), so ingest dropped every market
+# (TS-01); or ingest produced zero markets for a reason /exchange/status could
+# not name — scanner.fetch_shard_statuses is fail-soft and returns None on ANY
+# internal failure, which makes the all-halted test unevaluable exactly when
+# something has gone wrong (VI-02). Distinct from EXIT_OK's "scanned
+# everything, found no edge": scheduler.run_job maps this to a WARNING, never
+# counts the weekly slot as satisfied, and retries it.
 EXIT_NO_TRADEABLE_SHARDS      = 30
 
 # ── API pagination ────────────────────────────────────────────────────────────

@@ -320,6 +320,20 @@ _SHARD2_FUNDED_BALANCE = {
 }
 
 
+def _stub_ingest() -> list:
+    """One market-shaped stand-in for "ingest returned something".
+
+    Tests that stub the pair finders out still have to hand _run_dev/_run_prod
+    a NON-empty ingest: a run whose ingest produced zero markets scanned
+    nothing and is now reported as a blind run (EXIT_NO_TRADEABLE_SHARDS,
+    VI-02), and "zero ingested markets but the finders returned pairs" is not
+    a shape the live pipeline can ever take. Only .ticker (prod's held-ticker
+    filter) and .exchange_index (the coverage census) are read on those
+    stubbed paths.
+    """
+    return [SimpleNamespace(ticker="STUB-INGEST-MKT", exchange_index=DEFAULT_EXCHANGE_INDEX)]
+
+
 def _status_entry(
     idx: int, *, trading_active: bool = True, transfers_active: bool = True,
     description: str = "Main",
@@ -1522,7 +1536,7 @@ class TestRunProdExitCodes:
             {DEFAULT_EXCHANGE_INDEX: 100_000},
         ]
         mock_held.return_value = set()
-        mock_fetch.return_value = []
+        mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
         mock_find_ts.return_value = []
         spec = make_spec()
@@ -1576,7 +1590,7 @@ class TestRunProdExitCodes:
             {DEFAULT_EXCHANGE_INDEX: 100_000},
         ]
         mock_held.return_value = set()
-        mock_fetch.return_value = []
+        mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
         mock_find_ts.return_value = []
         spec = make_spec()
@@ -1602,7 +1616,10 @@ class TestRunProdExitCodes:
         with (
             patch("kalshi_betting.main.get_held_tickers", return_value=set()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
@@ -1612,12 +1629,124 @@ class TestRunProdExitCodes:
         assert code == EXIT_OK
 
 
+class TestBlindRunReason:
+    """VI-02: a run whose ingest produced nothing scanned nothing, and must
+    report EXIT_NO_TRADEABLE_SHARDS rather than EXIT_OK. EXIT_OK claims
+    "scanned everything, found no edge", which lets scheduler.run_job record
+    the weekly slot as satisfied by a run that never looked at a single order
+    book — TS-01's bug surviving through a second door, because
+    scanner.fetch_shard_statuses is fail-soft and returns None on ANY internal
+    failure, which makes the all-shards-halted test unevaluable.
+    """
+
+    _HALTED = {0: {"trading_active": False}, 1: {"trading_active": False}}
+    _ACTIVE = {0: {"trading_active": True}, 1: {"trading_active": True}}
+
+    def test_halt_fires_even_when_a_stray_market_survived_ingest(self):
+        # The disjunct that must NEVER be collapsed into a bare census test.
+        # /exchange/status can advertise every shard halted while a market
+        # tagged with an UNADVERTISED shard still survives ingest:
+        # scanner._shard_index only defaults a MISSING/unparseable index to
+        # DEFAULT_EXCHANGE_INDEX, so an explicit shard 9 stays 9, and 9 is not
+        # in inactive_shards. Reading that run as healthy would carry it into
+        # pair discovery, Kelly sizing and — on a live Monday run — order
+        # submission with an explicit exchange_index during an exchange-wide
+        # halt.
+        stray = [SimpleNamespace(ticker="STRAY", exchange_index=9)]
+        reason = main._blind_run_reason(stray, self._HALTED, {0, 1})
+        assert reason is not None
+        assert "Every advertised exchange shard is trading-inactive ([0, 1])" in reason
+
+    def test_zero_census_fires_when_status_was_unavailable(self):
+        # The VI-02 hole itself: status is None, so the halt disjunct cannot
+        # fire, and an ingest that came back empty used to exit EXIT_OK.
+        assert main._blind_run_reason([], None, set()) == (
+            "Ingest produced zero markets — nothing can be scanned this run"
+        )
+
+    def test_zero_census_fires_on_a_fully_active_exchange(self):
+        # Nothing halted, nothing ingested — API drift (a renamed events or
+        # markets key empties the ingest silently) rather than a halt, but
+        # equally blind.
+        assert main._blind_run_reason([], self._ACTIVE, set()) is not None
+
+    def test_halt_is_reported_in_preference_to_the_census(self):
+        # Both causes hold during a real halt; the halt is the more specific
+        # diagnosis, so that is the sentence an operator reads.
+        reason = main._blind_run_reason([], self._HALTED, {0, 1})
+        assert "trading-inactive" in reason
+        assert "Ingest produced zero markets" not in reason
+
+    def test_a_run_that_ingested_something_is_never_blind(self):
+        markets = _stub_ingest()
+        assert main._blind_run_reason(markets, self._ACTIVE, set()) is None
+        assert main._blind_run_reason(markets, None, set()) is None
+        # One halted shard out of two is a PARTIAL ingest — reported by the
+        # coverage check, never by this gate.
+        partial = {0: {"trading_active": True}, 1: {"trading_active": False}}
+        assert main._blind_run_reason(markets, partial, {1}) is None
+
+    def test_empty_status_dict_cannot_fire_the_halt_disjunct(self):
+        # fetch_shard_statuses never returns {} (it returns None for that
+        # shape), but the `shard_statuses and` guard is what stops
+        # set() == set({}) from reading as "every advertised shard halted".
+        assert main._blind_run_reason(_stub_ingest(), {}, set()) is None
+
+
+class TestBlindRunCensusEndToEnd:
+    def test_run_prod_zero_market_ingest_returns_blind_code(self, caplog):
+        # An empty prod ingest with the status breakdown unavailable: the
+        # all-halted disjunct cannot fire, so only the census catches it.
+        with (
+            patch(
+                "kalshi_betting.main.verify_auth",
+                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10},
+            ),
+            patch("kalshi_betting.main.get_held_tickers", return_value=set()),
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch("kalshi_betting.main.enrich_with_orderbook_prices") as mock_enrich,
+        ):
+            with caplog.at_level(logging.INFO):
+                code = main._run_prod(MagicMock(), _args())
+
+        assert code == EXIT_NO_TRADEABLE_SHARDS
+        assert "Ingest produced zero markets" in caplog.text
+        assert mock_enrich.call_count == 0, "a blind run short-circuits before enrichment"
+
+    def test_run_dev_zero_market_ingest_returns_blind_code(self, caplog):
+        wrote: list = []
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.write_dev_simulation",
+                side_effect=lambda *a, **k: wrote.append(a),
+            ),
+        ):
+            with caplog.at_level(logging.INFO):
+                code = main._run_dev(
+                    MagicMock(),
+                    SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                )
+
+        assert code == EXIT_NO_TRADEABLE_SHARDS
+        assert "Ingest produced zero markets" in caplog.text
+        # Same rule test_run_dev_all_shards_inactive_returns_blind_code already
+        # pins for the halt path: the empty simulation file records a run that
+        # SCANNED and found no pairs, never one that never looked.
+        assert not wrote, "a blind run must short-circuit before the simulation write"
+
+
 class TestRunDevExitCode:
     def test_run_dev_returns_ok_code(self):
         client = MagicMock()
         with (
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
@@ -1652,7 +1781,7 @@ class TestMainEntryPoint:
         monkeypatch,
     ):
         mock_build_client.return_value = MagicMock()
-        mock_fetch.return_value = []
+        mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda m, d: m
         mock_find_ts.return_value = []
         mock_find_st.return_value = []
@@ -1742,7 +1871,10 @@ class TestDevSimulationLoggedOnce:
         client = MagicMock()
         with (
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
@@ -1760,7 +1892,10 @@ class TestDevSimulationLoggedOnce:
         pair = make_spec().pair
         with (
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[pair]),
@@ -1780,7 +1915,10 @@ class TestDevSimulationLoggedOnce:
         spec = make_spec()
         with (
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[spec.pair]),
@@ -1849,7 +1987,10 @@ class TestLoggingRotation:
             with (
                 patch("kalshi_betting.main.build_client", return_value=MagicMock()),
                 patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+                patch(
+                    "kalshi_betting.main.fetch_open_events_with_markets",
+                    return_value=_stub_ingest(),
+                ),
                 patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
                 patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
                 patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
@@ -1890,7 +2031,10 @@ class TestDryRunInertInDev:
         with (
             patch("kalshi_betting.main.build_client", return_value=MagicMock()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
-            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            patch(
+                "kalshi_betting.main.fetch_open_events_with_markets",
+                return_value=_stub_ingest(),
+            ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
             patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
