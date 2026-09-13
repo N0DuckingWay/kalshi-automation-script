@@ -440,3 +440,68 @@ class TestVerifyAuthRetryAndDrift:
         with patch.object(_http.time, "sleep"):
             with pytest.raises(ValueError):
                 auth.verify_auth(client)
+
+
+class TestBalanceFieldChosenByPresence:
+    """TS-16: the breakdown field is chosen by PRESENCE, not truthiness.
+
+    `entry.get("balance_dollars") or entry.get("balance")` discarded a numeric
+    zero and read the stale legacy field instead, reporting a genuinely-empty
+    shard as funded. That is the one OVER-statement this function can produce,
+    in a module whose flooring rule and drop-with-a-warning rule both exist to
+    guarantee the opposite. It feeds Kelly sizing, the MIN_BALANCE_CENTS gate,
+    the shard-coverage audit and the transfer planner.
+    """
+
+    def test_numeric_zero_balance_dollars_is_honoured_not_skipped(self):
+        payload = {"balance_breakdown": [
+            {"exchange_index": 0, "balance_dollars": 0, "balance": "5.00"},
+        ]}
+        assert _balance_cents_by_shard(payload) == {0: 0}
+
+    def test_float_zero_balance_dollars_is_honoured(self):
+        payload = {"balance_breakdown": [
+            {"exchange_index": 0, "balance_dollars": 0.0, "balance": "5.00"},
+        ]}
+        assert _balance_cents_by_shard(payload) == {0: 0}
+
+    def test_empty_balance_dollars_reaches_the_warning_not_the_legacy_field(self, caplog):
+        # "" is unparseable, not zero — it must drop the shard LOUDLY through
+        # the existing warning rather than silently reading another field.
+        payload = {
+            "balance_breakdown": [
+                {"exchange_index": 0, "balance_dollars": "", "balance": "5.00"},
+            ],
+            "balance_dollars": "7.00",
+        }
+        with caplog.at_level(logging.WARNING):
+            out = _balance_cents_by_shard(payload)
+        assert out == {DEFAULT_EXCHANGE_INDEX: 700}
+        assert "NOT counted" in caplog.text
+
+    def test_string_zero_still_reads_as_zero(self):
+        # Regression guard: the string form was always correct (it is truthy),
+        # which is exactly why the live payload never exposed the bug.
+        payload = {"balance_breakdown": [
+            {"exchange_index": 0, "balance_dollars": "0.0000"},
+        ]}
+        assert _balance_cents_by_shard(payload) == {0: 0}
+
+    def test_duplicate_exchange_index_warns_and_keeps_last(self, caplog):
+        # Last-win matches the previous behaviour and is as defensible as
+        # first-win; being SILENT about a changed payload shape is not.
+        payload = {"balance_breakdown": [
+            {"exchange_index": 0, "balance": "1.00"},
+            {"exchange_index": 0, "balance": "9.00"},
+        ]}
+        with caplog.at_level(logging.WARNING):
+            out = _balance_cents_by_shard(payload)
+        assert out == {0: 900}
+        assert "more than once" in caplog.text
+
+    def test_dollar_converter_distinguishes_zero_from_unparseable(self):
+        # The converter was never the problem — pin that, so the fix can't be
+        # "corrected" back into the caller.
+        assert _dollar_str_to_cents(0) == 0
+        assert _dollar_str_to_cents(0.0) == 0
+        assert _dollar_str_to_cents("") is None

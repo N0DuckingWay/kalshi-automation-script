@@ -190,6 +190,11 @@ def _check_and_parse(resp: Any) -> Any:
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
             not 2xx.
+        ValueError: (json.JSONDecodeError, or TypeError for a null body) when
+            the status IS 2xx but the body is empty or is not JSON. Because the
+            status check runs first, this can only mean the request itself
+            SUCCEEDED — which matters at any call site where that implies work
+            was already done server-side (see trader._execute_transfer).
     """
     # RESTResponse.data may be unread until .read() is called, depending on
     # how the underlying urllib3 response was created
@@ -226,6 +231,11 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
             not 2xx.
+        ValueError: (json.JSONDecodeError, or TypeError for a null body) when
+            the status IS 2xx but the body is empty or is not JSON. Because the
+            status check runs first, this can only mean the request itself
+            SUCCEEDED — which matters at any call site where that implies work
+            was already done server-side (see trader._execute_transfer).
     """
     resp = fetch_fn(**kwargs)
     # Shared with signed_request_json so the non-2xx → ApiException contract
@@ -280,6 +290,11 @@ def signed_request_json(
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
             not 2xx.
+        ValueError: (json.JSONDecodeError, or TypeError for a null body) when
+            the status IS 2xx but the body is empty or is not JSON. Because the
+            status check runs first, this can only mean the request itself
+            SUCCEEDED — which matters at any call site where that implies work
+            was already done server-side (see trader._execute_transfer).
     """
     verb = method.upper()
     # configuration.host already includes the /trade-api/v2 prefix, and `path`

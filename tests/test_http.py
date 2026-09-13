@@ -296,3 +296,33 @@ class TestSignedRequestJson:
         # only scheme+netloc are taken from the host, so it appears exactly once.
         assert url.count("/trade-api/v2") == 1
         assert url == f"https://demo-api.kalshi.co{self._PATH}"
+
+
+class TestEmpty2xxBodyStillRaises:
+    """TS-17: a 2xx with an empty body must keep RAISING, deliberately.
+
+    Returning {} here looks obvious and is dangerous. trader._read_position
+    would answer "the account is flat" when the truth is unknown — during the
+    window where an unhedged NO leg may be open — and eight cursor-pagination
+    loops would read a falsy page as "cleanly finished" and truncate silently,
+    including the settled-market archive, which persists its day slices as
+    complete. The loud failure is load-bearing; the one call site where it
+    costs money is fixed in trader._execute_transfer instead.
+    """
+
+    @staticmethod
+    def _response(status: int, body: bytes) -> MagicMock:
+        resp = MagicMock()
+        resp.status = status
+        resp.data = body
+        return resp
+
+    def test_empty_2xx_body_raises_rather_than_returning_empty(self):
+        fetch_fn = MagicMock(return_value=self._response(204, b""))
+        with pytest.raises(ValueError):
+            fetch_json_page(fetch_fn)
+
+    def test_non_json_2xx_body_raises(self):
+        fetch_fn = MagicMock(return_value=self._response(200, b"<html>oops</html>"))
+        with pytest.raises(ValueError):
+            fetch_json_page(fetch_fn)
