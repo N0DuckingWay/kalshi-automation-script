@@ -463,7 +463,9 @@ def _raw_book_response(ob: dict) -> SimpleNamespace:
     return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
 
 
-def _ts_orderbook_client(*, pA_fill: float, nB_fill: float, qty: int = 100):
+def _ts_orderbook_client(
+    *, pA_fill: float, nB_fill: float, qty: int = 100, pB_ref: float | None = None,
+):
     """Mock KalshiClient serving TIME-SERIES-shaped depth at exactly one level.
 
     A time-series pair buys YES on EARLY and NO on LATE. Buying YES on EARLY
@@ -472,6 +474,13 @@ def _ts_orderbook_client(*, pA_fill: float, nB_fill: float, qty: int = 100):
     (1 - pA_fill) on EARLY and a YES bid of (1 - nB_fill) on LATE yield
     qualifying depth priced at exactly pA_fill + nB_fill. The opposite sides
     are left empty so a wrong-side read shows up as "no depth".
+
+    pB_ref, when given, additionally rests a NO bid of (1 - pB_ref) on LATE so
+    LATE's best YES ask is exactly pB_ref — the reference quote
+    _reference_yes_ask reads. It is NOT a leg side for this pair type, so it
+    changes no fill price; setting it above 1 - (1 - nB_fill), i.e. crossing
+    LATE's book, is the only way to drive the post-enrichment direction guard.
+    Left None, LATE's NO side stays empty and the pair keeps its scan-time pB.
     """
     def fake_orderbook(ticker):
         if ticker == "EARLY":  # market A — NO bids become YES ask levels
@@ -479,7 +488,10 @@ def _ts_orderbook_client(*, pA_fill: float, nB_fill: float, qty: int = 100):
                   "no_dollars": [[str(round(1.0 - pA_fill, 4)), str(qty)]]}
         else:                  # market B — YES bids become NO ask levels
             ob = {"yes_dollars": [[str(round(1.0 - nB_fill, 4)), str(qty)]],
-                  "no_dollars": []}
+                  "no_dollars": (
+                      [] if pB_ref is None
+                      else [[str(round(1.0 - pB_ref, 4)), str(qty)]]
+                  )}
         return _raw_book_response(ob)
 
     client = MagicMock()
@@ -487,7 +499,10 @@ def _ts_orderbook_client(*, pA_fill: float, nB_fill: float, qty: int = 100):
     return client
 
 
-def _st_orderbook_client(*, nA_fill: float, pB_fill: float, qty: int = 100, ticker_a: str = "A1"):
+def _st_orderbook_client(
+    *, nA_fill: float, pB_fill: float, qty: int = 100, ticker_a: str = "A1",
+    pA_ref: float | None = None,
+):
     """Mock KalshiClient serving SAME-TITLE-shaped depth at exactly one level.
 
     A same-title pair buys NO on A and YES on B. Buying NO on A consumes A's
@@ -496,11 +511,19 @@ def _st_orderbook_client(*, nA_fill: float, pB_fill: float, qty: int = 100, tick
     NO bid of (1 - pB_fill) on every other ticker yield qualifying depth
     priced at exactly nA_fill + pB_fill. This is the book shape the scanner
     read for EVERY pair before the 2026-09 time-series inversion.
+
+    pA_ref mirrors _ts_orderbook_client's pB_ref: it rests a NO bid of
+    (1 - pA_ref) on ticker_a so A's best YES ask is exactly pA_ref — the
+    reference quote for THIS pair type. Left None, A's NO side stays empty and
+    the pair keeps its scan-time pA.
     """
     def fake_orderbook(ticker):
         if ticker == ticker_a:  # market A — YES bids become NO ask levels
             ob = {"yes_dollars": [[str(round(1.0 - nA_fill, 4)), str(qty)]],
-                  "no_dollars": []}
+                  "no_dollars": (
+                      [] if pA_ref is None
+                      else [[str(round(1.0 - pA_ref, 4)), str(qty)]]
+                  )}
         else:                   # market B — NO bids become YES ask levels
             ob = {"yes_dollars": [],
                   "no_dollars": [[str(round(1.0 - pB_fill, 4)), str(qty)]]}
@@ -550,16 +573,19 @@ class TestOrderbookCeilingTieredByDeadlineGap:
     def test_short_gap_depth_at_080_sum_qualifies(self):
         # 10-day gap → ceiling 0.85. Leg depth priced at 0.30 + 0.50 = 0.80
         # qualifies and the pair picks up the depth-weighted fill prices in
-        # the LEG fields (pA/nB) — nA/pB are not leg prices and stay put.
+        # the LEG fields (pA/nB). pB is not a leg price but IS the model's
+        # reference quote, so it is refreshed from LATE's NO bids in the same
+        # pass (0.62 here, against a scan-time 0.60); nA is reporting-only for
+        # this pair type and stays put.
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.62)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is True
         assert enriched.max_contracts == 100
         assert enriched.pA == pytest.approx(0.30)
         assert enriched.nB == pytest.approx(0.50)
         assert enriched.nA == pair.nA
-        assert enriched.pB == pair.pB
+        assert enriched.pB == pytest.approx(0.62)
 
     def test_validate_pair_price_rejects_long_gap_at_old_ceiling(self):
         # Pre-execution re-check applies the same tiered ceiling: a 20-day-gap
@@ -633,17 +659,19 @@ class TestTimeSeriesEnrichmentSides:
             assert no_levels == [(pytest.approx(0.45), 7.0)]
             assert yes_levels == [(pytest.approx(0.31), 3.0)]
 
-    def test_enrichment_writes_fills_to_pA_nB_and_leaves_nA_pB(self):
+    def test_enrichment_writes_fills_to_pA_nB_and_refreshes_pB_leaving_nA(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
-        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40)
+        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40, pB_ref=0.58)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is True
         assert enriched.max_contracts == 40
         assert enriched.pA == pytest.approx(0.32)
         assert enriched.nB == pytest.approx(0.42)
-        # Not leg prices for this pair type — must be byte-identical to the input
+        # pB is the reference quote _kelly_p subtracts pA from, so it comes from
+        # this same snapshot (LATE's NO bids) rather than the scan
+        assert enriched.pB == pytest.approx(0.58)
+        # nA is reporting-only for this pair type — byte-identical to the input
         assert enriched.nA == pair.nA
-        assert enriched.pB == pair.pB
         assert leg_prices(enriched) == (pytest.approx(0.32), pytest.approx(0.42))
 
     def test_same_title_shaped_books_yield_no_depth_for_time_series(self):
@@ -669,7 +697,10 @@ class TestTimeSeriesEnrichmentSides:
 class TestSameTitleEnrichmentByteIdentity:
     """Same-title behaviour must not change with the time-series inversion:
     NO on A still consumes A's YES bids, YES on B still consumes B's NO bids,
-    and the fills still land in nA/pB with pA/nB untouched."""
+    and the fills still land in nA/pB with nB untouched. pA is refreshed from
+    A's NO bids (TS-34) — the reporting-only reference quote — but same-title
+    is deliberately NOT direction-guarded: its model is the fixed co-resolution
+    prior, so nothing sizes on pA and there is no clamp to protect."""
 
     @staticmethod
     def _pair() -> CandidatePair:
@@ -684,15 +715,18 @@ class TestSameTitleEnrichmentByteIdentity:
             nB=0.70,
         )
 
-    def test_enrichment_writes_fills_to_nA_pB_and_leaves_pA_nB(self):
+    def test_enrichment_writes_fills_to_nA_pB_and_refreshes_pA_leaving_nB(self):
         pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100, pA_ref=0.57)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is True
         assert enriched.max_contracts == 100
         assert enriched.nA == pytest.approx(0.44)
         assert enriched.pB == pytest.approx(0.31)
-        assert enriched.pA == pair.pA
+        # pA is same_title's reference quote — refreshed from A's NO bids in the
+        # same snapshot as the fills (scan-time was 0.55)
+        assert enriched.pA == pytest.approx(0.57)
+        # nB is reporting-only for this pair type — byte-identical to the input
         assert enriched.nB == pair.nB
         assert leg_prices(enriched) == (pytest.approx(0.44), pytest.approx(0.31))
 
@@ -728,6 +762,135 @@ class TestSameTitleEnrichmentByteIdentity:
         client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
         [enriched] = enrich_with_orderbook_prices(client, [pair])
         assert enriched.tradeable is False
+
+
+class TestEnrichmentRefreshesReferenceQuote:
+    """enrich_with_orderbook_prices must refresh the pair's REFERENCE YES ask —
+    the non-leg market's YES ask (pB for time_series, pA for same_title) — from
+    the book it already fetched, and drop any pair whose refreshed reference is
+    not above the YES leg's fill.
+
+    Left stale, that quote is compared against a depth-weighted fill by
+    strategy._kelly_p, and config.time_series_profit_prob's max(0, pB - pA)
+    clamp turns a stale pB at or below a fresh pA into p = 1.0 — a riskless
+    model on a directional bet (TS-34)."""
+
+    def test_enrichment_refreshes_the_time_series_reference_ask(self):
+        # LATE's YES ask has moved to 0.65 since the scan captured 0.60; the
+        # refreshed value is what lands in pB, from LATE's NO bids
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.pB == pytest.approx(0.65)
+        assert enriched.pB != pytest.approx(pair.pB)
+        # The leg prices and the reporting-only nA are unaffected by the refresh
+        assert enriched.pA == pytest.approx(0.30)
+        assert enriched.nB == pytest.approx(0.50)
+        assert enriched.nA == pair.nA
+
+    def test_enrichment_refreshes_the_same_title_reference_ask(self):
+        # Mirror: for a same-title pair the YES leg is on B, so the reference
+        # is A's YES ask (pA), read from A's NO bids
+        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
+        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
+        pair = CandidatePair(
+            market_a=mA, market_b=mB,
+            pA=0.55, pB=0.30, nA=0.45,
+            tradeable=True,
+            canonical_title="Q",
+            pair_type="same_title",
+            nB=0.70,
+        )
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.pA == pytest.approx(0.60)
+        assert enriched.pA != pytest.approx(pair.pA)
+        assert enriched.nA == pytest.approx(0.44)
+        assert enriched.pB == pytest.approx(0.31)
+        assert enriched.nB == pair.nB
+
+    @staticmethod
+    def _inverted_pair_and_client():
+        """A time-series pair whose depth-weighted pA lands ABOVE LATE's fresh pB.
+
+        LATE's book is deliberately CROSSED (YES bid 0.70 with a NO bid of
+        0.55, summing to 1.25): once the reference is refreshed from the same
+        snapshot, the qualifying ceiling avg_yes + avg_no <= 1 - tier makes the
+        inversion arithmetically impossible on an uncrossed book, so a crossed
+        book is the only shape that can still reach the guard.
+
+        Leg fills: pA 0.54 (EARLY NO bid 0.46) + nB 0.30 (LATE YES bid 0.70) =
+        0.84, inside the 10-day-gap ceiling of 0.85 and profitable after fees.
+        The refreshed reference is LATE's YES ask of 0.45 — below the 0.54 fill.
+        """
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.50, nB=0.30)
+        client = _ts_orderbook_client(pA_fill=0.54, nB_fill=0.30, pB_ref=0.45)
+        return pair, client
+
+    def test_inverted_pair_after_enrichment_is_dropped(self, caplog):
+        pair, client = self._inverted_pair_and_client()
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(client, [pair])
+
+        assert enriched.tradeable is False
+
+        direction_drops = [
+            r for r in caplog.records
+            if "no longer prices above the YES leg fill" in r.getMessage()
+        ]
+        assert len(direction_drops) == 1
+        assert direction_drops[0].levelno == logging.WARNING
+
+        # The pair IS profitable at those fills — it must not also be reported
+        # as unprofitable, which would misattribute the drop
+        assert [
+            r for r in caplog.records
+            if "unprofitable after depth adjustment" in r.getMessage()
+        ] == []
+
+    def test_refresh_makes_the_riskless_clamp_unreachable(self):
+        # The consequence, not just the flag. Import locally so this scanner
+        # test file does not take a module-level dependency on strategy.
+        from kalshi_betting.strategy import _kelly_p
+
+        pair, client = self._inverted_pair_and_client()
+
+        # The pre-fix shape: leg fill written to pA while pB stays at its
+        # scan-time 0.50. time_series_profit_prob clamps the negative gap to
+        # zero and the pair models as RISKLESS.
+        stale_shape = dataclasses.replace(pair, pA=0.54)
+        assert _kelly_p(stale_shape) == 1.0
+
+        # The fixed enrichment never produces such a pair: the refreshed
+        # reference fails the direction guard, so it is not tradeable and
+        # compute_trade returns None before _kelly_p is ever consulted.
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is False
+
+    def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self):
+        # LATE has no resting NO bids, so no reference ask can be derived —
+        # pB keeps its scan-time value and the guard evaluates against that
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.pB == pair.pB
+        assert enriched.pA == pytest.approx(0.30)
+
+    def test_reference_refresh_costs_no_extra_orderbook_fetch(self):
+        # The reference comes off an array _fetch_orderbook already returned,
+        # so the fetch count stays one per DISTINCT ticker (get_ob's cache),
+        # i.e. two for a pair and still two for two pairs on the same markets
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
+        enrich_with_orderbook_prices(client, [pair])
+        assert client.get_market_orderbook_without_preload_content.call_count == 2
+
+        client_two = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
+        enrich_with_orderbook_prices(client_two, [pair, dataclasses.replace(pair)])
+        assert client_two.get_market_orderbook_without_preload_content.call_count == 2
 
 
 class TestTimeSeriesBestPairPerGroup:

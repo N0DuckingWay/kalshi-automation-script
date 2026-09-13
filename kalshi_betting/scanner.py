@@ -1846,6 +1846,41 @@ def _leg_ask_levels(
     return _bids_to_ask_levels(ob_b["yes"]), _bids_to_ask_levels(ob_a["no"])
 
 
+def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
+    """
+    Best YES ask on the market that does NOT carry the pair's YES leg.
+
+    Each pair type buys YES on one market and NO on the other, so exactly one
+    market's YES ask is a LEG price; the OTHER market's YES ask is the model's
+    reference quote (pB for time_series, pA for same_title). _leg_ask_levels
+    reads only one side of each book, which leaves the side that yields this
+    quote fetched but unused — so deriving it here costs no extra request.
+
+    A YES ask is the complement of a resting NO bid, so the reference comes
+    from the non-YES-leg market's NO bids via _bids_to_ask_levels.
+
+    Args:
+        pair (Any): CandidatePair (or anything exposing pair_type); only
+            pair_type is read, via leg_sides, so an unknown type resolves to
+            the same-title sides exactly as leg_sides specifies.
+        ob_a (dict): market_a's parsed book from _fetch_orderbook —
+            {"yes": [[price, qty], ...], "no": [...]} (bids, dollar strings).
+        ob_b (dict): market_b's parsed book, same shape.
+
+    Returns:
+        float | None: The lowest YES ask on the non-YES-leg market, or None
+            when that side carries no usable resting bids (the caller then
+            keeps the pair's scan-time value).
+    """
+    # leg_sides is the only source of truth for which market carries the YES
+    # leg: YES on A for time_series, YES on B for same_title
+    side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
+    ob_ref = ob_b if side_a == "yes" else ob_a
+    levels = _bids_to_ask_levels(ob_ref["no"])
+    # _bids_to_ask_levels returns ASCENDING asks, so [0] is the best (lowest)
+    return levels[0][0] if levels else None
+
+
 # Unit tags for an orderbook side-key candidate set. Dollar sets carry bid prices
 # as 0-1 dollar strings (parsed straight by _bids_to_ask_levels); cents sets carry
 # integer cents and MUST be converted to dollars before that parser sees them.
@@ -2129,9 +2164,14 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
 
     The two leg prices are replaced with weighted-average fill prices over
     qualifying contracts — written back to nA/pB for a same-title pair and to
-    pA/nB for a time-series pair, leaving the other two quotes untouched.
+    pA/nB for a time-series pair. The pair's REFERENCE quote (the non-leg
+    market's YES ask: pB for time_series, pA for same_title) is refreshed from
+    the same books via _reference_yes_ask, so downstream models never subtract
+    a scan-time quote from a depth-weighted one; the remaining quote (nA for
+    time_series, nB for same_title) is reporting-only and stays untouched.
     max_contracts is set to the total qualifying count. Pairs with no
-    qualifying contracts are marked tradeable=False.
+    qualifying contracts are marked tradeable=False, as are pairs whose
+    refreshed reference no longer sits above the YES leg's fill.
 
     Args:
         client (Any): Authenticated KalshiClient used to fetch each pair's
@@ -2141,8 +2181,10 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the
-            leg prices (nA/pB for same_title, pA/nB for time_series),
-            tradeable and max_contracts replaced by depth-validated values.
+            leg prices (nA/pB for same_title, pA/nB for time_series), the
+            reference quote (pB for time_series, pA for same_title, refreshed
+            only when the reference book side had resting bids), tradeable and
+            max_contracts replaced by depth-validated values.
     """
     # Cache order books by ticker to avoid fetching the same book twice
     # when the same market appears in multiple pairs
@@ -2210,19 +2252,71 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         avg_yes   = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
         avg_no    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
 
+        # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
+        # book already in hand. Left at its scan-time value it would be compared
+        # against a fresh avg_yes by strategy._kelly_p, whose subtraction runs
+        # through config.time_series_profit_prob's max(0, pB - pA) clamp: a stale
+        # pB at or below the fresh pA clamps to zero, returning p = 1.0, so the
+        # pair models as RISKLESS and Kelly sizes it at the BUDGET_FRACTION cap.
+        ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
+
+        # Direction, re-asserted for TIME_SERIES ONLY. avg_yes is the YES leg's
+        # fill and ref_yes the later contract's YES ask, so `ref_yes > avg_yes`
+        # is exactly the `pB > pA` conjunct find_time_series_pairs applies at
+        # scan time — re-applied now that the fill price has moved.
+        #
+        # same_title is deliberately NOT guarded here. Its model is the fixed
+        # co-resolution prior (strategy._kelly_p), so pA is not a model input and
+        # there is no clamp to protect: a guard would buy nothing, while its
+        # stale-fallback branch could drop a sound near-arbitrage on exactly the
+        # quantity this change exists to distrust.
+        #
+        # With a refreshed reference the test is implied by the ceiling applied
+        # above: every qualifying level satisfies yes + no <= 1 - tier, so
+        # avg_yes <= (1 - tier) - avg_no <= max(YES bid on the later market)
+        # - tier, and an UNCROSSED book puts that market's YES ask at or above
+        # its YES bid. On fresh data it can therefore only fire on a CROSSED book.
+        is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
+        direction_ok = True
+        if is_time_series:
+            if ref_yes is not None:
+                direction_ok = ref_yes > avg_yes
+                basis = f"fresh reference ask {ref_yes:.4f}"
+            else:
+                # No fresh reference (the later market had no resting NO bids),
+                # so the only quote available is the scan-time pB — seconds to
+                # tens of seconds old. Demand the FULL tier rather than a bare
+                # `>`: a mixed-snapshot gap of a thousandth would otherwise pass,
+                # and as the gap shrinks time_series_profit_prob rises toward 1.0
+                # and Kelly sizes toward the BUDGET_FRACTION cap.
+                tier = min_price_diff_for_gap(
+                    deadline_gap_days(pair.market_a, pair.market_b)
+                )
+                direction_ok = (pair.pB - avg_yes) >= tier
+                basis = (
+                    f"scan-time reference ask {pair.pB:.4f} (later book's NO side "
+                    f"empty), which must clear the {tier:.2f} tier"
+                )
+            if not direction_ok:
+                logging.warning(
+                    "Pair '%s' dropped: the later contract no longer prices above "
+                    "the YES leg fill %.4f — %s",
+                    pair.canonical_title, avg_yes, basis,
+                )
+
         # Re-validate tradeability at the depth-weighted prices (the pair may still be
         # unprofitable if all qualifying contracts are at the edge of the gap threshold).
-        # Deliberately NO direction conjunct here (find_time_series_pairs adds
-        # pB > pA at scan time): every qualifying level already satisfies
-        # avg_yes + avg_no <= 1 - threshold, which implies an executable gap of
-        # at least the tier — a strictly stronger condition than the direction.
-        new_tradeable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
+        profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
 
-        if not new_tradeable:
+        if not profitable:
+            # Kept as its own arm so this line only ever reports the profitability
+            # verdict — a direction drop has already logged its own WARNING above
             logging.info(
                 "Pair '%s' unprofitable after depth adjustment: avg_no=%.3f avg_yes=%.3f",
                 pair.canonical_title, avg_no, avg_yes,
             )
+
+        new_tradeable = profitable and direction_ok
 
         # Replace the LEG prices and contract count with depth-accurate values,
         # writing back to whichever fields are the leg prices for this pair type
@@ -2230,8 +2324,21 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         # leg_prices() reads); strategy.py sizes the final Kelly trade on them
         if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
             leg_updates = {"pA": avg_yes, "nB": avg_no}
+            # pB is the model's reference quote, not a leg price — refreshed so
+            # strategy._kelly_p's pB - pA subtraction has both operands from one
+            # snapshot. Left alone when the reference side had no resting bids.
+            if ref_yes is not None:
+                leg_updates["pB"] = ref_yes
         else:
             leg_updates = {"nA": avg_no, "pB": avg_yes}
+            # Mirror: pA is same_title's reference quote. Nothing sizes on it
+            # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
+            # guarded above, but it is the operand of the reported pA - pB
+            # "Price Diff", which otherwise subtracts a scan-time quote from a
+            # depth-weighted fill and can print a negative gap for a pair that
+            # passed the finder's directional filter. Refreshed for coherence.
+            if ref_yes is not None:
+                leg_updates["pA"] = ref_yes
         enriched.append(dc_replace(
             pair,
             tradeable=new_tradeable,
