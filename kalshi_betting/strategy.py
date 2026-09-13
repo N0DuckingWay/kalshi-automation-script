@@ -151,15 +151,22 @@ def _kelly_p(pair: CandidatePair) -> float:
     value) Kelly is <= 0 for every pair and nothing trades — the edge exists
     only if the market systematically overstates the in-between probability.
 
-    Inputs after enrichment: pair.pA is the depth-weighted YES fill on A
-    (enrich_with_orderbook_prices writes the time-series leg prices back to
-    pA/nB) while pair.pB is still the scan-time best YES ask on B. A worse YES
-    fill therefore raises pA, which shrinks the modelled gap (raising p) and
-    shrinks the edge (raising the cost) together — a second-order effect that
-    moves in the conservative direction on the sizing that matters. The gap is
-    kept on YES asks (pB - pA) rather than on the executable spread because
-    the YES-ask gap is the smaller, more conservative estimate of the mass the
-    market assigns to the loss cell.
+    Inputs after enrichment: pair.pA is the depth-weighted YES fill on A and
+    pair.pB is B's best YES ask re-read from the book fetched in the same pass
+    (scanner._reference_yes_ask), so pB - pA is a single-snapshot gap whenever
+    B's NO side carried resting bids; when it did not, pB keeps its scan-time
+    value. That matters because time_series_profit_prob clamps the gap at zero:
+    a pA that had risen to or past pB would clamp to zero and return p = 1.0,
+    modelling the pair as riskless. Enrichment therefore drops any time-series
+    pair whose reference is not above the YES fill: strictly above when the
+    reference was re-read fresh, and clearing the whole deadline-gap tier when
+    it fell back to the scan-time quote, since a mixed-snapshot gap of a
+    thousandth would otherwise pass. compute_trade returns None on a
+    non-tradeable pair before reaching here (strategy.py:58), so every pair
+    this prices from the live pipeline satisfies pB > pA and the clamp is
+    unreachable. The gap is kept on YES asks (pB - pA) rather than on
+    the executable spread because the YES-ask gap is the smaller, more
+    conservative estimate of the mass the market assigns to the loss cell.
 
     same_title: p = SAME_TITLE_CO_RESOLVE_PROB — fixed prior for markets confirmed to ask
     the exact same question (matching event_title + title + subtitle, see scanner.pair_key).

@@ -7,7 +7,9 @@ MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 """
 import ast
 import inspect
+import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +22,7 @@ from kalshi_betting.config import (
     fee_per_pair_approx,
     time_series_profit_prob,
 )
+from kalshi_betting.scanner import CandidatePair, enrich_with_orderbook_prices
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
 
 
@@ -448,3 +451,96 @@ class TestSelectPortfolio:
         # Sanity: with fees still inside the balance, it is selected
         spec_ok = make_spec(total_cost=490.0, total_cost_with_fees=499.0)
         assert select_portfolio([spec_ok], 50_000) == [spec_ok]
+
+
+class TestKellyOperandsShareOneSnapshot:
+    """_kelly_p's two time-series operands (pair.pA and pair.pB) must both come
+    from the enrichment snapshot.
+
+    config.time_series_profit_prob clamps the gap at zero, so a pB left at its
+    scan-time value while pA is refreshed to a depth-weighted fill can return
+    p = 1.0 — a riskless model on what is a directional bet, which Kelly then
+    sizes at the BUDGET_FRACTION cap. scanner.enrich_with_orderbook_prices
+    refreshes pB from the same books and drops any pair whose reference is not
+    above the YES fill, so no pair it marks tradeable can reach the clamp
+    (TS-34)."""
+
+    @staticmethod
+    def _books(*, pA_fill: float, nB_fill: float, pB_ref: float, qty: int = 100):
+        """Mock KalshiClient serving EARLY/LATE time-series books, one level each.
+
+        EARLY rests a NO bid of (1 - pA_fill) so its YES ask — the YES leg's
+        fill — is pA_fill. LATE rests a YES bid of (1 - nB_fill) so its NO ask
+        — the NO leg's fill — is nB_fill, and a NO bid of (1 - pB_ref) so its
+        YES ask (the reference quote) is pB_ref. Books arrive in the raw
+        orderbook_fp wire format, which is what _fetch_orderbook parses.
+        """
+        def fake_orderbook(ticker):
+            if ticker == "EARLY":
+                ob = {"yes_dollars": [],
+                      "no_dollars": [[str(round(1.0 - pA_fill, 4)), str(qty)]]}
+            else:
+                ob = {"yes_dollars": [[str(round(1.0 - nB_fill, 4)), str(qty)]],
+                      "no_dollars": [[str(round(1.0 - pB_ref, 4)), str(qty)]]}
+            payload = json.dumps({"orderbook_fp": ob}).encode("utf-8")
+            return SimpleNamespace(status=200, data=payload)
+
+        client = MagicMock()
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=fake_orderbook
+        )
+        return client
+
+    @staticmethod
+    def _pair(*, pA: float, pB: float, nB: float, gap_days: int = 10):
+        """A real CandidatePair (a dataclass, as dc_replace in enrichment needs)."""
+        early_close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = SimpleNamespace(ticker="EARLY", close_time=early_close)
+        mB = SimpleNamespace(
+            ticker="LATE", close_time=early_close + timedelta(days=gap_days),
+        )
+        return CandidatePair(
+            market_a=mA, market_b=mB,
+            pA=pA, pB=pB, nA=round(1.0 - pA, 4),
+            tradeable=True,
+            canonical_title="will btc exceed $80k",
+            pair_type="time_series",
+            nB=nB,
+        )
+
+    def test_kelly_p_operands_come_from_one_snapshot(self):
+        # LATE's book is CROSSED (YES bid 0.70 against a NO bid of 0.55), the
+        # only shape that can invert a pair once the reference is refreshed:
+        # the fills are pA 0.54 + nB 0.30 = 0.84, inside the 10-day ceiling of
+        # 0.85 and profitable after fees, while LATE's fresh YES ask is 0.45.
+        pair = self._pair(pA=0.30, pB=0.50, nB=0.30)
+        client = self._books(pA_fill=0.54, nB_fill=0.30, pB_ref=0.45)
+
+        # Enrichment is the producer of every pair _kelly_p ever prices
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+
+        # The invariant: a tradeable time-series pair still runs in the
+        # direction it qualified in, so the max(0, pB - pA) clamp is
+        # unreachable; an inverted one is dropped before compute_trade sizes it
+        if enriched.tradeable:
+            assert enriched.pB > enriched.pA
+            assert _kelly_p(enriched) < 1.0
+        else:
+            assert compute_trade(enriched, 100_000) is None
+
+        # This fixture is the inverted one, so it must take the dropped branch
+        assert enriched.tradeable is False
+
+    def test_uninverted_pair_keeps_a_real_loss_probability(self):
+        # The control: an UNCROSSED LATE book (YES bid 0.50, NO bid 0.35)
+        # leaves the refreshed reference 0.65 above the 0.30 fill, so the pair
+        # survives and is priced on a genuine, non-clamped gap
+        pair = self._pair(pA=0.30, pB=0.60, nB=0.50)
+        client = self._books(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
+        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        assert enriched.tradeable is True
+        assert enriched.pB > enriched.pA
+        assert _kelly_p(enriched) == pytest.approx(
+            time_series_profit_prob(enriched.pA, enriched.pB)
+        )
+        assert _kelly_p(enriched) < 1.0
