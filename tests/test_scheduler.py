@@ -25,12 +25,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import schedule
 
 from kalshi_betting import scheduler
 from kalshi_betting.config import (
+    EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
+    SCHEDULER_BLIND_MAX_RETRIES,
+    SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
 )
 
@@ -54,6 +58,23 @@ def _tmp_project_root(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(scheduler, "PROJECT_ROOT", tmp_path)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _clean_global_schedule():
+    """
+    Empty the `schedule` library's GLOBAL job registry around every test.
+
+    TS-01's blind-run retry calls schedule.every(...).do(...), which mutates
+    process-wide state that outlives the test that created it: without this,
+    a run_job() that exits 30 leaves a live job behind and the next test's
+    `schedule.jobs` assertion (or a stray run_pending) sees it. Cleared in
+    BOTH setup and teardown so the module is order-independent whether or not
+    some other module registered a job first.
+    """
+    schedule.clear()
+    yield
+    schedule.clear()
 
 
 class TestRunJobExitCodeMapping:
@@ -316,6 +337,216 @@ class TestCatchUp:
 
         mock_run_job.assert_called_once()
         assert any("missing expected fields" in r.getMessage() for r in caplog.records)
+
+    def test_blind_run_slot_is_retried_on_startup(self, tmp_path, caplog):
+        # TS-01: the old test was purely temporal (last_slot < slot) and never
+        # read the exit code, so a slot whose only attempt scanned NOTHING
+        # counted as satisfied and the bot waited a week.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=1,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job, \
+             caplog.at_level(logging.WARNING):
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_called_once_with(retries=2)
+        assert any("blind-run" in r.getMessage() for r in caplog.records)
+
+    def test_blind_run_at_the_cap_is_not_retried(self, tmp_path):
+        # The daemon-restart path shares run_job's cap, so a multi-day outage
+        # cannot make every restart re-run the same dead slot forever.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=SCHEDULER_BLIND_MAX_RETRIES,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_not_called()
+
+    def test_blind_run_state_without_retries_key_counts_as_zero(self, tmp_path):
+        # A state file written before TS-01 has no "retries" key; _load_state's
+        # validation is untouched, so it must still load and read as attempt 0.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_called_once_with(retries=1)
+
+    def test_stale_slot_catch_up_starts_at_zero_retries(self, tmp_path):
+        # A never-attempted slot is a fresh first run, not a retry — its count
+        # must not inherit anything from the previous slot's record.
+        now = datetime(2026, 9, 2, 10, 0)
+        stale_slot = scheduler._most_recent_slot(now) - timedelta(days=7)
+        _write_state(
+            tmp_path, last_slot=stale_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=3,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_called_once_with(retries=0)
+
+    def test_failed_but_scanning_run_is_still_not_retried(self, tmp_path):
+        # BS-17's deliberate behaviour, unchanged: only a BLIND run reopens a
+        # slot. A run that scanned and merely failed stays satisfied.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(tmp_path, last_slot=current_slot.isoformat(), exit_code=1)
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_not_called()
+
+
+class TestBlindRunRetry:
+    """TS-01/VI-02: EXIT_NO_TRADEABLE_SHARDS means the run scanned nothing —
+    either an exchange-wide halt dropped every market at ingest, or the ingest
+    came back empty for a cause /exchange/status could not name. The scheduler
+    sees only the exit code, so its messages name both possibilities and point
+    at kalshi_arb.log, where main._blind_run_reason logged which one fired. The
+    bot trades only on the weekly fire, so that slot must not count as
+    satisfied — it is retried hourly, a bounded number of times."""
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_blind_exit_warns_and_registers_one_retry(self, mock_run, tmp_path, caplog):
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job()
+
+        matches = [
+            r for r in caplog.records
+            if "Job scanned nothing (exit 30)" in r.getMessage()
+        ]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.WARNING
+        assert "NOT satisfied" in matches[0].getMessage()
+        # The daemon has only the exit code, which no longer identifies one
+        # cause: the message must offer both and point at the log that does.
+        assert "the market ingest came back empty" in matches[0].getMessage()
+        assert "kalshi_arb.log" in matches[0].getMessage()
+        assert f"attempt 1 of {SCHEDULER_BLIND_MAX_RETRIES}" in matches[0].getMessage()
+        # Never the generic "Job failed" branch, and never "successfully".
+        assert "Job failed" not in caplog.text
+        assert "Job completed successfully." not in caplog.text
+
+        assert len(schedule.jobs) == 1
+        assert schedule.jobs[0].interval == SCHEDULER_BLIND_RETRY_SECONDS
+
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["exit_code"] == EXIT_NO_TRADEABLE_SHARDS
+        assert state["retries"] == 0
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_firing_the_retry_reenters_run_job_and_cancels_itself(self, mock_run):
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+
+        scheduler.run_job()
+        job = schedule.jobs[0]
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            result = job.run()
+
+        # The retry carries the incremented count — the cap is enforced by the
+        # argument each attempt passes on, not by the caller.
+        mock_run_job.assert_called_once_with(retries=1)
+        assert result is schedule.CancelJob
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_retry_is_one_shot_not_recurring(self, mock_run):
+        # schedule removes a job whose function returns CancelJob, so a blind
+        # retry can never become a permanent hourly job.
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+
+        scheduler.run_job(retries=SCHEDULER_BLIND_MAX_RETRIES)  # registers nothing
+        assert schedule.jobs == []
+
+        scheduler.run_job()
+        assert len(schedule.jobs) == 1
+
+        # Dispatch through the library itself (run_pending is what honours
+        # CancelJob; Job.run() alone does not deregister), with the due time
+        # pulled into the past so the hourly job fires now.
+        schedule.jobs[0].next_run = datetime.now() - timedelta(seconds=1)
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            schedule.run_pending()
+
+        mock_run_job.assert_called_once_with(retries=1)
+        assert schedule.jobs == [], "a blind retry must never become a recurring job"
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_at_the_cap_logs_error_and_registers_nothing(
+        self, mock_run, tmp_path, caplog,
+    ):
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job(retries=SCHEDULER_BLIND_MAX_RETRIES)
+
+        matches = [
+            r for r in caplog.records
+            if "Job scanned nothing on" in r.getMessage()
+        ]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.ERROR
+        assert f"{SCHEDULER_BLIND_MAX_RETRIES + 1} attempts" in matches[0].getMessage()
+        # Terminal message for the week: it must not assert the halt as fact
+        # when an empty ingest is equally possible behind exit 30.
+        assert "kept coming back empty" in matches[0].getMessage()
+        assert "kalshi_arb.log" in matches[0].getMessage()
+        assert schedule.jobs == [], "the cap must stop the retry chain"
+
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["retries"] == SCHEDULER_BLIND_MAX_RETRIES
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_one_below_the_cap_still_retries(self, mock_run):
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+
+        scheduler.run_job(retries=SCHEDULER_BLIND_MAX_RETRIES - 1)
+
+        assert len(schedule.jobs) == 1
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_other_exit_codes_register_no_retry(self, mock_run):
+        # Only a BLIND run reopens the slot. A clean run, a low-balance skip,
+        # a manual-review run and a crash all leave the schedule empty.
+        for code in (EXIT_OK, EXIT_SKIPPED_LOW_BALANCE, EXIT_TRADES_NEED_ATTENTION, 1):
+            mock_run.return_value = _completed(code, stderr="x")
+            scheduler.run_job()
+            assert schedule.jobs == [], f"exit {code} must not schedule a retry"
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_retry_count_is_persisted_on_the_claim(self, mock_run, tmp_path):
+        # The claim happens BEFORE the subprocess runs, so a host reboot
+        # mid-retry leaves the attempt number on disk for the catch-up check.
+        claimed: list = []
+
+        def spy(*args, **kwargs):
+            claimed.append(json.loads((tmp_path / "scheduler_state.json").read_text()))
+            return _completed(EXIT_OK)
+
+        mock_run.side_effect = spy
+        scheduler.run_job(retries=2)
+
+        assert claimed[0]["retries"] == 2
+        assert claimed[0]["finished_at"] is None
 
 
 class TestSlotClaimAndFinalize:

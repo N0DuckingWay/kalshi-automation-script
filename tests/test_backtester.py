@@ -1,5 +1,8 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
+import gc
+import re
 import time
+import weakref
 from dataclasses import astuple
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -22,6 +25,7 @@ from kalshi_betting.backtester import (
     _group_by_normalized_title,
     _interval_calibration,
     _log_interval_calibration,
+    _log_rss,
     _pair_key,
     _parse_iso_date,
     _parse_iso_datetime,
@@ -41,6 +45,18 @@ from kalshi_betting.config import (
 )
 from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
+
+
+class _WeakrefDict(dict):
+    """A market dict a test can take a weak reference to.
+
+    Plain dicts do not support weak references, so a residency test has no way
+    to observe when the code under test has let go of one. This subclass adds
+    the slot and changes nothing else — the backtester only ever reads these
+    through .get()/[] like any other cached market record.
+    """
+
+    __slots__ = ("__weakref__",)
 
 
 def _md(ticker, event_ticker, title="", subtitle="", event_title=""):
@@ -314,6 +330,61 @@ class TestFindEntryDirection:
         assert entry["mA"]["ticker"] == "EARLY"
         assert entry["mB"]["ticker"] == "LATE"
         assert (entry["pA"], entry["nB"]) == pytest.approx((0.30, 0.40))
+
+    @staticmethod
+    def _same_date_markets():
+        # Both legs close on the SAME UTC date, twelve hours apart — a genuine
+        # zero-day-gap pair (short 15% tier), and the population TS-06
+        # mis-ordered: _parse_iso_date collapses both to 2026-02-09, so
+        # neither `close_b < close_a` nor its mirror is true and the swap
+        # never fired.
+        early = {"ticker": "EARLY", "event_ticker": "E1",
+                 "close_time": "2026-02-09T09:00:00+00:00"}
+        late  = {"ticker": "LATE", "event_ticker": "E2",
+                 "close_time": "2026-02-09T21:00:00+00:00"}
+        return early, late
+
+    def test_same_date_legs_are_ordered_by_close_time_not_close_date(self):
+        # Passed LATE-first (what the group list produces when it happens to
+        # hold the later contract first): A must still come back as the 09:00
+        # contract and the YES leg must be bought on it.
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        entry = _find_entry(candles_late, candles_early, late, early,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+        assert entry["mB"]["ticker"] == "LATE"
+        # The YES leg is bought on A at pA; the NO leg on B at nB
+        assert (entry["pA"], entry["nB"]) == pytest.approx((0.30, 0.40))
+        # Twelve hours apart floors to a zero-day deadline gap (short tier)
+        assert entry["gap_days"] == 0
+
+    def test_same_date_entry_is_independent_of_the_argument_order(self):
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        early_first = _find_entry(candles_early, candles_late, early, late,
+                                  "time_series", date(2026, 1, 1))
+        late_first  = _find_entry(candles_late, candles_early, late, early,
+                                  "time_series", date(2026, 1, 1))
+        assert early_first is not None
+        assert early_first == late_first
+
+    def test_same_date_pricier_earlier_contract_rejected_in_both_orders(self):
+        # The earlier contract is the dear one (0.60 vs 0.30) — never a
+        # candidate in either direction. Before TS-06 the LATE-first order
+        # skipped the swap, so pB − pA read as +0.30 and the pair ENTERED with
+        # its legs inverted; its genuine in-between settlement then booked as
+        # the impossible A=YES/B=NO premise violation.
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        assert _find_entry(candles_early, candles_late, early, late,
+                           "time_series", date(2026, 1, 1)) is None
+        assert _find_entry(candles_late, candles_early, late, early,
+                           "time_series", date(2026, 1, 1)) is None
 
     def test_time_series_wide_later_book_is_rejected_by_the_sum_ceiling(self):
         # Same YES asks (gap 0.30 clears the tier) but the later NO ask is
@@ -1307,6 +1378,62 @@ class TestFetchCandlesParallel:
         assert any(m.endswith("50 / 51") for m in messages)
         assert not any("50 / 56" in m for m in messages)
 
+    @staticmethod
+    def _empty_summaries(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "returned no candles" in r.getMessage()]
+
+    def test_empty_series_are_summarized_once(self, monkeypatch, caplog):
+        # TS-02: on a post-cutoff window every ticker 404s and each failure
+        # logged its own warning. The count is the useful signal, and it is
+        # taken off the RESULT dict — fetch_candlesticks fail-softs a failure
+        # to [] internally, so there is no exception here to count.
+        needed = self._needed(3)
+        empties = {"T00", "T01"}
+        monkeypatch.setattr(
+            backtester, "fetch_candlesticks",
+            lambda _c, ticker, *_a, **_k: (
+                [] if ticker in empties else [_candle(_MONDAY_TS, 0.70, 0.32)]),
+        )
+
+        with caplog.at_level("WARNING"):
+            result = _fetch_candles_parallel(MagicMock(), needed,
+                                             date(2026, 1, 1), False)
+
+        assert sum(1 for s in result.values() if not s) == 2
+        msgs = self._empty_summaries(caplog)
+        assert len(msgs) == 1
+        assert "2 of 3 tickers returned no candles" in msgs[0]
+
+    def test_no_empty_series_logs_nothing(self, monkeypatch, caplog):
+        # Summary-warning idiom: silent at zero.
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *_a, **_k: [_candle(_MONDAY_TS, 0.70, 0.32)])
+        with caplog.at_level("WARNING"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3),
+                                    date(2026, 1, 1), False)
+        assert self._empty_summaries(caplog) == []
+
+    def test_summary_counts_tickers_that_never_reached_a_worker(
+        self, monkeypatch, caplog,
+    ):
+        # The summary sits OUTSIDE the `if work:` block on purpose: a ticker
+        # resolved to [] for a missing or unparseable close_time never enters
+        # `work`, but it is every bit as much a ticker with no prices.
+        needed = {
+            "GOOD": {"ticker": "GOOD", "close_time": "2026-02-01T00:00:00+00:00"},
+            "NOCLOSE": {"ticker": "NOCLOSE", "close_time": None},
+        }
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *_a, **_k: [_candle(_MONDAY_TS, 0.70, 0.32)])
+
+        with caplog.at_level("WARNING"):
+            _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        msgs = self._empty_summaries(caplog)
+        assert len(msgs) == 1
+        assert "1 of 2 tickers returned no candles" in msgs[0]
+
     def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
         # Same guarantee end-to-end: the three existing run_backtest fixtures
         # rely on an unknown ticker raising KeyError out of the whole run as a
@@ -1329,6 +1456,214 @@ class TestFetchCandlesParallel:
         with pytest.raises(KeyError):
             run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
                          start_date=date(2026, 1, 1), initial_balance=1000.0)
+
+
+class TestLogRss:
+    """_log_rss: one INFO line, same meaning on macOS and Linux (TS-07)."""
+
+    @staticmethod
+    def _rss_records(caplog):
+        return [r for r in caplog.records if r.getMessage().startswith("Peak RSS")]
+
+    def test_reports_a_positive_mib_value(self, caplog):
+        with caplog.at_level("INFO"):
+            _log_rss("before grouping")
+        records = self._rss_records(caplog)
+        assert len(records) == 1
+        label, mib = records[0].args
+        assert label == "before grouping"
+        assert mib > 0
+
+    @pytest.mark.parametrize(
+        ("platform", "ru_maxrss", "expected_mib"),
+        [
+            # macOS reports ru_maxrss in BYTES ...
+            ("darwin", 6 * 1024 * 1024 * 1024, 6144.0),
+            # ... and Linux in KILOBYTES. Same peak, same line.
+            ("linux", 6 * 1024 * 1024, 6144.0),
+        ],
+    )
+    def test_units_are_normalized_per_platform(
+        self, monkeypatch, caplog, platform, ru_maxrss, expected_mib,
+    ):
+        monkeypatch.setattr(backtester, "sys", SimpleNamespace(platform=platform))
+        monkeypatch.setattr(backtester, "resource", SimpleNamespace(
+            RUSAGE_SELF=0,
+            getrusage=lambda _who: SimpleNamespace(ru_maxrss=ru_maxrss),
+        ))
+        with caplog.at_level("INFO"):
+            _log_rss("after pair extraction")
+        assert self._rss_records(caplog)[0].args[1] == pytest.approx(expected_mib)
+
+
+class TestPrepareEntriesMemoryInstrumentation:
+    """TS-07: the grouping/pairing step holds the whole record list, two group
+    maps and two pair lists live at once. It is bracketed by RSS lines, the
+    first of which precedes a RAM-budget warning carrying only this run's own
+    numbers, and the maps and the record list are released together before the
+    candlestick pool runs. The measured figures behind all of this live in
+    config.py beside BACKTEST_RECORD_BYTES_ESTIMATE, not here.
+    """
+
+    @staticmethod
+    def _markets() -> list[dict]:
+        return [
+            {"ticker": "EA", "event_ticker": "EVA", "event_title": "EV",
+             "title": "Team wins by February 1, 2026", "subtitle": "",
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "EB", "event_ticker": "EVB", "event_title": "EV",
+             "title": "Team wins by February 14, 2026", "subtitle": "",
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-14T00:00:00+00:00",
+             "settlement_ts": "2026-02-14T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch):
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    @staticmethod
+    def _ram_warnings(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "eligible markets: their records alone are" in r.getMessage()]
+
+    def test_rss_lines_bracket_the_grouping_step(self, monkeypatch, caplog):
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        labels = [r.args[0] for r in caplog.records
+                  if r.getMessage().startswith("Peak RSS")]
+        # In order, and exactly the two that bracket grouping/pairing — the
+        # window between the existing "Total settled markets" and "Potential
+        # pairs" lines, where the peak lives and is otherwise invisible.
+        assert labels == ["before grouping", "after pair extraction"]
+
+    def test_ram_warning_fires_above_the_threshold(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        warnings = self._ram_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].startswith("2 eligible markets")
+
+    def test_ram_warning_is_silent_at_the_threshold(self, monkeypatch, caplog):
+        # Strictly greater-than: a run exactly at the threshold is not warned.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 2)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        assert self._ram_warnings(caplog) == []
+
+    def test_ram_warning_is_silent_at_the_configured_threshold(
+        self, monkeypatch, caplog,
+    ):
+        # The real constant, unpatched: an ordinary small run says nothing.
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        assert self._ram_warnings(caplog) == []
+
+    def test_trades_are_unchanged_by_the_instrumentation(self, monkeypatch):
+        # The `del` of the group maps and the record list must not change what
+        # the run produces: nothing below pair extraction reads either.
+        trades, _ = self._run(monkeypatch)
+        assert len(trades) == 1
+        assert (trades[0].ticker_a, trades[0].ticker_b) == ("EA", "EB")
+
+    def test_peak_rss_is_logged_before_the_ram_warning(self, monkeypatch, caplog):
+        # Causal order: the RSS line reports what the fetch or cache load has
+        # already cost, and the warning budgets the records inside it. The
+        # warning's own text points at "the peak RSS line above", so the order
+        # is part of what it means.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records]
+        rss_at = next(i for i, m in enumerate(messages)
+                      if m.startswith("Peak RSS before grouping"))
+        warn_at = next(i for i, m in enumerate(messages)
+                       if "eligible markets: their records alone are" in m)
+        assert rss_at < warn_at
+
+    def test_ram_warning_quotes_only_this_runs_numbers(self, monkeypatch, caplog):
+        # A line emitted on every run must not carry another run's
+        # measurements: those live in config.py's comment, where a reader is
+        # prompted to keep them current. The only numbers here are this run's
+        # own market count and the footprint derived from it.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        message = self._ram_warnings(caplog)[0]
+        expected_gb = 2 * backtester.BACKTEST_RECORD_BYTES_ESTIMATE / 1e9
+        assert message.startswith("2 eligible markets")
+        assert f"{expected_gb:.1f} GB" in message
+        # Every numeric token in the line is derived from this run.
+        numbers = re.findall(r"\d+(?:\.\d+)?", message)
+        assert numbers == ["2", f"{expected_gb:.1f}"]
+
+    def test_unpaired_records_are_released_before_the_candlestick_fetch(
+        self, monkeypatch,
+    ):
+        """TS-07: deleting the group maps alone frees no record dicts, because
+        `markets` still references every one of them. Deleting the list too is
+        what lets a market that landed in no candidate pair be collected
+        before the candlestick pool and the _find_entry sweep run.
+
+        Residency, not peak: the process high-water mark is already set by
+        this point. The probe is a weakref taken inside the patched fetch, so
+        the test itself never holds the record alive.
+        """
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        # A third eligible market with a title that groups with nothing else,
+        # so it survives the prefilter but appears in no candidate pair.
+        lonely = {"ticker": "EC", "event_ticker": "EVC", "event_title": "EVC",
+                  "title": "Unrelated question by March 1, 2026", "subtitle": "",
+                  "result": "no",
+                  "open_time": "2026-01-01T00:00:00+00:00",
+                  "close_time": "2026-03-01T00:00:00+00:00",
+                  "settlement_ts": "2026-03-01T12:00:00+00:00"}
+        probes: dict[str, weakref.ref] = {}
+
+        def _fetch(*_a, **_k):
+            # Built and weak-referenced HERE so the only strong references are
+            # the ones the backtester itself keeps.
+            records = [_WeakrefDict(m) for m in self._markets() + [lonely]]
+            for rec in records:
+                probes[rec["ticker"]] = weakref.ref(rec)
+            return records
+
+        real_pool = backtester._fetch_candles_parallel
+        observed: dict[str, bool] = {}
+
+        def _spy(*a, **k):
+            gc.collect()
+            observed.update({t: probes[t]() is not None for t in probes})
+            return real_pool(*a, **k)
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", _fetch)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles.get(ticker, []))
+        monkeypatch.setattr(backtester, "_fetch_candles_parallel", _spy)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=10_000.0)
+
+        # The unpaired record is gone; the two that a candidate pair holds are
+        # still alive, because the pair lists legitimately reference them.
+        assert observed == {"EA": True, "EB": True, "EC": False}
 
 
 class TestRunBacktestFeasibilityPreCheck:
@@ -2000,6 +2335,95 @@ class TestRunBacktestTimeSeriesFlow:
         assert calib.pooled.n == 0
         assert calib.pooled.empirical_k is None
         assert calib.buckets == []
+
+
+class TestRunBacktestSameDateLegOrder:
+    """End-to-end proof of TS-06 through run_backtest.
+
+    Both legs close on 2026-02-09 — EARLY at 09:00Z, LATE at 21:00Z — and the
+    market list holds LATE first, which is the order _extract_pairs preserves
+    (its close-time sort is by DATE and stable, so an equal-date pair keeps
+    group order). Before TS-06 _find_entry decided its swap on those same
+    dates, so the pair was a tie and "market A" was simply LATE.
+    """
+
+    @staticmethod
+    def _markets(result_early: str, result_late: str) -> list[dict]:
+        # LATE first on purpose — this is the ordering the defect needed.
+        # Titles normalize to one key (the date text is stripped) but are not
+        # exact-title equal, so only the time-series grouping forms the pair
+        # and the cross-type dedup has nothing to drop.
+        return [
+            {"ticker": "LATE", "event_ticker": "EVL", "event_title": "EV",
+             "title": "Team wins by February 10, 2026", "subtitle": "",
+             "result": result_late,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-09T21:00:00+00:00",
+             "settlement_ts": "2026-02-09T23:00:00+00:00"},
+            {"ticker": "EARLY", "event_ticker": "EVE", "event_title": "EV",
+             "title": "Team wins by February 9, 2026", "subtitle": "",
+             "result": result_early,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-09T09:00:00+00:00",
+             "settlement_ts": "2026-02-09T23:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch, result_early, result_late,
+             early_quotes, late_quotes):
+        candles = {
+            "EARLY": [_candle(_MONDAY_TS, *early_quotes)],
+            "LATE":  [_candle(_MONDAY_TS, *late_quotes)],
+        }
+        markets = self._markets(result_early, result_late)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    def test_fixture_is_a_time_series_group_only(self):
+        markets = self._markets("yes", "yes")
+        assert len(_group_by_normalized_title(markets)) == 1
+        assert _group_by_exact_title(markets) == {}
+        # And the pair really does reach _find_entry LATE-first.
+        pairs = _extract_pairs(_group_by_normalized_title(markets))
+        assert len(pairs) == 1
+        assert pairs[0][0]["ticker"] == "LATE"
+
+    def test_same_date_pair_enters_with_the_earlier_leg_as_a(self, monkeypatch):
+        # EARLY cheap (0.30) / LATE dear (0.60): the anomaly the strategy
+        # disputes. Before TS-06 the untaken swap made pB − pA read as −0.30
+        # and the pair was silently dropped.
+        trades, _ = self._run(monkeypatch, "yes", "yes",
+                              early_quotes=(0.30, 0.70), late_quotes=(0.60, 0.40))
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.pair_type == "time_series"
+        assert (t.ticker_a, t.ticker_b) == ("EARLY", "LATE")
+        assert t.entry_pA == pytest.approx(0.30)
+        assert t.entry_nB == pytest.approx(0.40)
+        assert t.deadline_gap_days == 0
+
+    def test_same_date_inverted_pricing_is_not_a_premise_violation(
+        self, monkeypatch, caplog,
+    ):
+        # EARLY dear (0.60) / LATE cheap (0.30) is never a candidate, and the
+        # settlement is the genuine in-between (EARLY no, LATE yes). Before
+        # TS-06 the pair entered with its legs inverted, so that settlement
+        # read as the impossible A=YES/B=NO cell and was booked as a premise
+        # violation — excluded from P&L and dropped from the interval-discount
+        # calibration's denominator.
+        with caplog.at_level("WARNING"):
+            trades, equity = self._run(monkeypatch, "no", "yes",
+                                       early_quotes=(0.60, 0.40),
+                                       late_quotes=(0.30, 0.70))
+        assert trades == []
+        assert not any("cumulative-deadline premise" in r.getMessage()
+                       for r in caplog.records)
+        assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
 
 
 def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series"):

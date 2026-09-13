@@ -290,6 +290,29 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 #   3. the only shard the legacy order path may route to.
 DEFAULT_EXCHANGE_INDEX       = 0
 
+# The JSON re-typings of an /exchange/status boolean that scanner._status_flag()
+# is allowed to RECOGNISE, matched case-insensitively after .strip(). Kalshi has
+# already retyped or dropped required fields on markets, positions, orders,
+# events and balance; the retyping that silently INVERTS a halt flag is the
+# string "false", because Python's bool("false") is True — a halted shard would
+# read as open and keep being scanned and traded. The NULL tokens are the
+# stringified spellings of a JSON null, which are truthy strings for the same
+# reason and carry no more information than an absent key, so they resolve to
+# "unknown" exactly as an absent key does. The empty string is deliberately in
+# NONE of these sets: bool("") is already False, and re-reading it as unknown
+# would UN-DROP a halted shard.
+EXCHANGE_FLAG_FALSE_TOKENS   = frozenset({"false", "f", "no", "n", "off", "0"})
+EXCHANGE_FLAG_TRUE_TOKENS    = frozenset({"true", "t", "yes", "y", "on", "1"})
+EXCHANGE_FLAG_NULL_TOKENS    = frozenset({"null", "none", "nil", "undefined"})
+
+# Maximum characters of a drifted flag value's repr() in the drift WARNING
+# scanner.fetch_shard_statuses() emits. The raw value is whatever the API sent,
+# so an unbounded repr of (say) a 300-element array is a multi-KB log line
+# repeated every run — the same per-line bloat TS-02 removed from the candlestick
+# and event-title paths. 80 characters is enough to identify any plausible
+# re-typing of a boolean.
+EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS = 80
+
 # ── Cross-shard collateral transfers ──────────────────────────────────────────
 
 # Full API path of the intra-exchange (shard-to-shard) collateral transfer
@@ -327,13 +350,23 @@ TRANSFER_POLL_INTERVAL_SECONDS = 2
 # weekly scheduler daemon forever.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
+# A run that exits EXIT_NO_TRADEABLE_SHARDS (exchange-wide halt) is retried
+# after this many seconds, at most SCHEDULER_BLIND_MAX_RETRIES times per
+# Monday slot, so a maintenance window overlapping the 09:00 fire no longer
+# silently costs the week (TS-01). Hourly x4 covers a four-hour outage while
+# keeping the scan close to the intended slot; a longer interval would trade
+# on stale morning pricing. Bounded on purpose: a multi-day outage stops
+# retrying after the cap and scheduler_state.json records the attempts.
+SCHEDULER_BLIND_RETRY_SECONDS = 3600
+SCHEDULER_BLIND_MAX_RETRIES   = 4
+
 # ── Process exit-code contract ────────────────────────────────────────────────
 # main.py's process exit code is the only signal the scheduler (a separate
 # subprocess, per scheduler.run_job) has for what happened in a run beyond a
 # generic pass/fail — a prod run skipped for insufficient balance used to exit
 # 0 just like a clean run, so the scheduler logged "Job completed successfully."
 # and the WARNING explaining why nothing happened was buried in a log the
-# scheduler never reads (BS-14). These three codes are shared between main.py
+# scheduler never reads (BS-14). These codes are shared between main.py
 # (which returns/exits them) and scheduler.py (which maps them to distinct log
 # levels/messages) — they live in config.py so both modules import the same
 # values instead of duplicating magic numbers. An unhandled exception in
@@ -342,6 +375,17 @@ SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 EXIT_OK                       = 0
 EXIT_SKIPPED_LOW_BALANCE      = 10
 EXIT_TRADES_NEED_ATTENTION    = 20
+# NOTHING was scanned this run. Two causes, both reported with this code
+# because the scheduler's decision is the same for either: every advertised
+# shard reported trading_active=false (an exchange-wide halt or maintenance
+# window — observed live 2026-09-03 00:29 PDT), so ingest dropped every market
+# (TS-01); or ingest produced zero markets for a reason /exchange/status could
+# not name — scanner.fetch_shard_statuses is fail-soft and returns None on ANY
+# internal failure, which makes the all-halted test unevaluable exactly when
+# something has gone wrong (VI-02). Distinct from EXIT_OK's "scanned
+# everything, found no edge": scheduler.run_job maps this to a WARNING, never
+# counts the weekly slot as satisfied, and retries it.
+EXIT_NO_TRADEABLE_SHARDS      = 30
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
@@ -352,6 +396,16 @@ MARKET_PAGE_SIZE   = 200
 
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
+
+# Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
+# events, positions). The stuck-cursor guard catches a cursor that repeats
+# consecutively, but a keyset cycling with period > 1 (A, B, A, B, ...) never
+# does; the guard now remembers every cursor it has used, and this cap bounds
+# the walk regardless (TS-05). At MARKET_PAGE_SIZE (200) this is 1,000,000
+# markets; a 2026-09 prod ingest is ~135k markets (~700 pages). Same
+# bound-the-work-then-say-so idiom as ARCHIVE_TAIL_MAX_PAGES and
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+SCANNER_MAX_PAGES  = 5000
 
 # Cap on the number of multivariate-events pages the backtester's event-title
 # lookup will scan (historical._load_or_build_event_titles). The MVE listing is
@@ -401,6 +455,48 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # workers. Each worker keeps fetch_candlesticks' own rate_limit_sleep default
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
+
+# Eligible-market count above which backtester._prepare_entries warns the
+# operator about the RAM the grouping/pairing step is about to need, and the
+# per-record estimate the warning multiplies by.
+#
+# BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
+# phase right after it holds the whole window as one list and builds two group
+# maps and two candidate-pair lists over it. This comment is the ONLY place
+# (with the matching CLAUDE.md note) that records historical measurements: the
+# warning itself prints only the running process's own numbers, so it can never
+# quote a figure from some other run. Two runs on a 16 GB host, both over the
+# same 1,089,165-record FIVE-DAY window — the cheapest run the tool supports —
+# measured this phase from opposite sides, and neither figure explains the
+# other (TS-07):
+#   * 2026-09-12, cache MISS: fetch_all_settled_markets assembled the list from
+#     the streamed day slices, and the recorded peak for that run is 6.05 GiB.
+#     That run predates the _log_rss() lines, so its own log carries no RSS
+#     line to confirm it — the figure was observed outside the log.
+#   * 2026-09-13, cache HIT: fetch_all_settled_markets returned at its
+#     use_cache early return ("Loaded 1089165 settled markets from cache") and
+#     assembled nothing, yet the run logged "Peak RSS before grouping: 3816
+#     MiB" and "Peak RSS after pair extraction: 3977 MiB". Grouping and pair
+#     extraction added only 161 MiB to the high-water mark there; the rest was
+#     the cache read itself, since historical._load_json_cache does
+#     json.loads(path.read_text()) over a 1.43 GB assembled cache file.
+# The warning is the operator's budget line on a smaller host; it never caps or
+# drops anything.
+#
+# BACKTEST_RECORD_BYTES_ESTIMATE is the PARSED footprint of one cached market
+# record — what the list of dicts itself costs in memory. It is NOT the
+# record's size on disk, and it is NOT a peak-RSS predictor: peak additionally
+# covers whatever transients are live at the same instant (on the cache-hit
+# path, the whole decoded JSON string that json.loads is reading from; during
+# pairing, the group maps and the pair lists). Two measurements taken on the
+# real 2026-09-07 assembled cache bracket the value, which is why it stays a
+# round estimate: decoding 195,038 sampled records under tracemalloc allocates
+# ~3.0 KB per record (the sample averages 1,290 JSON bytes/record against the
+# file-wide 1,310, so it is representative), while subtracting that 1.43 GB
+# decoded string from the 3,816 MiB pre-grouping peak above leaves no more than
+# ~2.4 KB per record actually resident. 2,700 sits between the two.
+BACKTEST_MARKETS_RAM_WARN      = 500_000
+BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair

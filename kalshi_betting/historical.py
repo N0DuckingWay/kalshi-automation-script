@@ -214,6 +214,46 @@ def _historical_get(client: Any, path: str, **params) -> dict:
     return api_call_with_retry(fetch_json_page, partial(_signed_raw_get, client, path), **params)
 
 
+def _exception_summary(exc: BaseException, limit: int = 120) -> str:
+    """
+    One-line, header-free rendering of an API exception for log lines.
+
+    The SDK's ApiException.__str__ emits the status, the reason, the ENTIRE
+    HTTP header dict and the body across five lines (~900 bytes), and its own
+    first line is only "(404)" — the reason lives on line two. Logged once per
+    failed candlestick fetch on a post-cutoff window (where every ticker 404s
+    by design, and those failures are deliberately never cached so they are
+    re-paid every run), that alone rotated the run's own diagnostics out of
+    kalshi_backtest.log: 99.5% of the file was this one warning and ~419 MB of
+    older history was evicted (TS-02).
+
+    So the exception's own `reason` attribute is preferred when it carries
+    one — that is the useful half of an ApiException — and a plain exception
+    falls back to the first line of its message, then to its class name, so a
+    non-API failure (a parse error, a KeyError) is never reduced to nothing.
+
+    Args:
+        exc (BaseException): The exception to summarize.
+        limit (int): Maximum characters of the resulting text to keep.
+
+    Returns:
+        str: A single line, never longer than `limit` characters, and never
+            containing the header dump. Never raises.
+    """
+    try:
+        reason = getattr(exc, "reason", None)
+        # str() rather than assuming a string: `reason` is whatever the SDK set.
+        text = str(reason).strip() if reason else str(exc).strip()
+        first = text.splitlines()[0].strip() if text else ""
+        return (first or type(exc).__name__)[:limit]
+    except Exception:
+        # The docstring promises this never raises, and every caller invokes it
+        # from INSIDE an `except` block on a per-ticker path — a pathological
+        # __str__ or a raising `reason` property must degrade to the class name,
+        # not escape a worker and kill the run.
+        return type(exc).__name__[:limit]
+
+
 def build_historical_client():
     """
     Construct the client used for /historical endpoint requests.
@@ -601,7 +641,11 @@ def _load_or_build_event_titles(
                 data = _historical_get(live_client, f"{_API_PREFIX}/events/{tkr}")
                 return tkr, (data.get("event") or {}).get("title") or ""
             except Exception as e:
-                logging.warning("Could not resolve event title for %s: %s", tkr, e)
+                # Same one-line treatment as the candlestick failure (TS-02):
+                # this loop runs once per unresolved ticker, up to
+                # EVENT_TITLE_FALLBACK_MAX_LOOKUPS of them per run.
+                logging.warning("Could not resolve event title for %s: HTTP %s %s",
+                                tkr, getattr(e, "status", "?"), _exception_summary(e))
                 return tkr, ""
 
         done = 0
@@ -2604,7 +2648,14 @@ def fetch_candlesticks(
         })
         return candles
     except Exception as e:
-        logging.warning("Candlestick fetch failed for %s: %s", ticker, e)
+        # ONE line, no header dump (TS-02): post-cutoff tickers 404 by design
+        # and are deliberately never cached, so this warning is re-paid on
+        # every run for every such ticker. The per-run count is summarized
+        # once by backtester._fetch_candles_parallel, which sees every ticker.
+        logging.warning(
+            "Candlestick fetch failed for %s: HTTP %s %s",
+            ticker, getattr(e, "status", "?"), _exception_summary(e),
+        )
         time.sleep(rate_limit_sleep)
         # Deliberately DO NOT cache — a poisoned empty file would silence this
         # ticker on every subsequent run until manually deleted.

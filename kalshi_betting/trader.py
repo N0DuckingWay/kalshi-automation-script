@@ -294,6 +294,13 @@ _V2_MIN_PRICE = Decimal("0.0001")
 # so quantizing here can never move a price off-grid.
 _V2_PRICE_QUANTUM = Decimal("0.0001")
 
+# Quantum applied to the scanned price BEFORE it is ceiled onto the tick grid —
+# the same round-before-ceil guard as _buy_max_cost_cents and
+# config.fee_leg_exact. No Kalshi grid point has a 7th decimal (the finest is
+# $0.0001), so quantizing can only remove binary float noise: it tightens or
+# keeps the cap, never loosens it (TS-03).
+_SCANNED_PRICE_QUANTUM = Decimal("0.000001")
+
 # Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one().
 # False until a V2 NO buy has been observed to produce a NEGATIVE account
 # position (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
@@ -552,6 +559,15 @@ def _v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) ->
     BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
     pre-execution check.
 
+    The scanned price is quantized to 6 decimals before that ceiling, the same
+    round-before-ceil guard the legacy cap applies in _buy_max_cost_cents (and
+    config.fee_leg_exact before it). Every scanned ask level is the complement
+    of a resting bid (1.0 - float(bid)), and 20 of the 99 whole-cent
+    complements land one ULP ABOVE the exact cent, which would otherwise ceil a
+    whole extra tick and hand the order 2 x BUY_SLIPPAGE_TICKS of tolerance.
+    No Kalshi grid point has a 7th decimal, so the quantize can only remove
+    float noise: it tightens or keeps the cap, never loosens it (TS-03).
+
     Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
     DIFFERENT band of the market's grid than the scanned price — stepping up
     across a band edge, or being mirrored to the other end of the book — the
@@ -591,7 +607,12 @@ def _v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) ->
             containing it, clamped one tick inside the open unit interval on
             this market's grid.
     """
-    scanned = Decimal(str(scanned_price_dollars))
+    # Every scanned level is 1.0 - float(bid) (scanner._bids_to_ask_levels),
+    # and 20 of the 99 whole-cent complements land one ULP ABOVE the exact
+    # cent (0.43 -> 0.5700000000000001). Un-quantized, _ceil_to_tick steps a
+    # whole extra tick and the FoK limit carries 2 x BUY_SLIPPAGE_TICKS of
+    # tolerance instead of 1 (TS-03).
+    scanned = Decimal(str(scanned_price_dollars)).quantize(_SCANNED_PRICE_QUANTUM)
     # Cross-module: the market's own tick grid is the only authority on what
     # price levels the exchange will accept for this leg
     tick = tick_size_for_price(market, scanned_price_dollars)
