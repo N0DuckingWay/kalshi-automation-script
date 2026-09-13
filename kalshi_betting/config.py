@@ -26,6 +26,9 @@ Notes:
 """
 import math
 import pathlib
+from pathlib import Path
+from typing import BinaryIO
+from uuid import uuid4
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
 
@@ -41,6 +44,11 @@ SANDBOX_URL = "https://demo-api.kalshi.co/trade-api/v2"
 # Path to project root (where secrets.json and the PEM key live).
 # Derived from __file__ so the package works on any machine after cloning.
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
+
+# Collision-suffix cap for create_new_output(). Past this many outputs competing
+# for one name, the helper takes a uuid tail rather than looping further: the cap
+# bounds a pathological retry, not how many outputs an operator may keep.
+OUTPUT_NAME_MAX_ATTEMPTS = 100
 
 # JSON file with API key IDs. Expected keys: "Kalshi-api-key" (prod) and
 # optionally "dev_api_key" (sandbox). See README for the full format.
@@ -635,3 +643,48 @@ def fee_leg_exact(n: int, p: float) -> float:
     # (e.g. 0.07*100*0.25*100 = 175.00000000000003) cannot bump an exact
     # cent amount up an extra cent — Kalshi charges ceil of the TRUE value.
     return math.ceil(round(TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100
+
+
+def create_new_output(path: Path) -> tuple[Path, BinaryIO]:
+    """
+    Exclusively create `path`, suffixing "-1", "-2", … if that exact name exists.
+
+    Every generated output in this project is named from a local timestamp. Two
+    writers that render the same timestamp string resolve to one path, and the
+    second truncates the first — silently discarding a run's rows on the very
+    path that exists to guarantee they are never dropped (TS-18). Exclusive
+    creation (O_EXCL, via Path.open("xb")) makes that impossible rather than
+    merely improbable: two processes racing for one name cannot both win,
+    however fine the timestamp in it.
+
+    Only FileExistsError is retried. Any other OSError — a permission failure, a
+    full disk — propagates on the first attempt rather than being retried
+    OUTPUT_NAME_MAX_ATTEMPTS times against a cause that will not change.
+
+    Args:
+        path (Path): Desired path. Used verbatim when free; otherwise its stem
+            gains a "-N" suffix, so "trade_log_….xlsx" becomes
+            "trade_log_…-1.xlsx". The suffix is "-", never "_", so it can never
+            be misread as another timestamp component.
+
+    Returns:
+        tuple[Path, BinaryIO]: The path actually created and its open binary
+            handle, positioned at byte 0. The CALLER closes the handle.
+
+    Raises:
+        OSError: If creation fails for any reason other than a name collision,
+            or if the final uuid-suffixed attempt also fails.
+    """
+    for attempt in range(OUTPUT_NAME_MAX_ATTEMPTS):
+        candidate = (
+            path if attempt == 0
+            else path.with_name(f"{path.stem}-{attempt}{path.suffix}")
+        )
+        try:
+            return candidate, candidate.open("xb")
+        except FileExistsError:
+            continue
+    # Pathological. One unguarded attempt on a random name, so an operator gets a
+    # real OSError rather than a silent loop.
+    final = path.with_name(f"{path.stem}-{uuid4().hex[:8]}{path.suffix}")
+    return final, final.open("xb")

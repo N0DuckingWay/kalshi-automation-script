@@ -15,7 +15,7 @@ Purpose:
 Dependencies:
     Imports display_title and leg_sides (which side each leg buys, rendered
     into the Notes prefix) from scanner.py and TradeSpec from strategy.py.
-    Imports PROJECT_ROOT from config.py. Exports the TradeResult dataclass
+    Imports PROJECT_ROOT and create_new_output from config.py. Exports the TradeResult dataclass
     (consumed by trader.py) and the two public write functions (consumed by
     main.py).
 
@@ -57,7 +57,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, create_new_output
 from .scanner import display_title, leg_sides
 from .strategy import TradeSpec
 
@@ -451,11 +451,19 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
         balance_after (float): Account balance in dollars after this run's trades.
 
     Returns:
-        Path: Absolute path to the fallback file
-            (PROJECT_ROOT / "trade_log_<timestamp>.xlsx").
+        Path: Absolute path to the fallback file actually created
+            (PROJECT_ROOT / "trade_log_YYYY-MM-DD_HHMMSS_ffffff.xlsx", with a
+            "-1", "-2", … stem suffix in the vanishingly rare case that exact
+            name is already taken — see config.create_new_output).
     """
     run_ts = datetime.now(UTC).astimezone()
-    fallback_path = PROJECT_ROOT / f"trade_log_{run_ts.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
+    # Microseconds keep two near-simultaneous fallbacks off the collision path at
+    # all (preserving the existing sort order), and create_new_output guarantees
+    # they cannot overwrite each other even if they do collide (TS-18). The name
+    # is suffixed on collision, never the timestamp: one run_ts serves the
+    # filename AND every row below, so a fallback file's rows always match its
+    # own name.
+    fallback_path = PROJECT_ROOT / f"trade_log_{run_ts.strftime('%Y-%m-%d_%H%M%S_%f')}.xlsx"
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -464,7 +472,9 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
     _write_separator_row(ws, run_ts, balance_before, balance_after, len(results))
     _write_trade_rows(ws, results, run_ts)
 
-    wb.save(fallback_path)
+    fallback_path, fh = create_new_output(fallback_path)
+    with fh:
+        wb.save(fh)
     logging.info("Fallback trade log written: %s (%d row(s))", fallback_path, len(results))
     return fallback_path
 
@@ -541,11 +551,16 @@ def write_dev_simulation(
         balance_cents (int): Virtual account balance in cents used for trade sizing.
 
     Returns:
-        Path: Absolute path to the newly created simulation file
-            (PROJECT_ROOT / "dev_simulation_YYYY-MM-DD_HHMMSS.xlsx").
+        Path: Absolute path to the simulation file actually created
+            (PROJECT_ROOT / "dev_simulation_YYYY-MM-DD_HHMMSS_ffffff.xlsx", with
+            a "-1", "-2", … stem suffix on collision — see
+            config.create_new_output).
     """
     run_ts   = datetime.now(UTC).astimezone()
-    filename = f"dev_simulation_{run_ts.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
+    # Microseconds plus exclusive creation, same reasoning as
+    # _write_fallback_log: two dev runs finishing in one second must not
+    # overwrite each other's simulation (TS-18)
+    filename = f"dev_simulation_{run_ts.strftime('%Y-%m-%d_%H%M%S_%f')}.xlsx"
     out_path = PROJECT_ROOT / filename
 
     wb = openpyxl.Workbook()
@@ -634,6 +649,8 @@ def write_dev_simulation(
         for col in (8, 9, 10, 11, 12):
             ws_cands.cell(row=row_idx, column=col).number_format = "0.00%"
 
-    wb.save(out_path)
+    out_path, fh = create_new_output(out_path)
+    with fh:
+        wb.save(fh)
     logging.info("Dev simulation written: %s", out_path)
     return out_path
