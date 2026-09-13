@@ -1400,6 +1400,169 @@ class TestFetchOpenEventsMveStatusFilter:
         assert "MVE events fetch" in caplog.text
 
 
+def _positions_page(ticker: str, cursor: str | None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/positions page."""
+    return SimpleNamespace(
+        status=200,
+        data=json.dumps({
+            "market_positions": [{"ticker": ticker, "position_fp": "3"}],
+            "cursor": cursor,
+        }).encode(),
+    )
+
+
+class TestCursorLoopBounds:
+    """TS-05: scanner.py's three cursor loops were the only unbounded scans
+    left in the ingest path. The stuck-cursor guard proved only ONE failure
+    shape (a cursor repeating consecutively); a keyset cycling with period > 1
+    (A, B, A, B, ...) never repeats consecutively and paged forever. Each loop
+    now remembers every cursor it has requested AND stops at SCANNER_MAX_PAGES,
+    which bounds the walk against pathologies nobody enumerated."""
+
+    def test_standard_events_cycling_cursor_stops_pagination(self, caplog):
+        # A, B, A: the third page's cursor never equals the one just used, so
+        # only the seen-set catches it.
+        pages = [
+            _raw_page([{"title": "E1", "markets": [_raw_market("PAGE1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "E2", "markets": [_raw_market("PAGE2", "Q two")]}], cursor="B"),
+            _raw_page([{"title": "E3", "markets": [_raw_market("PAGE3", "Q three")]}], cursor="A"),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=pages)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # A fourth call would raise StopIteration against the side_effect list.
+        assert {m.ticker for m in markets} == {"PAGE1", "PAGE2", "PAGE3"}
+        assert client.get_events_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_cycling_cursor_stops_and_warns(self, caplog):
+        from kalshi_betting.scanner import get_held_tickers
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[
+            _positions_page("HELD-1", "A"),
+            _positions_page("HELD-2", "B"),
+            _positions_page("HELD-3", "A"),
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        assert held == {"HELD-1", "HELD-2", "HELD-3"}
+        assert client.get_positions_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_cycling_cursor_stops_pagination(self, caplog):
+        # Every page carries an ACTIVE nested market, so MVE_MAX_EMPTY_PAGES
+        # never fires — the seen-cursor set is the only thing that can stop it.
+        pages = [
+            _raw_page([{"title": "M1", "markets": [_raw_market("MVE-1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "M2", "markets": [_raw_market("MVE-2", "Q two")]}], cursor="B"),
+            _raw_page([{"title": "M3", "markets": [_raw_market("MVE-3", "Q three")]}], cursor="A"),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(side_effect=pages)
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert {m.ticker for m in markets} == {"MVE-1", "MVE-2", "MVE-3"}
+        assert client.get_multivariate_events_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "MVE events fetch" in caplog.text
+
+    def test_standard_events_page_cap_stops_pagination(self, caplog, monkeypatch):
+        # A server handing back a FRESH cursor forever defeats both the
+        # consecutive-repeat guard and the seen-set; only the page cap bounds
+        # it. Patched to 5 so the test is instant rather than 5000 pages.
+        from itertools import count
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"E{n}", "markets": [_raw_market(f"T{n}", f"Q {n}")]}],
+                cursor=f"CUR-{n}",
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=endless)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == 5
+        assert client.get_events_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_page_cap_stops_pagination(self, caplog, monkeypatch):
+        from itertools import count
+
+        from kalshi_betting.scanner import get_held_tickers
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _positions_page(f"HELD-{n}", f"CUR-{n}")
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=endless)
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        assert len(held) == 5
+        assert client.get_positions_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_page_cap_stops_pagination(self, caplog, monkeypatch):
+        # The cap is independent of MVE_MAX_EMPTY_PAGES (25): every page here
+        # is productive, so the productivity bail-out can never fire.
+        from itertools import count
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"M{n}", "markets": [_raw_market(f"MVE-{n}", f"Q {n}")]}],
+                cursor=f"CUR-{n}",
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(side_effect=endless)
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == 5
+        assert client.get_multivariate_events_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "MVE events fetch" in caplog.text
+
+
 class TestShardIndex:
     """Unit coverage for the fail-safe shard *label* read itself. This never
     decides whether a market is kept — market data is cross-shard — so every

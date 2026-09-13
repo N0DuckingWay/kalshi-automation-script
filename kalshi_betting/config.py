@@ -361,6 +361,16 @@ MARKET_PAGE_SIZE   = 200
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
 
+# Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
+# events, positions). The stuck-cursor guard catches a cursor that repeats
+# consecutively, but a keyset cycling with period > 1 (A, B, A, B, ...) never
+# does; the guard now remembers every cursor it has used, and this cap bounds
+# the walk regardless (TS-05). At MARKET_PAGE_SIZE (200) this is 1,000,000
+# markets; a 2026-09 prod ingest is ~135k markets (~700 pages). Same
+# bound-the-work-then-say-so idiom as ARCHIVE_TAIL_MAX_PAGES and
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+SCANNER_MAX_PAGES  = 5000
+
 # Cap on the number of multivariate-events pages the backtester's event-title
 # lookup will scan (historical._load_or_build_event_titles). The MVE listing is
 # effectively unbounded, so titles not found within this many pages fall back

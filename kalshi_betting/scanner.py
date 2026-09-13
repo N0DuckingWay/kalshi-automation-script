@@ -67,6 +67,7 @@ from .config import (
     POSITION_PAGE_SIZE,
     SAME_TITLE_LEG_SIDES,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
     TIME_SERIES_LEG_SIDES,
     fee_per_pair_approx,
@@ -572,6 +573,12 @@ def get_held_tickers(client: Any) -> set:
     string) — the modeled get_positions call raises ValidationError on any
     non-empty positions page.
 
+    The cursor loop is BOUNDED twice over (TS-05): it remembers every cursor it
+    has requested, so a keyset that cycles (A, B, A, B, ...) rather than
+    repeating consecutively still stops with a warning, and it stops
+    unconditionally at SCANNER_MAX_PAGES. This runs before any pairing, so an
+    unbounded walk here means the run never scans at all.
+
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
 
@@ -581,6 +588,9 @@ def get_held_tickers(client: Any) -> set:
     """
     held: set = set()
     cursor: str | None = None
+    # Every cursor already requested, so a keyset that CYCLES (A, B, A, B, ...)
+    # rather than repeating consecutively is still caught — see the guard below.
+    seen_cursors: set[str] = set()
     pages = 0
     while True:
         kwargs: dict = {"limit": POSITION_PAGE_SIZE, "count_filter": "position"}
@@ -610,17 +620,30 @@ def get_held_tickers(client: Any) -> set:
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Positions fetch: %d pages, %d held tickers so far", pages, len(held))
         new_cursor = data.get("cursor")
-        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
-        # the exact cursor we just used is already proof the server isn't
-        # advancing — one more page would come back identical forever, same
-        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
-        if new_cursor and new_cursor == cursor:
+        # Stuck-cursor guard, widened from "same as the last cursor" to "any
+        # cursor already used": the cursor is a keyset position, so a repeat of
+        # one we already requested is proof the server isn't advancing — but a
+        # keyset that CYCLES with period > 1 never repeats consecutively and
+        # used to page forever (TS-05). Same bounded-scan idiom as the
+        # MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and (new_cursor == cursor or new_cursor in seen_cursors):
             logging.warning(
-                "Positions fetch: cursor did not advance on page %d — "
+                "Positions fetch: cursor did not advance (repeated) on page %d — "
                 "stopping pagination to avoid an infinite loop",
                 pages,
             )
             break
+        # Hard page cap: bounds the walk against any cursor pathology, named or
+        # not — the only unbounded scans left in the ingest path were here.
+        if pages >= SCANNER_MAX_PAGES:
+            logging.warning(
+                "Positions fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
+                "pagination; raise the constant if the account genuinely holds more",
+                SCANNER_MAX_PAGES,
+            )
+            break
+        if new_cursor:
+            seen_cursors.add(new_cursor)
         cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
@@ -1018,6 +1041,13 @@ def fetch_open_events_with_markets(
     When False, only the standard endpoint is hit and the previous binary-only
     behaviour is preserved.
 
+    Both cursor loops are BOUNDED twice over (TS-05): each remembers every
+    cursor it has requested, so a keyset that cycles (A, B, A, B, ...) rather
+    than repeating consecutively still stops with a warning; and each stops
+    unconditionally at SCANNER_MAX_PAGES, which bounds the walk against any
+    cursor pathology whether or not it was anticipated. The MVE loop keeps its
+    independent MVE_MAX_EMPTY_PAGES productivity bail-out unchanged.
+
     Markets are TAGGED with their exchange shard, not filtered by it. The
     market-data endpoints are cross-shard, so every shard's bids and asks
     reach the pair pipeline and each ApiMarket carries its own
@@ -1051,6 +1081,9 @@ def fetch_open_events_with_markets(
     skipped_shard = 0
     # Standard (non-MVE) events with nested markets
     cursor: str | None = None
+    # Every cursor already requested, so a keyset that CYCLES (A, B, A, B, ...)
+    # rather than repeating consecutively is still caught — see the guard below.
+    seen_cursors: set[str] = set()
     pages = 0
     while True:
         kwargs: dict = {
@@ -1089,17 +1122,30 @@ def fetch_open_events_with_markets(
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
         new_cursor = data.get("cursor")
-        # Stuck-cursor guard: the cursor is a keyset position, so a repeat of
-        # the exact cursor we just used already proves the server isn't
-        # advancing — one more page would come back identical forever. Same
-        # bounded-scan idiom as the MVE_MAX_EMPTY_PAGES bail-out below.
-        if new_cursor and new_cursor == cursor:
+        # Stuck-cursor guard, widened from "same as the last cursor" to "any
+        # cursor already used": the cursor is a keyset position, so a repeat of
+        # one we already requested already proves the server isn't advancing —
+        # but a keyset that CYCLES with period > 1 never repeats consecutively
+        # and used to page forever (TS-05). Same bounded-scan idiom as the
+        # MVE_MAX_EMPTY_PAGES bail-out below.
+        if new_cursor and (new_cursor == cursor or new_cursor in seen_cursors):
             logging.warning(
-                "Open-events fetch: cursor did not advance on page %d — "
+                "Open-events fetch: cursor did not advance (repeated) on page %d — "
                 "stopping pagination to avoid an infinite loop",
                 pages,
             )
             break
+        # Hard page cap: bounds the walk against any cursor pathology, named or
+        # not — the only unbounded scans left in the ingest path were here.
+        if pages >= SCANNER_MAX_PAGES:
+            logging.warning(
+                "Open-events fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
+                "pagination; raise the constant if the exchange genuinely lists more",
+                SCANNER_MAX_PAGES,
+            )
+            break
+        if new_cursor:
+            seen_cursors.add(new_cursor)
         cursor = new_cursor
         # A None or empty cursor signals the last page
         if not cursor:
@@ -1120,6 +1166,10 @@ def fetch_open_events_with_markets(
         empty_pages = 0
         mve_pages = 0
         mve_market_count = 0
+        # Independent of empty_pages above: that counter bails on unproductive
+        # pages, this set catches a keyset that CYCLES (A, B, A, B, ...) while
+        # every page stays productive — see the guard below.
+        seen_cursors = set()
         while True:
             kwargs = {"limit": MARKET_PAGE_SIZE, "with_nested_markets": True}
             if cursor:
@@ -1167,17 +1217,31 @@ def fetch_open_events_with_markets(
             else:
                 empty_pages = 0
             new_cursor = data.get("cursor")
-            # Stuck-cursor guard: the cursor is a keyset position, so a single
-            # repeat of the cursor we just used already proves the server
-            # isn't advancing — same bounded-scan idiom as the empty-pages
-            # bail-out just above.
-            if new_cursor and new_cursor == cursor:
+            # Stuck-cursor guard, widened from "same as the last cursor" to
+            # "any cursor already used": the cursor is a keyset position, so a
+            # repeat of one we already requested proves the server isn't
+            # advancing — but a keyset that CYCLES with period > 1 never
+            # repeats consecutively and used to page forever (TS-05). Same
+            # bounded-scan idiom as the empty-pages bail-out just above, which
+            # keeps its own independent counter and reset semantics.
+            if new_cursor and (new_cursor == cursor or new_cursor in seen_cursors):
                 logging.warning(
-                    "MVE events fetch: cursor did not advance on page %d — "
+                    "MVE events fetch: cursor did not advance (repeated) on page %d — "
                     "stopping pagination to avoid an infinite loop",
                     mve_pages,
                 )
                 break
+            # Hard page cap: bounds the walk against any cursor pathology,
+            # named or not, independently of the productivity bail-out above.
+            if mve_pages >= SCANNER_MAX_PAGES:
+                logging.warning(
+                    "MVE events fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
+                    "pagination; raise the constant if the exchange genuinely lists more",
+                    SCANNER_MAX_PAGES,
+                )
+                break
+            if new_cursor:
+                seen_cursors.add(new_cursor)
             cursor = new_cursor
             if not cursor:
                 break
