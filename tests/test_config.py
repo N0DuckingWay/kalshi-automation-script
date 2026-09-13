@@ -206,3 +206,42 @@ class TestMinPriceDiffForGap:
         # The tiers the strategy is specified against: 15% short, 30% long
         assert MIN_PRICE_DIFF_SHORT_GAP == 0.15
         assert MIN_PRICE_DIFF_LONG_GAP == 0.30
+
+
+class TestCreateNewOutput:
+    """TS-18: exclusive creation is what makes the callers' "never silently
+    dropped" promise a guarantee rather than a probability — two writers racing
+    for one name cannot both win, however fine the timestamp in it."""
+
+    def test_suffixes_on_collision(self, tmp_path):
+        made = []
+        for i in range(3):
+            path, fh = config.create_new_output(tmp_path / "trade_log_x.xlsx")
+            with fh:
+                fh.write(f"run{i}".encode())
+            made.append(path)
+
+        assert [p.name for p in made] == [
+            "trade_log_x.xlsx",
+            "trade_log_x-1.xlsx",
+            "trade_log_x-2.xlsx",
+        ]
+        # Each write survives with its own content — nothing was overwritten.
+        assert [p.read_bytes() for p in made] == [b"run0", b"run1", b"run2"]
+
+    def test_propagates_non_collision_errors(self, tmp_path, monkeypatch):
+        # Only FileExistsError is retried. A permission failure must surface on
+        # the first attempt rather than looping OUTPUT_NAME_MAX_ATTEMPTS times
+        # against a cause that will not change. Monkeypatch rather than chmod:
+        # a directory-mode test silently passes when run as root.
+        calls = []
+
+        def boom(self, *args, **kwargs):
+            calls.append(self)
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(pathlib.Path, "open", boom)
+
+        with pytest.raises(PermissionError):
+            config.create_new_output(tmp_path / "trade_log_x.xlsx")
+        assert len(calls) == 1
