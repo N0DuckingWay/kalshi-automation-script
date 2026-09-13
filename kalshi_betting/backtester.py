@@ -1328,11 +1328,14 @@ def _log_rss(label: str) -> None:
     Log this process's peak resident set size so far, in MiB.
 
     Diagnostics only — nothing branches on the value. Two calls bracket the
-    grouping/pairing step of _prepare_entries, which is where a five-day
-    window peaked at 6.05 GiB on a 16 GB host while the fetch phase it follows
-    had already been hardened to stream to disk (TS-07). Without these lines
-    the peak is invisible: it lives entirely between two existing INFO lines
-    and falls back to 100-300 MB immediately after.
+    grouping/pairing step of _prepare_entries, the phase that follows a fetch
+    already hardened to stream to disk and that was nonetheless the suspected
+    home of a multi-GiB peak (TS-07). Without these lines that peak is
+    invisible: it lives entirely between two existing INFO lines and falls
+    back to 100-300 MB immediately after. The two runs actually measured, and
+    which of them the cost belonged to, are recorded in config.py beside
+    BACKTEST_RECORD_BYTES_ESTIMATE — deliberately in one place, so no figure
+    from one run is ever restated somewhere it will go stale.
 
     getrusage reports ru_maxrss in BYTES on macOS and in KILOBYTES on Linux,
     so the two are normalized here — otherwise the same line means two things
@@ -1462,32 +1465,52 @@ def _prepare_entries(
     )
     markets = eligible_markets
 
-    # The fetch above streams to disk a day at a time, but everything from here
-    # to the end of pair extraction is held live at once: the assembled record
-    # list, two group maps over it, and two candidate-pair lists referencing
-    # those same dicts. Warn before entering that window rather than after
-    # being OOM-killed inside it — a five-day window (the cheapest run this
-    # tool supports) measured 1.09M eligible markets and 6.05 GiB peak RSS on a
-    # 16 GB host (TS-07). Advisory only: nothing is capped or dropped.
+    # Logged BEFORE the RAM-budget warning below so the two read in causal
+    # order: this line is what the fetch — or, on a cache hit, the cache load —
+    # has ALREADY cost, and the warning that follows names the record list's
+    # share of it and what grouping is about to add on top.
+    _log_rss("before grouping")
+
+    # Everything from here to the end of pair extraction is held live at once:
+    # the whole record list, two group maps over it, and two candidate-pair
+    # lists referencing those same dicts. The records are ALREADY resident when
+    # this fires — fetch_all_settled_markets either assembled them from the
+    # streamed day slices or, on a cache hit, rebuilt every one of them with
+    # json.loads() over the assembled file — so this is a budget line covering
+    # money already spent plus money about to be spent, not a forecast issued
+    # ahead of the whole cost. It deliberately carries only THIS run's numbers;
+    # the historical measurements live in config.py beside
+    # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them
+    # current, rather than in a string emitted on every run (TS-07). Advisory
+    # only: nothing is capped or dropped.
     if len(markets) > BACKTEST_MARKETS_RAM_WARN:
         logging.warning(
-            "%d eligible markets: expect roughly %.1f GB of records in memory "
-            "during grouping/pairing, plus the group maps and pair lists built "
-            "over them; a 16 GB host handled 1.09M",
+            "%d eligible markets: their records alone are roughly %.1f GB and "
+            "are already resident — the peak RSS line above covers them; "
+            "grouping and pair extraction add the group maps and the pair "
+            "lists on top of them",
             len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
         )
-    _log_rss("before grouping")
 
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
     ts_pairs     = _extract_pairs(ts_groups)
     same_pairs   = _extract_pairs(same_groups)
-    # The group maps are the transient half of the peak and nothing below reads
-    # them — the pair lists carry the market dicts they need. Release them
-    # before the candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads
-    # rather than at function exit, which is where they were freed before.
-    del ts_groups, same_groups
+    # Release the group maps AND the record list together, before the
+    # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
+    # at function exit, which is where they were all freed before. Nothing
+    # below reads any of them — the pair lists carry the market dicts they
+    # need. Dropping the group maps alone frees no record dicts at all:
+    # `markets` still references every one of them, and after the prefilter
+    # above `eligible_markets` is the SAME list object as `markets`, so all
+    # four names have to go for the records that landed in no candidate pair
+    # to become collectable.
+    #
+    # This lowers RESIDENCY across the candlestick fetch and the _find_entry
+    # sweep below. It does NOT lower the run's peak RSS, which is a high-water
+    # mark already reached by the time this statement runs.
+    del ts_groups, same_groups, markets, eligible_markets
     _log_rss("after pair extraction")
 
     logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))

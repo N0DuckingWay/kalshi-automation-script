@@ -1,5 +1,8 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
+import gc
+import re
 import time
+import weakref
 from dataclasses import astuple
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -42,6 +45,18 @@ from kalshi_betting.config import (
 )
 from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
+
+
+class _WeakrefDict(dict):
+    """A market dict a test can take a weak reference to.
+
+    Plain dicts do not support weak references, so a residency test has no way
+    to observe when the code under test has let go of one. This subclass adds
+    the slot and changes nothing else — the backtester only ever reads these
+    through .get()/[] like any other cached market record.
+    """
+
+    __slots__ = ("__weakref__",)
 
 
 def _md(ticker, event_ticker, title="", subtitle="", event_title=""):
@@ -1482,10 +1497,12 @@ class TestLogRss:
 
 
 class TestPrepareEntriesMemoryInstrumentation:
-    """TS-07: the grouping/pairing step holds the assembled record list, two
-    group maps and two pair lists live at once — 6.05 GiB on a measured
-    five-day window. It is bracketed by RSS lines and preceded by a RAM-budget
-    warning, and the group maps are released before the candlestick pool runs.
+    """TS-07: the grouping/pairing step holds the whole record list, two group
+    maps and two pair lists live at once. It is bracketed by RSS lines, the
+    first of which precedes a RAM-budget warning carrying only this run's own
+    numbers, and the maps and the record list are released together before the
+    candlestick pool runs. The measured figures behind all of this live in
+    config.py beside BACKTEST_RECORD_BYTES_ESTIMATE, not here.
     """
 
     @staticmethod
@@ -1522,7 +1539,7 @@ class TestPrepareEntriesMemoryInstrumentation:
     @staticmethod
     def _ram_warnings(caplog):
         return [r.getMessage() for r in caplog.records
-                if "eligible markets: expect roughly" in r.getMessage()]
+                if "eligible markets: their records alone are" in r.getMessage()]
 
     def test_rss_lines_bracket_the_grouping_step(self, monkeypatch, caplog):
         with caplog.at_level("INFO"):
@@ -1558,11 +1575,95 @@ class TestPrepareEntriesMemoryInstrumentation:
         assert self._ram_warnings(caplog) == []
 
     def test_trades_are_unchanged_by_the_instrumentation(self, monkeypatch):
-        # The `del` of the group maps must not change what the run produces:
-        # nothing below pair extraction reads them.
+        # The `del` of the group maps and the record list must not change what
+        # the run produces: nothing below pair extraction reads either.
         trades, _ = self._run(monkeypatch)
         assert len(trades) == 1
         assert (trades[0].ticker_a, trades[0].ticker_b) == ("EA", "EB")
+
+    def test_peak_rss_is_logged_before_the_ram_warning(self, monkeypatch, caplog):
+        # Causal order: the RSS line reports what the fetch or cache load has
+        # already cost, and the warning budgets the records inside it. The
+        # warning's own text points at "the peak RSS line above", so the order
+        # is part of what it means.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records]
+        rss_at = next(i for i, m in enumerate(messages)
+                      if m.startswith("Peak RSS before grouping"))
+        warn_at = next(i for i, m in enumerate(messages)
+                       if "eligible markets: their records alone are" in m)
+        assert rss_at < warn_at
+
+    def test_ram_warning_quotes_only_this_runs_numbers(self, monkeypatch, caplog):
+        # A line emitted on every run must not carry another run's
+        # measurements: those live in config.py's comment, where a reader is
+        # prompted to keep them current. The only numbers here are this run's
+        # own market count and the footprint derived from it.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        message = self._ram_warnings(caplog)[0]
+        expected_gb = 2 * backtester.BACKTEST_RECORD_BYTES_ESTIMATE / 1e9
+        assert message.startswith("2 eligible markets")
+        assert f"{expected_gb:.1f} GB" in message
+        # Every numeric token in the line is derived from this run.
+        numbers = re.findall(r"\d+(?:\.\d+)?", message)
+        assert numbers == ["2", f"{expected_gb:.1f}"]
+
+    def test_unpaired_records_are_released_before_the_candlestick_fetch(
+        self, monkeypatch,
+    ):
+        """TS-07: deleting the group maps alone frees no record dicts, because
+        `markets` still references every one of them. Deleting the list too is
+        what lets a market that landed in no candidate pair be collected
+        before the candlestick pool and the _find_entry sweep run.
+
+        Residency, not peak: the process high-water mark is already set by
+        this point. The probe is a weakref taken inside the patched fetch, so
+        the test itself never holds the record alive.
+        """
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        # A third eligible market with a title that groups with nothing else,
+        # so it survives the prefilter but appears in no candidate pair.
+        lonely = {"ticker": "EC", "event_ticker": "EVC", "event_title": "EVC",
+                  "title": "Unrelated question by March 1, 2026", "subtitle": "",
+                  "result": "no",
+                  "open_time": "2026-01-01T00:00:00+00:00",
+                  "close_time": "2026-03-01T00:00:00+00:00",
+                  "settlement_ts": "2026-03-01T12:00:00+00:00"}
+        probes: dict[str, weakref.ref] = {}
+
+        def _fetch(*_a, **_k):
+            # Built and weak-referenced HERE so the only strong references are
+            # the ones the backtester itself keeps.
+            records = [_WeakrefDict(m) for m in self._markets() + [lonely]]
+            for rec in records:
+                probes[rec["ticker"]] = weakref.ref(rec)
+            return records
+
+        real_pool = backtester._fetch_candles_parallel
+        observed: dict[str, bool] = {}
+
+        def _spy(*a, **k):
+            gc.collect()
+            observed.update({t: probes[t]() is not None for t in probes})
+            return real_pool(*a, **k)
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", _fetch)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles.get(ticker, []))
+        monkeypatch.setattr(backtester, "_fetch_candles_parallel", _spy)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=10_000.0)
+
+        # The unpaired record is gone; the two that a candidate pair holds are
+        # still alive, because the pair lists legitimately reference them.
+        assert observed == {"EA": True, "EB": True, "EC": False}
 
 
 class TestRunBacktestFeasibilityPreCheck:

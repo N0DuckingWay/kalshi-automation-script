@@ -453,13 +453,40 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # per-record estimate the warning multiplies by.
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
-# phase right after it assembles the whole window back into one list and then
-# builds two group maps and two candidate-pair lists over it, releasing nothing
-# until the function returns. Measured 2026-09-12 on a FIVE-DAY window — the
-# cheapest run the tool supports — 1,089,165 compact market dicts at ~2.7 KB
-# each peaked at 6.05 GiB RSS between the "Total settled markets to analyze"
-# and "Potential pairs" log lines, on a 16 GB host (TS-07). The warning is the
-# operator's early signal on a smaller host; it never caps or drops anything.
+# phase right after it holds the whole window as one list and builds two group
+# maps and two candidate-pair lists over it. This comment is the ONLY place
+# (with the matching CLAUDE.md note) that records historical measurements: the
+# warning itself prints only the running process's own numbers, so it can never
+# quote a figure from some other run. Two runs on a 16 GB host, both over the
+# same 1,089,165-record FIVE-DAY window — the cheapest run the tool supports —
+# measured this phase from opposite sides, and neither figure explains the
+# other (TS-07):
+#   * 2026-09-12, cache MISS: fetch_all_settled_markets assembled the list from
+#     the streamed day slices, and the recorded peak for that run is 6.05 GiB.
+#     That run predates the _log_rss() lines, so its own log carries no RSS
+#     line to confirm it — the figure was observed outside the log.
+#   * 2026-09-13, cache HIT: fetch_all_settled_markets returned at its
+#     use_cache early return ("Loaded 1089165 settled markets from cache") and
+#     assembled nothing, yet the run logged "Peak RSS before grouping: 3816
+#     MiB" and "Peak RSS after pair extraction: 3977 MiB". Grouping and pair
+#     extraction added only 161 MiB to the high-water mark there; the rest was
+#     the cache read itself, since historical._load_json_cache does
+#     json.loads(path.read_text()) over a 1.43 GB assembled cache file.
+# The warning is the operator's budget line on a smaller host; it never caps or
+# drops anything.
+#
+# BACKTEST_RECORD_BYTES_ESTIMATE is the PARSED footprint of one cached market
+# record — what the list of dicts itself costs in memory. It is NOT the
+# record's size on disk, and it is NOT a peak-RSS predictor: peak additionally
+# covers whatever transients are live at the same instant (on the cache-hit
+# path, the whole decoded JSON string that json.loads is reading from; during
+# pairing, the group maps and the pair lists). Two measurements taken on the
+# real 2026-09-07 assembled cache bracket the value, which is why it stays a
+# round estimate: decoding 195,038 sampled records under tracemalloc allocates
+# ~3.0 KB per record (the sample averages 1,290 JSON bytes/record against the
+# file-wide 1,310, so it is representative), while subtracting that 1.43 GB
+# decoded string from the 3,816 MiB pre-grouping peak above leaves no more than
+# ~2.4 KB per record actually resident. 2,700 sits between the two.
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
