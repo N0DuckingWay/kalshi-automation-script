@@ -154,6 +154,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from json import JSONDecodeError
 from typing import Any
 
 from kalshi_python_sync.models import CreateOrderRequest
@@ -1629,7 +1630,10 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
     Returns:
         str | None: The accepted transfer's id, or None when the response
             carried none (the transfer may still have been accepted, so the
-            caller must treat this as "in flight", not "failed").
+            caller must treat this as "in flight", not "failed"). A 2xx whose
+            body cannot be parsed also returns None, for the same reason: the
+            status check ran first, so the exchange accepted the transfer and
+            the money has moved (TS-17).
 
     Raises:
         ApiException: On a non-2xx status from the transfer endpoint.
@@ -1638,7 +1642,24 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
     """
     # Retry-free by design (see docstring): signed_request_json signs the path
     # verbatim, raises ApiException on non-2xx, and never retries.
-    data = signed_request_json(client, "POST", TRANSFER_PATH, body=_transfer_body(source, dest, cents))
+    try:
+        data = signed_request_json(client, "POST", TRANSFER_PATH, body=_transfer_body(source, dest, cents))
+    except (JSONDecodeError, TypeError) as exc:
+        # _check_and_parse validates the status BEFORE parsing, so a parse
+        # failure proves the exchange returned 2xx: the transfer was ACCEPTED
+        # and the funds have moved. Letting this propagate would land in
+        # ensure_shard_collateral's generic handler, which logs a FAILED POST,
+        # skips the settlement poll entirely and suppresses the MONEY IN FLIGHT
+        # critical — the worst of both worlds. Returning None routes it into
+        # the existing id-less-acceptance path instead. Still single-shot: the
+        # request is NOT re-sent (TS-17).
+        logging.critical(
+            "Transfer POST of $%.2f shard %d→%d was ACCEPTED (2xx) but its response "
+            "could not be parsed — MONEY IS IN FLIGHT, CHECK THE ACCOUNT. Treating as "
+            "accepted with no transfer_id; NOT re-sent. Parse error: %s",
+            cents / 100, source, dest, exc,
+        )
+        return None
     return data.get("transfer_id")
 
 

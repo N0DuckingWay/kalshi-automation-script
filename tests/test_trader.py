@@ -35,6 +35,7 @@ import math
 import textwrap
 import uuid
 from decimal import Decimal
+from json import JSONDecodeError
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -2418,3 +2419,82 @@ class TestTimeSeriesLegOrder:
         assert line.index("NO on Market B") < line.index("YES on Market A")
         assert "Profit if won: $1.50" in line
         assert "Min profit" not in line
+
+
+class TestUnparseableTransferResponse:
+    """TS-17: a transfer the exchange ACCEPTED but answered unparseably.
+
+    _check_and_parse validates the status BEFORE parsing, so a parse error out
+    of signed_request_json proves a 2xx came back — the transfer was accepted
+    and the money has moved. Before the fix that exception propagated into
+    ensure_shard_collateral's generic handler, which logged a FAILED POST, left
+    the destination out of accepted_cents, SKIPPED the settlement poll entirely
+    and therefore never fired the MONEY IS IN FLIGHT critical. Money gone,
+    balance never re-read, nothing alerted.
+    """
+
+    @staticmethod
+    def _parse_error() -> JSONDecodeError:
+        return JSONDecodeError("Expecting value", "", 0)
+
+    def test_unparseable_2xx_returns_none_not_raise(self, monkeypatch):
+        post = MagicMock(side_effect=self._parse_error())
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        # None is the value that already means "accepted, in flight" — the
+        # contract ensure_shard_collateral implements by NOT branching on it.
+        assert _execute_transfer(MagicMock(), 1, 0, 1400) is None
+        # Still single-shot: a retried transfer moves the money twice.
+        assert post.call_count == 1
+
+    def test_unparseable_2xx_logs_money_in_flight_critical(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            trader, "signed_request_json", MagicMock(side_effect=self._parse_error())
+        )
+        with caplog.at_level(logging.CRITICAL):
+            _execute_transfer(MagicMock(), 1, 0, 1400)
+        criticals = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL
+        )
+        assert "MONEY IS IN FLIGHT" in criticals
+        assert "NOT re-sent" in criticals
+
+    def test_unparseable_2xx_is_awaited_and_specs_survive(self, monkeypatch):
+        # End to end: the destination must reach accepted_cents so the settle
+        # poll actually runs. Before the fix the poll was skipped and every
+        # spec needing that shard was dropped while the funds were in flight.
+        post = MagicMock(side_effect=self._parse_error())
+        va = MagicMock(return_value={0: 100_000, 1: 100_000})
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        monkeypatch.setattr(trader, "read_shard_balances", va)
+        monkeypatch.setattr(trader, "TRANSFER_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", 0.05)
+
+        spec = make_spec(shard_a=0, shard_b=0, cost_a=10.00, cost_b=5.00)
+        result = ensure_shard_collateral(
+            MagicMock(), [spec], {0: 100, 1: 100_000}, None
+        )
+        assert result == [spec]          # not dropped
+        va.assert_called()               # the settle poll DID run
+        assert post.call_count == 1      # and was never re-sent
+
+    def test_non_2xx_still_takes_the_failed_path(self, monkeypatch, caplog):
+        # ApiException is not a ValueError, so the new handler must not catch
+        # it: a genuine non-2xx is still a FAILED POST and still drops specs.
+        post = MagicMock(side_effect=ApiException(status=500, reason="boom"))
+        va = MagicMock(return_value={0: 100, 1: 100_000})
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        monkeypatch.setattr(trader, "read_shard_balances", va)
+        monkeypatch.setattr(trader, "TRANSFER_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", 0.05)
+
+        spec = make_spec(shard_a=0, shard_b=0, cost_a=10.00, cost_b=5.00)
+        with caplog.at_level(logging.INFO, logger="root"):
+            result = ensure_shard_collateral(
+                MagicMock(), [spec], {0: 100, 1: 100_000}, None
+            )
+        assert result == []
+        errors = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
+        )
+        assert "FAILED" in errors
+        assert post.call_count == 1

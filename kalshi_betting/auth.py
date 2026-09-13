@@ -219,8 +219,25 @@ def _balance_cents_by_shard(data: dict) -> dict[int, int]:
         # top-level "balance", which is integer cents) — hence the dollar
         # converter here. balance_dollars is accepted first in case the
         # field is ever added to the entries.
-        cents = _dollar_str_to_cents(entry.get("balance_dollars") or entry.get("balance"))
+        # PRESENCE, not truthiness: a numeric 0 or "" in balance_dollars is a
+        # real answer, and `or` would discard it and read the stale legacy
+        # field instead — reporting a genuinely-empty shard as funded. That is
+        # the one OVER-statement this function can produce, in a module whose
+        # flooring and drop-with-a-warning rules both exist to guarantee the
+        # opposite (TS-16). An unparseable "" now correctly reaches the WARNING
+        # branch below instead of silently reading another field.
+        raw = entry["balance_dollars"] if "balance_dollars" in entry else entry.get("balance")
+        cents = _dollar_str_to_cents(raw)
         if cents is not None:
+            if idx in by_shard:
+                # A repeated index means the payload shape changed (a
+                # per-subaccount split, say). Last-win matches the previous
+                # behaviour and is as defensible as first-win; being SILENT
+                # about it is not.
+                logging.warning(
+                    "balance_breakdown lists exchange_index %d more than once — "
+                    "keeping the last entry; earlier entry discarded", idx,
+                )
             by_shard[idx] = cents
         else:
             # A parseable shard index with an unparseable balance means that
