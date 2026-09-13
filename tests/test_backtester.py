@@ -315,6 +315,61 @@ class TestFindEntryDirection:
         assert entry["mB"]["ticker"] == "LATE"
         assert (entry["pA"], entry["nB"]) == pytest.approx((0.30, 0.40))
 
+    @staticmethod
+    def _same_date_markets():
+        # Both legs close on the SAME UTC date, twelve hours apart — a genuine
+        # zero-day-gap pair (short 15% tier), and the population TS-06
+        # mis-ordered: _parse_iso_date collapses both to 2026-02-09, so
+        # neither `close_b < close_a` nor its mirror is true and the swap
+        # never fired.
+        early = {"ticker": "EARLY", "event_ticker": "E1",
+                 "close_time": "2026-02-09T09:00:00+00:00"}
+        late  = {"ticker": "LATE", "event_ticker": "E2",
+                 "close_time": "2026-02-09T21:00:00+00:00"}
+        return early, late
+
+    def test_same_date_legs_are_ordered_by_close_time_not_close_date(self):
+        # Passed LATE-first (what the group list produces when it happens to
+        # hold the later contract first): A must still come back as the 09:00
+        # contract and the YES leg must be bought on it.
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        entry = _find_entry(candles_late, candles_early, late, early,
+                            "time_series", date(2026, 1, 1))
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "EARLY"
+        assert entry["mB"]["ticker"] == "LATE"
+        # The YES leg is bought on A at pA; the NO leg on B at nB
+        assert (entry["pA"], entry["nB"]) == pytest.approx((0.30, 0.40))
+        # Twelve hours apart floors to a zero-day deadline gap (short tier)
+        assert entry["gap_days"] == 0
+
+    def test_same_date_entry_is_independent_of_the_argument_order(self):
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        early_first = _find_entry(candles_early, candles_late, early, late,
+                                  "time_series", date(2026, 1, 1))
+        late_first  = _find_entry(candles_late, candles_early, late, early,
+                                  "time_series", date(2026, 1, 1))
+        assert early_first is not None
+        assert early_first == late_first
+
+    def test_same_date_pricier_earlier_contract_rejected_in_both_orders(self):
+        # The earlier contract is the dear one (0.60 vs 0.30) — never a
+        # candidate in either direction. Before TS-06 the LATE-first order
+        # skipped the swap, so pB − pA read as +0.30 and the pair ENTERED with
+        # its legs inverted; its genuine in-between settlement then booked as
+        # the impossible A=YES/B=NO premise violation.
+        early, late = self._same_date_markets()
+        candles_early = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        candles_late  = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        assert _find_entry(candles_early, candles_late, early, late,
+                           "time_series", date(2026, 1, 1)) is None
+        assert _find_entry(candles_late, candles_early, late, early,
+                           "time_series", date(2026, 1, 1)) is None
+
     def test_time_series_wide_later_book_is_rejected_by_the_sum_ceiling(self):
         # Same YES asks (gap 0.30 clears the tier) but the later NO ask is
         # 0.60: the traded legs pA+nB = 0.90 exceed the short-tier ceiling of
@@ -2000,6 +2055,95 @@ class TestRunBacktestTimeSeriesFlow:
         assert calib.pooled.n == 0
         assert calib.pooled.empirical_k is None
         assert calib.buckets == []
+
+
+class TestRunBacktestSameDateLegOrder:
+    """End-to-end proof of TS-06 through run_backtest.
+
+    Both legs close on 2026-02-09 — EARLY at 09:00Z, LATE at 21:00Z — and the
+    market list holds LATE first, which is the order _extract_pairs preserves
+    (its close-time sort is by DATE and stable, so an equal-date pair keeps
+    group order). Before TS-06 _find_entry decided its swap on those same
+    dates, so the pair was a tie and "market A" was simply LATE.
+    """
+
+    @staticmethod
+    def _markets(result_early: str, result_late: str) -> list[dict]:
+        # LATE first on purpose — this is the ordering the defect needed.
+        # Titles normalize to one key (the date text is stripped) but are not
+        # exact-title equal, so only the time-series grouping forms the pair
+        # and the cross-type dedup has nothing to drop.
+        return [
+            {"ticker": "LATE", "event_ticker": "EVL", "event_title": "EV",
+             "title": "Team wins by February 10, 2026", "subtitle": "",
+             "result": result_late,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-09T21:00:00+00:00",
+             "settlement_ts": "2026-02-09T23:00:00+00:00"},
+            {"ticker": "EARLY", "event_ticker": "EVE", "event_title": "EV",
+             "title": "Team wins by February 9, 2026", "subtitle": "",
+             "result": result_early,
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-09T09:00:00+00:00",
+             "settlement_ts": "2026-02-09T23:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch, result_early, result_late,
+             early_quotes, late_quotes):
+        candles = {
+            "EARLY": [_candle(_MONDAY_TS, *early_quotes)],
+            "LATE":  [_candle(_MONDAY_TS, *late_quotes)],
+        }
+        markets = self._markets(result_early, result_late)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    def test_fixture_is_a_time_series_group_only(self):
+        markets = self._markets("yes", "yes")
+        assert len(_group_by_normalized_title(markets)) == 1
+        assert _group_by_exact_title(markets) == {}
+        # And the pair really does reach _find_entry LATE-first.
+        pairs = _extract_pairs(_group_by_normalized_title(markets))
+        assert len(pairs) == 1
+        assert pairs[0][0]["ticker"] == "LATE"
+
+    def test_same_date_pair_enters_with_the_earlier_leg_as_a(self, monkeypatch):
+        # EARLY cheap (0.30) / LATE dear (0.60): the anomaly the strategy
+        # disputes. Before TS-06 the untaken swap made pB − pA read as −0.30
+        # and the pair was silently dropped.
+        trades, _ = self._run(monkeypatch, "yes", "yes",
+                              early_quotes=(0.30, 0.70), late_quotes=(0.60, 0.40))
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.pair_type == "time_series"
+        assert (t.ticker_a, t.ticker_b) == ("EARLY", "LATE")
+        assert t.entry_pA == pytest.approx(0.30)
+        assert t.entry_nB == pytest.approx(0.40)
+        assert t.deadline_gap_days == 0
+
+    def test_same_date_inverted_pricing_is_not_a_premise_violation(
+        self, monkeypatch, caplog,
+    ):
+        # EARLY dear (0.60) / LATE cheap (0.30) is never a candidate, and the
+        # settlement is the genuine in-between (EARLY no, LATE yes). Before
+        # TS-06 the pair entered with its legs inverted, so that settlement
+        # read as the impossible A=YES/B=NO cell and was booked as a premise
+        # violation — excluded from P&L and dropped from the interval-discount
+        # calibration's denominator.
+        with caplog.at_level("WARNING"):
+            trades, equity = self._run(monkeypatch, "no", "yes",
+                                       early_quotes=(0.60, 0.40),
+                                       late_quotes=(0.30, 0.70))
+        assert trades == []
+        assert not any("cumulative-deadline premise" in r.getMessage()
+                       for r in caplog.records)
+        assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
 
 
 def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series"):

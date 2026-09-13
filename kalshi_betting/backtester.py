@@ -947,7 +947,10 @@ def _find_entry(
     trading logic, and returns the entry data for the first qualifying week.
 
     Direction rules mirror the live scanner exactly:
-      - time_series: market A is fixed as the EARLIER-closing contract, and an
+      - time_series: market A is fixed as the EARLIER-closing contract —
+        decided on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        sorts its group members, so two contracts closing on the same UTC date
+        at different times of day are ordered rather than tied — and an
         entry requires pB − pA >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the LATER contract priced higher by at least the tier is the anomaly
@@ -1024,22 +1027,44 @@ def _find_entry(
         # Live-scanner invariant: market A is the EARLIER-closing contract.
         # Never swap by price — the trade only exists when the LATER contract
         # is priced higher (checked per Monday below).
-        if close_b < close_a:
+        #
+        # Decide on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        # sorts on m.close_time. Two contracts closing on the same UTC date at
+        # different times are a valid zero-day-gap pair (live data shows 9
+        # distinct close dates across 43 distinct times of day), and deciding on
+        # the parsed DATES made that a tie — neither `close_b < close_a` nor its
+        # mirror was true — so "market A" was left as whichever the group list
+        # happened to hold first. The pair was then either dropped (the
+        # direction test goes negative) or replayed with the legs inverted,
+        # whose genuine in-between settlement reads as the impossible
+        # A=YES/B=NO cell: booked as a premise violation, excluded from P&L and
+        # dropped from the interval-discount calibration's denominator (TS-06).
+        # The date comparison survives only as the fallback for a naive/aware
+        # mix (reachable from a hand-edited cache, since every live timestamp is
+        # tz-aware), per this file's "can't parse it = unknown, not an error"
+        # convention.
+        dt_a = _parse_iso_datetime(mA.get("close_time"))
+        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        try:
+            b_before_a = dt_b < dt_a
+        except TypeError:
+            b_before_a = close_b < close_a
+        if b_before_a:
             mA, mB = mB, mA
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
+            dt_a, dt_b = dt_b, dt_a
         # Deadline gap is loop-invariant: a wider gap carries more genuine
         # in-between probability mass, so 16-30 day gaps demand the larger
         # tier and gaps beyond MAX_DEADLINE_GAP_DAYS are never disputed.
-        # Measure it on the close_time DATETIMES, not the dates parsed above:
+        # Measure it on the close_time DATETIMES parsed above, not on the dates:
         # timedelta.days floors, while calendar-date subtraction counts day
         # boundaries, so the two disagree by up to a day whenever the closes
         # straddle midnight (2026-02-01T23:00Z vs 2026-02-17T01:00Z is gap 15
         # live but 16 by date). That one day flips both the tier boundary and
         # the 30-day cutoff, so a backtest that is supposed to replay the live
-        # strategy must use the live arithmetic.
-        dt_a = _parse_iso_datetime(mA.get("close_time"))
-        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        # strategy must use the live arithmetic. The gap is order-independent
+        # (abs), so swapping dt_a/dt_b above cannot change it.
         try:
             # Identical arithmetic to scanner.deadline_gap_days (used by
             # find_time_series_pairs / _pair_max_sum): absolute timedelta.days
