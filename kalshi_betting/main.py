@@ -341,8 +341,10 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     an exchange-wide halt), check_shard_coverage's two loops are empty and it
     returns ([], []), which used to print the same "Full shard coverage" line
     a healthy run prints (TS-01); that case now warns instead. A shard whose
-    trading_active is None (flag absent, TS-04) counts as scannable, matching
-    scanner.inactive_shard_indexes.
+    trading_active is None (flag absent or unreadable, TS-04) counts as
+    scannable, matching scanner.inactive_shard_indexes; a re-typed "false"
+    does NOT, because scanner.fetch_shard_statuses normalises it to a real
+    False first (TS-04b).
 
     Args:
         shard_statuses (dict | None): Return value of scanner.fetch_shard_statuses().
@@ -361,8 +363,9 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     # Coverage may only be CLAIMED over shards that were scannable.
     # check_shard_coverage deliberately skips trading-inactive shards (their
     # ingest drop already warned), so an all-inactive exchange yields ([], [])
-    # — which read as success (TS-01). Only an explicit False is inactive;
-    # None (flag absent) is scannable, matching scanner.inactive_shard_indexes.
+    # — which read as success (TS-01). Only a False is inactive (a real bool
+    # by now: scanner.fetch_shard_statuses recovers a re-typed "false" into
+    # one); None (flag unknown) is scannable, matching inactive_shard_indexes.
     scannable = sorted(
         idx for idx, st in shard_statuses.items() if st.get("trading_active") is not False
     )

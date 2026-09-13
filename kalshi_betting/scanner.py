@@ -60,6 +60,10 @@ from ._http import api_call_with_retry, fetch_json_page
 from .config import (
     DEFAULT_EXCHANGE_INDEX,
     DEFAULT_TICK_SIZE_DOLLARS,
+    EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS,
+    EXCHANGE_FLAG_FALSE_TOKENS,
+    EXCHANGE_FLAG_NULL_TOKENS,
+    EXCHANGE_FLAG_TRUE_TOKENS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_DEADLINE_GAP_DAYS,
@@ -792,6 +796,97 @@ def _shard_index(m: dict) -> int:
         return DEFAULT_EXCHANGE_INDEX
 
 
+def _status_flag(raw: Any) -> bool | None:
+    """
+    Normalise one /exchange/status boolean flag, tolerating JSON re-typing.
+
+    fetch_shard_statuses() is the only producer of these status dicts, so this
+    is the single place where a re-typed flag can be given back its real
+    meaning: a bare bool() of the raw payload value reads the drifted string
+    "false" as True, which silently un-halts a shard the exchange has halted
+    and lets a collateral POST reach a shard whose transfers are disabled
+    (TS-04b).
+
+    The resolution order is: a real bool; the conventional numeric spellings
+    0 and 1; then, for strings, the closed token sets in config
+    (EXCHANGE_FLAG_NULL_TOKENS / _FALSE_TOKENS / _TRUE_TOKENS, stripped and
+    lower-cased). Anything left is UNRECOGNISED and resolves by its truthiness
+    in the one direction that cannot break a correct reading: a FALSY
+    unrecognised value (0.0, "", [], {}) keeps the False that bool() already
+    gave it, because turning that into "unknown" would un-drop a halted shard;
+    a TRUTHY unrecognised value (2, "maybe", [1]) becomes None, which every
+    trading_active consumer already treats exactly as it treated True (the
+    shard stays in the ingest) and which makes the ENABLING flags — stored as
+    `_status_flag(...) is True` — fail closed rather than move money on a
+    value nobody can read.
+
+    An absent, null or stringified-null flag returns None for the same reason:
+    it is unknown, never halted. The caller decides what unknown means for
+    each flag (keep the shard for trading_active per TS-04; refuse to move
+    money for intra_exchange_transfers_active).
+
+    Args:
+        raw (Any): The value as it arrived in the JSON payload, or None when
+            the key was absent.
+
+    Returns:
+        bool | None: The flag's boolean meaning, or None when it is unknown
+            (absent, null, a stringified null, or an unrecognised truthy
+            value).
+
+    Raises:
+        Nothing. Every input shape, including lists and dicts, resolves to a
+        bool or None.
+    """
+    if raw is None:
+        return None
+    # Real bools pass through untouched.
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        # 0/1 are the other conventional JSON spelling of a wire boolean, and
+        # this branch gives them exactly the reading bool() already gave them.
+        # Without it, 1 would fall through to the unrecognised-truthy rule
+        # below and read as unknown, which would make the enabling flags
+        # (which demand `is True`) refuse every transfer under an int retyping.
+        return bool(raw)
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token in EXCHANGE_FLAG_NULL_TOKENS:
+            # A stringified null carries no more information than an absent
+            # key, so it resolves the same way: unknown, never halted.
+            return None
+        if token in EXCHANGE_FLAG_FALSE_TOKENS:
+            return False
+        if token in EXCHANGE_FLAG_TRUE_TOKENS:
+            return True
+    # Unrecognised. Falsy keeps the pre-existing bool() reading (un-dropping a
+    # halted shard is the one change this must never make); truthy is unknown.
+    return False if not raw else None
+
+
+def _drift_repr(value: Any) -> str:
+    """
+    Render a drifted flag value for a log line, with a bounded length.
+
+    The value is whatever the API sent, so an unbounded repr() of (for
+    instance) a large array would emit a multi-KB line on every run — the
+    per-line log bloat TS-02 removed from the candlestick and event-title
+    paths.
+
+    Args:
+        value (Any): The raw payload value to render.
+
+    Returns:
+        str: repr(value), truncated to config.EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS
+            characters with a "(truncated)" marker appended when it was longer.
+    """
+    text = repr(value)
+    if len(text) > EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS:
+        return text[:EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS] + "…(truncated)"
+    return text
+
+
 def fetch_shard_statuses(client: Any) -> dict | None:
     """
     Read the per-exchange-shard status breakdown from GET /exchange/status.
@@ -815,7 +910,19 @@ def fetch_shard_statuses(client: Any) -> dict | None:
     field is "unknown", never "halted" — normalising it to False would mark
     every shard inactive and empty the entire ingest while the exchange is
     open (TS-04), the same fail-safe policy _shard_index applies to a missing
-    exchange_index. Only an explicit False halts a shard.
+    exchange_index. Only a False halts a shard.
+
+    Every flag here is read through _status_flag(), not bool(): a wire boolean
+    that drifts into its string form ("false") is TRUTHY in Python, so the
+    bare coercion read a halted shard as open and an un-transferable shard as
+    movable (TS-04b). The three flags then differ in what UNKNOWN means, which
+    is why the last step is not uniform: `trading_active` stores the tri-state
+    verdict as-is, so unknown keeps the shard in the ingest (TS-04), while
+    `exchange_active` and `intra_exchange_transfers_active` store
+    `_status_flag(...) is True`, so anything but a recognised true — absent,
+    null, false, or unreadable — is stored as False. Not moving money is the
+    safe direction, and for an absent flag it is also exactly what the
+    previous bool() coercion did.
 
     Args:
         client (Any): An authenticated KalshiClient produced by
@@ -825,9 +932,10 @@ def fetch_shard_statuses(client: Any) -> dict | None:
         dict | None: Mapping of exchange_index (int) -> {"trading_active":
             bool | None, "exchange_active": bool,
             "intra_exchange_transfers_active": bool, "description": str}.
-            `trading_active` is None when the field was absent or null.
-            Malformed entries are skipped. None when the breakdown is
-            unavailable or anything at all went wrong.
+            `trading_active` is None when the field was absent, null or
+            unreadable; the other two flags are True only when the payload
+            affirmatively said so. Malformed entries are skipped. None when
+            the breakdown is unavailable or anything at all went wrong.
     """
     try:
         # Read-only GET, so api_call_with_retry's 429/5xx backoff is correct
@@ -843,6 +951,7 @@ def fetch_shard_statuses(client: Any) -> dict | None:
             return None
         statuses: dict = {}
         unknown_active = 0
+        drifted: list = []
         for entry in raw:
             try:
                 # A non-dict entry raises AttributeError on .get; a missing or
@@ -856,20 +965,53 @@ def fetch_shard_statuses(client: Any) -> dict | None:
             # events and balance) must read as "unknown" and KEEP the shard —
             # normalising it to False empties the entire ingest at exit 0
             # (TS-04). Same fail-safe policy as _shard_index for a missing
-            # exchange_index. Only an explicit False halts a shard.
-            ta = entry.get("trading_active")
-            if ta is None:
+            # exchange_index. Only a False halts a shard. A RE-TYPED field is
+            # a different case: it still carries a meaning, and _status_flag
+            # recovers it rather than bool()-coercing a drifted "false" (which
+            # is truthy in Python) into an open shard (TS-04b).
+            raw_ta = entry.get("trading_active")
+            raw_ea = entry.get("exchange_active")
+            raw_tx = entry.get("intra_exchange_transfers_active")
+            ta = _status_flag(raw_ta)
+            # Counted on the RAW value, not on `ta`: this warning says the key
+            # was absent, and a key that is present but unreadable is named
+            # individually by the drift warning below instead.
+            if raw_ta is None:
                 unknown_active += 1
+            # `is True` makes unknown fail CLOSED on these two: only a
+            # recognised true enables them. For an absent flag that matches
+            # the previous bool() reading exactly; for an unreadable one it
+            # refuses to move money on a value nobody can interpret.
+            ea = _status_flag(raw_ea) is True
+            # Read by trader.ensure_shard_collateral() to refuse moving funds
+            # to or from a shard where transfers are disabled.
+            tx = _status_flag(raw_tx) is True
+            for name, raw_value, resolved in (
+                ("trading_active", raw_ta, ta),
+                ("intra_exchange_transfers_active", raw_tx, tx),
+                ("exchange_active", raw_ea, ea),
+            ):
+                if raw_value is not None and not isinstance(raw_value, bool):
+                    # Name the shard, the flag and the (length-bounded) raw
+                    # value: a merged count says drift happened but not where,
+                    # which is not actionable.
+                    drifted.append(
+                        f"shard {idx} {name}={_drift_repr(raw_value)} -> {resolved}"
+                    )
             statuses[idx] = {
-                "trading_active": None if ta is None else bool(ta),
-                "exchange_active": bool(entry.get("exchange_active")),
-                # Read by trader.ensure_shard_collateral() to refuse moving
-                # funds to or from a shard where transfers are disabled.
-                "intra_exchange_transfers_active": bool(
-                    entry.get("intra_exchange_transfers_active")
-                ),
+                "trading_active": ta,
+                "exchange_active": ea,
+                "intra_exchange_transfers_active": tx,
                 "description": entry.get("description") or "",
             }
+        if drifted:
+            # Separate from the unknown-flag counter below: a re-typed flag
+            # was READ (and may have just halted a shard), where an absent one
+            # was not. Summary line, silent when nothing drifted.
+            logging.warning(
+                "Exchange status: non-boolean flag value(s) — API drift, read as: %s",
+                "; ".join(drifted),
+            )
         if unknown_active:
             # Summary WARNING, silent at zero — the drift signal an operator
             # needs, without one line per shard per run.
@@ -909,10 +1051,11 @@ def inactive_shard_indexes(shard_statuses: dict | None) -> set:
             None (breakdown unavailable) means no shard is known inactive.
 
     Returns:
-        set: exchange_index values whose trading_active flag is EXPLICITLY
-            False. None (flag absent, TS-04) and True both keep the shard —
-            an absent flag is unknown, not halted, and must never empty the
-            ingest.
+        set: exchange_index values whose trading_active flag is False — a real
+            bool by this point, since fetch_shard_statuses normalises a
+            re-typed "false" into one (TS-04b). None (flag absent or
+            unreadable, TS-04) and True both keep the shard — unknown is not
+            halted, and must never empty the ingest.
     """
     return {
         idx for idx, st in (shard_statuses or {}).items()
@@ -951,9 +1094,11 @@ def check_shard_coverage(
         not a missed trading opportunity. A `trading_active=False` advertised
         shard is never flagged at all — fetch_open_events_with_markets() drops
         its markets deliberately, and that drop already logs its own warning.
-        The flag is tri-state (TS-04): only an EXPLICIT False is skipped here,
-        because a shard whose flag is absent (None) is still scanned at ingest
-        and must therefore still be audited for coverage.
+        The flag is tri-state (TS-04): only a False is skipped here (a real
+        bool by this point — fetch_shard_statuses normalises a re-typed
+        "false" into one), because a shard whose flag is unknown (None) is
+        still scanned at ingest and must therefore still be audited for
+        coverage.
 
     Args:
         advertised (dict | None): The per-shard status breakdown from
@@ -987,7 +1132,8 @@ def check_shard_coverage(
         if status.get("trading_active") is False:
             # Deliberately dropped at ingest; fetch_open_events_with_markets
             # already warns about this — not this function's job to repeat it.
-            # Explicit False only: an absent flag (None) leaves the shard in
+            # False only — including one fetch_shard_statuses recovered from
+            # a re-typed "false". An unknown flag (None) leaves the shard in
             # the ingest, so its coverage still has to be audited (TS-04).
             continue
         if idx in market_shards:

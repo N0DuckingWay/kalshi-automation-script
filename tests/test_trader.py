@@ -923,6 +923,14 @@ class TestUnfundedShardsAndPartitioning:
         assert _transfers_active(statuses, 0) is True
         assert _transfers_active(statuses, 1) is False
 
+    def test_drifted_false_transfers_flag_refuses_the_transfer(self):
+        # scanner.fetch_shard_statuses normalises a re-typed "false" (and any
+        # value it cannot read) to a real False before it ever reaches here;
+        # this pins that the money gate then refuses to move, where the old
+        # bool("false") would have returned True and POSTed the transfer.
+        statuses = {0: shard_status(False)}
+        assert _transfers_active(statuses, 0) is False
+
     def test_shard_absent_from_statuses_is_treated_as_inactive(self):
         # Refusing a shard the exchange never advertised costs at most a
         # dropped trade; attempting it moves money into an unmodelled state.

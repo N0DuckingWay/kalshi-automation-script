@@ -1725,8 +1725,8 @@ class TestFetchShardStatuses:
         # trading_active is deliberately TRI-STATE (TS-04): an absent flag is
         # "unknown", never "halted", because normalising it to False marks
         # every shard inactive and empties the whole ingest. The other two
-        # booleans keep their bool() coercion — a missing transfers flag
-        # correctly means "don't move money".
+        # booleans fail CLOSED on anything but a recognised true — a missing
+        # transfers flag correctly means "don't move money".
         client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
         statuses = fetch_shard_statuses(client)
         assert statuses[3] == {
@@ -1806,9 +1806,163 @@ class TestFetchShardStatusesUnknownFlag:
         assert fetch_shard_statuses(client)[0]["trading_active"] is True
 
     def test_truthy_non_bool_is_coerced_to_true(self):
-        # Only None means unknown; anything else keeps its bool() coercion.
+        # 1 is a recognised spelling of a wire boolean, exactly as bool(1) read
+        # it before; see TestExchangeFlagDrift for the values that do change.
         client = self._client([{"exchange_index": 0, "trading_active": 1}])
         assert fetch_shard_statuses(client)[0]["trading_active"] is True
+
+
+class TestExchangeFlagDrift:
+    """TS-04b: an /exchange/status boolean that arrives RE-TYPED must keep its
+    meaning. bool("false") is True, so the bare coercion read a HALTED shard as
+    open (scanned and traded) and an un-transferable shard as movable (a real,
+    non-idempotent collateral POST). Unrecognised values resolve in the one
+    direction that cannot break a correct reading: falsy keeps its False,
+    truthy becomes unknown."""
+
+    @staticmethod
+    def _client(entries):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": entries}).encode("utf-8"),
+            )
+        )
+        return client
+
+    @pytest.mark.parametrize("raw, expected", [
+        # Real booleans and the conventional numeric spellings.
+        (True, True), (False, False), (0, False), (1, True),
+        (0.0, False), (1.0, True),
+        # Recognised re-typings — the cases the bare bool() got WRONG.
+        ("false", False), ("FALSE", False), (" false ", False),
+        ("no", False), ("0", False), ("off", False), ("f", False), ("n", False),
+        ("true", True), ("True", True), ("yes", True), ("1", True), ("on", True),
+        # A stringified null is truthy in Python but carries no information:
+        # unknown, exactly like an absent key.
+        ("null", None), ("NULL", None), ("None", None), ("nil", None),
+        ("undefined", None),
+        # Unrecognised: falsy keeps its historical False, truthy is unknown.
+        ("", False), ([], False), ({}, False),
+        (2, None), ("maybe", None), ([1], None), (3.5, None),
+        # Absent / null.
+        (None, None),
+    ])
+    def test_flag_table(self, raw, expected):
+        assert scanner._status_flag(raw) is expected
+
+    def test_drifted_false_halts_the_shard_end_to_end(self, caplog):
+        client = self._client([
+            {"exchange_index": 0, "trading_active": "false", "description": "Main"},
+            {"exchange_index": 1, "trading_active": True, "description": "Combos"},
+        ])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        # Ingest must DROP it, exactly as an explicit JSON false would.
+        assert inactive_shard_indexes(statuses) == {0}
+        # And the coverage audit must not then CRITICAL about the shard whose
+        # markets it deliberately dropped.
+        critical, warnings = check_shard_coverage(statuses, {1}, {0, 1})
+        assert critical == [] and warnings == []
+        # Drift is reported, naming the shard, the flag and the raw value.
+        assert "shard 0 trading_active='false' -> False" in caplog.text
+
+    def test_drifted_false_transfers_flag_blocks_money_movement(self):
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "intra_exchange_transfers_active": "false",
+        }])
+        statuses = fetch_shard_statuses(client)
+        # The money consequence: trader._transfers_active reads this key.
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+
+    def test_unreadable_transfers_flag_fails_closed(self):
+        # The enabling flags are stored as `_status_flag(...) is True`, so an
+        # UNREADABLE value refuses the transfer instead of coercing truthy and
+        # firing a real, non-idempotent, never-retried collateral POST.
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "intra_exchange_transfers_active": "maybe", "exchange_active": 2,
+        }])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+        assert statuses[0]["exchange_active"] is False
+
+    def test_stringified_null_is_unknown_not_open(self, caplog):
+        # "null" is a truthy STRING, so bool() read it as an open shard. It is
+        # unknown: the shard stays in the ingest (TS-04) but the money flag
+        # still refuses.
+        client = self._client([{
+            "exchange_index": 0, "trading_active": "null",
+            "intra_exchange_transfers_active": "null",
+        }])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert inactive_shard_indexes(statuses) == set(), "unknown is not halted"
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+        assert "shard 0 trading_active='null' -> None" in caplog.text
+        # The absent-flag counter counts ABSENT keys; a present-but-unreadable
+        # one is named individually above instead.
+        assert "no trading_active flag" not in caplog.text
+
+    def test_real_booleans_log_no_drift_warning(self, caplog):
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "exchange_active": True, "intra_exchange_transfers_active": False,
+        }])
+        with caplog.at_level(logging.WARNING):
+            fetch_shard_statuses(client)
+        assert "non-boolean flag value" not in caplog.text, "silent at zero drift"
+
+    def test_absent_flags_are_not_drift_and_keep_their_defaults(self, caplog):
+        # Regression pin: absence is unknown (None) for trading_active and
+        # fail-CLOSED (False) for the two enabling flags — unchanged.
+        client = self._client([{"exchange_index": 3}])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[3] == {
+            "trading_active": None, "exchange_active": False,
+            "intra_exchange_transfers_active": False, "description": "",
+        }
+        assert "non-boolean flag value" not in caplog.text
+
+    @pytest.mark.parametrize("raw", [0, 0.0, "", [], {}])
+    def test_falsy_non_bools_still_halt_the_shard(self, raw):
+        # NO-REGRESSION pin against the rejected "non-bool means unknown"
+        # design, which turned every one of these from DROP into SCAN+TRADE.
+        client = self._client([{"exchange_index": 0, "trading_active": raw}])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        assert inactive_shard_indexes(statuses) == {0}
+
+    @pytest.mark.parametrize("raw", [2, "maybe"])
+    def test_unrecognised_truthy_values_still_keep_the_shard_scanned(self, raw):
+        # These read True before and read None (unknown) now; every
+        # trading_active consumer treats the two identically, so the shard is
+        # still ingested, still audited and still scannable.
+        client = self._client([{"exchange_index": 0, "trading_active": raw}])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert inactive_shard_indexes(statuses) == set()
+        assert check_shard_coverage(statuses, set(), {0}) == (
+            ["advertised active shard 0 () produced zero ingested markets but "
+             "holds account funds"], [],
+        )
+
+    def test_drift_warning_bounds_a_huge_raw_value(self, caplog):
+        # TS-02 class: the raw value is whatever the API sent, so an unbounded
+        # repr would put a multi-KB line in the log on every single run.
+        client = self._client([{"exchange_index": 0, "trading_active": list(range(300))}])
+        with caplog.at_level(logging.WARNING):
+            fetch_shard_statuses(client)
+        line = next(
+            r.getMessage() for r in caplog.records if "non-boolean flag value" in r.getMessage()
+        )
+        assert "(truncated)" in line
+        assert len(line) < 300, "one drifted flag must not emit a multi-KB line"
 
 
 class TestInactiveShardIndexes:

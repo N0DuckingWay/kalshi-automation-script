@@ -282,6 +282,29 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 #   3. the only shard the legacy order path may route to.
 DEFAULT_EXCHANGE_INDEX       = 0
 
+# The JSON re-typings of an /exchange/status boolean that scanner._status_flag()
+# is allowed to RECOGNISE, matched case-insensitively after .strip(). Kalshi has
+# already retyped or dropped required fields on markets, positions, orders,
+# events and balance; the retyping that silently INVERTS a halt flag is the
+# string "false", because Python's bool("false") is True — a halted shard would
+# read as open and keep being scanned and traded. The NULL tokens are the
+# stringified spellings of a JSON null, which are truthy strings for the same
+# reason and carry no more information than an absent key, so they resolve to
+# "unknown" exactly as an absent key does. The empty string is deliberately in
+# NONE of these sets: bool("") is already False, and re-reading it as unknown
+# would UN-DROP a halted shard.
+EXCHANGE_FLAG_FALSE_TOKENS   = frozenset({"false", "f", "no", "n", "off", "0"})
+EXCHANGE_FLAG_TRUE_TOKENS    = frozenset({"true", "t", "yes", "y", "on", "1"})
+EXCHANGE_FLAG_NULL_TOKENS    = frozenset({"null", "none", "nil", "undefined"})
+
+# Maximum characters of a drifted flag value's repr() in the drift WARNING
+# scanner.fetch_shard_statuses() emits. The raw value is whatever the API sent,
+# so an unbounded repr of (say) a 300-element array is a multi-KB log line
+# repeated every run — the same per-line bloat TS-02 removed from the candlestick
+# and event-title paths. 80 characters is enough to identify any plausible
+# re-typing of a boolean.
+EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS = 80
+
 # ── Cross-shard collateral transfers ──────────────────────────────────────────
 
 # Full API path of the intra-exchange (shard-to-shard) collateral transfer
