@@ -924,6 +924,14 @@ class TestUnfundedShardsAndPartitioning:
         assert _transfers_active(statuses, 0) is True
         assert _transfers_active(statuses, 1) is False
 
+    def test_drifted_false_transfers_flag_refuses_the_transfer(self):
+        # scanner.fetch_shard_statuses normalises a re-typed "false" (and any
+        # value it cannot read) to a real False before it ever reaches here;
+        # this pins that the money gate then refuses to move, where the old
+        # bool("false") would have returned True and POSTed the transfer.
+        statuses = {0: shard_status(False)}
+        assert _transfers_active(statuses, 0) is False
+
     def test_shard_absent_from_statuses_is_treated_as_inactive(self):
         # Refusing a shard the exchange never advertised costs at most a
         # dropped trade; attempting it moves money into an unmodelled state.
@@ -1283,6 +1291,30 @@ class TestV2PriceMath:
         price = _v2_limit_price("buy_yes", 0.35, market)
         for count in (1, 5, 17):
             assert price * count * 100 == _buy_max_cost_cents(count, 0.35)
+
+    def test_v2_float_noise_does_not_loosen_the_cap(self):
+        # 1.0 - 0.43 == 0.5700000000000001: the cap must be 0.58 (one tick of
+        # slippage), not 0.59 — the V2 twin of the legacy round-before-ceil
+        # guard pinned by test_float_noise_does_not_loosen_the_cap (TS-03).
+        market = make_market("linear_cent")
+        assert _v2_limit_price("buy_yes", 1.0 - 0.43, market) == Decimal("0.58")
+        # buy_no: NO price 0.30000000000000004 -> cap 0.31 -> YES-book ask 0.69
+        assert _v2_limit_price("buy_no", 1.0 - 0.70, market) == Decimal("0.69")
+
+    def test_v2_cap_parity_with_legacy_over_every_whole_cent_bid(self):
+        # Every scanned ask is 1.0 - float(bid), so walk all 99 whole-cent bids
+        # in exactly the form scanner._bids_to_ask_levels produces and require
+        # the V2 cap to equal the legacy one-cent cap to the cent.
+        market = make_market("linear_cent")
+        for cents in range(2, 100):
+            p = 1.0 - cents / 100          # the exact form the scanner produces
+            cap = _v2_limit_price("buy_yes", p, market)
+            assert cap * 100 == _buy_max_cost_cents(1, p), cents
+        # cents == 1 (scanned 0.99) is the one deliberate divergence and is NOT
+        # float noise: the legacy cap is $1.00, which is a settlement value and
+        # not a tradeable level, so the V2 cap clamps to the top of this
+        # market's grid. That clamp is stricter, which is the allowed direction.
+        assert _v2_limit_price("buy_yes", 1.0 - 0.01, market) == Decimal("0.99")
 
     def test_deci_cent_cap_moves_one_deci_cent_not_one_cent(self):
         market = make_market("deci_cent", DECI_CENT_BANDS)

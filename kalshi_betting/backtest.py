@@ -105,6 +105,11 @@ def main() -> None:
             # BS-25: a single unrotated FileHandler grew to 398MB during one backtest
             # sweep. 20MB/3 backups is logging infra sized for this CLI's own verbosity,
             # not a strategy constant, so it stays inline rather than in config.py.
+            # TS-02: that budget only holds many runs because the per-ticker
+            # candlestick failure is now ONE line (no HTTP header dump) and the
+            # misses are summarized once per run by _fetch_candles_parallel.
+            # Before that, 99.5% of this file was that single warning and a
+            # sweep evicted ~419 MB of pre-sweep history through this rotation.
             logging.handlers.RotatingFileHandler(
                 PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024, backupCount=3,
             ),

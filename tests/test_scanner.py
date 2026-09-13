@@ -35,6 +35,7 @@ from kalshi_betting.scanner import (
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
+    inactive_shard_indexes,
     leg_prices,
     leg_sides,
     normalize_title,
@@ -1399,6 +1400,199 @@ class TestFetchOpenEventsMveStatusFilter:
         assert "MVE events fetch" in caplog.text
 
 
+def _positions_page(ticker: str, cursor: str | None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/positions page."""
+    return SimpleNamespace(
+        status=200,
+        data=json.dumps({
+            "market_positions": [{"ticker": ticker, "position_fp": "3"}],
+            "cursor": cursor,
+        }).encode(),
+    )
+
+
+class TestCursorLoopBounds:
+    """TS-05: scanner.py's three cursor loops were the only unbounded scans
+    left in the ingest path. The stuck-cursor guard proved only ONE failure
+    shape (a cursor repeating consecutively); a keyset cycling with period > 1
+    (A, B, A, B, ...) never repeats consecutively and paged forever. Each loop
+    now remembers every cursor it has requested AND stops at SCANNER_MAX_PAGES,
+    which bounds the walk against pathologies nobody enumerated."""
+
+    def test_standard_events_cycling_cursor_stops_pagination(self, caplog):
+        # A, B, A: the third page's cursor never equals the one just used, so
+        # only the seen-set catches it.
+        pages = [
+            _raw_page([{"title": "E1", "markets": [_raw_market("PAGE1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "E2", "markets": [_raw_market("PAGE2", "Q two")]}], cursor="B"),
+            _raw_page([{"title": "E3", "markets": [_raw_market("PAGE3", "Q three")]}], cursor="A"),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=pages)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # A fourth call would raise StopIteration against the side_effect list.
+        assert {m.ticker for m in markets} == {"PAGE1", "PAGE2", "PAGE3"}
+        assert client.get_events_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_cycling_cursor_stops_and_warns(self, caplog):
+        from kalshi_betting.scanner import get_held_tickers
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=[
+            _positions_page("HELD-1", "A"),
+            _positions_page("HELD-2", "B"),
+            _positions_page("HELD-3", "A"),
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        assert held == {"HELD-1", "HELD-2", "HELD-3"}
+        assert client.get_positions_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_cycling_cursor_stops_pagination(self, caplog):
+        # Every page carries an ACTIVE nested market, so MVE_MAX_EMPTY_PAGES
+        # never fires — the seen-cursor set is the only thing that can stop it.
+        pages = [
+            _raw_page([{"title": "M1", "markets": [_raw_market("MVE-1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "M2", "markets": [_raw_market("MVE-2", "Q two")]}], cursor="B"),
+            _raw_page([{"title": "M3", "markets": [_raw_market("MVE-3", "Q three")]}], cursor="A"),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(side_effect=pages)
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert {m.ticker for m in markets} == {"MVE-1", "MVE-2", "MVE-3"}
+        assert client.get_multivariate_events_without_preload_content.call_count == 3
+        assert "cursor did not advance" in caplog.text
+        assert "MVE events fetch" in caplog.text
+
+    def test_standard_events_page_cap_stops_pagination(self, caplog, monkeypatch):
+        # A server handing back a FRESH cursor forever defeats both the
+        # consecutive-repeat guard and the seen-set; only the page cap bounds
+        # it. Patched to 5 so the test is instant rather than 5000 pages.
+        from itertools import count
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"E{n}", "markets": [_raw_market(f"T{n}", f"Q {n}")]}],
+                cursor=f"CUR-{n}",
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=endless)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == 5
+        assert client.get_events_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "Open-events fetch" in caplog.text
+
+    def test_get_held_tickers_page_cap_stops_pagination(self, caplog, monkeypatch):
+        from itertools import count
+
+        from kalshi_betting.scanner import get_held_tickers
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _positions_page(f"HELD-{n}", f"CUR-{n}")
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=endless)
+
+        with caplog.at_level(logging.WARNING):
+            held = get_held_tickers(client)
+
+        assert len(held) == 5
+        assert client.get_positions_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "Positions fetch" in caplog.text
+
+    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    def test_mve_page_cap_stops_pagination(self, caplog, monkeypatch):
+        # The cap is independent of MVE_MAX_EMPTY_PAGES (25): every page here
+        # is productive, so the productivity bail-out can never fire.
+        from itertools import count
+
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 5)
+        counter = count()
+
+        def endless(**kwargs):
+            n = next(counter)
+            return _raw_page(
+                [{"title": f"M{n}", "markets": [_raw_market(f"MVE-{n}", f"Q {n}")]}],
+                cursor=f"CUR-{n}",
+            )
+
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([]))
+        client.get_multivariate_events_without_preload_content = MagicMock(side_effect=endless)
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        assert len(markets) == 5
+        assert client.get_multivariate_events_without_preload_content.call_count == 5
+        assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
+        assert "MVE events fetch" in caplog.text
+
+    def test_complete_stream_ending_on_the_cap_does_not_warn(self, caplog, monkeypatch):
+        # The cap check runs BEFORE `cursor = new_cursor` and before the
+        # end-of-stream `if not cursor: break`, so a walk that COMPLETES on
+        # page SCANNER_MAX_PAGES used to log a truncation warning for a stream
+        # that was never truncated — a false alarm that reads, in a weekly
+        # prod log, exactly like a real blind spot. Guarding the cap on
+        # new_cursor fixes it: the final page carries a null cursor, so there
+        # is provably nothing left to fetch.
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 3)
+        pages = [
+            _raw_page([{"title": "E1", "markets": [_raw_market("T1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "E2", "markets": [_raw_market("T2", "Q two")]}], cursor="B"),
+            # Last page: end of stream, landing exactly on the cap.
+            _raw_page([{"title": "E3", "markets": [_raw_market("T3", "Q three")]}], cursor=None),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=pages)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # Every page was ingested — the guard bounds the warning, not the walk.
+        assert {m.ticker for m in markets} == {"T1", "T2", "T3"}
+        assert client.get_events_without_preload_content.call_count == 3
+        assert "SCANNER_MAX_PAGES" not in caplog.text
+        assert "cursor did not advance" not in caplog.text
+
+
 class TestShardIndex:
     """Unit coverage for the fail-safe shard *label* read itself. This never
     decides whether a market is kept — market data is cross-shard — so every
@@ -1527,11 +1721,16 @@ class TestFetchShardStatuses:
         statuses = fetch_shard_statuses(client)
         assert set(statuses) == {0}, "one bad record must not discard the good one"
 
-    def test_missing_boolean_fields_default_to_false(self):
+    def test_missing_boolean_fields_default_to_false_but_trading_active_is_none(self):
+        # trading_active is deliberately TRI-STATE (TS-04): an absent flag is
+        # "unknown", never "halted", because normalising it to False marks
+        # every shard inactive and empties the whole ingest. The other two
+        # booleans fail CLOSED on anything but a recognised true — a missing
+        # transfers flag correctly means "don't move money".
         client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
         statuses = fetch_shard_statuses(client)
         assert statuses[3] == {
-            "trading_active": False, "exchange_active": False,
+            "trading_active": None, "exchange_active": False,
             "intra_exchange_transfers_active": False, "description": "",
         }
 
@@ -1556,6 +1755,248 @@ class TestFetchShardStatuses:
         fetch_shard_statuses(client)
         client.get_exchange_status_without_preload_content.assert_called_once()
         client.get_exchange_status.assert_not_called()
+
+
+class TestFetchShardStatusesUnknownFlag:
+    """TS-04: a renamed or dropped trading_active field must read as UNKNOWN
+    (None) and keep the shard. Coercing absence to False marks every shard
+    inactive, drops every ingested market, and the run still exits 0 claiming
+    full coverage — the exact drift class that already hit markets, positions,
+    orders, events and balance."""
+
+    @staticmethod
+    def _client(entries):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": entries}).encode("utf-8"),
+            )
+        )
+        return client
+
+    def test_absent_key_is_none_and_warns_once(self, caplog):
+        client = self._client([
+            {"exchange_index": 0, "description": "Main"},
+            {"exchange_index": 1, "description": "Combos"},
+        ])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert statuses[1]["trading_active"] is None
+        drift = [
+            r for r in caplog.records if "no trading_active flag" in r.getMessage()
+        ]
+        assert len(drift) == 1, "one summary WARNING, not one line per shard"
+        assert "2 shard(s)" in drift[0].getMessage()
+
+    def test_explicit_null_value_is_also_none(self):
+        client = self._client([{"exchange_index": 0, "trading_active": None}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is None
+
+    def test_explicit_false_is_still_false(self, caplog):
+        client = self._client([{"exchange_index": 0, "trading_active": False}])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        assert "no trading_active flag" not in caplog.text, "silent at zero unknowns"
+
+    def test_explicit_true_is_still_true(self):
+        client = self._client([{"exchange_index": 0, "trading_active": True}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is True
+
+    def test_truthy_non_bool_is_coerced_to_true(self):
+        # 1 is a recognised spelling of a wire boolean, exactly as bool(1) read
+        # it before; see TestExchangeFlagDrift for the values that do change.
+        client = self._client([{"exchange_index": 0, "trading_active": 1}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is True
+
+
+class TestExchangeFlagDrift:
+    """TS-04b: an /exchange/status boolean that arrives RE-TYPED must keep its
+    meaning. bool("false") is True, so the bare coercion read a HALTED shard as
+    open (scanned and traded) and an un-transferable shard as movable (a real,
+    non-idempotent collateral POST). Unrecognised values resolve in the one
+    direction that cannot break a correct reading: falsy keeps its False,
+    truthy becomes unknown."""
+
+    @staticmethod
+    def _client(entries):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": entries}).encode("utf-8"),
+            )
+        )
+        return client
+
+    @pytest.mark.parametrize("raw, expected", [
+        # Real booleans and the conventional numeric spellings.
+        (True, True), (False, False), (0, False), (1, True),
+        (0.0, False), (1.0, True),
+        # Recognised re-typings — the cases the bare bool() got WRONG.
+        ("false", False), ("FALSE", False), (" false ", False),
+        ("no", False), ("0", False), ("off", False), ("f", False), ("n", False),
+        ("true", True), ("True", True), ("yes", True), ("1", True), ("on", True),
+        # A stringified null is truthy in Python but carries no information:
+        # unknown, exactly like an absent key.
+        ("null", None), ("NULL", None), ("None", None), ("nil", None),
+        ("undefined", None),
+        # Unrecognised: falsy keeps its historical False, truthy is unknown.
+        ("", False), ([], False), ({}, False),
+        (2, None), ("maybe", None), ([1], None), (3.5, None),
+        # Absent / null.
+        (None, None),
+    ])
+    def test_flag_table(self, raw, expected):
+        assert scanner._status_flag(raw) is expected
+
+    def test_drifted_false_halts_the_shard_end_to_end(self, caplog):
+        client = self._client([
+            {"exchange_index": 0, "trading_active": "false", "description": "Main"},
+            {"exchange_index": 1, "trading_active": True, "description": "Combos"},
+        ])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        # Ingest must DROP it, exactly as an explicit JSON false would.
+        assert inactive_shard_indexes(statuses) == {0}
+        # And the coverage audit must not then CRITICAL about the shard whose
+        # markets it deliberately dropped.
+        critical, warnings = check_shard_coverage(statuses, {1}, {0, 1})
+        assert critical == [] and warnings == []
+        # Drift is reported, naming the shard, the flag and the raw value.
+        assert "shard 0 trading_active='false' -> False" in caplog.text
+
+    def test_drifted_false_transfers_flag_blocks_money_movement(self):
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "intra_exchange_transfers_active": "false",
+        }])
+        statuses = fetch_shard_statuses(client)
+        # The money consequence: trader._transfers_active reads this key.
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+
+    def test_unreadable_transfers_flag_fails_closed(self):
+        # The enabling flags are stored as `_status_flag(...) is True`, so an
+        # UNREADABLE value refuses the transfer instead of coercing truthy and
+        # firing a real, non-idempotent, never-retried collateral POST.
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "intra_exchange_transfers_active": "maybe", "exchange_active": 2,
+        }])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+        assert statuses[0]["exchange_active"] is False
+
+    def test_stringified_null_is_unknown_not_open(self, caplog):
+        # "null" is a truthy STRING, so bool() read it as an open shard. It is
+        # unknown: the shard stays in the ingest (TS-04) but the money flag
+        # still refuses.
+        client = self._client([{
+            "exchange_index": 0, "trading_active": "null",
+            "intra_exchange_transfers_active": "null",
+        }])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert inactive_shard_indexes(statuses) == set(), "unknown is not halted"
+        assert statuses[0]["intra_exchange_transfers_active"] is False
+        assert "shard 0 trading_active='null' -> None" in caplog.text
+        # The absent-flag counter counts ABSENT keys; a present-but-unreadable
+        # one is named individually above instead.
+        assert "no trading_active flag" not in caplog.text
+
+    def test_real_booleans_log_no_drift_warning(self, caplog):
+        client = self._client([{
+            "exchange_index": 0, "trading_active": True,
+            "exchange_active": True, "intra_exchange_transfers_active": False,
+        }])
+        with caplog.at_level(logging.WARNING):
+            fetch_shard_statuses(client)
+        assert "non-boolean flag value" not in caplog.text, "silent at zero drift"
+
+    def test_absent_flags_are_not_drift_and_keep_their_defaults(self, caplog):
+        # Regression pin: absence is unknown (None) for trading_active and
+        # fail-CLOSED (False) for the two enabling flags — unchanged.
+        client = self._client([{"exchange_index": 3}])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[3] == {
+            "trading_active": None, "exchange_active": False,
+            "intra_exchange_transfers_active": False, "description": "",
+        }
+        assert "non-boolean flag value" not in caplog.text
+
+    @pytest.mark.parametrize("raw", [0, 0.0, "", [], {}])
+    def test_falsy_non_bools_still_halt_the_shard(self, raw):
+        # NO-REGRESSION pin against the rejected "non-bool means unknown"
+        # design, which turned every one of these from DROP into SCAN+TRADE.
+        client = self._client([{"exchange_index": 0, "trading_active": raw}])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        assert inactive_shard_indexes(statuses) == {0}
+
+    @pytest.mark.parametrize("raw", [2, "maybe"])
+    def test_unrecognised_truthy_values_still_keep_the_shard_scanned(self, raw):
+        # These read True before and read None (unknown) now; every
+        # trading_active consumer treats the two identically, so the shard is
+        # still ingested, still audited and still scannable.
+        client = self._client([{"exchange_index": 0, "trading_active": raw}])
+        statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert inactive_shard_indexes(statuses) == set()
+        assert check_shard_coverage(statuses, set(), {0}) == (
+            ["advertised active shard 0 () produced zero ingested markets but "
+             "holds account funds"], [],
+        )
+
+    def test_drift_warning_bounds_a_huge_raw_value(self, caplog):
+        # TS-02 class: the raw value is whatever the API sent, so an unbounded
+        # repr would put a multi-KB line in the log on every single run.
+        client = self._client([{"exchange_index": 0, "trading_active": list(range(300))}])
+        with caplog.at_level(logging.WARNING):
+            fetch_shard_statuses(client)
+        line = next(
+            r.getMessage() for r in caplog.records if "non-boolean flag value" in r.getMessage()
+        )
+        assert "(truncated)" in line
+        assert len(line) < 300, "one drifted flag must not emit a multi-KB line"
+
+
+class TestInactiveShardIndexes:
+    """Only an EXPLICIT trading_active=False drops a shard at ingest (TS-04).
+    One leftover truthiness test here would empty the entire market list on a
+    renamed field."""
+
+    @staticmethod
+    def _st(trading_active):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": "",
+        }
+
+    @pytest.mark.parametrize("statuses, expected", [
+        (None, set()),
+        ({}, set()),
+        ({0: {"trading_active": True}, 1: {"trading_active": True}}, set()),
+        ({0: {"trading_active": True}, 1: {"trading_active": False}}, {1}),
+        ({0: {"trading_active": False}, 1: {"trading_active": False}}, {0, 1}),
+        ({0: {"trading_active": None}, 1: {"trading_active": None}}, set()),
+        ({0: {"trading_active": None}, 1: {"trading_active": False}}, {1}),
+        ({0: {}}, set()),
+    ])
+    def test_table(self, statuses, expected):
+        assert inactive_shard_indexes(statuses) == expected
+
+    def test_unknown_flag_keeps_every_shard_scannable(self):
+        # The TS-04 production shape: /exchange/status renames the field, so
+        # every entry parses to None. Ingest must keep them all.
+        statuses = {idx: self._st(None) for idx in range(4)}
+        assert inactive_shard_indexes(statuses) == set()
 
 
 class TestFetchOpenEventsShardTagging:
@@ -1773,6 +2214,25 @@ class TestCheckShardCoverage:
         assert len(warnings) == 1
         assert "shard 9" in warnings[0]
         assert "does not advertise" in warnings[0]
+
+    def test_unknown_trading_active_shard_is_still_audited(self):
+        # TS-04: an absent flag (None) leaves the shard IN the ingest, so its
+        # coverage must still be checked. Only an explicit False is skipped —
+        # a truthiness test here would silently stop auditing drifted shards.
+        advertised = {0: self._status(trading_active=None, description="Main")}
+        critical, warnings = check_shard_coverage(advertised, set(), {0})
+        assert len(critical) == 1
+        assert "shard 0" in critical[0]
+        assert "holds account funds" in critical[0]
+        assert warnings == []
+
+    def test_explicit_false_shard_is_still_never_flagged(self):
+        # The contrast case: an explicitly halted shard already warned at
+        # ingest, so it is not reported here even while holding funds.
+        advertised = {0: self._status(trading_active=False, description="Main")}
+        critical, warnings = check_shard_coverage(advertised, set(), {0})
+        assert critical == []
+        assert warnings == []
 
 
 class TestSubtitleFallback:

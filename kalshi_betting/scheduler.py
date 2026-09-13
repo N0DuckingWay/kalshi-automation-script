@@ -17,11 +17,13 @@ Purpose:
     for the next scheduled fire.
 
 Dependencies:
-    Imports PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS, and the EXIT_OK /
-    EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION exit-code constants
-    from config.py — the EXIT_* imports are what let run_job() map the
-    subprocess's exit code to a distinct log level/message (BS-14) rather than
-    treating every nonzero code identically. Spawns kalshi_betting.main as a
+    Imports PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS,
+    SCHEDULER_BLIND_RETRY_SECONDS / SCHEDULER_BLIND_MAX_RETRIES, and the
+    EXIT_OK / EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION /
+    EXIT_NO_TRADEABLE_SHARDS exit-code constants from config.py — the EXIT_*
+    imports are what let run_job() map the subprocess's exit code to a
+    distinct log level/message (BS-14) rather than treating every nonzero code
+    identically. Spawns kalshi_betting.main as a
     subprocess (via sys.executable) rather than importing it directly, to
     isolate run-time errors and capture stdout/stderr separately. Entry point for
     `python3 -m kalshi_betting.scheduler`.
@@ -76,6 +78,28 @@ Notes:
     registering the weekly schedule: the very first daemon start after this
     feature was added will therefore always trigger an immediate prod run,
     since scheduler_state.json does not yet exist.
+
+    TS-01/VI-02 blind-run retry: EXIT_NO_TRADEABLE_SHARDS (30) means the run
+    scanned NOTHING. main.py returns it for either of two causes (see
+    main._blind_run_reason): every advertised exchange shard was
+    trading-inactive, so ingest dropped every market — an exchange-wide
+    maintenance window overlapping the 09:00 fire, observed live 2026-09-03 —
+    or the market ingest came back empty for a cause /exchange/status could
+    not name, which is the case scanner.fetch_shard_statuses' fail-soft None
+    leaves undiagnosable. This daemon cannot tell the two apart from the exit
+    code alone; kalshi_arb.log carries the WARNING naming which one fired. The
+    bot trades only on the weekly fire, so that used to cost the entire week
+    while both logs said the run succeeded. run_job() now registers a one-shot
+    retry (SCHEDULER_BLIND_RETRY_SECONDS out, at most
+    SCHEDULER_BLIND_MAX_RETRIES per slot) instead, and _maybe_catch_up()
+    re-runs a slot whose recorded attempt exited 30. The count is carried on
+    run_job's `retries` argument and persisted as the state file's optional
+    "retries" key — the cap can only be enforced there, because a retry that
+    exits 30 again schedules its own successor. A pre-existing state file has
+    no such key and reads as 0.
+    An hourly cadence bounded at four attempts covers a typical maintenance
+    window while keeping the scan near its intended Monday-morning slot; a
+    longer interval would trade on stale morning pricing.
 """
 import json
 import logging
@@ -90,10 +114,13 @@ from pathlib import Path
 import schedule
 
 from .config import (
+    EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
     PROJECT_ROOT,
+    SCHEDULER_BLIND_MAX_RETRIES,
+    SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
 )
 
@@ -224,6 +251,7 @@ def _save_state(
     started_at: datetime,
     finished_at: datetime | None,
     exit_code: int | None,
+    retries: int = 0,
 ) -> None:
     """
     Persist scheduler run state atomically (tmp file + rename).
@@ -244,6 +272,9 @@ def _save_state(
         exit_code (int | None): The subprocess exit code, or None if the run
             has only been claimed, or ended via timeout/OSError before a
             subprocess exit code existed.
+        retries (int): How many blind-run retries (TS-01) preceded this
+            attempt at this slot. Defaults to 0 — the ordinary first run —
+            so existing callers are unaffected.
     """
     state = {
         "schema": _STATE_SCHEMA_VERSION,
@@ -251,6 +282,10 @@ def _save_state(
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat() if finished_at is not None else None,
         "exit_code": exit_code,
+        # Blind-run retry count for this slot (TS-01); absent in pre-existing
+        # state files, which _load_state still accepts unchanged and every
+        # reader treats as 0.
+        "retries": retries,
     }
     path = _state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +294,7 @@ def _save_state(
     tmp.replace(path)
 
 
-def run_job() -> None:
+def run_job(retries: int = 0) -> None:
     """
     Execute a single production arbitrage bot run as an isolated subprocess.
 
@@ -294,6 +329,31 @@ def run_job() -> None:
     run's traceback, was previously dropped entirely). A bare OSError from
     subprocess.run() itself (BS-31 — e.g. the interpreter can't be spawned)
     is logged with a specific message and does not escape this function.
+
+    EXIT_NO_TRADEABLE_SHARDS (TS-01, VI-02) is the one code that does NOT
+    satisfy the weekly slot: it means nothing was scanned at all — an
+    exchange-wide halt, or an ingest that came back empty for a cause
+    /exchange/status could not name — and the bot trades only on the weekly
+    fire, so letting it stand would cost the week. Which of the two fired is
+    named in kalshi_arb.log by the subprocess, not here: this daemon sees only
+    the exit code, so its own messages must not claim one cause over the
+    other. That branch registers a one-shot retry on the `schedule` library's
+    global scheduler, SCHEDULER_BLIND_RETRY_SECONDS out, and the retry
+    re-enters this function with `retries` incremented. The cap lives HERE,
+    not in the caller: a retried run that exits 30 again schedules its own
+    successor, so SCHEDULER_BLIND_MAX_RETRIES can only be enforced by the
+    argument each attempt carries.
+
+    Args:
+        retries (int): How many blind-run retries have already been spent on
+            this Monday slot. 0 for the ordinary weekly fire and for a
+            catch-up of a never-attempted slot; greater than 0 only when
+            _blind_retry or _maybe_catch_up is re-running a slot that a blind
+            run left unsatisfied. Persisted into scheduler_state.json so the
+            count survives a daemon restart.
+
+    Returns:
+        None
     """
     logging.info("Scheduler: starting weekly arbitrage scan.")
     started_at = datetime.now()
@@ -302,7 +362,8 @@ def run_job() -> None:
     # still leaves a recorded attempt for this slot — otherwise the startup
     # catch-up check would see no record at all and re-run it on every
     # restart until one attempt happens to finish cleanly.
-    _save_state(last_slot=slot, started_at=started_at, finished_at=None, exit_code=None)
+    _save_state(last_slot=slot, started_at=started_at, finished_at=None,
+                exit_code=None, retries=retries)
 
     try:
         # Use sys.executable to ensure the subprocess uses the same Python environment
@@ -323,14 +384,14 @@ def run_job() -> None:
         )
         _save_state(
             last_slot=slot, started_at=started_at,
-            finished_at=datetime.now(), exit_code=None,
+            finished_at=datetime.now(), exit_code=None, retries=retries,
         )
         return
     except OSError as exc:
         logging.error("Failed to spawn bot subprocess: %s", exc)
         _save_state(
             last_slot=slot, started_at=started_at,
-            finished_at=datetime.now(), exit_code=None,
+            finished_at=datetime.now(), exit_code=None, retries=retries,
         )
         return
 
@@ -346,19 +407,66 @@ def run_job() -> None:
             "Job completed but one or more trades need MANUAL REVIEW — "
             "check kalshi_arb.log and trade_log.xlsx.",
         )
+    elif result.returncode == EXIT_NO_TRADEABLE_SHARDS:
+        # Not a satisfied slot: nothing was scanned (TS-01, VI-02). The exit
+        # code does not say WHICH cause fired, so neither does this message —
+        # the subprocess logs that sentence into kalshi_arb.log.
+        if retries < SCHEDULER_BLIND_MAX_RETRIES:
+            logging.warning(
+                "Job scanned nothing (exit %d): every advertised exchange shard was "
+                "trading-inactive, or the market ingest came back empty — "
+                "kalshi_arb.log names which. The weekly slot is NOT satisfied — "
+                "retrying in %d s (attempt %d of %d).",
+                result.returncode, SCHEDULER_BLIND_RETRY_SECONDS,
+                retries + 1, SCHEDULER_BLIND_MAX_RETRIES,
+            )
+            # One-shot job on the schedule library's global scheduler; it
+            # cancels itself when it fires (see _blind_retry), and the next
+            # attempt decides for itself whether to schedule another.
+            schedule.every(SCHEDULER_BLIND_RETRY_SECONDS).seconds.do(
+                _blind_retry, retries + 1
+            )
+        else:
+            logging.error(
+                "Job scanned nothing on %d attempts: every advertised exchange shard "
+                "stayed trading-inactive, or the market ingest kept coming back empty "
+                "— giving up on this slot; check the exchange status and "
+                "kalshi_arb.log, which names the cause.",
+                retries + 1,
+            )
     else:
         logging.error("Job failed (exit %d):\n%s", result.returncode, result.stderr)
 
     _save_state(
         last_slot=slot, started_at=started_at,
-        finished_at=datetime.now(), exit_code=result.returncode,
+        finished_at=datetime.now(), exit_code=result.returncode, retries=retries,
     )
+
+
+def _blind_retry(retries: int) -> type[schedule.CancelJob]:
+    """
+    One-shot retry of a blind run (TS-01).
+
+    Returning schedule.CancelJob removes this job after it fires, so the retry
+    never recurs on its own; run_job decides whether to schedule another and
+    enforces SCHEDULER_BLIND_MAX_RETRIES.
+
+    Args:
+        retries (int): The attempt number this retry represents — passed
+            straight through to run_job, which persists it and uses it to
+            enforce the cap.
+
+    Returns:
+        schedule.CancelJob: The library's sentinel meaning "deregister me".
+    """
+    run_job(retries=retries)
+    return schedule.CancelJob
 
 
 def _maybe_catch_up(now: datetime | None = None) -> None:
     """
     Run an immediate catch-up job if the most recent Monday-09:00 slot has
-    no recorded run (BS-17).
+    no recorded run (BS-17), or was only "satisfied" by a blind run (TS-01).
 
     Guards against a missed run when the daemon was offline (not started
     yet, crashed, host down, mid-deploy) across a scheduled fire time —
@@ -368,20 +476,39 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
     whose edge is time-sensitive. Extracted from main() so it can be tested
     without entering the infinite poll loop.
 
+    The test was purely temporal (`last_slot < slot`) and never read the exit
+    code, so a slot whose only attempt exited EXIT_NO_TRADEABLE_SHARDS —
+    nothing scanned at all — counted as satisfied (TS-01). It is now also
+    re-run, carrying `retries + 1` so the daemon-restart path shares
+    run_job's SCHEDULER_BLIND_MAX_RETRIES cap rather than looping forever
+    through an outage. A slot whose attempt merely FAILED is still not
+    retried — that is BS-17's deliberate behaviour and is unchanged.
+
     Args:
         now (datetime | None): Override for the current local time, for
             testing. Defaults to datetime.now().
+
+    Returns:
+        None
     """
     now = now if now is not None else datetime.now()
     slot = _most_recent_slot(now)
     state = _load_state()
-    if state is None or datetime.fromisoformat(state["last_slot"]) < slot:
+    stale = state is None or datetime.fromisoformat(state["last_slot"]) < slot
+    # A slot finalized by a blind run is not satisfied (TS-01): re-run it on
+    # daemon start, under the same bounded retry count run_job applies. A
+    # pre-existing state file has no "retries" key, which reads as 0.
+    blind = (
+        state is not None
+        and state.get("exit_code") == EXIT_NO_TRADEABLE_SHARDS
+        and state.get("retries", 0) < SCHEDULER_BLIND_MAX_RETRIES
+    )
+    if stale or blind:
         logging.warning(
-            "Most recent Monday 09:00 slot (%s) has no recorded run — "
-            "running catch-up now",
-            slot.isoformat(),
+            "Most recent Monday 09:00 slot (%s) has no %s run — running catch-up now",
+            slot.isoformat(), "recorded" if stale else "successful (blind-run)",
         )
-        run_job()
+        run_job(retries=0 if stale else state.get("retries", 0) + 1)
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:

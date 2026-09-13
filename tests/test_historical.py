@@ -32,6 +32,29 @@ def _raw_resp(payload: dict) -> SimpleNamespace:
     return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
 
 
+class _FakeApiException(Exception):
+    """Stand-in for the SDK's ApiException, including its five-line __str__.
+
+    The real one renders the status, the reason, the ENTIRE HTTP header dict
+    and the body across five lines (~900 bytes) and its own FIRST line is only
+    "(404)" — the reason lives on line two. That shape is the whole point of
+    TS-02, so it is reproduced here rather than approximated.
+    """
+
+    def __init__(self, status: int = 404, reason: str = "Not Found"):
+        self.status = status
+        self.reason = reason
+        self.headers = {"X-Big-Header": "x" * 500}
+        self.body = '{"error": {"code": "not_found"}}'
+        super().__init__(f"({status})")
+
+    def __str__(self) -> str:
+        return (f"({self.status})\n"
+                f"Reason: {self.reason}\n"
+                f"HTTP response headers: {self.headers}\n"
+                f"HTTP response body: {self.body}\n")
+
+
 def _make_client_with_event_pages(non_mve_pages: list[list[tuple[str, str]]],
                                   mve_pages: list[list[tuple[str, str]]] | None = None):
     """Build a MagicMock client whose raw get_events /
@@ -146,6 +169,32 @@ class TestEventTitlesCache:
         _patch_single_event_lookups(monkeypatch, single_failures={"BAD-1"})
         result = historical._load_or_build_event_titles(client, {"BAD-1"})
         assert result == {"BAD-1": ""}
+
+    def test_lookup_failure_logs_one_line_without_header_dump(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # TS-02: this warning fires once per unresolved ticker, up to
+        # EVENT_TITLE_FALLBACK_MAX_LOOKUPS (5000) of them per run. Logging the
+        # SDK exception whole would dump the entire HTTP header dict each time.
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+
+        def fake_signed_get(_client, _path, **_params):
+            raise _FakeApiException()
+
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=fake_signed_get))
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, {"BAD-1"})
+
+        assert result == {"BAD-1": ""}          # poison pill unchanged
+        msgs = [r.getMessage() for r in caplog.records
+                if "Could not resolve event title" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "BAD-1" in msgs[0]
+        assert "HTTP 404 Not Found" in msgs[0]
+        assert "\n" not in msgs[0]
+        assert "X-Big-Header" not in msgs[0]
+        assert "HTTP response headers" not in msgs[0]
 
     def test_mve_bulk_scan_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
         # The MVE listing is effectively unbounded — a ticker that never
@@ -2274,3 +2323,81 @@ class TestFetchCandlesticks:
         )
         assert fetch2.call_count == 0
         assert out[0]["ts"] == 1_700_000_000
+
+    def test_fetch_failure_logs_one_line_without_header_dump(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # TS-02: post-cutoff tickers 404 by design and those failures are
+        # deliberately never cached, so this warning is re-paid every run for
+        # every such ticker. Logging the SDK exception whole emitted ~900
+        # bytes across five lines each time, which rotated the run's own
+        # diagnostics out of kalshi_backtest.log.
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=_FakeApiException()))
+
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+
+        assert out == []                        # fail-soft contract unchanged
+        msgs = [r.getMessage() for r in caplog.records
+                if "Candlestick fetch failed" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "T1" in msgs[0]
+        assert "HTTP 404 Not Found" in msgs[0]
+        # One physical line, and none of the header dump the SDK's __str__ emits
+        assert "\n" not in msgs[0]
+        assert "X-Big-Header" not in msgs[0]
+        assert "HTTP response headers" not in msgs[0]
+        assert len(msgs[0]) < 200
+        # Still not cached — a poisoned empty file would silence this ticker
+        assert not (tmp_path / "candles" / "T1.json").exists()
+
+
+class TestExceptionSummary:
+    """_exception_summary: one line, never the SDK's header dump (TS-02)."""
+
+    def test_prefers_the_reason_attribute(self):
+        # The SDK exception's own first line is only "(404)" — the useful half
+        # is `reason`, which is why it is preferred over str(exc).
+        assert historical._exception_summary(_FakeApiException()) == "Not Found"
+
+    def test_falls_back_to_the_message_for_a_plain_exception(self):
+        # A non-API failure (a parse error, a KeyError) carries no `reason`;
+        # reducing it to its class name alone would throw away the diagnosis.
+        assert historical._exception_summary(ValueError("bad payload")) == "bad payload"
+
+    def test_falls_back_to_the_class_name_when_there_is_no_text(self):
+        assert historical._exception_summary(ValueError()) == "ValueError"
+
+    def test_keeps_only_the_first_line(self):
+        assert historical._exception_summary(
+            ValueError("first line\nsecond line\nthird")) == "first line"
+
+    def test_truncates_at_the_limit(self):
+        summary = historical._exception_summary(ValueError("y" * 500))
+        assert len(summary) == 120
+        assert summary == "y" * 120
+
+    def test_limit_is_configurable(self):
+        assert historical._exception_summary(ValueError("y" * 500), limit=10) == "y" * 10
+
+    def test_never_raises_even_on_a_pathological_exception(self):
+        # Every caller invokes this from INSIDE an `except` block on a
+        # per-ticker path, and a _fetch_candles_parallel worker exception kills
+        # the whole backtest by that function's deliberate design — so a
+        # rendering failure here must degrade to the class name, never escape.
+        class ExplodingStr(Exception):
+            def __str__(self):
+                raise RuntimeError("__str__ is broken")
+
+        class ExplodingReason(Exception):
+            @property
+            def reason(self):
+                raise RuntimeError("reason is broken")
+
+        assert historical._exception_summary(ExplodingStr()) == "ExplodingStr"
+        assert historical._exception_summary(ExplodingReason()) == "ExplodingReason"

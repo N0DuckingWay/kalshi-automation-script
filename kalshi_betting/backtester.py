@@ -110,6 +110,8 @@ Notes:
     live scanner cannot detect it from prices.
 """
 import logging
+import resource
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -119,6 +121,8 @@ from typing import Any
 import pandas as pd
 
 from .config import (
+    BACKTEST_MARKETS_RAM_WARN,
+    BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
     INTERVAL_DISCOUNT_SWEEP,
@@ -947,7 +951,10 @@ def _find_entry(
     trading logic, and returns the entry data for the first qualifying week.
 
     Direction rules mirror the live scanner exactly:
-      - time_series: market A is fixed as the EARLIER-closing contract, and an
+      - time_series: market A is fixed as the EARLIER-closing contract —
+        decided on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        sorts its group members, so two contracts closing on the same UTC date
+        at different times of day are ordered rather than tied — and an
         entry requires pB − pA >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the LATER contract priced higher by at least the tier is the anomaly
@@ -1024,22 +1031,44 @@ def _find_entry(
         # Live-scanner invariant: market A is the EARLIER-closing contract.
         # Never swap by price — the trade only exists when the LATER contract
         # is priced higher (checked per Monday below).
-        if close_b < close_a:
+        #
+        # Decide on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        # sorts on m.close_time. Two contracts closing on the same UTC date at
+        # different times are a valid zero-day-gap pair (live data shows 9
+        # distinct close dates across 43 distinct times of day), and deciding on
+        # the parsed DATES made that a tie — neither `close_b < close_a` nor its
+        # mirror was true — so "market A" was left as whichever the group list
+        # happened to hold first. The pair was then either dropped (the
+        # direction test goes negative) or replayed with the legs inverted,
+        # whose genuine in-between settlement reads as the impossible
+        # A=YES/B=NO cell: booked as a premise violation, excluded from P&L and
+        # dropped from the interval-discount calibration's denominator (TS-06).
+        # The date comparison survives only as the fallback for a naive/aware
+        # mix (reachable from a hand-edited cache, since every live timestamp is
+        # tz-aware), per this file's "can't parse it = unknown, not an error"
+        # convention.
+        dt_a = _parse_iso_datetime(mA.get("close_time"))
+        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        try:
+            b_before_a = dt_b < dt_a
+        except TypeError:
+            b_before_a = close_b < close_a
+        if b_before_a:
             mA, mB = mB, mA
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
+            dt_a, dt_b = dt_b, dt_a
         # Deadline gap is loop-invariant: a wider gap carries more genuine
         # in-between probability mass, so 16-30 day gaps demand the larger
         # tier and gaps beyond MAX_DEADLINE_GAP_DAYS are never disputed.
-        # Measure it on the close_time DATETIMES, not the dates parsed above:
+        # Measure it on the close_time DATETIMES parsed above, not on the dates:
         # timedelta.days floors, while calendar-date subtraction counts day
         # boundaries, so the two disagree by up to a day whenever the closes
         # straddle midnight (2026-02-01T23:00Z vs 2026-02-17T01:00Z is gap 15
         # live but 16 by date). That one day flips both the tier boundary and
         # the 30-day cutoff, so a backtest that is supposed to replay the live
-        # strategy must use the live arithmetic.
-        dt_a = _parse_iso_datetime(mA.get("close_time"))
-        dt_b = _parse_iso_datetime(mB.get("close_time"))
+        # strategy must use the live arithmetic. The gap is order-independent
+        # (abs), so swapping dt_a/dt_b above cannot change it.
         try:
             # Identical arithmetic to scanner.deadline_gap_days (used by
             # find_time_series_pairs / _pair_max_sum): absolute timedelta.days
@@ -1190,6 +1219,10 @@ def _fetch_candles_parallel(
     prefiltered out) and must surface rather than be silently degraded into
     "this ticker has no prices".
 
+    Before returning, the tickers that resolved to an empty series are counted
+    and reported in ONE summary WARNING (silent at zero) — the per-run signal
+    that replaces reading hundreds of individual 404 lines (TS-02).
+
     Args:
         hist_client (Any): Historical KalshiClient, shared across worker
             threads (the same pattern historical.py's fetch pools use).
@@ -1270,10 +1303,55 @@ def _fetch_candles_parallel(
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
 
+    # Summarize the misses ONCE. On a post-cutoff window every ticker 404s
+    # (documented, and deliberately never cached), so the count is the useful
+    # signal — not one warning per ticker (TS-02). Counted off the RESULT dict
+    # rather than off caught exceptions, because fetch_candlesticks already
+    # fail-softs a failure to [] internally; deliberately outside the `if work`
+    # block so the tickers resolved to [] above for a missing or unparseable
+    # close_time are counted too.
+    empty = sum(1 for series in candles_by_ticker.values() if not series)
+    if empty:
+        logging.warning(
+            "Candlestick fetch: %d of %d tickers returned no candles "
+            "(post-cutoff tickers 404 by design and are never cached)",
+            empty, len(candles_by_ticker),
+        )
+
     return candles_by_ticker
 
 
 # ─── Main backtest loop ───────────────────────────────────────────────────────
+
+def _log_rss(label: str) -> None:
+    """
+    Log this process's peak resident set size so far, in MiB.
+
+    Diagnostics only — nothing branches on the value. Two calls bracket the
+    grouping/pairing step of _prepare_entries, the phase that follows a fetch
+    already hardened to stream to disk and that was nonetheless the suspected
+    home of a multi-GiB peak (TS-07). Without these lines that peak is
+    invisible: it lives entirely between two existing INFO lines and falls
+    back to 100-300 MB immediately after. The two runs actually measured, and
+    which of them the cost belonged to, are recorded in config.py beside
+    BACKTEST_RECORD_BYTES_ESTIMATE — deliberately in one place, so no figure
+    from one run is ever restated somewhere it will go stale.
+
+    getrusage reports ru_maxrss in BYTES on macOS and in KILOBYTES on Linux,
+    so the two are normalized here — otherwise the same line means two things
+    on the two platforms this runs on (dev is macOS, CI is Linux). It is a
+    high-water mark for the whole process, so it never decreases.
+
+    Args:
+        label (str): Phase name for the log line (e.g. "before grouping").
+
+    Returns:
+        None
+    """
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    mib = peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
+    logging.info("Peak RSS %s: %.0f MiB", label, mib)
+
 
 def _prepare_entries(
     hist_client: Any,
@@ -1387,11 +1465,53 @@ def _prepare_entries(
     )
     markets = eligible_markets
 
+    # Logged BEFORE the RAM-budget warning below so the two read in causal
+    # order: this line is what the fetch — or, on a cache hit, the cache load —
+    # has ALREADY cost, and the warning that follows names the record list's
+    # share of it and what grouping is about to add on top.
+    _log_rss("before grouping")
+
+    # Everything from here to the end of pair extraction is held live at once:
+    # the whole record list, two group maps over it, and two candidate-pair
+    # lists referencing those same dicts. The records are ALREADY resident when
+    # this fires — fetch_all_settled_markets either assembled them from the
+    # streamed day slices or, on a cache hit, rebuilt every one of them with
+    # json.loads() over the assembled file — so this is a budget line covering
+    # money already spent plus money about to be spent, not a forecast issued
+    # ahead of the whole cost. It deliberately carries only THIS run's numbers;
+    # the historical measurements live in config.py beside
+    # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them
+    # current, rather than in a string emitted on every run (TS-07). Advisory
+    # only: nothing is capped or dropped.
+    if len(markets) > BACKTEST_MARKETS_RAM_WARN:
+        logging.warning(
+            "%d eligible markets: their records alone are roughly %.1f GB and "
+            "are already resident — the peak RSS line above covers them; "
+            "grouping and pair extraction add the group maps and the pair "
+            "lists on top of them",
+            len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
+        )
+
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
     ts_pairs     = _extract_pairs(ts_groups)
     same_pairs   = _extract_pairs(same_groups)
+    # Release the group maps AND the record list together, before the
+    # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
+    # at function exit, which is where they were all freed before. Nothing
+    # below reads any of them — the pair lists carry the market dicts they
+    # need. Dropping the group maps alone frees no record dicts at all:
+    # `markets` still references every one of them, and after the prefilter
+    # above `eligible_markets` is the SAME list object as `markets`, so all
+    # four names have to go for the records that landed in no candidate pair
+    # to become collectable.
+    #
+    # This lowers RESIDENCY across the candlestick fetch and the _find_entry
+    # sweep below. It does NOT lower the run's peak RSS, which is a high-water
+    # mark already reached by the time this statement runs.
+    del ts_groups, same_groups, markets, eligible_markets
+    _log_rss("after pair extraction")
 
     logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))
 
