@@ -35,6 +35,7 @@ from kalshi_betting.scanner import (
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
+    inactive_shard_indexes,
     leg_prices,
     leg_sides,
     normalize_title,
@@ -1527,11 +1528,16 @@ class TestFetchShardStatuses:
         statuses = fetch_shard_statuses(client)
         assert set(statuses) == {0}, "one bad record must not discard the good one"
 
-    def test_missing_boolean_fields_default_to_false(self):
+    def test_missing_boolean_fields_default_to_false_but_trading_active_is_none(self):
+        # trading_active is deliberately TRI-STATE (TS-04): an absent flag is
+        # "unknown", never "halted", because normalising it to False marks
+        # every shard inactive and empties the whole ingest. The other two
+        # booleans keep their bool() coercion — a missing transfers flag
+        # correctly means "don't move money".
         client = self._client({"exchange_index_statuses": [{"exchange_index": 3}]})
         statuses = fetch_shard_statuses(client)
         assert statuses[3] == {
-            "trading_active": False, "exchange_active": False,
+            "trading_active": None, "exchange_active": False,
             "intra_exchange_transfers_active": False, "description": "",
         }
 
@@ -1556,6 +1562,94 @@ class TestFetchShardStatuses:
         fetch_shard_statuses(client)
         client.get_exchange_status_without_preload_content.assert_called_once()
         client.get_exchange_status.assert_not_called()
+
+
+class TestFetchShardStatusesUnknownFlag:
+    """TS-04: a renamed or dropped trading_active field must read as UNKNOWN
+    (None) and keep the shard. Coercing absence to False marks every shard
+    inactive, drops every ingested market, and the run still exits 0 claiming
+    full coverage — the exact drift class that already hit markets, positions,
+    orders, events and balance."""
+
+    @staticmethod
+    def _client(entries):
+        client = MagicMock()
+        client.get_exchange_status_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200,
+                data=json.dumps({"exchange_index_statuses": entries}).encode("utf-8"),
+            )
+        )
+        return client
+
+    def test_absent_key_is_none_and_warns_once(self, caplog):
+        client = self._client([
+            {"exchange_index": 0, "description": "Main"},
+            {"exchange_index": 1, "description": "Combos"},
+        ])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is None
+        assert statuses[1]["trading_active"] is None
+        drift = [
+            r for r in caplog.records if "no trading_active flag" in r.getMessage()
+        ]
+        assert len(drift) == 1, "one summary WARNING, not one line per shard"
+        assert "2 shard(s)" in drift[0].getMessage()
+
+    def test_explicit_null_value_is_also_none(self):
+        client = self._client([{"exchange_index": 0, "trading_active": None}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is None
+
+    def test_explicit_false_is_still_false(self, caplog):
+        client = self._client([{"exchange_index": 0, "trading_active": False}])
+        with caplog.at_level(logging.WARNING):
+            statuses = fetch_shard_statuses(client)
+        assert statuses[0]["trading_active"] is False
+        assert "no trading_active flag" not in caplog.text, "silent at zero unknowns"
+
+    def test_explicit_true_is_still_true(self):
+        client = self._client([{"exchange_index": 0, "trading_active": True}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is True
+
+    def test_truthy_non_bool_is_coerced_to_true(self):
+        # Only None means unknown; anything else keeps its bool() coercion.
+        client = self._client([{"exchange_index": 0, "trading_active": 1}])
+        assert fetch_shard_statuses(client)[0]["trading_active"] is True
+
+
+class TestInactiveShardIndexes:
+    """Only an EXPLICIT trading_active=False drops a shard at ingest (TS-04).
+    One leftover truthiness test here would empty the entire market list on a
+    renamed field."""
+
+    @staticmethod
+    def _st(trading_active):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": "",
+        }
+
+    @pytest.mark.parametrize("statuses, expected", [
+        (None, set()),
+        ({}, set()),
+        ({0: {"trading_active": True}, 1: {"trading_active": True}}, set()),
+        ({0: {"trading_active": True}, 1: {"trading_active": False}}, {1}),
+        ({0: {"trading_active": False}, 1: {"trading_active": False}}, {0, 1}),
+        ({0: {"trading_active": None}, 1: {"trading_active": None}}, set()),
+        ({0: {"trading_active": None}, 1: {"trading_active": False}}, {1}),
+        ({0: {}}, set()),
+    ])
+    def test_table(self, statuses, expected):
+        assert inactive_shard_indexes(statuses) == expected
+
+    def test_unknown_flag_keeps_every_shard_scannable(self):
+        # The TS-04 production shape: /exchange/status renames the field, so
+        # every entry parses to None. Ingest must keep them all.
+        statuses = {idx: self._st(None) for idx in range(4)}
+        assert inactive_shard_indexes(statuses) == set()
 
 
 class TestFetchOpenEventsShardTagging:
@@ -1773,6 +1867,25 @@ class TestCheckShardCoverage:
         assert len(warnings) == 1
         assert "shard 9" in warnings[0]
         assert "does not advertise" in warnings[0]
+
+    def test_unknown_trading_active_shard_is_still_audited(self):
+        # TS-04: an absent flag (None) leaves the shard IN the ingest, so its
+        # coverage must still be checked. Only an explicit False is skipped —
+        # a truthiness test here would silently stop auditing drifted shards.
+        advertised = {0: self._status(trading_active=None, description="Main")}
+        critical, warnings = check_shard_coverage(advertised, set(), {0})
+        assert len(critical) == 1
+        assert "shard 0" in critical[0]
+        assert "holds account funds" in critical[0]
+        assert warnings == []
+
+    def test_explicit_false_shard_is_still_never_flagged(self):
+        # The contrast case: an explicitly halted shard already warned at
+        # ingest, so it is not reported here even while holding funds.
+        advertised = {0: self._status(trading_active=False, description="Main")}
+        critical, warnings = check_shard_coverage(advertised, set(), {0})
+        assert critical == []
+        assert warnings == []
 
 
 class TestSubtitleFallback:

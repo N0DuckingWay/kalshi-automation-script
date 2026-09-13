@@ -785,15 +785,24 @@ def fetch_shard_statuses(client: Any) -> dict | None:
     fail-soft: an exchange-status hiccup must degrade to the pre-sharding
     behaviour, never abort a scan.
 
+    `trading_active` is deliberately TRI-STATE on the parsed result: True,
+    False, or None when the payload carried no such key at all. An absent
+    field is "unknown", never "halted" — normalising it to False would mark
+    every shard inactive and empty the entire ingest while the exchange is
+    open (TS-04), the same fail-safe policy _shard_index applies to a missing
+    exchange_index. Only an explicit False halts a shard.
+
     Args:
         client (Any): An authenticated KalshiClient produced by
             auth.build_client().
 
     Returns:
         dict | None: Mapping of exchange_index (int) -> {"trading_active":
-            bool, "exchange_active": bool, "intra_exchange_transfers_active":
-            bool, "description": str}. Malformed entries are skipped. None
-            when the breakdown is unavailable or anything at all went wrong.
+            bool | None, "exchange_active": bool,
+            "intra_exchange_transfers_active": bool, "description": str}.
+            `trading_active` is None when the field was absent or null.
+            Malformed entries are skipped. None when the breakdown is
+            unavailable or anything at all went wrong.
     """
     try:
         # Read-only GET, so api_call_with_retry's 429/5xx backoff is correct
@@ -808,6 +817,7 @@ def fetch_shard_statuses(client: Any) -> dict | None:
             )
             return None
         statuses: dict = {}
+        unknown_active = 0
         for entry in raw:
             try:
                 # A non-dict entry raises AttributeError on .get; a missing or
@@ -816,8 +826,17 @@ def fetch_shard_statuses(client: Any) -> dict | None:
                 idx = int(entry.get("exchange_index"))
             except (AttributeError, TypeError, ValueError):
                 continue
+            # ABSENT is not FALSE. A renamed or dropped field (the documented
+            # API-drift class that already hit markets, positions, orders,
+            # events and balance) must read as "unknown" and KEEP the shard —
+            # normalising it to False empties the entire ingest at exit 0
+            # (TS-04). Same fail-safe policy as _shard_index for a missing
+            # exchange_index. Only an explicit False halts a shard.
+            ta = entry.get("trading_active")
+            if ta is None:
+                unknown_active += 1
             statuses[idx] = {
-                "trading_active": bool(entry.get("trading_active")),
+                "trading_active": None if ta is None else bool(ta),
                 "exchange_active": bool(entry.get("exchange_active")),
                 # Read by trader.ensure_shard_collateral() to refuse moving
                 # funds to or from a shard where transfers are disabled.
@@ -826,6 +845,14 @@ def fetch_shard_statuses(client: Any) -> dict | None:
                 ),
                 "description": entry.get("description") or "",
             }
+        if unknown_active:
+            # Summary WARNING, silent at zero — the drift signal an operator
+            # needs, without one line per shard per run.
+            logging.warning(
+                "Exchange status: %d shard(s) carry no trading_active flag — "
+                "treated as tradeable (unknown, not halted)",
+                unknown_active,
+            )
         if not statuses:
             # An empty list (or one with no parseable entries) is the same
             # "breakdown unavailable" shape as an absent field — returning {}
@@ -857,10 +884,14 @@ def inactive_shard_indexes(shard_statuses: dict | None) -> set:
             None (breakdown unavailable) means no shard is known inactive.
 
     Returns:
-        set: exchange_index values whose trading_active flag is falsy.
+        set: exchange_index values whose trading_active flag is EXPLICITLY
+            False. None (flag absent, TS-04) and True both keep the shard —
+            an absent flag is unknown, not halted, and must never empty the
+            ingest.
     """
     return {
-        idx for idx, st in (shard_statuses or {}).items() if not st.get("trading_active")
+        idx for idx, st in (shard_statuses or {}).items()
+        if st.get("trading_active") is False
     }
 
 
@@ -895,6 +926,9 @@ def check_shard_coverage(
         not a missed trading opportunity. A `trading_active=False` advertised
         shard is never flagged at all — fetch_open_events_with_markets() drops
         its markets deliberately, and that drop already logs its own warning.
+        The flag is tri-state (TS-04): only an EXPLICIT False is skipped here,
+        because a shard whose flag is absent (None) is still scanned at ingest
+        and must therefore still be audited for coverage.
 
     Args:
         advertised (dict | None): The per-shard status breakdown from
@@ -925,9 +959,11 @@ def check_shard_coverage(
     warnings: list = []
 
     for idx, status in advertised.items():
-        if not status.get("trading_active"):
+        if status.get("trading_active") is False:
             # Deliberately dropped at ingest; fetch_open_events_with_markets
             # already warns about this — not this function's job to repeat it.
+            # Explicit False only: an absent flag (None) leaves the shard in
+            # the ingest, so its coverage still has to be audited (TS-04).
             continue
         if idx in market_shards:
             continue
