@@ -13,7 +13,8 @@ open() calls on the same path do contend for the lock.
 """
 import fcntl
 import logging
-from datetime import datetime
+import re
+from datetime import UTC, datetime
 
 import openpyxl
 import pytest
@@ -322,3 +323,72 @@ class TestWriteDevSimulationCandidatesSheet:
         # Row 1 headers, row 2 the merged summary banner, row 3 the trade
         assert ws.cell(row=3, column=17).value == "executed"
         assert ws.cell(row=3, column=18).value == "[time_series: YES A / NO B nB=0.4000] "
+
+
+class _FrozenDatetime:
+    """datetime stand-in whose now() always returns one fixed instant.
+
+    Installed over reporter's module-global `datetime` (reporter.py imports it
+    at module scope), so two successive writes render the IDENTICAL filename
+    timestamp. That forces the TS-18 collision deterministically instead of
+    waiting for two real writes to land in one microsecond — which is only a
+    workable test because the fix is exclusive creation, not merely a finer
+    timestamp. Under a microseconds-only fix this fixture would make even
+    correct code emit a single filename.
+    """
+
+    FIXED = datetime(2026, 9, 13, 1, 2, 3, 456789, tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.FIXED
+
+
+class TestOutputFilenameCollisions:
+    """TS-18: a second output written in the same instant must never overwrite
+    the first. The fallback log is the sharpest case — it exists precisely to
+    guarantee 'this run's rows are never silently dropped' (reporter.py module
+    docstring), and before this fix it was the one write path in the module with
+    neither a lock, an atomic rename, nor a unique name."""
+
+    def test_fallback_filename_carries_microseconds(self, reporter_paths):
+        # Six extra zero-padded digits keep two near-simultaneous fallbacks off
+        # the collision path at all. %f is always six digits, so this pins the
+        # format with no clock control.
+        path = reporter._write_fallback_log([make_result("1")], 100.0, 95.0)
+        assert re.fullmatch(r"trade_log_\d{4}-\d{2}-\d{2}_\d{6}_\d{6}\.xlsx", path.name)
+
+    def test_two_fallback_writes_at_one_instant_both_survive(
+        self, reporter_paths, monkeypatch
+    ):
+        # The load-bearing test: distinct paths alone would only restate that a
+        # suffix was typed. Each file must still hold ITS OWN row — that is what
+        # proves no run's rows were dropped.
+        monkeypatch.setattr(reporter, "datetime", _FrozenDatetime)
+
+        first = reporter._write_fallback_log([make_result("A")], 100.0, 95.0)
+        second = reporter._write_fallback_log([make_result("B")], 95.0, 90.0)
+
+        assert first != second
+        assert second.name.endswith("-1.xlsx")
+        assert first.exists()
+        assert second.exists()
+        assert _count_data_rows(first) == 1
+        assert _count_data_rows(second) == 1
+
+    def test_two_dev_simulations_at_one_instant_both_survive(
+        self, reporter_paths, monkeypatch
+    ):
+        monkeypatch.setattr(reporter, "datetime", _FrozenDatetime)
+
+        first = reporter.write_dev_simulation(
+            [make_result("A")], [], balance_cents=100_000
+        )
+        second = reporter.write_dev_simulation(
+            [make_result("B")], [], balance_cents=100_000
+        )
+
+        assert first != second
+        assert second.name.endswith("-1.xlsx")
+        assert first.exists()
+        assert second.exists()

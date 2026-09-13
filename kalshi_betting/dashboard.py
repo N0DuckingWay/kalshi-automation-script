@@ -17,7 +17,7 @@ Purpose:
 
 Dependencies:
     Imports BacktestSweep and BacktestTrade from backtester.py, and PROJECT_ROOT,
-    SAME_TITLE_CO_RESOLVE_PROB, fee_per_pair_approx() and
+    SAME_TITLE_CO_RESOLVE_PROB, create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
@@ -52,6 +52,7 @@ from .backtester import BacktestSweep, BacktestTrade
 from .config import (
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
+    create_new_output,
     fee_per_pair_approx,
     time_series_profit_prob,
 )
@@ -1121,8 +1122,11 @@ def generate_dashboard(
 
     Calls each _section_*() builder in order, concatenates the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag, then
-    writes the file to PROJECT_ROOT. The output file is timestamped so multiple
-    backtest runs can be compared without overwriting previous results.
+    writes the file to PROJECT_ROOT. The output file is timestamped to
+    microsecond precision AND created exclusively, so multiple backtest runs can
+    be compared without overwriting previous results even when two runs finish in
+    the same second — which was observed happening under the old second-precision
+    name (TS-18).
 
     The two sweep-related parameters are keyword-only WITH defaults, so the
     existing four-argument positional call still works verbatim: omit both and
@@ -1152,10 +1156,11 @@ def generate_dashboard(
             to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     Returns:
-        Path: Absolute path to the generated HTML file
-            (PROJECT_ROOT / "backtest_dashboard_YYYY-MM-DD_HHMMSS.html").
+        Path: Absolute path to the HTML file actually created
+            (PROJECT_ROOT / "backtest_dashboard_YYYY-MM-DD_HHMMSS_ffffff.html",
+            with a "-1", "-2", … stem suffix on collision).
     """
-    ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S")
+    ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
 
     sections = [
@@ -1195,6 +1200,10 @@ def generate_dashboard(
 </body>
 </html>"""
 
-    out_path.write_text(page_html, encoding="utf-8")
+    # create_new_output hands back a binary handle, so encode explicitly rather
+    # than adding a text-mode parameter to the shared helper (TS-18)
+    out_path, fh = create_new_output(out_path)
+    with fh:
+        fh.write(page_html.encode("utf-8"))
     logging.info("Dashboard written: %s", out_path)
     return out_path
