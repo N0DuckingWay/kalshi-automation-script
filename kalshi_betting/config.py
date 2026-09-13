@@ -319,6 +319,16 @@ TRANSFER_POLL_INTERVAL_SECONDS = 2
 # weekly scheduler daemon forever.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
+# A run that exits EXIT_NO_TRADEABLE_SHARDS (exchange-wide halt) is retried
+# after this many seconds, at most SCHEDULER_BLIND_MAX_RETRIES times per
+# Monday slot, so a maintenance window overlapping the 09:00 fire no longer
+# silently costs the week (TS-01). Hourly x4 covers a four-hour outage while
+# keeping the scan close to the intended slot; a longer interval would trade
+# on stale morning pricing. Bounded on purpose: a multi-day outage stops
+# retrying after the cap and scheduler_state.json records the attempts.
+SCHEDULER_BLIND_RETRY_SECONDS = 3600
+SCHEDULER_BLIND_MAX_RETRIES   = 4
+
 # ── Process exit-code contract ────────────────────────────────────────────────
 # main.py's process exit code is the only signal the scheduler (a separate
 # subprocess, per scheduler.run_job) has for what happened in a run beyond a
