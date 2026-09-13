@@ -420,6 +420,21 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
+# Eligible-market count above which backtester._prepare_entries warns the
+# operator about the RAM the grouping/pairing step is about to need, and the
+# per-record estimate the warning multiplies by.
+#
+# BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
+# phase right after it assembles the whole window back into one list and then
+# builds two group maps and two candidate-pair lists over it, releasing nothing
+# until the function returns. Measured 2026-09-12 on a FIVE-DAY window — the
+# cheapest run the tool supports — 1,089,165 compact market dicts at ~2.7 KB
+# each peaked at 6.05 GiB RSS between the "Total settled markets to analyze"
+# and "Potential pairs" log lines, on a 16 GB host (TS-07). The warning is the
+# operator's early signal on a smaller host; it never caps or drops anything.
+BACKTEST_MARKETS_RAM_WARN      = 500_000
+BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
+
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair
 # execution of the selected portfolio (execute_trades). Each pool is sized

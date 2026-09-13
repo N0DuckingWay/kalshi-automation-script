@@ -110,6 +110,8 @@ Notes:
     live scanner cannot detect it from prices.
 """
 import logging
+import resource
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -119,6 +121,8 @@ from typing import Any
 import pandas as pd
 
 from .config import (
+    BACKTEST_MARKETS_RAM_WARN,
+    BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
     INTERVAL_DISCOUNT_SWEEP,
@@ -1319,6 +1323,33 @@ def _fetch_candles_parallel(
 
 # ─── Main backtest loop ───────────────────────────────────────────────────────
 
+def _log_rss(label: str) -> None:
+    """
+    Log this process's peak resident set size so far, in MiB.
+
+    Diagnostics only — nothing branches on the value. Two calls bracket the
+    grouping/pairing step of _prepare_entries, which is where a five-day
+    window peaked at 6.05 GiB on a 16 GB host while the fetch phase it follows
+    had already been hardened to stream to disk (TS-07). Without these lines
+    the peak is invisible: it lives entirely between two existing INFO lines
+    and falls back to 100-300 MB immediately after.
+
+    getrusage reports ru_maxrss in BYTES on macOS and in KILOBYTES on Linux,
+    so the two are normalized here — otherwise the same line means two things
+    on the two platforms this runs on (dev is macOS, CI is Linux). It is a
+    high-water mark for the whole process, so it never decreases.
+
+    Args:
+        label (str): Phase name for the log line (e.g. "before grouping").
+
+    Returns:
+        None
+    """
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    mib = peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
+    logging.info("Peak RSS %s: %.0f MiB", label, mib)
+
+
 def _prepare_entries(
     hist_client: Any,
     live_client,
@@ -1431,11 +1462,33 @@ def _prepare_entries(
     )
     markets = eligible_markets
 
+    # The fetch above streams to disk a day at a time, but everything from here
+    # to the end of pair extraction is held live at once: the assembled record
+    # list, two group maps over it, and two candidate-pair lists referencing
+    # those same dicts. Warn before entering that window rather than after
+    # being OOM-killed inside it — a five-day window (the cheapest run this
+    # tool supports) measured 1.09M eligible markets and 6.05 GiB peak RSS on a
+    # 16 GB host (TS-07). Advisory only: nothing is capped or dropped.
+    if len(markets) > BACKTEST_MARKETS_RAM_WARN:
+        logging.warning(
+            "%d eligible markets: expect roughly %.1f GB of records in memory "
+            "during grouping/pairing, plus the group maps and pair lists built "
+            "over them; a 16 GB host handled 1.09M",
+            len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
+        )
+    _log_rss("before grouping")
+
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
     ts_pairs     = _extract_pairs(ts_groups)
     same_pairs   = _extract_pairs(same_groups)
+    # The group maps are the transient half of the peak and nothing below reads
+    # them — the pair lists carry the market dicts they need. Release them
+    # before the candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads
+    # rather than at function exit, which is where they were freed before.
+    del ts_groups, same_groups
+    _log_rss("after pair extraction")
 
     logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))
 

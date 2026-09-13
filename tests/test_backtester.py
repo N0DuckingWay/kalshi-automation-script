@@ -22,6 +22,7 @@ from kalshi_betting.backtester import (
     _group_by_normalized_title,
     _interval_calibration,
     _log_interval_calibration,
+    _log_rss,
     _pair_key,
     _parse_iso_date,
     _parse_iso_datetime,
@@ -1440,6 +1441,128 @@ class TestFetchCandlesParallel:
         with pytest.raises(KeyError):
             run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
                          start_date=date(2026, 1, 1), initial_balance=1000.0)
+
+
+class TestLogRss:
+    """_log_rss: one INFO line, same meaning on macOS and Linux (TS-07)."""
+
+    @staticmethod
+    def _rss_records(caplog):
+        return [r for r in caplog.records if r.getMessage().startswith("Peak RSS")]
+
+    def test_reports_a_positive_mib_value(self, caplog):
+        with caplog.at_level("INFO"):
+            _log_rss("before grouping")
+        records = self._rss_records(caplog)
+        assert len(records) == 1
+        label, mib = records[0].args
+        assert label == "before grouping"
+        assert mib > 0
+
+    @pytest.mark.parametrize(
+        ("platform", "ru_maxrss", "expected_mib"),
+        [
+            # macOS reports ru_maxrss in BYTES ...
+            ("darwin", 6 * 1024 * 1024 * 1024, 6144.0),
+            # ... and Linux in KILOBYTES. Same peak, same line.
+            ("linux", 6 * 1024 * 1024, 6144.0),
+        ],
+    )
+    def test_units_are_normalized_per_platform(
+        self, monkeypatch, caplog, platform, ru_maxrss, expected_mib,
+    ):
+        monkeypatch.setattr(backtester, "sys", SimpleNamespace(platform=platform))
+        monkeypatch.setattr(backtester, "resource", SimpleNamespace(
+            RUSAGE_SELF=0,
+            getrusage=lambda _who: SimpleNamespace(ru_maxrss=ru_maxrss),
+        ))
+        with caplog.at_level("INFO"):
+            _log_rss("after pair extraction")
+        assert self._rss_records(caplog)[0].args[1] == pytest.approx(expected_mib)
+
+
+class TestPrepareEntriesMemoryInstrumentation:
+    """TS-07: the grouping/pairing step holds the assembled record list, two
+    group maps and two pair lists live at once — 6.05 GiB on a measured
+    five-day window. It is bracketed by RSS lines and preceded by a RAM-budget
+    warning, and the group maps are released before the candlestick pool runs.
+    """
+
+    @staticmethod
+    def _markets() -> list[dict]:
+        return [
+            {"ticker": "EA", "event_ticker": "EVA", "event_title": "EV",
+             "title": "Team wins by February 1, 2026", "subtitle": "",
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "EB", "event_ticker": "EVB", "event_title": "EV",
+             "title": "Team wins by February 14, 2026", "subtitle": "",
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-14T00:00:00+00:00",
+             "settlement_ts": "2026-02-14T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch):
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    @staticmethod
+    def _ram_warnings(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "eligible markets: expect roughly" in r.getMessage()]
+
+    def test_rss_lines_bracket_the_grouping_step(self, monkeypatch, caplog):
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        labels = [r.args[0] for r in caplog.records
+                  if r.getMessage().startswith("Peak RSS")]
+        # In order, and exactly the two that bracket grouping/pairing — the
+        # window between the existing "Total settled markets" and "Potential
+        # pairs" lines, where the peak lives and is otherwise invisible.
+        assert labels == ["before grouping", "after pair extraction"]
+
+    def test_ram_warning_fires_above_the_threshold(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        warnings = self._ram_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].startswith("2 eligible markets")
+
+    def test_ram_warning_is_silent_at_the_threshold(self, monkeypatch, caplog):
+        # Strictly greater-than: a run exactly at the threshold is not warned.
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 2)
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        assert self._ram_warnings(caplog) == []
+
+    def test_ram_warning_is_silent_at_the_configured_threshold(
+        self, monkeypatch, caplog,
+    ):
+        # The real constant, unpatched: an ordinary small run says nothing.
+        with caplog.at_level("WARNING"):
+            self._run(monkeypatch)
+        assert self._ram_warnings(caplog) == []
+
+    def test_trades_are_unchanged_by_the_instrumentation(self, monkeypatch):
+        # The `del` of the group maps must not change what the run produces:
+        # nothing below pair extraction reads them.
+        trades, _ = self._run(monkeypatch)
+        assert len(trades) == 1
+        assert (trades[0].ticker_a, trades[0].ticker_b) == ("EA", "EB")
 
 
 class TestRunBacktestFeasibilityPreCheck:
