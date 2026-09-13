@@ -2384,3 +2384,20 @@ class TestExceptionSummary:
 
     def test_limit_is_configurable(self):
         assert historical._exception_summary(ValueError("y" * 500), limit=10) == "y" * 10
+
+    def test_never_raises_even_on_a_pathological_exception(self):
+        # Every caller invokes this from INSIDE an `except` block on a
+        # per-ticker path, and a _fetch_candles_parallel worker exception kills
+        # the whole backtest by that function's deliberate design — so a
+        # rendering failure here must degrade to the class name, never escape.
+        class ExplodingStr(Exception):
+            def __str__(self):
+                raise RuntimeError("__str__ is broken")
+
+        class ExplodingReason(Exception):
+            @property
+            def reason(self):
+                raise RuntimeError("reason is broken")
+
+        assert historical._exception_summary(ExplodingStr()) == "ExplodingStr"
+        assert historical._exception_summary(ExplodingReason()) == "ExplodingReason"

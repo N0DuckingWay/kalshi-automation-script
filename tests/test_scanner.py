@@ -1562,6 +1562,36 @@ class TestCursorLoopBounds:
         assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
         assert "MVE events fetch" in caplog.text
 
+    def test_complete_stream_ending_on_the_cap_does_not_warn(self, caplog, monkeypatch):
+        # The cap check runs BEFORE `cursor = new_cursor` and before the
+        # end-of-stream `if not cursor: break`, so a walk that COMPLETES on
+        # page SCANNER_MAX_PAGES used to log a truncation warning for a stream
+        # that was never truncated — a false alarm that reads, in a weekly
+        # prod log, exactly like a real blind spot. Guarding the cap on
+        # new_cursor fixes it: the final page carries a null cursor, so there
+        # is provably nothing left to fetch.
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 3)
+        pages = [
+            _raw_page([{"title": "E1", "markets": [_raw_market("T1", "Q one")]}], cursor="A"),
+            _raw_page([{"title": "E2", "markets": [_raw_market("T2", "Q two")]}], cursor="B"),
+            # Last page: end of stream, landing exactly on the cap.
+            _raw_page([{"title": "E3", "markets": [_raw_market("T3", "Q three")]}], cursor=None),
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(side_effect=pages)
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page([])
+        )
+
+        with caplog.at_level(logging.WARNING):
+            markets = fetch_open_events_with_markets(client)
+
+        # Every page was ingested — the guard bounds the warning, not the walk.
+        assert {m.ticker for m in markets} == {"T1", "T2", "T3"}
+        assert client.get_events_without_preload_content.call_count == 3
+        assert "SCANNER_MAX_PAGES" not in caplog.text
+        assert "cursor did not advance" not in caplog.text
+
 
 class TestShardIndex:
     """Unit coverage for the fail-safe shard *label* read itself. This never

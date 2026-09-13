@@ -426,7 +426,7 @@ def run_job(retries: int = 0) -> None:
     )
 
 
-def _blind_retry(retries: int):
+def _blind_retry(retries: int) -> type[schedule.CancelJob]:
     """
     One-shot retry of a blind run (TS-01).
 

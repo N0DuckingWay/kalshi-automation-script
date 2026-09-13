@@ -240,11 +240,18 @@ def _exception_summary(exc: BaseException, limit: int = 120) -> str:
         str: A single line, never longer than `limit` characters, and never
             containing the header dump. Never raises.
     """
-    reason = getattr(exc, "reason", None)
-    # str() rather than assuming a string: `reason` is whatever the SDK set.
-    text = str(reason).strip() if reason else str(exc).strip()
-    first = text.splitlines()[0].strip() if text else ""
-    return (first or type(exc).__name__)[:limit]
+    try:
+        reason = getattr(exc, "reason", None)
+        # str() rather than assuming a string: `reason` is whatever the SDK set.
+        text = str(reason).strip() if reason else str(exc).strip()
+        first = text.splitlines()[0].strip() if text else ""
+        return (first or type(exc).__name__)[:limit]
+    except Exception:
+        # The docstring promises this never raises, and every caller invokes it
+        # from INSIDE an `except` block on a per-ticker path — a pathological
+        # __str__ or a raising `reason` property must degrade to the class name,
+        # not escape a worker and kill the run.
+        return type(exc).__name__[:limit]
 
 
 def build_historical_client():

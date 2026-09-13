@@ -635,7 +635,9 @@ def get_held_tickers(client: Any) -> set:
             break
         # Hard page cap: bounds the walk against any cursor pathology, named or
         # not — the only unbounded scans left in the ingest path were here.
-        if pages >= SCANNER_MAX_PAGES:
+        # Guarded on new_cursor: a stream that ENDS on page SCANNER_MAX_PAGES
+        # was not truncated, and must not claim it was.
+        if new_cursor and pages >= SCANNER_MAX_PAGES:
             logging.warning(
                 "Positions fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
                 "pagination; raise the constant if the account genuinely holds more",
@@ -1137,7 +1139,9 @@ def fetch_open_events_with_markets(
             break
         # Hard page cap: bounds the walk against any cursor pathology, named or
         # not — the only unbounded scans left in the ingest path were here.
-        if pages >= SCANNER_MAX_PAGES:
+        # Guarded on new_cursor: a stream that ENDS on page SCANNER_MAX_PAGES
+        # was not truncated, and must not claim it was.
+        if new_cursor and pages >= SCANNER_MAX_PAGES:
             logging.warning(
                 "Open-events fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
                 "pagination; raise the constant if the exchange genuinely lists more",
@@ -1233,7 +1237,9 @@ def fetch_open_events_with_markets(
                 break
             # Hard page cap: bounds the walk against any cursor pathology,
             # named or not, independently of the productivity bail-out above.
-            if mve_pages >= SCANNER_MAX_PAGES:
+            # Guarded on new_cursor: a stream that ENDS on page
+            # SCANNER_MAX_PAGES was not truncated, and must not claim it was.
+            if new_cursor and mve_pages >= SCANNER_MAX_PAGES:
                 logging.warning(
                     "MVE events fetch: reached SCANNER_MAX_PAGES (%d) — stopping "
                     "pagination; raise the constant if the exchange genuinely lists more",

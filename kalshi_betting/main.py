@@ -374,8 +374,8 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     if not scannable:
         logging.warning(
             "Shard coverage NOT claimable: all %d advertised shards are "
-            "trading-inactive and 0 markets were ingested",
-            len(shard_statuses),
+            "trading-inactive — markets were ingested from %d shard(s)",
+            len(shard_statuses), len(market_shards),
         )
     elif not critical and not warnings:
         # Lists the shards actually scanned, not every advertised one — a

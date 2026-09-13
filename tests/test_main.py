@@ -1687,6 +1687,39 @@ class TestMainEntryPoint:
         assert exc_info.value.code == EXIT_SKIPPED_LOW_BALANCE
         assert exc_info.value.code == 10
 
+    @patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[])
+    @patch("kalshi_betting.main.fetch_shard_statuses")
+    @patch("kalshi_betting.main.get_held_tickers", return_value=set())
+    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.build_client")
+    def test_main_prod_mode_blind_run_exits_no_tradeable_shards_code(
+        self, mock_build_client, mock_verify_auth, mock_held, mock_shard_statuses,
+        mock_fetch, tmp_path, monkeypatch,
+    ):
+        # _run_prod's exit-30 return is covered directly elsewhere, but nothing
+        # asserted that main() actually propagates it to sys.exit — and that
+        # process code is the ONLY signal scheduler.run_job has that the weekly
+        # slot went unscanned rather than merely finding no edge (TS-01).
+        mock_build_client.return_value = MagicMock()
+        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10}
+        # Every advertised shard halted: ingest drops every market, so nothing
+        # could be scanned this run.
+        mock_shard_statuses.return_value = {
+            0: {"exchange_index": 0, "trading_active": False},
+            1: {"exchange_index": 1, "trading_active": False},
+        }
+
+        monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            sys, "argv", ["kalshi_betting.main", "--mode", "prod", "--dry-run"],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main.main()
+
+        assert exc_info.value.code == EXIT_NO_TRADEABLE_SHARDS
+        assert exc_info.value.code == 30
+
 
 def _fake_write_dev_simulation(results, candidate_pairs, balance_cents):
     """Stand-in for reporter.write_dev_simulation() that reproduces its one
