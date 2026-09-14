@@ -3285,3 +3285,103 @@ class TestValidatePairPriceReachableDepth:
         # buy_max_cost is a TOTAL-cost cap and can sweep a ladder.
         monkeypatch.setattr(scanner, "ORDER_API_VERSION", "legacy")
         assert self._run(monkeypatch, 600) is True
+
+
+class TestCloseTimeWarningOncePerRun:
+    """
+    TS-22: _filter_active_markets emits one summary WARNING naming how many
+    markets it dropped for a missing close_time. Both finders call it on the
+    SAME list in one run, so the line appeared TWICE. CLAUDE.md specifies one
+    summary WARNING carrying the count.
+    """
+
+    @staticmethod
+    def _markets():
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        good_a = _mock_market(ticker="A1", event_ticker="EV-A", title="Q",
+                              subtitle="Yes", yes_ask=0.35, no_ask=0.65,
+                              close_time=close)
+        good_b = _mock_market(ticker="B1", event_ticker="EV-B", title="Q",
+                              subtitle="Yes", yes_ask=0.30, no_ask=0.70,
+                              close_time=close)
+        # _mock_market substitutes a default for a falsy close_time, so the
+        # missing-deadline markets are built directly.
+        bad_1 = SimpleNamespace(ticker="X1", event_ticker="EV-X", title="Q2",
+                                subtitle="Yes", yes_ask_dollars="0.40",
+                                no_ask_dollars="0.60", yes_bid_dollars="0.38",
+                                close_time=None)
+        bad_2 = SimpleNamespace(ticker="X2", event_ticker="EV-Y", title="Q2",
+                                subtitle="Yes", yes_ask_dollars="0.40",
+                                no_ask_dollars="0.60", yes_bid_dollars="0.38",
+                                close_time=None)
+        return [good_a, good_b, bad_1, bad_2]
+
+    def test_one_warning_across_both_finders_in_one_run(self, caplog):
+        # The duplication happens one level up from _filter_active_markets, so
+        # a test that invokes it once is tautologically satisfied and cannot
+        # see this. Drive BOTH finders on one list, as both run modes do.
+        markets = self._markets()
+        with caplog.at_level(logging.WARNING):
+            find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+            find_same_title_pairs(markets, held_tickers=set())
+        lines = [r.getMessage() for r in caplog.records
+                 if "missing/unparseable close_time" in r.getMessage()]
+        assert len(lines) == 1
+        assert "2" in lines[0]
+
+    def test_the_markets_are_still_dropped_by_the_quiet_caller(self):
+        # GUARD: the flag suppresses the REPORT, never the filtering.
+        markets = self._markets()
+        kept = scanner._filter_active_markets(markets, set(), warn_missing_close=False)
+        assert [m.ticker for m in kept] == ["A1", "B1"]
+
+    def test_standalone_caller_still_warns_by_default(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            scanner._filter_active_markets(self._markets(), set())
+        assert "missing/unparseable close_time" in caplog.text
+
+
+class TestTimeSeriesFallbackForwardsShardFilter:
+    """
+    TS-27: find_time_series_pairs fetches its own markets when the caller
+    supplies none, and that fallback passed NO shard filter — so it would
+    ingest and pair markets on shards the exchange reports trading_active=false
+    for, the one ingest-time exclusion CLAUDE.md calls mandatory.
+
+    DEAD CODE TODAY: both non-test callers pass markets=, as do all the test
+    call sites. Unreachable in production, unreachable in the suite, and wrong
+    if ever reached.
+    """
+
+    def test_fallback_forwards_the_inactive_shard_set(self, monkeypatch):
+        seen = {}
+
+        def _fake_fetch(client, inactive_shards=None):
+            seen["inactive_shards"] = inactive_shards
+            return []
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _fake_fetch)
+        find_time_series_pairs(MagicMock(), inactive_shards={2, 3})
+        # The VALUE, not merely the parameter's existence: a test that only
+        # asserted the kwarg was accepted would pass against an inverted or
+        # dropped forward.
+        assert seen["inactive_shards"] == {2, 3}
+
+    def test_fallback_defaults_to_excluding_nothing(self, monkeypatch):
+        seen = {}
+
+        def _fake_fetch(client, inactive_shards=None):
+            seen["inactive_shards"] = inactive_shards
+            return []
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _fake_fetch)
+        find_time_series_pairs(MagicMock())
+        assert seen["inactive_shards"] is None
+
+    def test_supplied_markets_skip_the_fetch_entirely(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError("fallback must not run when markets= is given")
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _boom)
+        find_time_series_pairs(MagicMock(), markets=[], inactive_shards={1})

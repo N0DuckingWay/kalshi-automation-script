@@ -665,7 +665,12 @@ def display_title(market: Any) -> str:
     return f"{event_title}: {base}" if event_title else base
 
 
-def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
+def _filter_active_markets(
+    markets: list,
+    excluded_tickers: set | None = None,
+    *,
+    warn_missing_close: bool = True,
+) -> list:
     """
     Filter markets to those that are actively priced, deadline-known, and not
     already held.
@@ -687,13 +692,21 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
         markets (list): List of Kalshi market API objects to filter.
         excluded_tickers (set | None): Set of ticker strings to skip. If None,
             no tickers are excluded.
+        warn_missing_close (bool): Whether to emit the missing-close_time
+            summary WARNING. Keyword-only, and True by default so any
+            standalone caller keeps the signal. Both run modes call this on the
+            SAME market list twice — once per finder — so the second caller
+            passes False to keep it at ONE line per run, which is what
+            CLAUDE.md specifies. This flag NEVER changes which markets are
+            dropped, only whether the drop is reported (TS-22).
 
     Returns:
         list: Subset of markets that have a non-None close_time and a parseable
             YES ask in [0.01, 0.99], and whose ticker is not in
             excluded_tickers. Markets with a missing/unparseable close_time are
-            dropped and reported once as a single summary WARNING with the count
-            (silent when none were dropped).
+            ALWAYS dropped; they are reported once as a single summary WARNING
+            with the count (silent when none were dropped, or when
+            warn_missing_close is False).
     """
     excluded = excluded_tickers or set()
     active = []
@@ -713,7 +726,7 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
                 active.append(m)
         except (ValueError, TypeError):
             pass
-    if missing_close_time:
+    if missing_close_time and warn_missing_close:
         # Same silent-at-zero idiom as the trading-inactive shard skip count.
         logging.warning(
             "Skipped %d markets with missing/unparseable close_time", missing_close_time
@@ -1617,6 +1630,7 @@ def find_time_series_pairs(
     client: Any,
     held_tickers: set | None = None,
     markets: list | None = None,
+    inactive_shards: set | None = None,
 ) -> list:
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
@@ -1667,6 +1681,12 @@ def find_time_series_pairs(
             None or empty means exclude nothing.
         markets (list | None): Pre-fetched ApiMarket list to scan. When None,
             fetches all open markets via fetch_open_events_with_markets(client).
+        inactive_shards (set | None): exchange_index values the exchange
+            reports trading_active=false for, forwarded to that fallback fetch
+            so this path applies the same single ingest-time shard exclusion
+            both run modes do. IGNORED when markets is supplied — which is what
+            every caller does today, making the fallback unreachable. None
+            excludes no shard.
 
     Returns:
         list: CandidatePair objects, one per normalized-title group that
@@ -1675,8 +1695,13 @@ def find_time_series_pairs(
             deadline-gap cap.
     """
     if markets is None:
-        # Fetch all open markets from the Kalshi API if not supplied by the caller
-        markets = fetch_open_events_with_markets(client)
+        # Fetch all open markets from the Kalshi API if not supplied by the
+        # caller. The exclusion must match main's: nothing on a shard the
+        # exchange reports trading_active=false for can be traded, and it must
+        # not linger as a stale candidate either. Without the forward this path
+        # would ingest and PAIR markets on halted shards — the one ingest-time
+        # exclusion that is mandatory (TS-27).
+        markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
 
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
@@ -1832,7 +1857,12 @@ def find_same_title_pairs(
             Empty if no group has two markets on different event_tickers.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
-    active = _filter_active_markets(markets, held_tickers)
+    # warn_missing_close=False: both run modes call find_time_series_pairs on
+    # this SAME list immediately before this call (main._run_dev, _run_prod),
+    # and it has already emitted the summary WARNING. One line per run, as
+    # CLAUDE.md specifies — not one per finder. The markets are still dropped
+    # here either way; only the report is suppressed (TS-22).
+    active = _filter_active_markets(markets, held_tickers, warn_missing_close=False)
 
     # Group by exact (event_title, title, subtitle) tuple — no normalization.
     # Three-element key: event_title prevents MVE cross-event collisions; the
