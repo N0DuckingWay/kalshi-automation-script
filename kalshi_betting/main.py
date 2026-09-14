@@ -522,8 +522,11 @@ def _run_dev(client, args) -> int:
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Replace best-ask prices with depth-weighted order book averages to validate liquidity
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
+    # Replace best-ask prices with order book averages over the depth this
+    # balance could actually buy, and validate liquidity
+    candidate_pairs   = enrich_with_orderbook_prices(
+        client, candidate_pairs, sandbox_balance_cents,
+    )
 
     if not candidate_pairs:
         # BS-26: write_dev_simulation() already logs "Dev simulation written: %s" —
@@ -676,8 +679,9 @@ def _run_prod(client, args) -> int:
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Replace best-ask prices with depth-weighted order book averages to validate liquidity
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs)
+    # Replace best-ask prices with order book averages over the depth this
+    # balance could actually buy, and validate liquidity
+    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs, balance_cents)
 
     if not candidate_pairs:
         logging.info(_no_pairs_msg())

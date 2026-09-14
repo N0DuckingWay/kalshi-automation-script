@@ -25,6 +25,12 @@ from kalshi_betting.config import (
 from kalshi_betting.scanner import CandidatePair, enrich_with_orderbook_prices
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
 
+# Balance handed to enrich_with_orderbook_prices. Deliberately far larger than
+# any fixture book: the affordability cap is min(book depth, what the budget
+# buys), so an ample balance makes it never bind and these tests keep exercising
+# the depth path alone. Tests that mean to exercise the cap set their own.
+_AMPLE_BALANCE_CENTS = 100_000_000
+
 
 def make_pair(
     pA: float = 0.70,
@@ -517,7 +523,7 @@ class TestKellyOperandsShareOneSnapshot:
         client = self._books(pA_fill=0.54, nB_fill=0.30, pB_ref=0.45)
 
         # Enrichment is the producer of every pair _kelly_p ever prices
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
 
         # The invariant: a tradeable time-series pair still runs in the
         # direction it qualified in, so the max(0, pB - pA) clamp is
@@ -537,7 +543,7 @@ class TestKellyOperandsShareOneSnapshot:
         # survives and is priced on a genuine, non-clamped gap
         pair = self._pair(pA=0.30, pB=0.60, nB=0.50)
         client = self._books(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pB > enriched.pA
         assert _kelly_p(enriched) == pytest.approx(
