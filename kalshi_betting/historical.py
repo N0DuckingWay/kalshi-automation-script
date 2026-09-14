@@ -17,6 +17,7 @@ Dependencies:
     from _http.py; and PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
     SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES, ARCHIVE_TAIL_MAX_PAGES,
+    ARCHIVE_TAIL_MAX_RECORDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     INCLUDE_MVE_MARKETS, PROD_URL) from config.py. Exports
@@ -84,6 +85,7 @@ from .auth import build_client
 from .config import (
     ARCHIVE_MAX_BARREN_PAGES,
     ARCHIVE_TAIL_MAX_PAGES,
+    ARCHIVE_TAIL_MAX_RECORDS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
@@ -1686,6 +1688,22 @@ def _fetch_archive_tail(
                 ARCHIVE_TAIL_MAX_PAGES, pages,
             )
             return kept
+        # Residency backstop, composing with the page cap above: whichever
+        # binds first stops the walk. This is the one fetch path with no
+        # chunked emit sink, so its whole result stays resident — the page cap
+        # alone allows ~2M records (roughly 5 GB), the same OOM shape the
+        # sharded fetch exists to avoid (TS-15).
+        if len(kept) >= ARCHIVE_TAIL_MAX_RECORDS:
+            logging.warning(
+                "Historical archive tail: reached the %d-record cap "
+                "(ARCHIVE_TAIL_MAX_RECORDS) after walking %d pages below "
+                "created_time == start_date — stopping to bound memory. "
+                "Long-lived pre-start markets beyond this point that settle "
+                "inside the window may be missed; raise the cap if a run needs "
+                "them.",
+                ARCHIVE_TAIL_MAX_RECORDS, pages,
+            )
+            return kept
         cursor = next_cursor
 
 
@@ -1871,6 +1889,25 @@ def _fetch_archive_phase(
             records already are. On the sequential fallback, everything is
             returned fully filtered in the first list and the second is empty.
     """
+    if start_ts >= cutoff_ts:
+        # The archive holds only markets that settled BEFORE the cutoff, so a
+        # window starting at or after it cannot contain a single archive
+        # record — there is nothing here to fetch, whatever the walk would do.
+        # Without this the phase still ran the cursor-synthesis probe and the
+        # tail walk to prove that, costing ~18 seconds and ~50,000 parsed
+        # records on every post-cutoff run (TS-25). Logged rather than silent
+        # so the absence of the usual archive progress lines is explained
+        # rather than read as a phase that failed; note that this also skips
+        # the synthesis probe, so a run with no archive contribution no longer
+        # reports on cursor synthesis at all.
+        logging.info(
+            "Historical archive phase skipped: the window starts at %s, at or "
+            "after the archive cutoff %s, so no archive record can satisfy it",
+            datetime.fromtimestamp(start_ts, tz=UTC).isoformat(timespec="seconds"),
+            datetime.fromtimestamp(cutoff_ts, tz=UTC).isoformat(timespec="seconds"),
+        )
+        return [], []
+
     try:
         # The probe issues a real request, so it can fail for reasons that have
         # nothing to do with cursor format (auth, outage, a body that won't

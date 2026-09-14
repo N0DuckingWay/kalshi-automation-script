@@ -639,6 +639,20 @@ ARCHIVE_MAX_BARREN_PAGES = 50
 # bound cost).
 ARCHIVE_TAIL_MAX_PAGES = 2000
 
+# Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
+# the page cap above. The tail is the one fetch path with no chunked `emit`
+# sink — every other phase streams its records to a day slice and drops them —
+# so its whole result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
+# that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,
+# which is the same OOM shape the sharded fetch was rewritten to avoid
+# (BS-15). The two caps COMPOSE: whichever binds first stops the walk, so the
+# real bound is min(pages x 1000, this) records. 500k at ~2.7 KB each is about
+# 1.3 GB — large enough that no realistic window reaches it, small enough that
+# a pathological one cannot take the host down. Hitting it logs a WARNING
+# naming the count, the same bound-the-work-then-say-so idiom as the page cap
+# and EVENT_TITLE_FALLBACK_MAX_LOOKUPS (TS-15).
+ARCHIVE_TAIL_MAX_RECORDS = 500_000
+
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE
 # loops, get_held_tickers). A live dev-mode run paged 125,538 sandbox markets
