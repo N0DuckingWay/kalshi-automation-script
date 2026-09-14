@@ -3100,3 +3100,53 @@ class TestFilterActiveMarketsCloseTimeGuard:
 
         assert len(pairs) == 1, f"Expected exactly one pair from the two good markets; got {pairs}"
         assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"EARLY", "LATE"}
+
+
+class TestBidsToAskLevelsSubCent:
+    """
+    _bids_to_ask_levels keeps sub-cent order-book levels (TS-14, levels half).
+
+    The bound here is config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the
+    extreme tradeable levels on Kalshi's FINEST grid — deliberately NOT the
+    0.01/0.99 market-eligibility bound, which is unchanged.
+    """
+
+    def test_sub_cent_ask_level_is_kept(self):
+        # NO bid 0.995 -> YES ask 0.005. Real depth on a centi-cent book; the
+        # old 0.01 floor discarded it silently.
+        assert _bids_to_ask_levels([["0.995", "40"]]) == [(pytest.approx(0.005), 40.0)]
+
+    def test_level_just_under_one_is_kept(self):
+        # NO bid 0.002 -> YES ask 0.998, inside 0.9999 but outside the old 0.99.
+        assert _bids_to_ask_levels([["0.002", "12"]]) == [(pytest.approx(0.998), 12.0)]
+
+    def test_levels_outside_the_finest_grid_are_still_dropped(self):
+        # 1.0 -> ask 0.0 and 0.0 -> ask 1.0 are settled prices, not depth.
+        assert _bids_to_ask_levels([["1.0", "5"], ["0.0", "5"]]) == []
+
+    def test_whole_cent_levels_are_unchanged(self):
+        # PIN: the common linear-cent path must be byte-identical.
+        assert _bids_to_ask_levels([["0.60", "10"], ["0.55", "20"]]) == [
+            (pytest.approx(0.40), 10.0), (pytest.approx(0.45), 20.0),
+        ]
+
+    def test_dropped_levels_are_counted_and_logged_once(self, caplog):
+        raw = [["1.0", "5"], ["0.60", "10"], ["0.55", "0"], ["bogus", "3"]]
+        with caplog.at_level(logging.WARNING):
+            levels = _bids_to_ask_levels(raw, "KXTEST-9")
+        assert levels == [(pytest.approx(0.40), 10.0)]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "KXTEST-9" in warnings[0]
+        assert "dropped 3 of 4" in warnings[0]
+
+    def test_no_warning_when_nothing_is_dropped(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _bids_to_ask_levels([["0.60", "10"]], "KXTEST-9")
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_market_eligibility_bound_is_unchanged(self):
+        # TS-14 is levels-only by operator decision: no market excluded today
+        # becomes tradeable. Guard, not proof of the fix.
+        assert scanner._MIN_ACTIVE_PRICE == 0.01
+        assert scanner._MAX_ACTIVE_PRICE == 0.99

@@ -237,6 +237,23 @@ BUY_SLIPPAGE_TICKS            = 1
 # the API's dollar-string fields exist to avoid.
 DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 
+# The extreme tradeable price levels on Kalshi's FINEST grid ($0.0001 ticks,
+# the center_deci_edge_centi_cent edge bands). Used by
+# scanner._bids_to_ask_levels to decide which ORDER-BOOK LEVELS are real
+# quotes: a level's complement outside this range is a settled or nonsensical
+# price, not depth.
+#
+# Deliberately NOT the same bound as scanner's market-eligibility check
+# (_MIN_ACTIVE_PRICE/_MAX_ACTIVE_PRICE, still 0.01/0.99), and the two must not
+# be unified. Eligibility asks "is this MARKET worth trading at all", where a
+# sub-cent YES ask means a near-settled market and admitting it would make a
+# 0.9999 quote into a $0.0001 hedge leg. This bound asks "is this LEVEL a real
+# quote on a market we already accepted" — and on the deci-cent and
+# centi-cent regimes, whose entire point is sub-cent ticks, the old 0.01/0.99
+# level bound silently discarded genuine depth (TS-14).
+MIN_ACTIVE_PRICE_DOLLARS      = 0.0001
+MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
+
 # Which create-order endpoint trader.py submits through. Allowed values:
 #   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
 #              (the limit price IS the price protection), fixed-point counts,

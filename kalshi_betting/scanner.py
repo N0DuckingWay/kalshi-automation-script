@@ -67,7 +67,9 @@ from .config import (
     EXCHANGE_FLAG_TRUE_TOKENS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
+    MAX_ACTIVE_PRICE_DOLLARS,
     MAX_DEADLINE_GAP_DAYS,
+    MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
     POSITION_PAGE_SIZE,
     SAME_TITLE_LEG_SIDES,
@@ -117,7 +119,11 @@ _DATE_PATTERNS = [
 ]
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
 
-# Minimum ask price to consider a market actively priced (not settled/illiquid)
+# Minimum ask price to consider a MARKET actively priced (not settled/illiquid).
+# Distinct from config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), which
+# bounds an order-book LEVEL. Do not unify them: widening this one would admit
+# near-settlement markets, turning a 0.9999 YES quote into a $0.0001 hedge leg
+# (TS-14, market half — a held operator decision, not an oversight).
 _MIN_ACTIVE_PRICE = 0.01
 _MAX_ACTIVE_PRICE = 0.99
 
@@ -1853,7 +1859,26 @@ def prefix_fill_prices(
     return sum_a / n, sum_b / n
 
 
-def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
+def _pair_ticker(pair: Any, attr: str) -> str:
+    """
+    Read one of a pair's market tickers without assuming the market is there.
+
+    Used only to name a market in a log line. _leg_ask_levels and
+    _reference_yes_ask are deliberately tolerant of a bare pair stub (the same
+    fail-safe rule leg_sides applies to an unknown pair_type), so a missing
+    market must degrade to a placeholder rather than raise inside the scan.
+
+    Args:
+        pair (Any): A CandidatePair or any stub exposing market_a/market_b.
+        attr (str): "market_a" or "market_b".
+
+    Returns:
+        str: The market's ticker, or "<unknown>" when it cannot be read.
+    """
+    return getattr(getattr(pair, attr, None), "ticker", "<unknown>")
+
+
+def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple[float, float]]:
     """
     Convert bid levels to ask levels via the complement price (1 − P).
 
@@ -1861,26 +1886,50 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
                            NO bid at P → YES ask at (1−P).
     Descending bids naturally yield ascending asks after the complement.
 
+    Bounded by config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the extreme
+    tradeable levels on Kalshi's FINEST grid — NOT by the 0.01/0.99
+    market-eligibility bound. Those are different questions, and using the
+    coarse one here silently discarded real depth on exactly the regimes whose
+    point is sub-cent ticks: every level of a deci-cent or centi-cent book
+    priced under a cent, or over 99c, vanished before pairing (TS-14).
+
     Args:
         bids_raw (list): [[price_str, qty_str], ...] sorted descending by
             price, as parsed from the orderbook payload.
+        ticker (str): The market the book came from, named in the drop
+            WARNING only. Defaults to a placeholder for hand-built input.
 
     Returns:
         list[tuple[float, float]]: [(ask_price, qty), ...] sorted ascending
             (cheapest ask first). A level whose complement price falls outside
-            [_MIN_ACTIVE_PRICE, _MAX_ACTIVE_PRICE] or whose qty is <= 0 is
-            dropped; a malformed entry (bad price/qty string) is skipped.
+            [MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS] or whose qty
+            is <= 0 is dropped, as is a malformed entry (bad price/qty string);
+            one summary WARNING names the total, silent at zero.
     """
     levels = []
+    dropped = 0
     for entry in bids_raw:
         try:
             bid_price = float(entry[0])
             qty = float(entry[1])
             ask_price = 1.0 - bid_price
-            if _MIN_ACTIVE_PRICE <= ask_price <= _MAX_ACTIVE_PRICE and qty > 0:
+            if MIN_ACTIVE_PRICE_DOLLARS <= ask_price <= MAX_ACTIVE_PRICE_DOLLARS and qty > 0:
                 levels.append((ask_price, qty))
+            else:
+                dropped += 1
         except (ValueError, TypeError, IndexError):
+            dropped += 1
             continue
+    if dropped:
+        # Same silent-at-zero summary idiom as the trading-inactive shard skip
+        # count. These drops used to be entirely invisible, so a book thinned
+        # by a drifted payload read downstream as genuinely thin depth (TS-14).
+        logging.warning(
+            "Orderbook for %s: dropped %d of %d bid levels as unusable "
+            "(complement outside [%s, %s], nonpositive qty, or unparseable)",
+            ticker, dropped, len(bids_raw),
+            MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS,
+        )
     levels.sort(key=lambda x: x[0])
     return levels
 
@@ -1923,9 +1972,11 @@ def _leg_ask_levels(
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     if side_a == "no":
         # NO on A consumes A's YES bids; YES on B consumes B's NO bids
-        return _bids_to_ask_levels(ob_a["yes"]), _bids_to_ask_levels(ob_b["no"])
+        return (_bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a")),
+                _bids_to_ask_levels(ob_b["no"], _pair_ticker(pair, "market_b")))
     # YES on A consumes A's NO bids; NO on B consumes B's YES bids
-    return _bids_to_ask_levels(ob_b["yes"]), _bids_to_ask_levels(ob_a["no"])
+    return (_bids_to_ask_levels(ob_b["yes"], _pair_ticker(pair, "market_b")),
+            _bids_to_ask_levels(ob_a["no"], _pair_ticker(pair, "market_a")))
 
 
 def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
@@ -1958,7 +2009,8 @@ def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
     # leg: YES on A for time_series, YES on B for same_title
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     ob_ref = ob_b if side_a == "yes" else ob_a
-    levels = _bids_to_ask_levels(ob_ref["no"])
+    ref_ticker = _pair_ticker(pair, "market_b" if side_a == "yes" else "market_a")
+    levels = _bids_to_ask_levels(ob_ref["no"], ref_ticker)
     # _bids_to_ask_levels returns ASCENDING asks, so [0] is the best (lowest)
     return levels[0][0] if levels else None
 
