@@ -1507,10 +1507,15 @@ def make_spec() -> SimpleNamespace:
         x=5,
         y=5,
         total_cost=2.0,
+        # Fee-INCLUSIVE, and deliberately different from total_cost: every
+        # human-facing cost line reports this one (TS-12), so a fixture where
+        # the two matched would let a regression back to total_cost pass.
+        # Equals cost_with_fees_a + cost_with_fees_b, the documented invariant.
+        total_cost_with_fees=2.30,
         # Per-leg fee-inclusive costs — trader._required_cents_by_shard reads
         # these to total the collateral each shard must hold before execution
-        cost_with_fees_a=1.0,
-        cost_with_fees_b=1.0,
+        cost_with_fees_a=1.15,
+        cost_with_fees_b=1.15,
         min_payoff=0.50,
         profit_ratio=0.10,
         monthly_profit_ratio=0.20,

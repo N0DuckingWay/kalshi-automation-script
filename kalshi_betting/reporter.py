@@ -91,7 +91,11 @@ _TRADE_COLUMNS = [
     # Notes prefix names the sides. An existing workbook keeps its old headers.
     ("x — A leg",         12),
     ("y — B leg",         13),
-    ("Total Cost ($)",    14),
+    # Fee-INCLUSIVE, matching the cash the collateral planner actually
+    # moves and the basis "Profit if won" is already net of (TS-12).
+    # An existing workbook keeps its old header; every row's Notes
+    # carries fees=$x.xx so a row under the old header is still readable.
+    ("Total Cost incl. fees ($)", 22),
     ("Profit if won ($)", 14),
     ("Profit Ratio (%)",  16),
     ("Status",            12),
@@ -201,8 +205,14 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     # nB is a traded leg price only for time-series pairs; for same-title it
     # is reporting-only and would just be noise in the Notes cell
     nb_note = f" nB={pair.nB:.4f}" if pair.pair_type == "time_series" else ""
+    # fees=... makes a row self-describing: _append_locked writes headers only
+    # when CREATING the file, so a pre-existing shared trade_log.xlsx keeps the
+    # old "Total Cost ($)" header above a column whose values are now
+    # fee-inclusive. The suffix is what tells a reader which basis a row is on.
+    fees = spec.total_cost_with_fees - spec.total_cost
     notes = (
-        f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}] "
+        f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}"
+        f" fees=${fees:.2f}] "
         + (result.error or "")
     )
 
@@ -223,7 +233,7 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
         round(pair.nA, 4),
         spec.x,
         spec.y,
-        round(spec.total_cost, 2),
+        round(spec.total_cost_with_fees, 2),
         round(spec.min_payoff, 2),
         round(spec.profit_ratio, 4),
         result.status,

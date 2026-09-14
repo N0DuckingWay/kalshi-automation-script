@@ -172,11 +172,11 @@ def _print_portfolio(portfolio: list, label: str) -> None:
         side_a, side_b = leg_sides(spec.pair.pair_type)
         logging.info(
             "  [%s] %s — %d× %s(A) + %d× %s(B) — "
-            "cost $%.2f, profit if won $%.2f (%.1f%% return)",
+            "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)",
             spec.pair.pair_type,
             spec.pair.canonical_title[:55],
             spec.x, side_a.upper(), spec.y, side_b.upper(),
-            spec.total_cost, spec.min_payoff,
+            spec.total_cost_with_fees, spec.min_payoff,
             spec.profit_ratio * 100,
         )
 
@@ -779,14 +779,14 @@ def _run_prod(client, args) -> int:
             # and for a time-series pair the NO leg (the one that gets unwound)
             # is market B's, so y is the count a human must reconcile first.
             logging.critical(
-                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d cost=$%.2f | %s",
+                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d cost=$%.2f incl. fees | %s",
                 r.status,
                 r.spec.pair.canonical_title,
                 r.spec.pair.market_a.ticker,
                 r.spec.pair.market_b.ticker,
                 r.spec.x,
                 r.spec.y,
-                r.spec.total_cost,
+                r.spec.total_cost_with_fees,
                 r.error or "",
             )
         raise

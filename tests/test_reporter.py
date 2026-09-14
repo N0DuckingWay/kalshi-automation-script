@@ -218,23 +218,25 @@ class TestResultToRow:
         assert row[10] == pytest.approx(0.70)
         assert row[11] == 5
         assert row[12] == 5
-        assert row[13] == pytest.approx(4.75)
+        # TS-12: the column is fee-INCLUSIVE now (total_cost_with_fees,
+        # 4.85), not the contract-only total_cost of 4.75.
+        assert row[13] == pytest.approx(4.85)
         assert row[14] == pytest.approx(0.25)
         assert row[15] == pytest.approx(0.05)
         assert row[16] == "executed"
         # Notes = prefix + the trader's error text, verbatim
-        assert row[17] == "[time_series: YES A / NO B nB=0.4000] YES leg FoK not filled"
+        assert row[17] == "[time_series: YES A / NO B nB=0.4000 fees=$0.10] YES leg FoK not filled"
 
     def test_notes_prefix_time_series_names_sides_and_nb(self):
         row = reporter._result_to_row(make_result("1"), datetime(2026, 9, 8))
-        assert row[17] == "[time_series: YES A / NO B nB=0.4000] "
+        assert row[17] == "[time_series: YES A / NO B nB=0.4000 fees=$0.10] "
 
     def test_notes_prefix_same_title_names_sides_without_nb(self):
         # nB is reporting-only for a same-title pair, so it is not in the prefix
         row = reporter._result_to_row(
             make_result("1", pair_type="same_title"), datetime(2026, 9, 8),
         )
-        assert row[17] == "[same_title: NO A / YES B] "
+        assert row[17] == "[same_title: NO A / YES B fees=$0.10] "
 
     def test_trade_column_headers_are_side_neutral(self):
         headers = [h for h, _ in reporter._TRADE_COLUMNS]
@@ -244,7 +246,7 @@ class TestResultToRow:
         assert headers[14] == "Profit if won ($)"
         # _apply_number_formats' hardcoded indices depend on this order
         assert headers[8:11] == ["pA (YES ask)", "pB (YES ask)", "nA (NO ask)"]
-        assert headers[13] == "Total Cost ($)"
+        assert headers[13] == "Total Cost incl. fees ($)"
         assert headers[15] == "Profit Ratio (%)"
 
 
@@ -322,7 +324,7 @@ class TestWriteDevSimulationCandidatesSheet:
         ws = openpyxl.load_workbook(path)["Simulated Trades"]
         # Row 1 headers, row 2 the merged summary banner, row 3 the trade
         assert ws.cell(row=3, column=17).value == "executed"
-        assert ws.cell(row=3, column=18).value == "[time_series: YES A / NO B nB=0.4000] "
+        assert ws.cell(row=3, column=18).value == "[time_series: YES A / NO B nB=0.4000 fees=$0.10] "
 
 
 class _FrozenDatetime:

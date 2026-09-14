@@ -2306,10 +2306,10 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             logging.info(
                 "[DRY RUN] Pair order (NO leg first, then YES — there is no batch "
                 "endpoint): Buy %dx %s @ %.2f%% | Buy %dx %s @ %.2f%% | "
-                "Total cost: $%.2f | Profit if won: $%.2f",
+                "Total cost: $%.2f incl. fees | Profit if won: $%.2f",
                 no_leg.count, no_leg.label, no_leg.price_dollars * 100,
                 yes_leg.count, yes_leg.label, yes_leg.price_dollars * 100,
-                spec.total_cost, spec.min_payoff,
+                spec.total_cost_with_fees, spec.min_payoff,
             )
             results.append(TradeResult(spec=spec, status="simulated"))
         return results
