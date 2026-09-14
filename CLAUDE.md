@@ -49,7 +49,7 @@ historical.py → auth.py (build_client, wrapped by build_historical_client/buil
 historical.py → backtester.py → dashboard.py → backtest.py
 backtester.py → scanner.py (normalize_title, for title-based pair grouping; leg_sides, so _settlement_receipt pays by the side each leg bought)
 
-v2_probe.py — standalone, human-run; imports auth/config/scanner/trader, imported by NOTHING
+v2_probe.py — standalone, human-run; imports _http/auth/config/scanner/trader, imported by NOTHING
 ```
 
 ---

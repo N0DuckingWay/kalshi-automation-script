@@ -844,7 +844,15 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     fig_slip.update_layout(title="Slippage Distribution (Actual − Win-Scenario Payoff, $)",
                             xaxis_title="Slippage ($)", yaxis_title="Count")
 
-    # Best and worst trades table
+    # Best and worst trades table.
+    #
+    # Below 11 trades these two slices OVERLAP — identical rows under both
+    # headings at fewer than 5, partial overlap at 5-10 — with nothing on the
+    # page saying so. That is a recorded WONTFIX (operator decision,
+    # 2026-09-13), not an oversight: on a low-frequency bot's early dashboards
+    # the overlap is accepted, and a reader of a 5-trade dashboard is looking
+    # at every trade either way. Do not "fix" it into a single merged table
+    # without asking; the sweep raised it as TS-29 and it was declined.
     sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
     best  = sorted_trades[:5]
     worst = sorted_trades[-5:]

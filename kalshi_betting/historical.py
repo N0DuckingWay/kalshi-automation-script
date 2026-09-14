@@ -1253,10 +1253,13 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
 
     Deliberately still writes the legacy format rather than "jsonl-v1": it is
     handed a fully-materialized list anyway, so it gains nothing from
-    streaming, and keeping it means the legacy format stays a first-class,
-    exercised write path for the hundreds of MB of legacy slices already on
-    disk. The fetch workers use _DayStreamWriter instead, because they are
-    exactly the callers that must NOT hold a whole day in memory.
+    streaming. It is NOT on any production path — both persisting fetch
+    workers use _DayStreamWriter, because they are exactly the callers that
+    must not hold a whole day in memory — so this is the legacy format's
+    writer of record, exercised by the tests and kept so the format both
+    writers must stay compatible with cannot rot. The legacy READ path is
+    live: hundreds of MB of legacy slices are already on disk and
+    _day_store_load still routes to them (TS-26).
 
     Args:
         path (Path): Destination path from _day_store_path().

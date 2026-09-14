@@ -22,4 +22,11 @@ Purpose:
 Dependencies:
     This file has no imports. All public modules are accessible as
     kalshi_betting.<module> after this package is imported.
+
+Notes:
+    Deliberately empty of re-exports. Importing submodules here would make
+    `import kalshi_betting` pull in the whole package — including trader.py,
+    which submits real orders — and would give the dependency graph in
+    CLAUDE.md a cycle through the package root that the modules themselves do
+    not have. Callers import the module they need by name.
 """

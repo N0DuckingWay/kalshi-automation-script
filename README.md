@@ -415,7 +415,7 @@ python3 -m pytest tests/ -v      # run the test suite
 python3 -m ruff check kalshi_betting/   # lint check
 ```
 
-Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. `.github/workflows/ci.yml` runs both commands on every push and pull request to `main`; both must pass before merging.
+Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. `.github/workflows/ci.yml` runs both commands on every push to `main` and on EVERY pull request, whatever its base branch — the `pull_request:` trigger carries no branch filter. Both must pass before merging.
 
 ---
 
