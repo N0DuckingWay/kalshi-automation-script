@@ -3385,3 +3385,44 @@ class TestTimeSeriesFallbackForwardsShardFilter:
 
         monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _boom)
         find_time_series_pairs(MagicMock(), markets=[], inactive_shards={1})
+
+
+class TestHorizonFilterLogging:
+    """
+    TS-24: filter_markets_within_horizon logged nothing, so --max-horizon-days
+    left no evidence it had taken effect and a live run whose pair counts
+    differed could not be attributed to it.
+    """
+
+    @staticmethod
+    def _markets():
+        from datetime import UTC, datetime, timedelta
+        now = datetime.now(UTC)
+        return [
+            _mock_market(ticker="NEAR", event_ticker="E1", close_time=now + timedelta(days=3)),
+            _mock_market(ticker="MID", event_ticker="E2", close_time=now + timedelta(days=10)),
+            _mock_market(ticker="FAR", event_ticker="E3", close_time=now + timedelta(days=90)),
+        ]
+
+    def test_logs_kept_and_total_and_the_cutoff(self, caplog):
+        with caplog.at_level(logging.INFO):
+            kept = filter_markets_within_horizon(self._markets(), 14)
+        assert [m.ticker for m in kept] == ["NEAR", "MID"]
+        lines = [r.getMessage() for r in caplog.records if "Horizon filter" in r.getMessage()]
+        assert len(lines) == 1
+        assert "kept 2 of 3" in lines[0]
+        assert "--max-horizon-days 14" in lines[0]
+
+    def test_cutoff_carries_a_time_of_day_not_just_a_date(self, caplog):
+        # The cutoff is now + N days, so printing only .date() would imply a
+        # midnight boundary the filter does not have.
+        with caplog.at_level(logging.INFO):
+            filter_markets_within_horizon(self._markets(), 14)
+        line = next(r.getMessage() for r in caplog.records if "Horizon filter" in r.getMessage())
+        assert "T" in line.split("before ")[1]
+
+    def test_silent_when_the_flag_is_absent(self, caplog):
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_within_horizon(self._markets(), None)
+        assert len(out) == 3
+        assert "Horizon filter" not in caplog.text

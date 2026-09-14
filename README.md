@@ -292,6 +292,12 @@ days from the moment the bot runs are considered — applies to both time-series
 and same-title pairs. Omit the flag (the default) to consider all otherwise-eligible
 markets regardless of deadline.
 
+When the flag is set, the run logs one `Horizon filter: kept N of M markets
+closing on or before <cutoff>` line at INFO, so a run whose pair counts differ
+from the previous one can be attributed to the horizon rather than to the
+market. The cutoff is *now + N days* — a time of day, not a midnight boundary —
+and is printed to the second. Nothing is logged when the flag is absent.
+
 ### Backtest
 
 ```bash

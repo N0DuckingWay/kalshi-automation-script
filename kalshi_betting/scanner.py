@@ -770,6 +770,17 @@ def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -
                 within_horizon.append(m)
         except TypeError:
             pass
+    # Silent when the flag is absent (the early return above), so this line
+    # appears only on a run that actually asked for a horizon. Without it the
+    # flag left NO evidence it had taken effect, and a live run whose pair
+    # counts differed could not be attributed to it (TS-24). isoformat to the
+    # second, not .date(): the cutoff is now + N days, a time of day, and
+    # printing only the date implies a midnight boundary it does not have.
+    logging.info(
+        "Horizon filter: kept %d of %d markets closing on or before %s (--max-horizon-days %d)",
+        len(within_horizon), len(markets),
+        cutoff.isoformat(timespec="seconds"), max_horizon_days,
+    )
     return within_horizon
 
 
