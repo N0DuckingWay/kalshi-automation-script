@@ -805,8 +805,14 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         used_tickers.add(ta)
         used_tickers.add(tb)
     logging.info(
-        "Portfolio: %d trades selected, total cost $%.2f",
+        # Fee-inclusive, matching the per-trade lines main._print_portfolio
+        # emits and the figure this loop actually budgets against two lines
+        # above. It summed total_cost, so the headline portfolio number was
+        # the one cost on the page that was NOT the cash being committed —
+        # a live prod dry run showed $60.47 here against $64.39 of per-trade
+        # costs and a $52.08 collateral transfer (TS-12).
+        "Portfolio: %d trades selected, total cost $%.2f incl. fees",
         len(selected),
-        sum(s.total_cost for s in selected),
+        sum(s.total_cost_with_fees for s in selected),
     )
     return selected

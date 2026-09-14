@@ -8,6 +8,7 @@ MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 import ast
 import inspect
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -929,3 +930,28 @@ class TestReachableDepthSizing:
         pair = make_booked_pair(levels, pair_type="same_title")
         spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
         assert spec.x == 600
+
+
+class TestPortfolioSummaryIsFeeInclusive:
+    """
+    TS-12, found by a live prod dry run rather than by the static enumeration:
+    select_portfolio BUDGETS against total_cost_with_fees but its summary line
+    summed total_cost, so the headline portfolio figure was the one cost on the
+    page that was not the cash being committed. Measured live: $60.47 reported
+    against $64.39 of per-trade costs and a $52.08 collateral transfer.
+    """
+
+    def test_summary_sums_the_figure_the_loop_budgets_against(self, caplog):
+        specs = [
+            make_spec(pair_type="same_title", total_cost=10.0,
+                      total_cost_with_fees=10.70),
+            make_spec(pair_type="same_title", total_cost=20.0,
+                      total_cost_with_fees=21.40),
+        ]
+        with caplog.at_level(logging.INFO):
+            select_portfolio(specs, 100_000)
+        line = next(r.getMessage() for r in caplog.records
+                    if "Portfolio:" in r.getMessage())
+        assert "$32.10" in line
+        assert "$30.00" not in line
+        assert "incl. fees" in line
