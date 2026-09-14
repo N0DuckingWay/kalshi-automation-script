@@ -186,8 +186,11 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     "center_deci_edge_centi_cent" ($0.0001 below $0.01 and above $0.99, $0.001
     in between). The authoritative grid is the market's own `price_ranges`
     bands; the structure name is only used to short-circuit the uniform-cent
-    case. The first band containing the price wins, so a price sitting exactly
-    on a band boundary resolves to the earlier (by convention finer) band.
+    case. A price sitting exactly on a band boundary belongs to TWO bands, and
+    the FINEST step among the bands containing it wins. First-match used to be
+    the rule, and it is only "finer" at a band's LOWER edge — at an UPPER edge
+    the earlier band is 10x COARSER, which multiplied BUY_SLIPPAGE_TICKS by a
+    10x tick exactly there and LOOSENED a buy cap that is a bid (TS-10).
 
     These grids are NESTED: $0.01 ⊂ $0.001 ⊂ $0.0001, so every point of a
     coarser grid is also a point of any finer one. Later price math relies on
@@ -209,12 +212,12 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
             dollars. Range: [0, 1].
 
     Returns:
-        Decimal: The tick size in dollars for that price. Falls back to
-            Decimal(config.DEFAULT_TICK_SIZE_DOLLARS) when the structure is
-            uniform-cent or unknown, when no band contains the price, or when
-            the matching band's step is nonpositive — logging a warning in the
-            latter two cases, which indicate a payload that drifted from the
-            shapes above.
+        Decimal: The FINEST tick size in dollars among the bands containing
+            that price. Falls back to Decimal(config.DEFAULT_TICK_SIZE_DOLLARS)
+            when the structure is uniform-cent or unknown, when no band
+            contains the price, or when every containing band's step is
+            nonpositive — logging a warning in the latter two cases, which
+            indicate a payload that drifted from the shapes above.
     """
     default = Decimal(DEFAULT_TICK_SIZE_DOLLARS)
     structure = getattr(market, "price_level_structure", "") or ""
@@ -224,17 +227,24 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     if structure in ("", "linear_cent") or not bands:
         return default
 
+    # Finest containing band wins (see docstring). Scanning every band instead
+    # of returning on the first match also means one malformed band no longer
+    # discards a valid later one — the old `break` abandoned the whole list.
+    finest: Decimal | None = None
     for band in bands:
         try:
             if band.start <= price_dollars <= band.end:
                 # Decimal(str(...)), never Decimal(float): the float came from
                 # parsing a dollar string and str() round-trips it back exactly.
                 step = Decimal(str(band.step))
-                if step > 0:
-                    return step
-                break
+                if step > 0 and (finest is None or step < finest):
+                    finest = step
         except (AttributeError, TypeError, InvalidOperation):
-            break
+            # This band is unreadable; keep scanning the rest rather than
+            # throwing away bands that may well be intact.
+            continue
+    if finest is not None:
+        return finest
 
     # Only reached on a malformed or non-covering band list; called once per
     # order leg at build time, so a warning here cannot spam the log.

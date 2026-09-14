@@ -573,14 +573,25 @@ def _v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) ->
     DIFFERENT band of the market's grid than the scanned price — stepping up
     across a band edge, or being mirrored to the other end of the book — the
     final price is re-quantized onto the grid of the band that actually
-    contains it, rounding UP. Ceiling is the protective direction here too: it
-    can only tighten-or-keep the cap by under one destination-band tick, so the
-    worst outcome of the re-quantization is a killed FoK (trade skipped), never
-    a worse-than-intended fill; a floor could instead round a YES cap below the
-    scanned price and make the order structurally unfillable. Kalshi's nested
-    grids ($0.01 subset of $0.001 subset of $0.0001) guarantee a price landing
-    in a FINER band than it was computed on is already on that band's grid, so
-    the snap is then a no-op.
+    contains it, rounding UP. Ceiling is chosen because a floor could round a
+    YES cap BELOW the scanned price and make the order structurally unfillable.
+    Kalshi's nested grids ($0.01 subset of $0.001 subset of $0.0001) mean a
+    price landing in a FINER band than it was computed on is already on that
+    band's grid, so the snap is then a no-op.
+
+    That re-quantization is NOT purely protective, and this docstring used to
+    claim it was. When the final price lands in a COARSER band than the one it
+    was computed on, ceiling moves it AWAY from the scanned price and LOOSENS
+    the cap by up to one destination-band tick. Reachable examples on the live
+    band layouts: scanned 0.10 on tapered_deci_cent submits 0.11 where 0.101
+    was intended ($0.0090/contract of extra tolerance), and scanned 0.01 on
+    center_deci_edge_centi_cent submits 0.011 where 0.0101 was intended
+    ($0.0009). The loosening is bounded by one tick of the destination band and
+    is a known, accepted cost of keeping the order fillable; it is a separate
+    finding from TS-10 and is deliberately not fixed here. TS-10 fixed the
+    other half — tick_size_for_price now resolves a boundary price to the
+    FINEST containing band, so the slippage allowance is no longer multiplied
+    by a 10x tick at a band's upper edge.
 
     The clamp bounds are grid-aware for the same reason: the extreme tradeable
     levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not

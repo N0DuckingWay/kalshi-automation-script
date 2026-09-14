@@ -2928,10 +2928,49 @@ class TestTickSizeForPrice:
         assert tick_size_for_price(m, 0.005) == Decimal("0.0001")
         assert tick_size_for_price(m, 0.995) == Decimal("0.0001")
 
-    def test_band_boundary_price_uses_first_containing_band(self):
-        # 0.01 is the end of band 1 and the start of band 2; first match wins.
+    def test_lower_band_boundary_resolves_to_the_finer_band(self):
+        # 0.01 is the end of band 1 ($0.0001) and the start of band 2
+        # ($0.001). Both contain it; the FINER one wins. First-match happened
+        # to agree here, which is why the old convention looked correct.
         m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
         assert tick_size_for_price(m, 0.01) == Decimal("0.0001")
+
+    def test_upper_band_boundary_resolves_to_the_finer_band(self):
+        # TS-10. 0.99 is the end of the $0.001 middle band and the start of
+        # the $0.0001 top band. First-match returned the EARLIER band, which
+        # at an upper edge is 10x COARSER — so the V2 buy cap
+        # (ceil(scanned) + BUY_SLIPPAGE_TICKS x tick) got a 10x tick of
+        # slippage exactly there, loosening a cap that is a bid.
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.99) == Decimal("0.0001")
+
+    def test_finest_wins_regardless_of_band_order(self):
+        # The rule is "finest containing", not "last containing" — a coarse
+        # band listed after a fine one must not win either.
+        m = self._market("tapered_deci_cent", [
+            PriceRange(start=0.0, end=1.0, step=0.01),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
+
+    def test_malformed_band_does_not_discard_valid_later_bands(self):
+        # The old loop `break`s out of the whole list on the first unreadable
+        # band, so a single drifted entry silently downgraded the market to
+        # the $0.01 default. Scanning on recovers the real grid.
+        m = self._market("deci_cent", [
+            SimpleNamespace(start=None, end=None, step=None),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
+
+    def test_nonpositive_step_does_not_mask_a_valid_containing_band(self):
+        # A zero-step band used to `break` the loop too. It must be skipped,
+        # not treated as the answer and not treated as the end of the list.
+        m = self._market("deci_cent", [
+            PriceRange(start=0.0, end=1.0, step=0.0),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
 
     def test_none_ranges_falls_back(self):
         # Structure names a fine grid but the bands failed to parse — the
