@@ -1,5 +1,6 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import gc
+import logging
 import re
 import time
 import weakref
@@ -2792,3 +2793,53 @@ class TestRunBacktestSweep:
         result = self._infeasible(monkeypatch, interval_discount=0.62)
         assert result.primary.k == 0.62
         assert result.points == [result.primary]
+
+
+class TestSimulationsAreLabelledWithTheirDiscount:
+    """
+    TS-21: "Backtest complete: N trades" appeared 13 times per default run with
+    nothing distinguishing them, the primary's copy printed BEFORE the sweep
+    was announced, and the "Sweeping i/13" counter started at 2 because the
+    primary's slot was never numbered.
+    """
+
+    def test_completion_line_names_the_resolved_discount(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.62)
+        lines = [r.getMessage() for r in caplog.records
+                 if "Backtest complete" in r.getMessage()]
+        assert len(lines) == 1
+        assert "k=0.620" in lines[0]
+
+    def test_completion_line_resolves_the_none_sentinel(self, caplog):
+        # The sentinel must never reach the log — a reader needs the number
+        # that was actually priced, not "None".
+        with caplog.at_level(logging.INFO):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=None)
+        line = next(r.getMessage() for r in caplog.records
+                    if "Backtest complete" in r.getMessage())
+        assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in line
+        assert "None" not in line
+
+    def test_every_swept_point_is_distinguishable(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", [0.50, 0.75])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+            )
+        completions = [r.getMessage() for r in caplog.records
+                       if "Backtest complete" in r.getMessage()]
+        # One per grid point, each naming a different k
+        assert len(completions) == len({c.split(":")[0] for c in completions})
+
+    def test_the_primary_slot_is_announced(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            )
+        assert any("Simulating the primary interval discount" in r.getMessage()
+                   for r in caplog.records)
