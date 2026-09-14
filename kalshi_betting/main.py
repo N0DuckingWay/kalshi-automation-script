@@ -275,6 +275,11 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     rows = []
     for pair in candidate_pairs:
         spec = display_specs.get(id(pair))
+        # Price columns come from the spec's own pair when there is one: that is
+        # the marginal fill price for the recommended size, so the prices and
+        # the trade on a row always describe the same thing. Candidates with no
+        # spec keep the enrichment-stage quote.
+        priced = spec.pair if spec else pair
         if spec:
             # Sides rendered next to each count, in market order (A then B)
             side_a, side_b = leg_sides(pair.pair_type)
@@ -302,11 +307,11 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
-            f"{pair.pA:.2%}",
-            f"{pair.pB:.2%}",
+            f"{priced.pA:.2%}",
+            f"{priced.pB:.2%}",
             # The NO ask of market B — the traded NO-leg price of a time-series
             # pair (depth-weighted after enrichment); reporting-only for same-title
-            f"{pair.nB:.2%}",
+            f"{priced.nB:.2%}",
             "YES ✓" if pair.tradeable else "no",
             trade_str,
             profit_str,
@@ -545,8 +550,13 @@ def _run_dev(client, args) -> int:
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
-    # Map pair id → TradeSpec for fast lookup in the pairs table display
-    display_specs = {id(s.pair): s for s in portfolio}
+    # Map pair id → TradeSpec for fast lookup in the pairs table display.
+    # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
+    # compute_trade returns a re-priced copy of the pair (the marginal fill
+    # price for the size it settled on), so id(spec.pair) no longer matches any
+    # entry in candidate_pairs and every selected row would render as "—".
+    chosen = {id(s) for s in portfolio}
+    display_specs = {pid: s for pid, s in trade_specs.items() if id(s) in chosen}
 
     logging.info("Kalshi Sandbox Scan — Virtual Balance: $%.2f | Mode: DEV", args.sandbox_balance)
     print_pairs_table(candidate_pairs, display_specs)
@@ -691,8 +701,13 @@ def _run_prod(client, args) -> int:
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
-    # Map pair id → TradeSpec for fast lookup in the pairs table display
-    display_specs = {id(s.pair): s for s in portfolio}
+    # Map pair id → TradeSpec for fast lookup in the pairs table display.
+    # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
+    # compute_trade returns a re-priced copy of the pair (the marginal fill
+    # price for the size it settled on), so id(spec.pair) no longer matches any
+    # entry in candidate_pairs and every selected row would render as "—".
+    chosen = {id(s) for s in portfolio}
+    display_specs = {pid: s for pid, s in trade_specs.items() if id(s) in chosen}
 
     logging.info("Kalshi Pair Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
     print_pairs_table(candidate_pairs, display_specs)

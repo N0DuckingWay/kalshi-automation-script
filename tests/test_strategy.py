@@ -20,9 +20,15 @@ from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     fee_leg_exact,
     fee_per_pair_approx,
+    max_affordable_pairs,
     time_series_profit_prob,
 )
-from kalshi_betting.scanner import CandidatePair, enrich_with_orderbook_prices
+from kalshi_betting.scanner import (
+    CandidatePair,
+    enrich_with_orderbook_prices,
+    leg_prices,
+    prefix_fill_prices,
+)
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
 
 # Balance handed to enrich_with_orderbook_prices. Deliberately far larger than
@@ -59,6 +65,54 @@ def make_pair(
     pair.market_a.close_time = now + timedelta(days=15)
     pair.market_b.close_time = now + timedelta(days=30)
     return pair
+
+
+def make_booked_pair(
+    levels: list[tuple[float, float, float]],
+    *,
+    pair_type: str = "time_series",
+    pB: float = 0.62,
+    pA: float | None = None,
+    nB: float | None = None,
+    nA: float = 0.70,
+    max_contracts: int | None = None,
+) -> CandidatePair:
+    """Build a REAL CandidatePair carrying order-book depth.
+
+    A real dataclass rather than make_pair's MagicMock: compute_trade's marginal
+    pricing reads depth_levels by type (strategy._depth_levels), so a mock's
+    truthy auto-attribute is deliberately treated as "no book" and would exercise
+    the wrong path entirely.
+
+    levels are (price_a, price_b, qty) in MARKET order, ascending by combined
+    price — the shape enrichment writes. The scalar leg prices default to the
+    BEST level, and max_contracts to the full depth, which is what enrichment
+    would have written for a balance large enough not to bind.
+    """
+    depth = tuple(levels)
+    best_a, best_b, _ = depth[0]
+    total = int(sum(q for _, _, q in depth))
+    now = datetime.now(UTC)
+    mA = SimpleNamespace(ticker="A1", title="A", close_time=now + timedelta(days=15),
+                         exchange_index=0)
+    mB = SimpleNamespace(ticker="B1", title="B", close_time=now + timedelta(days=30),
+                         exchange_index=0)
+    if pair_type == "time_series":
+        pA_v, nB_v = (best_a if pA is None else pA), (best_b if nB is None else nB)
+        nA_v, pB_v = nA, pB
+    else:
+        nA_v, pB_v = best_a, best_b
+        pA_v, nB_v = (0.70 if pA is None else pA), (0.70 if nB is None else nB)
+    return CandidatePair(
+        market_a=mA, market_b=mB,
+        pA=pA_v, pB=pB_v, nA=nA_v,
+        tradeable=True,
+        canonical_title="booked pair",
+        pair_type=pair_type,
+        nB=nB_v,
+        max_contracts=total if max_contracts is None else max_contracts,
+        depth_levels=depth,
+    )
 
 
 def make_spec(
@@ -352,6 +406,161 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
+    """Uncapped Kelly fraction for a pair priced at (price_a, price_b).
+
+    Mirrors compute_trade's formula so a test can state, in its own terms, what
+    the old whole-book average would have concluded about a book.
+    """
+    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+    if net_spread <= 0:
+        return -1.0
+    b = net_spread / (price_a + price_b)
+    p = strategy._kelly_p_at(pair, price_a)
+    return p - (1.0 - p) / b
+
+
+class TestMarginalFillPricing:
+    """compute_trade must price the contracts it is ACTUALLY buying.
+
+    Enrichment bounds its average at the most the budget could ever buy; this is
+    the second half — the size and the price are solved together, so the price
+    the spec carries (and therefore the FoK limit the trader builds from it) is
+    the average over exactly the contracts that will be submitted.
+    """
+
+    # Ascending by combined price: 0.70, 0.75, 0.82.
+    LEVELS = [(0.30, 0.40, 20.0), (0.33, 0.42, 80.0), (0.37, 0.45, 400.0)]
+
+    def test_spec_price_is_the_average_over_exactly_its_own_size(self):
+        # The core invariant. Whatever n the descent lands on, leg_prices of the
+        # returned pair is prefix_fill_prices at that same n — never at some
+        # other quantity's average.
+        for balance in (5_000, 25_000, 100_000, 1_000_000):
+            pair = make_booked_pair(self.LEVELS)
+            spec = compute_trade(pair, balance)
+            if spec is None:
+                continue
+            expected = prefix_fill_prices(pair.depth_levels, spec.x)
+            assert leg_prices(spec.pair) == pytest.approx(expected), balance
+
+    def test_kelly_supports_the_size_it_settled_on(self):
+        # The descent's stopping condition, checked from the outside: at the
+        # price of n contracts, the capped Kelly budget still affords n.
+        spec = compute_trade(make_booked_pair(self.LEVELS), 200_000)
+        assert spec is not None
+        price_sum = sum(leg_prices(spec.pair))
+        assert max_affordable_pairs(200_000, price_sum, spec.kelly_fraction) >= spec.x
+
+    def test_fee_inclusive_cost_still_fits_the_kelly_budget(self):
+        # Re-pricing after the fee shrink must not push the trade back over
+        # budget — a smaller n can only reach cheaper levels.
+        spec = compute_trade(make_booked_pair(self.LEVELS), 200_000)
+        assert spec is not None
+        assert spec.total_cost_with_fees <= (200_000 / 100.0) * spec.kelly_fraction
+
+    def test_never_sizes_past_the_depth_it_priced(self):
+        for balance in (5_000, 50_000, 5_000_000):
+            pair = make_booked_pair(self.LEVELS)
+            spec = compute_trade(pair, balance)
+            if spec is not None:
+                assert spec.x <= pair.max_contracts
+
+    def test_small_balance_pays_the_best_level(self):
+        # $30 * 20% = $6.00 at 0.70 a pair -> 8 pairs, well inside the 20 resting
+        # at the top rung, so the fill is the best level outright.
+        spec = compute_trade(make_booked_pair(self.LEVELS), 3_000)
+        assert spec is not None
+        assert spec.x <= 20
+        assert leg_prices(spec.pair) == pytest.approx((0.30, 0.40))
+
+    def test_price_beats_the_whole_book_average(self):
+        # The regression this change exists for: the old sizer priced every pair
+        # at the average of the ENTIRE qualifying book, including depth no single
+        # trade could reach. The solved price must be strictly better than that.
+        pair = make_booked_pair(self.LEVELS)
+        total = sum(q for _, _, q in pair.depth_levels)
+        whole_book = (
+            sum(a * q for a, _, q in pair.depth_levels) / total
+            + sum(b * q for _, b, q in pair.depth_levels) / total
+        )
+        spec = compute_trade(pair, 100_000)
+        assert spec is not None
+        assert sum(leg_prices(spec.pair)) < whole_book
+
+    def test_deep_book_no_longer_kills_a_pair_with_a_real_edge(self):
+        # A thin band of genuine edge on top of a wall of near-worthless depth.
+        # Averaged whole, the pair's Kelly fraction goes NEGATIVE and the old
+        # sizer returned None — "a wide book drives Kelly negative and the pair
+        # is skipped", on depth no trade could reach. Priced at what a real
+        # trade would consume, the same pair sizes.
+        levels = [(0.30, 0.40, 25.0), (0.42, 0.43, 100_000.0)]
+        pair = make_booked_pair(levels)
+        total = sum(q for _, _, q in levels)
+        avg_a = sum(a * q for a, _, q in levels) / total
+        avg_b = sum(b * q for _, b, q in levels) / total
+        # Confirm the premise: at the whole-book average Kelly says don't bet
+        whole_book_kelly = _kelly_fraction_at(pair, avg_a, avg_b)
+        assert whole_book_kelly <= 0
+        # ...while at the top of the book it is comfortably positive
+        assert _kelly_fraction_at(pair, 0.30, 0.40) > 0
+        spec = compute_trade(pair, 50_000)
+        assert spec is not None
+        assert spec.min_payoff > 0
+        assert spec.kelly_fraction > 0
+        # It may reach a little past the cheap band — what matters is that the
+        # size it settled on is justified at its OWN price, not at the average
+        # of a book it would never sweep.
+        assert _kelly_fraction_at(pair, *leg_prices(spec.pair)) > 0
+        assert sum(leg_prices(spec.pair)) < avg_a + avg_b
+
+    def test_bookless_pair_sizes_exactly_as_before(self):
+        # depth_levels=() is the no-book path, byte-identical to the pre-change
+        # single-shot sizing. This is what keeps the backtester's Kelly-parity
+        # test (which builds a bare pair on purpose) meaningful.
+        booked = make_booked_pair([(0.30, 0.40, 1_000_000.0)])
+        bare = make_pair(pA=0.30, nB=0.40, pB=0.62, nA=0.70, pair_type="time_series")
+        bare_spec = compute_trade(bare, 100_000)
+        booked_spec = compute_trade(booked, 100_000)
+        assert bare_spec is not None and booked_spec is not None
+        # One flat, effectively bottomless level prices identically at any size
+        assert booked_spec.x == bare_spec.x
+        assert booked_spec.total_cost == pytest.approx(bare_spec.total_cost)
+
+    def test_bookless_pair_leaves_its_pair_object_untouched(self):
+        # No book, nothing solved, so the spec carries the very same object —
+        # the property main's display_specs mapping used to rely on everywhere.
+        bare = make_pair(pair_type="same_title")
+        spec = compute_trade(bare, 100_000)
+        assert spec is not None
+        assert spec.pair is bare
+
+    def test_same_title_solves_on_its_own_leg_prices(self):
+        # Same-title legs are (nA, pB), so the solved prices must land there —
+        # writeback goes through leg_sides, never a hardcoded field name.
+        levels = [(0.44, 0.31, 30.0), (0.47, 0.34, 500.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        spec = compute_trade(pair, 100_000)
+        assert spec is not None
+        assert leg_prices(spec.pair) == pytest.approx(
+            prefix_fill_prices(pair.depth_levels, spec.x)
+        )
+        assert (spec.pair.nA, spec.pair.pB) == pytest.approx(leg_prices(spec.pair))
+        # pA/nB are reporting-only for this pair type and must be left alone
+        assert spec.pair.pA == pair.pA
+        assert spec.pair.nB == pair.nB
+
+    def test_descent_terminates_on_a_steeply_worsening_book(self):
+        # Every rung materially worse than the last, so the descent has to walk
+        # rather than settle on its first guess. It must still return.
+        levels = [(0.30 + i * 0.002, 0.40 + i * 0.002, 5.0) for i in range(40)]
+        spec = compute_trade(make_booked_pair(levels), 500_000)
+        if spec is not None:
+            assert leg_prices(spec.pair) == pytest.approx(
+                prefix_fill_prices(tuple(levels), spec.x)
+            )
+
+
 class TestTimeSeriesKellyParity:
     """The three sizers — strategy._kelly_p / compute_trade, dashboard._kelly_fraction
     and the backtester (run_backtest -> _simulate_at_discount) — must all price
@@ -396,7 +605,22 @@ class TestTimeSeriesKellyParity:
         assert compute_trade(make_pair(pA=0.30, pB=0.70, nA=0.70, nB=0.30, pair_type="time_series"), 1_000_000) is None
 
     def test_ast_strategy_kelly_p_calls_helper(self):
-        assert _function_calls(strategy, "_kelly_p", "time_series_profit_prob")
+        # A two-link chain, same shape (and same intent) as the backtester pin
+        # below: the priced call moved into _kelly_p_at when compute_trade
+        # started re-deriving p at each candidate size, since pA is a LEG price
+        # and therefore moves with the quantity being bought.
+        assert _function_calls(strategy, "_kelly_p_at", "time_series_profit_prob")
+        assert _function_calls(strategy, "_kelly_p", "_kelly_p_at")
+
+    def test_ast_compute_trade_prices_through_kelly_helper(self):
+        # compute_trade must reach the model through the same helper, never
+        # reimplement 1 - k * (pB - pA) against its own per-size prices. The
+        # chain runs through _evaluate_size, which is where every gate now
+        # lives, and _solve_marginal_size, which searches over it.
+        assert _function_calls(strategy, "_evaluate_size", "_kelly_p_at")
+        assert _function_calls(strategy, "_solve_marginal_size", "_evaluate_size")
+        assert _function_calls(strategy, "compute_trade", "_evaluate_size")
+        assert _function_calls(strategy, "compute_trade", "_solve_marginal_size")
 
     def test_ast_dashboard_kelly_fraction_calls_helper(self):
         assert _function_calls(dashboard, "_kelly_fraction", "time_series_profit_prob")

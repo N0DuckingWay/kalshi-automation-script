@@ -67,6 +67,16 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 # mathematical Kelly says to bet more, we never exceed 20% of the balance on one pair.
 BUDGET_FRACTION               = 0.20
 
+# Defensive ceiling on strategy.compute_trade's marginal-price descent. That
+# loop re-prices a pair at each candidate contract count and takes the SMALLER
+# of the count it started with and the one Kelly then allows, so the sequence is
+# strictly decreasing and terminates on its own — this cap only exists so a
+# future edit that breaks the decrease invariant surfaces as one WARNING and a
+# skipped pair rather than a hung weekly run. Convergence takes 1-3 passes in
+# practice; 64 strict decreases without settling means a pathological book, and
+# refusing to trade it is the safe answer.
+SIZE_SOLVE_MAX_ITERATIONS     = 64
+
 # Tiered minimum YES ask price difference for time-series pairs, keyed by the
 # deadline gap between the two legs. The LATER-closing contract's YES ask must
 # exceed the earlier's by at least the tier: that gap is the market-implied
