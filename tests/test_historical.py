@@ -423,7 +423,11 @@ class TestEventTitlesCache:
 
         result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
 
-        assert result == {"E1": ""}  # this run genuinely could not resolve it
+        # TS-11: this RUN could not resolve it, but an earlier one did, and the
+        # accumulator exists precisely so that answer is not thrown away. The
+        # return is the MERGED view — returning "" here is what collapsed the
+        # same-title grouping key toward the bare title under --no-cache.
+        assert result == {"E1": "Good Title"}
         assert json.loads(isolated_cache.read_text()) == {"E1": "Good Title"}
 
     def test_fresh_poison_pill_stored_for_ticker_unknown_to_disk(self, isolated_cache,
@@ -445,9 +449,10 @@ class TestEventTitlesCache:
         # The pill is honored on the next cached run — no repeat lookup.
         client2 = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
         fallback2 = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
-        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {
-            "E1": "Good Title", "NEW-1": "",
-        }
+        # Restricted to the tickers ASKED about, not the whole accumulator:
+        # that file holds every ticker every past run resolved (hundreds of
+        # thousands), and a caller asking about one must not receive them all.
+        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {"NEW-1": ""}
         assert fallback2.call_count == 0
 
     def test_listing_pages_request_market_page_size_limit(self, isolated_cache, monkeypatch):
@@ -2507,3 +2512,68 @@ class TestArchivePhaseSkippedWhenProvablyEmpty:
             )
         assert probed == [True]
         assert "Historical archive phase skipped" not in caplog.text
+
+
+class TestEventTitlesReturnsMergedView:
+    """
+    TS-11: _load_or_build_event_titles wrote `merged` to disk but returned
+    `cached` — this run's resolution alone. Under --no-cache every ticker the
+    listings missed and the EVENT_TITLE_FALLBACK_MAX_LOOKUPS cap skipped came
+    back as the "" poison pill even though disk held a real title. Measured:
+    771,601 unresolved against a 5,000 cap, so ~99% of stragglers. Those
+    markets then group by market title alone, collapsing the same-title key
+    (event_title, title, subtitle) toward the bare title — the direction that
+    manufactures cross-event false positives under the 95% co-resolution prior.
+    """
+
+    def test_accumulator_answers_a_ticker_this_run_could_not_resolve(
+        self, isolated_cache, monkeypatch,
+    ):
+        isolated_cache.write_text(json.dumps({"E1": "Real Title", "E2": "Other"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"E1"}, use_cache=False,
+        )
+        assert result == {"E1": "Real Title"}
+
+    def test_result_is_restricted_to_the_requested_tickers(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the accumulator is a cross-run store of every ticker ever
+        # resolved. Returning it whole would hand a caller asking about one
+        # ticker hundreds of thousands of unrelated entries.
+        isolated_cache.write_text(json.dumps({"E1": "Real Title", "E2": "Other"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"E1"}, use_cache=False,
+        )
+        assert set(result) == {"E1"}
+
+    def test_a_ticker_nobody_has_ever_resolved_still_maps_to_the_pill(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the merge must not invent titles. An unresolved ticker with no
+        # disk entry keeps poison-pill semantics.
+        isolated_cache.write_text(json.dumps({"E1": "Real Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"UNKNOWN"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"UNKNOWN"}, use_cache=False,
+        )
+        assert result == {"UNKNOWN": ""}
+
+    def test_the_substitution_is_counted_in_the_log(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        isolated_cache.write_text(json.dumps({"E1": "Real Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        with caplog.at_level(logging.INFO):
+            historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+        assert "1 of this run's tickers answered from the accumulator" in caplog.text

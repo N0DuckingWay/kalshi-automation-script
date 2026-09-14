@@ -487,10 +487,23 @@ def _load_or_build_event_titles(
             titles it did not ask about.
 
     Returns:
-        dict[str, str]: Mapping event_ticker → event_title for THIS run's
-            resolution (the merged accumulator is only written to disk, not
-            returned). Tickers that could not be resolved map to "". Caller
-            treats those markets as ungrouped (effectively MVE-excluded).
+        dict[str, str]: Mapping event_ticker → event_title, restricted to
+            event_tickers, read from the MERGED view — this run's resolution
+            layered over the on-disk accumulator. Tickers that could not be
+            resolved anywhere map to "". Caller treats those markets as
+            ungrouped (effectively MVE-excluded).
+
+            It used to return this run's resolution ALONE, which under
+            --no-cache handed back the "" poison pill for every ticker the
+            listings missed and the EVENT_TITLE_FALLBACK_MAX_LOOKUPS cap
+            skipped — even when disk held a real title fetched by an earlier
+            run. Measured: 771,601 unresolved against a 5,000 cap, so ~99% of
+            stragglers. Those markets then group by market title alone,
+            collapsing the same-title key (event_title, title, subtitle)
+            toward the bare title: on a captured payload, 52 groups with
+            titles became 133 groups with a largest of 112 without — the
+            direction that manufactures cross-event false positives under the
+            95% co-resolution prior (TS-11).
     """
     # Always read the accumulator: even when use_cache is False and it must not
     # seed resolution, it is needed at save time so this run's writes MERGE with
@@ -500,7 +513,10 @@ def _load_or_build_event_titles(
     cached: dict[str, str] = dict(disk_titles) if use_cache else {}
     missing = event_tickers - cached.keys()
     if not missing:
-        return cached
+        # Restricted to the caller's tickers for the same reason the merged
+        # return below is: the accumulator holds every ticker every past run
+        # ever resolved, and a caller asking about 40 must not receive 800k.
+        return {tkr: cached.get(tkr, "") for tkr in event_tickers}
 
     # Bulk pull non-MVE events across all statuses. Each get_events call returns
     # up to 200 events; pagination continues until cursor is empty or all misses
@@ -673,9 +689,22 @@ def _load_or_build_event_titles(
         if title or not merged.get(tkr):
             merged[tkr] = title
     _save_json_cache(_EVENT_TITLES_CACHE, merged)
-    logging.info("Event titles resolved: %d this run, %d cached entries on disk",
-                 len(cached), len(merged))
-    return cached
+    # Return the MERGED view, restricted to what the caller asked about. The
+    # accumulator exists precisely so a ticker resolved by an earlier run need
+    # not be re-fetched; returning `cached` threw that away at the last step and
+    # substituted the "" poison pill (TS-11).
+    result = {tkr: merged.get(tkr, "") for tkr in event_tickers}
+    # Count the substitutions so the accumulator's contribution is visible
+    # rather than inferred — this is the number that was silently lost.
+    from_accumulator = sum(
+        1 for tkr in event_tickers if not cached.get(tkr) and merged.get(tkr)
+    )
+    logging.info(
+        "Event titles resolved: %d this run, %d cached entries on disk, "
+        "%d of this run's tickers answered from the accumulator",
+        len(cached), len(merged), from_accumulator,
+    )
+    return result
 
 
 # ─── Market fetching ──────────────────────────────────────────────────────────
