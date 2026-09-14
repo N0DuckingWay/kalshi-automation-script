@@ -740,7 +740,25 @@ class TestEnrichmentBoundsDepthByAffordability:
     def test_unaffordable_pair_logs_its_own_reason(self, caplog):
         with caplog.at_level(logging.INFO, logger=""):
             self._enrich(1)
-        assert any("No affordable contract pairs" in r.message for r in caplog.records)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        # Depth and budget are named SEPARATELY: they are different faults with
+        # different fixes (the book is too thin vs. add funds), and a message
+        # that printed only the binding minimum misattributed one as the other.
+        assert "100.00 contract(s) rest at the gap" in line, line
+        assert "budget affords 0" in line, line
+
+    def test_thin_book_and_poor_budget_are_reported_distinctly(self, caplog):
+        # Ample balance, so the BOOK is what binds — the message must say so
+        # rather than blaming the budget.
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client([(0.30, 0.45, 0.4)])
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "0.40 contract(s) rest at the gap" in line, line
+        assert "budget affords 0" not in line, line
 
     def test_max_contracts_is_what_the_written_price_covers(self):
         # The invariant compute_trade's depth clamp relies on: the price written

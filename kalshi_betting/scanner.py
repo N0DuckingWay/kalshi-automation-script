@@ -2356,7 +2356,8 @@ def enrich_with_orderbook_prices(
         # can be) is an upper bound on the n that trade finally sizes — the
         # price written here is therefore never optimistic relative to it.
         best_a, best_b, _ = depth_levels[0]
-        cap = min(int(total_qty), max_affordable_pairs(balance_cents, best_a + best_b))
+        affordable = max_affordable_pairs(balance_cents, best_a + best_b)
+        cap = min(int(total_qty), affordable)
         fills = prefix_fill_prices(depth_levels, cap)
 
         if fills is None:
@@ -2364,10 +2365,13 @@ def enrich_with_orderbook_prices(
             # holds under one contract of qualifying depth. Drop the pair rather
             # than write max_contracts=0, which compute_trade reads as UNCAPPED
             # — the sub-one-contract hole that overloaded sentinel used to have.
+            # Both figures are named because they are different faults with
+            # different fixes (add funds vs. the book is too thin), and the
+            # binding one is whichever is smaller.
             logging.info(
-                "No affordable contract pairs for '%s' — %.1f contract(s) at the "
-                "gap but the budget affords %d; skipping",
-                pair.canonical_title, total_qty, cap,
+                "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
+                "the gap and the budget affords %d; skipping",
+                pair.canonical_title, total_qty, affordable,
             )
             enriched.append(dc_replace(pair, tradeable=False))
             continue
