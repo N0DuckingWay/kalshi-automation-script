@@ -3426,3 +3426,70 @@ class TestHorizonFilterLogging:
             out = filter_markets_within_horizon(self._markets(), None)
         assert len(out) == 3
         assert "Horizon filter" not in caplog.text
+
+
+class TestCoerceIntCents:
+    """
+    TS-28: _coerce_int_cents had no direct coverage. It decides whether a
+    legacy `true`/`false` bid array is really carrying whole cents; getting it
+    wrong sends dollars through the cents path (x100) or drops a real level.
+    """
+
+    def test_accepts_a_genuine_int(self):
+        assert scanner._coerce_int_cents(45) == 45
+
+    def test_accepts_an_integral_float(self):
+        assert scanner._coerce_int_cents(45.0) == 45
+
+    def test_accepts_integral_strings_in_both_spellings(self):
+        assert scanner._coerce_int_cents("45") == 45
+        assert scanner._coerce_int_cents(" 45.0 ") == 45
+
+    def test_rejects_a_fractional_value(self):
+        # A fractional "cent" means the array is really dollars. Multiplying it
+        # through the cents path would be a 100x price error.
+        assert scanner._coerce_int_cents(0.45) is None
+        assert scanner._coerce_int_cents("0.45") is None
+
+    def test_rejects_bool_despite_int_subclassing(self):
+        # bool is an int subclass, so True would silently become 1 cent.
+        assert scanner._coerce_int_cents(True) is None
+        assert scanner._coerce_int_cents(False) is None
+
+    def test_rejects_non_numeric_and_none(self):
+        assert scanner._coerce_int_cents("abc") is None
+        assert scanner._coerce_int_cents(None) is None
+        assert scanner._coerce_int_cents([45]) is None
+
+
+class TestCentsBidsToDollarBids:
+    """
+    TS-28: _cents_bids_to_dollar_bids converts the legacy integer-cent arrays
+    to dollars BEFORE _bids_to_ask_levels, which is dollars-only by contract.
+    Feeding cents straight through that parser yields 1 - 45 = -44, which is
+    then silently discarded — a full book becomes a silent empty one (BS-12).
+    """
+
+    def test_converts_whole_cents_to_dollars(self):
+        out = scanner._cents_bids_to_dollar_bids("T", "true", [[45, 100], [40, 50]])
+        assert out == [[0.45, 100], [0.40, 50]]
+
+    def test_preserves_order_and_quantity_type(self):
+        out = scanner._cents_bids_to_dollar_bids("T", "true", [[60, "10"], [55, "20"]])
+        assert out == [[0.60, "10"], [0.55, "20"]]
+
+    def test_drops_out_of_range_levels_with_a_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = scanner._cents_bids_to_dollar_bids(
+                "KXT-1", "true", [[0, 5], [45, 100], [100, 5]])
+        assert out == [[0.45, 100]]
+        assert caplog.text.count("KXT-1") == 2
+
+    def test_drops_a_level_that_is_not_a_price_qty_pair(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = scanner._cents_bids_to_dollar_bids("KXT-1", "true", [[45], [40, 10]])
+        assert out == [[0.40, 10]]
+        assert "not a [price, qty] pair" in caplog.text
+
+    def test_all_malformed_yields_empty_not_an_exception(self):
+        assert scanner._cents_bids_to_dollar_bids("T", "true", [["x", 1], [0.5, 1]]) == []
