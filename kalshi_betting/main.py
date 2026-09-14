@@ -925,6 +925,18 @@ def main() -> None:
         # --dry-run change anything" after the fact.
         logging.warning("--dry-run is inert in dev mode — dev never submits orders")
 
+    if args.mode == "prod" and args.sandbox_balance != parser.get_default("sandbox_balance"):
+        # Mirror of the --dry-run-in-dev twin above. _run_prod sizes on the
+        # REAL per-shard balance from verify_auth and never reads
+        # sandbox_balance, so passing it in prod silently does nothing — an
+        # operator who meant to cap their exposure would get full-size live
+        # orders instead. Logged rather than parser.error'd, same as the twin,
+        # so it lands in kalshi_arb.log for later diagnosis (TS-19).
+        logging.warning(
+            "--sandbox-balance is inert in prod mode — prod sizes on the real "
+            "account balance; use --dry-run to avoid submitting orders",
+        )
+
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
     if args.mode == "dev":

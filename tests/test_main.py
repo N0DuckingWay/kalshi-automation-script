@@ -2107,3 +2107,37 @@ def test_exit_code_constants_distinct():
         EXIT_TRADES_NEED_ATTENTION,
         EXIT_NO_TRADEABLE_SHARDS,
     }) == 4
+
+
+class TestSandboxBalanceInertInProd:
+    """
+    TS-19: --sandbox-balance is read only by _run_dev. Passing it in prod
+    silently did nothing, so an operator who meant to cap their exposure got
+    full-size live orders. Mirrors the --dry-run-in-dev twin beside it.
+    """
+
+    @staticmethod
+    def _run(argv, caplog):
+        with patch.object(sys, "argv", argv), \
+             patch("kalshi_betting.main.build_client", return_value=MagicMock()), \
+             patch("kalshi_betting.main._run_prod", return_value=0), \
+             patch("kalshi_betting.main._run_dev", return_value=0), \
+             patch("kalshi_betting.main._setup_logging"), \
+             caplog.at_level(logging.WARNING), \
+             pytest.raises(SystemExit):
+            main.main()
+        return caplog.text
+
+    def test_warns_when_passed_in_prod(self, caplog):
+        text = self._run(
+            ["main", "--mode", "prod", "--sandbox-balance", "50"], caplog)
+        assert "--sandbox-balance is inert in prod mode" in text
+
+    def test_silent_when_not_passed_in_prod(self, caplog):
+        text = self._run(["main", "--mode", "prod"], caplog)
+        assert "--sandbox-balance" not in text
+
+    def test_silent_in_dev(self, caplog):
+        text = self._run(
+            ["main", "--mode", "dev", "--sandbox-balance", "50"], caplog)
+        assert "--sandbox-balance is inert" not in text
