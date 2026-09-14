@@ -54,6 +54,7 @@ from .config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     fee_leg_exact,
     fee_per_pair_approx,
+    max_affordable_pairs,
     time_series_profit_prob,
 )
 from .scanner import CandidatePair, leg_prices, leg_sides
@@ -286,7 +287,10 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
 
     # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
-    n = int(budget_dollars / (price_a + price_b))
+    # Cross-module: the single definition of the budget -> contracts step. The
+    # scanner calls the same helper with BUDGET_FRACTION and the best level's
+    # price sum, so its depth cap is provably an upper bound on this n.
+    n = max_affordable_pairs(balance_cents, price_a + price_b, kelly_fraction_capped)
     if n < 1:
         # The Kelly budget can't afford even one contract pair — forcing n=1
         # would silently exceed both the Kelly fraction and BUDGET_FRACTION

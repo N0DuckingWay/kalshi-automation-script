@@ -50,6 +50,7 @@ Notes:
 import logging
 import re
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
@@ -1769,6 +1770,63 @@ def _pair_orderbooks(
                 rem_yes = yes_levels[j][1]
 
     return pairs
+
+
+def prefix_fill_prices(
+    levels: Sequence[tuple[float, float, float]], n: int,
+) -> tuple[float, float] | None:
+    """
+    Quantity-weighted average fill price of the FIRST n contracts of a book.
+
+    The single definition of "what would n contract pairs actually cost", shared
+    by enrich_with_orderbook_prices (which prices a pair at the most contracts
+    the budget could ever buy) and strategy.compute_trade (which prices the
+    exact n it sizes). Averaging the WHOLE qualifying book instead — what this
+    replaced — priced every pair against depth no single trade could reach,
+    which both inflated the fill price and killed pairs at the profitability
+    gate on levels they would never have touched.
+
+    Levels are consumed cheapest-first, taking min(remaining, qty) at each, so
+    the result is exactly the volume-weighted price of a marketable order for n
+    contracts. Because levels ascend by combined price, the returned sum is
+    non-decreasing in n: a larger n can only reach further down the book into
+    worse-priced levels.
+
+    Args:
+        levels (Sequence[tuple[float, float, float]]): The pair's qualifying
+            depth as (price_a, price_b, qty) in MARKET order, ascending by
+            combined price — CandidatePair.depth_levels, or the freshly
+            oriented levels enrichment is about to store there.
+        n (int): Whole contract pairs to price. Range: >= 1.
+
+    Returns:
+        tuple[float, float] | None: (avg price on market_a, avg price on
+            market_b) in dollars. None when n < 1, or when the levels hold
+            fewer than n contracts in total — the caller decides whether that
+            is a dropped pair or a smaller size.
+    """
+    if n < 1:
+        return None
+    remaining = float(n)
+    sum_a = 0.0
+    sum_b = 0.0
+    for price_a, price_b, qty in levels:
+        take = min(remaining, qty)
+        if take <= 0:
+            # A zero/negative level cannot contribute; _bids_to_ask_levels
+            # already drops these, so this only guards hand-built input
+            continue
+        sum_a += price_a * take
+        sum_b += price_b * take
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        # Fewer than n contracts available. No epsilon is needed: the final
+        # take is exactly `remaining` whenever a level can cover it, so
+        # remaining reaches exactly 0.0 on every sufficient book.
+        return None
+    return sum_a / n, sum_b / n
 
 
 def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:

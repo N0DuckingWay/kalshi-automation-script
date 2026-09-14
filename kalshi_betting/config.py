@@ -741,6 +741,54 @@ def fee_leg_exact(n: int, p: float) -> float:
     return math.ceil(round(TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100
 
 
+def max_affordable_pairs(
+    balance_cents: int, price_sum: float, fraction: float | None = None,
+) -> int:
+    """
+    Return the largest whole contract-pair count a fraction of the balance buys.
+
+    The single definition of the budget -> contracts step, called from both ends
+    of the sizing pipeline so the two can never drift:
+
+      * scanner.enrich_with_orderbook_prices() passes the default
+        BUDGET_FRACTION and the BEST qualifying level's price sum, to bound how
+        much order-book depth it averages into the pair's fill price.
+      * strategy.compute_trade() passes the capped Kelly fraction and the actual
+        prefix-average price sum, to size the trade itself.
+
+    The scanner's call is therefore an UPPER BOUND on the sizer's: its fraction
+    is the maximum any Kelly result can be capped to, and its price sum the
+    minimum any prefix average can reach (levels are ascending, so every deeper
+    prefix costs at least as much per pair). That bound is what lets enrichment
+    price a pair at a size the sizer can never exceed.
+
+    fraction is resolved at CALL time rather than bound as a default argument,
+    so a test that monkeypatches BUDGET_FRACTION still takes effect — the same
+    rule, for the same reason, as time_series_profit_prob's k.
+
+    Args:
+        balance_cents (int): Account balance in integer cents. Range: >= 0.
+        price_sum (float): Combined per-contract cost of the two legs, in
+            dollars. Range: (0, 2); a nonpositive value returns 0 rather than
+            raising, since it means the book carried no usable level.
+        fraction (float | None): Fraction of the balance to spend. None (the
+            default) reads BUDGET_FRACTION. Range: [0, 1].
+
+    Returns:
+        int: Floor of (balance_dollars * fraction / price_sum). 0 when the
+            budget cannot afford a single contract pair, or when price_sum is
+            nonpositive.
+    """
+    f = BUDGET_FRACTION if fraction is None else fraction
+    if price_sum <= 0:
+        # A nonpositive sum means no usable level; "affords nothing" is the
+        # right answer and keeps every caller free of a ZeroDivisionError guard
+        return 0
+    # Same expression order as the sizing this replaced, so the float result is
+    # identical: dollars first, then the fraction, then the division.
+    return int((balance_cents / 100.0) * f / price_sum)
+
+
 def create_new_output(path: Path) -> tuple[Path, BinaryIO]:
     """
     Exclusively create `path`, suffixing "-1", "-2", … if that exact name exists.

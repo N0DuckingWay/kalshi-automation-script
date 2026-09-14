@@ -40,6 +40,7 @@ from kalshi_betting.scanner import (
     leg_sides,
     normalize_title,
     pair_key,
+    prefix_fill_prices,
     tick_size_for_price,
     validate_pair_price,
 )
@@ -551,6 +552,74 @@ def _ts_candidate(
         pair_type="time_series",
         nB=nB,
     )
+
+
+class TestPrefixFillPrices:
+    """prefix_fill_prices is the shared definition of "what would n contract
+    pairs actually cost". Enrichment and strategy.compute_trade both read the
+    book through it, so the price a pair is gated on and the price it is sized
+    on can never be computed two different ways."""
+
+    # (price_a, price_b, qty), market order, ascending by combined price —
+    # the shape CandidatePair.depth_levels carries.
+    BOOK = ((0.40, 0.45, 10.0), (0.42, 0.46, 20.0), (0.50, 0.48, 70.0))
+
+    def test_single_contract_is_the_best_level(self):
+        assert prefix_fill_prices(self.BOOK, 1) == (0.40, 0.45)
+
+    def test_prefix_within_one_level_does_not_reach_the_next(self):
+        assert prefix_fill_prices(self.BOOK, 10) == (0.40, 0.45)
+
+    def test_partial_level_is_weighted_by_the_quantity_taken(self):
+        # 10 @ 0.40 then 5 @ 0.42 -> (10*0.40 + 5*0.42) / 15
+        avg_a, avg_b = prefix_fill_prices(self.BOOK, 15)
+        assert avg_a == pytest.approx((10 * 0.40 + 5 * 0.42) / 15)
+        assert avg_b == pytest.approx((10 * 0.45 + 5 * 0.46) / 15)
+
+    def test_full_depth_equals_the_whole_book_average(self):
+        # The pre-change behaviour is the n == total-depth special case, so the
+        # old number is still reachable — it is just no longer what we price on.
+        total = sum(q for _, _, q in self.BOOK)
+        avg_a, avg_b = prefix_fill_prices(self.BOOK, int(total))
+        assert avg_a == pytest.approx(
+            sum(a * q for a, _, q in self.BOOK) / total
+        )
+        assert avg_b == pytest.approx(
+            sum(b * q for _, b, q in self.BOOK) / total
+        )
+
+    def test_price_is_non_decreasing_in_n(self):
+        # The property the fixed-point descent in compute_trade relies on:
+        # buying more can only reach further down the book into worse levels.
+        sums = [sum(prefix_fill_prices(self.BOOK, n)) for n in range(1, 101)]
+        # Compared with a tolerance, not exactly: within one level every prefix
+        # average is the same price, but sum_a/n reintroduces binary float noise
+        # (0.40 * 3.0 / 3 == 0.4000000000000001), which is not a real increase.
+        assert all(sums[i + 1] >= sums[i] - 1e-12 for i in range(len(sums) - 1))
+
+    def test_insufficient_depth_returns_none(self):
+        assert prefix_fill_prices(self.BOOK, 101) is None
+
+    def test_exact_depth_is_not_insufficient(self):
+        # Boundary: the last take is exactly `remaining`, so the float
+        # accumulator lands on 0.0 and needs no epsilon.
+        assert prefix_fill_prices(self.BOOK, 100) is not None
+
+    def test_zero_or_negative_n_returns_none(self):
+        assert prefix_fill_prices(self.BOOK, 0) is None
+        assert prefix_fill_prices(self.BOOK, -1) is None
+
+    def test_empty_book_returns_none(self):
+        assert prefix_fill_prices((), 1) is None
+
+    def test_fractional_quantities_accumulate_exactly(self):
+        # Order-book quantities arrive as floats (_bids_to_ask_levels parses
+        # them with float()), so a book of fractional levels must still resolve
+        # rather than tripping the insufficient-depth arm.
+        book = ((0.30, 0.40, 0.5), (0.31, 0.41, 0.5), (0.32, 0.42, 4.0))
+        avg_a, avg_b = prefix_fill_prices(book, 1)
+        assert avg_a == pytest.approx((0.5 * 0.30 + 0.5 * 0.31) / 1)
+        assert avg_b == pytest.approx((0.5 * 0.40 + 0.5 * 0.41) / 1)
 
 
 class TestOrderbookCeilingTieredByDeadlineGap:
