@@ -2451,6 +2451,11 @@ class TestTimeSeriesLegOrder:
         assert line.index("NO on Market B") < line.index("YES on Market A")
         assert "Profit if won: $1.50" in line
         assert "Min profit" not in line
+        # TS-23: the line names a PAIR order in submission order. "Batch order"
+        # implied an atomic two-leg submission; there is no batch endpoint, and
+        # the whole rollback machinery exists because the legs go one at a time.
+        assert "Pair order (NO leg first" in line
+        assert "Batch order" not in line
 
 
 class TestUnparseableTransferResponse:

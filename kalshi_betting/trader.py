@@ -2304,7 +2304,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             # NO leg first
             no_leg, yes_leg = _ordered_legs(spec)
             logging.info(
-                "[DRY RUN] Batch order: Buy %dx %s @ %.2f%% | Buy %dx %s @ %.2f%% | "
+                "[DRY RUN] Pair order (NO leg first, then YES — there is no batch "
+                "endpoint): Buy %dx %s @ %.2f%% | Buy %dx %s @ %.2f%% | "
                 "Total cost: $%.2f | Profit if won: $%.2f",
                 no_leg.count, no_leg.label, no_leg.price_dollars * 100,
                 yes_leg.count, yes_leg.label, yes_leg.price_dollars * 100,
