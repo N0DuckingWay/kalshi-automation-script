@@ -97,6 +97,17 @@ def main() -> None:
     if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
         parser.error("--interval-discount must be between 0 and 1")
 
+    # Validated BEFORE logging is configured, alongside the other two argument
+    # checks, so a rejected argument leaves no trace: parser.error exits, and
+    # doing this after basicConfig created kalshi_backtest.log for a run that
+    # never happened — or, worse, ROTATED it, evicting real history to record
+    # nothing (TS-20). delay=True on the handler below is the belt to this
+    # brace, matching main.py and scheduler.py.
+    try:
+        start_date = date.fromisoformat(args.start_date)
+    except ValueError:
+        parser.error(f"Invalid --start-date: {args.start_date!r}. Use YYYY-MM-DD format.")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
@@ -110,16 +121,15 @@ def main() -> None:
             # misses are summarized once per run by _fetch_candles_parallel.
             # Before that, 99.5% of this file was that single warning and a
             # sweep evicted ~419 MB of pre-sweep history through this rotation.
+            # delay=True: the file is opened on the first emit, not at
+            # construction, so a run that exits before logging anything leaves
+            # no file behind. Matches main.py and scheduler.py (TS-20).
             logging.handlers.RotatingFileHandler(
-                PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024, backupCount=3,
+                PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024,
+                backupCount=3, delay=True,
             ),
         ],
     )
-
-    try:
-        start_date = date.fromisoformat(args.start_date)
-    except ValueError:
-        parser.error(f"Invalid --start-date: {args.start_date!r}. Use YYYY-MM-DD format.")
 
     use_cache = not args.no_cache
 
