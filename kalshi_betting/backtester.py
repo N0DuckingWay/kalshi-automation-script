@@ -1423,7 +1423,15 @@ def _prepare_entries(
     # structurally-impossible case, so it must be strictly conservative: an
     # over-tight end date would wrongly skip a real run (e.g. today is Monday
     # and start_date is within the last week).
-    feasibility_end = date.today()
+    # UTC, not local. _monday_timestamps builds 09:00 UTC checkpoints, and
+    # _build_equity_curve already uses datetime.now(UTC).date() with a comment
+    # explaining why local is wrong there — this is the same reasoning, and it
+    # was the only date.today() left in the fetch path. West of UTC the local
+    # date lags for the first hours of each UTC day (7 of every 24 on a PDT
+    # host), so a window whose ONLY Monday is the current UTC day short-
+    # circuits to zero trades and reports the run as structurally impossible
+    # when it is not (TS-13).
+    feasibility_end = datetime.now(UTC).date()
     if not _monday_timestamps(start_date, feasibility_end):
         logging.warning(
             "No Monday 09:00 UTC entry checkpoint exists in [%s, %s] — no "

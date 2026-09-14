@@ -1197,7 +1197,7 @@ def generate_dashboard(
 <body>
 <h1>Kalshi Arbitrage Backtest</h1>
 <p style="color:#616161; font-size:14px;">
-  Period: {start_date} → {date.today()} &nbsp;|&nbsp;
+  Period: {start_date} → {datetime.now(UTC).date()} &nbsp;|&nbsp;
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>

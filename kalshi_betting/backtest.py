@@ -33,7 +33,7 @@ Notes:
 import argparse
 import logging
 import logging.handlers
-from datetime import date
+from datetime import UTC, date, datetime
 
 from .backtester import run_backtest_sweep
 from .config import PROJECT_ROOT, TIME_SERIES_INTERVAL_PROB_DISCOUNT
@@ -171,7 +171,11 @@ def main() -> None:
         total_return = (final_value - args.balance) / args.balance
         n_win        = sum(1 for t in trades if t.profit > 0)
         logging.info("Backtest Summary")
-        logging.info("  Period:        %s → %s", start_date, date.today())
+        # UTC, matching the window the backtester actually simulates
+        # (_prepare_entries' feasibility end and _build_equity_curve's last
+        # row are both UTC dates) — a local date here would print a period
+        # the run did not cover (TS-13).
+        logging.info("  Period:        %s → %s", start_date, datetime.now(UTC).date())
         logging.info("  Total trades:  %d", len(trades))
         logging.info("  Win rate:      %.1f%%", n_win / len(trades) * 100)
         logging.info("  Total return:  %+.1f%%", total_return * 100)
