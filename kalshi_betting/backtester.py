@@ -128,6 +128,7 @@ from .config import (
     INTERVAL_DISCOUNT_SWEEP,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
+    PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG,
@@ -1144,8 +1145,13 @@ def _find_entry(
             gap = pA - pB
 
         # Enforce the minimum price gap for this pair type (directional in
-        # both cases — the gap above is signed, never an absolute value)
-        if gap < threshold:
+        # both cases — the gap above is signed, never an absolute value).
+        # PRICE_EPSILON mirrors scanner.find_time_series_pairs /
+        # find_same_title_pairs: candle prices are floats too, so a gap sitting
+        # exactly on the tier can evaluate a hair under it and be rejected for
+        # representation noise. The AST parity pins do NOT check this constant,
+        # so a missed mirror here is silent divergence (TS-09).
+        if gap < threshold - PRICE_EPSILON:
             continue
 
         # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
@@ -1164,7 +1170,7 @@ def _find_entry(
         # Live orderbook-depth parity: enrich_with_orderbook_prices only keeps
         # contracts whose combined LEG price leaves the required gap
         # (price_a + price_b <= 1 - threshold) — apply the same cut to candle entries
-        if price_a + price_b > 1.0 - threshold:
+        if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
         # Check that the gross spread on the leg prices exceeds the continuous fee estimate

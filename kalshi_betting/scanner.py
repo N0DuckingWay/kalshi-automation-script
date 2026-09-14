@@ -54,11 +54,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     DEFAULT_TICK_SIZE_DOLLARS,
     EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS,
@@ -71,7 +72,9 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
+    ORDER_API_VERSION,
     POSITION_PAGE_SIZE,
+    PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
@@ -260,6 +263,171 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     )
     return default
 
+
+
+# Lowest valid V2 limit price, in dollars. Kalshi prices live in the open unit
+# interval — 0 and 1 are settlement values, not tradeable levels — and the
+# finest grid in any regime is $0.0001, so this is the extreme valid bottom
+# tick. The top of grid is not a module constant: it depends on the market's
+# own tick regime and is derived per market by _v2_top_of_grid_price() from
+# config.V2_ROLLBACK_BID_PRICE_DOLLARS.
+_V2_MIN_PRICE = Decimal("0.0001")
+
+# Quantum applied to the scanned price BEFORE it is ceiled onto the tick grid —
+# the same round-before-ceil guard as _buy_max_cost_cents and
+# config.fee_leg_exact. No Kalshi grid point has a 7th decimal (the finest is
+# $0.0001), so quantizing can only remove binary float noise: it tightens or
+# keeps the cap, never loosens it (TS-03).
+_SCANNED_PRICE_QUANTUM = Decimal("0.000001")
+
+def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    """
+    Round a price UP to the next point of a tick grid.
+
+    Ceiling, never nearest or floor: this is the first half of a buy leg's price
+    cap, and it mirrors the legacy _buy_max_cost_cents' math.ceil for exactly
+    the same reason — a cap rounded BELOW the scanned depth-weighted price could
+    never fill at the price we actually scanned, so a fill-or-kill order carrying
+    it would be structurally killed every time rather than protected.
+
+    Args:
+        price (Decimal): Price in dollars to round. Range: [0, 1].
+        tick (Decimal): Tick size in dollars for the grid to land on. Must be
+            > 0 (tick_size_for_price guarantees this).
+
+    Returns:
+        Decimal: The smallest grid point >= price. Returns price unchanged when
+            it already sits exactly on the grid.
+    """
+    return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+
+def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
+    """
+    Compute the fill-or-kill LIMIT price for one V2 buy leg, in dollars.
+
+    V2 has no "market" order type, so a taker order is a marketable FoK limit
+    and this price IS the price protection that buy_max_cost provided on the
+    legacy path: the order fills at or better than the cap, or not at all.
+    The cap is the scanned price ceiled onto the market's own tick grid plus
+    BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
+    pre-execution check.
+
+    The scanned price is quantized to 6 decimals before that ceiling, the same
+    round-before-ceil guard the legacy cap applies in _buy_max_cost_cents (and
+    config.fee_leg_exact before it). Every scanned ask level is the complement
+    of a resting bid (1.0 - float(bid)), and 20 of the 99 whole-cent
+    complements land one ULP ABOVE the exact cent, which would otherwise ceil a
+    whole extra tick and hand the order 2 x BUY_SLIPPAGE_TICKS of tolerance.
+    No Kalshi grid point has a 7th decimal, so the quantize can only remove
+    float noise: it tightens or keeps the cap, never loosens it (TS-03).
+
+    Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
+    DIFFERENT band of the market's grid than the scanned price — stepping up
+    across a band edge, or being mirrored to the other end of the book — the
+    final price is re-quantized onto the grid of the band that actually
+    contains it, rounding UP. Ceiling is chosen because a floor could round a
+    YES cap BELOW the scanned price and make the order structurally unfillable.
+    Kalshi's nested grids ($0.01 subset of $0.001 subset of $0.0001) mean a
+    price landing in a FINER band than it was computed on is already on that
+    band's grid, so the snap is then a no-op.
+
+    That re-quantization is NOT purely protective, and this docstring used to
+    claim it was. When the final price lands in a COARSER band than the one it
+    was computed on, ceiling moves it AWAY from the scanned price and LOOSENS
+    the cap by up to one destination-band tick. Reachable examples on the live
+    band layouts: scanned 0.10 on tapered_deci_cent submits 0.11 where 0.101
+    was intended ($0.0090/contract of extra tolerance), and scanned 0.01 on
+    center_deci_edge_centi_cent submits 0.011 where 0.0101 was intended
+    ($0.0009). The loosening is bounded by one tick of the destination band and
+    is a known, accepted cost of keeping the order fillable; it is a separate
+    finding from TS-10 and is deliberately not fixed here. TS-10 fixed the
+    other half — tick_size_for_price now resolves a boundary price to the
+    FINEST containing band, so the slippage allowance is no longer multiplied
+    by a 10x tick at a band's upper edge.
+
+    The clamp bounds are grid-aware for the same reason: the extreme tradeable
+    levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not
+    0.9999, on a linear-cent market), so the bounds are derived from the tick
+    size at each end of the book rather than the global finest-grid constants.
+
+    This mapping (which side, and the complement for the NO leg) is the single
+    assumption most in need of verification at the first live submission; see
+    _V2_LEG_SIDE, which is where a correction would be made.
+
+    Args:
+        leg_kind (str): Which KIND of leg is being priced — "buy_yes" or
+            "buy_no". Any other value is treated as a YES-style leg (the price
+            is used as-is). A plain string, not a _Leg: this helper prices one
+            side and knows nothing about which of the pair's markets it is on.
+        scanned_price_dollars (float): The scanned depth-weighted per-contract
+            price for this leg, in dollars. Range: (0, 1). For "buy_no" this is
+            the NO price (the NO leg's _Leg.price_dollars), which is
+            complemented into a YES-book ask price.
+        market (Any): The market object the leg trades, used only to look up its
+            tick grid. Any object exposing price_level_structure / price_ranges.
+
+    Returns:
+        Decimal: The limit price in dollars — a valid grid point of the band
+            containing it, clamped one tick inside the open unit interval on
+            this market's grid.
+    """
+    # Every scanned level is 1.0 - float(bid) (scanner._bids_to_ask_levels),
+    # and 20 of the 99 whole-cent complements land one ULP ABOVE the exact
+    # cent (0.43 -> 0.5700000000000001). Un-quantized, _ceil_to_tick steps a
+    # whole extra tick and the FoK limit carries 2 x BUY_SLIPPAGE_TICKS of
+    # tolerance instead of 1 (TS-03).
+    scanned = Decimal(str(scanned_price_dollars)).quantize(_SCANNED_PRICE_QUANTUM)
+    # Cross-module: the market's own tick grid is the only authority on what
+    # price levels the exchange will accept for this leg
+    tick = tick_size_for_price(market, scanned_price_dollars)
+    cap = ceil_to_tick(scanned, tick) + BUY_SLIPPAGE_TICKS * tick
+    # Buying NO is selling YES on the single YES book, so the YES-side price is
+    # the complement of the capped NO price
+    price = Decimal("1") - cap if leg_kind == "buy_no" else cap
+    # Re-quantize onto the grid of the band the FINAL price sits in (see
+    # docstring: ceiling is protective — worst case is a killed FoK)
+    final_tick = tick_size_for_price(market, float(price))
+    price = ceil_to_tick(price, final_tick)
+    # Grid-aware clamp: the extreme valid levels are one tick inside 0 and 1
+    # on this market's own grid at each end of the book
+    bottom_tick = tick_size_for_price(market, float(_V2_MIN_PRICE))
+    top_tick = tick_size_for_price(market, float(Decimal("1") - _V2_MIN_PRICE))
+    return min(max(price, bottom_tick), Decimal("1") - top_tick)
+
+
+def v2_effective_cap(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
+    """
+    The V2 FoK cap for one buy leg, expressed in that leg's OWN side terms.
+
+    v2_limit_price returns the price that goes on the WIRE, which for a NO leg
+    is a YES-book ask of 1 - cap. Callers that need to compare the cap against
+    NO-side level prices — strategy's reachability gate, validate_pair_price's
+    pre-execution re-check — need the NO price, so this undoes that complement
+    and nothing else.
+
+    It exists so those callers never re-derive the cap themselves. TS-08 is
+    precisely "the size and the cap disagree", and a second copy of the formula
+    guarantees they disagree again; going through v2_limit_price means the
+    number tested here is the number the order body will carry, including the
+    NO leg's complement round-trip, which can TIGHTEN the effective NO cap on a
+    sub-cent grid.
+
+    Args:
+        leg_kind (str): "buy_yes" or "buy_no", as for v2_limit_price.
+        scanned_price_dollars (float): The leg's per-contract price in dollars
+            — for "buy_no" the NO price. Range: (0, 1).
+        market (Any): The market the leg trades, for its tick grid.
+
+    Returns:
+        Decimal: The highest per-contract price this leg can pay, in the leg's
+            own side's terms — a YES price for "buy_yes", a NO price for
+            "buy_no". A level priced above it cannot fill under this order.
+    """
+    wire = v2_limit_price(leg_kind, scanned_price_dollars, market)
+    # Buying NO is selling YES, so the NO-side cap is the complement of the
+    # YES-book ask that actually gets submitted.
+    return Decimal("1") - wire if leg_kind == "buy_no" else wire
 
 @dataclass
 class CandidatePair:
@@ -1575,7 +1743,13 @@ def find_time_series_pairs(
                 # here would let such pairs through as untradeable placeholders that
                 # could still win the group's one-pair-per-title slot below. Mirrors
                 # the directional check in backtester._find_entry.
-                if pB - pA < min_price_diff_for_gap(gap_days):
+                # PRICE_EPSILON, not a bare <: both prices are floats parsed
+                # from cent-quantized dollar strings, so an exactly-at-tier
+                # gap can evaluate a hair under it (0.45 - 0.30 ->
+                # 0.15000000000000002 is fine, but 0.35 - 0.20 ->
+                # 0.14999999999999997 is not) and the pair is rejected for
+                # representation noise rather than for its price (TS-09).
+                if pB - pA < min_price_diff_for_gap(gap_days) - PRICE_EPSILON:
                     continue
 
                 # tradeable=True when a win scenario (YES-on-A or NO-on-B paying $1)
@@ -1704,7 +1878,10 @@ def find_same_title_pairs(
 
                 # Enforce the minimum 5% YES price difference for same-title pairs.
                 # A smaller gap is within normal bid-ask spread noise.
-                if pA - pB < SAME_TITLE_MIN_PRICE_DIFF:
+                # Same float-noise tolerance as the time-series tier test:
+                # 0.35 - 0.30 == 0.04999999999999999, which a bare < rejects
+                # at the documented 5% threshold (TS-09).
+                if pA - pB < SAME_TITLE_MIN_PRICE_DIFF - PRICE_EPSILON:
                     continue
 
                 try:
@@ -2388,7 +2565,9 @@ def enrich_with_orderbook_prices(
         # _pair_max_sum for the exact per-tier ceilings.
         max_sum    = _pair_max_sum(pair)
         qualifying = [
-            (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
+            (yp, np_, qty)
+            for yp, np_, qty in paired
+            if yp + np_ <= max_sum + PRICE_EPSILON
         ]
 
         if not qualifying:
@@ -2486,7 +2665,7 @@ def enrich_with_orderbook_prices(
                 tier = min_price_diff_for_gap(
                     deadline_gap_days(pair.market_a, pair.market_b)
                 )
-                direction_ok = (pair.pB - avg_yes) >= tier
+                direction_ok = (pair.pB - avg_yes) >= tier - PRICE_EPSILON
                 basis = (
                     f"scan-time reference ask {pair.pB:.4f} (later book's NO side "
                     f"empty), which must clear the {tier:.2f} tier"
@@ -2588,7 +2767,11 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
     # Same per-pair gap ceiling used at scan time (deadline-gap-tiered for
     # time_series) — the trade must still qualify at execution time
     max_sum    = _pair_max_sum(pair)
-    qualifying = [(yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum]
+    qualifying = [
+        (yp, np_, qty)
+        for yp, np_, qty in paired
+        if yp + np_ <= max_sum + PRICE_EPSILON
+    ]
 
     if not qualifying:
         # WARNING, not INFO: this is a SELECTED trade being dropped seconds
@@ -2600,12 +2783,41 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
         )
         return False
 
-    # Require enough depth to fill our full intended contract count via FoK
-    total_qty = sum(qty for _, _, qty in qualifying)
+    # Require enough depth to fill our full intended contract count via FoK.
+    # On the V2 path "enough depth" means depth the ORDER CAN REACH, not depth
+    # that merely clears the gap: the order is one fill-or-kill limit per leg,
+    # priced from this spec's own leg prices, and it buys nothing resting above
+    # that limit. Counting the whole qualifying book here would let a trade
+    # whose top levels sit above its cap pass the pre-execution check and then
+    # be killed on the wire, reported as "NO leg FoK not filled" — the same
+    # confusion between cap and size that TS-08 fixed on the sizing side.
+    #
+    # The caps come from leg_prices(spec.pair) — the price the trader is about
+    # to submit at — NOT from a freshly recomputed average of this book. That
+    # is the question that actually matters: will the order we are about to
+    # send fill against the book as it stands now?
+    if ORDER_API_VERSION == "v2":
+        side_a, side_b = leg_sides(pair.pair_type)
+        price_a, price_b = leg_prices(spec.pair)
+        cap_a = float(v2_effective_cap(f"buy_{side_a}", price_a, pair.market_a))
+        cap_b = float(v2_effective_cap(f"buy_{side_b}", price_b, pair.market_b))
+        # qualifying is in SIDE order (yes, no, qty); orient the caps to match
+        cap_yes, cap_no = (cap_b, cap_a) if side_a == "no" else (cap_a, cap_b)
+        total_qty = sum(
+            qty for yp, np_, qty in qualifying
+            if yp <= cap_yes + PRICE_EPSILON and np_ <= cap_no + PRICE_EPSILON
+        )
+        basis = "reachable at the FoK limit"
+    else:
+        # Legacy buy_max_cost is a TOTAL-cost cap and can sweep a ladder, so
+        # every qualifying contract is reachable on that path.
+        total_qty = sum(qty for _, _, qty in qualifying)
+        basis = "at gap"
+
     if total_qty < spec.x:
         logging.warning(
-            "Pre-execution check failed for '%s' — only %.1f contracts at gap (need %d); dropping",
-            pair.canonical_title, total_qty, spec.x,
+            "Pre-execution check failed for '%s' — only %.1f contracts %s (need %d); dropping",
+            pair.canonical_title, total_qty, basis, spec.x,
         )
         return False
 

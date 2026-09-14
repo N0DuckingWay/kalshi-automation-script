@@ -153,7 +153,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, Decimal
 from json import JSONDecodeError
 from typing import Any
 
@@ -163,7 +163,6 @@ from ._http import api_call_with_retry, fetch_json_page, signed_request_json
 from .auth import read_shard_balances
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
-    BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
@@ -175,8 +174,25 @@ from .config import (
     V2_ROLLBACK_BID_PRICE_DOLLARS,
 )
 from .reporter import TradeResult
-from .scanner import leg_prices, leg_sides, tick_size_for_price, validate_pair_price
+from .scanner import (
+    ceil_to_tick,
+    leg_prices,
+    leg_sides,
+    tick_size_for_price,
+    v2_limit_price,
+    validate_pair_price,
+)
 from .strategy import TradeSpec
+
+# The V2 buy-cap arithmetic LIVES IN scanner.py and is only re-exported here.
+# It moved there so strategy.py could size against the very cap this module
+# submits, without importing trader (a real cycle — trader imports both
+# scanner and strategy). Duplicating the formula was not an option: TS-08 is
+# "the size and the cap disagree", and a second copy guarantees a second
+# disagreement. Kept under the historical private names because every call
+# site, docstring and test in this module already refers to them that way.
+_ceil_to_tick = ceil_to_tick
+_v2_limit_price = v2_limit_price
 
 # Tolerance for comparing position deltas against whole-contract expectations.
 # Contract counts are always whole numbers on the wire, but the API now sends
@@ -282,25 +298,10 @@ def _ordered_legs(spec: TradeSpec) -> tuple[_Leg, _Leg]:
     return (leg_a, leg_b) if leg_a.side == "no" else (leg_b, leg_a)
 
 
-# Lowest valid V2 limit price, in dollars. Kalshi prices live in the open unit
-# interval — 0 and 1 are settlement values, not tradeable levels — and the
-# finest grid in any regime is $0.0001, so this is the extreme valid bottom
-# tick. The top of grid is not a module constant: it depends on the market's
-# own tick regime and is derived per market by _v2_top_of_grid_price() from
-# config.V2_ROLLBACK_BID_PRICE_DOLLARS.
-_V2_MIN_PRICE = Decimal("0.0001")
-
 # Number of decimal places in a V2 dollar-string price. Four places exactly
 # represents every grid point of every known regime ($0.01 / $0.001 / $0.0001),
 # so quantizing here can never move a price off-grid.
 _V2_PRICE_QUANTUM = Decimal("0.0001")
-
-# Quantum applied to the scanned price BEFORE it is ceiled onto the tick grid —
-# the same round-before-ceil guard as _buy_max_cost_cents and
-# config.fee_leg_exact. No Kalshi grid point has a 7th decimal (the finest is
-# $0.0001), so quantizing can only remove binary float noise: it tightens or
-# keeps the cap, never loosens it (TS-03).
-_SCANNED_PRICE_QUANTUM = Decimal("0.000001")
 
 # Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one().
 # False until a V2 NO buy has been observed to produce a NEGATIVE account
@@ -525,122 +526,6 @@ def _build_yes_order(leg: _Leg) -> CreateOrderRequest:
         # Price protection: never pay more than scanned price + slippage allowance
         buy_max_cost=_buy_max_cost_cents(leg.count, leg.price_dollars),
     )
-
-
-def _ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
-    """
-    Round a price UP to the next point of a tick grid.
-
-    Ceiling, never nearest or floor: this is the first half of a buy leg's price
-    cap, and it mirrors the legacy _buy_max_cost_cents' math.ceil for exactly
-    the same reason — a cap rounded BELOW the scanned depth-weighted price could
-    never fill at the price we actually scanned, so a fill-or-kill order carrying
-    it would be structurally killed every time rather than protected.
-
-    Args:
-        price (Decimal): Price in dollars to round. Range: [0, 1].
-        tick (Decimal): Tick size in dollars for the grid to land on. Must be
-            > 0 (tick_size_for_price guarantees this).
-
-    Returns:
-        Decimal: The smallest grid point >= price. Returns price unchanged when
-            it already sits exactly on the grid.
-    """
-    return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-
-
-def _v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
-    """
-    Compute the fill-or-kill LIMIT price for one V2 buy leg, in dollars.
-
-    V2 has no "market" order type, so a taker order is a marketable FoK limit
-    and this price IS the price protection that buy_max_cost provided on the
-    legacy path: the order fills at or better than the cap, or not at all.
-    The cap is the scanned price ceiled onto the market's own tick grid plus
-    BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
-    pre-execution check.
-
-    The scanned price is quantized to 6 decimals before that ceiling, the same
-    round-before-ceil guard the legacy cap applies in _buy_max_cost_cents (and
-    config.fee_leg_exact before it). Every scanned ask level is the complement
-    of a resting bid (1.0 - float(bid)), and 20 of the 99 whole-cent
-    complements land one ULP ABOVE the exact cent, which would otherwise ceil a
-    whole extra tick and hand the order 2 x BUY_SLIPPAGE_TICKS of tolerance.
-    No Kalshi grid point has a 7th decimal, so the quantize can only remove
-    float noise: it tightens or keeps the cap, never loosens it (TS-03).
-
-    Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
-    DIFFERENT band of the market's grid than the scanned price — stepping up
-    across a band edge, or being mirrored to the other end of the book — the
-    final price is re-quantized onto the grid of the band that actually
-    contains it, rounding UP. Ceiling is chosen because a floor could round a
-    YES cap BELOW the scanned price and make the order structurally unfillable.
-    Kalshi's nested grids ($0.01 subset of $0.001 subset of $0.0001) mean a
-    price landing in a FINER band than it was computed on is already on that
-    band's grid, so the snap is then a no-op.
-
-    That re-quantization is NOT purely protective, and this docstring used to
-    claim it was. When the final price lands in a COARSER band than the one it
-    was computed on, ceiling moves it AWAY from the scanned price and LOOSENS
-    the cap by up to one destination-band tick. Reachable examples on the live
-    band layouts: scanned 0.10 on tapered_deci_cent submits 0.11 where 0.101
-    was intended ($0.0090/contract of extra tolerance), and scanned 0.01 on
-    center_deci_edge_centi_cent submits 0.011 where 0.0101 was intended
-    ($0.0009). The loosening is bounded by one tick of the destination band and
-    is a known, accepted cost of keeping the order fillable; it is a separate
-    finding from TS-10 and is deliberately not fixed here. TS-10 fixed the
-    other half — tick_size_for_price now resolves a boundary price to the
-    FINEST containing band, so the slippage allowance is no longer multiplied
-    by a 10x tick at a band's upper edge.
-
-    The clamp bounds are grid-aware for the same reason: the extreme tradeable
-    levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not
-    0.9999, on a linear-cent market), so the bounds are derived from the tick
-    size at each end of the book rather than the global finest-grid constants.
-
-    This mapping (which side, and the complement for the NO leg) is the single
-    assumption most in need of verification at the first live submission; see
-    _V2_LEG_SIDE, which is where a correction would be made.
-
-    Args:
-        leg_kind (str): Which KIND of leg is being priced — "buy_yes" or
-            "buy_no". Any other value is treated as a YES-style leg (the price
-            is used as-is). A plain string, not a _Leg: this helper prices one
-            side and knows nothing about which of the pair's markets it is on.
-        scanned_price_dollars (float): The scanned depth-weighted per-contract
-            price for this leg, in dollars. Range: (0, 1). For "buy_no" this is
-            the NO price (the NO leg's _Leg.price_dollars), which is
-            complemented into a YES-book ask price.
-        market (Any): The market object the leg trades, used only to look up its
-            tick grid. Any object exposing price_level_structure / price_ranges.
-
-    Returns:
-        Decimal: The limit price in dollars — a valid grid point of the band
-            containing it, clamped one tick inside the open unit interval on
-            this market's grid.
-    """
-    # Every scanned level is 1.0 - float(bid) (scanner._bids_to_ask_levels),
-    # and 20 of the 99 whole-cent complements land one ULP ABOVE the exact
-    # cent (0.43 -> 0.5700000000000001). Un-quantized, _ceil_to_tick steps a
-    # whole extra tick and the FoK limit carries 2 x BUY_SLIPPAGE_TICKS of
-    # tolerance instead of 1 (TS-03).
-    scanned = Decimal(str(scanned_price_dollars)).quantize(_SCANNED_PRICE_QUANTUM)
-    # Cross-module: the market's own tick grid is the only authority on what
-    # price levels the exchange will accept for this leg
-    tick = tick_size_for_price(market, scanned_price_dollars)
-    cap = _ceil_to_tick(scanned, tick) + BUY_SLIPPAGE_TICKS * tick
-    # Buying NO is selling YES on the single YES book, so the YES-side price is
-    # the complement of the capped NO price
-    price = Decimal("1") - cap if leg_kind == "buy_no" else cap
-    # Re-quantize onto the grid of the band the FINAL price sits in (see
-    # docstring: ceiling is protective — worst case is a killed FoK)
-    final_tick = tick_size_for_price(market, float(price))
-    price = _ceil_to_tick(price, final_tick)
-    # Grid-aware clamp: the extreme valid levels are one tick inside 0 and 1
-    # on this market's own grid at each end of the book
-    bottom_tick = tick_size_for_price(market, float(_V2_MIN_PRICE))
-    top_tick = tick_size_for_price(market, float(Decimal("1") - _V2_MIN_PRICE))
-    return min(max(price, bottom_tick), Decimal("1") - top_tick)
 
 
 def _v2_top_of_grid_price(market: Any) -> Decimal:

@@ -254,6 +254,23 @@ DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 MIN_ACTIVE_PRICE_DOLLARS      = 0.0001
 MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
 
+# Tolerance for comparing two contract prices for equality-or-better.
+#
+# Every price in the pipeline is a float parsed from a cent-quantized dollar
+# string, so exact arithmetic on them does not hold: 0.35 - 0.30 evaluates to
+# 0.04999999999999999, and a bare `< 0.05` therefore REJECTS a pair that sits
+# exactly on the documented 5% threshold. Measured over live books: the
+# same-title 5c test rejected 50 of 94 qualifying pairs, the time-series 15c
+# tier 21 of 84, and the 30c tier 15 of 69 (TS-09).
+#
+# 1e-6 is two orders of magnitude below the FINEST tick any regime uses
+# ($0.0001), so it can only absorb representation noise — never a real price
+# difference, which is at least one tick. DO NOT TUNE UPWARD: this is an
+# ABSOLUTE tolerance, so its weight relative to the quantity being compared
+# grows as that quantity shrinks, and a larger value would start admitting
+# genuinely sub-threshold pairs at the bottom of the book.
+PRICE_EPSILON                 = 1e-6
+
 # Which create-order endpoint trader.py submits through. Allowed values:
 #   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
 #              (the limit price IS the price protection), fixed-point counts,

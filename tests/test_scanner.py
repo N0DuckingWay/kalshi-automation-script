@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import scanner
+from kalshi_betting import config, scanner
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     INCLUDE_MVE_MARKETS,
@@ -3150,3 +3150,138 @@ class TestBidsToAskLevelsSubCent:
         # becomes tradeable. Guard, not proof of the fix.
         assert scanner._MIN_ACTIVE_PRICE == 0.01
         assert scanner._MAX_ACTIVE_PRICE == 0.99
+
+
+class TestPriceEpsilonThresholds:
+    """
+    TS-09: prices are floats parsed from cent-quantized dollar strings, so a
+    pair sitting EXACTLY on a documented threshold can evaluate a hair under it
+    and be rejected for representation noise rather than for its price.
+    Measured over live books: the same-title 5c test rejected 50 of 94
+    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69.
+    """
+
+    def test_the_float_noise_this_exists_for_is_real(self):
+        # PIN on the premise, not on the fix: if these ever become exact the
+        # epsilon is dead weight and should be revisited.
+        assert 0.35 - 0.30 < 0.05
+        assert 0.35 - 0.20 < 0.15
+
+    def test_epsilon_is_far_below_the_finest_tick(self):
+        # GUARD on magnitude. The finest grid in any regime is $0.0001, and
+        # the tolerance is at most 1% of one tick, so it can only absorb
+        # representation noise — never a real one-tick price difference.
+        assert config.PRICE_EPSILON <= 0.0001 / 100
+
+    @staticmethod
+    def _same_title(pA: float, pB: float):
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = _mock_market(ticker="A1", event_ticker="EV-A", title="Same question",
+                          subtitle="Yes", yes_ask=pA, no_ask=round(1.0 - pA, 4),
+                          close_time=close)
+        mB = _mock_market(ticker="B1", event_ticker="EV-B", title="Same question",
+                          subtitle="Yes", yes_ask=pB, no_ask=round(1.0 - pB, 4),
+                          close_time=close)
+        return find_same_title_pairs([mA, mB])
+
+    def test_same_title_pair_exactly_at_threshold_qualifies(self):
+        # 0.35 - 0.30 == 0.04999999999999999, one ULP under the 5% threshold.
+        pairs = self._same_title(0.35, 0.30)
+        assert len(pairs) == 1
+        assert pairs[0].pA == pytest.approx(0.35)
+
+    def test_same_title_pair_a_cent_under_threshold_is_still_rejected(self):
+        # GUARD: the epsilon must not admit a genuinely sub-threshold pair.
+        assert self._same_title(0.34, 0.30) == []
+
+    def test_time_series_pair_exactly_at_the_short_tier_qualifies(self):
+        # 0.35 - 0.20 == 0.14999999999999997, one ULP under the 15% tier.
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.20, pB=0.35)
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+        assert pairs[0].pB == pytest.approx(0.35)
+
+    def test_time_series_pair_a_cent_under_the_tier_is_still_rejected(self):
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.21, pB=0.34)
+        assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
+
+
+class TestValidatePairPriceReachableDepth:
+    """
+    The pre-execution re-check must ask the question the wire asks: will the
+    order we are ABOUT TO SUBMIT fill against the book as it stands? Counting
+    every contract that merely clears the gap let a spec whose top levels rest
+    above its own FoK limit pass here and then be killed on the exchange,
+    reported as "NO leg FoK not filled" (TS-08).
+    """
+
+    @staticmethod
+    def _client(a_yes_bids, b_no_bids):
+        client = MagicMock()
+
+        def _raw(ticker, *a, **k):
+            book = {"A1": {"yes": a_yes_bids, "no": []},
+                    "B1": {"yes": [], "no": b_no_bids}}[ticker]
+            return {"orderbook_fp": {"yes_dollars": book["yes"], "no_dollars": book["no"]}}
+
+        client._get = _raw
+        return client
+
+    @staticmethod
+    def _pair(nA, pB):
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        return CandidatePair(
+            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
+            tradeable=True, canonical_title="reachability pair",
+            pair_type="same_title",
+        )
+
+    def _run(self, monkeypatch, x):
+        # NO leg (market_a) ladders 0.32@300 then 0.37@300; YES leg flat 0.30.
+        # The spec is priced at the top level, so its NO cap is 0.33 and only
+        # the first 300 contracts are reachable.
+        pair = self._pair(nA=0.32, pB=0.30)
+        spec = SimpleNamespace(pair=pair, x=x)
+        client = self._client(
+            a_yes_bids=[["0.68", "300"], ["0.63", "300"]],
+            b_no_bids=[["0.70", "600"]],
+        )
+        monkeypatch.setattr(scanner, "_fetch_orderbook",
+                            lambda c, t: {"A1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": []},
+                                          "B1": {"yes": [], "no": [["0.70", "600"]]}}[t])
+        return validate_pair_price(client, spec)
+
+    def test_spec_within_reachable_depth_passes(self):
+        import pytest as _p
+        mp = _p.MonkeyPatch()
+        try:
+            assert self._run(mp, 300) is True
+        finally:
+            mp.undo()
+
+    def test_spec_beyond_reachable_depth_is_dropped(self):
+        # 600 contracts clear the gap, but only 300 rest at or below the cap.
+        import pytest as _p
+        mp = _p.MonkeyPatch()
+        try:
+            assert self._run(mp, 600) is False
+        finally:
+            mp.undo()
+
+    def test_the_rejection_names_reachability_not_thin_depth(self, caplog, monkeypatch):
+        with caplog.at_level(logging.WARNING):
+            self._run(monkeypatch, 600)
+        assert "reachable at the FoK limit" in caplog.text
+
+    def test_legacy_path_counts_the_whole_qualifying_book(self, monkeypatch):
+        # buy_max_cost is a TOTAL-cost cap and can sweep a ladder.
+        monkeypatch.setattr(scanner, "ORDER_API_VERSION", "legacy")
+        assert self._run(monkeypatch, 600) is True
