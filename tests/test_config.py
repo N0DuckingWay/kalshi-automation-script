@@ -7,6 +7,7 @@ import pytest
 
 from kalshi_betting import config
 from kalshi_betting.config import (
+    BUDGET_FRACTION,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -18,6 +19,7 @@ from kalshi_betting.config import (
     TIME_SERIES_LEG_SIDES,
     fee_leg_exact,
     fee_per_pair_approx,
+    max_affordable_pairs,
     min_price_diff_for_gap,
     time_series_profit_prob,
 )
@@ -206,6 +208,49 @@ class TestMinPriceDiffForGap:
         # The tiers the strategy is specified against: 15% short, 30% long
         assert MIN_PRICE_DIFF_SHORT_GAP == 0.15
         assert MIN_PRICE_DIFF_LONG_GAP == 0.30
+
+
+class TestMaxAffordablePairs:
+    """max_affordable_pairs is the single budget -> contracts definition shared
+    by the scanner's depth cap and strategy.compute_trade's sizing. The upper-
+    bound property below is what lets enrichment price a pair at a size the
+    sizer can never exceed."""
+
+    def test_floors_rather_than_rounds(self):
+        # $10.00 at a $0.90 pair sum buys 11.11 pairs -> 11, never 12
+        assert max_affordable_pairs(5_000, 0.90, 1.0) == 55
+        assert max_affordable_pairs(1_000, 0.90, 1.0) == 11
+
+    def test_defaults_to_budget_fraction(self):
+        assert (max_affordable_pairs(100_000, 0.50)
+                == max_affordable_pairs(100_000, 0.50, BUDGET_FRACTION))
+
+    def test_fraction_default_resolves_at_call_time(self, monkeypatch):
+        # Bound as a default argument this would freeze at import time, so a
+        # test (or an operator edit) of the constant would silently not apply —
+        # the same rule, for the same reason, as time_series_profit_prob's k.
+        base = max_affordable_pairs(100_000, 0.50)
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.40)
+        assert max_affordable_pairs(100_000, 0.50) == base * 2
+
+    def test_nonpositive_price_sum_returns_zero_not_zerodivision(self):
+        # A nonpositive sum means the book carried no usable level; every
+        # caller gets 0 rather than having to guard the division itself.
+        assert max_affordable_pairs(100_000, 0.0) == 0
+        assert max_affordable_pairs(100_000, -0.5) == 0
+
+    def test_budget_too_small_for_one_pair(self):
+        assert max_affordable_pairs(100, 0.90, 0.20) == 0
+
+    def test_scanner_cap_bounds_the_sizer(self):
+        # The invariant the whole design rests on: the scanner calls with the
+        # MAXIMUM fraction and the MINIMUM (best-level) price sum, so its answer
+        # can never be smaller than the sizer's, whatever Kelly returns.
+        balance, best_sum = 250_000, 0.82
+        cap = max_affordable_pairs(balance, best_sum)
+        for kelly_f in (0.01, 0.06, 0.13, BUDGET_FRACTION):
+            for prefix_sum in (best_sum, 0.85, 0.90, 0.94):
+                assert max_affordable_pairs(balance, prefix_sum, kelly_f) <= cap
 
 
 class TestCreateNewOutput:

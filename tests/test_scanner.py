@@ -40,9 +40,16 @@ from kalshi_betting.scanner import (
     leg_sides,
     normalize_title,
     pair_key,
+    prefix_fill_prices,
     tick_size_for_price,
     validate_pair_price,
 )
+
+# Balance handed to enrich_with_orderbook_prices. Deliberately far larger than
+# any fixture book: the affordability cap is min(book depth, what the budget
+# buys), so an ample balance makes it never bind and these tests keep exercising
+# the depth path alone. Tests that mean to exercise the cap set their own.
+_AMPLE_BALANCE_CENTS = 100_000_000
 
 
 class TestNormalizeTitle:
@@ -534,6 +541,35 @@ def _st_orderbook_client(
     return client
 
 
+def _ts_multilevel_client(levels: list[tuple[float, float, int]]):
+    """Mock KalshiClient serving TIME-SERIES depth at SEVERAL price levels.
+
+    levels is [(pA_fill, nB_fill, qty), ...]. Same side mapping as
+    _ts_orderbook_client (EARLY's NO bids -> YES asks, LATE's YES bids -> NO
+    asks), just with more than one rung, so the affordability bound has
+    somewhere worse to reach when the budget is large.
+
+    The two legs are SEPARATE books that _pair_orderbooks merges with a
+    two-pointer sweep, so each column must ascend on its own for the rungs here
+    to pair up 1:1 with the slices that sweep emits — a column that dips gets
+    re-sorted by _bids_to_ask_levels and the quantities no longer line up.
+    """
+    def fake_orderbook(ticker):
+        if ticker == "EARLY":
+            ob = {"yes_dollars": [],
+                  "no_dollars": [[str(round(1.0 - pa, 4)), str(q)]
+                                 for pa, _, q in levels]}
+        else:
+            ob = {"yes_dollars": [[str(round(1.0 - nb, 4)), str(q)]
+                                  for _, nb, q in levels],
+                  "no_dollars": []}
+        return _raw_book_response(ob)
+
+    client = MagicMock()
+    client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
+    return client
+
+
 def _ts_candidate(
     *, gap_days: int, pA: float, pB: float, nB: float, nA: float | None = None,
 ) -> CandidatePair:
@@ -553,6 +589,229 @@ def _ts_candidate(
     )
 
 
+class TestPrefixFillPrices:
+    """prefix_fill_prices is the shared definition of "what would n contract
+    pairs actually cost". Enrichment and strategy.compute_trade both read the
+    book through it, so the price a pair is gated on and the price it is sized
+    on can never be computed two different ways."""
+
+    # (price_a, price_b, qty), market order, ascending by combined price —
+    # the shape CandidatePair.depth_levels carries.
+    BOOK = ((0.40, 0.45, 10.0), (0.42, 0.46, 20.0), (0.50, 0.48, 70.0))
+
+    def test_single_contract_is_the_best_level(self):
+        assert prefix_fill_prices(self.BOOK, 1) == (0.40, 0.45)
+
+    def test_prefix_within_one_level_does_not_reach_the_next(self):
+        assert prefix_fill_prices(self.BOOK, 10) == (0.40, 0.45)
+
+    def test_partial_level_is_weighted_by_the_quantity_taken(self):
+        # 10 @ 0.40 then 5 @ 0.42 -> (10*0.40 + 5*0.42) / 15
+        avg_a, avg_b = prefix_fill_prices(self.BOOK, 15)
+        assert avg_a == pytest.approx((10 * 0.40 + 5 * 0.42) / 15)
+        assert avg_b == pytest.approx((10 * 0.45 + 5 * 0.46) / 15)
+
+    def test_full_depth_equals_the_whole_book_average(self):
+        # The pre-change behaviour is the n == total-depth special case, so the
+        # old number is still reachable — it is just no longer what we price on.
+        total = sum(q for _, _, q in self.BOOK)
+        avg_a, avg_b = prefix_fill_prices(self.BOOK, int(total))
+        assert avg_a == pytest.approx(
+            sum(a * q for a, _, q in self.BOOK) / total
+        )
+        assert avg_b == pytest.approx(
+            sum(b * q for _, b, q in self.BOOK) / total
+        )
+
+    def test_price_is_non_decreasing_in_n(self):
+        # The property the fixed-point descent in compute_trade relies on:
+        # buying more can only reach further down the book into worse levels.
+        sums = [sum(prefix_fill_prices(self.BOOK, n)) for n in range(1, 101)]
+        # Compared with a tolerance, not exactly: within one level every prefix
+        # average is the same price, but sum_a/n reintroduces binary float noise
+        # (0.40 * 3.0 / 3 == 0.4000000000000001), which is not a real increase.
+        assert all(sums[i + 1] >= sums[i] - 1e-12 for i in range(len(sums) - 1))
+
+    def test_insufficient_depth_returns_none(self):
+        assert prefix_fill_prices(self.BOOK, 101) is None
+
+    def test_exact_depth_is_not_insufficient(self):
+        # Boundary: the last take is exactly `remaining`, so the float
+        # accumulator lands on 0.0 and needs no epsilon.
+        assert prefix_fill_prices(self.BOOK, 100) is not None
+
+    def test_zero_or_negative_n_returns_none(self):
+        assert prefix_fill_prices(self.BOOK, 0) is None
+        assert prefix_fill_prices(self.BOOK, -1) is None
+
+    def test_empty_book_returns_none(self):
+        assert prefix_fill_prices((), 1) is None
+
+    def test_fractional_quantities_accumulate_exactly(self):
+        # Order-book quantities arrive as floats (_bids_to_ask_levels parses
+        # them with float()), so a book of fractional levels must still resolve
+        # rather than tripping the insufficient-depth arm.
+        book = ((0.30, 0.40, 0.5), (0.31, 0.41, 0.5), (0.32, 0.42, 4.0))
+        avg_a, avg_b = prefix_fill_prices(book, 1)
+        assert avg_a == pytest.approx((0.5 * 0.30 + 0.5 * 0.31) / 1)
+        assert avg_b == pytest.approx((0.5 * 0.40 + 0.5 * 0.41) / 1)
+
+
+def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> CandidatePair:
+    """Build a same_title CandidatePair on tickers A1/B1.
+
+    (nA, pB) are the leg prices (NO on A, YES on B); pA is the reference quote
+    and nB is reporting-only for this pair type.
+    """
+    mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=pA, no_ask=nA)
+    mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=pB, no_ask=nB)
+    return CandidatePair(
+        market_a=mA, market_b=mB,
+        pA=pA, pB=pB, nA=nA,
+        tradeable=True,
+        canonical_title="Q",
+        pair_type="same_title",
+        nB=nB,
+    )
+
+
+class TestEnrichmentBoundsDepthByAffordability:
+    """Enrichment must average only the depth this balance could actually buy.
+
+    One pair is capped at BUDGET_FRACTION of the balance, so averaging a liquid
+    market's full book priced every pair against levels no single trade can
+    reach — inflating the fill price and killing pairs at the profitability gate
+    on contracts we would never have bought.
+    """
+
+    # Each column ascends on its own (see _ts_multilevel_client), so the sweep
+    # emits these rungs 1:1 at combined prices 0.75, 0.85 and 0.97. The 10-day
+    # short-tier ceiling is 0.85 and the filter is inclusive, so the first two
+    # qualify and the deep 500-lot is trimmed — leaving 10 cheap contracts and
+    # 90 dearer ones for the affordability bound to choose between.
+    LEVELS = [(0.30, 0.45, 10), (0.36, 0.49, 90), (0.45, 0.52, 500)]
+
+    def _enrich(self, balance_cents):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client(self.LEVELS)
+        [enriched] = enrich_with_orderbook_prices(client, [pair], balance_cents)
+        return enriched
+
+    def test_small_balance_prices_at_the_best_level_only(self):
+        # $40 * 20% = $8.00, and the best rung costs 0.75 a pair -> 10 pairs,
+        # exactly what rests there, so the fill is the best level outright.
+        enriched = self._enrich(4_000)
+        assert enriched.tradeable is True
+        assert enriched.pA == pytest.approx(0.30)
+        assert enriched.nB == pytest.approx(0.45)
+        assert enriched.max_contracts == 10
+
+    def test_larger_balance_reaches_further_down_the_book(self):
+        # $1,000 * 20% = $200 at 0.75 a pair -> 266 pairs, more than the 100
+        # qualifying, so the whole qualifying book is averaged.
+        enriched = self._enrich(100_000)
+        assert enriched.max_contracts == 100
+        assert enriched.pA == pytest.approx((10 * 0.30 + 90 * 0.36) / 100)
+        assert enriched.nB == pytest.approx((10 * 0.45 + 90 * 0.49) / 100)
+
+    def test_price_is_never_better_for_a_bigger_balance(self):
+        # The direction that matters: a bigger budget can only reach worse
+        # levels, so its fill price is never better than a smaller budget's.
+        small = self._enrich(4_000)
+        large = self._enrich(100_000)
+        assert small.pA + small.nB <= large.pA + large.nB
+
+    def test_whole_book_average_would_have_killed_the_pair(self):
+        # The regression this change exists for. Averaged over ALL 100
+        # qualifying contracts the pair still trades here, but the same book
+        # priced at the top rung is strictly cheaper — so the gate sees the
+        # price a real trade would pay, not one it could never get.
+        small, large = self._enrich(4_000), self._enrich(100_000)
+        assert small.pA < large.pA
+        assert small.nB < large.nB
+
+    def test_budget_too_small_for_one_contract_is_not_tradeable(self):
+        # 1 cent of balance affords nothing. The pair must be DROPPED, never
+        # written with max_contracts=0 — compute_trade reads that as UNCAPPED.
+        enriched = self._enrich(1)
+        assert enriched.tradeable is False
+        assert enriched.max_contracts == 0
+
+    def test_unaffordable_pair_logs_its_own_reason(self, caplog):
+        with caplog.at_level(logging.INFO, logger=""):
+            self._enrich(1)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        # Depth and budget are named SEPARATELY: they are different faults with
+        # different fixes (the book is too thin vs. add funds), and a message
+        # that printed only the binding minimum misattributed one as the other.
+        assert "100.00 contract(s) rest at the gap" in line, line
+        assert "budget affords 0" in line, line
+
+    def test_thin_book_and_poor_budget_are_reported_distinctly(self, caplog):
+        # Ample balance, so the BOOK is what binds — the message must say so
+        # rather than blaming the budget.
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client([(0.30, 0.45, 0.4)])
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "0.40 contract(s) rest at the gap" in line, line
+        assert "budget affords 0" not in line, line
+
+    def test_max_contracts_is_what_the_written_price_covers(self):
+        # The invariant compute_trade's depth clamp relies on: the price written
+        # back is the average over exactly max_contracts contracts.
+        for balance in (4_000, 5_000, 20_000, 100_000):
+            enriched = self._enrich(balance)
+            expected = prefix_fill_prices(enriched.depth_levels, enriched.max_contracts)
+            assert leg_prices(enriched) == pytest.approx(expected)
+
+
+class TestEnrichmentStoresOrientedDepthLevels:
+    """depth_levels must be in MARKET order — (market_a's leg price, market_b's
+    leg price, qty) — so strategy.compute_trade reads them exactly the way
+    leg_prices reads the pair's scalars, with no pair-type logic of its own."""
+
+    def test_time_series_levels_are_pA_then_nB(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
+        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40)
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
+        [level] = enriched.depth_levels
+        assert level == pytest.approx((0.32, 0.42, 40.0))
+        # market_a's entry is the YES leg (pA), market_b's the NO leg (nB)
+        assert leg_prices(enriched) == pytest.approx((0.32, 0.42))
+
+    def test_same_title_levels_are_nA_then_pB(self):
+        pair = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
+        [level] = enriched.depth_levels
+        assert level == pytest.approx((0.44, 0.31, 100.0))
+        # market_a's entry is the NO leg (nA), market_b's the YES leg (pB)
+        assert leg_prices(enriched) == pytest.approx((0.44, 0.31))
+
+    def test_levels_match_leg_prices_ordering_for_both_types(self):
+        # The orientation contract stated once: depth_levels[i][0] always
+        # belongs to market_a and [1] to market_b, whichever side each buys.
+        ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
+        [ts_e] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42), [ts], _AMPLE_BALANCE_CENTS,
+        )
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [st_e] = enrich_with_orderbook_prices(
+            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
+        )
+        for enriched in (ts_e, st_e):
+            a, b, _ = enriched.depth_levels[0]
+            assert (a, b) == pytest.approx(leg_prices(enriched))
+
+    def test_unenriched_pair_has_empty_levels(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
+        assert pair.depth_levels == ()
+
+
 class TestOrderbookCeilingTieredByDeadlineGap:
     """enrich_with_orderbook_prices and validate_pair_price must apply the
     deadline-gap-tiered LEG-price-sum ceiling (0.85 for gaps <= 15 days, 0.70
@@ -567,7 +826,7 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         # 0.75 would have passed the old flat 0.85 ceiling but must disqualify.
         pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.45)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
     def test_short_gap_depth_at_080_sum_qualifies(self):
@@ -579,7 +838,7 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         # this pair type and stays put.
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.62)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.max_contracts == 100
         assert enriched.pA == pytest.approx(0.30)
@@ -662,7 +921,7 @@ class TestTimeSeriesEnrichmentSides:
     def test_enrichment_writes_fills_to_pA_nB_and_refreshes_pB_leaving_nA(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40, pB_ref=0.58)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.max_contracts == 40
         assert enriched.pA == pytest.approx(0.32)
@@ -680,7 +939,7 @@ class TestTimeSeriesEnrichmentSides:
         # rather than pricing the legs off the wrong side of each book.
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         client = _st_orderbook_client(nA_fill=0.70, pB_fill=0.60, ticker_a="EARLY")
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
         assert enriched.max_contracts == 0
         # Same for the pre-execution re-check
@@ -704,21 +963,12 @@ class TestSameTitleEnrichmentByteIdentity:
 
     @staticmethod
     def _pair() -> CandidatePair:
-        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
-        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
-        return CandidatePair(
-            market_a=mA, market_b=mB,
-            pA=0.55, pB=0.30, nA=0.45,
-            tradeable=True,
-            canonical_title="Q",
-            pair_type="same_title",
-            nB=0.70,
-        )
+        return _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
 
     def test_enrichment_writes_fills_to_nA_pB_and_refreshes_pA_leaving_nB(self):
         pair = self._pair()
         client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100, pA_ref=0.57)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.max_contracts == 100
         assert enriched.nA == pytest.approx(0.44)
@@ -734,10 +984,10 @@ class TestSameTitleEnrichmentByteIdentity:
         # 0.50 + 0.46 = 0.96 > 0.95 — the same-title ceiling, no deadline tiering
         pair = self._pair()
         client = _st_orderbook_client(nA_fill=0.50, pB_fill=0.46)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
         client_ok = _st_orderbook_client(nA_fill=0.50, pB_fill=0.45)
-        [enriched_ok] = enrich_with_orderbook_prices(client_ok, [pair])
+        [enriched_ok] = enrich_with_orderbook_prices(client_ok, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched_ok.tradeable is True
 
     def test_validate_pair_price_same_title(self):
@@ -760,7 +1010,7 @@ class TestSameTitleEnrichmentByteIdentity:
 
         client = MagicMock()
         client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
 
@@ -780,7 +1030,7 @@ class TestEnrichmentRefreshesReferenceQuote:
         # refreshed value is what lands in pB, from LATE's NO bids
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pB == pytest.approx(0.65)
         assert enriched.pB != pytest.approx(pair.pB)
@@ -803,7 +1053,7 @@ class TestEnrichmentRefreshesReferenceQuote:
             nB=0.70,
         )
         client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pA == pytest.approx(0.60)
         assert enriched.pA != pytest.approx(pair.pA)
@@ -832,7 +1082,7 @@ class TestEnrichmentRefreshesReferenceQuote:
     def test_inverted_pair_after_enrichment_is_dropped(self, caplog):
         pair, client = self._inverted_pair_and_client()
         with caplog.at_level(logging.INFO):
-            [enriched] = enrich_with_orderbook_prices(client, [pair])
+            [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
 
         assert enriched.tradeable is False
 
@@ -866,7 +1116,7 @@ class TestEnrichmentRefreshesReferenceQuote:
         # The fixed enrichment never produces such a pair: the refreshed
         # reference fails the direction guard, so it is not tradeable and
         # compute_trade returns None before _kelly_p is ever consulted.
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
     def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self):
@@ -874,7 +1124,7 @@ class TestEnrichmentRefreshesReferenceQuote:
         # pB keeps its scan-time value and the guard evaluates against that
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
-        [enriched] = enrich_with_orderbook_prices(client, [pair])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pB == pair.pB
         assert enriched.pA == pytest.approx(0.30)
@@ -885,11 +1135,11 @@ class TestEnrichmentRefreshesReferenceQuote:
         # i.e. two for a pair and still two for two pairs on the same markets
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
-        enrich_with_orderbook_prices(client, [pair])
+        enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert client.get_market_orderbook_without_preload_content.call_count == 2
 
         client_two = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
-        enrich_with_orderbook_prices(client_two, [pair, dataclasses.replace(pair)])
+        enrich_with_orderbook_prices(client_two, [pair, dataclasses.replace(pair)], _AMPLE_BALANCE_CENTS)
         assert client_two.get_market_orderbook_without_preload_content.call_count == 2
 
 
@@ -1158,7 +1408,7 @@ class TestFetchOrderbookKeyMapping:
         # mark the pair non-tradeable (both legs resolve to None depth).
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         payload = {"orderbook_fp": {"yes": [["0.55", "100"]], "no": [["0.65", "100"]]}}
-        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair])
+        [enriched] = enrich_with_orderbook_prices(_orderbook_payload_client(payload), [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
 

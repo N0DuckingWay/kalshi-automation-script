@@ -47,16 +47,20 @@ Notes:
 """
 import logging
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 from .config import (
     BUDGET_FRACTION,
     SAME_TITLE_CO_RESOLVE_PROB,
+    SIZE_SOLVE_MAX_ITERATIONS,
     fee_leg_exact,
     fee_per_pair_approx,
+    max_affordable_pairs,
     time_series_profit_prob,
 )
-from .scanner import CandidatePair, leg_prices, leg_sides
+from .scanner import CandidatePair, leg_prices, leg_sides, prefix_fill_prices
 
 
 @dataclass
@@ -136,6 +140,28 @@ class TradeSpec:
     cost_with_fees_b: float = 0.0
 
 
+def _depth_levels(pair: CandidatePair) -> tuple:
+    """
+    Return the pair's qualifying order-book depth, or () when it has no book.
+
+    Read defensively by TYPE, not by truthiness. A MagicMock standing in for a
+    pair — which most of this module's tests use — answers any attribute with a
+    truthy auto-attribute that iterates into nonsense, and a pair whose depth we
+    cannot actually read must be priced on its scalar leg prices rather than on
+    a guess. Same fail-safe rule scanner.leg_sides applies to an unknown
+    pair_type: when the input is not recognisable, take the conservative branch.
+
+    Args:
+        pair (CandidatePair): The candidate pair, or any stand-in for one.
+
+    Returns:
+        tuple: The (price_a, price_b, qty) levels enrichment stored, in MARKET
+            order; () when the attribute is missing, None, or not a list/tuple.
+    """
+    levels = getattr(pair, "depth_levels", None)
+    return tuple(levels) if isinstance(levels, (tuple, list)) else ()
+
+
 def _kelly_p(pair: CandidatePair) -> float:
     """
     Probability that the pair results in a profit, per the pair type's model.
@@ -184,11 +210,217 @@ def _kelly_p(pair: CandidatePair) -> float:
         float: Probability of profit, in (0, 1], used as "p" in compute_trade()'s
             Kelly formula.
     """
+    # The pair's own stored YES-leg quote. compute_trade calls _kelly_p_at
+    # directly instead, with the price of the quantity it is actually sizing.
+    return _kelly_p_at(pair, pair.pA)
+
+
+def _kelly_p_at(pair: CandidatePair, yes_leg_price: float) -> float:
+    """
+    _kelly_p with the YES leg's price supplied rather than read off the pair.
+
+    For a time-series pair the probability model is a function of the YES-ask
+    gap pB - pA, and pA is a LEG price — so it depends on how many contracts are
+    being bought. compute_trade's marginal-price descent re-prices the legs at
+    each candidate size and must re-derive p from that price, not from the
+    single scalar enrichment happened to write. For a same-title pair p is the
+    fixed co-resolution prior and the argument is ignored.
+
+    Args:
+        pair (CandidatePair): The candidate pair. pair_type selects the model
+            and, for time_series, pair.pB supplies the reference quote — which
+            is NOT a leg price and so does not move with the size.
+        yes_leg_price (float): Price of the YES leg at the size being sized,
+            dollars in (0, 1). For a time-series pair this is pA (market_a's
+            leg); ignored for same_title.
+
+    Returns:
+        float: Probability of profit, in (0, 1], used as "p" in compute_trade()'s
+            Kelly formula.
+    """
     if pair.pair_type == "time_series":
         # Single shared definition of the time-series model — backtester and
         # dashboard call the same helper so the three sizers cannot drift
-        return time_series_profit_prob(pair.pA, pair.pB)
+        return time_series_profit_prob(yes_leg_price, pair.pB)
     return SAME_TITLE_CO_RESOLVE_PROB
+
+
+class _Sizing(NamedTuple):
+    """
+    One candidate contract count, priced and Kelly-evaluated at its OWN fill price.
+
+    Attributes:
+        n (int): The contract count this was evaluated AT. 0 on the no-book
+            path, where there is no size-dependent price to evaluate at.
+        target (int): The count the capped Kelly budget affords at that price,
+            already clamped to the pair's depth. n is "supported" when
+            target >= n.
+        price_a (float): market_a's leg price at n, dollars in (0, 1).
+        price_b (float): market_b's leg price at n, dollars in (0, 1).
+        p (float): Probability of profit at that price.
+        profit_ratio (float): Kelly's "b" at that price.
+        kelly_fraction (float): Kelly fraction, capped at BUDGET_FRACTION.
+        budget_dollars (float): Contract-only budget the fee shrink measures against.
+    """
+    n: int
+    target: int
+    price_a: float
+    price_b: float
+    p: float
+    profit_ratio: float
+    kelly_fraction: float
+    budget_dollars: float
+
+
+def _evaluate_size(
+    pair: CandidatePair, levels: tuple, n: int, balance_cents: int,
+) -> _Sizing | None:
+    """
+    Price n contract pairs off the pair's book and return what Kelly then affords.
+
+    Every gate compute_trade applies lives here, so each candidate size is judged
+    entirely at ITS OWN fill price rather than at one scalar average computed
+    over depth the trade may never reach. With no levels the pair's stored leg
+    prices are used and n is ignored — the single-shot path.
+
+    Args:
+        pair (CandidatePair): The pair being sized. Supplies pair_type and pB
+            for the probability model and max_contracts for the depth clamp.
+        levels (tuple): The pair's qualifying depth from _depth_levels(); ()
+            means price on the stored scalars instead.
+        n (int): Contract count to price at. Ignored when levels is empty.
+        balance_cents (int): Account balance in integer cents.
+
+    Returns:
+        _Sizing | None: The priced, Kelly-evaluated candidate, or None when any
+            gate fails — leg price outside (0, 1), no net spread after the fee
+            approximation, a nonpositive Kelly fraction, a budget that cannot
+            afford one contract pair, or a book too thin to fill n.
+    """
+    if levels:
+        fills = prefix_fill_prices(levels, n)
+        if fills is None:
+            # Depth ran out below n — the caller searches smaller sizes
+            return None
+        price_a, price_b = fills
+    else:
+        # The two prices the legs actually cost — which of the pair's four quotes
+        # they are depends on the pair type; leg_prices is the single source of truth
+        price_a, price_b = leg_prices(pair)
+
+    # Validate that both leg prices are in the open interval (0, 1).
+    # Edge cases at 0 or 1 indicate a settled market and would break the fee formula.
+    if price_b <= 0.0 or price_b >= 1.0 or price_a <= 0.0 or price_a >= 1.0:
+        return None
+
+    # Subtract the continuous fee approximation from the gross spread to get the
+    # net edge. A zero or negative net_spread means the trade costs more than it pays.
+    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+    if net_spread <= 0:
+        return None
+
+    # profit_ratio is the net return per dollar invested — this is "b" in the Kelly formula
+    profit_ratio = net_spread / (price_a + price_b)
+
+    # Probability of profit at the price of THIS size — not at the pair's stored
+    # pA, which is only one point on the book
+    p = _kelly_p_at(pair, price_a)
+    q = 1.0 - p
+    # b is the net payoff per dollar risked (same as profit_ratio)
+    b = profit_ratio
+
+    # Kelly formula: f* = p - q/b. A negative result means negative expected value.
+    kelly_fraction = p - q / b
+    if kelly_fraction <= 0:
+        # Kelly says don't bet — expected value is negative despite the positive spread
+        return None
+
+    # Cap at BUDGET_FRACTION (20%) to avoid over-concentrating in a single pair
+    kelly_fraction_capped = min(BUDGET_FRACTION, kelly_fraction)
+
+    # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
+    budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
+    # Cross-module: the single definition of the budget -> contracts step. The
+    # scanner calls the same helper with BUDGET_FRACTION and the best level's
+    # price sum, so its depth cap is provably an upper bound on this count.
+    target = max_affordable_pairs(balance_cents, price_a + price_b, kelly_fraction_capped)
+
+    # Respect the order book depth limit set by scanner.enrich_with_orderbook_prices()
+    if pair.max_contracts > 0:
+        target = min(target, pair.max_contracts)
+    if target < 1:
+        # The Kelly budget can't afford even one contract pair — forcing n=1
+        # would silently exceed both the Kelly fraction and BUDGET_FRACTION
+        return None
+
+    return _Sizing(
+        n=n, target=target, price_a=price_a, price_b=price_b, p=p,
+        profit_ratio=profit_ratio, kelly_fraction=kelly_fraction_capped,
+        budget_dollars=budget_dollars,
+    )
+
+
+def _solve_marginal_size(
+    pair: CandidatePair, levels: tuple, balance_cents: int,
+) -> _Sizing | None:
+    """
+    Find the largest contract count whose own marginal fill price still justifies it.
+
+    Size and price are mutually dependent: buying more means eating further down
+    the book into worse-priced levels, and a worse average price both shrinks
+    Kelly's "b" and shrinks what the budget affords. A count n is SUPPORTED when
+    every gate passes at the price of n contracts AND the Kelly budget at that
+    price still affords at least n. This binary-searches [1, pair.max_contracts]
+    for the largest supported count.
+
+    The upper bound is enrichment's own affordability cap — BUDGET_FRACTION over
+    the best level's price sum, i.e. the largest fraction over the cheapest
+    possible prefix — so no count above it can ever be supported and the search
+    range is exhaustive.
+
+    Safety does not rest on the predicate being perfectly downward-closed. It
+    very nearly is (a smaller count fills at a better price, which relaxes every
+    gate, and b rises faster than p falls), but the guarantee here is simpler:
+    a count is only ever returned after being DIRECTLY verified, so a search that
+    lands low under-sizes rather than mis-prices. That also makes the search the
+    right shape for the gates themselves — evaluating only the top of the range,
+    as a plain descent would, would abandon a pair whose Kelly fraction is
+    negative at full depth but comfortably positive at a realistic size, which is
+    exactly the pair this whole mechanism exists to rescue.
+
+    Args:
+        pair (CandidatePair): The pair being sized; max_contracts bounds the search.
+        levels (tuple): The pair's qualifying depth, non-empty.
+        balance_cents (int): Account balance in integer cents.
+
+    Returns:
+        _Sizing | None: The largest verified-supported candidate, or None when
+            no count in the range is supported.
+    """
+    lo, hi = 1, pair.max_contracts
+    best: _Sizing | None = None
+    for _ in range(SIZE_SOLVE_MAX_ITERATIONS):
+        if lo > hi:
+            return best
+        mid = (lo + hi) // 2
+        sized = _evaluate_size(pair, levels, mid, balance_cents)
+        if sized is None or sized.target < mid:
+            # Too big: a gate fails at this price, or Kelly won't fund this many
+            hi = mid - 1
+        else:
+            best = sized
+            lo = mid + 1
+    # Unreachable: a bisection of [1, max_contracts] closes in about
+    # log2(max_contracts) passes, ~20 even for a million-contract book. Kept so
+    # an edit that breaks the halving costs one under-sized pair and a WARNING
+    # rather than a hung weekly run — best is already verified, so returning it
+    # is safe.
+    logging.warning(
+        "Marginal size for '%s' did not converge in %d passes — using the largest "
+        "count verified so far",
+        pair.canonical_title, SIZE_SOLVE_MAX_ITERATIONS,
+    )
+    return best
 
 
 def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
@@ -251,50 +483,30 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     if not pair.tradeable:
         return None
 
-    # The two prices the legs actually cost — which of the pair's four quotes
-    # they are depends on the pair type; leg_prices is the single source of truth
-    price_a, price_b = leg_prices(pair)
+    # The qualifying order-book depth enrichment left on the pair. With it, the
+    # size and the price are solved together below; without it — a pair built
+    # outside the scanner, or the bare pair the backtester's Kelly-parity test
+    # constructs — the pair's scalar leg prices are all there is.
+    levels = _depth_levels(pair)
 
-    # Validate that both leg prices are in the open interval (0, 1).
-    # Edge cases at 0 or 1 indicate a settled market and would break the fee formula.
-    if price_b <= 0.0 or price_b >= 1.0 or price_a <= 0.0 or price_a >= 1.0:
-        return None
+    if levels:
+        sized = _solve_marginal_size(pair, levels, balance_cents)
+        if sized is None:
+            return None
+        # The size whose OWN fill price justifies it, and that price
+        n = sized.n
+    else:
+        sized = _evaluate_size(pair, levels, 0, balance_cents)
+        if sized is None:
+            return None
+        # No book to re-price against: the single-shot sizing this always did
+        n = sized.target
 
-    # Subtract the continuous fee approximation from the gross spread to get the
-    # net edge. A zero or negative net_spread means the trade costs more than it pays.
-    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
-    if net_spread <= 0:
-        return None
-
-    # profit_ratio is the net return per dollar invested — this is "b" in the Kelly formula
-    profit_ratio = net_spread / (price_a + price_b)
-
-    # Compute the probability that the trade is profitable using the appropriate model
-    p = _kelly_p(pair)
-    q = 1.0 - p
-    # b is the net payoff per dollar risked (same as profit_ratio)
-    b = profit_ratio
-
-    # Kelly formula: f* = p - q/b. A negative result means negative expected value.
-    kelly_fraction = p - q / b
-    if kelly_fraction <= 0:
-        # Kelly says don't bet — expected value is negative despite the positive spread
-        return None
-
-    # Cap at BUDGET_FRACTION (20%) to avoid over-concentrating in a single pair
-    kelly_fraction_capped = min(BUDGET_FRACTION, kelly_fraction)
-
-    # Convert the Kelly fraction to a dollar budget, then derive the integer contract count
-    budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
-    n = int(budget_dollars / (price_a + price_b))
-    if n < 1:
-        # The Kelly budget can't afford even one contract pair — forcing n=1
-        # would silently exceed both the Kelly fraction and BUDGET_FRACTION
-        return None
-
-    # Respect the order book depth limit set by scanner.enrich_with_orderbook_prices()
-    if pair.max_contracts > 0:
-        n = min(n, pair.max_contracts)
+    price_a, price_b = sized.price_a, sized.price_b
+    p                = sized.p
+    profit_ratio     = sized.profit_ratio
+    kelly_fraction_capped = sized.kelly_fraction
+    budget_dollars   = sized.budget_dollars
 
     # Compute exact ceiling-rounded fees for the final integer n. budget_dollars
     # above only covers the contract cost (n * (price_a + price_b)) — fees are
@@ -311,6 +523,22 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     if n < 1:
         # Fees ate the entire Kelly budget — no contract count fits
         return None
+
+    if levels and n != sized.n:
+        # The shrink loop moved n, so re-price over exactly the contracts this
+        # trade will submit — that price is what trader._ordered_legs reads for
+        # the FoK limit and the rollback floor. A smaller n can only reach
+        # fewer, cheaper levels, so the fee-inclusive cost stays inside
+        # budget_dollars and the loop above needs no second pass. p,
+        # profit_ratio and kelly_fraction_capped are deliberately left at their
+        # pre-shrink values: they are reporting/ranking figures, recomputing
+        # them would reopen the non-monotone Kelly question above for no gain,
+        # and the pre-shrink price is the conservative side of the estimate.
+        fills = prefix_fill_prices(levels, n)
+        if fills is not None:
+            price_a, price_b = fills
+            fee_a = fee_leg_exact(n, price_a)
+            fee_b = fee_leg_exact(n, price_b)
 
     # Verify the win-scenario payoff is positive after exact fees. At very
     # small n the ceiling rounding can eat the entire profit margin. (For a
@@ -348,7 +576,8 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     monthly_profit_ratio = profit_ratio * 30.0 / days_to_close
 
     # Name the sides in the log so a time-series line (YES on A at pA, NO on B
-    # at nB) is never misread as the same-title NO/YES layout
+    # at nB) is never misread as the same-title NO/YES layout. Also the mapping
+    # the solved prices are written back through, below.
     side_a, side_b = leg_sides(pair.pair_type)
     logging.info(
         "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f kelly=%.1f%% n=%d "
@@ -366,6 +595,19 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
         profit_ratio * 100,
         monthly_profit_ratio * 100,
     )
+    if levels:
+        # Hand the solved prices back on the pair itself, through the same
+        # leg_sides mapping enrichment writes them with. leg_prices(spec.pair)
+        # is the documented single source of truth for what a leg costs, so
+        # doing it here means trader._ordered_legs, _v2_limit_price,
+        # _buy_max_cost_cents, _rollback_floor_cents and the prod trade log all
+        # pick up the marginal price with no changes of their own.
+        leg_updates = (
+            {"pA": price_a, "nB": price_b} if side_a == "yes"
+            else {"nA": price_a, "pB": price_b}
+        )
+        pair = dc_replace(pair, max_contracts=n, **leg_updates)
+
     return TradeSpec(
         pair=pair,
         x=n,

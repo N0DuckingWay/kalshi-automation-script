@@ -940,6 +940,38 @@ class TestRunDevLiveShapeReplay:
         assert client.rest_client.request.call_count == 0
 
 
+    def test_pairs_table_still_shows_the_trade_for_a_selected_pair(
+        self, monkeypatch, caplog,
+    ):
+        # Regression guard for an identity coupling. print_pairs_table looks a
+        # spec up by id(pair) against the candidate list, and compute_trade now
+        # returns a RE-PRICED COPY of the pair (the marginal fill price for the
+        # size it settled on). Keyed off id(spec.pair), as it was, every
+        # selected row would silently render "—" in the trade columns while the
+        # trade itself executed perfectly normally — a reporting-only break that
+        # no other assertion in this file would catch.
+        client = _live_shape_client(
+            monkeypatch,
+            balance_payload=_LIVE_BALANCE_PAYLOAD,
+            include_time_series=True,
+        )
+        _capture_dev_simulation(monkeypatch)
+        args = SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None)
+
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, args)
+
+        # The pairs table is logged one line per row; find the time-series row.
+        row = next(
+            (line for line in caplog.text.splitlines()
+             if "time_series" in line and "│" in line),
+            None,
+        )
+        assert row is not None, "time-series row missing from the pairs table"
+        assert "YES(A)" in row and "NO(B)" in row, row
+        assert "—" not in row.split("YES(A)")[0].split("│")[-2], row
+
+
 class TestRunProdDryRunLiveShapeReplay:
     def test_run_prod_dry_run_end_to_end_current_payload_shapes(self, monkeypatch, caplog):
         client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)

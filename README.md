@@ -20,7 +20,7 @@ The earlier contract resolving YES while the later resolves NO is impossible for
 
 The required price gap for time-series pairs is tiered by how far apart the two deadlines are: 15% for deadlines ≤ 15 days apart, 30% for 16–30 days — wider gaps leave more room for the event to genuinely land between the two deadlines, so more of the market-implied in-between probability is real rather than mispricing, and a bigger gap must be demanded before disputing it. Deadlines more than 30 days apart are never considered. See `min_price_diff_for_gap()` in `config.py` for the exact thresholds.
 
-In both cases, Kalshi charges a taker fee per contract leg. The bot only executes trades where the profit margin exceeds all fees after applying order book depth to confirm the gap exists in real liquidity.
+In both cases, Kalshi charges a taker fee per contract leg. The bot only executes trades where the profit margin exceeds all fees after applying order book depth to confirm the gap exists in real liquidity. Depth is priced at the **margin**: a single pair can never consume more than `BUDGET_FRACTION` of the balance, so averaging a liquid market's entire book would price every trade against levels it could never reach. The scanner bounds its average at the most contracts the balance could ever buy, and the sizer then searches the book for the largest contract count whose own fill price still justifies it.
 
 ### Strategy change (2026-09)
 
@@ -96,8 +96,8 @@ main.py
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   ├─ scanner.find_same_title_pairs()    — same-title pair detection
   ├─ main._dedup_pairs()            — merge both lists, preferring same-title on overlap
-  ├─ scanner.enrich_with_orderbook_prices() — validate depth & real fills
-  ├─ strategy.compute_trade()      — Kelly sizing per pair
+  ├─ scanner.enrich_with_orderbook_prices() — validate depth; price each pair over the depth this balance could actually buy
+  ├─ strategy.compute_trade()      — Kelly sizing per pair, at the marginal fill price of the size it settles on
   ├─ strategy.select_portfolio()   — greedy portfolio selection
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved
   ├─ trader.drop_legacy_unroutable() — legacy path only: drop specs with a leg off the default shard BEFORE any money moves
@@ -131,11 +131,11 @@ backtest.py (CLI)
 | Module | Description |
 |--------|-------------|
 | `__init__.py` | Package initializer. No exports; marks the directory as the `kalshi_betting` package. |
-| `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths) and the two fee helper functions used throughout the codebase. |
+| `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths), the two fee helper functions, and `max_affordable_pairs()` — the single budget-to-contracts definition shared by the scanner's depth bound and the sizer. |
 | `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
 | `_http.py` | Shared HTTP helpers used across the package (auth, scanner, historical, trader, and v2_probe): `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission and the collateral transfer call it directly). |
-| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades. |
-| `strategy.py` | Applies the Kelly criterion to size each trade, computes the profit floor for same-title pairs / the win-scenario profit for time-series pairs and the monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
+| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles to group time-series pairs, detects same-title pairs via exact match, and enriches tradeable pairs with live order book depth to compute real fill prices — averaged over the contracts the balance could actually buy, not the whole book, with the qualifying levels kept on the pair (`depth_levels`) for the sizer to re-price against via `prefix_fill_prices()`. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades. |
+| `strategy.py` | Solves size and price together — binary-searching the book for the largest contract count whose own marginal fill price still justifies it — then applies the Kelly criterion to size each trade, computes the profit floor for same-title pairs / the win-scenario profit for time-series pairs and the monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
 | `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg — the NO leg is `market_a` for a same-title pair and `market_b`, the later contract, for a time-series pair) via the Kalshi API, with automatic rollback of the filled NO leg if the YES leg doesn't fill. Multiple pairs execute concurrently. Submission goes to the V2 order endpoint by default and to the retained legacy endpoint when `config.ORDER_API_VERSION` is flipped — see "Order API version" below. |
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |

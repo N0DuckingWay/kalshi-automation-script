@@ -50,6 +50,7 @@ Notes:
 import logging
 import re
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
@@ -75,6 +76,7 @@ from .config import (
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
     TIME_SERIES_LEG_SIDES,
     fee_per_pair_approx,
+    max_affordable_pairs,
     min_price_diff_for_gap,
 )
 
@@ -292,12 +294,22 @@ class CandidatePair:
             time-series pairs, raw title for same-title pairs.
         pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
             "same_title" for pairs with identical title/subtitle across different event tickers.
-        max_contracts (int): Qualifying contract count from the order book after
-            enrich_with_orderbook_prices(); 0 before enrichment (uncapped).
+        max_contracts (int): How many contracts the pair's written leg prices
+            are valid for — the affordability-bounded qualifying depth set by
+            enrich_with_orderbook_prices(). 0 means NOT ENRICHED (uncapped);
+            enrichment never writes 0, dropping such a pair instead.
         nB (float): NO ask price of market B in dollars (cost to buy NO on B).
             Range: [0, 1]. A leg price for time_series; populated fail-soft
             (0.0 when unparseable) for same_title, where it is reporting-only
             and never priced.
+        depth_levels (tuple): The pair's qualifying order-book depth as
+            (price_a, price_b, qty) triples in MARKET order, ascending by
+            combined price — oriented once by enrich_with_orderbook_prices via
+            leg_sides, the same source of truth leg_prices follows, so readers
+            need no pair-type logic. Empty () before enrichment. This is what
+            lets strategy.compute_trade price the exact n it sizes
+            (scanner.prefix_fill_prices) instead of reusing one scalar average
+            computed over depth the trade could never reach.
     """
     market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER-closing contract
     market_b: Any           # same_title: cheaper side by YES ask  | time_series: later-closing contract
@@ -309,6 +321,9 @@ class CandidatePair:
     pair_type: str          # "time_series" | "same_title"
     max_contracts: int = 0  # qualifying contracts from order book (0 = not yet enriched)
     nB: float = 0.0         # no_ask_dollars of B (cost to buy NO on B) — a LEG price for time_series; reporting-only for same_title
+    # Qualifying (price_a, price_b, qty) depth in MARKET order, ascending by
+    # combined price; () = not enriched. Read via prefix_fill_prices().
+    depth_levels: tuple[tuple[float, float, float], ...] = ()
 
 
 def leg_sides(pair_type: str) -> tuple[str, str]:
@@ -1771,6 +1786,63 @@ def _pair_orderbooks(
     return pairs
 
 
+def prefix_fill_prices(
+    levels: Sequence[tuple[float, float, float]], n: int,
+) -> tuple[float, float] | None:
+    """
+    Quantity-weighted average fill price of the FIRST n contracts of a book.
+
+    The single definition of "what would n contract pairs actually cost", shared
+    by enrich_with_orderbook_prices (which prices a pair at the most contracts
+    the budget could ever buy) and strategy.compute_trade (which prices the
+    exact n it sizes). Averaging the WHOLE qualifying book instead — what this
+    replaced — priced every pair against depth no single trade could reach,
+    which both inflated the fill price and killed pairs at the profitability
+    gate on levels they would never have touched.
+
+    Levels are consumed cheapest-first, taking min(remaining, qty) at each, so
+    the result is exactly the volume-weighted price of a marketable order for n
+    contracts. Because levels ascend by combined price, the returned sum is
+    non-decreasing in n: a larger n can only reach further down the book into
+    worse-priced levels.
+
+    Args:
+        levels (Sequence[tuple[float, float, float]]): The pair's qualifying
+            depth as (price_a, price_b, qty) in MARKET order, ascending by
+            combined price — CandidatePair.depth_levels, or the freshly
+            oriented levels enrichment is about to store there.
+        n (int): Whole contract pairs to price. Range: >= 1.
+
+    Returns:
+        tuple[float, float] | None: (avg price on market_a, avg price on
+            market_b) in dollars. None when n < 1, or when the levels hold
+            fewer than n contracts in total — the caller decides whether that
+            is a dropped pair or a smaller size.
+    """
+    if n < 1:
+        return None
+    remaining = float(n)
+    sum_a = 0.0
+    sum_b = 0.0
+    for price_a, price_b, qty in levels:
+        take = min(remaining, qty)
+        if take <= 0:
+            # A zero/negative level cannot contribute; _bids_to_ask_levels
+            # already drops these, so this only guards hand-built input
+            continue
+        sum_a += price_a * take
+        sum_b += price_b * take
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        # Fewer than n contracts available. No epsilon is needed: the final
+        # take is exactly `remaining` whenever a level can cover it, so
+        # remaining reaches exactly 0.0 on every sufficient book.
+        return None
+    return sum_a / n, sum_b / n
+
+
 def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
     """
     Convert bid levels to ask levels via the complement price (1 − P).
@@ -2152,7 +2224,9 @@ def _pair_max_sum(pair: Any) -> float:
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
 
-def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
+def enrich_with_orderbook_prices(
+    client: Any, pairs: list, balance_cents: int,
+) -> list:
     """
     For each tradeable pair, fetch both order books, pair the NO leg's asks
     with the YES leg's asks using a merge sweep (the legs' markets and sides
@@ -2162,29 +2236,47 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
       same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
       time_series: yes_price + no_price <= 1 - min_price_diff_for_gap(gap)
 
-    The two leg prices are replaced with weighted-average fill prices over
-    qualifying contracts — written back to nA/pB for a same-title pair and to
-    pA/nB for a time-series pair. The pair's REFERENCE quote (the non-leg
+    The two leg prices are replaced with weighted-average fill prices over the
+    contracts this account could actually BUY — not over the whole qualifying
+    book. One pair is capped at BUDGET_FRACTION of the balance, so averaging a
+    liquid market's full depth priced every pair against levels no single trade
+    can reach: it inflated the fill price and killed pairs at the profitability
+    gate below on contracts we would never have bought. The bound is
+    config.max_affordable_pairs(balance_cents, best level's price sum) — the
+    maximum fraction over the minimum price sum, so it is an upper bound on
+    whatever strategy.compute_trade sizes, and the price written here can never
+    be optimistic relative to the one that trade is finally priced at. The
+    qualifying levels themselves are kept on the pair (depth_levels) so
+    compute_trade can re-price at the exact n it settles on. Prices are written
+    back to nA/pB for a same-title pair and to pA/nB for a time-series pair. The pair's REFERENCE quote (the non-leg
     market's YES ask: pB for time_series, pA for same_title) is refreshed from
     the same books via _reference_yes_ask, so downstream models never subtract
     a scan-time quote from a depth-weighted one; the remaining quote (nA for
     time_series, nB for same_title) is reporting-only and stays untouched.
-    max_contracts is set to the total qualifying count. Pairs with no
-    qualifying contracts are marked tradeable=False, as are pairs whose
-    refreshed reference no longer sits above the YES leg's fill.
+    max_contracts is set to that affordability-bounded count, i.e. how many
+    contracts the written prices are valid for. Pairs with no qualifying
+    contracts are marked tradeable=False, as are pairs whose refreshed
+    reference no longer sits above the YES leg's fill, and pairs the budget
+    cannot afford a single contract of.
 
     Args:
         client (Any): Authenticated KalshiClient used to fetch each pair's
             order books (cached per ticker across the whole call).
         pairs (list): CandidatePair objects to enrich. A pair already marked
             tradeable=False is passed through unchanged.
+        balance_cents (int): Account balance in integer cents — the real
+            per-shard sum in prod, the virtual --sandbox-balance in dev. Bounds
+            how much book depth is averaged into each pair's fill price.
+            Required rather than defaulted: both call sites already hold it,
+            and a default would silently restore whole-book pricing on a
+            real-money path with no signal that it had.
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the
             leg prices (nA/pB for same_title, pA/nB for time_series), the
             reference quote (pB for time_series, pA for same_title, refreshed
-            only when the reference book side had resting bids), tradeable and
-            max_contracts replaced by depth-validated values.
+            only when the reference book side had resting bids), tradeable,
+            max_contracts and depth_levels replaced by depth-validated values.
     """
     # Cache order books by ticker to avoid fetching the same book twice
     # when the same market appears in multiple pairs
@@ -2246,11 +2338,47 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
             enriched.append(dc_replace(pair, tradeable=False))
             continue
 
+        # Orient the levels into MARKET order — (market_a's leg price,
+        # market_b's leg price, qty) — so everything downstream reads them the
+        # way leg_prices reads the pair's scalars. leg_sides is the only source
+        # of truth for which market buys which side.
+        side_a, _side_b = leg_sides(pair.pair_type)
+        a_is_no = side_a == "no"
+        depth_levels = tuple(
+            (np_, yp, q) if a_is_no else (yp, np_, q) for yp, np_, q in qualifying
+        )
+
         total_qty = sum(qty for _, _, qty in qualifying)
-        # Compute depth-weighted average fill prices to replace the best-ask
-        # estimates — one per LEG (the YES leg's YES ask, the NO leg's NO ask)
-        avg_yes   = sum(yp  * qty for yp, _,   qty in qualifying) / total_qty
-        avg_no    = sum(np_ * qty for _,  np_, qty in qualifying) / total_qty
+        # Bound the average at the most contracts any Kelly result could ever
+        # afford, rather than averaging the whole book. Levels ascend by
+        # combined price, so BUDGET_FRACTION (the largest fraction compute_trade
+        # can cap to) over the BEST level's sum (the cheapest any prefix average
+        # can be) is an upper bound on the n that trade finally sizes — the
+        # price written here is therefore never optimistic relative to it.
+        best_a, best_b, _ = depth_levels[0]
+        affordable = max_affordable_pairs(balance_cents, best_a + best_b)
+        cap = min(int(total_qty), affordable)
+        fills = prefix_fill_prices(depth_levels, cap)
+
+        if fills is None:
+            # cap < 1: the budget cannot afford one contract pair, or the book
+            # holds under one contract of qualifying depth. Drop the pair rather
+            # than write max_contracts=0, which compute_trade reads as UNCAPPED
+            # — the sub-one-contract hole that overloaded sentinel used to have.
+            # Both figures are named because they are different faults with
+            # different fixes (add funds vs. the book is too thin), and the
+            # binding one is whichever is smaller.
+            logging.info(
+                "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
+                "the gap and the budget affords %d; skipping",
+                pair.canonical_title, total_qty, affordable,
+            )
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        # Back to SIDE order for the direction guard, the fee check and the
+        # writeback below, all of which speak in "the YES leg"/"the NO leg"
+        avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
 
         # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
         # book already in hand. Left at its scan-time value it would be compared
@@ -2276,6 +2404,10 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         # avg_yes <= (1 - tier) - avg_no <= max(YES bid on the later market)
         # - tier, and an UNCROSSED book puts that market's YES ask at or above
         # its YES bid. On fresh data it can therefore only fire on a CROSSED book.
+        # The affordability bound above does not weaken that: the ceiling holds
+        # for EVERY qualifying level individually, so it holds for any PREFIX
+        # average of them, and truncating only lowers avg_yes. The guard is no
+        # more likely to fire than it was over the whole book.
         is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
         direction_ok = True
         if is_time_series:
@@ -2342,7 +2474,10 @@ def enrich_with_orderbook_prices(client: Any, pairs: list) -> list:
         enriched.append(dc_replace(
             pair,
             tradeable=new_tradeable,
-            max_contracts=int(total_qty),
+            # How many contracts the prices just written are valid for — the
+            # bound compute_trade's own depth clamp then honours
+            max_contracts=cap,
+            depth_levels=depth_levels,
             **leg_updates,
         ))
 
