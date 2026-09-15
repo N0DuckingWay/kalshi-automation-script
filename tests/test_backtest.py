@@ -16,7 +16,7 @@ import logging
 import sys
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -199,3 +199,49 @@ class TestSummaryBlock:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
+
+
+class TestRejectedArgumentLeavesNoLogFile:
+    """
+    TS-20: --start-date was parsed AFTER logging.basicConfig, so a rejected
+    value still created kalshi_backtest.log — or, on an existing 20 MB file,
+    rotated it, evicting real history to record a run that never happened.
+    """
+
+    @staticmethod
+    def _run(argv, tmp_path, monkeypatch):
+        monkeypatch.setattr(backtest, "PROJECT_ROOT", tmp_path)
+        # basicConfig is a no-op once the root logger has handlers, which it
+        # does under pytest — force it to actually build ours.
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        root.handlers = []
+        try:
+            with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+                backtest.main()
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved
+
+    def test_bad_start_date_writes_no_log_file(self, tmp_path, monkeypatch):
+        self._run(["backtest", "--start-date", "not-a-date"], tmp_path, monkeypatch)
+        assert not (tmp_path / "kalshi_backtest.log").exists()
+
+    def test_bad_start_date_leaves_an_existing_log_untouched(self, tmp_path, monkeypatch):
+        # GUARD, not proof: this passes pre-fix too, because a tiny file never
+        # trips the 20 MB rotation threshold. The damaging case — a rejected
+        # argument rotating a full log and evicting real history — needs a
+        # 20 MB fixture to reproduce and is not worth one. What this pins is
+        # that the existing content survives either way.
+        existing = tmp_path / "kalshi_backtest.log"
+        existing.write_text("real history\n")
+        self._run(["backtest", "--start-date", "2026-13-99"], tmp_path, monkeypatch)
+        assert existing.read_text() == "real history\n"
+        assert not (tmp_path / "kalshi_backtest.log.1").exists()
+
+    def test_bad_horizon_also_writes_no_log_file(self, tmp_path, monkeypatch):
+        # GUARD: the other two argument checks already ran before basicConfig
+        # and must keep doing so.
+        self._run(["backtest", "--max-horizon-days", "0"], tmp_path, monkeypatch)
+        assert not (tmp_path / "kalshi_backtest.log").exists()

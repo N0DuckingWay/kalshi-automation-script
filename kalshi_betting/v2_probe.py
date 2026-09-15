@@ -149,8 +149,15 @@ def _confirm(assume_yes: bool, summary: str) -> bool:
     Show a plain-English summary of what is about to be submitted and gate on it.
 
     This is the only thing standing between the operator and a real order, so it
-    runs BEFORE every submission and every transfer, after the exact request
-    body has already been printed.
+    runs before every step that submits, after that step's exact request body
+    has been printed.
+
+    ONE gate per STEP, not per request. The transfer step confirms the whole
+    round trip up front and its RETURN leg has no gate of its own — by the time
+    that leg runs the cent is already on the far shard and leaving it there is
+    the worse outcome, so the step is deliberately committed once the operator
+    approves it. Read "before every submission" as "before every step"; this
+    docstring used to say the former and mean the latter (TS-30).
 
     Args:
         assume_yes (bool): True when --yes was passed, which skips the
@@ -823,6 +830,11 @@ def _step_transfer(client: Any, ticker: str, assume_yes: bool, dest_shard: int) 
         return _FAIL
     print(f"Outbound leg settled: {_TRANSFER_PROBE_CENTS}c landed on shard {dest_shard}.")
 
+    # No _confirm here, deliberately. The operator approved the ROUND TRIP at
+    # the top of this step, and by now the cent is sitting on the far shard:
+    # stopping to ask would strand it there on a declined or unattended prompt,
+    # which is strictly worse than completing the trip that was authorised
+    # (TS-30).
     back_id = _transfer_leg(client, dest_shard, _TRANSFER_SOURCE_SHARD, "return")
     if back_id is False:
         print(

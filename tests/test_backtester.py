@@ -1,5 +1,6 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import gc
+import logging
 import re
 import time
 import weakref
@@ -1671,22 +1672,28 @@ class TestRunBacktestFeasibilityPreCheck:
     ever be entered, so run_backtest must skip the fetch entirely rather than
     discover that only after paying for it.
 
-    `backtester.date` (not the stdlib `datetime.date`) is patched with a
-    thin subclass whose `.today()` is frozen, since backtester.py imports
-    `date` by name (`from datetime import ... date ...`) and calls
-    `date.today()` through that module-level binding.
+    `backtester.datetime` (not the stdlib one) is patched with a thin subclass
+    whose `.now(tz)` is frozen, since backtester.py imports `datetime` by name
+    (`from datetime import ... datetime ...`) and the feasibility window is
+    `datetime.now(UTC).date()`. It used to be `date.today()`, and this helper
+    used to freeze `backtester.date` accordingly — the switch to UTC (TS-13)
+    is what moved the seam.
     """
 
-    class _FrozenDate(date):
-        _fixed: date
+    class _FrozenDateTime(datetime):
+        _fixed: datetime
 
         @classmethod
-        def today(cls):
-            return cls._fixed
+        def now(cls, tz=None):
+            return cls._fixed if tz is None else cls._fixed.astimezone(tz)
 
-    def _freeze(self, monkeypatch, today: date):
-        frozen = type("FrozenDate", (self._FrozenDate,), {"_fixed": today})
-        monkeypatch.setattr(backtester, "date", frozen)
+    def _freeze(self, monkeypatch, today: date, hour: int = 12):
+        """Freeze UTC now at `hour` on `today`. The default noon is
+        deliberately mid-day so a test that does not care about the boundary
+        cannot accidentally straddle one."""
+        fixed = datetime(today.year, today.month, today.day, hour, tzinfo=UTC)
+        frozen = type("FrozenDateTime", (self._FrozenDateTime,), {"_fixed": fixed})
+        monkeypatch.setattr(backtester, "datetime", frozen)
 
     def _fetch_should_not_be_called(self, monkeypatch):
         def _boom(*_a, **_k):
@@ -2762,9 +2769,12 @@ class TestRunBacktestSweep:
     _INFEASIBLE_TODAY = date(2026, 8, 28)   # Friday, same week
 
     def _infeasible(self, monkeypatch, **kwargs):
-        frozen = type("FrozenDate", (TestRunBacktestFeasibilityPreCheck._FrozenDate,),
-                      {"_fixed": self._INFEASIBLE_TODAY})
-        monkeypatch.setattr(backtester, "date", frozen)
+        fixed = datetime(self._INFEASIBLE_TODAY.year, self._INFEASIBLE_TODAY.month,
+                         self._INFEASIBLE_TODAY.day, 12, tzinfo=UTC)
+        frozen = type("FrozenDateTime",
+                      (TestRunBacktestFeasibilityPreCheck._FrozenDateTime,),
+                      {"_fixed": fixed})
+        monkeypatch.setattr(backtester, "datetime", frozen)
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: pytest.fail("fetch must be skipped"))
         return run_backtest_sweep(
@@ -2792,3 +2802,128 @@ class TestRunBacktestSweep:
         result = self._infeasible(monkeypatch, interval_discount=0.62)
         assert result.primary.k == 0.62
         assert result.points == [result.primary]
+
+
+class TestSimulationsAreLabelledWithTheirDiscount:
+    """
+    TS-21: "Backtest complete: N trades" appeared 13 times per default run with
+    nothing distinguishing them, the primary's copy printed BEFORE the sweep
+    was announced, and the "Sweeping i/13" counter started at 2 because the
+    primary's slot was never numbered.
+    """
+
+    def test_completion_line_names_the_resolved_discount(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.62)
+        lines = [r.getMessage() for r in caplog.records
+                 if "Backtest complete" in r.getMessage()]
+        assert len(lines) == 1
+        assert "k=0.620" in lines[0]
+
+    def test_completion_line_resolves_the_none_sentinel(self, caplog):
+        # The sentinel must never reach the log — a reader needs the number
+        # that was actually priced, not "None".
+        with caplog.at_level(logging.INFO):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=None)
+        line = next(r.getMessage() for r in caplog.records
+                    if "Backtest complete" in r.getMessage())
+        assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in line
+        assert "None" not in line
+
+    def test_every_swept_point_is_distinguishable(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", [0.50, 0.75])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+            )
+        completions = [r.getMessage() for r in caplog.records
+                       if "Backtest complete" in r.getMessage()]
+        # One per grid point, each naming a different k
+        assert len(completions) == len({c.split(":")[0] for c in completions})
+
+    def test_the_primary_slot_is_announced(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            )
+        assert any("Simulating the primary interval discount" in r.getMessage()
+                   for r in caplog.records)
+
+
+class TestFeasibilityWindowIsMeasuredInUTC:
+    """
+    TS-13: the feasibility pre-check used date.today() — a LOCAL date — while
+    _monday_timestamps builds 09:00 UTC checkpoints and _build_equity_curve
+    already used datetime.now(UTC).date(). West of UTC the local date lags the
+    UTC one for the first hours of each UTC day (7 of every 24 on a PDT host),
+    so a window whose only Monday is the current UTC day short-circuited to
+    zero trades and reported the run as structurally impossible when it was not.
+    """
+
+    # 2026-08-31 is a Monday. At 02:00 UTC that day it is still Sunday
+    # 2026-08-30 in PDT (UTC-7) — the exact instant old and new disagree.
+    _UTC_INSTANT = datetime(2026, 8, 31, 2, 0, tzinfo=UTC)
+    _START = date(2026, 8, 30)   # Sunday
+
+    def _freeze(self, monkeypatch, moment: datetime):
+        """Freeze BOTH date seams at one real instant.
+
+        backtester.datetime.now(UTC) is what the code reads now; backtester
+        .date.today() is what it read before TS-13. Freezing only the new one
+        would leave pre-fix code on the real clock, and these tests would then
+        pass or fail for reasons unrelated to the fix.
+        """
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return moment.astimezone().date()   # the LOCAL date, as before
+
+        monkeypatch.setattr(backtester, "datetime", _Frozen)
+        monkeypatch.setattr(backtester, "date", _FrozenDate)
+
+    def test_the_window_includes_the_current_utc_day(self, monkeypatch):
+        # Under the old local-date rule feasibility_end was Sunday 08-30 and
+        # [Sun, Sun] holds no Monday, so the fetch was skipped and the run
+        # returned None. In UTC the end is Monday 08-31 and the checkpoint
+        # exists, so the fetch must actually be reached.
+        self._freeze(monkeypatch, self._UTC_INSTANT)
+        reached = []
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: reached.append(True) or [])
+        out = backtester._prepare_entries(
+            MagicMock(), MagicMock(), self._START, False, None,
+        )
+        assert reached == [True]
+        assert out == []
+
+    def test_a_genuinely_infeasible_window_still_short_circuits(self, monkeypatch):
+        # GUARD: moving to UTC must not disarm the check. Tuesday to Friday
+        # holds no Monday in either timezone.
+        self._freeze(monkeypatch, datetime(2026, 8, 28, 12, 0, tzinfo=UTC))
+        monkeypatch.setattr(
+            backtester, "fetch_all_settled_markets",
+            lambda *a, **k: pytest.fail("fetch must be skipped"),
+        )
+        assert backtester._prepare_entries(
+            MagicMock(), MagicMock(), date(2026, 8, 25), False, None,
+        ) is None
+
+    def test_the_local_date_is_not_what_is_measured(self, monkeypatch):
+        # Pins the seam itself: the frozen instant's LOCAL date is behind its
+        # UTC date on any timezone west of UTC, and it is the UTC one the
+        # window must use. Skipped where the two agree, so the test is honest
+        # about only being meaningful west of UTC.
+        local_date = self._UTC_INSTANT.astimezone().date()
+        if local_date == self._UTC_INSTANT.date():
+            pytest.skip("host is at or east of UTC; the two dates agree here")
+        assert local_date.weekday() != 0        # Sunday locally
+        assert self._UTC_INSTANT.date().weekday() == 0   # Monday in UTC

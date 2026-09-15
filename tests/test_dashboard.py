@@ -17,7 +17,7 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from kalshi_betting import config
+from kalshi_betting import config, dashboard
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -358,3 +358,26 @@ class TestMaxDrawdown:
         # Peak 120 -> trough 90 = -25%
         assert max_dd == pytest.approx(-0.25)
         assert when == date(2026, 1, 3)
+
+
+class TestCapitalDeployedIsFeeInclusive:
+    """
+    TS-12: the Kelly-vs-actual scatter already divided by (total_cost + fees),
+    but the trades tables and the capital-deployed chart summed total_cost
+    alone — so two charts on one dashboard disagreed by the fee rate.
+    """
+
+    def test_trades_table_cell_includes_fees(self):
+        t = make_trade()
+        out = dashboard._section_diagnostics([t])
+        assert f"${t.total_cost + t.fees:.2f}" in out
+        assert f">${t.total_cost:.2f}<" not in out
+
+    def test_trades_table_header_says_incl_fees(self):
+        out = dashboard._section_diagnostics([make_trade()])
+        assert "Cost incl. fees" in out
+
+    def test_capital_deployed_sums_fee_inclusive_cost(self):
+        t = make_trade()
+        out = dashboard._section_risk([t], make_equity([1000.0, 1010.0]), 1000.0)
+        assert f"{t.total_cost + t.fees:.2f}" in out.replace(",", "")

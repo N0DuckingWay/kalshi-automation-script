@@ -423,7 +423,11 @@ class TestEventTitlesCache:
 
         result = historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
 
-        assert result == {"E1": ""}  # this run genuinely could not resolve it
+        # TS-11: this RUN could not resolve it, but an earlier one did, and the
+        # accumulator exists precisely so that answer is not thrown away. The
+        # return is the MERGED view — returning "" here is what collapsed the
+        # same-title grouping key toward the bare title under --no-cache.
+        assert result == {"E1": "Good Title"}
         assert json.loads(isolated_cache.read_text()) == {"E1": "Good Title"}
 
     def test_fresh_poison_pill_stored_for_ticker_unknown_to_disk(self, isolated_cache,
@@ -445,9 +449,10 @@ class TestEventTitlesCache:
         # The pill is honored on the next cached run — no repeat lookup.
         client2 = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
         fallback2 = _patch_single_event_lookups(monkeypatch, single_failures={"NEW-1"})
-        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {
-            "E1": "Good Title", "NEW-1": "",
-        }
+        # Restricted to the tickers ASKED about, not the whole accumulator:
+        # that file holds every ticker every past run resolved (hundreds of
+        # thousands), and a caller asking about one must not receive them all.
+        assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {"NEW-1": ""}
         assert fallback2.call_count == 0
 
     def test_listing_pages_request_market_page_size_limit(self, isolated_cache, monkeypatch):
@@ -1208,6 +1213,44 @@ class TestShardedFetch:
         assert calls == 3
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+
+    def test_tail_stops_at_the_absolute_record_cap(self, monkeypatch, caplog):
+        # TS-15. The tail is the one fetch path with no chunked emit sink, so
+        # its whole result is resident at once; the page cap alone allows
+        # ~2M records (~5 GB). The record cap composes with it — whichever
+        # binds first stops the walk — and here the page cap is left high so
+        # only the record cap can fire.
+        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_PAGES", 100)
+        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_RECORDS", 2)
+        pages = [
+            [_mk_raw_market(f"LL{i}", f"2026-06-04T2{i}:00:00Z",
+                            "2026-06-06T10:00:00Z")]
+            for i in range(3)
+        ] + [
+            # Beyond the cap: must never be requested (_PagedArchive asserts).
+            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
+        ]
+        with caplog.at_level(logging.WARNING):
+            kept, calls = self._walk_paged(
+                monkeypatch, historical._fetch_archive_tail, pages,
+            )
+        assert kept == {"LL0", "LL1"}
+        assert calls == 2
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("ARCHIVE_TAIL_MAX_RECORDS" in w for w in warnings)
+        # GUARD: the page cap must not be what stopped this walk.
+        assert not any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+
+    def test_record_cap_does_not_fire_on_an_ordinary_walk(self, monkeypatch, caplog):
+        # GUARD: the cap is a backstop, silent on any realistic window.
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 1)
+        pages = [
+            [_mk_raw_market("LL0", "2026-06-04T20:00:00Z", "2026-06-06T10:00:00Z")],
+            [_mk_raw_market("PB1", "2026-06-04T19:00:00Z", "2026-06-04T19:30:00Z")],
+        ]
+        with caplog.at_level(logging.WARNING):
+            self._walk_paged(monkeypatch, historical._fetch_archive_tail, pages)
+        assert "ARCHIVE_TAIL_MAX_RECORDS" not in caplog.text
 
     def _walk_paged(self, monkeypatch, walk, pages):
         """Run one archive walk against hand-built pages; return (kept, calls)."""
@@ -2401,3 +2444,136 @@ class TestExceptionSummary:
 
         assert historical._exception_summary(ExplodingStr()) == "ExplodingStr"
         assert historical._exception_summary(ExplodingReason()) == "ExplodingReason"
+
+
+class TestArchivePhaseSkippedWhenProvablyEmpty:
+    """
+    TS-25: the archive holds only markets that settled BEFORE the cutoff, so a
+    window starting at or after it cannot contain a single archive record. The
+    phase still ran the cursor-synthesis probe and the tail walk to prove that,
+    costing ~18 seconds and ~50,000 parsed records on every post-cutoff run.
+    """
+
+    @staticmethod
+    def _ts(iso: str) -> int:
+        from datetime import datetime
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+
+    def test_no_request_is_made_when_the_window_starts_at_the_cutoff(
+        self, monkeypatch, caplog,
+    ):
+        def _boom(*a, **k):
+            raise AssertionError("no archive request may be made")
+
+        monkeypatch.setattr(historical, "_signed_raw_get", _boom)
+        cutoff = self._ts("2026-06-04T00:00:00Z")
+        with caplog.at_level(logging.INFO):
+            slices, tail = historical._fetch_archive_phase(
+                MagicMock(), cutoff, cutoff, {"limit": 1000},
+            )
+        assert slices == []
+        assert tail == []
+        assert "Historical archive phase skipped" in caplog.text
+
+    def test_no_request_is_made_when_the_window_starts_after_the_cutoff(
+        self, monkeypatch, caplog,
+    ):
+        def _boom(*a, **k):
+            raise AssertionError("no archive request may be made")
+
+        monkeypatch.setattr(historical, "_signed_raw_get", _boom)
+        with caplog.at_level(logging.INFO):
+            slices, tail = historical._fetch_archive_phase(
+                MagicMock(),
+                self._ts("2026-07-01T00:00:00Z"),
+                self._ts("2026-06-04T00:00:00Z"),
+                {"limit": 1000},
+            )
+        assert (slices, tail) == ([], [])
+        assert "Historical archive phase skipped" in caplog.text
+
+    def test_a_pre_cutoff_window_still_runs_the_phase(self, monkeypatch, caplog):
+        # GUARD: the skip must be exact. A window that genuinely overlaps the
+        # archive still does the work — proved by the synthesis probe firing.
+        probed = []
+        monkeypatch.setattr(
+            historical, "_archive_cursor_synthesis_ok",
+            lambda *a, **k: probed.append(True) or False,
+        )
+        monkeypatch.setattr(
+            historical, "_fetch_archive_sequential", lambda *a, **k: [],
+        )
+        with caplog.at_level(logging.INFO):
+            historical._fetch_archive_phase(
+                MagicMock(),
+                self._ts("2026-06-01T00:00:00Z"),
+                self._ts("2026-06-04T00:00:00Z"),
+                {"limit": 1000},
+            )
+        assert probed == [True]
+        assert "Historical archive phase skipped" not in caplog.text
+
+
+class TestEventTitlesReturnsMergedView:
+    """
+    TS-11: _load_or_build_event_titles wrote `merged` to disk but returned
+    `cached` — this run's resolution alone. Under --no-cache every ticker the
+    listings missed and the EVENT_TITLE_FALLBACK_MAX_LOOKUPS cap skipped came
+    back as the "" poison pill even though disk held a real title. Measured:
+    771,601 unresolved against a 5,000 cap, so ~99% of stragglers. Those
+    markets then group by market title alone, collapsing the same-title key
+    (event_title, title, subtitle) toward the bare title — the direction that
+    manufactures cross-event false positives under the 95% co-resolution prior.
+    """
+
+    def test_accumulator_answers_a_ticker_this_run_could_not_resolve(
+        self, isolated_cache, monkeypatch,
+    ):
+        isolated_cache.write_text(json.dumps({"E1": "Real Title", "E2": "Other"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"E1"}, use_cache=False,
+        )
+        assert result == {"E1": "Real Title"}
+
+    def test_result_is_restricted_to_the_requested_tickers(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the accumulator is a cross-run store of every ticker ever
+        # resolved. Returning it whole would hand a caller asking about one
+        # ticker hundreds of thousands of unrelated entries.
+        isolated_cache.write_text(json.dumps({"E1": "Real Title", "E2": "Other"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"E1"}, use_cache=False,
+        )
+        assert set(result) == {"E1"}
+
+    def test_a_ticker_nobody_has_ever_resolved_still_maps_to_the_pill(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the merge must not invent titles. An unresolved ticker with no
+        # disk entry keeps poison-pill semantics.
+        isolated_cache.write_text(json.dumps({"E1": "Real Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"UNKNOWN"})
+
+        result = historical._load_or_build_event_titles(
+            client, {"UNKNOWN"}, use_cache=False,
+        )
+        assert result == {"UNKNOWN": ""}
+
+    def test_the_substitution_is_counted_in_the_log(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        isolated_cache.write_text(json.dumps({"E1": "Real Title"}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"E1"})
+
+        with caplog.at_level(logging.INFO):
+            historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
+        assert "1 of this run's tickers answered from the accumulator" in caplog.text

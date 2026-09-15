@@ -292,6 +292,12 @@ days from the moment the bot runs are considered — applies to both time-series
 and same-title pairs. Omit the flag (the default) to consider all otherwise-eligible
 markets regardless of deadline.
 
+When the flag is set, the run logs one `Horizon filter: kept N of M markets
+closing on or before <cutoff>` line at INFO, so a run whose pair counts differ
+from the previous one can be attributed to the horizon rather than to the
+market. The cutoff is *now + N days* — a time of day, not a midnight boundary —
+and is printed to the second. Nothing is logged when the flag is absent.
+
 ### Backtest
 
 ```bash
@@ -409,7 +415,7 @@ python3 -m pytest tests/ -v      # run the test suite
 python3 -m ruff check kalshi_betting/   # lint check
 ```
 
-Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. `.github/workflows/ci.yml` runs both commands on every push and pull request to `main`; both must pass before merging.
+Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. `.github/workflows/ci.yml` runs both commands on every push to `main` and on EVERY pull request, whatever its base branch — the `pull_request:` trigger carries no branch filter. Both must pass before merging.
 
 ---
 

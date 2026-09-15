@@ -17,6 +17,7 @@ Dependencies:
     from _http.py; and PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
     SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES, ARCHIVE_TAIL_MAX_PAGES,
+    ARCHIVE_TAIL_MAX_RECORDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     INCLUDE_MVE_MARKETS, PROD_URL) from config.py. Exports
@@ -84,6 +85,7 @@ from .auth import build_client
 from .config import (
     ARCHIVE_MAX_BARREN_PAGES,
     ARCHIVE_TAIL_MAX_PAGES,
+    ARCHIVE_TAIL_MAX_RECORDS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
@@ -485,10 +487,23 @@ def _load_or_build_event_titles(
             titles it did not ask about.
 
     Returns:
-        dict[str, str]: Mapping event_ticker → event_title for THIS run's
-            resolution (the merged accumulator is only written to disk, not
-            returned). Tickers that could not be resolved map to "". Caller
-            treats those markets as ungrouped (effectively MVE-excluded).
+        dict[str, str]: Mapping event_ticker → event_title, restricted to
+            event_tickers, read from the MERGED view — this run's resolution
+            layered over the on-disk accumulator. Tickers that could not be
+            resolved anywhere map to "". Caller treats those markets as
+            ungrouped (effectively MVE-excluded).
+
+            It used to return this run's resolution ALONE, which under
+            --no-cache handed back the "" poison pill for every ticker the
+            listings missed and the EVENT_TITLE_FALLBACK_MAX_LOOKUPS cap
+            skipped — even when disk held a real title fetched by an earlier
+            run. Measured: 771,601 unresolved against a 5,000 cap, so ~99% of
+            stragglers. Those markets then group by market title alone,
+            collapsing the same-title key (event_title, title, subtitle)
+            toward the bare title: on a captured payload, 52 groups with
+            titles became 133 groups with a largest of 112 without — the
+            direction that manufactures cross-event false positives under the
+            95% co-resolution prior (TS-11).
     """
     # Always read the accumulator: even when use_cache is False and it must not
     # seed resolution, it is needed at save time so this run's writes MERGE with
@@ -498,7 +513,10 @@ def _load_or_build_event_titles(
     cached: dict[str, str] = dict(disk_titles) if use_cache else {}
     missing = event_tickers - cached.keys()
     if not missing:
-        return cached
+        # Restricted to the caller's tickers for the same reason the merged
+        # return below is: the accumulator holds every ticker every past run
+        # ever resolved, and a caller asking about 40 must not receive 800k.
+        return {tkr: cached.get(tkr, "") for tkr in event_tickers}
 
     # Bulk pull non-MVE events across all statuses. Each get_events call returns
     # up to 200 events; pagination continues until cursor is empty or all misses
@@ -671,9 +689,22 @@ def _load_or_build_event_titles(
         if title or not merged.get(tkr):
             merged[tkr] = title
     _save_json_cache(_EVENT_TITLES_CACHE, merged)
-    logging.info("Event titles resolved: %d this run, %d cached entries on disk",
-                 len(cached), len(merged))
-    return cached
+    # Return the MERGED view, restricted to what the caller asked about. The
+    # accumulator exists precisely so a ticker resolved by an earlier run need
+    # not be re-fetched; returning `cached` threw that away at the last step and
+    # substituted the "" poison pill (TS-11).
+    result = {tkr: merged.get(tkr, "") for tkr in event_tickers}
+    # Count the substitutions so the accumulator's contribution is visible
+    # rather than inferred — this is the number that was silently lost.
+    from_accumulator = sum(
+        1 for tkr in event_tickers if not cached.get(tkr) and merged.get(tkr)
+    )
+    logging.info(
+        "Event titles resolved: %d this run, %d cached entries on disk, "
+        "%d of this run's tickers answered from the accumulator",
+        len(cached), len(merged), from_accumulator,
+    )
+    return result
 
 
 # ─── Market fetching ──────────────────────────────────────────────────────────
@@ -1222,10 +1253,13 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
 
     Deliberately still writes the legacy format rather than "jsonl-v1": it is
     handed a fully-materialized list anyway, so it gains nothing from
-    streaming, and keeping it means the legacy format stays a first-class,
-    exercised write path for the hundreds of MB of legacy slices already on
-    disk. The fetch workers use _DayStreamWriter instead, because they are
-    exactly the callers that must NOT hold a whole day in memory.
+    streaming. It is NOT on any production path — both persisting fetch
+    workers use _DayStreamWriter, because they are exactly the callers that
+    must not hold a whole day in memory — so this is the legacy format's
+    writer of record, exercised by the tests and kept so the format both
+    writers must stay compatible with cannot rot. The legacy READ path is
+    live: hundreds of MB of legacy slices are already on disk and
+    _day_store_load still routes to them (TS-26).
 
     Args:
         path (Path): Destination path from _day_store_path().
@@ -1686,6 +1720,22 @@ def _fetch_archive_tail(
                 ARCHIVE_TAIL_MAX_PAGES, pages,
             )
             return kept
+        # Residency backstop, composing with the page cap above: whichever
+        # binds first stops the walk. This is the one fetch path with no
+        # chunked emit sink, so its whole result stays resident — the page cap
+        # alone allows ~2M records (roughly 5 GB), the same OOM shape the
+        # sharded fetch exists to avoid (TS-15).
+        if len(kept) >= ARCHIVE_TAIL_MAX_RECORDS:
+            logging.warning(
+                "Historical archive tail: reached the %d-record cap "
+                "(ARCHIVE_TAIL_MAX_RECORDS) after walking %d pages below "
+                "created_time == start_date — stopping to bound memory. "
+                "Long-lived pre-start markets beyond this point that settle "
+                "inside the window may be missed; raise the cap if a run needs "
+                "them.",
+                ARCHIVE_TAIL_MAX_RECORDS, pages,
+            )
+            return kept
         cursor = next_cursor
 
 
@@ -1871,6 +1921,25 @@ def _fetch_archive_phase(
             records already are. On the sequential fallback, everything is
             returned fully filtered in the first list and the second is empty.
     """
+    if start_ts >= cutoff_ts:
+        # The archive holds only markets that settled BEFORE the cutoff, so a
+        # window starting at or after it cannot contain a single archive
+        # record — there is nothing here to fetch, whatever the walk would do.
+        # Without this the phase still ran the cursor-synthesis probe and the
+        # tail walk to prove that, costing ~18 seconds and ~50,000 parsed
+        # records on every post-cutoff run (TS-25). Logged rather than silent
+        # so the absence of the usual archive progress lines is explained
+        # rather than read as a phase that failed; note that this also skips
+        # the synthesis probe, so a run with no archive contribution no longer
+        # reports on cursor synthesis at all.
+        logging.info(
+            "Historical archive phase skipped: the window starts at %s, at or "
+            "after the archive cutoff %s, so no archive record can satisfy it",
+            datetime.fromtimestamp(start_ts, tz=UTC).isoformat(timespec="seconds"),
+            datetime.fromtimestamp(cutoff_ts, tz=UTC).isoformat(timespec="seconds"),
+        )
+        return [], []
+
     try:
         # The probe issues a real request, so it can fail for reasons that have
         # nothing to do with cursor format (auth, outage, a body that won't

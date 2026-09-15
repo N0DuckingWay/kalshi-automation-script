@@ -8,6 +8,7 @@ MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 import ast
 import inspect
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -27,6 +28,7 @@ from kalshi_betting.scanner import (
     CandidatePair,
     enrich_with_orderbook_prices,
     leg_prices,
+    leg_sides,
     prefix_fill_prices,
 )
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
@@ -774,3 +776,182 @@ class TestKellyOperandsShareOneSnapshot:
             time_series_profit_prob(enriched.pA, enriched.pB)
         )
         assert _kelly_p(enriched) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# TS-08: the sized count must be depth the V2 FoK limit can actually reach.
+# ---------------------------------------------------------------------------
+class TestReachableDepthSizing:
+    """
+    A V2 taker order is ONE fill-or-kill limit per leg, so it buys only the
+    depth resting at or below that limit — and the limit is a PER-CONTRACT cap
+    derived from the leg price, which is the average of a MULTI-LEVEL prefix.
+    An average over a ladder sits below the ladder's top level, so the top of
+    the very prefix being priced could rest above its own cap and the order was
+    killed, reported as "NO leg FoK not filled" and indistinguishable from a
+    genuine price move (TS-08).
+
+    Fixtures are same_title, so market_a buys NO and market_b buys YES, and
+    depth_levels are (market_a price, market_b price, qty) in MARKET order.
+    """
+
+    @staticmethod
+    def _reach(spec, levels):
+        """
+        Contracts the spec's own submitted order actually reaches.
+
+        Derived from trader._v2_limit_price — the function that builds the real
+        order body — NOT from strategy's own helper. The whole finding is that
+        the sizer and the order disagreed, so the oracle here has to be the
+        order side, independently of whatever the sizer believes.
+        """
+        from kalshi_betting import trader
+        side_a, side_b = leg_sides(spec.pair.pair_type)
+        price_a, price_b = leg_prices(spec.pair)
+
+        def cap(kind, price, market):
+            wire = trader._v2_limit_price(f"buy_{kind}", price, market)
+            return float(1 - wire) if kind == "no" else float(wire)
+
+        cap_a = cap(side_a, price_a, spec.pair.market_a)
+        cap_b = cap(side_b, price_b, spec.pair.market_b)
+        return sum(q for pa, pb, q in levels if pa <= cap_a + 1e-9 and pb <= cap_b + 1e-9)
+
+    def test_no_leg_ladder_is_sized_to_reachable_depth(self):
+        # Priced over all 600 the NO leg averages 0.345, whose cap is 0.36 —
+        # which cannot reach the 0.37 level. Pre-fix this sized 600 and the
+        # fill-or-kill died with nothing to unwind (the NO leg goes first).
+        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        assert spec.x == 300
+        assert leg_prices(spec.pair)[0] == pytest.approx(0.32)
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_yes_leg_ladder_is_sized_to_reachable_depth(self):
+        # The SAME defect with the ladder on the YES leg, which is the
+        # expensive half: the NO leg is submitted first and FILLS, then the YES
+        # leg is killed, so the pair unwinds. A rollback, not a skipped trade.
+        levels = [(0.32, 0.30, 300.0), (0.32, 0.35, 300.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        assert spec.x == 300
+        assert leg_prices(spec.pair)[1] == pytest.approx(0.30)
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_flat_book_is_unchanged(self):
+        # GUARD: one level means the prefix average IS that level's price, so
+        # the cap always covers it. The gate must be a no-op here.
+        levels = [(0.32, 0.30, 600.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        assert spec.x == 600
+
+    def test_small_balance_path_is_unchanged(self):
+        # GUARD: when the budget cannot size past the cheapest level the
+        # prefix price and the cap already agree, so #51's affordability bound
+        # masks TS-08 entirely. That is why a thin-balance dry run shows no
+        # delta — the fix must not move this case either.
+        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
+        pair = make_booked_pair(levels, pair_type="same_title", max_contracts=161)
+        spec = compute_trade(pair, 500_00)
+        assert spec.x == 153
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_the_supported_set_has_a_hole_and_the_search_lands_below_it(self):
+        # Reachability is NOT downward-closed, which is why the post-shrink
+        # backstop exists. On this book n<=1000 is supported, 1001..1500 is
+        # not (the prefix average ceils to 0.31, capping at 0.32, which cannot
+        # reach the 0.33 level), and 1501..1600 is supported again (the average
+        # passes 0.31, capping at 0.33). _solve_marginal_size bisects, so it
+        # converges to the top of the LOWER island and never lands above the
+        # hole — which is precisely why the backstop has never been observed
+        # to fire on a real book.
+        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        supported = {
+            n: strategy._reachable_contracts(
+                pair, tuple(levels), *prefix_fill_prices(tuple(levels), n)
+            ) >= n
+            for n in (1000, 1001, 1500, 1501, 1600)
+        }
+        assert supported == {1000: True, 1001: False, 1500: False,
+                             1501: True, 1600: True}
+        spec = compute_trade(pair, 5_000_000)
+        assert spec.x == 1000
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_post_shrink_backstop_pulls_a_stranded_count_back(self, monkeypatch):
+        # Drive the backstop directly. No real book reaches it (see the test
+        # above), so the only honest way to exercise it is to hand compute_trade
+        # a solved size inside the hole's upper island together with a budget
+        # the fees overrun — exactly the shape the shrink loop would produce if
+        # the search ever landed there.
+        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        price_a, price_b = prefix_fill_prices(tuple(levels), 1600)
+        forced = strategy._Sizing(
+            n=1600, target=1600, price_a=price_a, price_b=price_b,
+            p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
+            kelly_fraction=BUDGET_FRACTION, budget_dollars=940.0,
+        )
+        monkeypatch.setattr(strategy, "_solve_marginal_size",
+                            lambda *a, **k: forced)
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        # The fee shrink alone would land in [1001, 1500] — unreachable. The
+        # backstop snaps to the reachable prefix instead.
+        assert spec.x == 1000
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_reachability_holds_for_every_ladder_and_balance(self):
+        # The invariant, swept: whatever compute_trade returns on a booked
+        # pair, the order it implies must be able to buy that many contracts.
+        ladders = [
+            [(0.30, 0.30, 100.0), (0.33, 0.30, 100.0)],
+            [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)],
+            [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)],
+            [(0.30, 0.30, 50.0), (0.31, 0.30, 50.0), (0.36, 0.30, 400.0)],
+            [(0.25, 0.30, 10.0), (0.26, 0.31, 20.0), (0.27, 0.34, 40.0)],
+        ]
+        for levels in ladders:
+            for balance in (20_000, 500_00, 100_000_00, 1_000_000_000):
+                pair = make_booked_pair(levels, pair_type="same_title")
+                spec = compute_trade(pair, balance)
+                if spec is None:
+                    continue
+                assert self._reach(spec, levels) >= spec.x, (levels, balance, spec.x)
+
+    def test_legacy_path_keeps_the_whole_ladder(self, monkeypatch):
+        # The legacy cap is buy_max_cost, a TOTAL-cost cap that CAN sweep a
+        # ladder, so narrowing to reachable depth there would shrink sizes for
+        # no reason. Gated, not unconditional.
+        monkeypatch.setattr(strategy, "ORDER_API_VERSION", "legacy")
+        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        assert spec.x == 600
+
+
+class TestPortfolioSummaryIsFeeInclusive:
+    """
+    TS-12, found by a live prod dry run rather than by the static enumeration:
+    select_portfolio BUDGETS against total_cost_with_fees but its summary line
+    summed total_cost, so the headline portfolio figure was the one cost on the
+    page that was not the cash being committed. Measured live: $60.47 reported
+    against $64.39 of per-trade costs and a $52.08 collateral transfer.
+    """
+
+    def test_summary_sums_the_figure_the_loop_budgets_against(self, caplog):
+        specs = [
+            make_spec(pair_type="same_title", total_cost=10.0,
+                      total_cost_with_fees=10.70),
+            make_spec(pair_type="same_title", total_cost=20.0,
+                      total_cost_with_fees=21.40),
+        ]
+        with caplog.at_level(logging.INFO):
+            select_portfolio(specs, 100_000)
+        line = next(r.getMessage() for r in caplog.records
+                    if "Portfolio:" in r.getMessage())
+        assert "$32.10" in line
+        assert "$30.00" not in line
+        assert "incl. fees" in line

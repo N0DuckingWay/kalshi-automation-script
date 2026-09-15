@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import scanner
+from kalshi_betting import config, scanner
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     INCLUDE_MVE_MARKETS,
@@ -2928,10 +2928,49 @@ class TestTickSizeForPrice:
         assert tick_size_for_price(m, 0.005) == Decimal("0.0001")
         assert tick_size_for_price(m, 0.995) == Decimal("0.0001")
 
-    def test_band_boundary_price_uses_first_containing_band(self):
-        # 0.01 is the end of band 1 and the start of band 2; first match wins.
+    def test_lower_band_boundary_resolves_to_the_finer_band(self):
+        # 0.01 is the end of band 1 ($0.0001) and the start of band 2
+        # ($0.001). Both contain it; the FINER one wins. First-match happened
+        # to agree here, which is why the old convention looked correct.
         m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
         assert tick_size_for_price(m, 0.01) == Decimal("0.0001")
+
+    def test_upper_band_boundary_resolves_to_the_finer_band(self):
+        # TS-10. 0.99 is the end of the $0.001 middle band and the start of
+        # the $0.0001 top band. First-match returned the EARLIER band, which
+        # at an upper edge is 10x COARSER — so the V2 buy cap
+        # (ceil(scanned) + BUY_SLIPPAGE_TICKS x tick) got a 10x tick of
+        # slippage exactly there, loosening a cap that is a bid.
+        m = self._market("center_deci_edge_centi_cent", self._CENTI_BANDS)
+        assert tick_size_for_price(m, 0.99) == Decimal("0.0001")
+
+    def test_finest_wins_regardless_of_band_order(self):
+        # The rule is "finest containing", not "last containing" — a coarse
+        # band listed after a fine one must not win either.
+        m = self._market("tapered_deci_cent", [
+            PriceRange(start=0.0, end=1.0, step=0.01),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
+
+    def test_malformed_band_does_not_discard_valid_later_bands(self):
+        # The old loop `break`s out of the whole list on the first unreadable
+        # band, so a single drifted entry silently downgraded the market to
+        # the $0.01 default. Scanning on recovers the real grid.
+        m = self._market("deci_cent", [
+            SimpleNamespace(start=None, end=None, step=None),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
+
+    def test_nonpositive_step_does_not_mask_a_valid_containing_band(self):
+        # A zero-step band used to `break` the loop too. It must be skipped,
+        # not treated as the answer and not treated as the end of the list.
+        m = self._market("deci_cent", [
+            PriceRange(start=0.0, end=1.0, step=0.0),
+            PriceRange(start=0.0, end=1.0, step=0.001),
+        ])
+        assert tick_size_for_price(m, 0.5) == Decimal("0.001")
 
     def test_none_ranges_falls_back(self):
         # Structure names a fine grid but the bands failed to parse — the
@@ -3061,3 +3100,396 @@ class TestFilterActiveMarketsCloseTimeGuard:
 
         assert len(pairs) == 1, f"Expected exactly one pair from the two good markets; got {pairs}"
         assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"EARLY", "LATE"}
+
+
+class TestBidsToAskLevelsSubCent:
+    """
+    _bids_to_ask_levels keeps sub-cent order-book levels (TS-14, levels half).
+
+    The bound here is config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the
+    extreme tradeable levels on Kalshi's FINEST grid — deliberately NOT the
+    0.01/0.99 market-eligibility bound, which is unchanged.
+    """
+
+    def test_sub_cent_ask_level_is_kept(self):
+        # NO bid 0.995 -> YES ask 0.005. Real depth on a centi-cent book; the
+        # old 0.01 floor discarded it silently.
+        assert _bids_to_ask_levels([["0.995", "40"]]) == [(pytest.approx(0.005), 40.0)]
+
+    def test_level_just_under_one_is_kept(self):
+        # NO bid 0.002 -> YES ask 0.998, inside 0.9999 but outside the old 0.99.
+        assert _bids_to_ask_levels([["0.002", "12"]]) == [(pytest.approx(0.998), 12.0)]
+
+    def test_levels_outside_the_finest_grid_are_still_dropped(self):
+        # 1.0 -> ask 0.0 and 0.0 -> ask 1.0 are settled prices, not depth.
+        assert _bids_to_ask_levels([["1.0", "5"], ["0.0", "5"]]) == []
+
+    def test_whole_cent_levels_are_unchanged(self):
+        # PIN: the common linear-cent path must be byte-identical.
+        assert _bids_to_ask_levels([["0.60", "10"], ["0.55", "20"]]) == [
+            (pytest.approx(0.40), 10.0), (pytest.approx(0.45), 20.0),
+        ]
+
+    def test_dropped_levels_are_counted_and_logged_once(self, caplog):
+        raw = [["1.0", "5"], ["0.60", "10"], ["0.55", "0"], ["bogus", "3"]]
+        with caplog.at_level(logging.WARNING):
+            levels = _bids_to_ask_levels(raw, "KXTEST-9")
+        assert levels == [(pytest.approx(0.40), 10.0)]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "KXTEST-9" in warnings[0]
+        assert "dropped 3 of 4" in warnings[0]
+
+    def test_no_warning_when_nothing_is_dropped(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _bids_to_ask_levels([["0.60", "10"]], "KXTEST-9")
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_market_eligibility_bound_is_unchanged(self):
+        # TS-14 is levels-only by operator decision: no market excluded today
+        # becomes tradeable. Guard, not proof of the fix.
+        assert scanner._MIN_ACTIVE_PRICE == 0.01
+        assert scanner._MAX_ACTIVE_PRICE == 0.99
+
+
+class TestPriceEpsilonThresholds:
+    """
+    TS-09: prices are floats parsed from cent-quantized dollar strings, so a
+    pair sitting EXACTLY on a documented threshold can evaluate a hair under it
+    and be rejected for representation noise rather than for its price.
+    Measured over live books: the same-title 5c test rejected 50 of 94
+    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69.
+    """
+
+    def test_the_float_noise_this_exists_for_is_real(self):
+        # PIN on the premise, not on the fix: if these ever become exact the
+        # epsilon is dead weight and should be revisited.
+        assert 0.35 - 0.30 < 0.05
+        assert 0.35 - 0.20 < 0.15
+
+    def test_epsilon_is_far_below_the_finest_tick(self):
+        # GUARD on magnitude. The finest grid in any regime is $0.0001, and
+        # the tolerance is at most 1% of one tick, so it can only absorb
+        # representation noise — never a real one-tick price difference.
+        assert config.PRICE_EPSILON <= 0.0001 / 100
+
+    @staticmethod
+    def _same_title(pA: float, pB: float):
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = _mock_market(ticker="A1", event_ticker="EV-A", title="Same question",
+                          subtitle="Yes", yes_ask=pA, no_ask=round(1.0 - pA, 4),
+                          close_time=close)
+        mB = _mock_market(ticker="B1", event_ticker="EV-B", title="Same question",
+                          subtitle="Yes", yes_ask=pB, no_ask=round(1.0 - pB, 4),
+                          close_time=close)
+        return find_same_title_pairs([mA, mB])
+
+    def test_same_title_pair_exactly_at_threshold_qualifies(self):
+        # 0.35 - 0.30 == 0.04999999999999999, one ULP under the 5% threshold.
+        pairs = self._same_title(0.35, 0.30)
+        assert len(pairs) == 1
+        assert pairs[0].pA == pytest.approx(0.35)
+
+    def test_same_title_pair_a_cent_under_threshold_is_still_rejected(self):
+        # GUARD: the epsilon must not admit a genuinely sub-threshold pair.
+        assert self._same_title(0.34, 0.30) == []
+
+    def test_time_series_pair_exactly_at_the_short_tier_qualifies(self):
+        # 0.35 - 0.20 == 0.14999999999999997, one ULP under the 15% tier.
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.20, pB=0.35)
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+        assert pairs[0].pB == pytest.approx(0.35)
+
+    def test_time_series_pair_a_cent_under_the_tier_is_still_rejected(self):
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.21, pB=0.34)
+        assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
+
+
+class TestValidatePairPriceReachableDepth:
+    """
+    The pre-execution re-check must ask the question the wire asks: will the
+    order we are ABOUT TO SUBMIT fill against the book as it stands? Counting
+    every contract that merely clears the gap let a spec whose top levels rest
+    above its own FoK limit pass here and then be killed on the exchange,
+    reported as "NO leg FoK not filled" (TS-08).
+    """
+
+    @staticmethod
+    def _client(a_yes_bids, b_no_bids):
+        client = MagicMock()
+
+        def _raw(ticker, *a, **k):
+            book = {"A1": {"yes": a_yes_bids, "no": []},
+                    "B1": {"yes": [], "no": b_no_bids}}[ticker]
+            return {"orderbook_fp": {"yes_dollars": book["yes"], "no_dollars": book["no"]}}
+
+        client._get = _raw
+        return client
+
+    @staticmethod
+    def _pair(nA, pB):
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        return CandidatePair(
+            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
+            tradeable=True, canonical_title="reachability pair",
+            pair_type="same_title",
+        )
+
+    def _run(self, monkeypatch, x):
+        # NO leg (market_a) ladders 0.32@300 then 0.37@300; YES leg flat 0.30.
+        # The spec is priced at the top level, so its NO cap is 0.33 and only
+        # the first 300 contracts are reachable.
+        pair = self._pair(nA=0.32, pB=0.30)
+        spec = SimpleNamespace(pair=pair, x=x)
+        client = self._client(
+            a_yes_bids=[["0.68", "300"], ["0.63", "300"]],
+            b_no_bids=[["0.70", "600"]],
+        )
+        monkeypatch.setattr(scanner, "_fetch_orderbook",
+                            lambda c, t: {"A1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": []},
+                                          "B1": {"yes": [], "no": [["0.70", "600"]]}}[t])
+        return validate_pair_price(client, spec)
+
+    def test_spec_within_reachable_depth_passes(self):
+        import pytest as _p
+        mp = _p.MonkeyPatch()
+        try:
+            assert self._run(mp, 300) is True
+        finally:
+            mp.undo()
+
+    def test_spec_beyond_reachable_depth_is_dropped(self):
+        # 600 contracts clear the gap, but only 300 rest at or below the cap.
+        import pytest as _p
+        mp = _p.MonkeyPatch()
+        try:
+            assert self._run(mp, 600) is False
+        finally:
+            mp.undo()
+
+    def test_the_rejection_names_reachability_not_thin_depth(self, caplog, monkeypatch):
+        with caplog.at_level(logging.WARNING):
+            self._run(monkeypatch, 600)
+        assert "reachable at the FoK limit" in caplog.text
+
+    def test_legacy_path_counts_the_whole_qualifying_book(self, monkeypatch):
+        # buy_max_cost is a TOTAL-cost cap and can sweep a ladder.
+        monkeypatch.setattr(scanner, "ORDER_API_VERSION", "legacy")
+        assert self._run(monkeypatch, 600) is True
+
+
+class TestCloseTimeWarningOncePerRun:
+    """
+    TS-22: _filter_active_markets emits one summary WARNING naming how many
+    markets it dropped for a missing close_time. Both finders call it on the
+    SAME list in one run, so the line appeared TWICE. CLAUDE.md specifies one
+    summary WARNING carrying the count.
+    """
+
+    @staticmethod
+    def _markets():
+        from datetime import UTC, datetime
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        good_a = _mock_market(ticker="A1", event_ticker="EV-A", title="Q",
+                              subtitle="Yes", yes_ask=0.35, no_ask=0.65,
+                              close_time=close)
+        good_b = _mock_market(ticker="B1", event_ticker="EV-B", title="Q",
+                              subtitle="Yes", yes_ask=0.30, no_ask=0.70,
+                              close_time=close)
+        # _mock_market substitutes a default for a falsy close_time, so the
+        # missing-deadline markets are built directly.
+        bad_1 = SimpleNamespace(ticker="X1", event_ticker="EV-X", title="Q2",
+                                subtitle="Yes", yes_ask_dollars="0.40",
+                                no_ask_dollars="0.60", yes_bid_dollars="0.38",
+                                close_time=None)
+        bad_2 = SimpleNamespace(ticker="X2", event_ticker="EV-Y", title="Q2",
+                                subtitle="Yes", yes_ask_dollars="0.40",
+                                no_ask_dollars="0.60", yes_bid_dollars="0.38",
+                                close_time=None)
+        return [good_a, good_b, bad_1, bad_2]
+
+    def test_one_warning_across_both_finders_in_one_run(self, caplog):
+        # The duplication happens one level up from _filter_active_markets, so
+        # a test that invokes it once is tautologically satisfied and cannot
+        # see this. Drive BOTH finders on one list, as both run modes do.
+        markets = self._markets()
+        with caplog.at_level(logging.WARNING):
+            find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+            find_same_title_pairs(markets, held_tickers=set())
+        lines = [r.getMessage() for r in caplog.records
+                 if "missing/unparseable close_time" in r.getMessage()]
+        assert len(lines) == 1
+        assert "2" in lines[0]
+
+    def test_the_markets_are_still_dropped_by_the_quiet_caller(self):
+        # GUARD: the flag suppresses the REPORT, never the filtering.
+        markets = self._markets()
+        kept = scanner._filter_active_markets(markets, set(), warn_missing_close=False)
+        assert [m.ticker for m in kept] == ["A1", "B1"]
+
+    def test_standalone_caller_still_warns_by_default(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            scanner._filter_active_markets(self._markets(), set())
+        assert "missing/unparseable close_time" in caplog.text
+
+
+class TestTimeSeriesFallbackForwardsShardFilter:
+    """
+    TS-27: find_time_series_pairs fetches its own markets when the caller
+    supplies none, and that fallback passed NO shard filter — so it would
+    ingest and pair markets on shards the exchange reports trading_active=false
+    for, the one ingest-time exclusion CLAUDE.md calls mandatory.
+
+    DEAD CODE TODAY: both non-test callers pass markets=, as do all the test
+    call sites. Unreachable in production, unreachable in the suite, and wrong
+    if ever reached.
+    """
+
+    def test_fallback_forwards_the_inactive_shard_set(self, monkeypatch):
+        seen = {}
+
+        def _fake_fetch(client, inactive_shards=None):
+            seen["inactive_shards"] = inactive_shards
+            return []
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _fake_fetch)
+        find_time_series_pairs(MagicMock(), inactive_shards={2, 3})
+        # The VALUE, not merely the parameter's existence: a test that only
+        # asserted the kwarg was accepted would pass against an inverted or
+        # dropped forward.
+        assert seen["inactive_shards"] == {2, 3}
+
+    def test_fallback_defaults_to_excluding_nothing(self, monkeypatch):
+        seen = {}
+
+        def _fake_fetch(client, inactive_shards=None):
+            seen["inactive_shards"] = inactive_shards
+            return []
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _fake_fetch)
+        find_time_series_pairs(MagicMock())
+        assert seen["inactive_shards"] is None
+
+    def test_supplied_markets_skip_the_fetch_entirely(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError("fallback must not run when markets= is given")
+
+        monkeypatch.setattr(scanner, "fetch_open_events_with_markets", _boom)
+        find_time_series_pairs(MagicMock(), markets=[], inactive_shards={1})
+
+
+class TestHorizonFilterLogging:
+    """
+    TS-24: filter_markets_within_horizon logged nothing, so --max-horizon-days
+    left no evidence it had taken effect and a live run whose pair counts
+    differed could not be attributed to it.
+    """
+
+    @staticmethod
+    def _markets():
+        from datetime import UTC, datetime, timedelta
+        now = datetime.now(UTC)
+        return [
+            _mock_market(ticker="NEAR", event_ticker="E1", close_time=now + timedelta(days=3)),
+            _mock_market(ticker="MID", event_ticker="E2", close_time=now + timedelta(days=10)),
+            _mock_market(ticker="FAR", event_ticker="E3", close_time=now + timedelta(days=90)),
+        ]
+
+    def test_logs_kept_and_total_and_the_cutoff(self, caplog):
+        with caplog.at_level(logging.INFO):
+            kept = filter_markets_within_horizon(self._markets(), 14)
+        assert [m.ticker for m in kept] == ["NEAR", "MID"]
+        lines = [r.getMessage() for r in caplog.records if "Horizon filter" in r.getMessage()]
+        assert len(lines) == 1
+        assert "kept 2 of 3" in lines[0]
+        assert "--max-horizon-days 14" in lines[0]
+
+    def test_cutoff_carries_a_time_of_day_not_just_a_date(self, caplog):
+        # The cutoff is now + N days, so printing only .date() would imply a
+        # midnight boundary the filter does not have.
+        with caplog.at_level(logging.INFO):
+            filter_markets_within_horizon(self._markets(), 14)
+        line = next(r.getMessage() for r in caplog.records if "Horizon filter" in r.getMessage())
+        assert "T" in line.split("before ")[1]
+
+    def test_silent_when_the_flag_is_absent(self, caplog):
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_within_horizon(self._markets(), None)
+        assert len(out) == 3
+        assert "Horizon filter" not in caplog.text
+
+
+class TestCoerceIntCents:
+    """
+    TS-28: _coerce_int_cents had no direct coverage. It decides whether a
+    legacy `true`/`false` bid array is really carrying whole cents; getting it
+    wrong sends dollars through the cents path (x100) or drops a real level.
+    """
+
+    def test_accepts_a_genuine_int(self):
+        assert scanner._coerce_int_cents(45) == 45
+
+    def test_accepts_an_integral_float(self):
+        assert scanner._coerce_int_cents(45.0) == 45
+
+    def test_accepts_integral_strings_in_both_spellings(self):
+        assert scanner._coerce_int_cents("45") == 45
+        assert scanner._coerce_int_cents(" 45.0 ") == 45
+
+    def test_rejects_a_fractional_value(self):
+        # A fractional "cent" means the array is really dollars. Multiplying it
+        # through the cents path would be a 100x price error.
+        assert scanner._coerce_int_cents(0.45) is None
+        assert scanner._coerce_int_cents("0.45") is None
+
+    def test_rejects_bool_despite_int_subclassing(self):
+        # bool is an int subclass, so True would silently become 1 cent.
+        assert scanner._coerce_int_cents(True) is None
+        assert scanner._coerce_int_cents(False) is None
+
+    def test_rejects_non_numeric_and_none(self):
+        assert scanner._coerce_int_cents("abc") is None
+        assert scanner._coerce_int_cents(None) is None
+        assert scanner._coerce_int_cents([45]) is None
+
+
+class TestCentsBidsToDollarBids:
+    """
+    TS-28: _cents_bids_to_dollar_bids converts the legacy integer-cent arrays
+    to dollars BEFORE _bids_to_ask_levels, which is dollars-only by contract.
+    Feeding cents straight through that parser yields 1 - 45 = -44, which is
+    then silently discarded — a full book becomes a silent empty one (BS-12).
+    """
+
+    def test_converts_whole_cents_to_dollars(self):
+        out = scanner._cents_bids_to_dollar_bids("T", "true", [[45, 100], [40, 50]])
+        assert out == [[0.45, 100], [0.40, 50]]
+
+    def test_preserves_order_and_quantity_type(self):
+        out = scanner._cents_bids_to_dollar_bids("T", "true", [[60, "10"], [55, "20"]])
+        assert out == [[0.60, "10"], [0.55, "20"]]
+
+    def test_drops_out_of_range_levels_with_a_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = scanner._cents_bids_to_dollar_bids(
+                "KXT-1", "true", [[0, 5], [45, 100], [100, 5]])
+        assert out == [[0.45, 100]]
+        assert caplog.text.count("KXT-1") == 2
+
+    def test_drops_a_level_that_is_not_a_price_qty_pair(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = scanner._cents_bids_to_dollar_bids("KXT-1", "true", [[45], [40, 10]])
+        assert out == [[0.40, 10]]
+        assert "not a [price, qty] pair" in caplog.text
+
+    def test_all_malformed_yields_empty_not_an_exception(self):
+        assert scanner._cents_bids_to_dollar_bids("T", "true", [["x", 1], [0.5, 1]]) == []

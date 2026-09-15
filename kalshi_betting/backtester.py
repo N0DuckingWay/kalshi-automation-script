@@ -128,6 +128,7 @@ from .config import (
     INTERVAL_DISCOUNT_SWEEP,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
+    PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG,
@@ -1144,8 +1145,13 @@ def _find_entry(
             gap = pA - pB
 
         # Enforce the minimum price gap for this pair type (directional in
-        # both cases — the gap above is signed, never an absolute value)
-        if gap < threshold:
+        # both cases — the gap above is signed, never an absolute value).
+        # PRICE_EPSILON mirrors scanner.find_time_series_pairs /
+        # find_same_title_pairs: candle prices are floats too, so a gap sitting
+        # exactly on the tier can evaluate a hair under it and be rejected for
+        # representation noise. The AST parity pins do NOT check this constant,
+        # so a missed mirror here is silent divergence (TS-09).
+        if gap < threshold - PRICE_EPSILON:
             continue
 
         # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
@@ -1164,7 +1170,7 @@ def _find_entry(
         # Live orderbook-depth parity: enrich_with_orderbook_prices only keeps
         # contracts whose combined LEG price leaves the required gap
         # (price_a + price_b <= 1 - threshold) — apply the same cut to candle entries
-        if price_a + price_b > 1.0 - threshold:
+        if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
         # Check that the gross spread on the leg prices exceeds the continuous fee estimate
@@ -1417,7 +1423,15 @@ def _prepare_entries(
     # structurally-impossible case, so it must be strictly conservative: an
     # over-tight end date would wrongly skip a real run (e.g. today is Monday
     # and start_date is within the last week).
-    feasibility_end = date.today()
+    # UTC, not local. _monday_timestamps builds 09:00 UTC checkpoints, and
+    # _build_equity_curve already uses datetime.now(UTC).date() with a comment
+    # explaining why local is wrong there — this is the same reasoning, and it
+    # was the only date.today() left in the fetch path. West of UTC the local
+    # date lags for the first hours of each UTC day (7 of every 24 on a PDT
+    # host), so a window whose ONLY Monday is the current UTC day short-
+    # circuits to zero trades and reports the run as structurally impossible
+    # when it is not (TS-13).
+    feasibility_end = datetime.now(UTC).date()
     if not _monday_timestamps(start_date, feasibility_end):
         logging.warning(
             "No Monday 09:00 UTC entry checkpoint exists in [%s, %s] — no "
@@ -1960,8 +1974,14 @@ def _simulate_at_discount(
         active_until.append((c["exit_date"], mA["ticker"]))
         active_until.append((c["exit_date"], mB["ticker"]))
 
+    # Named with the RESOLVED discount. A default run emits this line 13 times
+    # — once per swept k — with nothing distinguishing them, so a reader could
+    # not tell which simulation a trade count belonged to, and the primary's
+    # copy appears BEFORE the sweep is even announced (TS-21). effective_k, not
+    # the k argument, so the None sentinel is never printed.
     logging.info(
-        "Backtest complete: %d trades, %d profitable",
+        "Backtest complete at k=%.3f: %d trades, %d profitable",
+        effective_k,
         len(trades),
         sum(1 for t in trades if t.profit > 0),
     )
@@ -2406,6 +2426,13 @@ def run_backtest_sweep(
     # The run's actual result. interval_discount is handed over verbatim —
     # including the None sentinel — so a no-override run prices identically to
     # run_backtest().
+    # Announced before it runs, like every swept point below — its slot used to
+    # be unnumbered, so "Sweeping 2/13" was the FIRST counter a reader saw and
+    # slot 1 appeared to be missing (TS-21). The index is filled in after the
+    # grid is known, below; this line names the run's own discount.
+    logging.info("Simulating the primary interval discount: k = %s",
+                 "config default" if interval_discount is None
+                 else f"{interval_discount:.2f}")
     primary = _simulate_at_discount(
         raw_entries, start_date, initial_balance, k=interval_discount
     )
@@ -2432,8 +2459,8 @@ def run_backtest_sweep(
             # its entry in points are the same point, not two equal ones.
             points.append(primary)
             continue
-        # Each _simulate_at_discount below logs its own trade count with no k
-        # attached, so name the discount first or a swept log is unreadable.
+        # Each point announces itself here and _simulate_at_discount then names
+        # the same k on its completion line, so the two bracket one simulation.
         logging.info("Sweeping interval discount %d/%d: k = %.2f", i, len(grid), point_k)
         points.append(_simulate_at_discount(
             raw_entries, start_date, initial_balance, k=point_k

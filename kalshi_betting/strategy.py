@@ -53,6 +53,8 @@ from typing import NamedTuple
 
 from .config import (
     BUDGET_FRACTION,
+    ORDER_API_VERSION,
+    PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SIZE_SOLVE_MAX_ITERATIONS,
     fee_leg_exact,
@@ -60,7 +62,13 @@ from .config import (
     max_affordable_pairs,
     time_series_profit_prob,
 )
-from .scanner import CandidatePair, leg_prices, leg_sides, prefix_fill_prices
+from .scanner import (
+    CandidatePair,
+    leg_prices,
+    leg_sides,
+    prefix_fill_prices,
+    v2_effective_cap,
+)
 
 
 @dataclass
@@ -272,6 +280,53 @@ class _Sizing(NamedTuple):
     budget_dollars: float
 
 
+def _reachable_contracts(
+    pair: CandidatePair, levels: tuple, price_a: float, price_b: float,
+) -> float:
+    """
+    How many contract pairs a V2 fill-or-kill priced at these legs can actually buy.
+
+    A V2 taker order is ONE fill-or-kill limit per leg, so it buys only the
+    depth resting at or below its own limit price — and that limit is a
+    PER-CONTRACT cap derived from the leg's price (scanner.v2_limit_price),
+    while the price itself is the quantity-weighted average of a MULTI-LEVEL
+    prefix. An average over a ladder sits BELOW the ladder's top level, so the
+    top of the very prefix being priced can rest above the cap it produces,
+    and the order is killed (TS-08). This counts what the order really reaches.
+
+    The caps come from scanner.v2_effective_cap — the same arithmetic the order
+    body will carry, including the NO leg's complement round-trip, which can
+    TIGHTEN the effective NO cap on a sub-cent grid. Never re-derive it here:
+    the whole finding is that the size and the cap disagree.
+
+    Both comparisons carry PRICE_EPSILON for the same reason every other price
+    comparison does — a level sitting exactly ON the cap must not be dropped by
+    float representation noise (TS-09).
+
+    Args:
+        pair (CandidatePair): The pair being sized; supplies pair_type (for
+            which side each market buys) and both markets' tick grids.
+        levels (tuple): The pair's qualifying depth as (price_a, price_b, qty)
+            in MARKET order, ascending by combined price — depth_levels.
+        price_a (float): market_a's leg price for the size being tested, in
+            dollars — the price that leg's cap is derived from.
+        price_b (float): market_b's leg price, likewise.
+
+    Returns:
+        float: Total contract pairs resting at or below BOTH legs' caps. A size
+            larger than this cannot fill.
+    """
+    # leg_sides is the only source of truth for which side each market buys,
+    # and levels are already oriented to market order, so this is a direct index
+    side_a, side_b = leg_sides(pair.pair_type)
+    cap_a = float(v2_effective_cap(f"buy_{side_a}", price_a, pair.market_a))
+    cap_b = float(v2_effective_cap(f"buy_{side_b}", price_b, pair.market_b))
+    return sum(
+        qty for pa, pb, qty in levels
+        if pa <= cap_a + PRICE_EPSILON and pb <= cap_b + PRICE_EPSILON
+    )
+
+
 def _evaluate_size(
     pair: CandidatePair, levels: tuple, n: int, balance_cents: int,
 ) -> _Sizing | None:
@@ -312,6 +367,21 @@ def _evaluate_size(
     # Edge cases at 0 or 1 indicate a settled market and would break the fee formula.
     if price_b <= 0.0 or price_b >= 1.0 or price_a <= 0.0 or price_a >= 1.0:
         return None
+
+    if levels and ORDER_API_VERSION == "v2":
+        # A V2 FoK buys only the depth resting at or below its own per-contract
+        # limit, and that limit comes from the prefix AVERAGE, which on a ladder
+        # sits below the prefix's own top level. Size n is unfillable when it
+        # reaches past what its own price can pay for (TS-08). Returning None
+        # makes _solve_marginal_size treat n as too big and search lower, so the
+        # search itself converges on the largest self-consistent size — no
+        # separate fixed-point loop is needed.
+        #
+        # Gated on the V2 path only: the legacy cap is a TOTAL-COST cap
+        # (buy_max_cost) which CAN sweep a ladder, so applying this there would
+        # shrink legacy sizes for no reason.
+        if _reachable_contracts(pair, levels, price_a, price_b) < n:
+            return None
 
     # Subtract the continuous fee approximation from the gross spread to get the
     # net edge. A zero or negative net_spread means the trade costs more than it pays.
@@ -540,6 +610,52 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
             fee_a = fee_leg_exact(n, price_a)
             fee_b = fee_leg_exact(n, price_b)
 
+        # BACKSTOP, not a live path. The shrink decrements n OUTSIDE
+        # _evaluate_size, so the count above is no longer one the reachability
+        # gate has verified, and reachability is genuinely NOT downward-closed:
+        # a cheaper prefix means a LOWER cap, and the cap can fall a tick while
+        # the deepest level the prefix still touches does not. On NO 0.30@1000
+        # then 0.33@600 the supported set is [1,1000] and [1501,1600] with a
+        # HOLE between, because n=1600 prices at 0.31125 for a 0.33 cap while
+        # n=1500 prices at 0.31000 for a 0.32 cap.
+        #
+        # That hole is why the snap has never been observed to fire, and the
+        # reason is worth stating so nobody "simplifies" it away on the grounds
+        # that it looks dead: _solve_marginal_size BISECTS [1, max_contracts],
+        # so on a set like the above it converges to the top of the LOWER
+        # island (1000 here) and cannot land in the upper one at all. Every
+        # count it can return therefore sits in a region where the cap covers
+        # the whole reachable prefix and shrinking keeps that true. A search
+        # that landed differently — a changed seed, a third level, a future
+        # non-bisecting solver — would not have that property, and the
+        # invariant this enforces is the one the money depends on.
+        #
+        # Snap n down to what the order actually reaches and re-price until the
+        # two agree. It terminates for the same reason a level-filtering loop
+        # would: the reachable set is a price-capped PREFIX of a ladder ordered
+        # by combined price, so each pass strictly shrinks it, and the cheapest
+        # level alone is always self-consistent (ceil(best) + slippage >= best).
+        # The fee budget needs no second pass either — a smaller n is strictly
+        # cheaper (TS-08).
+        if ORDER_API_VERSION == "v2":
+            while n >= 1:
+                reachable = _reachable_contracts(pair, levels, price_a, price_b)
+                if reachable >= n:
+                    break
+                n = int(reachable)
+                if n < 1:
+                    break
+                fills = prefix_fill_prices(levels, n)
+                if fills is None:
+                    break
+                price_a, price_b = fills
+                fee_a = fee_leg_exact(n, price_a)
+                fee_b = fee_leg_exact(n, price_b)
+            if n < 1:
+                # Nothing the cap can reach — the same verdict compute_trade
+                # already returns when no count survives its gates.
+                return None
+
     # Verify the win-scenario payoff is positive after exact fees. At very
     # small n the ceiling rounding can eat the entire profit margin. (For a
     # time-series pair this is the profit in either win cell, not a floor —
@@ -689,8 +805,14 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         used_tickers.add(ta)
         used_tickers.add(tb)
     logging.info(
-        "Portfolio: %d trades selected, total cost $%.2f",
+        # Fee-inclusive, matching the per-trade lines main._print_portfolio
+        # emits and the figure this loop actually budgets against two lines
+        # above. It summed total_cost, so the headline portfolio number was
+        # the one cost on the page that was NOT the cash being committed —
+        # a live prod dry run showed $60.47 here against $64.39 of per-trade
+        # costs and a $52.08 collateral transfer (TS-12).
+        "Portfolio: %d trades selected, total cost $%.2f incl. fees",
         len(selected),
-        sum(s.total_cost for s in selected),
+        sum(s.total_cost_with_fees for s in selected),
     )
     return selected

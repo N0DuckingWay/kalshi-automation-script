@@ -2439,6 +2439,11 @@ class TestTimeSeriesLegOrder:
     def test_dry_run_lists_the_no_leg_first_with_leg_prices(self, caplog):
         spec = self._ts_spec()
         spec.total_cost = 3.50
+        # Deliberately DIFFERENT from total_cost. make_spec returns a MagicMock,
+        # so leaving this unset auto-vivifies a child mock and the %.2f format
+        # would still render something — the assertion below would pass
+        # vacuously against a regression back to total_cost (TS-12).
+        spec.total_cost_with_fees = 3.78
         spec.min_payoff = 1.50
         with caplog.at_level(logging.INFO, logger="root"):
             results = execute_trades(MagicMock(), [spec], dry_run=True)
@@ -2449,8 +2454,16 @@ class TestTimeSeriesLegOrder:
         assert "Buy 5x NO on Market B @ 40.00%" in line
         assert "Buy 5x YES on Market A @ 30.00%" in line
         assert line.index("NO on Market B") < line.index("YES on Market A")
+        # TS-12: the fee-INCLUSIVE figure, not the 3.50 contract-only total
+        assert "Total cost: $3.78 incl. fees" in line
+        assert "$3.50" not in line
         assert "Profit if won: $1.50" in line
         assert "Min profit" not in line
+        # TS-23: the line names a PAIR order in submission order. "Batch order"
+        # implied an atomic two-leg submission; there is no batch endpoint, and
+        # the whole rollback machinery exists because the legs go one at a time.
+        assert "Pair order (NO leg first" in line
+        assert "Batch order" not in line
 
 
 class TestUnparseableTransferResponse:

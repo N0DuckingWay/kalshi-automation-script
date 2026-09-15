@@ -237,6 +237,40 @@ BUY_SLIPPAGE_TICKS            = 1
 # the API's dollar-string fields exist to avoid.
 DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 
+# The extreme tradeable price levels on Kalshi's FINEST grid ($0.0001 ticks,
+# the center_deci_edge_centi_cent edge bands). Used by
+# scanner._bids_to_ask_levels to decide which ORDER-BOOK LEVELS are real
+# quotes: a level's complement outside this range is a settled or nonsensical
+# price, not depth.
+#
+# Deliberately NOT the same bound as scanner's market-eligibility check
+# (_MIN_ACTIVE_PRICE/_MAX_ACTIVE_PRICE, still 0.01/0.99), and the two must not
+# be unified. Eligibility asks "is this MARKET worth trading at all", where a
+# sub-cent YES ask means a near-settled market and admitting it would make a
+# 0.9999 quote into a $0.0001 hedge leg. This bound asks "is this LEVEL a real
+# quote on a market we already accepted" — and on the deci-cent and
+# centi-cent regimes, whose entire point is sub-cent ticks, the old 0.01/0.99
+# level bound silently discarded genuine depth (TS-14).
+MIN_ACTIVE_PRICE_DOLLARS      = 0.0001
+MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
+
+# Tolerance for comparing two contract prices for equality-or-better.
+#
+# Every price in the pipeline is a float parsed from a cent-quantized dollar
+# string, so exact arithmetic on them does not hold: 0.35 - 0.30 evaluates to
+# 0.04999999999999999, and a bare `< 0.05` therefore REJECTS a pair that sits
+# exactly on the documented 5% threshold. Measured over live books: the
+# same-title 5c test rejected 50 of 94 qualifying pairs, the time-series 15c
+# tier 21 of 84, and the 30c tier 15 of 69 (TS-09).
+#
+# 1e-6 is two orders of magnitude below the FINEST tick any regime uses
+# ($0.0001), so it can only absorb representation noise — never a real price
+# difference, which is at least one tick. DO NOT TUNE UPWARD: this is an
+# ABSOLUTE tolerance, so its weight relative to the quantity being compared
+# grows as that quantity shrinks, and a larger value would start admitting
+# genuinely sub-threshold pairs at the bottom of the book.
+PRICE_EPSILON                 = 1e-6
+
 # Which create-order endpoint trader.py submits through. Allowed values:
 #   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
 #              (the limit price IS the price protection), fixed-point counts,
@@ -604,6 +638,20 @@ ARCHIVE_MAX_BARREN_PAGES = 50
 # EVENT_TITLE_FALLBACK_MAX_LOOKUPS (bound the work, then say loudly what the
 # bound cost).
 ARCHIVE_TAIL_MAX_PAGES = 2000
+
+# Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
+# the page cap above. The tail is the one fetch path with no chunked `emit`
+# sink — every other phase streams its records to a day slice and drops them —
+# so its whole result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
+# that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,
+# which is the same OOM shape the sharded fetch was rewritten to avoid
+# (BS-15). The two caps COMPOSE: whichever binds first stops the walk, so the
+# real bound is min(pages x 1000, this) records. 500k at ~2.7 KB each is about
+# 1.3 GB — large enough that no realistic window reaches it, small enough that
+# a pathological one cannot take the host down. Hitting it logs a WARNING
+# naming the count, the same bound-the-work-then-say-so idiom as the page cap
+# and EVENT_TITLE_FALLBACK_MAX_LOOKUPS (TS-15).
+ARCHIVE_TAIL_MAX_RECORDS = 500_000
 
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE

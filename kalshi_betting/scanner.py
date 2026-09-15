@@ -54,11 +54,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, fetch_json_page
 from .config import (
+    BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     DEFAULT_TICK_SIZE_DOLLARS,
     EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS,
@@ -67,9 +68,13 @@ from .config import (
     EXCHANGE_FLAG_TRUE_TOKENS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
+    MAX_ACTIVE_PRICE_DOLLARS,
     MAX_DEADLINE_GAP_DAYS,
+    MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
+    ORDER_API_VERSION,
     POSITION_PAGE_SIZE,
+    PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
@@ -117,7 +122,11 @@ _DATE_PATTERNS = [
 ]
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
 
-# Minimum ask price to consider a market actively priced (not settled/illiquid)
+# Minimum ask price to consider a MARKET actively priced (not settled/illiquid).
+# Distinct from config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), which
+# bounds an order-book LEVEL. Do not unify them: widening this one would admit
+# near-settlement markets, turning a 0.9999 YES quote into a $0.0001 hedge leg
+# (TS-14, market half — a held operator decision, not an oversight).
 _MIN_ACTIVE_PRICE = 0.01
 _MAX_ACTIVE_PRICE = 0.99
 
@@ -186,8 +195,11 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     "center_deci_edge_centi_cent" ($0.0001 below $0.01 and above $0.99, $0.001
     in between). The authoritative grid is the market's own `price_ranges`
     bands; the structure name is only used to short-circuit the uniform-cent
-    case. The first band containing the price wins, so a price sitting exactly
-    on a band boundary resolves to the earlier (by convention finer) band.
+    case. A price sitting exactly on a band boundary belongs to TWO bands, and
+    the FINEST step among the bands containing it wins. First-match used to be
+    the rule, and it is only "finer" at a band's LOWER edge — at an UPPER edge
+    the earlier band is 10x COARSER, which multiplied BUY_SLIPPAGE_TICKS by a
+    10x tick exactly there and LOOSENED a buy cap that is a bid (TS-10).
 
     These grids are NESTED: $0.01 ⊂ $0.001 ⊂ $0.0001, so every point of a
     coarser grid is also a point of any finer one. Later price math relies on
@@ -209,12 +221,12 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
             dollars. Range: [0, 1].
 
     Returns:
-        Decimal: The tick size in dollars for that price. Falls back to
-            Decimal(config.DEFAULT_TICK_SIZE_DOLLARS) when the structure is
-            uniform-cent or unknown, when no band contains the price, or when
-            the matching band's step is nonpositive — logging a warning in the
-            latter two cases, which indicate a payload that drifted from the
-            shapes above.
+        Decimal: The FINEST tick size in dollars among the bands containing
+            that price. Falls back to Decimal(config.DEFAULT_TICK_SIZE_DOLLARS)
+            when the structure is uniform-cent or unknown, when no band
+            contains the price, or when every containing band's step is
+            nonpositive — logging a warning in the latter two cases, which
+            indicate a payload that drifted from the shapes above.
     """
     default = Decimal(DEFAULT_TICK_SIZE_DOLLARS)
     structure = getattr(market, "price_level_structure", "") or ""
@@ -224,17 +236,24 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     if structure in ("", "linear_cent") or not bands:
         return default
 
+    # Finest containing band wins (see docstring). Scanning every band instead
+    # of returning on the first match also means one malformed band no longer
+    # discards a valid later one — the old `break` abandoned the whole list.
+    finest: Decimal | None = None
     for band in bands:
         try:
             if band.start <= price_dollars <= band.end:
                 # Decimal(str(...)), never Decimal(float): the float came from
                 # parsing a dollar string and str() round-trips it back exactly.
                 step = Decimal(str(band.step))
-                if step > 0:
-                    return step
-                break
+                if step > 0 and (finest is None or step < finest):
+                    finest = step
         except (AttributeError, TypeError, InvalidOperation):
-            break
+            # This band is unreadable; keep scanning the rest rather than
+            # throwing away bands that may well be intact.
+            continue
+    if finest is not None:
+        return finest
 
     # Only reached on a malformed or non-covering band list; called once per
     # order leg at build time, so a warning here cannot spam the log.
@@ -244,6 +263,171 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     )
     return default
 
+
+
+# Lowest valid V2 limit price, in dollars. Kalshi prices live in the open unit
+# interval — 0 and 1 are settlement values, not tradeable levels — and the
+# finest grid in any regime is $0.0001, so this is the extreme valid bottom
+# tick. The top of grid is not a module constant: it depends on the market's
+# own tick regime and is derived per market by _v2_top_of_grid_price() from
+# config.V2_ROLLBACK_BID_PRICE_DOLLARS.
+_V2_MIN_PRICE = Decimal("0.0001")
+
+# Quantum applied to the scanned price BEFORE it is ceiled onto the tick grid —
+# the same round-before-ceil guard as _buy_max_cost_cents and
+# config.fee_leg_exact. No Kalshi grid point has a 7th decimal (the finest is
+# $0.0001), so quantizing can only remove binary float noise: it tightens or
+# keeps the cap, never loosens it (TS-03).
+_SCANNED_PRICE_QUANTUM = Decimal("0.000001")
+
+def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    """
+    Round a price UP to the next point of a tick grid.
+
+    Ceiling, never nearest or floor: this is the first half of a buy leg's price
+    cap, and it mirrors the legacy _buy_max_cost_cents' math.ceil for exactly
+    the same reason — a cap rounded BELOW the scanned depth-weighted price could
+    never fill at the price we actually scanned, so a fill-or-kill order carrying
+    it would be structurally killed every time rather than protected.
+
+    Args:
+        price (Decimal): Price in dollars to round. Range: [0, 1].
+        tick (Decimal): Tick size in dollars for the grid to land on. Must be
+            > 0 (tick_size_for_price guarantees this).
+
+    Returns:
+        Decimal: The smallest grid point >= price. Returns price unchanged when
+            it already sits exactly on the grid.
+    """
+    return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+
+def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
+    """
+    Compute the fill-or-kill LIMIT price for one V2 buy leg, in dollars.
+
+    V2 has no "market" order type, so a taker order is a marketable FoK limit
+    and this price IS the price protection that buy_max_cost provided on the
+    legacy path: the order fills at or better than the cap, or not at all.
+    The cap is the scanned price ceiled onto the market's own tick grid plus
+    BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
+    pre-execution check.
+
+    The scanned price is quantized to 6 decimals before that ceiling, the same
+    round-before-ceil guard the legacy cap applies in _buy_max_cost_cents (and
+    config.fee_leg_exact before it). Every scanned ask level is the complement
+    of a resting bid (1.0 - float(bid)), and 20 of the 99 whole-cent
+    complements land one ULP ABOVE the exact cent, which would otherwise ceil a
+    whole extra tick and hand the order 2 x BUY_SLIPPAGE_TICKS of tolerance.
+    No Kalshi grid point has a 7th decimal, so the quantize can only remove
+    float noise: it tightens or keeps the cap, never loosens it (TS-03).
+
+    Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
+    DIFFERENT band of the market's grid than the scanned price — stepping up
+    across a band edge, or being mirrored to the other end of the book — the
+    final price is re-quantized onto the grid of the band that actually
+    contains it, rounding UP. Ceiling is chosen because a floor could round a
+    YES cap BELOW the scanned price and make the order structurally unfillable.
+    Kalshi's nested grids ($0.01 subset of $0.001 subset of $0.0001) mean a
+    price landing in a FINER band than it was computed on is already on that
+    band's grid, so the snap is then a no-op.
+
+    That re-quantization is NOT purely protective, and this docstring used to
+    claim it was. When the final price lands in a COARSER band than the one it
+    was computed on, ceiling moves it AWAY from the scanned price and LOOSENS
+    the cap by up to one destination-band tick. Reachable examples on the live
+    band layouts: scanned 0.10 on tapered_deci_cent submits 0.11 where 0.101
+    was intended ($0.0090/contract of extra tolerance), and scanned 0.01 on
+    center_deci_edge_centi_cent submits 0.011 where 0.0101 was intended
+    ($0.0009). The loosening is bounded by one tick of the destination band and
+    is a known, accepted cost of keeping the order fillable; it is a separate
+    finding from TS-10 and is deliberately not fixed here. TS-10 fixed the
+    other half — tick_size_for_price now resolves a boundary price to the
+    FINEST containing band, so the slippage allowance is no longer multiplied
+    by a 10x tick at a band's upper edge.
+
+    The clamp bounds are grid-aware for the same reason: the extreme tradeable
+    levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not
+    0.9999, on a linear-cent market), so the bounds are derived from the tick
+    size at each end of the book rather than the global finest-grid constants.
+
+    This mapping (which side, and the complement for the NO leg) is the single
+    assumption most in need of verification at the first live submission; see
+    _V2_LEG_SIDE, which is where a correction would be made.
+
+    Args:
+        leg_kind (str): Which KIND of leg is being priced — "buy_yes" or
+            "buy_no". Any other value is treated as a YES-style leg (the price
+            is used as-is). A plain string, not a _Leg: this helper prices one
+            side and knows nothing about which of the pair's markets it is on.
+        scanned_price_dollars (float): The scanned depth-weighted per-contract
+            price for this leg, in dollars. Range: (0, 1). For "buy_no" this is
+            the NO price (the NO leg's _Leg.price_dollars), which is
+            complemented into a YES-book ask price.
+        market (Any): The market object the leg trades, used only to look up its
+            tick grid. Any object exposing price_level_structure / price_ranges.
+
+    Returns:
+        Decimal: The limit price in dollars — a valid grid point of the band
+            containing it, clamped one tick inside the open unit interval on
+            this market's grid.
+    """
+    # Every scanned level is 1.0 - float(bid) (scanner._bids_to_ask_levels),
+    # and 20 of the 99 whole-cent complements land one ULP ABOVE the exact
+    # cent (0.43 -> 0.5700000000000001). Un-quantized, _ceil_to_tick steps a
+    # whole extra tick and the FoK limit carries 2 x BUY_SLIPPAGE_TICKS of
+    # tolerance instead of 1 (TS-03).
+    scanned = Decimal(str(scanned_price_dollars)).quantize(_SCANNED_PRICE_QUANTUM)
+    # Cross-module: the market's own tick grid is the only authority on what
+    # price levels the exchange will accept for this leg
+    tick = tick_size_for_price(market, scanned_price_dollars)
+    cap = ceil_to_tick(scanned, tick) + BUY_SLIPPAGE_TICKS * tick
+    # Buying NO is selling YES on the single YES book, so the YES-side price is
+    # the complement of the capped NO price
+    price = Decimal("1") - cap if leg_kind == "buy_no" else cap
+    # Re-quantize onto the grid of the band the FINAL price sits in (see
+    # docstring: ceiling is protective — worst case is a killed FoK)
+    final_tick = tick_size_for_price(market, float(price))
+    price = ceil_to_tick(price, final_tick)
+    # Grid-aware clamp: the extreme valid levels are one tick inside 0 and 1
+    # on this market's own grid at each end of the book
+    bottom_tick = tick_size_for_price(market, float(_V2_MIN_PRICE))
+    top_tick = tick_size_for_price(market, float(Decimal("1") - _V2_MIN_PRICE))
+    return min(max(price, bottom_tick), Decimal("1") - top_tick)
+
+
+def v2_effective_cap(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
+    """
+    The V2 FoK cap for one buy leg, expressed in that leg's OWN side terms.
+
+    v2_limit_price returns the price that goes on the WIRE, which for a NO leg
+    is a YES-book ask of 1 - cap. Callers that need to compare the cap against
+    NO-side level prices — strategy's reachability gate, validate_pair_price's
+    pre-execution re-check — need the NO price, so this undoes that complement
+    and nothing else.
+
+    It exists so those callers never re-derive the cap themselves. TS-08 is
+    precisely "the size and the cap disagree", and a second copy of the formula
+    guarantees they disagree again; going through v2_limit_price means the
+    number tested here is the number the order body will carry, including the
+    NO leg's complement round-trip, which can TIGHTEN the effective NO cap on a
+    sub-cent grid.
+
+    Args:
+        leg_kind (str): "buy_yes" or "buy_no", as for v2_limit_price.
+        scanned_price_dollars (float): The leg's per-contract price in dollars
+            — for "buy_no" the NO price. Range: (0, 1).
+        market (Any): The market the leg trades, for its tick grid.
+
+    Returns:
+        Decimal: The highest per-contract price this leg can pay, in the leg's
+            own side's terms — a YES price for "buy_yes", a NO price for
+            "buy_no". A level priced above it cannot fill under this order.
+    """
+    wire = v2_limit_price(leg_kind, scanned_price_dollars, market)
+    # Buying NO is selling YES, so the NO-side cap is the complement of the
+    # YES-book ask that actually gets submitted.
+    return Decimal("1") - wire if leg_kind == "buy_no" else wire
 
 @dataclass
 class CandidatePair:
@@ -481,7 +665,12 @@ def display_title(market: Any) -> str:
     return f"{event_title}: {base}" if event_title else base
 
 
-def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -> list:
+def _filter_active_markets(
+    markets: list,
+    excluded_tickers: set | None = None,
+    *,
+    warn_missing_close: bool = True,
+) -> list:
     """
     Filter markets to those that are actively priced, deadline-known, and not
     already held.
@@ -503,13 +692,21 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
         markets (list): List of Kalshi market API objects to filter.
         excluded_tickers (set | None): Set of ticker strings to skip. If None,
             no tickers are excluded.
+        warn_missing_close (bool): Whether to emit the missing-close_time
+            summary WARNING. Keyword-only, and True by default so any
+            standalone caller keeps the signal. Both run modes call this on the
+            SAME market list twice — once per finder — so the second caller
+            passes False to keep it at ONE line per run, which is what
+            CLAUDE.md specifies. This flag NEVER changes which markets are
+            dropped, only whether the drop is reported (TS-22).
 
     Returns:
         list: Subset of markets that have a non-None close_time and a parseable
             YES ask in [0.01, 0.99], and whose ticker is not in
             excluded_tickers. Markets with a missing/unparseable close_time are
-            dropped and reported once as a single summary WARNING with the count
-            (silent when none were dropped).
+            ALWAYS dropped; they are reported once as a single summary WARNING
+            with the count (silent when none were dropped, or when
+            warn_missing_close is False).
     """
     excluded = excluded_tickers or set()
     active = []
@@ -529,7 +726,7 @@ def _filter_active_markets(markets: list, excluded_tickers: set | None = None) -
                 active.append(m)
         except (ValueError, TypeError):
             pass
-    if missing_close_time:
+    if missing_close_time and warn_missing_close:
         # Same silent-at-zero idiom as the trading-inactive shard skip count.
         logging.warning(
             "Skipped %d markets with missing/unparseable close_time", missing_close_time
@@ -573,6 +770,17 @@ def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -
                 within_horizon.append(m)
         except TypeError:
             pass
+    # Silent when the flag is absent (the early return above), so this line
+    # appears only on a run that actually asked for a horizon. Without it the
+    # flag left NO evidence it had taken effect, and a live run whose pair
+    # counts differed could not be attributed to it (TS-24). isoformat to the
+    # second, not .date(): the cutoff is now + N days, a time of day, and
+    # printing only the date implies a midnight boundary it does not have.
+    logging.info(
+        "Horizon filter: kept %d of %d markets closing on or before %s (--max-horizon-days %d)",
+        len(within_horizon), len(markets),
+        cutoff.isoformat(timespec="seconds"), max_horizon_days,
+    )
     return within_horizon
 
 
@@ -1433,6 +1641,7 @@ def find_time_series_pairs(
     client: Any,
     held_tickers: set | None = None,
     markets: list | None = None,
+    inactive_shards: set | None = None,
 ) -> list:
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
@@ -1483,6 +1692,12 @@ def find_time_series_pairs(
             None or empty means exclude nothing.
         markets (list | None): Pre-fetched ApiMarket list to scan. When None,
             fetches all open markets via fetch_open_events_with_markets(client).
+        inactive_shards (set | None): exchange_index values the exchange
+            reports trading_active=false for, forwarded to that fallback fetch
+            so this path applies the same single ingest-time shard exclusion
+            both run modes do. IGNORED when markets is supplied — which is what
+            every caller does today, making the fallback unreachable. None
+            excludes no shard.
 
     Returns:
         list: CandidatePair objects, one per normalized-title group that
@@ -1491,8 +1706,13 @@ def find_time_series_pairs(
             deadline-gap cap.
     """
     if markets is None:
-        # Fetch all open markets from the Kalshi API if not supplied by the caller
-        markets = fetch_open_events_with_markets(client)
+        # Fetch all open markets from the Kalshi API if not supplied by the
+        # caller. The exclusion must match main's: nothing on a shard the
+        # exchange reports trading_active=false for can be traded, and it must
+        # not linger as a stale candidate either. Without the forward this path
+        # would ingest and PAIR markets on halted shards — the one ingest-time
+        # exclusion that is mandatory (TS-27).
+        markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
 
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     active = _filter_active_markets(markets, held_tickers)
@@ -1559,7 +1779,13 @@ def find_time_series_pairs(
                 # here would let such pairs through as untradeable placeholders that
                 # could still win the group's one-pair-per-title slot below. Mirrors
                 # the directional check in backtester._find_entry.
-                if pB - pA < min_price_diff_for_gap(gap_days):
+                # PRICE_EPSILON, not a bare <: both prices are floats parsed
+                # from cent-quantized dollar strings, so an exactly-at-tier
+                # gap can evaluate a hair under it (0.45 - 0.30 ->
+                # 0.15000000000000002 is fine, but 0.35 - 0.20 ->
+                # 0.14999999999999997 is not) and the pair is rejected for
+                # representation noise rather than for its price (TS-09).
+                if pB - pA < min_price_diff_for_gap(gap_days) - PRICE_EPSILON:
                     continue
 
                 # tradeable=True when a win scenario (YES-on-A or NO-on-B paying $1)
@@ -1642,7 +1868,12 @@ def find_same_title_pairs(
             Empty if no group has two markets on different event_tickers.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
-    active = _filter_active_markets(markets, held_tickers)
+    # warn_missing_close=False: both run modes call find_time_series_pairs on
+    # this SAME list immediately before this call (main._run_dev, _run_prod),
+    # and it has already emitted the summary WARNING. One line per run, as
+    # CLAUDE.md specifies — not one per finder. The markets are still dropped
+    # here either way; only the report is suppressed (TS-22).
+    active = _filter_active_markets(markets, held_tickers, warn_missing_close=False)
 
     # Group by exact (event_title, title, subtitle) tuple — no normalization.
     # Three-element key: event_title prevents MVE cross-event collisions; the
@@ -1688,7 +1919,10 @@ def find_same_title_pairs(
 
                 # Enforce the minimum 5% YES price difference for same-title pairs.
                 # A smaller gap is within normal bid-ask spread noise.
-                if pA - pB < SAME_TITLE_MIN_PRICE_DIFF:
+                # Same float-noise tolerance as the time-series tier test:
+                # 0.35 - 0.30 == 0.04999999999999999, which a bare < rejects
+                # at the documented 5% threshold (TS-09).
+                if pA - pB < SAME_TITLE_MIN_PRICE_DIFF - PRICE_EPSILON:
                     continue
 
                 try:
@@ -1843,7 +2077,26 @@ def prefix_fill_prices(
     return sum_a / n, sum_b / n
 
 
-def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
+def _pair_ticker(pair: Any, attr: str) -> str:
+    """
+    Read one of a pair's market tickers without assuming the market is there.
+
+    Used only to name a market in a log line. _leg_ask_levels and
+    _reference_yes_ask are deliberately tolerant of a bare pair stub (the same
+    fail-safe rule leg_sides applies to an unknown pair_type), so a missing
+    market must degrade to a placeholder rather than raise inside the scan.
+
+    Args:
+        pair (Any): A CandidatePair or any stub exposing market_a/market_b.
+        attr (str): "market_a" or "market_b".
+
+    Returns:
+        str: The market's ticker, or "<unknown>" when it cannot be read.
+    """
+    return getattr(getattr(pair, attr, None), "ticker", "<unknown>")
+
+
+def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple[float, float]]:
     """
     Convert bid levels to ask levels via the complement price (1 − P).
 
@@ -1851,26 +2104,50 @@ def _bids_to_ask_levels(bids_raw: list) -> list[tuple[float, float]]:
                            NO bid at P → YES ask at (1−P).
     Descending bids naturally yield ascending asks after the complement.
 
+    Bounded by config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the extreme
+    tradeable levels on Kalshi's FINEST grid — NOT by the 0.01/0.99
+    market-eligibility bound. Those are different questions, and using the
+    coarse one here silently discarded real depth on exactly the regimes whose
+    point is sub-cent ticks: every level of a deci-cent or centi-cent book
+    priced under a cent, or over 99c, vanished before pairing (TS-14).
+
     Args:
         bids_raw (list): [[price_str, qty_str], ...] sorted descending by
             price, as parsed from the orderbook payload.
+        ticker (str): The market the book came from, named in the drop
+            WARNING only. Defaults to a placeholder for hand-built input.
 
     Returns:
         list[tuple[float, float]]: [(ask_price, qty), ...] sorted ascending
             (cheapest ask first). A level whose complement price falls outside
-            [_MIN_ACTIVE_PRICE, _MAX_ACTIVE_PRICE] or whose qty is <= 0 is
-            dropped; a malformed entry (bad price/qty string) is skipped.
+            [MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS] or whose qty
+            is <= 0 is dropped, as is a malformed entry (bad price/qty string);
+            one summary WARNING names the total, silent at zero.
     """
     levels = []
+    dropped = 0
     for entry in bids_raw:
         try:
             bid_price = float(entry[0])
             qty = float(entry[1])
             ask_price = 1.0 - bid_price
-            if _MIN_ACTIVE_PRICE <= ask_price <= _MAX_ACTIVE_PRICE and qty > 0:
+            if MIN_ACTIVE_PRICE_DOLLARS <= ask_price <= MAX_ACTIVE_PRICE_DOLLARS and qty > 0:
                 levels.append((ask_price, qty))
+            else:
+                dropped += 1
         except (ValueError, TypeError, IndexError):
+            dropped += 1
             continue
+    if dropped:
+        # Same silent-at-zero summary idiom as the trading-inactive shard skip
+        # count. These drops used to be entirely invisible, so a book thinned
+        # by a drifted payload read downstream as genuinely thin depth (TS-14).
+        logging.warning(
+            "Orderbook for %s: dropped %d of %d bid levels as unusable "
+            "(complement outside [%s, %s], nonpositive qty, or unparseable)",
+            ticker, dropped, len(bids_raw),
+            MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS,
+        )
     levels.sort(key=lambda x: x[0])
     return levels
 
@@ -1913,9 +2190,11 @@ def _leg_ask_levels(
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     if side_a == "no":
         # NO on A consumes A's YES bids; YES on B consumes B's NO bids
-        return _bids_to_ask_levels(ob_a["yes"]), _bids_to_ask_levels(ob_b["no"])
+        return (_bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a")),
+                _bids_to_ask_levels(ob_b["no"], _pair_ticker(pair, "market_b")))
     # YES on A consumes A's NO bids; NO on B consumes B's YES bids
-    return _bids_to_ask_levels(ob_b["yes"]), _bids_to_ask_levels(ob_a["no"])
+    return (_bids_to_ask_levels(ob_b["yes"], _pair_ticker(pair, "market_b")),
+            _bids_to_ask_levels(ob_a["no"], _pair_ticker(pair, "market_a")))
 
 
 def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
@@ -1948,7 +2227,8 @@ def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
     # leg: YES on A for time_series, YES on B for same_title
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     ob_ref = ob_b if side_a == "yes" else ob_a
-    levels = _bids_to_ask_levels(ob_ref["no"])
+    ref_ticker = _pair_ticker(pair, "market_b" if side_a == "yes" else "market_a")
+    levels = _bids_to_ask_levels(ob_ref["no"], ref_ticker)
     # _bids_to_ask_levels returns ASCENDING asks, so [0] is the best (lowest)
     return levels[0][0] if levels else None
 
@@ -2326,7 +2606,9 @@ def enrich_with_orderbook_prices(
         # _pair_max_sum for the exact per-tier ceilings.
         max_sum    = _pair_max_sum(pair)
         qualifying = [
-            (yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum
+            (yp, np_, qty)
+            for yp, np_, qty in paired
+            if yp + np_ <= max_sum + PRICE_EPSILON
         ]
 
         if not qualifying:
@@ -2424,7 +2706,7 @@ def enrich_with_orderbook_prices(
                 tier = min_price_diff_for_gap(
                     deadline_gap_days(pair.market_a, pair.market_b)
                 )
-                direction_ok = (pair.pB - avg_yes) >= tier
+                direction_ok = (pair.pB - avg_yes) >= tier - PRICE_EPSILON
                 basis = (
                     f"scan-time reference ask {pair.pB:.4f} (later book's NO side "
                     f"empty), which must clear the {tier:.2f} tier"
@@ -2526,7 +2808,11 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
     # Same per-pair gap ceiling used at scan time (deadline-gap-tiered for
     # time_series) — the trade must still qualify at execution time
     max_sum    = _pair_max_sum(pair)
-    qualifying = [(yp, np_, qty) for yp, np_, qty in paired if yp + np_ <= max_sum]
+    qualifying = [
+        (yp, np_, qty)
+        for yp, np_, qty in paired
+        if yp + np_ <= max_sum + PRICE_EPSILON
+    ]
 
     if not qualifying:
         # WARNING, not INFO: this is a SELECTED trade being dropped seconds
@@ -2538,12 +2824,41 @@ def validate_pair_price(client: Any, spec: Any) -> bool:
         )
         return False
 
-    # Require enough depth to fill our full intended contract count via FoK
-    total_qty = sum(qty for _, _, qty in qualifying)
+    # Require enough depth to fill our full intended contract count via FoK.
+    # On the V2 path "enough depth" means depth the ORDER CAN REACH, not depth
+    # that merely clears the gap: the order is one fill-or-kill limit per leg,
+    # priced from this spec's own leg prices, and it buys nothing resting above
+    # that limit. Counting the whole qualifying book here would let a trade
+    # whose top levels sit above its cap pass the pre-execution check and then
+    # be killed on the wire, reported as "NO leg FoK not filled" — the same
+    # confusion between cap and size that TS-08 fixed on the sizing side.
+    #
+    # The caps come from leg_prices(spec.pair) — the price the trader is about
+    # to submit at — NOT from a freshly recomputed average of this book. That
+    # is the question that actually matters: will the order we are about to
+    # send fill against the book as it stands now?
+    if ORDER_API_VERSION == "v2":
+        side_a, side_b = leg_sides(pair.pair_type)
+        price_a, price_b = leg_prices(spec.pair)
+        cap_a = float(v2_effective_cap(f"buy_{side_a}", price_a, pair.market_a))
+        cap_b = float(v2_effective_cap(f"buy_{side_b}", price_b, pair.market_b))
+        # qualifying is in SIDE order (yes, no, qty); orient the caps to match
+        cap_yes, cap_no = (cap_b, cap_a) if side_a == "no" else (cap_a, cap_b)
+        total_qty = sum(
+            qty for yp, np_, qty in qualifying
+            if yp <= cap_yes + PRICE_EPSILON and np_ <= cap_no + PRICE_EPSILON
+        )
+        basis = "reachable at the FoK limit"
+    else:
+        # Legacy buy_max_cost is a TOTAL-cost cap and can sweep a ladder, so
+        # every qualifying contract is reachable on that path.
+        total_qty = sum(qty for _, _, qty in qualifying)
+        basis = "at gap"
+
     if total_qty < spec.x:
         logging.warning(
-            "Pre-execution check failed for '%s' — only %.1f contracts at gap (need %d); dropping",
-            pair.canonical_title, total_qty, spec.x,
+            "Pre-execution check failed for '%s' — only %.1f contracts %s (need %d); dropping",
+            pair.canonical_title, total_qty, basis, spec.x,
         )
         return False
 

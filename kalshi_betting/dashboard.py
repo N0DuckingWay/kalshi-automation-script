@@ -844,7 +844,15 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     fig_slip.update_layout(title="Slippage Distribution (Actual − Win-Scenario Payoff, $)",
                             xaxis_title="Slippage ($)", yaxis_title="Count")
 
-    # Best and worst trades table
+    # Best and worst trades table.
+    #
+    # Below 11 trades these two slices OVERLAP — identical rows under both
+    # headings at fewer than 5, partial overlap at 5-10 — with nothing on the
+    # page saying so. That is a recorded WONTFIX (operator decision,
+    # 2026-09-13), not an oversight: on a low-frequency bot's early dashboards
+    # the overlap is accepted, and a reader of a 5-trade dashboard is looking
+    # at every trade either way. Do not "fix" it into a single merged table
+    # without asking; the sweep raised it as TS-29 and it was declined.
     sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
     best  = sorted_trades[:5]
     worst = sorted_trades[-5:]
@@ -870,7 +878,7 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
                 f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{safe_title}</td>"
                 f"<td>{t.pair_type}</td>"
                 f"<td>{t.n}</td>"
-                f"<td>${t.total_cost:.2f}</td>"
+                f"<td>${t.total_cost + t.fees:.2f}</td>"
                 f"<td style='color:{'#2E7D32' if t.profit>=0 else '#C62828'}'>"
                 f"${t.profit:+.2f} ({t.profit_ratio:.1%})</td>"
                 f"</tr>")
@@ -880,7 +888,7 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 <b>Top 5 Trades</b>
 <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
 <tr style="background:#E8F5E9;font-weight:bold;">
-  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost</th><th>Profit</th>
+  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost incl. fees</th><th>Profit</th>
 </tr>
 """ + "".join(_trow(t, "#F9FBE7") for t in best) + """
 </table>
@@ -888,7 +896,7 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 <b>Worst 5 Trades</b>
 <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
 <tr style="background:#FFEBEE;font-weight:bold;">
-  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost</th><th>Profit</th>
+  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost incl. fees</th><th>Profit</th>
 </tr>
 """ + "".join(_trow(t, "#FFF8F8") for t in worst) + """
 </table>
@@ -968,8 +976,13 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     entry_by_date: dict[date, float] = {}
     exit_by_date: dict[date, float] = {}
     for t in trades:
-        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + t.total_cost
-        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + t.total_cost
+        # Fee-inclusive: fees are cash out the door at entry, so they are part
+        # of the capital deployed. The Kelly-vs-actual scatter twenty-six lines
+        # above already uses (total_cost + fees); this used not to, so the two
+        # charts on one dashboard disagreed by the fee rate (TS-12).
+        cost = t.total_cost + t.fees
+        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + cost
+        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + cost
 
     invested_by_date: list[float] = []
     running_invested = 0.0
@@ -1192,7 +1205,7 @@ def generate_dashboard(
 <body>
 <h1>Kalshi Arbitrage Backtest</h1>
 <p style="color:#616161; font-size:14px;">
-  Period: {start_date} → {date.today()} &nbsp;|&nbsp;
+  Period: {start_date} → {datetime.now(UTC).date()} &nbsp;|&nbsp;
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>

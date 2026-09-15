@@ -326,3 +326,39 @@ class TestEmpty2xxBodyStillRaises:
         fetch_fn = MagicMock(return_value=self._response(200, b"<html>oops</html>"))
         with pytest.raises(ValueError):
             fetch_json_page(fetch_fn)
+
+
+class TestExtractStatus:
+    """
+    TS-28: _extract_status decides whether api_call_with_retry sees a 429/5xx
+    at all. Returning None where a status exists turns a retryable failure into
+    a fatal one; inventing one does the reverse.
+    """
+
+    def test_reads_the_sdk_status_attribute(self):
+        assert _http._extract_status(SimpleNamespace(status=429)) == 429
+
+    def test_reads_a_requests_style_status_code(self):
+        assert _http._extract_status(SimpleNamespace(status_code=503)) == 503
+
+    def test_prefers_status_over_a_nested_response(self):
+        exc = SimpleNamespace(status=429, response=SimpleNamespace(status_code=500))
+        assert _http._extract_status(exc) == 429
+
+    def test_falls_back_to_a_nested_response(self):
+        exc = SimpleNamespace(response=SimpleNamespace(status_code=502))
+        assert _http._extract_status(exc) == 502
+
+    def test_none_when_no_status_is_discoverable(self):
+        # The caller treats None as NON-retryable, so this is the fail-closed
+        # answer for a transport error that carries no HTTP status at all.
+        assert _http._extract_status(ValueError("boom")) is None
+
+    def test_ignores_a_non_integer_status(self):
+        # A drifted payload could put a string here; "429" is not a status the
+        # backoff logic can compare, and guessing would be worse than None.
+        assert _http._extract_status(SimpleNamespace(status="429")) is None
+
+    def test_ignores_a_response_whose_status_code_is_not_an_int(self):
+        exc = SimpleNamespace(response=SimpleNamespace(status_code=None))
+        assert _http._extract_status(exc) is None
