@@ -1524,6 +1524,69 @@ def make_spec() -> SimpleNamespace:
     )
 
 
+class TestPairsTableOutcomeColumns:
+    """DR-17: the outcome label gets its own pair of table cells.
+
+    Appending it to the title cell alone is not enough — _truncate cuts the
+    two title cells at 40 characters (the outcome cells it adds get their own
+    24), and a real display_title ("<event title>: <market title> —
+    <subtitle>") is well past that, so two strikes of one daily family render
+    as the same truncated string. The reviewer of the 2026-09-15 dry run could
+    not tell the four cross-strike trades apart for exactly that reason.
+    """
+
+    @staticmethod
+    def _cells(caplog, sub_a: str, sub_b: str) -> dict:
+        """Render one candidate row and return {header: cell text}."""
+        pair = make_spec().pair
+        pair.market_a.subtitle = sub_a
+        pair.market_b.subtitle = sub_b
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            main.print_pairs_table([pair], {})
+        # tabulate's "rounded_outline" draws the header row and the single data
+        # row as the only lines carrying cell separators.
+        lines = [line for line in caplog.text.splitlines() if "\u2502" in line]
+        assert len(lines) == 2, lines
+        headers = [c.strip() for c in lines[0].split("\u2502")[1:-1]]
+        values = [c.strip() for c in lines[1].split("\u2502")[1:-1]]
+        assert len(headers) == len(values)
+        return dict(zip(headers, values, strict=True))
+
+    def test_outcome_cells_carry_the_subtitles(self, caplog):
+        cells = self._cells(caplog, "$82,750 or above", "$78,500 or above")
+        assert cells["Outcome A"] == "$82,750 or above"
+        assert cells["Outcome B"] == "$78,500 or above"
+
+    def test_two_strikes_of_one_family_are_distinguishable(self, caplog):
+        # The titles are identical by construction here (make_spec's stub pair
+        # uses "Market A"/"Market B"); the outcome cells are the only thing
+        # that separates one strike from another.
+        cells = self._cells(caplog, "$82,750 or above", "$82,750 or above")
+        same = self._cells(caplog, "$82,750 or above", "$78,500 or above")
+        assert cells["Outcome A"] == cells["Outcome B"]
+        assert same["Outcome A"] != same["Outcome B"]
+
+    def test_missing_subtitle_renders_a_placeholder(self, caplog):
+        cells = self._cells(caplog, "", "")
+        assert cells["Outcome A"] == "\u2014"
+        assert cells["Outcome B"] == "\u2014"
+
+    def test_headers_and_row_stay_aligned(self, caplog):
+        # The row cells and the header list are built in two separate places;
+        # a column added to one and not the other silently shifts every price
+        # column. tabulate pads the SHORTER list (with a blank header at the
+        # front), so the two stay the same length and neither the length
+        # assertion nor the strict zip in _cells fires — the shift surfaces as
+        # a known header carrying its neighbour's value, which is what the
+        # per-value assertions below catch.
+        cells = self._cells(caplog, "Yes", "Yes")
+        assert cells["Market A"].startswith("Market A")
+        assert cells["pA (YES)"] == "30.00%"
+        assert cells["pB (YES)"] == "60.00%"
+        assert cells["nB (NO)"] == "40.00%"
+
+
 class TestRunProdExitCodes:
     @patch("kalshi_betting.main.verify_auth")
     def test_low_balance_returns_skip_code(self, mock_verify_auth):

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, strategy
+from kalshi_betting import backtester, config, dashboard, scanner, strategy
 from kalshi_betting.config import (
     BUDGET_FRACTION,
     SAME_TITLE_CO_RESOLVE_PROB,
@@ -634,6 +634,15 @@ class TestTimeSeriesKellyParity:
         # reimplement the formula — so it is pinned as a two-link chain.
         assert _function_calls(backtester, "_simulate_at_discount", "time_series_profit_prob")
         assert _function_calls(backtester, "run_backtest", "_simulate_at_discount")
+
+    def test_ast_both_finders_group_through_the_shared_key_helper(self):
+        # DR-01: the live scanner and the backtester must derive the
+        # time-series group key from ONE definition. They previously each
+        # called normalize_title on their own combined title, so the backtester
+        # reproduced the strike-blind key exactly and could never have
+        # surfaced the defect on settled history.
+        assert _function_calls(scanner, "find_time_series_pairs", "time_series_group_key")
+        assert _function_calls(backtester, "_group_by_normalized_title", "time_series_group_key")
 
 
 class TestSelectPortfolio:

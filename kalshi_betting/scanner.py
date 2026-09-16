@@ -6,10 +6,12 @@ Last edited by: Zachary Hoffman
 Purpose:
     Fetches all open Kalshi markets from the REST API and identifies pairs of
     contracts for the bot's two pair strategies: (1) time-series pairs —
-    contracts that ask the same question at different deadlines, identified by
-    stripping date tokens from their titles and exact-matching the remainder,
-    traded as a directional bet (YES on the earlier contract, NO on the later)
-    when the later contract is priced well above the earlier; and (2)
+    contracts that ask the same question about the same OUTCOME at different
+    deadlines, identified by stripping date tokens from their titles and
+    exact-matching the remainder together with the market's outcome label
+    (time_series_group_key), traded as a directional bet (YES on the earlier
+    contract, NO on the later) when the later contract is priced well above
+    the earlier; and (2)
     same-title pairs — contracts with identical title and subtitle on
     different event tickers, traded as a near-arbitrage (NO on the pricier,
     YES on the cheaper) when their prices diverge. Both paths then check the
@@ -23,15 +25,19 @@ Dependencies:
     deadline_gap_days() (the only source of truth for which side each leg
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
     main.py and backtester.py), and the scanning functions consumed by
-    main.py, backtester.py (which also imports normalize_title and
-    leg_sides), and (via normalize_title) historical.py. Depends on the
-    KalshiClient produced by auth.py.
+    main.py and backtester.py (which also imports time_series_group_key and
+    leg_sides, so the live scanner and the backtester group time-series
+    candidates through one definition). Depends on the KalshiClient produced
+    by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
     the observation that Kalshi titles differ only in date tokens when the same
     question is asked across multiple deadline-indexed markets. The _DATE_PATTERNS
     list must cover all Kalshi date formats to avoid missed pairs or false positives.
+    It is only half of the time-series grouping key: the market's outcome label
+    (its subtitle) is the other half, because a daily strike family shares one
+    title and differs only there — see time_series_group_key().
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -88,7 +94,9 @@ from .config import (
 # ---------------------------------------------------------------------------
 # Date patterns stripped from titles before exact-match grouping.
 # After stripping, two contracts that differ ONLY in their deadline will
-# produce the same normalized string — no fuzzy matching needed.
+# produce the same normalized string — no fuzzy matching needed. The
+# time-series key appends the outcome label to that string so two different
+# OUTCOMES cannot share a group (see time_series_group_key).
 # ---------------------------------------------------------------------------
 _DATE_PATTERNS = [
     # Full month-name dates: "December 1, 2026" / "January 31, 2027"
@@ -103,6 +111,21 @@ _DATE_PATTERNS = [
     r"\b\d{1,2}/\d{1,2}/\d{4}\b",
     # ISO dates: "2026-12-31"
     r"\b\d{4}-\d{2}-\d{2}\b",
+    # Deadline preposition + full month name + day, no year: "by June 30".
+    # Must sit AHEAD of the "by/before/until/through/after" clause below,
+    # whose optional day group matches only when a year follows: from behind,
+    # that clause consumes "by June" and strands the day, leaving "30" against
+    # "31" to split two titles that differ only in their deadline.
+    # Anchored to the preposition deliberately. A bare "<Month> <day>" would
+    # also erase the date from SNAPSHOT titles ("... on June 30"), which would
+    # put two snapshot markets of one family into a single time-series group —
+    # the premise violation the live scanner cannot detect from prices.
+    # Anchored, this pattern fires only where the clause below already fired
+    # and stranded a day, so no title that used to stay apart is merged.
+    # The abbreviated spelling ("by Oct 1") is deliberately NOT covered: its
+    # own pattern still sits after that clause and still strands the day
+    # there, exactly as before this commit.
+    r"\b(?:by|before|until|through|after)\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b",
     # "by/before/until/through/after [month] [optional date+year]"
     r"\b(?:by|before|until|through|after)\s+(?:end\s+of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?(?:\s+\d{1,2},?\s+\d{4}|\s+\d{4})?\b",
     # "end of [the] year"
@@ -121,6 +144,27 @@ _DATE_PATTERNS = [
     r"\bH\d{4}\b",
 ]
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
+
+# The unambiguous DATE shapes only — what _normalize_subtitle may strip from an
+# outcome label. Every entry is taken BY INDEX from _DATE_PATTERNS and none is
+# re-spelled here, so editing a pattern there can never leave a stale copy
+# behind: indexes 0-5 are the month-name / abbreviated-month / numeric / ISO
+# shapes that carry a year, index 6 is the deadline-anchored month + day shape
+# added above, and index 12 is the pre-existing bare abbreviated month + day.
+# Deliberately NOT the whole list. Excluded are the bare "by <Month>" clause
+# (7), "end of year" (8), quarters (9), "in 20xx" (10), the standalone 20xx
+# year (11) and the two time shapes (13, 14). A subtitle is where a bare
+# 4-digit strike ("2050 or above") lives, so the year and quarter shapes would
+# erase real outcome labels; an hour inside an outcome label may BE the
+# outcome; and the bare "by <Month>" clause adds nothing a dated label needs,
+# since 0-6 already cover every shape carrying a day or a year. One consequence
+# to know: index 12 is unanchored, so a bare "Sep 14" outcome label normalizes
+# to "" and two such labels share a key.
+_EXPLICIT_DATE_PATTERNS = (
+    *_DATE_PATTERNS[0:7],
+    _DATE_PATTERNS[12],
+)
+_COMPILED_EXPLICIT_DATES = [re.compile(p, re.IGNORECASE) for p in _EXPLICIT_DATE_PATTERNS]
 
 # Minimum ask price to consider a MARKET actively priced (not settled/illiquid).
 # Distinct from config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), which
@@ -474,7 +518,8 @@ class CandidatePair:
             type's flag is a settlement guarantee: same-title rests on the
             co-resolution prior, time-series on the in-between probability
             being overstated.
-        canonical_title (str): Grouping key used to identify the pair — normalized title for
+        canonical_title (str): Grouping key used to identify the pair — the
+            normalized title+outcome key (scanner.time_series_group_key) for
             time-series pairs, raw title for same-title pairs.
         pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
             "same_title" for pairs with identical title/subtitle across different event tickers.
@@ -587,6 +632,11 @@ def normalize_title(title: str) -> str:
     that differ only in their deadline will produce the same normalized string,
     enabling exact-match grouping without fuzzy matching.
 
+    This is the TITLE half of the time-series grouping key only. Callers that
+    group time-series candidates must go through time_series_group_key(),
+    which appends the market's outcome discriminator — a title alone does not
+    separate the strikes of one daily family (DR-01).
+
     Args:
         title (str): Raw market title from the Kalshi API.
 
@@ -645,6 +695,84 @@ def pair_key(market: Any) -> str:
     return f"{event_title} | {market_title(market)}"
 
 
+def _normalize_subtitle(subtitle: str) -> str:
+    """
+    Normalize an outcome label for use inside the time-series grouping key.
+
+    Lower-cases, collapses whitespace, strips explicit dates
+    (_COMPILED_EXPLICIT_DATES) and trailing punctuation, so that
+    "Donald Trump" and "Donald Trump." are one option label and
+    "$80,000 by June 30" and "$80,000 by July 31" are one strike at two
+    deadlines. Trailing whitespace and punctuation are trimmed together, so
+    a label that ends in a stripped date FOLLOWED by punctuation
+    ("$80,000 by June 30.") still matches the same label written without
+    either.
+
+    Deliberately NOT normalize_title(): that pass strips any bare 20xx token as
+    a year, and a subtitle is exactly where a bare 4-digit strike
+    ("2050 or above") lives — running it over an outcome label would merge two
+    strikes in 2000-2099 into one key, i.e. reintroduce DR-01 through the
+    subtitle.
+
+    Args:
+        subtitle (str): Raw outcome label (ApiMarket.subtitle, sourced from the
+            API's `yes_sub_title` — see _market_from_dict).
+
+    Returns:
+        str: Lower-cased, date-stripped, punctuation-trimmed label. "" when
+            nothing survives.
+    """
+    result = subtitle
+    for pat in _COMPILED_EXPLICIT_DATES:
+        result = pat.sub(" ", result)
+    # Trim the whitespace and the punctuation in ONE rstrip, not whitespace
+    # first and punctuation second: a stripped date leaves a space in FRONT of
+    # any trailing punctuation ("$80,000 by June 30." -> "$80,000 by ."), and
+    # trimming the punctuation last would leave that space in the key, so the
+    # label would not match the same one written without the period.
+    return re.sub(r"\s+", " ", result).strip().rstrip(" .,;:!").lower()
+
+
+def time_series_group_key(combined_title: str, subtitle: Any) -> str:
+    """
+    Grouping key for time-series pair detection: the date-stripped
+    event_title | title PLUS the market's outcome discriminator.
+
+    Two contracts are "the same question at two deadlines" only when they ask
+    about the same OUTCOME. The outcome label — a strike such as "$82,750 or
+    above", a temperature band, an MVE option name — lives in the market's
+    subtitle (ingested from `subtitle`, falling back to `yes_sub_title`), and
+    market_title() reaches `.subtitle` only when `.title` is empty, so a key
+    built from the title alone merged every strike of a daily family into one
+    group and the best-pair rule then selected the widest strike mismatch
+    (DR-01 — CLAUDE.md's cross-strike gotcha carries the measurement). A strike
+    spelled inside the TITLE is a separate case, not handled here.
+
+    Single source of truth for BOTH paths — scanner.find_time_series_pairs and
+    backtester._group_by_normalized_title must call this (pinned by AST in
+    tests/test_strategy.py). Fail-safe on a non-string subtitle (a MagicMock's
+    auto-attribute, None from an old cache record): treated as absent, never
+    raised on — the same rule leg_sides and strategy._depth_levels follow.
+
+    Args:
+        combined_title (str): The pair_key() of the market — "<event_title> |
+            <market_title>", or the bare market title when no event title is
+            attached.
+        subtitle (Any): The market's outcome label. Anything that is not a str
+            is read as absent.
+
+    Returns:
+        str: "<normalized title> | <normalized subtitle>", the normalized title
+            alone when the subtitle normalizes to nothing, or "" when the title
+            itself normalizes to nothing (the caller drops such markets).
+    """
+    base = normalize_title(combined_title)
+    if not base:
+        return ""
+    sub = _normalize_subtitle(subtitle) if isinstance(subtitle, str) else ""
+    return f"{base} | {sub}" if sub else base
+
+
 def display_title(market: Any) -> str:
     """
     Human-readable label for console and Excel output.
@@ -652,7 +780,10 @@ def display_title(market: Any) -> str:
     Returns "<event_title>: <market_title>" when an event title is attached
     (so multivariate option labels like "Trump" or "Above $80k" carry their
     event context for manual spot-checking). Falls back to the bare market
-    title for non-MVE markets.
+    title for non-MVE markets. The outcome label is appended as
+    " — <subtitle>" whenever it is not already the whole label, so two strikes
+    of one daily family are distinguishable in the Excel rows instead of
+    rendering as the same title twice (DR-17).
 
     Args:
         market (Any): A Kalshi market object. May have an `_event_title` attribute.
@@ -662,6 +793,16 @@ def display_title(market: Any) -> str:
     """
     event_title = getattr(market, "_event_title", "") or ""
     base = market_title(market)
+    # Append the outcome label unless it IS the label already — market_title
+    # falls back to the subtitle when the title is empty, in which case the
+    # two are equal and nothing is appended. The test is exact equality, so a
+    # title that merely ENDS with the subtitle ("Biggest Mover: <name>" with
+    # subtitle "<name>") renders the name twice; cosmetic only, because
+    # display_title feeds Excel cells and the pairs table and is never a
+    # grouping key — DR-17
+    sub = getattr(market, "subtitle", "") or ""
+    if isinstance(sub, str) and sub and sub != base:
+        base = f"{base} — {sub}"
     return f"{event_title}: {base}" if event_title else base
 
 
@@ -1646,12 +1787,16 @@ def find_time_series_pairs(
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
 
-    Grouping strategy: EXACT normalized-title matching over the combined
-    `event_title + market_title` key (see `pair_key`). If two contracts differ
-    ONLY in their deadline, stripping all date tokens from the combined key
-    yields the exact same string. The event-title prefix is what keeps
-    multivariate option labels (e.g. "Trump" appearing in unrelated events)
-    from false-positive pairing.
+    Grouping strategy: EXACT matching over
+    `time_series_group_key(pair_key(m), m.subtitle)` — the date-stripped
+    `event_title + market_title` key (see `pair_key`) PLUS the market's outcome
+    discriminator. If two contracts differ ONLY in their deadline, stripping
+    all date tokens from the combined key yields the exact same string; the
+    event-title prefix keeps multivariate option labels (e.g. "Trump" appearing
+    in unrelated events) from false-positive pairing, and the subtitle keeps
+    two different OUTCOMES — two strikes of one daily price family, two
+    temperature bands — out of one group, where the best-pair rule below would
+    otherwise have paired the widest mismatch (DR-01).
 
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
@@ -1666,8 +1811,12 @@ def find_time_series_pairs(
          the strategy disputes it. A pricier EARLIER contract is never a
          candidate — there is no in-between mass to dispute.
 
-    Per normalized title, keeps the single best pair (tradeable preferred, then
-    largest pB - pA) to avoid flooding the portfolio with dozens of similar pairs.
+    Per normalized title+outcome key, keeps the single best pair (tradeable
+    preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
+    outcome label, so the rule no longer bounds one FAMILY to one pair — a
+    daily family of N strikes now yields up to N pairs, every one on the same
+    underlying over the same window, and nothing downstream caps that
+    concentration (strategy.select_portfolio dedups tickers only).
 
     The legs are YES on A at pA and NO on B at nB, so tradeable=True when
     pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
@@ -1700,9 +1849,9 @@ def find_time_series_pairs(
             excludes no shard.
 
     Returns:
-        list: CandidatePair objects, one per normalized-title group that
-            produced a pair, each carrying pair_type="time_series". Empty if
-            no group has two markets on different event_tickers within the
+        list: CandidatePair objects, one per normalized title+outcome group
+            that produced a pair, each carrying pair_type="time_series". Empty
+            if no group has two markets on different event_tickers within the
             deadline-gap cap.
     """
     if markets is None:
@@ -1718,18 +1867,22 @@ def find_time_series_pairs(
     active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
-    # Group by exact normalized title over the combined (event + market) key.
-    # Stripping date tokens means two markets that differ ONLY in their deadline
-    # produce the same key. Using event_title in the key prevents two unrelated
-    # MVE events sharing an option label (e.g. "Trump") from being grouped.
+    # Group by exact normalized title + outcome label over the combined
+    # (event + market) key. Stripping date tokens means two markets that differ
+    # ONLY in their deadline produce the same key; event_title in the key
+    # prevents two unrelated MVE events sharing an option label (e.g. "Trump")
+    # from being grouped; and the subtitle keeps two different OUTCOMES of one
+    # title (e.g. two strikes of a daily crypto family) apart — without it the
+    # best-pair rule below picks the widest strike mismatch in the group and
+    # sizes it as one cumulative-deadline pair (DR-01).
     by_title: dict = defaultdict(list)
     for m in active:
-        norm = normalize_title(pair_key(m))
+        norm = time_series_group_key(pair_key(m), getattr(m, "subtitle", "") or "")
         # Skip markets whose title collapses entirely to an empty string after stripping
         if norm:
             by_title[norm].append(m)
 
-    logging.info("Distinct normalized titles with >= 1 market: %d", len(by_title))
+    logging.info("Distinct normalized title+outcome keys with >= 1 market: %d", len(by_title))
 
     candidate_pairs: list = []
     for norm_title, members in by_title.items():
@@ -1812,7 +1965,7 @@ def find_time_series_pairs(
         if not group_pairs:
             continue
 
-        # Keep only the single best pair per normalized title group to avoid flooding
+        # Keep only the single best pair per normalized title+outcome group to avoid flooding
         # the portfolio with many near-identical positions. Tradeable pairs rank above
         # non-tradeable ones; within each tier, the largest pB - pA (the disputed
         # in-between probability) wins. pB > pA holds for every entry in group_pairs

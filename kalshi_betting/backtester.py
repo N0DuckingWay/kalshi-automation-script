@@ -14,7 +14,9 @@ Purpose:
     a daily equity curve. Results feed into dashboard.py for visualization.
 
 Dependencies:
-    Imports normalize_title and leg_sides from scanner.py; fee/model helpers
+    Imports time_series_group_key (the single definition of the time-series
+    grouping key, shared with the live scanner) and leg_sides from
+    scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
@@ -144,7 +146,7 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
 )
-from .scanner import leg_sides, normalize_title
+from .scanner import leg_sides, time_series_group_key
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -694,22 +696,35 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
 
 def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
     """
-    Group markets by date-stripped combined key (event_title + title) for time-series pair detection.
+    Group markets by date-stripped combined key (event_title + title) plus the
+    outcome label (subtitle), for time-series pair detection.
+
+    Mirrors the live scanner exactly by calling the same helper,
+    scanner.time_series_group_key — pinned by AST in tests/test_strategy.py.
 
     Args:
         markets (list[dict]): Market dicts in the compact historical._market_to_dict
             form.
 
     Returns:
-        dict[str, list[dict]]: Mapping of normalized (event_title + title) key
-            -> member markets, for groups with >= 2 members. A market whose
-            key normalizes to an empty string is dropped.
+        dict[str, list[dict]]: Mapping of normalized (event_title + title +
+            subtitle) key -> member markets, for groups with >= 2 members. A
+            market whose key normalizes to an empty string is dropped.
+
+    Note:
+        Day slices cached before the 2026-08 subtitle fix carry subtitle=None,
+        which time_series_group_key reads as absent — such records still group
+        by title alone, so an old cache reproduces the pre-DR-01 grouping. See
+        CLAUDE.md's subtitle-drift gotcha for how to refresh them.
     """
     groups: dict = defaultdict(list)
     for m in markets:
-        # _pair_key combines event_title + market title before normalization so that
-        # two MVE markets sharing an option label across unrelated events do not collide.
-        norm = normalize_title(_pair_key(m))
+        # Same key as the live scanner, through the same helper: _pair_key
+        # combines event_title + market title (so an option label shared across
+        # unrelated events does not collide) and the subtitle keeps two
+        # different OUTCOMES — two strikes of one daily family — out of one
+        # group. This mirror reproduced DR-01 and so could never detect it.
+        norm = time_series_group_key(_pair_key(m), m.get("subtitle") or "")
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
@@ -775,7 +790,8 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     label to each returned tuple itself.
 
     Group keys may be:
-      - a string (normalized-title group from _group_by_normalized_title), or
+      - a string (normalized title+outcome group from
+        _group_by_normalized_title), or
       - a 3-tuple (event_title, title, subtitle) from _group_by_exact_title.
     For the 3-tuple form, the display canonical is taken from title-or-subtitle,
     but the FULL 3-tuple (including event_title) is also returned as group_key —
@@ -805,7 +821,7 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
             compact historical._market_to_dict form). Keys are either a
-            normalized-title string (time-series groups) or an
+            normalized title+outcome string (time-series groups) or an
             (event_title, title, subtitle) 3-tuple (same-title groups).
 
     Returns:

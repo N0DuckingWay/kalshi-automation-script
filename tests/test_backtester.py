@@ -151,6 +151,93 @@ class TestNormalizedTitleGrouping:
         # Each lands alone, filtered out by len>=2
         assert groups == {}
 
+    def test_distinct_outcome_labels_separate_groups(self):
+        # DR-01: the subtitle is part of the time-series key too, not just the
+        # same-title one. Two strikes of a daily family share a title and
+        # differ only here.
+        mA = _md("A1", "EVT-SEP14", title="Solana price on Sep 14, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 14, 2026?")
+        mB = _md("B1", "EVT-SEP18", title="Solana price on Sep 18, 2026?",
+                 subtitle="$190 or above", event_title="Solana price on Sep 18, 2026?")
+        assert _group_by_normalized_title([mA, mB]) == {}
+
+    def test_identical_outcome_labels_at_two_deadlines_group(self):
+        mA = _md("A1", "EVT-SEP14", title="Solana price on Sep 14, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 14, 2026?")
+        mB = _md("B1", "EVT-SEP18", title="Solana price on Sep 18, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 18, 2026?")
+        groups = _group_by_normalized_title([mA, mB])
+        assert len(groups) == 1
+        assert len(next(iter(groups.values()))) == 2
+
+    def test_old_cache_none_subtitle_still_groups_by_title_alone(self):
+        # Day slices written before the 2026-08 subtitle fix carry
+        # subtitle=None; time_series_group_key reads a non-str as absent, so
+        # such records keep the pre-DR-01 title-only grouping rather than
+        # raising. Backtest fidelity only — no live-money path reads them.
+        mA = _md("A1", "EVT-MAR", title="BTC over $80k by March 2026",
+                 event_title="BTC price tracker")
+        mB = _md("B1", "EVT-JUN", title="BTC over $80k by June 2026",
+                 event_title="BTC price tracker")
+        mA["subtitle"] = None
+        mB["subtitle"] = None
+        groups = _group_by_normalized_title([mA, mB])
+        assert len(groups) == 1
+        assert len(next(iter(groups.values()))) == 2
+
+
+class TestTimeSeriesOutcomeDiscriminator:
+    """DR-01 mirror: the backtester keys time-series groups through the same
+    scanner.time_series_group_key the live scanner uses.
+
+    Before this, both sides keyed on the date-stripped title alone, so the
+    backtester reproduced the live defect exactly and could never have
+    detected it: a whole daily strike family was one group, and _extract_pairs
+    emitted every early-strike x late-strike combination as a candidate.
+    """
+
+    _STRIKES = ("$180 or above", "$190 or above", "$200 or above", "$210 or above")
+    _EVENTS = (("KXSOLD-26SEP14", "14", "2026-09-14"), ("KXSOLD-26SEP18", "18", "2026-09-18"))
+
+    def _family(self, *, strike_in_subtitle: bool = True) -> list[dict]:
+        markets = []
+        for i, strike in enumerate(self._STRIKES):
+            for event_ticker, day, close_day in self._EVENTS:
+                title = f"Solana price on Sep {day}, 2026?"
+                markets.append({
+                    "ticker": f"{event_ticker}-T{i}",
+                    "event_ticker": event_ticker,
+                    "event_title": title,
+                    "title": title,
+                    "subtitle": strike if strike_in_subtitle else "",
+                    "close_time": f"{close_day}T21:00:00Z",
+                })
+        return markets
+
+    def test_each_strike_is_its_own_group(self):
+        groups = _group_by_normalized_title(self._family())
+        assert len(groups) == len(self._STRIKES)
+        for members in groups.values():
+            assert len({m["subtitle"] for m in members}) == 1
+            assert len(members) == 2
+
+    def test_extract_pairs_emits_no_cross_strike_candidate(self):
+        pairs = _extract_pairs(_group_by_normalized_title(self._family()))
+        assert len(pairs) == len(self._STRIKES)
+        for mA, mB, _canon, _group_key in pairs:
+            assert mA["subtitle"] == mB["subtitle"]
+
+    def test_without_the_discriminator_every_combination_is_a_candidate(self):
+        # The defect, reproduced: one group of eight, and _extract_pairs (which
+        # has no best-pair rule — that is run_backtest's job) materializes all
+        # 4 x 4 early/late combinations, 12 of which are cross-strike.
+        groups = _group_by_normalized_title(self._family(strike_in_subtitle=False))
+        assert len(groups) == 1
+        pairs = _extract_pairs(groups)
+        assert len(pairs) == 16
+        cross = [(a, b) for a, b, _, _ in pairs if a["ticker"][-2:] != b["ticker"][-2:]]
+        assert len(cross) == 12
+
 
 class TestExtractPairsCanonHandling:
     def test_three_tuple_key_uses_title_not_event(self):

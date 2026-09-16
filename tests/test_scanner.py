@@ -42,6 +42,7 @@ from kalshi_betting.scanner import (
     pair_key,
     prefix_fill_prices,
     tick_size_for_price,
+    time_series_group_key,
     validate_pair_price,
 )
 
@@ -138,6 +139,31 @@ class TestNormalizeTitle:
         result = normalize_title("  Will BTC   exceed $80k by March 2025?  ")
         assert result == result.strip()
 
+    def test_month_name_and_day_without_a_year(self):
+        # The "by/before/until/through/after <Month>" pattern only consumes the
+        # day when a YEAR follows it, so "by June 30" used to leave a bare "30"
+        # (and "by July 31" a bare "31") behind and split two titles that
+        # differ only in their deadline. The added pattern — the same
+        # prepositions plus a full month name and a day — sits AHEAD of that
+        # clause in _DATE_PATTERNS and takes the whole phrase.
+        a = normalize_title("Will the S&P close above 6,000 by June 30?")
+        b = normalize_title("Will the S&P close above 6,000 by July 31?")
+        assert a == b
+        assert "june" not in a
+        assert "30" not in a
+
+    def test_a_snapshot_date_with_no_deadline_preposition_is_kept(self):
+        # The pattern above is anchored to the deadline preposition on
+        # purpose. A bare "<Month> <day>" would also erase the date from
+        # SNAPSHOT titles, merging two markets that ask about two different
+        # days into one time-series group — the premise violation the live
+        # scanner cannot detect from prices. These two must stay apart, as
+        # they did before the pattern was added.
+        a = normalize_title("Highest temperature in NYC on June 30")
+        b = normalize_title("Highest temperature in NYC on July 1")
+        assert a != b
+        assert "june 30" in a
+
 
 def _mock_market(
     *,
@@ -199,6 +225,36 @@ class TestDisplayTitle:
     def test_falls_back_to_bare_title(self):
         m = _mock_market(ticker="T1", event_ticker="E1", title="Will BTC exceed $80k", event_title=None)
         assert display_title(m) == "Will BTC exceed $80k"
+
+    def test_appends_the_outcome_label(self):
+        # DR-17: two strikes of one daily family share a title and differ only
+        # in the subtitle, so the Excel "Market A"/"Market B" cells rendered
+        # the same string for both legs of a cross-strike pair.
+        m = _mock_market(
+            ticker="KXBTCD-26SEP1517-T82749.99", event_ticker="KXBTCD-26SEP1517",
+            title="Bitcoin price on Sep 15, 2026?", subtitle="$82,750 or above",
+            event_title="BTC price on Sep 15, 2026 at 5pm EDT?",
+        )
+        assert display_title(m) == (
+            "BTC price on Sep 15, 2026 at 5pm EDT?: "
+            "Bitcoin price on Sep 15, 2026? — $82,750 or above"
+        )
+
+    def test_does_not_repeat_a_subtitle_that_is_already_the_label(self):
+        # market_title() falls back to the subtitle when the title is empty, so
+        # appending it again would render "Trump — Trump".
+        m = _mock_market(
+            ticker="T1", event_ticker="E1", title="", subtitle="Trump",
+            event_title="2024 Election Winner",
+        )
+        assert display_title(m) == "2024 Election Winner: Trump"
+
+    def test_no_subtitle_leaves_the_label_untouched(self):
+        m = _mock_market(
+            ticker="T1", event_ticker="E1", title="Trump", subtitle="",
+            event_title="2024 Election Winner",
+        )
+        assert display_title(m) == "2024 Election Winner: Trump"
 
 
 class TestSameTitleGrouping:
@@ -301,6 +357,205 @@ class TestTimeSeriesGrouping:
         )
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
         assert pairs == [], f"Pricier earlier contract must not be a candidate; got {pairs}"
+
+
+class TestOutcomeDiscriminator:
+    """DR-01: the time-series group key carries the market's outcome label.
+
+    A daily price family lists dozens of strikes under ONE title, with the
+    strike only in the subtitle. Keyed on the date-stripped title alone, every
+    strike of every deadline landed in a single group, and the one-best-pair
+    rule (largest pB - pA) then selected the highest earlier strike against the
+    lowest later one — two different questions sized as one cumulative pair.
+    time_series_group_key() appends the normalized subtitle, so a group now
+    holds one OUTCOME at several deadlines.
+    """
+
+    _EARLY_CLOSE = datetime(2026, 9, 14, 21, tzinfo=UTC)
+    _LATE_CLOSE = datetime(2026, 9, 18, 21, tzinfo=UTC)
+    # (subtitle, earlier-event YES ask, later-event YES ask). Every same-strike
+    # gap is 0.30, comfortably over the 15% short tier for this 4-day deadline
+    # gap, so grouping — not price — is what decides which pairs appear.
+    _STRIKES = (
+        ("$180 or above", 0.10, 0.40),
+        ("$190 or above", 0.09, 0.39),
+        ("$200 or above", 0.08, 0.38),
+        ("$210 or above", 0.07, 0.37),
+    )
+
+    def _family(self, *, strike_in_subtitle: bool = True) -> list:
+        """Two deadline events of one daily family, four strikes each.
+
+        Both titles normalize to the same string, so with an empty subtitle the
+        whole family collapses into one group — which is exactly the shape
+        `strike_in_subtitle=False` reproduces.
+        """
+        markets = []
+        for i, (strike, pA, pB) in enumerate(self._STRIKES):
+            markets.append(_mock_market(
+                ticker=f"KXSOLD-26SEP14-T{i}", event_ticker="KXSOLD-26SEP14",
+                title="Solana price on Sep 14, 2026?",
+                event_title="Solana price on Sep 14, 2026?",
+                subtitle=strike if strike_in_subtitle else "",
+                yes_ask=pA, no_ask=round(1.0 - pA, 4),
+                close_time=self._EARLY_CLOSE,
+            ))
+            markets.append(_mock_market(
+                ticker=f"KXSOLD-26SEP18-T{i}", event_ticker="KXSOLD-26SEP18",
+                title="Solana price on Sep 18, 2026?",
+                event_title="Solana price on Sep 18, 2026?",
+                subtitle=strike if strike_in_subtitle else "",
+                yes_ask=pB, no_ask=round(1.0 - pB, 4),
+                close_time=self._LATE_CLOSE,
+            ))
+        return markets
+
+    def test_one_pair_per_strike_and_no_cross_strike_pair(self):
+        pairs = find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=self._family(),
+        )
+        assert len(pairs) == len(self._STRIKES)
+        for p in pairs:
+            assert p.market_a.subtitle == p.market_b.subtitle, (
+                f"cross-strike pair: {p.market_a.ticker} vs {p.market_b.ticker}"
+            )
+            # market_a is the EARLIER contract, as find_time_series_pairs sorts
+            assert p.market_a.event_ticker == "KXSOLD-26SEP14"
+            assert p.market_b.event_ticker == "KXSOLD-26SEP18"
+        assert {p.market_a.subtitle for p in pairs} == {s for s, _, _ in self._STRIKES}
+
+    def test_without_the_discriminator_the_family_collapses_to_one_pair(self):
+        # The defect, reproduced: with no outcome label to key on, the eight
+        # markets are one group and the best-pair rule picks the WIDEST strike
+        # mismatch — the cheapest earlier contract ($210, pA 0.07) against the
+        # dearest later one ($180, pB 0.40).
+        pairs = find_time_series_pairs(
+            MagicMock(), held_tickers=set(),
+            markets=self._family(strike_in_subtitle=False),
+        )
+        assert len(pairs) == 1
+        assert pairs[0].market_a.ticker == "KXSOLD-26SEP14-T3"
+        assert pairs[0].market_b.ticker == "KXSOLD-26SEP18-T0"
+
+    def test_mve_option_label_at_two_deadlines_still_pairs(self):
+        # The subtitle must not break the case it was added to protect: one
+        # option label across two deadline events of the same event title.
+        mA = _mock_market(
+            ticker="MAR-TRUMP", event_ticker="ELECT-MAR", title="Trump",
+            event_title="Presidential Election Winner", subtitle="Donald Trump",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="JUN-TRUMP", event_ticker="ELECT-JUN", title="Trump",
+            event_title="Presidential Election Winner", subtitle="Donald Trump",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 11, tzinfo=UTC),
+        )
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+
+    def test_trailing_punctuation_in_the_outcome_label_is_one_key(self):
+        mA = _mock_market(
+            ticker="MAR-TRUMP", event_ticker="ELECT-MAR", title="Trump",
+            event_title="Presidential Election Winner", subtitle="Donald Trump",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="JUN-TRUMP", event_ticker="ELECT-JUN", title="Trump",
+            event_title="Presidential Election Winner", subtitle="Donald Trump.",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 11, tzinfo=UTC),
+        )
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+
+    def test_dated_outcome_label_is_one_key(self):
+        # A deadline spelled inside the OUTCOME label is still a deadline: the
+        # explicit-date subset strips "June 30"/"July 31" so one strike at two
+        # deadlines stays one group.
+        mA = _mock_market(
+            ticker="JUN-80K", event_ticker="EVT-JUN", title="Will BTC hit a new high",
+            event_title="BTC milestones", subtitle="$80,000 by June 30",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 6, 30, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="JUL-80K", event_ticker="EVT-JUL", title="Will BTC hit a new high",
+            event_title="BTC milestones", subtitle="$80,000 by July 31",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 7, 10, tzinfo=UTC),
+        )
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+
+    def test_strike_spelled_in_the_title_still_pairs(self):
+        # The cumulative case the strategy exists for — the strike is in the
+        # TITLE, the subtitle is empty on both legs, so the key is unchanged.
+        mA = _mock_market(
+            ticker="MAR-80K", event_ticker="EVT-MAR",
+            title="Will BTC exceed $80k by March 2026?",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="JUN-80K", event_ticker="EVT-JUN",
+            title="Will BTC exceed $80k by June 2026?",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 11, tzinfo=UTC),
+        )
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert len(pairs) == 1
+
+
+class TestTimeSeriesGroupKey:
+    """Unit-level contract of scanner.time_series_group_key()."""
+
+    def test_one_outcome_at_two_deadlines_is_one_key(self):
+        assert (
+            time_series_group_key("Solana price on Sep 14, 2026?", "$180 or above")
+            == time_series_group_key("Solana price on Sep 18, 2026?", "$180 or above")
+        )
+
+    def test_two_outcomes_under_one_title_are_two_keys(self):
+        assert (
+            time_series_group_key("Solana price on Sep 14, 2026?", "$180 or above")
+            != time_series_group_key("Solana price on Sep 18, 2026?", "$190 or above")
+        )
+
+    def test_bare_four_digit_strike_is_not_stripped_as_a_year(self):
+        # normalize_title() erases any bare 20xx token as a year; running it
+        # over an outcome label would merge every strike in 2000-2099 into one
+        # key, i.e. reintroduce DR-01 through the subtitle.
+        assert (
+            time_series_group_key("Ethereum price?", "2050 or above")
+            != time_series_group_key("Ethereum price?", "2060 or above")
+        )
+
+    def test_trailing_punctuation_after_a_stripped_date_is_one_key(self):
+        # Stripping the date leaves a space in FRONT of the period
+        # ("$80,000 by June 30." -> "$80,000 by ."), so trimming whitespace
+        # first and punctuation second left a trailing space in the key and
+        # silently dropped a genuine same-strike, two-deadline pair.
+        assert (
+            time_series_group_key("Will BTC hit a new high", "$80,000 by June 30.")
+            == time_series_group_key("Will BTC hit a new high", "$80,000 by July 31")
+        )
+
+    def test_empty_title_yields_the_empty_key(self):
+        # The caller drops such markets; the subtitle must not resurrect them.
+        assert time_series_group_key("", "$180 or above") == ""
+
+    def test_none_subtitle_reads_as_absent(self):
+        assert time_series_group_key("Will BTC exceed $80k", None) == normalize_title(
+            "Will BTC exceed $80k"
+        )
+
+    def test_magicmock_subtitle_reads_as_absent(self):
+        # Fail-safe by TYPE, not truthiness: a MagicMock stand-in answers any
+        # attribute with a truthy child mock, and regex-substituting one would
+        # raise. Same rule leg_sides and strategy._depth_levels follow.
+        assert time_series_group_key("Will BTC exceed $80k", MagicMock()) == normalize_title(
+            "Will BTC exceed $80k"
+        )
+
+    def test_empty_subtitle_leaves_the_title_key_unchanged(self):
+        assert time_series_group_key("Will BTC exceed $80k", "") == normalize_title(
+            "Will BTC exceed $80k"
+        )
 
 
 def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = None):
