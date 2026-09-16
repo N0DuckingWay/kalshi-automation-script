@@ -9,7 +9,9 @@ Purpose:
     Covers the retry classification rules that every market-data call depends
     on (HTTP 429/5xx back off, transient transport failures back off, everything
     else fails fast) plus signed_request_json's URL/header/signature contract
-    and its deliberate absence of internal retries.
+    and its deliberate absence of internal retries, and the un-narrowed return
+    contract both public helpers carry: a 2xx body is handed back exactly as the
+    JSON parser produced it, object or not (DR-05).
 
 Dependencies:
     Imports api_call_with_retry, fetch_json_page, signed_request_json, and
@@ -20,6 +22,7 @@ Notes:
     time.sleep is patched out in every retry test so the suite doesn't actually
     wait the 2s/4s/8s backoff schedule.
 """
+import inspect
 import json
 from http.client import IncompleteRead
 from types import SimpleNamespace
@@ -362,3 +365,75 @@ class TestExtractStatus:
     def test_ignores_a_response_whose_status_code_is_not_an_int(self):
         exc = SimpleNamespace(response=SimpleNamespace(status_code=None))
         assert _http._extract_status(exc) is None
+
+
+class TestNonObject2xxBodyIsReturnedUnnarrowed:
+    """DR-05: a 2xx body that parses to something other than an object comes
+    back AS IS — the helpers return Any, not dict.
+
+    _check_and_parse hands back whatever the JSON parser produced, and both
+    public helpers were annotated `-> dict` while doing so. The annotation was
+    the only thing suggesting callers could `.get()` the result unconditionally;
+    trader._execute_transfer did, and a body of b'"accepted"' raised
+    AttributeError AFTER the POST had already moved money. These pin the real
+    contract the isinstance guard there now relies on: no exception, no
+    coercion, no empty dict — the parsed value itself, including the None a
+    literal JSON `null` parses to.
+    """
+
+    # Every JSON type a 2xx body can carry that is NOT an object.
+    NON_OBJECT_BODIES = [
+        (b'"accepted"', "accepted"),
+        (b"[]", []),
+        (b'[{"a": 1}]', [{"a": 1}]),
+        (b"null", None),
+        (b"123", 123),
+        (b"true", True),
+    ]
+
+    @staticmethod
+    def _response(status: int, body: bytes) -> SimpleNamespace:
+        # reason/getheaders are what ApiException.from_response reads off a real
+        # RESTResponse; harmless on the 2xx path and required if one ever isn't.
+        return SimpleNamespace(
+            status=status, data=body, reason="OK", getheaders=lambda: {}
+        )
+
+    @pytest.mark.parametrize("body,expected", NON_OBJECT_BODIES)
+    def test_fetch_json_page_returns_the_parsed_value(self, body, expected):
+        fetch_fn = MagicMock(return_value=self._response(200, body))
+        assert fetch_json_page(fetch_fn) == expected
+
+    def test_fetch_json_page_returns_none_for_a_literal_json_null(self):
+        # `== None` would pass for several wrong answers; pin identity, because
+        # None is precisely what makes a caller's `.get()` an AttributeError.
+        fetch_fn = MagicMock(return_value=self._response(200, b"null"))
+        assert fetch_json_page(fetch_fn) is None
+
+    @pytest.mark.parametrize("body,expected", NON_OBJECT_BODIES)
+    def test_signed_request_json_returns_the_parsed_value(self, body, expected):
+        client = SimpleNamespace(
+            configuration=SimpleNamespace(host="https://demo-api.kalshi.co/trade-api/v2"),
+            kalshi_auth=_RecordingAuth(),
+            rest_client=MagicMock(),
+        )
+        client.rest_client.request.return_value = self._response(200, body)
+        result = signed_request_json(
+            client, "POST", "/trade-api/v2/portfolio/intra_exchange_instance_transfer",
+            body={"amount": 1},
+        )
+        assert result == expected
+        # Single-shot, as always on this helper: one transport call, no retry.
+        assert client.rest_client.request.call_count == 1
+
+    def test_annotations_do_not_promise_a_dict(self):
+        # The honest annotation is what stops the next caller from assuming
+        # .get() is safe; nothing at runtime enforces it, so pin it in the
+        # source text. Only the signature is inspected — the docstring's own
+        # "a `dict` for every Kalshi endpoint ... observed" wording is prose
+        # about practice, not a promise, and must not trip this.
+        for fn in (fetch_json_page, signed_request_json):
+            source = inspect.getsource(fn)
+            signature = source.split('"""')[0]
+            assert "-> dict" not in signature
+            assert "-> Any" in signature

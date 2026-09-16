@@ -43,6 +43,21 @@ Notes:
     calls it directly and retry-free, because a retried fill-or-kill leg can
     double-fill (see trader._submit_order_v2 and the CLAUDE.md rule). Read-only
     callers wrap it in api_call_with_retry themselves.
+
+    Neither public helper narrows its return type. Every Kalshi endpoint
+    observed answers a 2xx with a JSON object, but _check_and_parse hands back
+    whatever the parser produced, so both are annotated `-> Any`: a body of
+    `"accepted"`, `[]`, `123`, `true` or a literal `null` (which parses to
+    None) reaches the caller unchanged. Callers that immediately `.get()` it
+    raise AttributeError on such a body, and callers that subscript it
+    (trader._submit_order's `data["order"]["status"]`) raise TypeError. Both
+    are deliberate loud failures at every call site, order submission included:
+    there an exception is what routes trader._execute_one into its
+    ambiguous-submission path, which reconciles the outcome against the
+    account's position ledger. trader._execute_transfer is the one exception —
+    an accepted transfer has no such ledger to reconcile it against and its
+    caller's generic handler would report a FAILED POST — so it guards with
+    isinstance(..., dict) instead (DR-05).
 """
 import json
 import logging
@@ -210,7 +225,7 @@ def _check_and_parse(resp: Any) -> Any:
     return _json_loads(body)
 
 
-def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
+def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body parses to; _check_and_parse does not narrow (a literal null is None)
     """
     Call a `*_without_preload_content` SDK method and parse the JSON body.
 
@@ -226,7 +241,21 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> dict:
         **kwargs: Query parameters forwarded to the SDK method.
 
     Returns:
-        dict: The parsed JSON response body.
+        Any: The parsed JSON response body — a `dict` for every Kalshi endpoint
+            response observed in practice, but not narrowed: _check_and_parse
+            returns whatever the JSON parser produced, so a body of `"ok"`,
+            `[]`, `123`, `true` or a literal `null` (which parses to None)
+            reaches the caller as-is. Callers that immediately `.get()` the
+            result raise AttributeError on such a body, and callers that
+            subscript it (trader._submit_order's `data["order"]["status"]`)
+            raise TypeError. Both are deliberate loud failures: on the order
+            path, raising is what routes trader._execute_one into its
+            ambiguous-submission path, where the account position decides the
+            outcome. The one call site that instead guards with
+            isinstance(..., dict) — because its 2xx has already moved money and
+            nothing reconciles a transfer after the fact — is
+            trader._execute_transfer, which reads signed_request_json rather
+            than this helper (DR-05).
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
@@ -250,7 +279,7 @@ def signed_request_json(
     *,
     query: dict | None = None,
     body: dict | None = None,
-) -> dict:
+) -> Any:  # whatever the 2xx body parses to; _check_and_parse does not narrow (a literal null is None)
     """
     Perform a signed request of any HTTP method against an arbitrary API path.
 
@@ -285,7 +314,17 @@ def signed_request_json(
             client json.dumps-serializes the dict.
 
     Returns:
-        dict: The parsed JSON response body.
+        Any: The parsed JSON response body — a `dict` for every Kalshi endpoint
+            response observed in practice, but not narrowed: _check_and_parse
+            returns whatever the JSON parser produced, so a body of `"ok"`,
+            `[]`, `123`, `true` or a literal `null` (which parses to None)
+            reaches the caller as-is. trader._execute_transfer guards on
+            isinstance(..., dict) for exactly that reason — by the time the
+            body is read, the 2xx has already moved the money and nothing
+            reconciles a transfer after the fact (DR-05). The other
+            money-moving caller, trader._submit_order_v2, deliberately stays
+            loud: its exception routes trader._execute_one into the
+            ambiguous-submission path, where the account position decides.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is

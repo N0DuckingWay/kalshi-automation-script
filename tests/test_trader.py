@@ -2543,3 +2543,144 @@ class TestUnparseableTransferResponse:
         )
         assert "FAILED" in errors
         assert post.call_count == 1
+
+
+class TestNonObject2xxTransferResponse:
+    """DR-05: a transfer the exchange ACCEPTED but answered with a non-object body.
+
+    _check_and_parse validates the status BEFORE parsing, so anything that comes
+    back from signed_request_json — parsed or not — proves a 2xx and therefore
+    that the money has already moved. TS-17 covered the bodies that FAIL to
+    parse; these are the ones that parse fine but to something other than a JSON
+    object: b'"accepted"' -> str, b'[]' -> list, b'null' -> None, b'123' -> int,
+    b'true' -> bool (every JSON type a body can carry that is NOT an object).
+    Before the isinstance guard, `data.get("transfer_id")` raised AttributeError
+    on every one of them, which landed in ensure_shard_collateral's generic
+    `except Exception` handler: logged "FAILED (not retried…)", left the
+    destination out of accepted_cents, SKIPPED the settlement poll and never
+    fired the MONEY IS IN FLIGHT critical — the same misreport TS-17 fixed, one
+    exception type over.
+
+    Every case below drives the REAL _http._check_and_parse over a raw-response
+    stand-in, so the value reaching _execute_transfer is produced by production
+    parsing code rather than hand-written into the stub.
+    """
+
+    # (body bytes, the type name _execute_transfer must name in its critical)
+    NON_OBJECT_BODIES = [
+        (b'"accepted"', "str"),
+        (b"[]", "list"),
+        (b"null", "NoneType"),
+        (b"123", "int"),
+        (b"true", "bool"),
+    ]
+
+    class _RawResponse:
+        """Minimal RESTResponse stand-in: .status and .data are all
+        _check_and_parse reads (it falls back to .read() only when .data is
+        None, which never happens here)."""
+
+        def __init__(self, status: int, data: bytes):
+            self.status = status
+            self.data = data
+            self.reason = "OK"
+
+        def getheaders(self) -> dict:
+            return {}
+
+    @classmethod
+    def _posting(cls, body: bytes) -> MagicMock:
+        """A signed_request_json stand-in that runs the REAL 2xx parse over
+        `body` — returning the parsed value, or raising exactly as production
+        would on an unparseable one — and records each call so the single-shot
+        contract can be asserted."""
+        return MagicMock(
+            side_effect=lambda *a, **kw: _http._check_and_parse(cls._RawResponse(200, body))
+        )
+
+    @pytest.mark.parametrize("body,type_name", NON_OBJECT_BODIES)
+    def test_non_object_2xx_returns_none_not_raise(self, monkeypatch, body, type_name):
+        post = self._posting(body)
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        # None is the value that already means "accepted, id unknown" — the same
+        # contract the id-less-dict and unparseable-body cases return.
+        assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
+        # Still single-shot: a retried transfer moves the money twice.
+        assert post.call_count == 1
+
+    @pytest.mark.parametrize("body,type_name", NON_OBJECT_BODIES)
+    def test_non_object_2xx_logs_one_critical_naming_the_type(
+        self, monkeypatch, caplog, body, type_name
+    ):
+        monkeypatch.setattr(trader, "signed_request_json", self._posting(body))
+        with caplog.at_level(logging.CRITICAL):
+            _execute_transfer(MagicMock(), 0, 1, 9662)
+        criticals = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        # Exactly one — the guard logs and returns, so one POST produces one
+        # alert; a second record would mean it also fell through to the
+        # parse-failure wording (or vice versa).
+        assert len(criticals) == 1
+        message = criticals[0].getMessage()
+        assert "MONEY IS IN FLIGHT" in message
+        assert "NOT re-sent" in message
+        assert "was not a JSON object" in message
+        # Naming the type is what tells the operator this is a payload-shape
+        # drift to chase, not a parse failure or an outage.
+        assert f"({type_name})" in message
+        # $96.62 and the direction, so the account can be reconciled by hand.
+        assert "96.62" in message
+        assert "shard 0→1" in message
+
+    @pytest.mark.parametrize("body,type_name", NON_OBJECT_BODIES)
+    def test_non_object_2xx_is_awaited_and_specs_survive(
+        self, monkeypatch, body, type_name
+    ):
+        # End to end: the destination must reach accepted_cents so the settle
+        # poll actually runs. Before the fix the AttributeError skipped the poll
+        # and dropped every spec needing that shard while the funds were moving.
+        post = self._posting(body)
+        balances = MagicMock(return_value={0: 100_000, 1: 100_000})
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        monkeypatch.setattr(trader, "read_shard_balances", balances)
+        monkeypatch.setattr(trader, "TRANSFER_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(trader, "TRANSFER_SETTLE_TIMEOUT_SECONDS", 0.05)
+
+        spec = make_spec(shard_a=0, shard_b=0, cost_a=10.00, cost_b=5.00)
+        result = ensure_shard_collateral(
+            MagicMock(), [spec], {0: 100, 1: 100_000}, None
+        )
+        assert result == [spec]          # not dropped
+        balances.assert_called()         # the settle poll DID run
+        assert post.call_count == 1      # and was never re-sent
+
+    def test_empty_2xx_body_still_takes_the_parse_failure_branch(
+        self, monkeypatch, caplog
+    ):
+        # The isinstance guard sits AFTER the except clause, so an empty body —
+        # which never produces a value at all — must keep its TS-17 wording.
+        monkeypatch.setattr(trader, "signed_request_json", self._posting(b""))
+        with caplog.at_level(logging.CRITICAL):
+            assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
+        criticals = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert len(criticals) == 1
+        message = criticals[0].getMessage()
+        assert "could not be parsed" in message
+        assert "was not a JSON object" not in message
+
+    def test_object_2xx_body_still_yields_the_transfer_id(self, monkeypatch, caplog):
+        # The guard must not fire on the normal shape: driven through the same
+        # real parser, a JSON object still returns its id and logs no critical.
+        monkeypatch.setattr(
+            trader, "signed_request_json", self._posting(b'{"transfer_id": "tr_1"}')
+        )
+        with caplog.at_level(logging.CRITICAL):
+            assert _execute_transfer(MagicMock(), 0, 1, 9662) == "tr_1"
+        assert [r for r in caplog.records if r.levelno == logging.CRITICAL] == []
+
+    def test_object_2xx_body_without_an_id_is_unchanged(self, monkeypatch, caplog):
+        # An id-less OBJECT is the pre-existing "accepted, id unknown" case and
+        # is NOT the new branch: same None, but no critical.
+        monkeypatch.setattr(trader, "signed_request_json", self._posting(b"{}"))
+        with caplog.at_level(logging.CRITICAL):
+            assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
+        assert [r for r in caplog.records if r.levelno == logging.CRITICAL] == []
