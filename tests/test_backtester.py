@@ -38,6 +38,7 @@ from kalshi_betting.config import (
     BUDGET_FRACTION,
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS,
+    MVE_SERIES_FAMILY_PREFIX,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -327,9 +328,13 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
     def test_two_combo_events_are_rejected(self):
         # A combo ticket's wording names its legs but never its date, so one
         # wording recurs across fixture instances and two tickets with
-        # identical leg wording are two DIFFERENT tickets. The prefix is the
-        # part before the FIRST hyphen, so the SHARD1 segment does not split
-        # these into two series.
+        # identical leg wording are two DIFFERENT tickets. Since DR-55 these
+        # two do not resolve to a literal prefix at all: both event tickers
+        # start with config.MVE_SERIES_FAMILY_PREFIX, so scanner.event_series
+        # answers "KXMVE" for each and _same_series_dicts sees one family.
+        # (Before DR-55 the same verdict came from the literal
+        # "KXMVECROSSCATEGORY" prefix — which is why the cross-prefix case
+        # below needed its own test.)
         recs = [
             self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
                       "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
@@ -1303,13 +1308,34 @@ def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
     return m
 
 
+def _naive_series(event_ticker: object) -> str:
+    """Oracle-local restatement of the series identity the one-series rule
+    compares on: the prefix before the first hyphen, stripped and upper-cased,
+    with every KXMVE* combo prefix collapsed onto the one family (DR-55).
+
+    The family collapse reads config.MVE_SERIES_FAMILY_PREFIX — a CONSTANT,
+    not the implementation — so the oracle still cannot inherit a bug from
+    scanner.event_series while staying in step with the rule it claims to
+    apply. Omitting the collapse would silently diverge from _extract_pairs on
+    any KXMVE fixture (two literal prefixes, one series), which is the
+    "oracle replays the old rule" failure mode this file's parity tests exist
+    to avoid.
+    """
+    if not isinstance(event_ticker, str):
+        return ""
+    prefix = event_ticker.split("-", 1)[0].strip().upper()
+    return (MVE_SERIES_FAMILY_PREFIX if prefix.startswith(MVE_SERIES_FAMILY_PREFIX)
+            else prefix)
+
+
 def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
     filtering by the same margin-inclusive close-time gap, the same
-    event_ticker rule AND the same one-series rule (DR-02/DR-54) that
+    event_ticker rule AND the same one-series rule (DR-02/DR-54/DR-55) that
     _extract_pairs applies, but without any sorting/windowing. Written
-    standalone (no backtester internals besides plain dict/date arithmetic)
-    so it can serve as ground truth for the windowed implementation.
+    standalone (no backtester internals besides plain dict/date arithmetic and
+    _naive_series' restatement of the series identity) so it can serve as
+    ground truth for the windowed implementation.
 
     The one-series conjunct is spelled out here rather than imported, for the
     same reason the rest is: an oracle that reuses the implementation cannot
@@ -1343,8 +1369,8 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
                  a.get("event_title") or "")
                     == (b.get("title") or "", b.get("subtitle") or "",
                         b.get("event_title") or "")):
-                sa = (a.get("event_ticker") or "").split("-", 1)[0].strip().upper()
-                sb = (b.get("event_ticker") or "").split("-", 1)[0].strip().upper()
+                sa = _naive_series(a.get("event_ticker"))
+                sb = _naive_series(b.get("event_ticker"))
                 if not sa or not sb or sa == sb:
                     continue
             result.add(frozenset([a["ticker"], b["ticker"]]))

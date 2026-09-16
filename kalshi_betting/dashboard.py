@@ -101,8 +101,11 @@ def _sharpe(daily_returns: pd.Series, rf: float = 0.0, *,
         rf (float): Annual hurdle rate (the T-bill "rf" term of the Sharpe
             formula) as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
-            positive; not validated, since both call sites pass a config
-            constant. Defaults to CALENDAR_DAYS_PER_YEAR (365).
+            positive; not validated, since every value that reaches it is a
+            config constant — three of this helper's four in-module call sites
+            take the CALENDAR_DAYS_PER_YEAR default and the fourth
+            (_section_benchmark's ^GSPC row) passes TRADING_DAYS_PER_YEAR
+            explicitly. Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
         float: Annualized Sharpe ratio. Returns 0.0 if the standard deviation is zero.

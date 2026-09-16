@@ -563,3 +563,69 @@ class TestBenchmarkAnnualizationPerRow:
         benchmark_calls = [p for s, p in seen if not s.equals(equity["daily_return"])]
         assert strategy_calls == [config.CALENDAR_DAYS_PER_YEAR]
         assert benchmark_calls == [config.TRADING_DAYS_PER_YEAR]
+
+
+def _recording(monkeypatch, name: str) -> list[int]:
+    """Replace dashboard.<name> with a shim recording the periods_per_year each
+    call received, and return the list it appends to.
+
+    Like TestBenchmarkAnnualizationPerRow's shim, the default is READ off the
+    real function (`__kwdefaults__`) rather than restated: a shim that
+    re-declares `periods_per_year=CALENDAR_DAYS_PER_YEAR` would record its own
+    constant and stay green even after the production default was flipped.
+    """
+    real = getattr(dashboard, name)
+    real_default = real.__kwdefaults__["periods_per_year"]
+    seen: list[int] = []
+
+    def shim(series, rf=0.0, *, periods_per_year=real_default):
+        seen.append(periods_per_year)
+        return real(series, rf, periods_per_year=periods_per_year)
+
+    monkeypatch.setattr(dashboard, name, shim)
+    return seen
+
+
+class TestCalendarAnnualizationAtTheUnpinnedCallSites:
+    """
+    DR-56 call-site pin for the three calendar-base _sharpe/_sortino calls not
+    already pinned elsewhere: the performance card's Sharpe and Sortino, and
+    the interval-discount section's per-k sweep row. FOUR of the module's five
+    calls consume a _build_equity_curve output and so must annualize on the
+    CALENDAR base (see dashboard._sharpe's own "four of the five calls"
+    paragraph); the fourth of them — the Benchmark table's STRATEGY row, which
+    reads equity_df["daily_return"] — and the one TRADING-base call (that
+    table's ^GSPC row) are both pinned by TestBenchmarkAnnualizationPerRow
+    above.
+
+    All three take the value by DEFAULT, so nothing at the call site would
+    break if one of them started passing TRADING_DAYS_PER_YEAR instead; only a
+    recorder can see it. Pinning the count as well as the value is what makes
+    a call quietly relocated onto the wrong base visible here.
+    """
+
+    def test_performance_card_annualizes_both_ratios_on_365(self, monkeypatch):
+        sharpe_seen = _recording(monkeypatch, "_sharpe")
+        sortino_seen = _recording(monkeypatch, "_sortino")
+
+        equity = make_equity([1000.0, 1010.0, 1005.0, 1020.0])
+        out = dashboard._section_performance(
+            equity, [make_trade()], date(2026, 1, 5), 1000.0)
+
+        assert "Portfolio Performance" in out
+        assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR]
+        assert sortino_seen == [config.CALENDAR_DAYS_PER_YEAR]
+
+    def test_per_k_sweep_row_annualizes_on_365(self, monkeypatch):
+        sharpe_seen = _recording(monkeypatch, "_sharpe")
+
+        points = _sweep_points([0.60, 0.75, 0.90])
+        sweep = BacktestSweep(primary=points[1], points=points,
+                              calibration=_calibration())
+        out = _section_interval_discount(sweep)
+
+        # One Sharpe per swept point, every one of them on the calendar base:
+        # each point's equity_df is a _build_equity_curve-shaped calendar-day
+        # series, exactly like the performance card's.
+        assert "updatemenus" in out
+        assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR] * len(points)

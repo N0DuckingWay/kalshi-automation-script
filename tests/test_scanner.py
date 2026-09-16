@@ -645,9 +645,12 @@ class TestOneEventSeriesIsTwoFixtures:
     def test_two_combo_events_are_rejected(self):
         # DR-54: a combo ticket's wording names its legs but never its date, so
         # one wording recurs across fixture instances and two tickets with
-        # identical leg wording are two DIFFERENT tickets. The series prefix is
-        # the part before the FIRST hyphen, so the SHARD1 segment in the middle
-        # does not make these two series.
+        # identical leg wording are two DIFFERENT tickets. Since DR-55 these
+        # two do not resolve to a literal prefix at all: both event tickers
+        # start with config.MVE_SERIES_FAMILY_PREFIX, so event_series answers
+        # "KXMVE" for each and _same_series sees one family. (Before DR-55 the
+        # same verdict came from the literal "KXMVECROSSCATEGORY" prefix —
+        # which is why the cross-prefix case below needed its own test.)
         close = datetime(2026, 9, 15, 20, tzinfo=UTC)
         mA = _mock_market(
             ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",

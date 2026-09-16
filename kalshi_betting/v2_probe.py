@@ -435,6 +435,13 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     Report a submitted order whose 2xx body is not a JSON object, and check the
     account.
 
+    This guards the probe's two submission-response READERS, which is not the
+    same as its three SUBMISSIONS: `_step_no_mapping`'s NO buy and
+    `_step_unfillable_ask`'s ask both read fill fields off the body, while
+    `_step_no_mapping`'s reduce-only NO close only hands its body to `_emit`
+    and takes its verdict from `trader._position_count`, so nothing there can
+    raise on a non-object body.
+
     `_http.signed_request_json` is annotated `-> Any` and does not narrow a 2xx
     body to a dict, so `"accepted"`, `[]`, `123`, `true` or a literal `null` all
     reach the caller as a `str`/`list`/`int`/`bool`/`None`. Every consumer below
@@ -532,7 +539,13 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          "bid", reduce_only=True), priced at the top of this market's own grid
          rather than at the builder's loss floor, so the close crosses
          whatever is resting on the book (see _no_close_body). PASS half two
-         iff the position returns to 0.
+         iff the position returns to 0. This is the step's SECOND submission
+         — the probe's second order-submission site of three — and it needs
+         no _non_object_body_fail guard: its 2xx body is only
+         handed to _emit (typed Any — it just pretty-prints), and the verdict
+         comes from trader._position_count, so there is no data.get(...) on
+         it to raise. Add the guard here if a future edit starts reading fill
+         fields off close_data (DR-58).
 
     Args:
         client (Any): Authenticated prod KalshiClient.

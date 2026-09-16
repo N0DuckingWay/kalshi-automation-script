@@ -811,6 +811,24 @@ class TestGuardedJobRegistration:
         # cancelled by a failure, only rescheduled.
         assert scheduler._guarded_job(boom) is None
 
+    @pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+    def test_guarded_job_lets_ctrl_c_and_sys_exit_through(self, exc):
+        """The guard catches Exception, NOT BaseException — Ctrl-C and
+        sys.exit() must still stop the daemon.
+
+        Nothing else in the suite pins this: widening the except clause to
+        BaseException passes every other test, and would leave a daemon that
+        cannot be interrupted while a job is running (each Ctrl-C would be
+        swallowed, logged as a failed job, and the poll loop would carry on).
+        The guard exists to stop a RAISING job re-firing every poll tick
+        (DR-59), not to make the daemon unkillable.
+        """
+        def boom():
+            raise exc("stop")
+
+        with pytest.raises(exc):
+            scheduler._guarded_job(boom, on_error=schedule.CancelJob)
+
     def test_ast_weekly_job_is_registered_through_the_guard(self):
         """DR-59: main() must register run_job through _guarded_job. main()
         spawns a real prod run and is never invoked by this suite, so no
