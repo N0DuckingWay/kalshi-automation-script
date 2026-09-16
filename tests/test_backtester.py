@@ -243,9 +243,16 @@ class TestExtractPairsCanonHandling:
     def test_three_tuple_key_uses_title_not_event(self):
         # Build a same-title group with a 3-tuple key and verify canon is the
         # market title (key[1]), not the event title (key[0]).
-        mA = _md("A1", "EVT-A", title="Republicans win majority",
+        #
+        # RE-PINNED (DR-02/DR-54): the event tickers used to be EVT-A/EVT-B,
+        # which share the series prefix "EVT" — _extract_pairs now reads that
+        # as two instances of one recurring fixture and forms no pair, so the
+        # assertion below would have failed for a reason that has nothing to do
+        # with canon selection. Two DIFFERENT series restore the shape the
+        # same-title strategy was built for.
+        mA = _md("A1", "EVA-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
-        mB = _md("B1", "EVT-B", title="Republicans win majority",
+        mB = _md("B1", "EVB-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
@@ -269,6 +276,133 @@ class TestExtractPairsCanonHandling:
         assert canons == {"Trump"}
         group_keys = {group_key for _, _, _, group_key in pairs}
         assert len(group_keys) == 2, "distinct events must yield distinct group_keys"
+
+
+class TestOneEventSeriesIsTwoFixturesBacktest:
+    """DR-02 / DR-54 mirror: _extract_pairs refuses two events of ONE series.
+
+    The rule is the live scanner's, applied to cached records through
+    backtester._same_series_dicts / _identical_wording_dicts, which derive the
+    series prefix from the same scanner.event_series the live path uses. Both
+    branches of _extract_pairs carry it: the 3-tuple (same-title) branch on the
+    series alone, because the group key already guarantees identical wording,
+    and the string (time-series) branch on the conjunct, because there the
+    wording is only date-stripped-equal.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, subtitle="Yes", event_title=""):
+        return {
+            "ticker": ticker,
+            "event_ticker": event_ticker,
+            "event_title": event_title,
+            "title": title,
+            "subtitle": subtitle,
+            "close_time": close_time,
+        }
+
+    @classmethod
+    def _npb(cls):
+        # The real sandbox pair: one fixture listed on two game days.
+        title = "Fukuoka Hawks vs Orix Buffaloes: First Inning Run?"
+        event_title = "Fukuoka Hawks vs Orix Buffaloes: First Inning Run"
+        return [
+            cls._rec("KXNPBRFI-26SEP160500FUKORI-Y", "KXNPBRFI-26SEP160500FUKORI",
+                     title, "2026-09-18T09:00:00Z", event_title=event_title),
+            cls._rec("KXNPBRFI-26SEP150500FUKORI-Y", "KXNPBRFI-26SEP150500FUKORI",
+                     title, "2026-09-17T09:00:00Z", event_title=event_title),
+        ]
+
+    def test_same_title_branch_rejects_two_game_days_of_one_fixture(self):
+        assert _extract_pairs(_group_by_exact_title(self._npb())) == []
+
+    def test_time_series_branch_rejects_the_same_two_records(self):
+        # Grouping still puts them together (their wording is identical, so it
+        # is trivially date-stripped-equal) — the conjunct is what drops them.
+        groups = _group_by_normalized_title(self._npb())
+        assert len(groups) == 1
+        assert _extract_pairs(groups) == []
+
+    def test_two_combo_events_are_rejected(self):
+        # Every MVE combo sits under KXMVECROSSCATEGORY, so two combos with
+        # identical leg wording are combos of DIFFERENT games. The prefix is
+        # the part before the FIRST hyphen, so the SHARD1 segment does not
+        # split these into two series.
+        recs = [
+            self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
+                      "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
+                      "Parlay", "2026-09-15T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+            self._rec("KXMVECROSSCATEGORY-SHARD1-S93FFD638F77-Y",
+                      "KXMVECROSSCATEGORY-SHARD1-S93FFD638F77",
+                      "Parlay", "2026-09-15T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+        ]
+        assert _extract_pairs(_group_by_exact_title(recs)) == []
+        assert _extract_pairs(_group_by_normalized_title(recs)) == []
+
+    def test_two_different_series_asking_one_question_still_pair(self):
+        recs = [
+            self._rec("KXFEDDEC-26-T25", "KXFEDDEC-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+            self._rec("FEDCUTDEC-26-T25", "FEDCUTDEC-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+        ]
+        pairs = _extract_pairs(_group_by_exact_title(recs))
+        assert len(pairs) == 1
+        assert {pairs[0][0]["ticker"], pairs[0][1]["ticker"]} == {
+            "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
+        }
+
+    def test_a_dated_pair_of_one_series_is_untouched(self):
+        # The deadline lives IN the wording, so _identical_wording_dicts is
+        # False and the time-series conjunct never fires. ELIGIBILITY only —
+        # a "price on <date>" family is a snapshot family, not a cumulative
+        # one, and the premise-violation counter is what judges that (see the
+        # live mirror, TestOneEventSeriesIsTwoFixtures::
+        # test_a_dated_pair_of_one_series_is_untouched).
+        recs = [
+            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
+                      "Solana price on Sep 14, 2026?", "2026-09-14T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title="Solana price on Sep 14, 2026?"),
+            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
+                      "Solana price on Sep 18, 2026?", "2026-09-18T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title="Solana price on Sep 18, 2026?"),
+        ]
+        pairs = _extract_pairs(_group_by_normalized_title(recs))
+        assert len(pairs) == 1
+
+    def test_an_unreadable_event_ticker_fails_closed(self):
+        # A record whose fixture identity cannot be read must NOT be replayed
+        # on the 95% co-resolution prior — the same direction the live helper
+        # fails in.
+        recs = [
+            self._rec("A1", "", "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+            self._rec("B1", "FEDCUTDEC-26", "Fed cuts rates in December?",
+                      "2026-12-10T19:00:00Z", event_title="Fed December decision"),
+        ]
+        assert _extract_pairs(_group_by_exact_title(recs)) == []
+        assert backtester._same_series_dicts(recs[0], recs[1]) is True
+
+    def test_a_missing_event_ticker_key_also_fails_closed(self):
+        # Old cache records predate nothing here, but .get() must not raise and
+        # an absent key must read as unknown, not as a distinct series.
+        assert backtester._same_series_dicts({}, {"event_ticker": "KXSOLD-26SEP14"}) is True
+
+    def test_identical_wording_mirror_reads_missing_keys_as_empty(self):
+        assert backtester._identical_wording_dicts({}, {}) is True
+        assert backtester._identical_wording_dicts(
+            {"title": "Q", "subtitle": "Yes", "event_title": "E"},
+            {"title": "Q", "subtitle": "Yes", "event_title": "E"},
+        ) is True
+        assert backtester._identical_wording_dicts(
+            {"title": "Q by March"}, {"title": "Q by June"},
+        ) is False
 
 
 class TestOldCacheToleranceMissingTickAndSubtitleFields:
@@ -304,9 +438,14 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
         assert len(groups) == 1
 
     def test_extract_pairs_same_title_handles_missing_fields(self):
-        mA = self._old_style_dict("A1", "EVT-A", "Republicans win majority",
+        # RE-PINNED (DR-02/DR-54): EVT-A/EVT-B share the series prefix "EVT",
+        # which _extract_pairs now refuses as two instances of one recurring
+        # fixture. The tickers name two DIFFERENT series so this test keeps
+        # pinning what it is for — that an old cache record missing the tick
+        # and subtitle keys still pairs.
+        mA = self._old_style_dict("A1", "EVA-1", "Republicans win majority",
                                    "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
-        mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
+        mB = self._old_style_dict("B1", "EVB-1", "Republicans win majority",
                                    "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
@@ -1124,10 +1263,21 @@ def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
 
 def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
-    filtering by the same margin-inclusive close-time gap and event_ticker
-    rule _extract_pairs applies, but without any sorting/windowing. Written
+    filtering by the same margin-inclusive close-time gap, the same
+    event_ticker rule AND the same one-series rule (DR-02/DR-54) that
+    _extract_pairs applies, but without any sorting/windowing. Written
     standalone (no backtester internals besides plain dict/date arithmetic)
     so it can serve as ground truth for the windowed implementation.
+
+    The one-series conjunct is spelled out here rather than imported, for the
+    same reason the rest is: an oracle that reuses the implementation cannot
+    falsify it. It is not dead weight on the current fixtures only by
+    accident — _build_synthetic_group's members carry no wording keys, so the
+    wording half is True for every pair in them and the distinct hyphen-less
+    event tickers are the only thing keeping the conjunct from firing. Add one
+    hyphenated shared-prefix ticker to that fixture and an oracle without this
+    clause diverges silently, which is exactly the "oracle replays the old
+    rule" failure CLAUDE.md records for the archive-walk parity tests.
     """
     result: set[frozenset] = set()
     n = len(members)
@@ -1147,6 +1297,14 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
                 continue
             if a["event_ticker"] == b["event_ticker"]:
                 continue
+            if ((a.get("title") or "", a.get("subtitle") or "",
+                 a.get("event_title") or "")
+                    == (b.get("title") or "", b.get("subtitle") or "",
+                        b.get("event_title") or "")):
+                sa = (a.get("event_ticker") or "").split("-", 1)[0].strip().upper()
+                sb = (b.get("event_ticker") or "").split("-", 1)[0].strip().upper()
+                if not sa or not sb or sa == sb:
+                    continue
             result.add(frozenset([a["ticker"], b["ticker"]]))
     return result
 

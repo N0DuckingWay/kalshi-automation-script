@@ -644,6 +644,28 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_time_series_pairs", "time_series_group_key")
         assert _function_calls(backtester, "_group_by_normalized_title", "time_series_group_key")
 
+    def test_ast_both_finders_apply_the_one_series_rule(self):
+        # DR-02/DR-54: identical wording across two events of ONE series is two
+        # instances of a recurring fixture. Gating only the same-title finder
+        # would merely RELABEL such a pair as a time-series bet — the same two
+        # tickers also qualify there, and main._dedup_pairs only ever dropped
+        # the time-series copy because a same-title copy existed. Both live
+        # finders must therefore reach scanner._same_series, and the
+        # backtester's _extract_pairs must reach its dict-world mirror on both
+        # of its branches (one function, so one pin covers both).
+        assert _function_calls(scanner, "find_same_title_pairs", "_same_series")
+        assert _function_calls(scanner, "find_time_series_pairs", "_same_series")
+        assert _function_calls(scanner, "find_time_series_pairs", "_identical_wording")
+        assert _function_calls(backtester, "_extract_pairs", "_same_series_dicts")
+        assert _function_calls(backtester, "_extract_pairs", "_identical_wording_dicts")
+
+    def test_ast_the_series_prefix_has_one_definition(self):
+        # The backtester must not re-split the event ticker itself: the mirror
+        # helpers call scanner.event_series, so live and backtest can never
+        # disagree about what a series is.
+        assert _function_calls(backtester, "_same_series_dicts", "event_series")
+        assert _function_calls(scanner, "_same_series", "event_series")
+
 
 class TestSelectPortfolio:
     def test_empty_input(self):

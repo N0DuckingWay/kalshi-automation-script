@@ -15,7 +15,9 @@ Purpose:
 
 Dependencies:
     Imports time_series_group_key (the single definition of the time-series
-    grouping key, shared with the live scanner) and leg_sides from
+    grouping key, shared with the live scanner), event_series (the single
+    definition of an event's series prefix, so the live and backtest
+    one-series rules can never disagree) and leg_sides from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
@@ -146,7 +148,7 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
 )
-from .scanner import leg_sides, time_series_group_key
+from .scanner import event_series, leg_sides, time_series_group_key
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -668,12 +670,62 @@ def _pair_key(m: dict) -> str:
     return f"{event_title} | {title}"
 
 
+def _identical_wording_dicts(mA: dict, mB: dict) -> bool:
+    """
+    Dict-world mirror of scanner._identical_wording over cached market records.
+
+    Compares the RAW (title, subtitle, event_title) strings, so a pair whose
+    two contracts are worded identically cannot be "the same question at two
+    deadlines" — the deadline is not in the wording at all.
+
+    Args:
+        mA (dict): A market dict in the compact historical._market_to_dict form.
+        mB (dict): A second market dict, same form.
+
+    Returns:
+        bool: True only when all three strings match exactly. Missing keys read
+            as "" on both sides, exactly as the live helper reads a falsy
+            attribute.
+    """
+    return (
+        (mA.get("title") or "", mA.get("subtitle") or "", mA.get("event_title") or "")
+        == (mB.get("title") or "", mB.get("subtitle") or "", mB.get("event_title") or "")
+    )
+
+
+def _same_series_dicts(mA: dict, mB: dict) -> bool:
+    """
+    Dict-world mirror of scanner._same_series over cached market records.
+
+    Fails CLOSED like the live helper: an absent or unreadable event_ticker on
+    either side reads as the same series, so a pair whose fixture identity
+    cannot be established is refused rather than replayed on the 95%
+    co-resolution prior (DR-02, DR-54).
+
+    Args:
+        mA (dict): A market dict in the compact historical._market_to_dict form.
+        mB (dict): A second market dict, same form.
+
+    Returns:
+        bool: True when both series prefixes are equal, or when either is
+            unreadable.
+    """
+    sa, sb = event_series(mA.get("event_ticker")), event_series(mB.get("event_ticker"))
+    return not sa or not sb or sa == sb
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
 
     Three-element key: the event_title component prevents cross-event option-label
     collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+
+    Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54):
+    two events of one recurring fixture still land in one group, and
+    _extract_pairs is what refuses to pair them. Keeping the rule in one place
+    mirrors the live scanner, where find_same_title_pairs groups first and
+    filters inside its inner loop.
 
     Args:
         markets (list[dict]): Market dicts in the compact historical._market_to_dict
@@ -783,7 +835,17 @@ def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
 def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
-    the two markets have different event_tickers. No price filtering at this stage.
+    the two markets have different event_tickers AND are not two events of one
+    series worded identically. No price filtering at this stage.
+
+    The one-series rule (DR-02, DR-54) mirrors both live finders through
+    _same_series_dicts / _identical_wording_dicts: two events sharing a series
+    prefix are two instances of one recurring fixture, so identical wording
+    across them is one question about two DIFFERENT events. The 3-tuple
+    (same-title) branch tests the series alone, because its group key already
+    guarantees the wording is identical; the string (time-series) branch tests
+    the conjunct, because there the wording is only date-stripped-equal and a
+    genuine cumulative pair (deadline IN the wording) must survive.
 
     The pair type is NOT a parameter: the shape of each group key (see below)
     decides which sweep applies, and run_backtest() attaches the pair_type
@@ -828,7 +890,7 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
             iteration order. Empty if no group has two members on different
-            event_tickers.
+            event_tickers of different event series.
     """
     pairs = []
     for key, members in groups.items():
@@ -868,6 +930,12 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         break
                     if mA["event_ticker"] == mB["event_ticker"]:
                         continue
+                    # Mirror of the scanner's time-series conjunct: identical
+                    # wording across two events of one series is two instances
+                    # of one recurring fixture, not one question at two
+                    # deadlines (DR-02, DR-54).
+                    if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                        continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
                         continue
@@ -878,6 +946,11 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             for i, mA in enumerate(members):
                 for mB in members[i + 1:]:
                     if mA["event_ticker"] == mB["event_ticker"]:
+                        continue
+                    # Mirror of scanner.find_same_title_pairs' one-series rule:
+                    # the group key already guarantees identical wording, so
+                    # two events of one series are two fixtures (DR-02, DR-54).
+                    if _same_series_dicts(mA, mB):
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:

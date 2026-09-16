@@ -425,40 +425,52 @@ def _build_events(same_cheap_shard: int = 0, include_time_series: bool = False) 
     one selectable trade into a cross-shard one. `include_time_series` appends
     the opt-in later-pricier time-series pair (TS-EARLY / TS-LATE, 10-day
     deadline gap) described in the suite header — off by default so the
-    ingest census pins on the fixed set stay exact."""
+    ingest census pins on the fixed set stay exact.
+
+    Every same-title pair here deliberately puts its two markets in two
+    DIFFERENT event series (EXPEVT-1 / CHEAPEVT-1, TICKAEVT-1 / TICKBEVT-1,
+    ...). They all used to share the prefix "EVT", i.e. one series, which
+    scanner.find_same_title_pairs now refuses: two events of one series are two
+    instances of one recurring fixture, so identical wording across them is two
+    questions rather than one question listed twice, and the 95% co-resolution
+    prior does not apply (DR-02, DR-54). Distinct series are the shape the
+    same-title strategy was built for. The time-series pair keeps ONE series
+    (EVT-TS-EARLY / EVT-TS-LATE) on purpose — a real cumulative-deadline family
+    is one series, and its two titles differ by the deadline, so the finder's
+    identical-wording conjunct never fires on it."""
     events = [
         _ev("Recurring Q", _mk_market(
-            _TICKER_SAME_EXP, "EVT-EXP", "Will X happen?", "Outcome Main",
+            _TICKER_SAME_EXP, "EXPEVT-1", "Will X happen?", "Outcome Main",
             "0.50", "0.45", price_level_structure="linear_cent",
         )),
         _ev("Recurring Q", _mk_market(
-            _TICKER_SAME_CHEAP, "EVT-CHEAP", "Will X happen?", "Outcome Main",
+            _TICKER_SAME_CHEAP, "CHEAPEVT-1", "Will X happen?", "Outcome Main",
             "0.20", "0.75", price_level_structure="linear_cent",
             exchange_index=same_cheap_shard,
         )),
         _ev("Tick Event", _mk_market(
-            _TICKER_TICK_A, "EVT-TICK-A", "Tick Test Market", "Outcome",
+            _TICKER_TICK_A, "TICKAEVT-1", "Tick Test Market", "Outcome",
             "0.90", "0.85", price_level_structure="center_deci_edge_centi_cent",
             price_ranges=_TICK_PRICE_RANGES,
         )),
         _ev("Tick Event", _mk_market(
-            _TICKER_TICK_B, "EVT-TICK-B", "Tick Test Market", "Outcome",
+            _TICKER_TICK_B, "TICKBEVT-1", "Tick Test Market", "Outcome",
             "0.50", "0.45",
         )),
         _ev("Shard Event", _mk_market(
-            _TICKER_SHARD_A, "EVT-SHARD-A", "Shard Test Market", "Outcome",
+            _TICKER_SHARD_A, "SHARDAEVT-1", "Shard Test Market", "Outcome",
             "0.60", "0.35", exchange_index=1,
         )),
         _ev("Shard Event", _mk_market(
-            _TICKER_SHARD_B, "EVT-SHARD-B", "Shard Test Market", "Outcome",
+            _TICKER_SHARD_B, "SHARDBEVT-1", "Shard Test Market", "Outcome",
             "0.50", "0.45",
         )),
         _ev("Held Event", _mk_market(
-            _TICKER_HELD_A, "EVT-HELD-A", "Held Question", "Outcome",
+            _TICKER_HELD_A, "HELDAEVT-1", "Held Question", "Outcome",
             "0.50", "0.45",
         )),
         _ev("Held Event", _mk_market(
-            _TICKER_HELD_B, "EVT-HELD-B", "Held Question", "Outcome",
+            _TICKER_HELD_B, "HELDBEVT-1", "Held Question", "Outcome",
             "0.20", "0.75",
         )),
     ]

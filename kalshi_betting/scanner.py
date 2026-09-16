@@ -13,10 +13,11 @@ Purpose:
     contract, NO on the later) when the later contract is priced well above
     the earlier; and (2)
     same-title pairs — contracts with identical title and subtitle on
-    different event tickers, traded as a near-arbitrage (NO on the pricier,
-    YES on the cheaper) when their prices diverge. Both paths then check the
-    live order book to replace best-ask prices with depth-weighted fill prices
-    and confirm the edge survives real liquidity.
+    different event tickers of DIFFERENT event series, traded as a
+    near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
+    diverge. Both paths then check the live order book to replace best-ask
+    prices with depth-weighted fill prices and confirm the edge survives real
+    liquidity.
 
 Dependencies:
     Imports constants, the leg-side tuples, and fee helpers from config.py and
@@ -38,6 +39,15 @@ Notes:
     It is only half of the time-series grouping key: the market's outcome label
     (its subtitle) is the other half, because a daily strike family shares one
     title and differs only there — see time_series_group_key().
+
+    Neither finder pairs two events of ONE series (event_series(): the ticker
+    prefix before the first "-") whose wording is identical. Two events of one
+    series are two instances of one recurring fixture — two ball games, two
+    15-minute price windows, two combos — so identical wording across them is
+    the same question about two DIFFERENT events, and neither the 95%
+    co-resolution prior nor the cumulative-deadline premise applies. Both
+    finders carry the rule because the same two tickers qualify for both; see
+    _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -485,7 +495,9 @@ class CandidatePair:
       same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
                    market_b (the cheaper side) at pB. Both legs pay when the
                    two identical questions co-resolve, so the trade is a
-                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB prior.
+                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
+                   prior — which is why the finder only forms such a pair
+                   across two DIFFERENT event series (see _same_series).
       time_series: YES on market_a (the EARLIER-closing contract) at pA, NO on
                    market_b (the later one) at nB. Three settlement cells
                    exist: event by A's deadline (A=YES, hence B=YES; YES-on-A
@@ -693,6 +705,87 @@ def pair_key(market: Any) -> str:
     if not event_title:
         return market_title(market)
     return f"{event_title} | {market_title(market)}"
+
+
+def event_series(event_ticker: Any) -> str:
+    """
+    Return the series prefix of a Kalshi event ticker — the part before the first "-".
+
+    Kalshi event tickers are a series prefix followed by the instance stamp, so
+    "KXNPBRFI-26SEP160500FUKORI" -> "KXNPBRFI" and
+    "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9" -> "KXMVECROSSCATEGORY". Two event
+    tickers that share a series are two instances of ONE recurring fixture (two
+    ball games, two 15-minute price windows, two combos), which is what makes
+    identical wording across them two different questions rather than one
+    question listed twice — see find_same_title_pairs and CLAUDE.md's
+    one-series gotcha (DR-02, DR-54).
+
+    Args:
+        event_ticker (Any): The market's event_ticker. Anything that is not a
+            str is read as unknown.
+
+    Returns:
+        str: The prefix before the first "-", stripped of surrounding
+            whitespace and upper-cased. "" for an empty, all-whitespace,
+            hyphen-leading or non-string ticker — every shape _same_series then
+            reads as an unknown series and fails closed on. A hyphen-less
+            ticker is its own series (returned stripped and upper-cased).
+    """
+    if not isinstance(event_ticker, str):
+        return ""
+    return event_ticker.split("-", 1)[0].strip().upper()
+
+
+def _identical_wording(mA: Any, mB: Any) -> bool:
+    """
+    True when two markets carry the same raw (title, subtitle, event title).
+
+    Compares the RAW strings, not the date-stripped ones: the point of the test
+    is that the deadline does not appear anywhere in the wording, so two
+    contracts worded identically cannot be "the same question at two
+    deadlines". Unreadable evidence reads as NOT identical rather than as a
+    rejection: two values that are not equal are two different wordings (a
+    MagicMock's auto-attributes are distinct objects), and every one of the
+    three attributes is read through getattr with a "" default — the same
+    fail-soft read find_time_series_pairs already uses for .subtitle when it
+    builds the grouping key — so a partial stub leaves the pair for the
+    ordinary filters instead of raising out of the finder.
+
+    Args:
+        mA (Any): First market object (.title, .subtitle, optional ._event_title).
+        mB (Any): Second market object, same shape.
+
+    Returns:
+        bool: True only when all three strings match exactly.
+    """
+    return (
+        (getattr(mA, "title", "") or "", getattr(mA, "subtitle", "") or "",
+         getattr(mA, "_event_title", "") or "")
+        == (getattr(mB, "title", "") or "", getattr(mB, "subtitle", "") or "",
+            getattr(mB, "_event_title", "") or "")
+    )
+
+
+def _same_series(mA: Any, mB: Any) -> bool:
+    """
+    True when two markets' event tickers share a series prefix, or either prefix
+    is unknown.
+
+    Fails CLOSED: a pair whose fixture identity cannot be read (an empty or
+    non-string event_ticker on either side) reads as the same series and is
+    therefore refused, because pricing it on the 95% co-resolution prior
+    requires PROVING the two events are different fixtures.
+
+    Args:
+        mA (Any): First market object with an .event_ticker attribute.
+        mB (Any): Second market object, same shape.
+
+    Returns:
+        bool: True when both series prefixes are equal, or when either is
+            unreadable.
+    """
+    sa, sb = event_series(mA.event_ticker), event_series(mB.event_ticker)
+    return not sa or not sb or sa == sb
 
 
 def _normalize_subtitle(subtitle: str) -> str:
@@ -1801,9 +1894,19 @@ def find_time_series_pairs(
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
-      3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
+      3. NOT identical wording across two events of one series: when the raw
+         (title, subtitle, event title) triple matches on both legs AND the two
+         event tickers share a series prefix, the deadline lives outside the
+         wording entirely, so these are two instances of one recurring fixture
+         rather than one question at two deadlines and there is no
+         cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
+         refuses the same shape; if only it did, this finder would simply
+         relabel the pair as a time-series bet and main._dedup_pairs — which
+         drops the time-series copy only when a same-title copy exists — would
+         have nothing to drop it against.
+      4. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
          order-independently by deadline_gap_days()
-      4. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
+      5. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
          LATER-closing contract (B) must be priced higher than the earlier
          one (A) by at least the tier (15% when the deadlines are <= 15 days
          apart, 30% for 16-30 days). That gap is the market-implied
@@ -1852,7 +1955,7 @@ def find_time_series_pairs(
         list: CandidatePair objects, one per normalized title+outcome group
             that produced a pair, each carrying pair_type="time_series". Empty
             if no group has two markets on different event_tickers within the
-            deadline-gap cap.
+            deadline-gap cap whose wording is not identical across one series.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -1899,6 +2002,17 @@ def find_time_series_pairs(
                 # Same event_ticker means these are options within a multi-choice event,
                 # not separate time-series markets — skip them
                 if mA.event_ticker == mB.event_ticker:
+                    continue
+
+                # Identical wording across two events of one series is the
+                # same-title shape find_same_title_pairs now refuses (DR-02,
+                # DR-54): the deadline lives outside the wording, so these are
+                # two instances of one recurring fixture and there is no
+                # cumulative-deadline premise to trade. Without this conjunct
+                # the same-title gate would merely RELABEL such a pair as a
+                # time-series bet — main._dedup_pairs only ever dropped the
+                # time-series copy because a same-title copy existed.
+                if _identical_wording(mA, mB) and _same_series(mA, mB):
                     continue
 
                 # Deadline gap check: past 30 days too much of the market-implied
@@ -1995,6 +2109,15 @@ def find_same_title_pairs(
     on the SAME_TITLE_CO_RESOLVE_PROB prior). The legs are NO on market_a at nA
     and YES on market_b at pB; nB is populated fail-soft for reporting only.
 
+    The two event tickers must belong to DIFFERENT series (_same_series). Two
+    events of one series are two instances of one recurring fixture — two ball
+    games, two 15-minute price windows, two MVE combos of different games — so
+    identical wording across them is one question asked about two different
+    events and the co-resolution prior does not apply at all: the 2026-09-15
+    sweep's own NPB pair was quoted 0.97 and 0.01 (DR-02, DR-54). Such
+    candidates are skipped and counted, and the count is reported once at the
+    end as an INFO line.
+
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
@@ -2005,8 +2128,10 @@ def find_same_title_pairs(
     under "Who will the next Pope be?") on different event tickers would be
     falsely paired as the same contract under the 95% co-resolution assumption.
 
-    Filters: different event_ticker (to exclude multi-choice options), both actively
-    priced (1%-99%), not in held_tickers. One best pair per title group.
+    Filters: different event_ticker (to exclude multi-choice options), different
+    event SERIES (to exclude two instances of one recurring fixture), both
+    actively priced (1%-99%), not in held_tickers. One best pair per title
+    group.
 
     Args:
         markets (list): ApiMarket objects to scan (already fetched by the
@@ -2018,7 +2143,8 @@ def find_same_title_pairs(
     Returns:
         list: CandidatePair objects, one per (event_title, title, subtitle)
             group that produced a pair, each carrying pair_type="same_title".
-            Empty if no group has two markets on different event_tickers.
+            Empty if no group has two markets on different event_tickers of
+            different event series.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     # warn_missing_close=False: both run modes call find_time_series_pairs on
@@ -2040,6 +2166,13 @@ def find_same_title_pairs(
             by_terms[(event_title, title, subtitle)].append(m)
 
     candidate_pairs: list = []
+    # Counted, not logged per pair. The rejection below fires per CANDIDATE
+    # pair — before the price parse and the 5% gate, so more often than the
+    # one-best-pair-per-group rows a run finally reports, of which the
+    # 2026-09-15 prod dry run had 71 of 75 pairing two DIFFERENT deadlines,
+    # i.e. two instances of one recurring fixture. One line each would bury the
+    # run's real output; one summary INFO after the loop instead.
+    series_skips = 0
     # members = all active markets that share this exact (event_title, title, subtitle)
     # key. Each entry is a separate market object from a different event — any two of
     # them are candidates for a same-title pair if their prices diverge.
@@ -2057,6 +2190,18 @@ def find_same_title_pairs(
                 # not separate markets asking the same question — skip them
                 if m_outer.event_ticker == m_inner.event_ticker:
                     continue
+
+                # Same wording, same series, different event: two instances of
+                # one recurring fixture (NPB game days, table-tennis matches,
+                # 15-minute price windows, MVE combos of different games) —
+                # two questions about two events, not one question listed
+                # twice, so the SAME_TITLE_CO_RESOLVE_PROB prior does not apply
+                # (DR-02, DR-54). The group key already guarantees the wording
+                # is identical, so the series test is the whole rule here.
+                if _same_series(m_outer, m_inner):
+                    series_skips += 1
+                    continue
+
                 try:
                     p_outer = float(m_outer.yes_ask_dollars)
                     p_inner = float(m_inner.yes_ask_dollars)
@@ -2115,6 +2260,12 @@ def find_same_title_pairs(
         # tradeable pairs wins; tradeable is preferred over non-tradeable
         group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
         candidate_pairs.append(group_pairs[0])
+
+    if series_skips:
+        logging.info(
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): %d", series_skips,
+        )
 
     logging.info(
         "Same-title pairs: %d total, %d tradeable",
