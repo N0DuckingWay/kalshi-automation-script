@@ -673,7 +673,12 @@ class TestFetchAllSettledMarkets:
         # Title resolution is not under test here (live is a bare MagicMock).
         monkeypatch.setattr(historical, "_load_or_build_event_titles", lambda *a, **k: {})
         cache_dir.mkdir(parents=True)
-        (cache_dir / "settled_markets_2026-02-01.json").write_text('[{"ticker": "T1"')
+        # INCLUDE_MVE_MARKETS is False above, so the assembled cache this run
+        # looks for carries the DR-57 _nomve marker; seeding the unmarked name
+        # would be a plain cache miss and would not exercise the corrupt-cache
+        # fall-through this test is named for.
+        corrupt = cache_dir / "settled_markets_2026-02-01_nomve.json"
+        corrupt.write_text('[{"ticker": "T1"')
 
         def fake_signed_get(client, path, **params):
             if path.endswith("/historical/cutoff"):
@@ -700,9 +705,7 @@ class TestFetchAllSettledMarkets:
         assert {m["ticker"] for m in out} == {"RECENT"}
         assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
         # The damaged file is replaced by a well-formed one for the next run.
-        assert json.loads(
-            (cache_dir / "settled_markets_2026-02-01.json").read_text()
-        ) == out
+        assert json.loads(corrupt.read_text()) == out
 
     def test_event_titles_resolved_when_mve_excluded(self, tmp_path, monkeypatch,
                                                      isolated_cache):
@@ -1537,6 +1540,97 @@ class TestShardedFetch:
                 MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
                 use_cache=False, prefilter_tag="testpred",
             )
+
+    def test_mve_included_keeps_the_legacy_unmarked_cache_filename(self, tmp_path,
+                                                                   monkeypatch):
+        # DR-57, backward-compatibility half: every assembled cache already on
+        # disk (there is a multi-GB one) was built with MVE included, so the
+        # default INCLUDE_MVE_MARKETS=True filename must stay byte-identical to
+        # the pre-DR-57 name. If this ever changes, every cached assembly is
+        # silently orphaned and the next run re-pays a multi-hour fetch.
+        # This one deliberately passes both BEFORE and AFTER the DR-57 fix — it
+        # pins the unchanged half. The two that fail pre-fix (i.e. the DR-57
+        # regression tests proper) are test_mve_flag_separates_assembled_cache_
+        # filenames and test_cache_written_under_one_mve_setting_is_not_served_
+        # to_the_other; don't delete this one as redundant with them.
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", True)
+        _install_sharded_fakes(monkeypatch, tmp_path,
+                               _FakeArchive(archive_markets), self.CUTOFF)
+        historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=False,
+        )
+        cache_dir = tmp_path / "cache"
+        assert (cache_dir / "settled_markets_2026-06-05.json").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05_nomve.json").exists()
+
+    def test_mve_flag_separates_assembled_cache_filenames(self, tmp_path, monkeypatch):
+        # DR-57: the flag changes WHAT IS FETCHED (mve_filter="exclude" on the
+        # archive query and on every live page), so the two settings must never
+        # share a cache file — and the marker must compose with prefilter_tag,
+        # which keys the same file on a different axis.
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+
+        def pred(m):
+            return not m["ticker"].endswith("1")
+
+        for flag, sub in ((True, "on"), (False, "off")):
+            monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", flag)
+            _install_sharded_fakes(monkeypatch, tmp_path / sub,
+                                   _FakeArchive(archive_markets), self.CUTOFF)
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False, prefilter=pred, prefilter_tag="testpred",
+            )
+
+        on_files = {p.name for p in (tmp_path / "on" / "cache").glob("settled_markets_*")}
+        off_files = {p.name for p in (tmp_path / "off" / "cache").glob("settled_markets_*")}
+        assert on_files == {"settled_markets_2026-06-05_testpred.json"}
+        assert off_files == {"settled_markets_2026-06-05_testpred_nomve.json"}
+        assert on_files.isdisjoint(off_files)
+
+    def test_cache_written_under_one_mve_setting_is_not_served_to_the_other(
+            self, tmp_path, monkeypatch):
+        # The real-money-adjacent half of DR-57: before the marker existed, an
+        # INCLUDE_MVE_MARKETS=False run loaded the MVE-INCLUSIVE assembly and
+        # analysed an almost entirely MVE corpus while believing it had
+        # excluded them — with nothing abnormal in the output to show for it.
+        from datetime import date
+
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", True)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, self.CUTOFF)
+        historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=False,
+        )
+
+        # Same flag, use_cache=True: the assembled cache is served, zero calls.
+        archive.calls = 0
+        historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True,
+        )
+        assert archive.calls == 0
+
+        # Flipping the flag must MISS that cache and refetch.
+        monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", False)
+        archive.calls = 0
+        historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=True,
+        )
+        assert archive.calls > 0
+        cache_dir = tmp_path / "cache"
+        assert (cache_dir / "settled_markets_2026-06-05.json").exists()
+        assert (cache_dir / "settled_markets_2026-06-05_nomve.json").exists()
 
     def test_probe_exception_falls_back_to_sequential(self, tmp_path, monkeypatch, caplog):
         # The cursor-synthesis probe issues a real request, so it can fail for

@@ -643,10 +643,14 @@ class TestOneEventSeriesIsTwoFixtures:
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
     def test_two_combo_events_are_rejected(self):
-        # DR-54: every MVE combo sits under KXMVECROSSCATEGORY, so two combos
-        # with identical leg wording are combos of DIFFERENT games. The series
-        # prefix is the part before the FIRST hyphen, so the SHARD1 segment in
-        # the middle does not make these two series.
+        # DR-54: a combo ticket's wording names its legs but never its date, so
+        # one wording recurs across fixture instances and two tickets with
+        # identical leg wording are two DIFFERENT tickets. Since DR-55 these
+        # two do not resolve to a literal prefix at all: both event tickers
+        # start with config.MVE_SERIES_FAMILY_PREFIX, so event_series answers
+        # "KXMVE" for each and _same_series sees one family. (Before DR-55 the
+        # same verdict came from the literal "KXMVECROSSCATEGORY" prefix —
+        # which is why the cross-prefix case below needed its own test.)
         close = datetime(2026, 9, 15, 20, tzinfo=UTC)
         mA = _mock_market(
             ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
@@ -664,6 +668,55 @@ class TestOneEventSeriesIsTwoFixtures:
         )
         assert find_same_title_pairs([mA, mB]) == []
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
+
+    @staticmethod
+    def _cross_prefix_combo_markets():
+        # DR-55: the SAME combo wording listed under two DIFFERENT KXMVE*
+        # series. Measured in backtest_cache/live_days/2026-09-14.json.gz,
+        # 10,643 distinct (event_title, title, subtitle) wordings appear under
+        # both KXMVECROSSCATEGORY and KXMVECROSSCATEGORY0. Before the family
+        # collapse these read as two different series, so the one-series rule
+        # never fired and both finders formed the pair.
+        #
+        # The prices are deliberately chosen so that NOTHING ELSE rejects the
+        # pair: the YES asks diverge 0.25 (>= SAME_TITLE_MIN_PRICE_DIFF for the
+        # same-title finder) and, with the earlier leg the cheaper one, give
+        # pB - pA = 0.25 at a zero-day gap (>= the 15% short-tier threshold,
+        # and pA + nB = 0.75 <= the 0.85 ceiling) for the time-series finder.
+        close = datetime(2026, 9, 15, 20, tzinfo=UTC)
+        earlier = _mock_market(
+            ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
+            event_ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
+            title="Parlay", subtitle="All legs hit",
+            event_title="Cross-category combo", yes_ask=0.20, no_ask=0.80,
+            close_time=close,
+        )
+        later = _mock_market(
+            ticker="KXMVECROSSCATEGORY0-SHARD1-S93FFD638F77-Y",
+            event_ticker="KXMVECROSSCATEGORY0-SHARD1-S93FFD638F77",
+            title="Parlay", subtitle="All legs hit",
+            event_title="Cross-category combo", yes_ask=0.45, no_ask=0.55,
+            close_time=close + timedelta(hours=2),
+        )
+        return earlier, later
+
+    def test_same_title_finder_rejects_two_combo_series(self):
+        earlier, later = self._cross_prefix_combo_markets()
+        # Guard that the fixture is the shape the rule must catch: identical
+        # wording, two literal prefixes, one collapsed series.
+        assert scanner._identical_wording(earlier, later) is True
+        assert earlier.event_ticker.split("-")[0] != later.event_ticker.split("-")[0]
+        assert scanner._same_series(earlier, later) is True
+        assert find_same_title_pairs([earlier, later]) == []
+
+    def test_time_series_finder_rejects_two_combo_series(self):
+        # This direction matters on its own: _same_series is also the second
+        # half of find_time_series_pairs' skip conjunct, so gating only the
+        # same-title finder would relabel the trade rather than remove it.
+        earlier, later = self._cross_prefix_combo_markets()
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[earlier, later]
+        ) == []
 
     def test_two_different_series_asking_one_question_still_pair(self):
         # The premise of the same-title strategy, and the only shape that
@@ -765,18 +818,48 @@ class TestOneEventSeriesIsTwoFixtures:
 
 class TestEventSeries:
     """The one-series primitives on their own: scanner.event_series (the series
-    prefix), _same_series (fixture identity, failing CLOSED on an unreadable
-    ticker) and _identical_wording (the raw title/subtitle/event-title triple),
-    plus the silent-at-zero half of find_same_title_pairs' skip summary."""
+    identity — the literal prefix, with every combo (KXMVE*) prefix collapsed
+    onto one family), _same_series (fixture identity, failing CLOSED on an unreadable
+    ticker) and _identical_wording (the raw title/subtitle/event-title
+    triple), plus the silent-at-zero half of find_same_title_pairs' skip
+    summary."""
 
     @pytest.mark.parametrize("ticker,expected", [
         ("KXNPBRFI-26SEP160500FUKORI", "KXNPBRFI"),
         ("KXTTELITEMATCH-26SEP101835KKAMOL", "KXTTELITEMATCH"),
-        ("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9", "KXMVECROSSCATEGORY"),
+        # DR-55: all four real combo prefixes collapse onto the KXMVE family.
+        # Kalshi lists combos under several series, so the literal prefix split
+        # them into four and the one-series rule never fired between two of
+        # them. Census of backtest_cache/event_titles.json, 2026-09-16:
+        # KXMVECROSSCATEGORY 2,960,840 | KXMVESPORTSMULTIGAMEEXTENDED 906,157 |
+        # KXMVECROSSCATEGORY0 94,230 | KXMVENBASINGLEGAME 61.
+        ("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9", "KXMVE"),
+        ("KXMVECROSSCATEGORY0-SHARD1-S93FFD638F77", "KXMVE"),
+        ("KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-SA1B2C3D4E5F", "KXMVE"),
+        ("KXMVENBASINGLEGAME-26SEP15LALBOS", "KXMVE"),
+        # The uncollapsed path stays pinned: a non-MVE ticker is its own series.
         ("KXSOLD-26SEP14", "KXSOLD"),
     ])
     def test_real_event_tickers(self, ticker, expected):
         assert scanner.event_series(ticker) == expected
+
+    def test_the_combo_family_collapses_but_neighbours_do_not(self):
+        # GUARD on the collapse's blast radius: it keys off the family prefix,
+        # so two combo series answer with one identity while ordinary series —
+        # including one that stops one letter short of the family — are
+        # untouched. Only KXMVE* collapses: no KXMV* prefix that is not KXMVE*
+        # exists in the census, so the family name is the narrowest one
+        # covering all four.
+        assert scanner.event_series("KXMVECROSSCATEGORY-A") == scanner.event_series(
+            "KXMVESPORTSMULTIGAMEEXTENDED-B"
+        )
+        assert scanner.event_series("KXNPBRFI-A") != scanner.event_series("KXSOLD-B")
+        # The KXMV/KXMVE boundary itself: the family literal is narrow, so a
+        # prefix that stops one letter short is NOT collapsed.
+        assert scanner.event_series("KXMVPAWARD-26") == "KXMVPAWARD"
+        # Case is normalized before the family test, so a lower-cased combo
+        # ticker collapses too.
+        assert scanner.event_series("kxmvecrosscategory0-shard1-x") == "KXMVE"
 
     def test_hyphenless_ticker_is_its_own_series(self):
         assert scanner.event_series("KXSOLD") == "KXSOLD"

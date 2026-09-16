@@ -88,7 +88,15 @@ Notes:
     (_http.signed_request_json — single-shot, retry-free, non-2xx raises) and
     reads fill_count/remaining_count itself via trader._parse_fixed_point,
     keeping the same Decimal comparison and the same "unparseable means
-    ambiguous, never a non-fill" semantics.
+    ambiguous, never a non-fill" semantics. A 2xx body that is not a JSON
+    OBJECT at all (`"accepted"`, `[]`, `123`, `true`, `null`) is handled one
+    step earlier, by _non_object_body_fail: the fill readers would raise
+    AttributeError out of a real, possibly-filled submission, killing the probe
+    before it could read the position or warn about it (DR-58). That guard
+    restores the position read and the warning, NOT the reduce-only close —
+    an unreadable body proves nothing about the mapping that close rests on,
+    so the step ends at FAIL with the position left for a human, exactly as a
+    disproven mapping does.
 
     CONFIRMATION. Nothing is submitted until the request body has been printed
     and the operator has typed "yes" — unless --yes was passed, which is for a
@@ -323,7 +331,7 @@ def _no_close_body(market: Any) -> dict:
     return body
 
 
-def _submit_probe_order(client: Any, body: dict) -> dict:
+def _submit_probe_order(client: Any, body: dict) -> Any:
     """
     Submit one probe order and return the parsed response body.
 
@@ -339,7 +347,13 @@ def _submit_probe_order(client: Any, body: dict) -> dict:
         body (dict): Request body from _no_buy_body/_no_close_body.
 
     Returns:
-        dict: Parsed response body (possibly wrapped under "order").
+        Any: The parsed 2xx response body. Normally a dict (possibly wrapped
+            under "order"), but DELIBERATELY not narrowed to one:
+            _http.signed_request_json is annotated `-> Any` and does not narrow
+            either, so a 2xx body of `"accepted"`, `[]`, `123`, `true` or
+            `null` reaches the caller as a str/list/int/bool/None. Every caller
+            must therefore check `isinstance(data, dict)` before reading fill
+            fields off it — see _non_object_body_fail (DR-58).
 
     Raises:
         ApiException: On a non-2xx status — never retried.
@@ -416,6 +430,86 @@ def _report_fee(data: dict, price_str: str) -> None:
     )
 
 
+def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> str:
+    """
+    Report a submitted order whose 2xx body is not a JSON object, and check the
+    account.
+
+    This guards the probe's two submission-response READERS, which is not the
+    same as its three SUBMISSIONS: `_step_no_mapping`'s NO buy and
+    `_step_unfillable_ask`'s ask both read fill fields off the body, while
+    `_step_no_mapping`'s reduce-only NO close only hands its body to `_emit`
+    and takes its verdict from `trader._position_count`, so nothing there can
+    raise on a non-object body.
+
+    `_http.signed_request_json` is annotated `-> Any` and does not narrow a 2xx
+    body to a dict, so `"accepted"`, `[]`, `123`, `true` or a literal `null` all
+    reach the caller as a `str`/`list`/`int`/`bool`/`None`. Every consumer below
+    the submission calls `data.get(...)` — `_fill_counts` at both guarded sites
+    and `_report_fee` in `_step_no_mapping` — so such a body used to raise an
+    uncaught `AttributeError` IMMEDIATELY AFTER A REAL ORDER HAD BEEN
+    SUBMITTED: the probe died on a traceback with no position read, no
+    flatten-it-manually warning (and, in `_step_no_mapping`, no reduce-only
+    close), and a real position was left open with nothing to tell the operator
+    it existed (DR-58). The close is NOT restored here — it rests on the very
+    mapping this unreadable body proves nothing about, so the position is left
+    for a human, as a disproven mapping already leaves it. A 2xx proves the
+    order reached the exchange, so it MAY have filled
+    — the same reading `trader._execute_transfer` takes of a non-object 2xx
+    transfer body (DR-05), and the opposite of the ORDER-submission readers in
+    `trader.py`, which must stay loud because raising there routes
+    `_execute_one` into its position-DELTA resolution path. No such caller
+    exists above the probe, so raising here resolves nothing.
+
+    The position is read, and re-read ONCE after
+    `trader._V2_MAPPING_RECHECK_DELAY_SECONDS` when the first read is flat or
+    unreadable. That EXTENDS DR-21's read-after-write-lag reasoning rather than
+    restating it: DR-21's re-read in `_step_no_mapping` fires only on an
+    exactly-zero read, and this one fires on `None` (lookup failed) as well,
+    because collapsing `None` into "flat" is precisely the silent branch this
+    guard exists to prevent. All three outcomes are printed distinctly: an
+    unreadable position, an open position, and a genuinely flat account.
+
+    Args:
+        client (Any): Authenticated prod KalshiClient.
+        ticker (str): The market the order was submitted against.
+        data (Any): The non-dict 2xx body, for its type name.
+        label (str): Which submission this was, e.g. "NO buy", for the message.
+
+    Returns:
+        str: Always _FAIL — the body cannot be read, so nothing is proven and a
+            position may be open.
+    """
+    print(
+        f"{_FAIL}: the 2xx {label} response body was {type(data).__name__}, not a JSON "
+        "object, so its fill fields cannot be read — the order MAY have filled."
+    )
+    # Cross-module: the account's ledger is the only remaining evidence about
+    # what this order did.
+    stranded = trader._position_count(client, ticker)
+    print(f"Position after the non-object {label} response: {stranded}")
+    if stranded is None or stranded == 0:
+        # A ledger that reads flat (or fails) straight after a submission is
+        # usually read-after-write lag, not proof of a kill — re-read ONCE
+        # before concluding anything, exactly as DR-21 established.
+        time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
+        stranded = trader._position_count(client, ticker)
+        print(f"Position after re-read: {stranded}")
+    if stranded is None:
+        print(
+            f"*** Could not read the position on {ticker}. CHECK IT MANUALLY and "
+            "FLATTEN ANYTHING YOU FIND. ***"
+        )
+    elif stranded:
+        print(
+            f"*** A {stranded} position is OPEN on {ticker}. FLATTEN IT MANUALLY in "
+            "the Kalshi UI. ***"
+        )
+    else:
+        print(f"The account reads flat on {ticker} — nothing to flatten.")
+    return _FAIL
+
+
 def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int) -> str:
     """
     THE CORE GATE: verify that an `ask` opens a NO position and reduce_only
@@ -427,7 +521,9 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
       2. Confirm the account is FLAT on this ticker — the probe's whole verdict
          is "which way did the position move", which is meaningless otherwise.
       3. Submit the NO-buy body built by trader._build_no_order_v2 (side "ask"
-         per _V2_LEG_SIDE).
+         per _V2_LEG_SIDE). A 2xx body that is not a JSON object is a FAIL that
+         still checks the account (_non_object_body_fail), never a traceback
+         out of the fill readers (DR-58).
       4. Re-read the position. PASS half one iff it went NEGATIVE, which is
          Kalshi's unified-ledger convention for a NO position. A position of
          exactly 0 after a reported full fill is read ONCE more, after
@@ -443,7 +539,13 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          "bid", reduce_only=True), priced at the top of this market's own grid
          rather than at the builder's loss floor, so the close crosses
          whatever is resting on the book (see _no_close_body). PASS half two
-         iff the position returns to 0.
+         iff the position returns to 0. This is the step's SECOND submission
+         — the probe's second order-submission site of three — and it needs
+         no _non_object_body_fail guard: its 2xx body is only
+         handed to _emit (typed Any — it just pretty-prints), and the verdict
+         comes from trader._position_count, so there is no data.get(...) on
+         it to raise. Add the guard here if a future edit starts reading fill
+         fields off close_data (DR-58).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -453,7 +555,8 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
 
     Returns:
         str: _PASS only when the position went negative AND came back to zero;
-            _FAIL on any contrary evidence, an error, or a position left open —
+            _FAIL on any contrary evidence, an error, an unreadable (non-object)
+            2xx response body, or a position left open —
             this includes declining the SECOND (closing) confirmation, since a
             real position is open by then and declining to close it is not a
             neutral outcome; _NEUTRAL only when the step never reached a
@@ -534,6 +637,12 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             )
         return _FAIL
     _emit("RAW RESPONSE (NO buy)", data)
+    if not isinstance(data, dict):
+        # A 2xx body that is not an object cannot be read by _fill_counts /
+        # _report_fee below, and letting their .get() raise here would skip the
+        # position read AND the reduce-only close, stranding a real position
+        # with no operator warning (DR-58).
+        return _non_object_body_fail(client, ticker, data, "NO buy")
 
     fill, remaining = _fill_counts(data)
     filled: bool | None
@@ -665,8 +774,10 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     Returns:
         str: _PASS when the order came back with zero filled, the full count
             remaining, and the account still flat; _FAIL if anything filled,
-            the response/position disagrees, or the market could not be read
-            at all (no market means no order was even attempted); _NEUTRAL
+            the response/position disagrees, the 2xx body is not a JSON object
+            (unreadable is not proof of a kill — DR-58), or the market could
+            not be read at all (no market means no order was even attempted);
+            _NEUTRAL
             only if the operator declined the interactive confirmation.
     """
     print("\n===== STEP: unfillable-ask (fill-or-kill kill semantics) =====")
@@ -727,6 +838,12 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
         print(f"Position after the error: {trader._position_count(client, ticker)}")
         return _FAIL
     _emit("RAW RESPONSE (unfillable ask)", data)
+    if not isinstance(data, dict):
+        # The ask was MEANT to be unfillable, but an unreadable 2xx body is not
+        # proof that it was killed — a 2xx proves only that the order reached
+        # the exchange. Check the account instead of raising out of
+        # _fill_counts' .get() (DR-58).
+        return _non_object_body_fail(client, ticker, data, "unfillable ask")
 
     fill, remaining = _fill_counts(data)
     if fill is None or remaining is None:

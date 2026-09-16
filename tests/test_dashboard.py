@@ -1,6 +1,7 @@
 """Tests for dashboard.py — HTML escaping of Kalshi-controlled titles (BS-20),
-the _max_drawdown empty/all-NaN guard (BS-30), and the interval-discount (k)
-section with its native Plotly k selector.
+the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
+annualization base and its per-row use in the benchmark table (DR-56), and the
+interval-discount (k) section with its native Plotly k selector.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -11,6 +12,7 @@ so these tests stay fully offline. Both sites are Kalshi-controlled
 interval-discount section is tested the same way: _section_interval_discount()
 is driven from a hand-built BacktestSweep, never through generate_dashboard().
 """
+import math
 import re
 from datetime import date, timedelta
 
@@ -432,3 +434,198 @@ class TestBenchmarkDownloadWindow:
             make_equity([1000.0]), date(2026, 1, 1), 1000.0)
 
         assert seen["start"] == "2025-12-31"
+
+
+# A series with both a nonzero standard deviation and at least one negative
+# value, so _sharpe's std > 0 branch AND _sortino's dd > 0 branch both run.
+_RETURNS = pd.Series([0.02, -0.01, 0.015, -0.03, 0.004, 0.011, -0.008, 0.02])
+
+
+class TestAnnualizationBase:
+    """
+    DR-56: _sharpe/_sortino hardcoded sqrt(252) and rf/252, but four of their
+    five call sites are handed backtester._build_equity_curve output, which has
+    one row per CALENDAR day (~365/yr). The ^GSPC benchmark row rendered beside
+    the strategy row in the SAME table is the one trading-day series.
+
+    These helpers had essentially no coverage before this class, so a
+    "tests must not drop" gate was satisfiable by adding nothing.
+    """
+
+    def test_sharpe_scales_by_the_exact_sqrt_ratio(self):
+        # The EXACT identity, never an approximate literal: at rf = 0 the
+        # helper reduces to mean/std * sqrt(P), so changing only P rescales by
+        # sqrt(365/252) = 1.2035002. A wrong-but-close base (e.g. 350, giving
+        # 1.1785) would slip through a loose "~1.18" assertion.
+        at_252 = dashboard._sharpe(_RETURNS, periods_per_year=252)
+        at_365 = dashboard._sharpe(_RETURNS, periods_per_year=365)
+        assert at_252 != 0.0
+        assert at_365 == pytest.approx(at_252 * math.sqrt(365 / 252))
+
+    def test_sortino_scales_by_the_exact_sqrt_ratio(self):
+        at_252 = dashboard._sortino(_RETURNS, periods_per_year=252)
+        at_365 = dashboard._sortino(_RETURNS, periods_per_year=365)
+        assert at_252 != 0.0
+        assert at_365 == pytest.approx(at_252 * math.sqrt(365 / 252))
+
+    def test_magnitude_grows_without_changing_sign(self):
+        # The rescale is of MAGNITUDE: a losing strategy's Sharpe gets MORE
+        # negative, it does not "improve".
+        losing = -_RETURNS
+        at_252 = dashboard._sharpe(losing, periods_per_year=252)
+        at_365 = dashboard._sharpe(losing, periods_per_year=365)
+        assert at_252 < 0 and at_365 < 0
+        assert at_365 < at_252
+
+    def test_bare_sharpe_call_annualizes_on_the_calendar_base(self):
+        # Pins the DEFAULT to 365 against an independently computed value, not
+        # against the constant the implementation happens to read.
+        expected = float(_RETURNS.mean() / _RETURNS.std() * math.sqrt(365))
+        assert dashboard._sharpe(_RETURNS) == pytest.approx(expected)
+        assert dashboard._sharpe(_RETURNS) != pytest.approx(
+            dashboard._sharpe(_RETURNS, periods_per_year=252))
+
+    def test_bare_sortino_call_annualizes_on_the_calendar_base(self):
+        downside = _RETURNS.where(_RETURNS < 0, 0.0)
+        dd = float((downside**2).mean() ** 0.5)
+        expected = float(_RETURNS.mean() / dd * math.sqrt(365))
+        assert dashboard._sortino(_RETURNS) == pytest.approx(expected)
+        assert dashboard._sortino(_RETURNS) != pytest.approx(
+            dashboard._sortino(_RETURNS, periods_per_year=252))
+
+    def test_default_is_the_calendar_constant(self):
+        assert config.CALENDAR_DAYS_PER_YEAR == 365
+        assert config.TRADING_DAYS_PER_YEAR == 252
+        assert dashboard._sharpe(_RETURNS) == pytest.approx(
+            dashboard._sharpe(_RETURNS,
+                              periods_per_year=config.CALENDAR_DAYS_PER_YEAR))
+
+    def test_periods_per_year_is_keyword_only(self):
+        # Positionally it would land in rf's slot and silently reinterpret a
+        # periodicity as a 252%-per-year hurdle.
+        with pytest.raises(TypeError):
+            dashboard._sharpe(_RETURNS, 0.0, 252)
+        with pytest.raises(TypeError):
+            dashboard._sortino(_RETURNS, 0.0, 252)
+
+    def test_nonzero_rf_is_not_a_constant_rescale(self):
+        # periods_per_year divides the annual hurdle as well as supplying the
+        # sqrt factor, so the sqrt(365/252) identity holds only at rf = 0.
+        ratio = (dashboard._sharpe(_RETURNS, 0.05, periods_per_year=365)
+                 / dashboard._sharpe(_RETURNS, 0.05, periods_per_year=252))
+        assert ratio != pytest.approx(math.sqrt(365 / 252))
+
+
+class TestBenchmarkAnnualizationPerRow:
+    """
+    DR-56 call-site pin: the Benchmark Comparison table's two rows must be
+    annualized on their own periodicities — ^GSPC (yfinance trading days) at
+    252, the strategy's calendar-day equity curve at 365. The strategy call
+    takes the value by DEFAULT rather than passing it, so the recording shim
+    must READ the real default (`__kwdefaults__`) rather than restate it: a
+    shim that re-declares `periods_per_year=CALENDAR_DAYS_PER_YEAR` records its
+    own constant for that call and stays green even when the production default
+    is flipped to 252 (measured — the same oracle-replays-the-bug shape
+    CLAUDE.md records for the archive-walk parity tests). Each call is recorded
+    with the SERIES it received, so the pin survives a reordering of the two
+    rows; the default's VALUE is pinned separately by TestAnnualizationBase.
+    """
+
+    def test_gspc_row_gets_252_and_strategy_row_gets_365(self, monkeypatch):
+        idx = pd.to_datetime(["2026-05-31", "2026-06-01", "2026-06-02", "2026-06-03"])
+        monkeypatch.setattr(
+            dashboard.yf, "download",
+            lambda ticker, **kw: pd.DataFrame(
+                {"Close": [100.0, 101.0, 99.5, 102.0]}, index=idx),
+        )
+
+        seen: list[tuple[pd.Series, int]] = []
+        real_sharpe = dashboard._sharpe
+        # The REAL default, read off the real function — never restated here.
+        real_default = real_sharpe.__kwdefaults__["periods_per_year"]
+
+        def recording_sharpe(series, rf=0.0, *, periods_per_year=real_default):
+            seen.append((series, periods_per_year))
+            return real_sharpe(series, rf, periods_per_year=periods_per_year)
+
+        monkeypatch.setattr(dashboard, "_sharpe", recording_sharpe)
+
+        equity = make_equity([1000.0, 1010.0, 1005.0, 1020.0])
+        out = dashboard._section_benchmark(equity, date(2026, 6, 1), 1000.0)
+
+        # The S&P row must actually have rendered — otherwise the benchmark
+        # block was swallowed by its own except and there is nothing to pin.
+        assert "S&P 500" in out
+        assert "Kalshi Arbitrage Strategy" in out
+        assert len(seen) == 2
+
+        strategy_calls = [p for s, p in seen if s.equals(equity["daily_return"])]
+        benchmark_calls = [p for s, p in seen if not s.equals(equity["daily_return"])]
+        assert strategy_calls == [config.CALENDAR_DAYS_PER_YEAR]
+        assert benchmark_calls == [config.TRADING_DAYS_PER_YEAR]
+
+
+def _recording(monkeypatch, name: str) -> list[int]:
+    """Replace dashboard.<name> with a shim recording the periods_per_year each
+    call received, and return the list it appends to.
+
+    Like TestBenchmarkAnnualizationPerRow's shim, the default is READ off the
+    real function (`__kwdefaults__`) rather than restated: a shim that
+    re-declares `periods_per_year=CALENDAR_DAYS_PER_YEAR` would record its own
+    constant and stay green even after the production default was flipped.
+    """
+    real = getattr(dashboard, name)
+    real_default = real.__kwdefaults__["periods_per_year"]
+    seen: list[int] = []
+
+    def shim(series, rf=0.0, *, periods_per_year=real_default):
+        seen.append(periods_per_year)
+        return real(series, rf, periods_per_year=periods_per_year)
+
+    monkeypatch.setattr(dashboard, name, shim)
+    return seen
+
+
+class TestCalendarAnnualizationAtTheUnpinnedCallSites:
+    """
+    DR-56 call-site pin for the three calendar-base _sharpe/_sortino calls not
+    already pinned elsewhere: the performance card's Sharpe and Sortino, and
+    the interval-discount section's per-k sweep row. FOUR of the module's five
+    calls consume a _build_equity_curve output and so must annualize on the
+    CALENDAR base (see dashboard._sharpe's own "four of the five calls"
+    paragraph); the fourth of them — the Benchmark table's STRATEGY row, which
+    reads equity_df["daily_return"] — and the one TRADING-base call (that
+    table's ^GSPC row) are both pinned by TestBenchmarkAnnualizationPerRow
+    above.
+
+    All three take the value by DEFAULT, so nothing at the call site would
+    break if one of them started passing TRADING_DAYS_PER_YEAR instead; only a
+    recorder can see it. Pinning the count as well as the value is what makes
+    a call quietly relocated onto the wrong base visible here.
+    """
+
+    def test_performance_card_annualizes_both_ratios_on_365(self, monkeypatch):
+        sharpe_seen = _recording(monkeypatch, "_sharpe")
+        sortino_seen = _recording(monkeypatch, "_sortino")
+
+        equity = make_equity([1000.0, 1010.0, 1005.0, 1020.0])
+        out = dashboard._section_performance(
+            equity, [make_trade()], date(2026, 1, 5), 1000.0)
+
+        assert "Portfolio Performance" in out
+        assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR]
+        assert sortino_seen == [config.CALENDAR_DAYS_PER_YEAR]
+
+    def test_per_k_sweep_row_annualizes_on_365(self, monkeypatch):
+        sharpe_seen = _recording(monkeypatch, "_sharpe")
+
+        points = _sweep_points([0.60, 0.75, 0.90])
+        sweep = BacktestSweep(primary=points[1], points=points,
+                              calibration=_calibration())
+        out = _section_interval_discount(sweep)
+
+        # One Sharpe per swept point, every one of them on the calendar base:
+        # each point's equity_df is a _build_equity_curve-shaped calendar-day
+        # series, exactly like the performance card's.
+        assert "updatemenus" in out
+        assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR] * len(points)

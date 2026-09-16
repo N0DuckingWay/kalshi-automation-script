@@ -17,7 +17,8 @@ Purpose:
 
 Dependencies:
     Imports BacktestSweep and BacktestTrade from backtester.py, and PROJECT_ROOT,
-    SAME_TITLE_CO_RESOLVE_PROB, create_new_output(), fee_per_pair_approx() and
+    SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
@@ -29,6 +30,14 @@ Notes:
     connection is required to view the charts. If yfinance fails to fetch S&P 500
     data (e.g. network unavailable), the benchmark section degrades gracefully
     and shows only the strategy equity curve.
+
+    _sharpe/_sortino annualize on whatever periodicity the caller names. The
+    strategy equity curve is CALENDAR-daily (backtester._build_equity_curve),
+    so every call on that curve takes their CALENDAR_DAYS_PER_YEAR default; the
+    ^GSPC benchmark row is the one TRADING-day series on the page and is the
+    single site that passes TRADING_DAYS_PER_YEAR explicitly. The two must never
+    share a factor — at rf = 0 the mismatch is exactly sqrt(365/252) = 1.2035 of
+    magnitude.
 
     The interval-discount section's k selector is a NATIVE Plotly `updatemenus`
     dropdown over one trace per swept k — no extra dependency and no hand-rolled
@@ -50,8 +59,10 @@ from plotly.subplots import make_subplots
 
 from .backtester import BacktestSweep, BacktestTrade
 from .config import (
+    CALENDAR_DAYS_PER_YEAR,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
+    TRADING_DAYS_PER_YEAR,
     create_new_output,
     fee_per_pair_approx,
     time_series_profit_prob,
@@ -59,47 +70,95 @@ from .config import (
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
-def _sharpe(daily_returns: pd.Series, rf: float = 0.0) -> float:
+def _sharpe(daily_returns: pd.Series, rf: float = 0.0, *,
+            periods_per_year: int = CALENDAR_DAYS_PER_YEAR) -> float:
     """
-    Compute the annualized Sharpe ratio from a series of daily returns.
+    Compute the annualized Sharpe ratio from a series of per-period returns.
 
-    Annualizes by multiplying the mean daily excess return by sqrt(252).
+    Annualizes by multiplying the RATIO of the mean per-period excess return to
+    its standard deviation by sqrt(periods_per_year) — not the mean alone, as
+    an earlier version of this docstring claimed.
+
+    `periods_per_year` governs BOTH halves of the annualization: it converts the
+    annual `rf` hurdle into a per-period hurdle AND supplies the sqrt scaling
+    factor. It must therefore match the actual periodicity of the series passed.
+    Use CALENDAR_DAYS_PER_YEAR (365) for a backtester._build_equity_curve()
+    output, which has one row per calendar day, and TRADING_DAYS_PER_YEAR (252)
+    for a trading-day series such as the ^GSPC benchmark's pct_change. Mixing
+    the two scales the calendar-day series' MAGNITUDE down by exactly
+    sqrt(365/252) = 1.2035 at rf = 0, leaving the sign alone (at rf != 0 it is
+    not a constant rescale, since the per-period hurdle moves too).
+
+    The default is the CALENDAR base because four of the five calls to this
+    helper and _sortino in this module consume _build_equity_curve output; the
+    single trading-day consumer (_section_benchmark's ^GSPC row) passes
+    TRADING_DAYS_PER_YEAR explicitly. The parameter is keyword-only so it can
+    never be passed positionally into `rf`'s slot.
 
     Args:
-        daily_returns (pd.Series): Series of daily fractional returns (e.g. 0.01 for 1%).
+        daily_returns (pd.Series): Series of per-period fractional returns
+            (e.g. 0.01 for 1%).
         rf (float): Annual hurdle rate (the T-bill "rf" term of the Sharpe
             formula) as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
+        periods_per_year (int): Periods per year in `daily_returns`. Must be
+            positive; not validated, since every value that reaches it is a
+            config constant — three of this helper's four in-module call sites
+            take the CALENDAR_DAYS_PER_YEAR default and the fourth
+            (_section_benchmark's ^GSPC row) passes TRADING_DAYS_PER_YEAR
+            explicitly. Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
         float: Annualized Sharpe ratio. Returns 0.0 if the standard deviation is zero.
+
+    Raises:
+        ZeroDivisionError: If `periods_per_year` is 0 (the per-period hurdle
+            divides by it).
     """
-    excess = daily_returns - rf / 252
+    excess = daily_returns - rf / periods_per_year
     std = excess.std()
-    return float(excess.mean() / std * np.sqrt(252)) if std > 0 else 0.0
+    return float(excess.mean() / std * np.sqrt(periods_per_year)) if std > 0 else 0.0
 
 
-def _sortino(daily_returns: pd.Series, rf: float = 0.0) -> float:
+def _sortino(daily_returns: pd.Series, rf: float = 0.0, *,
+             periods_per_year: int = CALENDAR_DAYS_PER_YEAR) -> float:
     """
-    Compute the annualized Sortino ratio from a series of daily returns.
+    Compute the annualized Sortino ratio from a series of per-period returns.
 
     Like the Sharpe ratio but uses only downside (negative) deviations in the
-    denominator, avoiding penalization for upside volatility.
+    denominator, avoiding penalization for upside volatility. Annualizes by
+    multiplying that RATIO by sqrt(periods_per_year).
+
+    `periods_per_year` governs BOTH the conversion of the annual `rf` hurdle to
+    a per-period hurdle AND the sqrt annualization factor, so it must match the
+    actual periodicity of the series passed: CALENDAR_DAYS_PER_YEAR (365) for a
+    backtester._build_equity_curve() output, TRADING_DAYS_PER_YEAR (252) for a
+    trading-day series such as the ^GSPC benchmark. It defaults to the calendar
+    base for the same reason _sharpe does — every in-module caller of this
+    helper consumes the calendar-day equity curve — and is keyword-only so it
+    can never land in `rf`'s positional slot.
 
     Args:
-        daily_returns (pd.Series): Series of daily fractional returns.
+        daily_returns (pd.Series): Series of per-period fractional returns.
         rf (float): Annual hurdle rate (the T-bill "rf" term) as a decimal.
             Defaults to 0.0.
+        periods_per_year (int): Periods per year in `daily_returns`. Must be
+            positive; not validated, since its one call site takes the default.
+            Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
         float: Annualized Sortino ratio. Returns 0.0 if there are no negative excess returns.
+
+    Raises:
+        ZeroDivisionError: If `periods_per_year` is 0 (the per-period hurdle
+            divides by it).
     """
-    excess = daily_returns - rf / 252
+    excess = daily_returns - rf / periods_per_year
     # Standard downside deviation: RMS of the negative excess returns over ALL
     # periods (positives clipped to 0). Using the sample std of only the
     # negative values returns NaN with a single loss and is not Sortino.
     downside = np.minimum(excess, 0.0)
     dd = float(np.sqrt(np.mean(np.square(downside))))
-    return float(excess.mean() / dd * np.sqrt(252)) if dd > 0 else 0.0
+    return float(excess.mean() / dd * np.sqrt(periods_per_year)) if dd > 0 else 0.0
 
 
 def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
@@ -1028,6 +1087,13 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     If yfinance fails (network error, no data), the S&P 500 line is omitted and
     only the strategy is shown.
 
+    The table's two rows are annualized on DIFFERENT bases, because they are two
+    different periodicities: the strategy row takes _sharpe's calendar default
+    (its curve has one row per calendar day) while the ^GSPC row passes
+    TRADING_DAYS_PER_YEAR, since yfinance serves trading days only (DR-56).
+    Sharing one factor would make the comparison this section exists for
+    apples-to-oranges by exactly sqrt(365/252) = 1.2035 of magnitude.
+
     Args:
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return].
@@ -1087,13 +1153,20 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             bench_rows.append({
                 "name": "S&P 500",
                 "return": f"{sp_ret:+.1%}",
-                "sharpe": f"{_sharpe(sp_daily):.2f}",
+                # yfinance serves TRADING days only, so this is the one series
+                # on the page that is not calendar-daily: it must override
+                # _sharpe's calendar default or the two rows of this very table
+                # would be annualized on different bases (DR-56).
+                "sharpe": f"{_sharpe(sp_daily, periods_per_year=TRADING_DAYS_PER_YEAR):.2f}",
                 "max_dd": f"{_max_drawdown(sp_norm)[0]:.1%}",
             })
         except Exception as e:
             logging.warning("Benchmark computation failed: %s — omitting S&P 500", e)
 
     strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
+    # Calendar-daily by construction (_build_equity_curve emits one row per
+    # calendar day), so this takes _sharpe's CALENDAR_DAYS_PER_YEAR default
+    # while the ^GSPC row above overrides it to the trading-day base.
     strat_sharpe = _sharpe(equity_df["daily_return"])
     strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
 

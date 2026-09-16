@@ -7,7 +7,10 @@ Purpose:
     Provides a long-running daemon that automatically invokes the production
     arbitrage bot every Monday at 09:00 local time. Uses the `schedule` library
     to register the job and a polling loop with 60-second sleep intervals to
-    check for pending jobs. The daemon logs to its own kalshi_scheduler.log
+    check for pending jobs. Every job is registered through _guarded_job(), so
+    an exception inside a job can never freeze that job's next_run and turn the
+    weekly fire into a once-per-poll-tick fire (DR-59 — see that function).
+    The daemon logs to its own kalshi_scheduler.log
     (and the console), separate from the kalshi_arb.log its subprocess writes
     and rotates. Also prints the equivalent cron job command to the
     log for users who prefer cron over a Python daemon. Persists the most
@@ -61,6 +64,18 @@ Notes:
     failure, a bad cwd — is now caught with a specific "Failed to spawn"
     error log instead of escaping run_job() and being swallowed by main()'s
     generic "Scheduler tick raised" handler with no run-specific context.
+
+    DR-59 registration guard: main()'s generic "Scheduler tick raised" handler
+    keeps the daemon alive but does NOT reschedule the job that raised —
+    schedule.Job.run() assigns last_run and calls _schedule_next_run() only
+    AFTER job_func() returns, so an escaping exception leaves next_run in the
+    past and the daemon re-enters the SAME job on the very next 60 s poll tick.
+    Every job is therefore registered through _guarded_job(), which catches at
+    the boundary `schedule` calls in — covering every escape path out of a job,
+    not just the ones an individual helper knows about. _save_state() itself is
+    deliberately unchanged: a failed CLAIM write must still prevent the spawn,
+    since a real-money run with no recorded slot would break BS-17's invariant
+    that a claimed slot always has a record.
 
     BS-17 catch-up: run_job() claims its Monday-09:00 slot in
     scheduler_state.json BEFORE spawning the subprocess, and finalizes that
@@ -120,8 +135,10 @@ import pathlib
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import schedule
 
@@ -344,6 +361,77 @@ def _save_state(
     tmp.replace(path)
 
 
+def _guarded_job(
+    job: Callable[..., Any],
+    *args: Any,
+    on_error: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Invoke a scheduled job so that no exception can escape into `schedule`.
+
+    This is the wrapper EVERY job in this module is registered through, and it
+    sits at the registration boundary rather than inside any one helper on
+    purpose (DR-59). `schedule.Job.run()` assigns `last_run` and calls
+    `_schedule_next_run()` only AFTER `job_func()` RETURNS, so an exception
+    that escapes the job leaves `next_run` in the past. main()'s poll loop
+    catches it ("Scheduler tick raised — daemon continues") and keeps the
+    daemon alive, but the job is still overdue — so it is re-entered on the
+    very next 60 s poll tick, turning a weekly production trading run into a
+    once-a-minute one for as long as the fault persists. The same mechanism
+    defeats the blind-retry one-shot contract: _blind_retry signals "run me
+    once" by RETURNING schedule.CancelJob, and a retry that raises never
+    returns, so it is never deregistered AND the SCHEDULER_BLIND_MAX_RETRIES
+    cap — carried solely on the `retries` argument each attempt hands its
+    successor — never advances.
+
+    Catching here covers every escape path a job has (a state-file OSError
+    from the slot claim or finalize, an undecodable child stream out of
+    subprocess.run's text=True decoding, anything added later), which is
+    exactly why the guard is not buried in one of them. The individual
+    helpers keep their current semantics: in particular _save_state() still
+    raises, so a failed slot CLAIM still prevents the subprocess spawn.
+
+    KeyboardInterrupt and SystemExit are NOT subclasses of Exception and are
+    deliberately not caught — Ctrl-C must still stop the daemon.
+
+    Args:
+        job (Callable[..., Any]): The job to invoke. `schedule`'s
+            `.do(_guarded_job, job, *args, **kwargs)` forwards everything
+            after the first argument straight through to this call.
+        *args (Any): Positional arguments forwarded to `job`.
+        on_error (Any): The value to return when `job` raises. Defaults to
+            None. A one-shot job passes `schedule.CancelJob` here so that a
+            RAISING attempt still deregisters itself — `schedule` decides
+            that on the value returned from this wrapper, not on the identity
+            of the registered function. Keyword-only, so it can never collide
+            positionally with a job's own arguments; it does, however, RESERVE
+            that name — a future job function with its own `on_error` keyword
+            would have it consumed here instead of forwarded. Neither
+            `run_job` nor `_blind_retry` has one.
+        **kwargs (Any): Keyword arguments forwarded to `job`.
+
+    Returns:
+        Any: Whatever `job` returned, or `on_error` if it raised. The raising
+            case is logged once, with traceback, at ERROR level.
+    """
+    try:
+        return job(*args, **kwargs)
+    except Exception:
+        # Deliberately says only what is true of BOTH registrations: the
+        # recurring weekly job is rescheduled for its next Monday, while a
+        # raising blind retry is deregistered by on_error=CancelJob and
+        # its retry chain for this slot ends. Claiming "the next scheduled
+        # fire is unaffected" would read, after a failing retry, as though
+        # another retry were still queued.
+        logging.exception(
+            "Scheduled job %s raised — this attempt is abandoned; "
+            "the daemon keeps polling.",
+            getattr(job, "__name__", job),
+        )
+        return on_error
+
+
 def run_job(retries: int = 0) -> None:
     """
     Execute a single production arbitrage bot run as an isolated subprocess.
@@ -392,7 +480,17 @@ def run_job(retries: int = 0) -> None:
     re-enters this function with `retries` incremented. The cap lives HERE,
     not in the caller: a retried run that exits 30 again schedules its own
     successor, so SCHEDULER_BLIND_MAX_RETRIES can only be enforced by the
-    argument each attempt carries.
+    argument each attempt carries. That retry is registered through
+    _guarded_job with on_error=schedule.CancelJob, so an attempt that RAISES
+    still deregisters itself instead of becoming a recurring job that never
+    advances the count (DR-59).
+
+    This function may raise: the slot CLAIM's _save_state() sits outside the
+    try below, the finalizing _save_state() sits after it, and
+    subprocess.run(..., text=True) decodes the child's streams strictly. That
+    is deliberate — a failed claim must prevent the spawn — and it is why
+    every registration of this function goes through _guarded_job(), which
+    keeps an escaping exception from freezing the job's next_run (DR-59).
 
     Args:
         retries (int): How many blind-run retries have already been spent on
@@ -473,8 +571,15 @@ def run_job(retries: int = 0) -> None:
             # One-shot job on the schedule library's global scheduler; it
             # cancels itself when it fires (see _blind_retry), and the next
             # attempt decides for itself whether to schedule another.
+            # Registered through _guarded_job with on_error=CancelJob so a
+            # RAISING retry still deregisters itself (DR-59): `schedule`
+            # cancels on the value RETURNED to it, and a retry that raises
+            # returns nothing — it would stay registered, re-fire every poll
+            # tick, and never advance the SCHEDULER_BLIND_MAX_RETRIES count,
+            # which rides solely on the `retries` argument below.
             schedule.every(SCHEDULER_BLIND_RETRY_SECONDS).seconds.do(
-                _blind_retry, retries + 1
+                _guarded_job, _blind_retry, retries + 1,
+                on_error=schedule.CancelJob,
             )
         else:
             logging.error(
@@ -638,6 +743,13 @@ def main() -> None:
     every Monday at 09:00, then enters an infinite polling loop checking for
     pending jobs every 60 seconds.
 
+    The weekly job is registered through _guarded_job() (DR-59), so an
+    exception escaping run_job() cannot leave next_run in the past and make
+    the poll loop below re-enter a production trading run on every 60-second
+    tick. The loop's own "Scheduler tick raised" handler keeps the daemon
+    alive but does NOT reschedule the job that raised — only the wrapper
+    returning normally does that.
+
     Note: the catch-up check means the very first daemon start after BS-17
     was added will always trigger an immediate prod run, since
     scheduler_state.json does not yet exist on that first start.
@@ -653,8 +765,12 @@ def main() -> None:
     # DR-24) can't exit the process before the weekly job is registered.
     _startup_catch_up()
 
-    # Register run_job() to fire every Monday at 09:00 local time
-    schedule.every().monday.at("09:00").do(run_job)
+    # Register run_job() to fire every Monday at 09:00 local time, through
+    # _guarded_job so an exception escaping the job can never freeze its
+    # next_run in the past and turn the weekly fire into a once-per-poll-tick
+    # fire (DR-59). schedule.Job.run() reschedules only AFTER job_func()
+    # RETURNS, and the poll loop below swallows the raise and keeps polling.
+    schedule.every().monday.at("09:00").do(_guarded_job, run_job)
 
     python_path  = sys.executable
     project_path = str(PROJECT_ROOT)
@@ -673,9 +789,12 @@ def main() -> None:
         try:
             schedule.run_pending()
         except Exception:
-            # The subprocess isolates bot crashes, but a host-level failure
-            # (e.g. the spawn itself raising) must not kill the daemon —
-            # log it and keep waiting for the next scheduled run.
+            # Since DR-59 every job body is caught by _guarded_job, so what
+            # reaches here is a failure in the scheduling machinery itself
+            # (run_pending's own bookkeeping, a reschedule). That must not
+            # kill the daemon — log it and keep waiting. Note this handler
+            # keeps the daemon alive but does NOT reschedule anything; that
+            # is exactly why the guard exists at the registration sites.
             logging.exception("Scheduler tick raised — daemon continues")
         time.sleep(60)
 

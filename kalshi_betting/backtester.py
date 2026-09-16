@@ -16,7 +16,8 @@ Purpose:
 Dependencies:
     Imports time_series_group_key (the single definition of the time-series
     grouping key, shared with the live scanner), event_series (the single
-    definition of an event's series prefix, so the live and backtest
+    definition of an event's series IDENTITY — the literal prefix, with every
+    combo (KXMVE*) prefix collapsed onto one family — so the live and backtest
     one-series rules can never disagree) and leg_sides from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
@@ -698,6 +699,11 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
     """
     Dict-world mirror of scanner._same_series over cached market records.
 
+    Resolves the series through the same scanner.event_series the live path
+    uses, so the collapse of every combo (KXMVE*) prefix onto one family
+    applies here identically: two combo tickets share a series while sharing no
+    literal prefix (DR-55).
+
     Fails CLOSED like the live helper: an absent or unreadable event_ticker on
     either side reads as the same series, so a pair whose fixture identity
     cannot be established is refused rather than replayed on the 95%
@@ -708,8 +714,8 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
         mB (dict): A second market dict, same form.
 
     Returns:
-        bool: True when both series prefixes are equal, or when either is
-            unreadable.
+        bool: True when both records resolve to the same series, or when either
+            is unreadable.
     """
     sa, sb = event_series(mA.get("event_ticker")), event_series(mB.get("event_ticker"))
     return not sa or not sb or sa == sb
@@ -840,9 +846,10 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     series worded identically. No price filtering at this stage.
 
     The one-series rule (DR-02, DR-54) mirrors both live finders through
-    _same_series_dicts / _identical_wording_dicts: two events sharing a series
-    prefix are two instances of one recurring fixture, so identical wording
-    across them is one question about two DIFFERENT events. The 3-tuple
+    _same_series_dicts / _identical_wording_dicts: two events resolving to one
+    series are two instances of one recurring fixture, so identical wording
+    across them is one question about two DIFFERENT events. Two combo tickets
+    resolve to one series while sharing no literal prefix (DR-55). The 3-tuple
     (same-title) branch tests the series alone, because its group key already
     guarantees the wording is identical; the string (time-series) branch tests
     the conjunct, because there the wording is only date-stripped-equal and a
