@@ -166,6 +166,54 @@ LARGE_GROUP_WARN_THRESHOLD    = 1000
 # binary events in both modes, so live and backtest grouping keys match.
 INCLUDE_MVE_MARKETS           = True
 
+# Series-prefix FAMILY that scanner.event_series() collapses onto one series
+# (DR-55). Kalshi lists its multi-leg COMBO (parlay) markets under SEVERAL
+# series prefixes, not one. A combo ticket's wording names its legs but never
+# its date, so one wording recurs across fixture instances and two tickets with
+# identical leg wording are two DIFFERENT tickets — exactly the shape the
+# DR-02/DR-54 one-series rule exists to refuse. event_series() used to return
+# the LITERAL prefix, which DID refuse two combos listed under ONE KXMVE*
+# prefix; what it could not see was a pair spanning TWO of them, which read as
+# two different series and was priced on the 0.95 SAME_TITLE_CO_RESOLVE_PROB
+# co-resolution prior (and, identically worded, as a time-series pair).
+#
+# Census of backtest_cache/event_titles.json (3,996,906 keys, 2,444 distinct
+# prefixes), measured 2026-09-16. Reproduce with:
+#   python3 -c "import json,collections;c=collections.Counter(k.split('-')[0] for k in json.load(open('backtest_cache/event_titles.json')));print([(k,v) for k,v in c.most_common() if k.startswith('KXMVE')])"
+#   KXMVECROSSCATEGORY            2,960,840
+#   KXMVESPORTSMULTIGAMEEXTENDED    906,157
+#   KXMVECROSSCATEGORY0              94,230
+#   KXMVENBASINGLEGAME                   61
+# No KXMV* prefix exists in that file that is not also KXMVE*.
+#
+# The cross-prefix exposure is measured, not assumed. In
+# backtest_cache/live_days/2026-09-14.json.gz (9,009,087 records, 8,939,229 of
+# them KXMVE*), 10,643 distinct (event_title, title, subtitle) wordings appear
+# under TWO literal KXMVE prefixes — every one of them KXMVECROSSCATEGORY x
+# KXMVECROSSCATEGORY0. Those wordings form 26,072 cross-prefix market pairs, of
+# which 17,829 co-resolved and 8,243 settled DIFFERENTLY: a 68.4%
+# co-resolution rate against the 0.95 prior the same-title finder would have
+# priced them on.
+#
+# A FAMILY PREFIX rather than an enumerated allowlist, deliberately. Enumerating
+# the combo series would BE an allowlist, and the codebase's own prior belief
+# ("every combo sits under KXMVECROSSCATEGORY") was already such an allowlist
+# with one of the four entries — so an allowlist is exactly the artefact that
+# was measurably wrong here, and it rots every time Kalshi adds a combo series
+# (KXMVENBASINGLEGAME, 61 keys, does not appear in the 2026-09-14 day slice at
+# all — a family that is barely listed today and could be listed in bulk
+# tomorrow).
+# Over-collapsing is the SAFE direction because _same_series() only ever
+# REFUSES a pair: the worst case is a missed trade between two genuinely
+# independent KXMVE* series, or — where the refused pair was a group's best
+# candidate — a different, still-eligible runner-up promoted in its place,
+# never a trade priced on a premise that does not hold. The family literal is
+# deliberately narrow: prefix containment among ordinary series is common
+# (the same census holds KXART, KXARTISTSTREAMS and KXARTISTVS, which are
+# unrelated series), so this must not later be widened to KXMV or to a generic
+# containment rule.
+MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
+
 # Kalshi taker fee rate. The exact per-leg fee is:
 #   ceil(TAKER_FEE_RATE × n_contracts × price × (1 − price) × 100) / 100
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.

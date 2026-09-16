@@ -282,8 +282,9 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
     """DR-02 / DR-54 mirror: _extract_pairs refuses two events of ONE series.
 
     The rule is the live scanner's, applied to cached records through
-    backtester._same_series_dicts / _identical_wording_dicts, which derive the
-    series prefix from the same scanner.event_series the live path uses. Both
+    backtester._same_series_dicts / _identical_wording_dicts, which resolve the
+    series identity through the same scanner.event_series the live path uses —
+    including its collapse of every combo (KXMVE*) prefix onto one family. Both
     branches of _extract_pairs carry it: the 3-tuple (same-title) branch on the
     series alone, because the group key already guarantees identical wording,
     and the string (time-series) branch on the conjunct, because there the
@@ -324,10 +325,11 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         assert _extract_pairs(groups) == []
 
     def test_two_combo_events_are_rejected(self):
-        # Every MVE combo sits under KXMVECROSSCATEGORY, so two combos with
-        # identical leg wording are combos of DIFFERENT games. The prefix is
-        # the part before the FIRST hyphen, so the SHARD1 segment does not
-        # split these into two series.
+        # A combo ticket's wording names its legs but never its date, so one
+        # wording recurs across fixture instances and two tickets with
+        # identical leg wording are two DIFFERENT tickets. The prefix is the
+        # part before the FIRST hyphen, so the SHARD1 segment does not split
+        # these into two series.
         recs = [
             self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
                       "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
@@ -340,6 +342,46 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         ]
         assert _extract_pairs(_group_by_exact_title(recs)) == []
         assert _extract_pairs(_group_by_normalized_title(recs)) == []
+
+    def test_two_combo_events_of_two_kxmve_series_are_rejected(self):
+        # DR-55 mirror: the same wording listed under two DIFFERENT KXMVE*
+        # series. Kalshi lists combos under several prefixes, so the literal
+        # prefix read these as two series and both _extract_pairs branches
+        # formed the pair. scanner.event_series collapses the whole KXMVE
+        # family onto one series, and _same_series_dicts inherits that because
+        # it resolves through the same helper the live path uses.
+        recs = [
+            self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
+                      "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
+                      "Parlay", "2026-09-15T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+            self._rec("KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-S93FFD638F77-Y",
+                      "KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-S93FFD638F77",
+                      "Parlay", "2026-09-17T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+        ]
+        # Guard that the fixture is the shape the rule must catch: two literal
+        # prefixes, identical wording, one collapsed series.
+        assert (recs[0]["event_ticker"].split("-")[0]
+                != recs[1]["event_ticker"].split("-")[0])
+        assert backtester._identical_wording_dicts(recs[0], recs[1]) is True
+        assert backtester._same_series_dicts(recs[0], recs[1]) is True
+        assert _extract_pairs(_group_by_exact_title(recs)) == []
+        assert _extract_pairs(_group_by_normalized_title(recs)) == []
+
+    def test_a_non_mve_series_pair_is_untouched_by_the_family_collapse(self):
+        # GUARD on the collapse's blast radius: only KXMVE* collapses, so two
+        # ordinary series still read as different and still pair.
+        recs = [
+            self._rec("KXFEDDEC-26-T25", "KXFEDDEC-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+            self._rec("KXMVPAWARD-26-T25", "KXMVPAWARD-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+        ]
+        assert backtester._same_series_dicts(recs[0], recs[1]) is False
+        assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
 
     def test_two_different_series_asking_one_question_still_pair(self):
         recs = [

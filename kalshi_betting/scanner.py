@@ -41,11 +41,13 @@ Notes:
     title and differs only there — see time_series_group_key().
 
     Neither finder pairs two events of ONE series (event_series(): the ticker
-    prefix before the first "-") whose wording is identical. Two events of one
-    series are two instances of one recurring fixture — two ball games, two
-    15-minute price windows, two combos — so identical wording across them is
-    the same question about two DIFFERENT events, and neither the 95%
-    co-resolution prior nor the cumulative-deadline premise applies. Both
+    prefix before the first "-", with every combo (KXMVE*) prefix collapsed
+    onto one family — see config.MVE_SERIES_FAMILY_PREFIX) whose wording is
+    identical. Two events of one series are two instances of one recurring
+    fixture — two ball games, two 15-minute price windows, two combo tickets
+    whose wording names their legs but never their date — so identical wording
+    across them is the same question about two DIFFERENT events, and neither
+    the 95% co-resolution prior nor the cumulative-deadline premise applies. Both
     finders carry the rule because the same two tickers qualify for both; see
     _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
 
@@ -88,6 +90,7 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
+    MVE_SERIES_FAMILY_PREFIX,
     ORDER_API_VERSION,
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
@@ -709,31 +712,56 @@ def pair_key(market: Any) -> str:
 
 def event_series(event_ticker: Any) -> str:
     """
-    Return the series prefix of a Kalshi event ticker — the part before the first "-".
+    Return the series identity of a Kalshi event ticker — its prefix before the
+    first "-", except that every combo (KXMVE*) prefix collapses onto one family.
 
     Kalshi event tickers are a series prefix followed by the instance stamp, so
-    "KXNPBRFI-26SEP160500FUKORI" -> "KXNPBRFI" and
-    "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9" -> "KXMVECROSSCATEGORY". Two event
-    tickers that share a series are two instances of ONE recurring fixture (two
-    ball games, two 15-minute price windows, two combos), which is what makes
-    identical wording across them two different questions rather than one
-    question listed twice — see find_same_title_pairs and CLAUDE.md's
-    one-series gotcha (DR-02, DR-54).
+    "KXNPBRFI-26SEP160500FUKORI" -> "KXNPBRFI". Two event tickers that share a
+    series are two instances of ONE recurring fixture (two ball games, two
+    15-minute price windows, two combo tickets), which is what makes identical
+    wording across them two different questions rather than one question listed
+    twice — see find_same_title_pairs and CLAUDE.md's one-series gotcha
+    (DR-02, DR-54).
+
+    Kalshi lists its multi-leg COMBO (parlay) markets under several prefixes,
+    all beginning config.MVE_SERIES_FAMILY_PREFIX ("KXMVE"). The literal prefix
+    did refuse two combos listed under ONE of them, but split the family into
+    four, so a pair spanning TWO combo prefixes was never seen by the
+    one-series rule (DR-55). Any prefix in that family therefore answers with
+    the family name, collapsing them onto one series:
+
+        "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9"       -> "KXMVE"
+        "KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-S93FF..." -> "KXMVE"
+
+    That is deliberately an over-collapse: a combo ticket's wording names its
+    legs but never its date, so two identically-worded tickets are two
+    different tickets whichever KXMVE* series they were listed under, and
+    _same_series() only ever REFUSES pairs — see
+    config.MVE_SERIES_FAMILY_PREFIX for the census and the measured
+    cross-prefix co-resolution rate behind the family rule, and for why an
+    allowlist was rejected.
 
     Args:
         event_ticker (Any): The market's event_ticker. Anything that is not a
             str is read as unknown.
 
     Returns:
-        str: The prefix before the first "-", stripped of surrounding
-            whitespace and upper-cased. "" for an empty, all-whitespace,
-            hyphen-leading or non-string ticker — every shape _same_series then
-            reads as an unknown series and fails closed on. A hyphen-less
-            ticker is its own series (returned stripped and upper-cased).
+        str: config.MVE_SERIES_FAMILY_PREFIX when the ticker's prefix starts
+            with it; otherwise the prefix before the first "-", stripped of
+            surrounding whitespace and upper-cased. "" for an empty,
+            all-whitespace, hyphen-leading or non-string ticker — every shape
+            _same_series then reads as an unknown series and fails closed on. A
+            hyphen-less ticker is its own series (returned stripped and
+            upper-cased, and collapsed to the family if it is a KXMVE* one).
     """
     if not isinstance(event_ticker, str):
         return ""
-    return event_ticker.split("-", 1)[0].strip().upper()
+    prefix = event_ticker.split("-", 1)[0].strip().upper()
+    # One family for every combo series: their literal prefixes differ, but two
+    # identically-worded combo tickets are different tickets regardless (DR-55).
+    if prefix.startswith(MVE_SERIES_FAMILY_PREFIX):
+        return MVE_SERIES_FAMILY_PREFIX
+    return prefix
 
 
 def _identical_wording(mA: Any, mB: Any) -> bool:
@@ -768,8 +796,12 @@ def _identical_wording(mA: Any, mB: Any) -> bool:
 
 def _same_series(mA: Any, mB: Any) -> bool:
     """
-    True when two markets' event tickers share a series prefix, or either prefix
-    is unknown.
+    True when two markets' event tickers resolve to the same series, or either
+    series is unknown.
+
+    The series is event_series()'s verdict, not a literal prefix match: every
+    combo (KXMVE*) prefix collapses onto one family, so two combo tickets share
+    a series while sharing no literal prefix (DR-55).
 
     Fails CLOSED: a pair whose fixture identity cannot be read (an empty or
     non-string event_ticker on either side) reads as the same series and is
@@ -781,8 +813,8 @@ def _same_series(mA: Any, mB: Any) -> bool:
         mB (Any): Second market object, same shape.
 
     Returns:
-        bool: True when both series prefixes are equal, or when either is
-            unreadable.
+        bool: True when both markets resolve to the same series, or when either
+            is unreadable.
     """
     sa, sb = event_series(mA.event_ticker), event_series(mB.event_ticker)
     return not sa or not sb or sa == sb
@@ -1896,10 +1928,11 @@ def find_time_series_pairs(
       2. Different event_tickers (rules out multi-choice options in the same event)
       3. NOT identical wording across two events of one series: when the raw
          (title, subtitle, event title) triple matches on both legs AND the two
-         event tickers share a series prefix, the deadline lives outside the
-         wording entirely, so these are two instances of one recurring fixture
-         rather than one question at two deadlines and there is no
-         cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
+         event tickers resolve to one series (_same_series, which collapses
+         every combo (KXMVE*) prefix onto one family — DR-55), the deadline
+         lives outside the wording entirely, so these are two instances of one
+         recurring fixture rather than one question at two deadlines and there
+         is no cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
          refuses the same shape; if only it did, this finder would simply
          relabel the pair as a time-series bet and main._dedup_pairs — which
          drops the time-series copy only when a same-title copy exists — would
