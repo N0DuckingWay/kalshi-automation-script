@@ -148,7 +148,7 @@ backtest.py (CLI)
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its outflow as a real daily return and a real drawdown. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, trade diagnostics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount` and `--no-sweep`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
-| `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. Never imported by the pipeline. |
+| `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. A 2xx order body that is not a JSON object is a clean FAIL that still reads the position and names what to flatten, never a traceback out of the fill readers (DR-58). Never imported by the pipeline. |
 
 ### Order API version
 
@@ -262,6 +262,17 @@ top-of-grid bid to the 0.01 contracts just opened. For the same reason, a positi
 reads exactly 0 straight after a reported full fill is re-read once, one second later,
 before the probe judges the sign: an unmoved ledger is usually read-after-write lag, not
 disproof.
+
+A 2xx response body that is not a JSON object at all (`"accepted"`, `[]`, `123`, `true`,
+`null`) is a FAIL, not a crash. Both fill readers call `.get()` on the body, so such a
+response used to raise an uncaught `AttributeError` immediately after a real order had
+been submitted — no position read, no warning, and a real position left open with nothing
+to tell the operator it existed. Both submission steps now print a FAIL naming the body
+type, read the position (re-reading once when the first read is flat *or* unreadable, so
+"flat", "open" and "could not read" stay distinguishable), and say exactly what to flatten
+in the Kalshi UI. The reduce-only close is deliberately *not* submitted: it rests on the
+mapping the unreadable body proves nothing about, so the position is left for a human,
+exactly as a disproven mapping leaves it.
 
 ### Dev dry-run (sandbox simulation, no real orders)
 

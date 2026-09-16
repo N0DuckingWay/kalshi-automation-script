@@ -591,6 +591,138 @@ class TestUnfillableAskStep:
         assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._FAIL
 
 
+class TestNonObjectOrderBody:
+    """DR-58: a 2xx order body that is not a JSON object must FAIL cleanly.
+
+    _fill_counts and _report_fee both call data.get(...), so a body of
+    "accepted" / [] / 123 / true / null raised an uncaught AttributeError
+    IMMEDIATELY AFTER A REAL ASK HAD BEEN SUBMITTED — the probe died on a
+    traceback with no position read, no reduce-only close and no
+    flatten-it-manually warning, leaving a real position open with nothing to
+    tell the operator it existed. Same reading trader._execute_transfer takes
+    of a non-object 2xx transfer body (DR-05); the trader.py ORDER readers
+    deliberately keep raising, because _execute_one resolves them against the
+    position delta, and nothing like _execute_one sits above the probe.
+    """
+
+    # Every shape _http.signed_request_json can hand back from a 2xx that is
+    # not a JSON object. `None` is the literal `null` body; 1.5 is a bare JSON
+    # number that is not an int, so the matrix covers both numeric spellings.
+    _NON_OBJECT_BODIES = ["accepted", [], 123, 1.5, True, None]
+
+    @staticmethod
+    def _arm(monkeypatch, response, reads: list):
+        """Hand `response` back from the submission seam and script the position
+        reads.
+
+        Returns (submitted bodies, observed reads, sleep durations) so a test
+        can assert that the position really was looked up, that the extra
+        re-read happened only when the first read was flat or unreadable, and
+        that the step stopped before any further submission.
+        """
+        submitted: list = []
+
+        def post(client, method, path, *, query=None, body=None):
+            submitted.append(body)
+            return response
+
+        monkeypatch.setattr(v2_probe, "signed_request_json", post)
+
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return submitted, observed, slept
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    def test_no_mapping_fails_and_checks_the_account(self, body, monkeypatch, capsys):
+        # start flat, then the guard's own read finds the position the
+        # unreadable response may have opened.
+        submitted, observed, _ = self._arm(monkeypatch, body, [0, -0.01])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        # The position WAS looked up — that lookup is the whole remedy.
+        assert observed == [0, -0.01]
+        # Only the opening ask went out: the close rests on a mapping this
+        # response proved nothing about.
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert type(body).__name__ in printed
+        assert "FLATTEN IT MANUALLY" in printed
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    def test_unfillable_ask_fails_and_checks_the_account(self, body, monkeypatch, capsys):
+        submitted, observed, _ = self._arm(monkeypatch, body, [0, -0.01])
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == [0, -0.01]
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert type(body).__name__ in printed
+        assert "FLATTEN IT MANUALLY" in printed
+
+    def test_a_flat_first_read_is_re_read_once_before_concluding(
+        self, monkeypatch, capsys,
+    ):
+        # DR-21's reasoning applies here too: a ledger that reads flat straight
+        # after a submission is usually lag, and the re-read is what surfaces
+        # the stranded position.
+        _, observed, slept = self._arm(monkeypatch, "accepted", [0, 0, -0.01])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, -0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
+
+    def test_a_persistently_flat_account_says_so_rather_than_warning(
+        self, monkeypatch, capsys,
+    ):
+        # Still a FAIL (nothing was proven), but the operator must be able to
+        # tell "flat" from "unreadable" and from "open".
+        _, observed, slept = self._arm(monkeypatch, [], [0, 0, 0])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "nothing to flatten" in printed
+        assert "FLATTEN IT MANUALLY" not in printed
+
+    def test_an_unreadable_position_says_check_it_manually(self, monkeypatch, capsys):
+        # None is "the lookup failed", which must not be collapsed into "flat".
+        _, observed, slept = self._arm(monkeypatch, 123, [0, None, None])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, None, None]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "CHECK IT MANUALLY" in printed
+        assert "nothing to flatten" not in printed
+
+    def test_a_nonzero_first_read_is_not_re_read(self, monkeypatch):
+        # A ledger that already moved is evidence; don't spend a second read.
+        _, observed, slept = self._arm(monkeypatch, True, [0, -0.01])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, -0.01]
+        assert slept == []
+
+    def test_a_genuine_json_object_body_is_untouched(self, submits):
+        # The guard must not disturb the normal path: a real object body still
+        # opens, confirms and closes the position exactly as before.
+        client = probe_client([0, -0.01, 0])
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        assert [b["body"]["side"] for b in submits] == ["ask", "bid"]
+
+    def test_a_genuine_json_object_kill_body_is_untouched(self, monkeypatch):
+        monkeypatch.setattr(v2_probe, "signed_request_json", lambda *a, **k: KILLED)
+        client = probe_client([0, 0])
+        assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._PASS
+
+
 def shard_statuses(transfers_active: bool = True, shards: tuple = (0, 1)) -> dict:
     """Parsed fetch_shard_statuses shape for the transfer step."""
     return {
