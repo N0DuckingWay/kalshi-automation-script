@@ -220,7 +220,11 @@ falls back to `kalshi_private_key.pem` when it's absent.
   backtest_cache/                ← Disk cache for historical data
     settled_markets_*.json        ← Assembled market list, keyed by start date (and by
                                     eligibility-filter tag when the backtester filters
-                                    during assembly, so subsets never mix with full lists)
+                                    during assembly, so subsets never mix with full lists,
+                                    and by a trailing `_nomve` when INCLUDE_MVE_MARKETS is
+                                    False, since that flag changes which markets are
+                                    fetched at all — the default True keeps the unmarked
+                                    name, so existing caches stay valid)
     event_titles.json             ← Cross-run event-title accumulator (merged, not overwritten)
     archive_days/                 ← Per-created-day archive slices (incremental/resumable)
     live_days/                    ← Per-settled-day recent-market slices (incremental/resumable)

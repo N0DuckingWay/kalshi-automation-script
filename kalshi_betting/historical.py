@@ -2358,9 +2358,15 @@ def fetch_all_settled_markets(
     fully-elapsed UTC days whose settlements are immutable — the current
     (frontier) day is always refetched.
 
-    The assembled result is serialized to a JSON cache file keyed by
-    start_date so subsequent backtests skip fetching entirely. Pass
-    use_cache=False (--no-cache) to rebuild it — thanks to the day stores
+    The assembled result is serialized to a JSON cache file named
+    settled_markets_<start_date>[_<prefilter_tag>][_nomve].json, so subsequent
+    backtests skip fetching entirely. Every component of that name is part of
+    the result's identity: the prefilter tag because a filtered result is a
+    strict subset, and the _nomve marker because INCLUDE_MVE_MARKETS changes
+    which markets are fetched at all (DR-57). Only the False case is marked —
+    every assembled cache already on disk was built with MVE included, so the
+    default (True) filename is unchanged and no existing cache is orphaned.
+    Pass use_cache=False (--no-cache) to rebuild it — thanks to the day stores
     that now only costs the frontier day plus any newly-appeared days. A
     fresh result is always written back regardless of use_cache, so a
     --no-cache run refreshes what the next default run will load.
@@ -2412,7 +2418,22 @@ def fetch_all_settled_markets(
     # otherwise a filtered cache could be served to an unfiltered caller (or a
     # cache built under different filter semantics silently reused).
     suffix = f"_{prefilter_tag}" if prefilter_tag else ""
-    cache_path = CACHE_DIR / f"settled_markets_{start_date.isoformat()}{suffix}.json"
+    # DR-57: INCLUDE_MVE_MARKETS changes WHAT IS FETCHED (it adds
+    # mve_filter="exclude" to the archive query and to every live page), so it
+    # is part of the assembled cache's identity exactly as prefilter_tag is —
+    # without it a run configured to EXCLUDE MVE is served an MVE-INCLUSIVE
+    # assembly (~99.7% combo markets in practice) and reports results over a
+    # universe its own config excludes, with nothing abnormal in the output.
+    # Only the False case is marked: every assembled cache currently on disk
+    # was built with MVE included, so leaving the True case unmarked keeps
+    # those filenames valid and avoids triggering a multi-hour refetch. The
+    # per-day slice stores need no such marker — their meta already carries
+    # include_mve (see _fetch_archive_phase / _fetch_live_phase), so a flip
+    # invalidates them on the existing gate; their PATHS are not flag-keyed,
+    # so each flip refetches and overwrites them.
+    mve_suffix = "" if INCLUDE_MVE_MARKETS else "_nomve"
+    cache_path = (CACHE_DIR /
+                  f"settled_markets_{start_date.isoformat()}{suffix}{mve_suffix}.json")
     if use_cache:
         cached = _load_json_cache(cache_path)
         if cached is not None:

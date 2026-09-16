@@ -162,6 +162,10 @@ LARGE_GROUP_WARN_THRESHOLD    = 1000
 # option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive
 # into a same-title or time-series pair. When False, mve_filter="exclude" is passed
 # to all market-fetch APIs, the backtester's MVE event-title listing is skipped,
+# the assembled backtest cache filename gains a trailing "_nomve" marker (DR-57 —
+# the flag changes WHAT IS FETCHED, so a cache built under one setting must never
+# be served to a run under the other; only the False case is marked, so the
+# default True keeps the pre-DR-57 filename and no cached assembly is orphaned),
 # and the bot operates only on binary events. Event titles are still resolved for
 # binary events in both modes, so live and backtest grouping keys match.
 INCLUDE_MVE_MARKETS           = True
@@ -633,8 +637,13 @@ TRADER_MAX_WORKERS = 8
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
 # markets are dropped during assembly instead of being held in memory and
 # written to the assembled cache. The tag is part of that cache's filename
-# (settled_markets_<start_date>_<tag>.json), so a cache built under one filter
-# can never be served to code expecting another.
+# (settled_markets_<start_date>_<tag>[_nomve].json — the trailing marker is
+# INCLUDE_MVE_MARKETS=False's, DR-57), so a cache built under one filter can
+# never be served to code expecting another. Because that marker is a bare
+# suffix rather than a delimited field, a tag ending in "_nomve" would collide
+# with the same tag minus the suffix under the other flag setting; harmless
+# while the tag is this single hand-edited constant, worth a delimiter if tags
+# ever become caller-supplied.
 #
 # MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
 # stale prefiltered cache is silently reused and the backtest sees a market set
