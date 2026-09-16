@@ -148,7 +148,7 @@ backtest.py (CLI)
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs, scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its outflow as a real daily return and a real drawdown. |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, trade diagnostics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount` and `--no-sweep`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
-| `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Never imported by the pipeline. |
+| `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. Never imported by the pipeline. |
 
 ### Order API version
 
@@ -246,6 +246,16 @@ position and a reduce-only `bid` must close it), fill-or-kill kill semantics, an
 inter-shard transfer's centicent unit — against the production account, for roughly one
 cent of worst-case exposure. Never wired into the pipeline; run it before trusting the
 V2 path unsupervised.
+
+What is being verified is a *side* mapping, not a price, so the closing bid is priced at
+the top of the market's own grid rather than at the rollback builder's loss floor. That
+floor is derived from the probe's placeholder entry and comes out at $0.62 on every
+market — a bid structurally killed on any market whose YES ask is above 62c, i.e. a FAIL
+unrelated to the mapping with a real position left open. `reduce_only` bounds the
+top-of-grid bid to the 0.01 contracts just opened. For the same reason, a position that
+reads exactly 0 straight after a reported full fill is re-read once, one second later,
+before the probe judges the sign: an unmoved ledger is usually read-after-write lag, not
+disproof.
 
 ### Dev dry-run (sandbox simulation, no real orders)
 
