@@ -73,11 +73,20 @@ Notes:
     the finalized record — there was no subprocess exit code to record — with
     finished_at still set to distinguish "attempted and ended" from "claimed,
     still running" (which only appears if the process was killed mid-run,
-    e.g. host reboot). main() calls the startup catch-up check
-    (_maybe_catch_up()) once, after logging is configured and before
-    registering the weekly schedule: the very first daemon start after this
-    feature was added will therefore always trigger an immediate prod run,
-    since scheduler_state.json does not yet exist.
+    e.g. host reboot). main() runs the startup catch-up check
+    (_startup_catch_up(), a logging-guarded wrapper around _maybe_catch_up())
+    once, after logging is configured and before registering the weekly
+    schedule: the very first daemon start after this feature was added will
+    therefore always trigger an immediate prod run, since
+    scheduler_state.json does not yet exist. _startup_catch_up() exists
+    because a corrupt-but-present `retries` in that file used to raise
+    TypeError out of _maybe_catch_up() (its `retries < ...` comparison)
+    before the weekly job was ever registered, exiting the daemon at
+    startup (DR-24) — _load_state now degrades a non-int `retries` to 0
+    with a WARNING before it gets there, and types `exit_code` the same
+    way for consistency, though a non-int `exit_code` only ever compared
+    unequal and never raised. _startup_catch_up() is the backstop for
+    whatever else _maybe_catch_up() might still raise.
 
     TS-01/VI-02 blind-run retry: EXIT_NO_TRADEABLE_SHARDS (30) means the run
     scanned NOTHING. main.py returns it for either of two causes (see
@@ -96,7 +105,10 @@ Notes:
     run_job's `retries` argument and persisted as the state file's optional
     "retries" key — the cap can only be enforced there, because a retry that
     exits 30 again schedules its own successor. A pre-existing state file has
-    no such key and reads as 0.
+    no such key and reads as 0; a PRESENT but non-int `retries` or `exit_code`
+    (a hand-edited file) is degraded by _load_state to that same 0 / unknown
+    reading with a WARNING rather than reaching this comparison unvalidated
+    (DR-24).
     An hourly cadence bounded at four attempts covers a typical maintenance
     window while keeping the scan near its intended Monday-morning slot; a
     longer interval would trade on stale morning pricing.
@@ -211,9 +223,24 @@ def _load_state() -> dict | None:
     known": a corrupt state file must not silently suppress the BS-17
     catch-up check.
 
+    The two optional numeric keys, `retries` and `exit_code`, get a WARNING
+    of their own (DR-24), but degrade IN PLACE rather than discarding the
+    whole state the way an unparseable `last_slot` does: a non-int `retries`
+    (a hand-edited string, `null`) is read as 0, and a present-but-non-int
+    `exit_code` is read as None. This closes a real crash: `_maybe_catch_up`
+    compares `retries` with `<`, so a corrupt value there used to raise
+    `TypeError` out of the daemon at startup before the weekly job was ever
+    registered. A corrupt `exit_code` never raised — it only ever compared
+    unequal to `EXIT_NO_TRADEABLE_SHARDS` via `==` — so typing it here is
+    hygiene, not a crash fix; it is validated anyway so the dict always
+    carries a typed value. A `retries` key that is simply ABSENT is
+    untouched by this and is still read as 0 by every caller's own
+    `.get("retries", 0)`.
+
     Returns:
         dict | None: The parsed state dict (guaranteed to have a parseable
-            `last_slot`), or None.
+            `last_slot`, and int-or-absent `retries` / int-or-None
+            `exit_code`), or None.
     """
     path = _state_file_path()
     if not path.exists():
@@ -242,6 +269,26 @@ def _load_state() -> dict | None:
             path, exc,
         )
         return None
+    # DR-24: `retries` is compared with `<` in _maybe_catch_up; a hand-edited
+    # string or null there used to raise TypeError out of main() before the
+    # weekly job was ever registered, killing the daemon at startup. A bad
+    # value degrades to "unknown" instead — bool is a subclass of int, so
+    # True/False are accepted as-is. `exit_code` is compared with `==`,
+    # which never raises on a type mismatch — its guard below is typing
+    # hygiene, not a crash fix, kept so the dict always carries a typed
+    # value.
+    if "retries" in state and not isinstance(state["retries"], int):
+        logging.warning(
+            "Scheduler state file %s has a non-integer retries (%r) — reading as 0",
+            path, state["retries"],
+        )
+        state["retries"] = 0
+    if state.get("exit_code") is not None and not isinstance(state["exit_code"], int):
+        logging.warning(
+            "Scheduler state file %s has a non-integer exit_code (%r) — reading as unknown",
+            path, state["exit_code"],
+        )
+        state["exit_code"] = None
     return state
 
 
@@ -284,7 +331,10 @@ def _save_state(
         "exit_code": exit_code,
         # Blind-run retry count for this slot (TS-01); absent in pre-existing
         # state files, which _load_state still accepts unchanged and every
-        # reader treats as 0.
+        # reader treats as 0 via `.get("retries", 0)` — _load_state now also
+        # degrades a PRESENT but non-int retries/exit_code to unknown
+        # (0 / None) with a WARNING (DR-24), but that validation never fires
+        # on this well-typed write.
         "retries": retries,
     }
     path = _state_file_path()
@@ -497,7 +547,10 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
     stale = state is None or datetime.fromisoformat(state["last_slot"]) < slot
     # A slot finalized by a blind run is not satisfied (TS-01): re-run it on
     # daemon start, under the same bounded retry count run_job applies. A
-    # pre-existing state file has no "retries" key, which reads as 0.
+    # pre-existing state file has no "retries" key, which reads as 0; a
+    # PRESENT but corrupt retries/exit_code has already been degraded to a
+    # typed value (0 / None) by _load_state (DR-24), so the `<` and `==`
+    # below never see anything but an int or None.
     blind = (
         state is not None
         and state.get("exit_code") == EXIT_NO_TRADEABLE_SHARDS
@@ -509,6 +562,30 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
             slot.isoformat(), "recorded" if stale else "successful (blind-run)",
         )
         run_job(retries=0 if stale else state.get("retries", 0) + 1)
+
+
+def _startup_catch_up() -> None:
+    """
+    Run _maybe_catch_up() and never let it take the daemon down.
+
+    main() calls this BEFORE registering the weekly job, so an exception
+    raised here used to propagate straight out of main() with nothing
+    scheduled — a corrupt-but-present `retries` in scheduler_state.json (a
+    raw string or null) reaching _maybe_catch_up's `retries < ...`
+    comparison was one way to trigger it (DR-24; _load_state now degrades
+    that case, and types `exit_code` alongside it, before they get here,
+    but this guard is the backstop for whatever else _maybe_catch_up might
+    still raise).
+    Extracted to its own function so the guard is testable without entering
+    main()'s infinite poll loop.
+
+    Returns:
+        None
+    """
+    try:
+        _maybe_catch_up()
+    except Exception:
+        logging.exception("Startup catch-up check raised — daemon continues")
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:
@@ -555,10 +632,11 @@ def main() -> None:
     """
     Entry point for the weekly scheduler daemon.
 
-    Configures logging, runs the BS-17 startup catch-up check (see
-    _maybe_catch_up()), registers run_job() to fire every Monday at 09:00,
-    then enters an infinite polling loop checking for pending jobs every 60
-    seconds.
+    Configures logging, runs the BS-17 startup catch-up check through
+    _startup_catch_up() (a guard around _maybe_catch_up() that logs and
+    continues instead of propagating — DR-24), registers run_job() to fire
+    every Monday at 09:00, then enters an infinite polling loop checking for
+    pending jobs every 60 seconds.
 
     Note: the catch-up check means the very first daemon start after BS-17
     was added will always trigger an immediate prod run, since
@@ -570,8 +648,10 @@ def main() -> None:
 
     # BS-17: catch up on a missed run before registering future ones, so a
     # daemon that was offline across a scheduled Monday 09:00 doesn't wait
-    # up to a week for the next fire.
-    _maybe_catch_up()
+    # up to a week for the next fire. Wrapped in _startup_catch_up so a
+    # raise here (e.g. a corrupt optional key in scheduler_state.json,
+    # DR-24) can't exit the process before the weekly job is registered.
+    _startup_catch_up()
 
     # Register run_job() to fire every Monday at 09:00 local time
     schedule.every().monday.at("09:00").do(run_job)
