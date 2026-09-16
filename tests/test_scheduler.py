@@ -658,6 +658,186 @@ class TestBlindRunRetry:
         assert claimed[0]["finished_at"] is None
 
 
+def _register_weekly_job_as_main_does():
+    """
+    Register the weekly job exactly as scheduler.main() does, due in the past.
+
+    main() itself spawns a real prod run and is never invoked by this suite, so
+    the registration it performs is reproduced here verbatim and its next_run
+    is pulled back one second so schedule.run_pending() fires it immediately.
+
+    Because this is a REPRODUCTION rather than a read of main(), the tests
+    built on it prove the guard WORKS, not that main() is wired to it — that
+    half is pinned on the source by
+    test_ast_weekly_job_is_registered_through_the_guard, and only that pin
+    fails if main() reverts to a bare `.do(run_job)`.
+
+    Returns:
+        schedule.Job: The registered, already-overdue weekly job.
+    """
+    job = schedule.every().monday.at("09:00").do(scheduler._guarded_job, scheduler.run_job)
+    job.next_run = datetime.now() - timedelta(seconds=1)
+    return job
+
+
+def _do_calls_in(func_name: str):
+    """
+    Collect every `<something>.do(...)` Call node inside one scheduler function.
+
+    Args:
+        func_name (str): The scheduler.py function to parse.
+
+    Returns:
+        list[ast.Call]: The `.do(...)` calls found, in source order.
+    """
+    tree = ast.parse(inspect.getsource(scheduler))
+    fn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == func_name
+    )
+    return [
+        sub for sub in ast.walk(fn)
+        if isinstance(sub, ast.Call)
+        and isinstance(sub.func, ast.Attribute)
+        and sub.func.attr == "do"
+    ]
+
+
+class TestGuardedJobRegistration:
+    """DR-59: schedule.Job.run() assigns last_run and calls
+    _schedule_next_run() only AFTER job_func() RETURNS, so any exception
+    escaping a job leaves next_run in the past. main()'s poll loop catches it
+    and keeps the daemon alive, but the job is still overdue — so it re-enters
+    on the very next 60 s poll tick, turning the weekly production trading run
+    into a once-a-minute one for as long as the fault persists. Every job is
+    therefore registered through _guarded_job()."""
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_state_write_failure_advances_next_run(self, mock_run, monkeypatch):
+        # _save_state's tmp+replace is the slot CLAIM, and it sits OUTSIDE
+        # run_job's try — so an OSError there escapes the job entirely.
+        mock_run.return_value = _completed(EXIT_OK)
+
+        def _failing_replace(self, target):
+            raise OSError("state write failed")
+
+        monkeypatch.setattr(scheduler.pathlib.Path, "replace", _failing_replace)
+        job = _register_weekly_job_as_main_does()
+
+        schedule.run_pending()  # must not raise
+
+        assert job.next_run > datetime.now()
+        assert not job.should_run, (
+            "an escaping exception must not leave the weekly job overdue — "
+            "that is what re-fires a prod run every 60 s poll tick"
+        )
+        # The claim raised before the spawn, so no prod run was attempted.
+        mock_run.assert_not_called()
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_unicode_decode_error_from_subprocess_run_is_contained(
+        self, mock_run, caplog,
+    ):
+        # subprocess.run(..., text=True) decodes the child's streams strictly,
+        # so one non-UTF-8 byte from the bot raises straight out of run_job.
+        mock_run.side_effect = UnicodeDecodeError(
+            "utf-8", b"\xff", 0, 1, "invalid start byte",
+        )
+        job = _register_weekly_job_as_main_does()
+
+        with caplog.at_level(logging.ERROR):
+            schedule.run_pending()  # must not raise
+
+        assert job.next_run > datetime.now()
+        assert not job.should_run
+        assert any(
+            "Scheduled job run_job raised" in r.getMessage() for r in caplog.records
+        )
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_raising_blind_retry_still_cancels_itself(self, mock_run):
+        # A retry signals "run me once" by RETURNING schedule.CancelJob; one
+        # that raises returns nothing, so without on_error it would stay
+        # registered, re-fire every poll tick, and never advance the
+        # SCHEDULER_BLIND_MAX_RETRIES count the `retries` argument carries.
+        mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
+        scheduler.run_job()
+        assert len(schedule.jobs) == 1
+
+        schedule.jobs[0].next_run = datetime.now() - timedelta(seconds=1)
+        with patch(
+            "kalshi_betting.scheduler.run_job", side_effect=OSError("disk write failed"),
+        ) as mock_run_job:
+            schedule.run_pending()  # must not raise
+
+        mock_run_job.assert_called_once_with(retries=1)
+        assert schedule.jobs == [], (
+            "a blind retry that RAISES must still deregister itself"
+        )
+
+    def test_guarded_job_forwards_arguments_and_return_value(self):
+        # .do(_guarded_job, job, *args, **kwargs) forwards everything after the
+        # first argument through functools.partial, so the guard must be
+        # transparent on the healthy path.
+        seen = {}
+
+        def record(a, b, c=None):
+            seen.update({"a": a, "b": b, "c": c})
+            return "ok"
+
+        assert scheduler._guarded_job(record, 1, 2, c=3) == "ok"
+        assert seen == {"a": 1, "b": 2, "c": 3}
+
+    def test_guarded_job_returns_on_error_and_logs_once(self, caplog):
+        def boom():
+            raise OSError("nope")
+
+        with caplog.at_level(logging.ERROR):
+            assert scheduler._guarded_job(boom, on_error=schedule.CancelJob) is (
+                schedule.CancelJob
+            )
+
+        matches = [
+            r for r in caplog.records if "Scheduled job boom raised" in r.getMessage()
+        ]
+        assert len(matches) == 1
+        assert matches[0].exc_info is not None, "the traceback must be logged"
+
+    def test_guarded_job_default_on_error_is_none(self):
+        def boom():
+            raise ValueError("nope")
+
+        # The weekly job passes no on_error: a recurring job must NOT be
+        # cancelled by a failure, only rescheduled.
+        assert scheduler._guarded_job(boom) is None
+
+    def test_ast_weekly_job_is_registered_through_the_guard(self):
+        """DR-59: main() must register run_job through _guarded_job. main()
+        spawns a real prod run and is never invoked by this suite, so no
+        runtime test can reach this line — without the pin, an edit reverting
+        to `.do(run_job)` restores DR-59 with a green suite."""
+        calls = _do_calls_in("main")
+        assert len(calls) == 1, "main() should register exactly one job"
+        args = calls[0].args
+        assert isinstance(args[0], ast.Name) and args[0].id == "_guarded_job"
+        assert isinstance(args[1], ast.Name) and args[1].id == "run_job"
+
+    def test_ast_blind_retry_is_registered_through_the_guard_with_canceljob(self):
+        """DR-59: the blind retry must route through _guarded_job with
+        on_error=schedule.CancelJob, so a RAISING retry still deregisters
+        itself and the retry cap keeps advancing."""
+        calls = _do_calls_in("run_job")
+        assert len(calls) == 1, "run_job() should register exactly one retry"
+        call = calls[0]
+        args = call.args
+        assert isinstance(args[0], ast.Name) and args[0].id == "_guarded_job"
+        assert isinstance(args[1], ast.Name) and args[1].id == "_blind_retry"
+        on_error = next(k.value for k in call.keywords if k.arg == "on_error")
+        assert isinstance(on_error, ast.Attribute)
+        assert on_error.attr == "CancelJob"
+        assert isinstance(on_error.value, ast.Name) and on_error.value.id == "schedule"
+
+
 class TestSlotClaimAndFinalize:
     """run_job() claims the slot before spawning and finalizes it at the end
     of every exit path."""
