@@ -314,8 +314,9 @@ class SweepPoint:
         trades (list[BacktestTrade]): One record per entered pair, in
             entry-date order; empty if nothing was ever entered.
         equity_df (pd.DataFrame): Daily equity curve with columns
-            [date, portfolio_value, daily_return], flat at the initial balance
-            when trades is empty.
+            [date, portfolio_value, daily_return], opening one row before the
+            run's start_date at the initial balance and flat at it when trades
+            is empty.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1704,7 +1705,8 @@ def _simulate_at_discount(
     Args:
         raw_entries (list[dict]): _prepare_entries() output — one record per
             pair that produced an entry.
-        start_date (date): First date of the equity curve.
+        start_date (date): First trading date of the window; the equity curve
+            _build_equity_curve returns opens one row earlier than this.
         initial_balance (float): Simulated starting cash balance in dollars.
         k (float | None): Interval-discount override in [0, 1], handed to
             config.time_series_profit_prob for every time-series candidate.
@@ -2369,8 +2371,9 @@ def run_backtest(
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
             trades is one BacktestTrade per entered pair, in entry-date order
             (empty if none were ever entered). equity_df has columns
-            [date, portfolio_value, daily_return], one row per day, flat at
-            initial_balance if trades is empty.
+            [date, portfolio_value, daily_return], one row per day from
+            start_date - 1 day (the untouched initial balance) through today,
+            flat at initial_balance if trades is empty.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2386,7 +2389,8 @@ def run_backtest(
         regardless of what the fetch would return, so the fetch is skipped
         entirely, that helper returns None, and this returns the same
         empty-result shape as the zero-trade path ([], an equity curve flat at
-        initial_balance) with a WARNING logged.
+        initial_balance — for a future start_date, its leading row plus
+        start_date's own) with a WARNING logged.
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -2574,16 +2578,26 @@ def _build_equity_curve(
     treatment where capital is deployed on entry and returned at settlement,
     with each dollar counted exactly once.
 
+    The curve opens one day before start_date at the untouched initial balance,
+    so a trade entering on start_date itself shows its outflow as a real
+    pct_change and a real decline from the cummax peak. Without that leading row
+    the day-0 stake was invisible to both (DR-03), and the per-k sweep table's
+    iloc[0] base was the post-outflow balance while the performance card's base
+    was initial_balance — one run reported two ways on one page.
+
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
             exit_date, total_cost, and actual_payoff populated.
-        start_date (date): The first date of the equity curve (initial balance day).
+        start_date (date): The first TRADING date of the window; the curve opens
+            one row earlier, on start_date - 1 day, at the untouched initial
+            balance.
         initial_balance (float): Starting portfolio value in dollars.
 
     Returns:
-        pd.DataFrame: DataFrame with one row per calendar day from start_date to
-            today (UTC) — and, when start_date is itself in the future, exactly
-            one row for start_date — with columns:
+        pd.DataFrame: DataFrame with one leading row for start_date - 1 day at
+            the initial balance, followed by one row per calendar day from
+            start_date to today (UTC) — and, when start_date is itself in the
+            future, exactly those two rows — with columns:
             - "date" (date): Calendar date.
             - "portfolio_value" (float): Cumulative portfolio value in dollars.
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
@@ -2598,9 +2612,21 @@ def _build_equity_curve(
     # Floored at 1: a start_date after today (reachable through run_backtest /
     # run_backtest_sweep, whose Monday-feasibility short-circuit builds an empty
     # curve for whatever window it was handed) makes the raw span zero or
-    # negative, leaving pd.DataFrame([]) with no columns at all.
+    # negative. The leading row below already keeps the frame from being the
+    # column-less pd.DataFrame([]), so the floor is what guarantees start_date
+    # itself is on the axis — the documented future-window shape is exactly the
+    # leading row plus start_date.
     span_days = max((today - start_date).days + 1, 1)
-    dates = [start_date + timedelta(days=i) for i in range(span_days)]
+    # The curve opens one day BEFORE start_date at the untouched initial
+    # balance. start_date itself can carry a Monday-09:00 entry (the default
+    # 2024-01-01 is a Monday), and applying that day's outflow to the FIRST
+    # row hid the entire day-0 stake from pct_change and cummax: max drawdown
+    # 0.0% and Sortino 0.00 on a run that lost 99.98% on day one, and the
+    # per-k table's "opening" was the post-outflow balance (DR-03). No trade
+    # can enter before start_date, so the leading row is always flat.
+    dates = [start_date - timedelta(days=1)] + [
+        start_date + timedelta(days=i) for i in range(span_days)
+    ]
 
     # Accumulate cash inflows and outflows per date
     cash_changes: dict[date, float] = defaultdict(float)
@@ -2618,6 +2644,8 @@ def _build_equity_curve(
         rows.append({"date": d, "portfolio_value": cash})
 
     df = pd.DataFrame(rows)
-    # Compute fractional daily returns; the first row has no prior day so it gets 0.0
+    # Compute fractional daily returns; the leading initial-balance row has no
+    # prior day so it gets 0.0, and start_date's own row is the first one that
+    # can show a day-0 outflow as a real return.
     df["daily_return"] = df["portfolio_value"].pct_change().fillna(0.0)
     return df

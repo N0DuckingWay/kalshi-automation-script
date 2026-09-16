@@ -2045,15 +2045,27 @@ class TestEquityCurveFutureStartDate:
             lambda *a, **k: pytest.fail("fetch must be skipped for a future window"),
         )
 
-    def test_build_equity_curve_emits_one_row_for_a_future_start(self):
+    def test_build_equity_curve_emits_two_rows_for_a_future_start(self):
+        """Re-pinned from "one row" (DR-03): _build_equity_curve now opens every
+        curve one day BEFORE start_date at the untouched initial balance, so the
+        floored span produces the leading row plus start_date's own — two rows,
+        not one. The old single-row expectation described the curve that hid a
+        day-0 entry's outflow from pct_change and cummax; nothing about the
+        future-window guarantee this class exists for changed (the frame still
+        has its three columns and is still readable by .iloc).
+        """
         df = backtester._build_equity_curve([], self._FUTURE_START, 1234.0)
 
         assert list(df.columns) == ["date", "portfolio_value", "daily_return"]
-        assert len(df) == 1
-        assert df["date"].iloc[0] == self._FUTURE_START
+        assert len(df) == 2
+        assert df["date"].iloc[0] == self._FUTURE_START - timedelta(days=1)
+        assert df["date"].iloc[1] == self._FUTURE_START
+        # Nothing can enter before start_date, and start_date is in the future,
+        # so both rows sit at the initial balance and neither moves.
         assert df["portfolio_value"].iloc[0] == pytest.approx(1234.0)
-        # No prior day to compare against, so the single row's return is flat.
+        assert df["portfolio_value"].iloc[1] == pytest.approx(1234.0)
         assert df["daily_return"].iloc[0] == pytest.approx(0.0)
+        assert df["daily_return"].iloc[1] == pytest.approx(0.0)
 
     def test_run_backtest_returns_the_empty_shape_for_a_future_start(self, monkeypatch):
         self._fetch_should_not_be_called(monkeypatch)
@@ -2086,6 +2098,157 @@ class TestEquityCurveFutureStartDate:
         assert list(result.primary.equity_df.columns) == [
             "date", "portfolio_value", "daily_return"]
         assert result.primary.equity_df["portfolio_value"].iloc[-1] == pytest.approx(2000.0)
+
+
+class TestEquityCurveOpensAtTheInitialBalance:
+    """A trade entering on start_date itself must show its outflow as a real
+    daily return and a real drawdown (DR-03).
+
+    The default backtest window starts on a Monday (--start-date 2024-01-01),
+    which is exactly the kind of day _find_entry can open a trade on, and the
+    curve used to apply that day's outflow to its FIRST row. pct_change and
+    cummax both read the first row as the baseline, so the entire day-0 stake
+    was invisible: on this fixture the dashboard reported max drawdown 0.0% on a
+    run that lost 99.98% of its balance on day one, and the per-k sweep table
+    divided by the depleted opening (+133,804.3%) while the performance card
+    divided by initial_balance (-75.4%) — one run reported two ways on one page.
+
+    The fixture reproduces the 2026-09-15 dry-run sweep's shape: $10,000 in,
+    everything committed on start_date ($9,998.16 all-in across both legs of two
+    pairs), $2,462.00 back 29 days later, a closing portfolio of $2,463.84. It
+    takes two trades because one cannot do it: a BacktestTrade's winning
+    settlement pays its own contract count, and a pair's two leg prices sum to
+    less than $1, so a single winning trade always pays back MORE than it cost.
+    The big pair therefore settles in the time-series in-between cell (A=NO,
+    B=YES — both legs worthless, the whole stake lost) and the small one in the
+    never-by-B win cell (A=NO, B=NO — the NO on B pays n).
+    """
+
+    _START = date(2026, 6, 1)      # a Monday, comfortably in the past
+    _EXIT = date(2026, 6, 30)
+    _HOLDING_DAYS = (_EXIT - _START).days
+    _INITIAL = 10_000.0
+
+    # Winner: YES on the earlier leg at 0.15, NO on the later at 0.40.
+    _WIN_N, _WIN_PA, _WIN_NB = 2462, 0.15, 0.40
+    # Loser: YES at 0.25, NO at 0.30 — settles in the in-between cell.
+    _LOSS_N, _LOSS_PA, _LOSS_NB = 14850, 0.25, 0.30
+
+    def _trade(self, n: int, pA: float, nB: float, outcome_b: str,
+               payoff: float) -> backtester.BacktestTrade:
+        """One coherent time-series BacktestTrade.
+
+        The loss cell (outcome_b="yes") pays nothing; the never-by-B win cell
+        (outcome_b="no") pays n, the count of NO contracts held on market B.
+        Fees are the real two-leg taker fees at these prices, so the outflow the
+        equity curve subtracts is the one the backtester would have recorded.
+        """
+        cost = n * (pA + nB)
+        fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
+        profit = payoff - cost - fees
+        expected_payoff = n * (1.0 - pA - nB) - fees
+        return backtester.BacktestTrade(
+            pair_type="time_series",
+            ticker_a="TICK-A", ticker_b="TICK-B",
+            title_a="Will BTC exceed $80k by June?",
+            title_b="Will BTC exceed $80k by July?",
+            category="Crypto",
+            entry_date=self._START, exit_date=self._EXIT,
+            entry_pA=pA, entry_pB=0.60, entry_nA=1.0 - pA, entry_nB=nB,
+            n=n,
+            total_cost=cost, fees=fees,
+            outcome_a="no", outcome_b=outcome_b,
+            actual_payoff=payoff,
+            profit=profit,
+            profit_ratio=profit / (cost + fees),
+            monthly_profit_ratio=profit / (cost + fees) * 30 / self._HOLDING_DAYS,
+            kelly_fraction=0.2,
+            expected_payoff=expected_payoff,
+            slippage=profit - expected_payoff,
+            holding_days=self._HOLDING_DAYS,
+            balance_at_entry=self._INITIAL,
+            deadline_gap_days=7,
+        )
+
+    def _trades(self) -> list[backtester.BacktestTrade]:
+        return [
+            self._trade(self._LOSS_N, self._LOSS_PA, self._LOSS_NB,
+                        outcome_b="yes", payoff=0.0),
+            self._trade(self._WIN_N, self._WIN_PA, self._WIN_NB,
+                        outcome_b="no", payoff=float(self._WIN_N)),
+        ]
+
+    def _curve(self) -> pd.DataFrame:
+        return backtester._build_equity_curve(
+            self._trades(), self._START, self._INITIAL)
+
+    def test_the_fixture_commits_the_whole_balance_on_day_zero(self):
+        # Guards the numbers every other test in this class reads: both pairs
+        # enter on start_date for $9,998.16 all-in out of $10,000.
+        outflow = sum(t.total_cost + t.fees for t in self._trades())
+        assert outflow == pytest.approx(9998.16)
+        assert all(t.entry_date == self._START for t in self._trades())
+
+        # ...and that each leg's payoff is the cell the backtester would
+        # actually have paid, so the class docstring's settlement claims are
+        # checked rather than asserted: hand-written literals would stay green
+        # through a change to _settlement_receipt's time-series table.
+        for t in self._trades():
+            assert t.actual_payoff == backtester._settlement_receipt(
+                t.n, t.outcome_a, t.outcome_b, t.pair_type)
+
+    def test_leading_row_is_the_untouched_initial_balance(self):
+        eq = self._curve()
+
+        assert eq["date"].iloc[0] == self._START - timedelta(days=1)
+        assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
+        assert eq["daily_return"].iloc[0] == pytest.approx(0.0)
+
+    def test_day_zero_outflow_is_a_real_daily_return(self):
+        eq = self._curve()
+
+        # Row 1 is start_date: the whole stake left the portfolio that day.
+        assert eq["date"].iloc[1] == self._START
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(1.84)
+        assert eq["daily_return"].iloc[1] < 0
+        assert eq["daily_return"].iloc[1] == pytest.approx(-0.999816, abs=1e-6)
+
+    def test_max_drawdown_sees_the_day_zero_trough(self):
+        from kalshi_betting.dashboard import _max_drawdown
+
+        eq = self._curve()
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        assert max_dd == pytest.approx(-0.9998, abs=1e-4)
+        assert trough == self._START
+
+    def test_sweep_row_and_performance_card_report_one_return(self):
+        # _srow (inside _section_interval_discount) divides by the curve's
+        # iloc[0]; _section_performance divides by initial_balance. With the
+        # leading row those bases are the same number, so the two cells on one
+        # page can no longer disagree.
+        from kalshi_betting import dashboard
+
+        eq = self._curve()
+        final = float(eq["portfolio_value"].iloc[-1])
+        opening = float(eq["portfolio_value"].iloc[0])
+
+        assert final == pytest.approx(2463.84)
+        assert opening == pytest.approx(self._INITIAL)
+        assert (final - opening) / opening == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-9)
+
+        trades = self._trades()
+        point = backtester.SweepPoint(
+            k=TIME_SERIES_INTERVAL_PROB_DISCOUNT, trades=trades, equity_df=eq)
+        sweep = backtester.BacktestSweep(
+            primary=point, points=[point], calibration=None)
+
+        # Both render the same headline percentage, -75.4%.
+        assert "-75.4%" in dashboard._section_interval_discount(sweep)
+        assert "-75.4%" in dashboard._section_performance(
+            eq, trades, self._START, self._INITIAL)
 
 
 class TestDropCrossTypeDuplicates:
