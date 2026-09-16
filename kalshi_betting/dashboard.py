@@ -39,7 +39,7 @@ Notes:
 """
 import html
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -745,8 +745,9 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
         equity curve, using this module's existing helpers exactly as
         _section_performance calls them (_max_drawdown needs the date axis and
         returns a (drawdown, trough_date) pair, not a scalar). The return base
-        is the curve's opening value, which is the run's initial balance unless
-        a trade entered on the very first day of the window.
+        is the curve's opening value, which is always the run's initial balance:
+        _build_equity_curve opens every curve one day before start_date, before
+        any trade can have entered.
 
         Args:
             pt (backtester.SweepPoint): One simulated interval discount.
@@ -766,6 +767,11 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
             return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
                     f"<td style='padding:6px 16px; font-weight:{weight}'>{label}</td>"
                     f"<td style='padding:6px 16px;'>{len(pt.trades)}</td>{cells}</tr>")
+        # iloc[0] is the curve's leading pre-start_date row, i.e. the untouched
+        # initial balance — the same base _section_performance divides by — so
+        # this row's total return and the performance card's agree exactly. It
+        # used to be the post-outflow balance whenever a trade entered on
+        # start_date, which reported one run two ways on one page (DR-03).
         opening = float(eq["portfolio_value"].iloc[0])
         final = float(eq["portfolio_value"].iloc[-1])
         total_return = (final - opening) / opening if opening else 0.0
@@ -1025,7 +1031,14 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     Args:
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return].
-        start_date (date): Start date used for downloading benchmark data.
+        start_date (date): The backtest's first trading date. The benchmark
+            download opens one day earlier so its window starts on the equity
+            curve's leading row. The alignment is of the WINDOW only: that
+            leading row is flat by construction, while the S&P's first bar is a
+            live trading day, so when start_date - 1 is itself a trading day the
+            benchmark carries one extra day of market P&L the strategy cannot
+            have. yfinance serves trading days only, so the first S&P bar can
+            also land later than start_date - 1.
         initial_balance (float): Starting portfolio value in dollars.
 
     Returns:
@@ -1034,7 +1047,13 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     # Fetch S&P 500
     sp_raw = None
     try:
-        sp_raw = yf.download("^GSPC", start=start_date.isoformat(),
+        # One day earlier, so the benchmark's WINDOW opens on the same date as
+        # the strategy trace's leading flat row (see _build_equity_curve). Only
+        # the window aligns: that row is flat by construction while the S&P's
+        # first bar is a live trading day, so a start_date - 1 that is itself a
+        # trading day moves the normalization anchor by one bar. yfinance
+        # returns trading days only, so the first bar served can also be later.
+        sp_raw = yf.download("^GSPC", start=(start_date - timedelta(days=1)).isoformat(),
                              progress=False, auto_adjust=True)
     except Exception as e:
         logging.warning("Could not fetch S&P 500: %s", e)

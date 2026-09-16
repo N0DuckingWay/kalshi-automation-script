@@ -152,7 +152,11 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     Legs are rendered in MARKET order (A then B) with the side bought on each
     market next to its count — e.g. "5× YES(A) + 5× NO(B)" for a time-series
     pair, "5× NO(A) + 5× YES(B)" for a same-title pair. The sides come from
-    scanner.leg_sides, never from the pair type by hand. "profit if won" is
+    scanner.leg_sides, never from the pair type by hand. Each line also names
+    both tickers: a time-series pair's canonical title now ends with the
+    outcome label (scanner.time_series_group_key) and the 55-character cut
+    applied below drops it, so two strikes of one daily family would otherwise
+    log an identical line (DR-17). "profit if won" is
     spec.min_payoff: the guaranteed floor for a same-title pair, and the
     profit in either winning settlement of a time-series pair (event by A, or
     never by B) — the in-between settlement loses the whole stake.
@@ -171,10 +175,15 @@ def _print_portfolio(portfolio: list, label: str) -> None:
         # Which side each market's leg buys — the only source of truth for sides
         side_a, side_b = leg_sides(spec.pair.pair_type)
         logging.info(
-            "  [%s] %s — %d× %s(A) + %d× %s(B) — "
+            "  [%s] %s (%s / %s) — %d× %s(A) + %d× %s(B) — "
             "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)",
             spec.pair.pair_type,
             spec.pair.canonical_title[:55],
+            # DR-17: the tickers identify the trade when the title cannot —
+            # the 55-character cut above drops the outcome label a time-series
+            # canonical title ends with, so two strikes of one daily family
+            # produced the same line in the review of a dry run
+            spec.pair.market_a.ticker, spec.pair.market_b.ticker,
             spec.x, side_a.upper(), spec.y, side_b.upper(),
             spec.total_cost_with_fees, spec.min_payoff,
             spec.profit_ratio * 100,
@@ -253,9 +262,14 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     """
     Log a formatted table of all qualifying candidate pairs to the log file.
 
-    Displays market titles, each leg's exchange shard, deadlines, prices —
-    both YES asks plus the NO ask of market B, which is the traded price of a
-    time-series pair's NO leg and reporting-only for a same-title pair —
+    Displays market titles, each leg's outcome label (the subtitle — the
+    discriminator that separates two strikes of one daily family; it gets its
+    own column because display_title appends it at the END and _truncate cuts
+    the title cells at 40 characters, so on any title that runs past 40 it is
+    the first thing dropped), each leg's exchange shard, deadlines, prices —
+    both YES asks
+    plus the NO ask of market B, which is the traded price of a time-series
+    pair's NO leg and reporting-only for a same-title pair —
     tradeability, and, for pairs selected in the portfolio, the computed trade
     (counts in MARKET order with the side bought on each market, from
     scanner.leg_sides), the profit if won (spec.min_payoff: a guaranteed floor
@@ -299,6 +313,12 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # option labels (e.g. "Trump", "Above $80k") carry their event context
             _truncate(display_title(pair.market_a)),
             _truncate(display_title(pair.market_b)),
+            # DR-17: the outcome label in its own cells — display_title
+            # appends it at the END, so _truncate's 40-character cut on the
+            # title cells above drops it first on any title that runs past 40
+            # characters, which the daily families this exists for all do
+            _truncate(getattr(pair.market_a, "subtitle", "") or "—", 24),
+            _truncate(getattr(pair.market_b, "subtitle", "") or "—", 24),
             # Which exchange shard each leg lives on — while the legacy order
             # path is in use (ORDER_API_VERSION="legacy") a pair spanning
             # shards is unexecutable (see trader._legacy_routable), so this
@@ -321,7 +341,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
 
     headers = [
         "Type",
-        "Market A", "Market B",
+        "Market A", "Market B", "Outcome A", "Outcome B",
         "Shards",
         "A Deadline", "B Deadline",
         "pA (YES)", "pB (YES)", "nB (NO)",

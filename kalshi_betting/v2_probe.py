@@ -20,7 +20,10 @@ Purpose:
     not merely a wrong price. This probe submits the smallest possible real
     orders built by the EXACT trader builders the live path uses
     (trader._build_no_order_v2, trader._build_rollback_order_v2) and reports
-    whether the account position moved the way the hypothesis predicts.
+    whether the account position moved the way the hypothesis predicts. What
+    it is verifying is a SIDE mapping, not a price, so the closing bid is
+    priced at the top of the market's own grid and crosses any resting YES ask
+    (see PRICE OVERRIDE below); reduce_only is what bounds it.
 
     STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is on by default
     (config.ORDER_API_VERSION = "v2") and does not wait for this probe. What
@@ -59,10 +62,24 @@ Notes:
     trader._Leg they are handed (rendered "<n>.00") because the bot sizes in
     whole contracts. The probe wants the V2 minimum of 0.01 contracts, so
     _no_buy_body() / _no_close_body() build the body through the real builders
-    on a real _Leg (_probe_leg: side "no", count 1) and then override the one
-    field — see the loud comment there. trader.py is deliberately NOT modified
-    for the probe's benefit: the thing being verified must stay byte-identical
-    to the thing that will run.
+    on a real _Leg (_probe_leg: side "no", count 1) and then override the
+    count — see the loud comment in _no_buy_body. trader.py is deliberately
+    NOT modified for the probe's benefit: the thing being verified must stay
+    byte-identical to the thing that will run.
+
+    PRICE OVERRIDE. _no_close_body() overrides a second field, the closing
+    bid's price, and _step_unfillable_ask overrides the same field on its own
+    body. The rollback builder prices a real unwind at a loss floor derived
+    from the leg's scanned entry, and the probe's placeholder entry of 0.5
+    makes that floor $0.62 on every market and every tick regime — a bid that
+    is structurally killed whenever the YES ask sits above 62c, which FAILed
+    the mapping gate for a reason unrelated to the mapping and left a real
+    position open (DR-04). The probe verifies a SIDE mapping, not a price, so
+    the close bids the top of the market's own grid instead
+    (trader._v2_top_of_grid_price: 0.99 on a linear-cent grid, 0.999 on
+    deci-cent, 0.9999 on a centi-cent edge band), exactly the level the
+    unfillable-ask step submits at. reduce_only=True is what bounds that bid:
+    it can only close the 0.01 contracts the probe just opened.
 
     SUBMISSION AND FILL READING. trader._submit_order_v2 classifies fills
     against `int(Decimal(body["count"]))`, which truncates the probe's
@@ -91,6 +108,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -270,18 +288,37 @@ def _no_buy_body(market: Any, no_price: float) -> dict:
 
 def _no_close_body(market: Any) -> dict:
     """
-    Build the reduce-only closing bid: the real rollback builder, 0.01 count.
+    Build the reduce-only closing bid: the real rollback builder, 0.01 count,
+    priced at the top of the market's own grid.
+
+    Everything that makes this body a CLOSE comes from
+    trader._build_rollback_order_v2 — side "bid" (trader._V2_LEG_SIDE's
+    "close_no"), reduce_only=True, time_in_force "fill_or_kill", the ticker and
+    the market's own exchange shard — so the probe verifies the real unwind
+    body rather than a reimplementation of it. TWO fields are then overridden:
+    the count (the V2 fractional minimum, see _no_buy_body) and the price. See
+    the module header's PRICE OVERRIDE note for why the builder's price cannot
+    be used here.
 
     Args:
         market (Any): The scanner.ApiMarket whose NO position is being closed.
 
     Returns:
         dict: The request body — trader._build_rollback_order_v2's output with
-            only the count overridden (see _no_buy_body for why).
+            the count and the price overridden.
     """
-    # Cross-module: the real unwind builder on a _Leg whose entry (0.5) only
-    # sets the loss floor of a bid the probe wants to fill regardless
     body = trader._build_rollback_order_v2(_probe_leg(market, 0.5))
+    # The real unwind builder fixes the SHAPE of the close (reduce-only YES
+    # bid, this market's shard; count overridden below). Its PRICE is a loss
+    # floor derived from the 0.5 placeholder entry — $0.62 on every market —
+    # and a bid at $0.62 is structurally killed whenever the YES ask is above
+    # it, which made the mapping gate FAIL for a reason unrelated to the
+    # mapping and left a real position open (DR-04). The probe wants a close
+    # that fills regardless of price at 0.01 contracts, so it bids the top of
+    # the market's own grid — the same LEVEL _step_unfillable_ask submits its
+    # deliberately unfillable ASK at, on the opposite side. reduce_only bounds
+    # the exposure to the held 0.01 contracts.
+    body["price"] = trader._format_price(trader._v2_top_of_grid_price(market))
     body["count"] = PROBE_COUNT_STR
     return body
 
@@ -392,13 +429,21 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
       3. Submit the NO-buy body built by trader._build_no_order_v2 (side "ask"
          per _V2_LEG_SIDE).
       4. Re-read the position. PASS half one iff it went NEGATIVE, which is
-         Kalshi's unified-ledger convention for a NO position. A POSITIVE
-         position means the hypothesis is WRONG — the ask opened YES exposure —
-         and the closing order is then NOT submitted, because its own mapping
+         Kalshi's unified-ledger convention for a NO position. A position of
+         exactly 0 after a reported full fill is read ONCE more, after
+         trader._V2_MAPPING_RECHECK_DELAY_SECONDS, before any of the sign
+         branches run: an unmoved ledger straight after a fill is usually
+         read-after-write lag, the same assumption
+         trader._confirm_v2_no_mapping makes (DR-21). A POSITIVE position
+         means the hypothesis is WRONG — the ask opened YES exposure — and the
+         closing order is then NOT submitted, because its own mapping
          (reduce_only bid nets a NO position to flat) rests on the same
          disproven assumption and would add to the wrong exposure instead.
       5. Submit the closing body from trader._build_rollback_order_v2 (side
-         "bid", reduce_only=True). PASS half two iff the position returns to 0.
+         "bid", reduce_only=True), priced at the top of this market's own grid
+         rather than at the builder's loss floor, so the close crosses
+         whatever is resting on the book (see _no_close_body). PASS half two
+         iff the position returns to 0.
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -502,6 +547,15 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
 
     after = trader._position_count(client, ticker)
     print(f"Position after the NO buy: {after}")
+    if filled and after == 0:
+        # Read-after-write lag is the usual cause, exactly as
+        # trader._confirm_v2_no_mapping assumes: re-read ONCE, here, before
+        # any of the sign branches below, so a re-read that comes back
+        # positive (mapping disproven) or None (lookup failed) still takes
+        # its own branch instead of falling through (DR-21).
+        time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
+        after = trader._position_count(client, ticker)
+        print(f"Position after re-read: {after}")
     _report_fee(data, body["price"])
 
     if filled is None:
@@ -536,7 +590,8 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     if after == 0:
         print(
             f"{_FAIL}: the response reported a complete fill but the position on {ticker} is "
-            "still 0. Neither signal is trustworthy — check the account manually."
+            "still 0 after a re-read. Neither signal is trustworthy — check the "
+            "account manually and FLATTEN ANY POSITION YOU FIND."
         )
         return _FAIL
 
@@ -651,8 +706,9 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
         return _NEUTRAL
 
     body = _no_buy_body(market, 0.5)
-    # Documented override #2: the deliberately unfillable price replaces the
-    # builder's capped one — everything else in the body stays the builder's.
+    # Price override (module header, PRICE OVERRIDE): the deliberately
+    # unfillable price replaces the builder's capped one — everything else in
+    # the body stays the builder's.
     body["price"] = price_str
     _emit("REQUEST BODY (deliberately unfillable ask)", body)
     if not _confirm(

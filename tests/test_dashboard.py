@@ -95,7 +95,14 @@ def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float | None = No
 
 def make_equity(values: list[float], start: date = date(2026, 1, 5)) -> pd.DataFrame:
     """Build an equity curve in _build_equity_curve's shape (one row per day,
-    columns [date, portfolio_value, daily_return]) from raw portfolio values."""
+    columns [date, portfolio_value, daily_return]) from raw portfolio values.
+
+    `start` here is the curve's own first date. The real builder prepends a
+    leading row one day before the backtest's start_date holding the untouched
+    initial balance (DR-03); these section tests only need the column shape and
+    a distinguishable series, so they pass the values they want directly rather
+    than modelling that row.
+    """
     df = pd.DataFrame({
         "date": [start + timedelta(days=i) for i in range(len(values))],
         "portfolio_value": [float(v) for v in values],
@@ -381,3 +388,47 @@ class TestCapitalDeployedIsFeeInclusive:
         t = make_trade()
         out = dashboard._section_risk([t], make_equity([1000.0, 1010.0]), 1000.0)
         assert f"{t.total_cost + t.fees:.2f}" in out.replace(",", "")
+
+
+class TestBenchmarkDownloadWindow:
+    """
+    DR-03: the ^GSPC download must open on the equity curve's leading
+    initial-balance row, one day before the backtest's start_date, so the two
+    traces on the benchmark chart cover the same window.
+
+    This is the only pin on _section_benchmark anywhere; without it the
+    download's `start` argument is invisible to the gates (reverting it leaves
+    the suite green). yfinance is stubbed out, so the test stays offline.
+    """
+
+    def _capture(self, monkeypatch, frame: pd.DataFrame) -> dict:
+        seen: dict = {}
+
+        def fake_download(ticker, **kwargs):
+            seen["ticker"] = ticker
+            seen.update(kwargs)
+            return frame
+
+        monkeypatch.setattr(dashboard.yf, "download", fake_download)
+        return seen
+
+    def test_download_opens_one_day_before_start_date(self, monkeypatch):
+        seen = self._capture(monkeypatch, pd.DataFrame())
+
+        out = dashboard._section_benchmark(
+            make_equity([1000.0, 1010.0]), date(2026, 6, 1), 1000.0)
+
+        assert seen["ticker"] == "^GSPC"
+        assert seen["start"] == "2026-05-31"
+        # An empty download still renders the strategy-only section.
+        assert "Kalshi Arbitrage Strategy" in out
+
+    def test_download_start_crosses_a_month_boundary_correctly(self, monkeypatch):
+        # A plain string slice of the isoformat would give "2026-06-00"; the
+        # date arithmetic has to do it.
+        seen = self._capture(monkeypatch, pd.DataFrame())
+
+        dashboard._section_benchmark(
+            make_equity([1000.0]), date(2026, 1, 1), 1000.0)
+
+        assert seen["start"] == "2025-12-31"

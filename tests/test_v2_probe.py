@@ -23,6 +23,13 @@ Dependencies:
 Notes:
     The confirmation prompt is driven by patching builtins.input; --yes paths
     bypass it entirely.
+
+    Two seams beyond the mock client are patched where a test needs the
+    account to answer dynamically rather than from a fixed sequence:
+    trader._position_count (the probe's ground truth) and v2_probe.time.sleep
+    (the one-second recheck pause, so the suite never actually waits). A test
+    that patches _position_count passes probe_client([]) — an empty positions
+    sequence, so an unpatched read would raise rather than silently pass.
 """
 import inspect
 import json
@@ -33,6 +40,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kalshi_betting import trader, v2_probe
+from kalshi_betting.scanner import PriceRange
 
 TICKER = "PROBE-TICKER"
 
@@ -117,6 +125,53 @@ FILLED = v2_resp("0.01", "0.00")
 KILLED = v2_resp("0.00", "0.01")
 
 
+class FakeExchange:
+    """A one-price book that honours limit prices, plus the position it moves.
+
+    Everywhere else in this file the submission seam returns a canned fill or
+    a canned kill, which cannot show whether a price would actually have
+    crossed. This models the single fact DR-04 turns on: a fill-or-kill ASK
+    (sell YES) fills only at or BELOW the resting YES bid, a fill-or-kill BID
+    (buy YES) fills only at or ABOVE the resting YES ask, and anything else
+    comes back killed with the full count remaining. `position` is a Decimal
+    so -0.01 + 0.01 is exactly 0.
+    """
+
+    def __init__(self, yes_bid: str, yes_ask: str):
+        self.yes_bid = Decimal(yes_bid)
+        self.yes_ask = Decimal(yes_ask)
+        self.position = Decimal("0")
+        self.submitted: list = []
+
+    def submit(self, client, method, path, *, query=None, body=None):
+        """Stand-in for v2_probe.signed_request_json."""
+        assert method == "POST"
+        self.submitted.append(body)
+        count = Decimal(body["count"])
+        price = Decimal(body["price"])
+        if body["side"] == "ask":
+            # Selling YES: the limit is a FLOOR on proceeds, so it crosses
+            # only a resting bid at or above it.
+            signed = -count if price <= self.yes_bid else Decimal("0")
+        else:
+            # Buying YES: the limit is a CEILING, so it crosses only a resting
+            # ask at or below it.
+            signed = count if price >= self.yes_ask else Decimal("0")
+        if body["reduce_only"]:
+            # reduce_only can only close existing exposure: a YES bid buys
+            # back no more than the NO position actually held, and cannot
+            # touch an account that is flat or already long (a bare
+            # min(signed, -position) would turn the bid into a SALE out of a
+            # long holding and report it as a fill).
+            signed = min(signed, max(-self.position, Decimal("0")))
+        self.position += signed
+        return v2_resp(str(abs(signed)), str(count - abs(signed)))
+
+    def position_count(self, client, ticker):
+        """Stand-in for trader._position_count — the account's ground truth."""
+        return self.position
+
+
 @pytest.fixture
 def submits(monkeypatch) -> list:
     """Capture every body the probe submits, returning fills by default.
@@ -142,8 +197,10 @@ def answer(monkeypatch, value: str) -> None:
 
 
 class TestBodyConstruction:
-    """The probe must exercise the REAL trader builders, overriding only what
-    its fractional count and unfillable price require."""
+    """The probe must exercise the REAL trader builders, overriding only the
+    fields its fractional count and its price-independent verdict require:
+    the count on both bodies, and the price on the close and on the
+    deliberately unfillable ask."""
 
     def test_no_mapping_submits_ask_then_reduce_only_bid(self, submits, monkeypatch):
         client = probe_client([0, -0.01, 0])
@@ -195,17 +252,62 @@ class TestBodyConstruction:
         assert (leg.side, leg.price_dollars, leg.count) == ("no", 0.41, 1)
         assert leg.label == "NO on v2-probe"
 
-    def test_close_body_uses_the_real_rollback_builder_then_overrides_only_count(self):
+    # (price_level_structure, price_ranges, the top-of-grid price the close
+    # must carry). The four structure strings CLAUDE.md lists, plus an
+    # absent/empty one. The expected price follows from the price_ranges each
+    # fixture below declares — scanner.tick_size_for_price reads the bands,
+    # not the name — so the empty and "linear_cent" fixtures land on the $0.01
+    # grid, the "deci_cent" and "tapered_deci_cent" fixtures put a $0.001 band
+    # under 0.9999, and only the "center_deci_edge_centi_cent" fixture puts a
+    # $0.0001 band there.
+    _TOP_OF_GRID_BY_REGIME = [
+        ("", None, "0.9900"),
+        ("linear_cent", [PriceRange(start=0.0, end=1.0, step=0.01)], "0.9900"),
+        ("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.001)], "0.9990"),
+        ("tapered_deci_cent", [
+            PriceRange(start=0.0, end=0.05, step=0.001),
+            PriceRange(start=0.05, end=0.95, step=0.01),
+            PriceRange(start=0.95, end=1.0, step=0.001),
+        ], "0.9990"),
+        ("center_deci_edge_centi_cent", [
+            PriceRange(start=0.0, end=0.01, step=0.0001),
+            PriceRange(start=0.01, end=0.99, step=0.001),
+            PriceRange(start=0.99, end=1.0, step=0.0001),
+        ], "0.9999"),
+    ]
+
+    @pytest.mark.parametrize("structure, ranges, expected_price", _TOP_OF_GRID_BY_REGIME)
+    def test_close_body_uses_the_real_rollback_builder_then_overrides_count_and_price(
+        self, structure, ranges, expected_price,
+    ):
+        """Re-pinned and renamed from
+        test_close_body_uses_the_real_rollback_builder_then_overrides_only_count
+        (DR-04): the old expectation that the close carries the BUILDER's price
+        was wrong. The builder prices a real unwind at a loss floor derived
+        from the leg's scanned entry, and the probe's placeholder entry of 0.5
+        puts that floor at $0.62 on every regime below (pinned here) — a bid
+        structurally killed on any market whose YES ask is above 62c, which
+        FAILed the mapping gate for a reason unrelated to the mapping and left
+        a real 0.01 NO position open. Every other key still comes from the
+        builder, so the probe still submits the real unwind body.
+        """
         market = SimpleNamespace(
-            ticker=TICKER, price_level_structure="", price_ranges=None, exchange_index=0,
+            ticker=TICKER, price_level_structure=structure, price_ranges=ranges,
+            exchange_index=0,
         )
         body = v2_probe._no_close_body(market)
         reference = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
-        for key in ("ticker", "side", "price", "time_in_force", "exchange_index",
+        for key in ("ticker", "side", "time_in_force", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
         assert body["reduce_only"] is True
         assert body["count"] == v2_probe.PROBE_COUNT_STR
+        # The price is the one key that must NOT be the builder's.
+        assert body["price"] == expected_price
+        assert body["price"] == trader._format_price(
+            trader._v2_top_of_grid_price(market)
+        )
+        assert reference["price"] == "0.6200"
 
 
 class TestConfirmationGate:
@@ -292,6 +394,172 @@ class TestNoMappingVerdict:
         )
         client = probe_client([0, 0])
         assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._FAIL
+
+
+class TestCloseCrossesTheBook:
+    """DR-04: the closing bid must actually cross the resting YES ask.
+
+    The other no-mapping tests feed the probe a canned fill, so they pass
+    whatever the close is priced at. This one runs the whole step against a
+    book that honours limit prices.
+    """
+
+    def test_close_fills_against_a_resting_ask_the_builder_price_could_not(
+        self, monkeypatch,
+    ):
+        """End-to-end on a linear-cent market quoting 0.89 / 0.90.
+
+        The NO buy goes out as an ask at 0.8800 and crosses the resting YES
+        bid of 0.89, opening -0.01. The close then goes out as a bid at
+        0.9900 and crosses the resting YES ask of 0.90, returning the account
+        to flat — PASS. The builder's own loss-floored price of $0.62 on the
+        same market sits BELOW that ask, so before DR-04 the close was killed,
+        the step reported FAIL against the mapping, and a real 0.01 NO
+        position was left open.
+        """
+        exchange = FakeExchange(yes_bid="0.89", yes_ask="0.90")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        # The book, not a scripted sequence, is what moves the position here.
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        client = probe_client([])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=orderbook_resp(yes_bid="0.89", qty="500")
+        )
+        _, market = v2_probe._fetch_market(client, TICKER)
+
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        assert exchange.position == 0
+        ask_body, close_body = exchange.submitted
+        assert (ask_body["side"], ask_body["price"]) == ("ask", "0.8800")
+        assert (close_body["side"], close_body["price"]) == ("bid", "0.9900")
+
+        # The counter-factual, on the same market: the rollback builder's
+        # loss-floored price cannot reach the resting ask this close crossed.
+        builder = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
+        assert builder["price"] == "0.6200"
+        assert Decimal(builder["price"]) < exchange.yes_ask
+
+    def test_the_old_builder_price_would_have_left_the_position_open(
+        self, monkeypatch,
+    ):
+        """The same book, with the close forced back to the builder's price.
+
+        Pins the failure DR-04 describes rather than asserting it in prose: a
+        $0.62 bid does not cross a 0.90 ask, the position stays at -0.01, and
+        the step reports FAIL — indistinguishable from a broken side mapping.
+        """
+        exchange = FakeExchange(yes_bid="0.89", yes_ask="0.90")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+
+        def builder_priced_close(market):
+            body = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
+            body["count"] = v2_probe.PROBE_COUNT_STR
+            return body
+
+        monkeypatch.setattr(v2_probe, "_no_close_body", builder_priced_close)
+        client = probe_client([])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=orderbook_resp(yes_bid="0.89", qty="500")
+        )
+
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._FAIL
+        assert exchange.submitted[1]["price"] == "0.6200"
+        assert exchange.position == Decimal("-0.01")
+
+
+class TestZeroPositionIsReReadOnce:
+    """DR-21: a ledger that reads 0 right after a reported full fill is read
+    once more, after trader._V2_MAPPING_RECHECK_DELAY_SECONDS, before any of
+    the sign branches run — so the re-read's own value decides the verdict."""
+
+    @staticmethod
+    def _arm(monkeypatch, reads: list):
+        """Script trader._position_count and neutralize the recheck sleep.
+
+        Returns (observed reads, slept durations) so a test can assert both
+        that the extra read happened and that it was the ONLY one.
+        """
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return observed, slept
+
+    def test_zero_then_negative_confirms_and_submits_the_close(self, submits, monkeypatch):
+        # start flat, ledger lags at 0, re-read shows the NO position, close flattens
+        observed, slept = self._arm(monkeypatch, [0, 0, -0.01, 0])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, 0, -0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submits) == 2  # the close really was submitted
+
+    def test_zero_then_positive_takes_the_disproven_branch(self, submits, monkeypatch, capsys):
+        # The re-read must reach the sign branches, not fall through to the
+        # terminal zero FAIL: a positive position is the disproof this probe
+        # exists to catch, and the close must NOT be submitted.
+        observed, slept = self._arm(monkeypatch, [0, 0, 0.01])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "HYPOTHESIS DISPROVEN" in printed
+        assert len(submits) == 1
+
+    def test_zero_then_none_is_a_lookup_failure_never_a_confirmation(
+        self, submits, monkeypatch, capsys,
+    ):
+        # A failed re-read is "state unknown", which must take the None branch
+        # rather than being read as either half of the mapping.
+        observed, slept = self._arm(monkeypatch, [0, 0, None])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, None]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "position lookup failed" in printed
+        assert "CONFIRMED" not in printed
+        assert len(submits) == 1
+
+    def test_persistent_zero_still_fails_and_says_it_was_re_read(
+        self, submits, monkeypatch, capsys,
+    ):
+        # Re-pinned wording (DR-21): a ledger still flat after the re-read is
+        # genuinely contradictory, so the verdict is unchanged — but the
+        # message now says the re-read happened and tells the operator to
+        # flatten anything they find.
+        observed, slept = self._arm(monkeypatch, [0, 0, 0])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "still 0 after a re-read" in printed
+        assert "FLATTEN ANY POSITION YOU FIND" in printed
+        assert len(submits) == 1
+
+    def test_a_nonzero_first_read_is_not_re_read(self, submits, monkeypatch):
+        # The extra read is spent only on the ambiguous case; a ledger that
+        # already moved is evidence and must not be re-polled.
+        observed, slept = self._arm(monkeypatch, [0, -0.01, 0])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, -0.01, 0]
+        assert slept == []
+
+    def test_an_unfilled_order_is_not_re_read(self, monkeypatch):
+        # No fill was reported, so a zero position is the expected outcome,
+        # not a lagging ledger: the step stays NEUTRAL without an extra read.
+        monkeypatch.setattr(v2_probe, "signed_request_json", lambda *a, **k: KILLED)
+        observed, slept = self._arm(monkeypatch, [0, 0])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert observed == [0, 0]
+        assert slept == []
 
 
 class TestUnfillableAskStep:

@@ -14,7 +14,11 @@ Purpose:
     a daily equity curve. Results feed into dashboard.py for visualization.
 
 Dependencies:
-    Imports normalize_title and leg_sides from scanner.py; fee/model helpers
+    Imports time_series_group_key (the single definition of the time-series
+    grouping key, shared with the live scanner), event_series (the single
+    definition of an event's series prefix, so the live and backtest
+    one-series rules can never disagree) and leg_sides from
+    scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
@@ -144,7 +148,7 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
 )
-from .scanner import leg_sides, normalize_title
+from .scanner import event_series, leg_sides, time_series_group_key
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -310,8 +314,9 @@ class SweepPoint:
         trades (list[BacktestTrade]): One record per entered pair, in
             entry-date order; empty if nothing was ever entered.
         equity_df (pd.DataFrame): Daily equity curve with columns
-            [date, portfolio_value, daily_return], flat at the initial balance
-            when trades is empty.
+            [date, portfolio_value, daily_return], opening one row before the
+            run's start_date at the initial balance and flat at it when trades
+            is empty.
     """
     k: float
     trades: list[BacktestTrade]
@@ -666,12 +671,62 @@ def _pair_key(m: dict) -> str:
     return f"{event_title} | {title}"
 
 
+def _identical_wording_dicts(mA: dict, mB: dict) -> bool:
+    """
+    Dict-world mirror of scanner._identical_wording over cached market records.
+
+    Compares the RAW (title, subtitle, event_title) strings, so a pair whose
+    two contracts are worded identically cannot be "the same question at two
+    deadlines" — the deadline is not in the wording at all.
+
+    Args:
+        mA (dict): A market dict in the compact historical._market_to_dict form.
+        mB (dict): A second market dict, same form.
+
+    Returns:
+        bool: True only when all three strings match exactly. Missing keys read
+            as "" on both sides, exactly as the live helper reads a falsy
+            attribute.
+    """
+    return (
+        (mA.get("title") or "", mA.get("subtitle") or "", mA.get("event_title") or "")
+        == (mB.get("title") or "", mB.get("subtitle") or "", mB.get("event_title") or "")
+    )
+
+
+def _same_series_dicts(mA: dict, mB: dict) -> bool:
+    """
+    Dict-world mirror of scanner._same_series over cached market records.
+
+    Fails CLOSED like the live helper: an absent or unreadable event_ticker on
+    either side reads as the same series, so a pair whose fixture identity
+    cannot be established is refused rather than replayed on the 95%
+    co-resolution prior (DR-02, DR-54).
+
+    Args:
+        mA (dict): A market dict in the compact historical._market_to_dict form.
+        mB (dict): A second market dict, same form.
+
+    Returns:
+        bool: True when both series prefixes are equal, or when either is
+            unreadable.
+    """
+    sa, sb = event_series(mA.get("event_ticker")), event_series(mB.get("event_ticker"))
+    return not sa or not sb or sa == sb
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
 
     Three-element key: the event_title component prevents cross-event option-label
     collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+
+    Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54):
+    two events of one recurring fixture still land in one group, and
+    _extract_pairs is what refuses to pair them. Keeping the rule in one place
+    mirrors the live scanner, where find_same_title_pairs groups first and
+    filters inside its inner loop.
 
     Args:
         markets (list[dict]): Market dicts in the compact historical._market_to_dict
@@ -694,22 +749,35 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
 
 def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
     """
-    Group markets by date-stripped combined key (event_title + title) for time-series pair detection.
+    Group markets by date-stripped combined key (event_title + title) plus the
+    outcome label (subtitle), for time-series pair detection.
+
+    Mirrors the live scanner exactly by calling the same helper,
+    scanner.time_series_group_key — pinned by AST in tests/test_strategy.py.
 
     Args:
         markets (list[dict]): Market dicts in the compact historical._market_to_dict
             form.
 
     Returns:
-        dict[str, list[dict]]: Mapping of normalized (event_title + title) key
-            -> member markets, for groups with >= 2 members. A market whose
-            key normalizes to an empty string is dropped.
+        dict[str, list[dict]]: Mapping of normalized (event_title + title +
+            subtitle) key -> member markets, for groups with >= 2 members. A
+            market whose key normalizes to an empty string is dropped.
+
+    Note:
+        Day slices cached before the 2026-08 subtitle fix carry subtitle=None,
+        which time_series_group_key reads as absent — such records still group
+        by title alone, so an old cache reproduces the pre-DR-01 grouping. See
+        CLAUDE.md's subtitle-drift gotcha for how to refresh them.
     """
     groups: dict = defaultdict(list)
     for m in markets:
-        # _pair_key combines event_title + market title before normalization so that
-        # two MVE markets sharing an option label across unrelated events do not collide.
-        norm = normalize_title(_pair_key(m))
+        # Same key as the live scanner, through the same helper: _pair_key
+        # combines event_title + market title (so an option label shared across
+        # unrelated events does not collide) and the subtitle keeps two
+        # different OUTCOMES — two strikes of one daily family — out of one
+        # group. This mirror reproduced DR-01 and so could never detect it.
+        norm = time_series_group_key(_pair_key(m), m.get("subtitle") or "")
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
@@ -768,14 +836,25 @@ def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
 def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
-    the two markets have different event_tickers. No price filtering at this stage.
+    the two markets have different event_tickers AND are not two events of one
+    series worded identically. No price filtering at this stage.
+
+    The one-series rule (DR-02, DR-54) mirrors both live finders through
+    _same_series_dicts / _identical_wording_dicts: two events sharing a series
+    prefix are two instances of one recurring fixture, so identical wording
+    across them is one question about two DIFFERENT events. The 3-tuple
+    (same-title) branch tests the series alone, because its group key already
+    guarantees the wording is identical; the string (time-series) branch tests
+    the conjunct, because there the wording is only date-stripped-equal and a
+    genuine cumulative pair (deadline IN the wording) must survive.
 
     The pair type is NOT a parameter: the shape of each group key (see below)
     decides which sweep applies, and run_backtest() attaches the pair_type
     label to each returned tuple itself.
 
     Group keys may be:
-      - a string (normalized-title group from _group_by_normalized_title), or
+      - a string (normalized title+outcome group from
+        _group_by_normalized_title), or
       - a 3-tuple (event_title, title, subtitle) from _group_by_exact_title.
     For the 3-tuple form, the display canonical is taken from title-or-subtitle,
     but the FULL 3-tuple (including event_title) is also returned as group_key —
@@ -805,14 +884,14 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
             compact historical._market_to_dict form). Keys are either a
-            normalized-title string (time-series groups) or an
+            normalized title+outcome string (time-series groups) or an
             (event_title, title, subtitle) 3-tuple (same-title groups).
 
     Returns:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
             iteration order. Empty if no group has two members on different
-            event_tickers.
+            event_tickers of different event series.
     """
     pairs = []
     for key, members in groups.items():
@@ -852,6 +931,12 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         break
                     if mA["event_ticker"] == mB["event_ticker"]:
                         continue
+                    # Mirror of the scanner's time-series conjunct: identical
+                    # wording across two events of one series is two instances
+                    # of one recurring fixture, not one question at two
+                    # deadlines (DR-02, DR-54).
+                    if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                        continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
                         continue
@@ -862,6 +947,11 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             for i, mA in enumerate(members):
                 for mB in members[i + 1:]:
                     if mA["event_ticker"] == mB["event_ticker"]:
+                        continue
+                    # Mirror of scanner.find_same_title_pairs' one-series rule:
+                    # the group key already guarantees identical wording, so
+                    # two events of one series are two fixtures (DR-02, DR-54).
+                    if _same_series_dicts(mA, mB):
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
@@ -1615,7 +1705,8 @@ def _simulate_at_discount(
     Args:
         raw_entries (list[dict]): _prepare_entries() output — one record per
             pair that produced an entry.
-        start_date (date): First date of the equity curve.
+        start_date (date): First trading date of the window; the equity curve
+            _build_equity_curve returns opens one row earlier than this.
         initial_balance (float): Simulated starting cash balance in dollars.
         k (float | None): Interval-discount override in [0, 1], handed to
             config.time_series_profit_prob for every time-series candidate.
@@ -2280,8 +2371,9 @@ def run_backtest(
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
             trades is one BacktestTrade per entered pair, in entry-date order
             (empty if none were ever entered). equity_df has columns
-            [date, portfolio_value, daily_return], one row per day, flat at
-            initial_balance if trades is empty.
+            [date, portfolio_value, daily_return], one row per day from
+            start_date - 1 day (the untouched initial balance) through today,
+            flat at initial_balance if trades is empty.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2297,7 +2389,8 @@ def run_backtest(
         regardless of what the fetch would return, so the fetch is skipped
         entirely, that helper returns None, and this returns the same
         empty-result shape as the zero-trade path ([], an equity curve flat at
-        initial_balance) with a WARNING logged.
+        initial_balance — for a future start_date, its leading row plus
+        start_date's own) with a WARNING logged.
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -2485,16 +2578,26 @@ def _build_equity_curve(
     treatment where capital is deployed on entry and returned at settlement,
     with each dollar counted exactly once.
 
+    The curve opens one day before start_date at the untouched initial balance,
+    so a trade entering on start_date itself shows its outflow as a real
+    pct_change and a real decline from the cummax peak. Without that leading row
+    the day-0 stake was invisible to both (DR-03), and the per-k sweep table's
+    iloc[0] base was the post-outflow balance while the performance card's base
+    was initial_balance — one run reported two ways on one page.
+
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
             exit_date, total_cost, and actual_payoff populated.
-        start_date (date): The first date of the equity curve (initial balance day).
+        start_date (date): The first TRADING date of the window; the curve opens
+            one row earlier, on start_date - 1 day, at the untouched initial
+            balance.
         initial_balance (float): Starting portfolio value in dollars.
 
     Returns:
-        pd.DataFrame: DataFrame with one row per calendar day from start_date to
-            today (UTC) — and, when start_date is itself in the future, exactly
-            one row for start_date — with columns:
+        pd.DataFrame: DataFrame with one leading row for start_date - 1 day at
+            the initial balance, followed by one row per calendar day from
+            start_date to today (UTC) — and, when start_date is itself in the
+            future, exactly those two rows — with columns:
             - "date" (date): Calendar date.
             - "portfolio_value" (float): Cumulative portfolio value in dollars.
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
@@ -2509,9 +2612,21 @@ def _build_equity_curve(
     # Floored at 1: a start_date after today (reachable through run_backtest /
     # run_backtest_sweep, whose Monday-feasibility short-circuit builds an empty
     # curve for whatever window it was handed) makes the raw span zero or
-    # negative, leaving pd.DataFrame([]) with no columns at all.
+    # negative. The leading row below already keeps the frame from being the
+    # column-less pd.DataFrame([]), so the floor is what guarantees start_date
+    # itself is on the axis — the documented future-window shape is exactly the
+    # leading row plus start_date.
     span_days = max((today - start_date).days + 1, 1)
-    dates = [start_date + timedelta(days=i) for i in range(span_days)]
+    # The curve opens one day BEFORE start_date at the untouched initial
+    # balance. start_date itself can carry a Monday-09:00 entry (the default
+    # 2024-01-01 is a Monday), and applying that day's outflow to the FIRST
+    # row hid the entire day-0 stake from pct_change and cummax: max drawdown
+    # 0.0% and Sortino 0.00 on a run that lost 99.98% on day one, and the
+    # per-k table's "opening" was the post-outflow balance (DR-03). No trade
+    # can enter before start_date, so the leading row is always flat.
+    dates = [start_date - timedelta(days=1)] + [
+        start_date + timedelta(days=i) for i in range(span_days)
+    ]
 
     # Accumulate cash inflows and outflows per date
     cash_changes: dict[date, float] = defaultdict(float)
@@ -2529,6 +2644,8 @@ def _build_equity_curve(
         rows.append({"date": d, "portfolio_value": cash})
 
     df = pd.DataFrame(rows)
-    # Compute fractional daily returns; the first row has no prior day so it gets 0.0
+    # Compute fractional daily returns; the leading initial-balance row has no
+    # prior day so it gets 0.0, and start_date's own row is the first one that
+    # can show a day-0 outflow as a real return.
     df["daily_return"] = df["portfolio_value"].pct_change().fillna(0.0)
     return df

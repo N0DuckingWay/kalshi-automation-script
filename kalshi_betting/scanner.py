@@ -6,15 +6,18 @@ Last edited by: Zachary Hoffman
 Purpose:
     Fetches all open Kalshi markets from the REST API and identifies pairs of
     contracts for the bot's two pair strategies: (1) time-series pairs —
-    contracts that ask the same question at different deadlines, identified by
-    stripping date tokens from their titles and exact-matching the remainder,
-    traded as a directional bet (YES on the earlier contract, NO on the later)
-    when the later contract is priced well above the earlier; and (2)
+    contracts that ask the same question about the same OUTCOME at different
+    deadlines, identified by stripping date tokens from their titles and
+    exact-matching the remainder together with the market's outcome label
+    (time_series_group_key), traded as a directional bet (YES on the earlier
+    contract, NO on the later) when the later contract is priced well above
+    the earlier; and (2)
     same-title pairs — contracts with identical title and subtitle on
-    different event tickers, traded as a near-arbitrage (NO on the pricier,
-    YES on the cheaper) when their prices diverge. Both paths then check the
-    live order book to replace best-ask prices with depth-weighted fill prices
-    and confirm the edge survives real liquidity.
+    different event tickers of DIFFERENT event series, traded as a
+    near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
+    diverge. Both paths then check the live order book to replace best-ask
+    prices with depth-weighted fill prices and confirm the edge survives real
+    liquidity.
 
 Dependencies:
     Imports constants, the leg-side tuples, and fee helpers from config.py and
@@ -23,15 +26,28 @@ Dependencies:
     deadline_gap_days() (the only source of truth for which side each leg
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
     main.py and backtester.py), and the scanning functions consumed by
-    main.py, backtester.py (which also imports normalize_title and
-    leg_sides), and (via normalize_title) historical.py. Depends on the
-    KalshiClient produced by auth.py.
+    main.py and backtester.py (which also imports time_series_group_key and
+    leg_sides, so the live scanner and the backtester group time-series
+    candidates through one definition). Depends on the KalshiClient produced
+    by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
     the observation that Kalshi titles differ only in date tokens when the same
     question is asked across multiple deadline-indexed markets. The _DATE_PATTERNS
     list must cover all Kalshi date formats to avoid missed pairs or false positives.
+    It is only half of the time-series grouping key: the market's outcome label
+    (its subtitle) is the other half, because a daily strike family shares one
+    title and differs only there — see time_series_group_key().
+
+    Neither finder pairs two events of ONE series (event_series(): the ticker
+    prefix before the first "-") whose wording is identical. Two events of one
+    series are two instances of one recurring fixture — two ball games, two
+    15-minute price windows, two combos — so identical wording across them is
+    the same question about two DIFFERENT events, and neither the 95%
+    co-resolution prior nor the cumulative-deadline premise applies. Both
+    finders carry the rule because the same two tickers qualify for both; see
+    _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -88,7 +104,9 @@ from .config import (
 # ---------------------------------------------------------------------------
 # Date patterns stripped from titles before exact-match grouping.
 # After stripping, two contracts that differ ONLY in their deadline will
-# produce the same normalized string — no fuzzy matching needed.
+# produce the same normalized string — no fuzzy matching needed. The
+# time-series key appends the outcome label to that string so two different
+# OUTCOMES cannot share a group (see time_series_group_key).
 # ---------------------------------------------------------------------------
 _DATE_PATTERNS = [
     # Full month-name dates: "December 1, 2026" / "January 31, 2027"
@@ -103,6 +121,21 @@ _DATE_PATTERNS = [
     r"\b\d{1,2}/\d{1,2}/\d{4}\b",
     # ISO dates: "2026-12-31"
     r"\b\d{4}-\d{2}-\d{2}\b",
+    # Deadline preposition + full month name + day, no year: "by June 30".
+    # Must sit AHEAD of the "by/before/until/through/after" clause below,
+    # whose optional day group matches only when a year follows: from behind,
+    # that clause consumes "by June" and strands the day, leaving "30" against
+    # "31" to split two titles that differ only in their deadline.
+    # Anchored to the preposition deliberately. A bare "<Month> <day>" would
+    # also erase the date from SNAPSHOT titles ("... on June 30"), which would
+    # put two snapshot markets of one family into a single time-series group —
+    # the premise violation the live scanner cannot detect from prices.
+    # Anchored, this pattern fires only where the clause below already fired
+    # and stranded a day, so no title that used to stay apart is merged.
+    # The abbreviated spelling ("by Oct 1") is deliberately NOT covered: its
+    # own pattern still sits after that clause and still strands the day
+    # there, exactly as before this commit.
+    r"\b(?:by|before|until|through|after)\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b",
     # "by/before/until/through/after [month] [optional date+year]"
     r"\b(?:by|before|until|through|after)\s+(?:end\s+of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?(?:\s+\d{1,2},?\s+\d{4}|\s+\d{4})?\b",
     # "end of [the] year"
@@ -121,6 +154,27 @@ _DATE_PATTERNS = [
     r"\bH\d{4}\b",
 ]
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _DATE_PATTERNS]
+
+# The unambiguous DATE shapes only — what _normalize_subtitle may strip from an
+# outcome label. Every entry is taken BY INDEX from _DATE_PATTERNS and none is
+# re-spelled here, so editing a pattern there can never leave a stale copy
+# behind: indexes 0-5 are the month-name / abbreviated-month / numeric / ISO
+# shapes that carry a year, index 6 is the deadline-anchored month + day shape
+# added above, and index 12 is the pre-existing bare abbreviated month + day.
+# Deliberately NOT the whole list. Excluded are the bare "by <Month>" clause
+# (7), "end of year" (8), quarters (9), "in 20xx" (10), the standalone 20xx
+# year (11) and the two time shapes (13, 14). A subtitle is where a bare
+# 4-digit strike ("2050 or above") lives, so the year and quarter shapes would
+# erase real outcome labels; an hour inside an outcome label may BE the
+# outcome; and the bare "by <Month>" clause adds nothing a dated label needs,
+# since 0-6 already cover every shape carrying a day or a year. One consequence
+# to know: index 12 is unanchored, so a bare "Sep 14" outcome label normalizes
+# to "" and two such labels share a key.
+_EXPLICIT_DATE_PATTERNS = (
+    *_DATE_PATTERNS[0:7],
+    _DATE_PATTERNS[12],
+)
+_COMPILED_EXPLICIT_DATES = [re.compile(p, re.IGNORECASE) for p in _EXPLICIT_DATE_PATTERNS]
 
 # Minimum ask price to consider a MARKET actively priced (not settled/illiquid).
 # Distinct from config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), which
@@ -441,7 +495,9 @@ class CandidatePair:
       same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
                    market_b (the cheaper side) at pB. Both legs pay when the
                    two identical questions co-resolve, so the trade is a
-                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB prior.
+                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
+                   prior — which is why the finder only forms such a pair
+                   across two DIFFERENT event series (see _same_series).
       time_series: YES on market_a (the EARLIER-closing contract) at pA, NO on
                    market_b (the later one) at nB. Three settlement cells
                    exist: event by A's deadline (A=YES, hence B=YES; YES-on-A
@@ -474,7 +530,8 @@ class CandidatePair:
             type's flag is a settlement guarantee: same-title rests on the
             co-resolution prior, time-series on the in-between probability
             being overstated.
-        canonical_title (str): Grouping key used to identify the pair — normalized title for
+        canonical_title (str): Grouping key used to identify the pair — the
+            normalized title+outcome key (scanner.time_series_group_key) for
             time-series pairs, raw title for same-title pairs.
         pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
             "same_title" for pairs with identical title/subtitle across different event tickers.
@@ -587,6 +644,11 @@ def normalize_title(title: str) -> str:
     that differ only in their deadline will produce the same normalized string,
     enabling exact-match grouping without fuzzy matching.
 
+    This is the TITLE half of the time-series grouping key only. Callers that
+    group time-series candidates must go through time_series_group_key(),
+    which appends the market's outcome discriminator — a title alone does not
+    separate the strikes of one daily family (DR-01).
+
     Args:
         title (str): Raw market title from the Kalshi API.
 
@@ -645,6 +707,165 @@ def pair_key(market: Any) -> str:
     return f"{event_title} | {market_title(market)}"
 
 
+def event_series(event_ticker: Any) -> str:
+    """
+    Return the series prefix of a Kalshi event ticker — the part before the first "-".
+
+    Kalshi event tickers are a series prefix followed by the instance stamp, so
+    "KXNPBRFI-26SEP160500FUKORI" -> "KXNPBRFI" and
+    "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9" -> "KXMVECROSSCATEGORY". Two event
+    tickers that share a series are two instances of ONE recurring fixture (two
+    ball games, two 15-minute price windows, two combos), which is what makes
+    identical wording across them two different questions rather than one
+    question listed twice — see find_same_title_pairs and CLAUDE.md's
+    one-series gotcha (DR-02, DR-54).
+
+    Args:
+        event_ticker (Any): The market's event_ticker. Anything that is not a
+            str is read as unknown.
+
+    Returns:
+        str: The prefix before the first "-", stripped of surrounding
+            whitespace and upper-cased. "" for an empty, all-whitespace,
+            hyphen-leading or non-string ticker — every shape _same_series then
+            reads as an unknown series and fails closed on. A hyphen-less
+            ticker is its own series (returned stripped and upper-cased).
+    """
+    if not isinstance(event_ticker, str):
+        return ""
+    return event_ticker.split("-", 1)[0].strip().upper()
+
+
+def _identical_wording(mA: Any, mB: Any) -> bool:
+    """
+    True when two markets carry the same raw (title, subtitle, event title).
+
+    Compares the RAW strings, not the date-stripped ones: the point of the test
+    is that the deadline does not appear anywhere in the wording, so two
+    contracts worded identically cannot be "the same question at two
+    deadlines". Unreadable evidence reads as NOT identical rather than as a
+    rejection: two values that are not equal are two different wordings (a
+    MagicMock's auto-attributes are distinct objects), and every one of the
+    three attributes is read through getattr with a "" default — the same
+    fail-soft read find_time_series_pairs already uses for .subtitle when it
+    builds the grouping key — so a partial stub leaves the pair for the
+    ordinary filters instead of raising out of the finder.
+
+    Args:
+        mA (Any): First market object (.title, .subtitle, optional ._event_title).
+        mB (Any): Second market object, same shape.
+
+    Returns:
+        bool: True only when all three strings match exactly.
+    """
+    return (
+        (getattr(mA, "title", "") or "", getattr(mA, "subtitle", "") or "",
+         getattr(mA, "_event_title", "") or "")
+        == (getattr(mB, "title", "") or "", getattr(mB, "subtitle", "") or "",
+            getattr(mB, "_event_title", "") or "")
+    )
+
+
+def _same_series(mA: Any, mB: Any) -> bool:
+    """
+    True when two markets' event tickers share a series prefix, or either prefix
+    is unknown.
+
+    Fails CLOSED: a pair whose fixture identity cannot be read (an empty or
+    non-string event_ticker on either side) reads as the same series and is
+    therefore refused, because pricing it on the 95% co-resolution prior
+    requires PROVING the two events are different fixtures.
+
+    Args:
+        mA (Any): First market object with an .event_ticker attribute.
+        mB (Any): Second market object, same shape.
+
+    Returns:
+        bool: True when both series prefixes are equal, or when either is
+            unreadable.
+    """
+    sa, sb = event_series(mA.event_ticker), event_series(mB.event_ticker)
+    return not sa or not sb or sa == sb
+
+
+def _normalize_subtitle(subtitle: str) -> str:
+    """
+    Normalize an outcome label for use inside the time-series grouping key.
+
+    Lower-cases, collapses whitespace, strips explicit dates
+    (_COMPILED_EXPLICIT_DATES) and trailing punctuation, so that
+    "Donald Trump" and "Donald Trump." are one option label and
+    "$80,000 by June 30" and "$80,000 by July 31" are one strike at two
+    deadlines. Trailing whitespace and punctuation are trimmed together, so
+    a label that ends in a stripped date FOLLOWED by punctuation
+    ("$80,000 by June 30.") still matches the same label written without
+    either.
+
+    Deliberately NOT normalize_title(): that pass strips any bare 20xx token as
+    a year, and a subtitle is exactly where a bare 4-digit strike
+    ("2050 or above") lives — running it over an outcome label would merge two
+    strikes in 2000-2099 into one key, i.e. reintroduce DR-01 through the
+    subtitle.
+
+    Args:
+        subtitle (str): Raw outcome label (ApiMarket.subtitle, sourced from the
+            API's `yes_sub_title` — see _market_from_dict).
+
+    Returns:
+        str: Lower-cased, date-stripped, punctuation-trimmed label. "" when
+            nothing survives.
+    """
+    result = subtitle
+    for pat in _COMPILED_EXPLICIT_DATES:
+        result = pat.sub(" ", result)
+    # Trim the whitespace and the punctuation in ONE rstrip, not whitespace
+    # first and punctuation second: a stripped date leaves a space in FRONT of
+    # any trailing punctuation ("$80,000 by June 30." -> "$80,000 by ."), and
+    # trimming the punctuation last would leave that space in the key, so the
+    # label would not match the same one written without the period.
+    return re.sub(r"\s+", " ", result).strip().rstrip(" .,;:!").lower()
+
+
+def time_series_group_key(combined_title: str, subtitle: Any) -> str:
+    """
+    Grouping key for time-series pair detection: the date-stripped
+    event_title | title PLUS the market's outcome discriminator.
+
+    Two contracts are "the same question at two deadlines" only when they ask
+    about the same OUTCOME. The outcome label — a strike such as "$82,750 or
+    above", a temperature band, an MVE option name — lives in the market's
+    subtitle (ingested from `subtitle`, falling back to `yes_sub_title`), and
+    market_title() reaches `.subtitle` only when `.title` is empty, so a key
+    built from the title alone merged every strike of a daily family into one
+    group and the best-pair rule then selected the widest strike mismatch
+    (DR-01 — CLAUDE.md's cross-strike gotcha carries the measurement). A strike
+    spelled inside the TITLE is a separate case, not handled here.
+
+    Single source of truth for BOTH paths — scanner.find_time_series_pairs and
+    backtester._group_by_normalized_title must call this (pinned by AST in
+    tests/test_strategy.py). Fail-safe on a non-string subtitle (a MagicMock's
+    auto-attribute, None from an old cache record): treated as absent, never
+    raised on — the same rule leg_sides and strategy._depth_levels follow.
+
+    Args:
+        combined_title (str): The pair_key() of the market — "<event_title> |
+            <market_title>", or the bare market title when no event title is
+            attached.
+        subtitle (Any): The market's outcome label. Anything that is not a str
+            is read as absent.
+
+    Returns:
+        str: "<normalized title> | <normalized subtitle>", the normalized title
+            alone when the subtitle normalizes to nothing, or "" when the title
+            itself normalizes to nothing (the caller drops such markets).
+    """
+    base = normalize_title(combined_title)
+    if not base:
+        return ""
+    sub = _normalize_subtitle(subtitle) if isinstance(subtitle, str) else ""
+    return f"{base} | {sub}" if sub else base
+
+
 def display_title(market: Any) -> str:
     """
     Human-readable label for console and Excel output.
@@ -652,7 +873,10 @@ def display_title(market: Any) -> str:
     Returns "<event_title>: <market_title>" when an event title is attached
     (so multivariate option labels like "Trump" or "Above $80k" carry their
     event context for manual spot-checking). Falls back to the bare market
-    title for non-MVE markets.
+    title for non-MVE markets. The outcome label is appended as
+    " — <subtitle>" whenever it is not already the whole label, so two strikes
+    of one daily family are distinguishable in the Excel rows instead of
+    rendering as the same title twice (DR-17).
 
     Args:
         market (Any): A Kalshi market object. May have an `_event_title` attribute.
@@ -662,6 +886,16 @@ def display_title(market: Any) -> str:
     """
     event_title = getattr(market, "_event_title", "") or ""
     base = market_title(market)
+    # Append the outcome label unless it IS the label already — market_title
+    # falls back to the subtitle when the title is empty, in which case the
+    # two are equal and nothing is appended. The test is exact equality, so a
+    # title that merely ENDS with the subtitle ("Biggest Mover: <name>" with
+    # subtitle "<name>") renders the name twice; cosmetic only, because
+    # display_title feeds Excel cells and the pairs table and is never a
+    # grouping key — DR-17
+    sub = getattr(market, "subtitle", "") or ""
+    if isinstance(sub, str) and sub and sub != base:
+        base = f"{base} — {sub}"
     return f"{event_title}: {base}" if event_title else base
 
 
@@ -1646,19 +1880,33 @@ def find_time_series_pairs(
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
 
-    Grouping strategy: EXACT normalized-title matching over the combined
-    `event_title + market_title` key (see `pair_key`). If two contracts differ
-    ONLY in their deadline, stripping all date tokens from the combined key
-    yields the exact same string. The event-title prefix is what keeps
-    multivariate option labels (e.g. "Trump" appearing in unrelated events)
-    from false-positive pairing.
+    Grouping strategy: EXACT matching over
+    `time_series_group_key(pair_key(m), m.subtitle)` — the date-stripped
+    `event_title + market_title` key (see `pair_key`) PLUS the market's outcome
+    discriminator. If two contracts differ ONLY in their deadline, stripping
+    all date tokens from the combined key yields the exact same string; the
+    event-title prefix keeps multivariate option labels (e.g. "Trump" appearing
+    in unrelated events) from false-positive pairing, and the subtitle keeps
+    two different OUTCOMES — two strikes of one daily price family, two
+    temperature bands — out of one group, where the best-pair rule below would
+    otherwise have paired the widest mismatch (DR-01).
 
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (rules out multi-choice options in the same event)
-      3. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
+      3. NOT identical wording across two events of one series: when the raw
+         (title, subtitle, event title) triple matches on both legs AND the two
+         event tickers share a series prefix, the deadline lives outside the
+         wording entirely, so these are two instances of one recurring fixture
+         rather than one question at two deadlines and there is no
+         cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
+         refuses the same shape; if only it did, this finder would simply
+         relabel the pair as a time-series bet and main._dedup_pairs — which
+         drops the time-series copy only when a same-title copy exists — would
+         have nothing to drop it against.
+      4. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
          order-independently by deadline_gap_days()
-      4. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
+      5. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
          LATER-closing contract (B) must be priced higher than the earlier
          one (A) by at least the tier (15% when the deadlines are <= 15 days
          apart, 30% for 16-30 days). That gap is the market-implied
@@ -1666,8 +1914,12 @@ def find_time_series_pairs(
          the strategy disputes it. A pricier EARLIER contract is never a
          candidate — there is no in-between mass to dispute.
 
-    Per normalized title, keeps the single best pair (tradeable preferred, then
-    largest pB - pA) to avoid flooding the portfolio with dozens of similar pairs.
+    Per normalized title+outcome key, keeps the single best pair (tradeable
+    preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
+    outcome label, so the rule no longer bounds one FAMILY to one pair — a
+    daily family of N strikes now yields up to N pairs, every one on the same
+    underlying over the same window, and nothing downstream caps that
+    concentration (strategy.select_portfolio dedups tickers only).
 
     The legs are YES on A at pA and NO on B at nB, so tradeable=True when
     pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
@@ -1700,10 +1952,10 @@ def find_time_series_pairs(
             excludes no shard.
 
     Returns:
-        list: CandidatePair objects, one per normalized-title group that
-            produced a pair, each carrying pair_type="time_series". Empty if
-            no group has two markets on different event_tickers within the
-            deadline-gap cap.
+        list: CandidatePair objects, one per normalized title+outcome group
+            that produced a pair, each carrying pair_type="time_series". Empty
+            if no group has two markets on different event_tickers within the
+            deadline-gap cap whose wording is not identical across one series.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -1718,18 +1970,22 @@ def find_time_series_pairs(
     active = _filter_active_markets(markets, held_tickers)
     logging.info("Actively priced markets (ask in 1%%–99%%): %d", len(active))
 
-    # Group by exact normalized title over the combined (event + market) key.
-    # Stripping date tokens means two markets that differ ONLY in their deadline
-    # produce the same key. Using event_title in the key prevents two unrelated
-    # MVE events sharing an option label (e.g. "Trump") from being grouped.
+    # Group by exact normalized title + outcome label over the combined
+    # (event + market) key. Stripping date tokens means two markets that differ
+    # ONLY in their deadline produce the same key; event_title in the key
+    # prevents two unrelated MVE events sharing an option label (e.g. "Trump")
+    # from being grouped; and the subtitle keeps two different OUTCOMES of one
+    # title (e.g. two strikes of a daily crypto family) apart — without it the
+    # best-pair rule below picks the widest strike mismatch in the group and
+    # sizes it as one cumulative-deadline pair (DR-01).
     by_title: dict = defaultdict(list)
     for m in active:
-        norm = normalize_title(pair_key(m))
+        norm = time_series_group_key(pair_key(m), getattr(m, "subtitle", "") or "")
         # Skip markets whose title collapses entirely to an empty string after stripping
         if norm:
             by_title[norm].append(m)
 
-    logging.info("Distinct normalized titles with >= 1 market: %d", len(by_title))
+    logging.info("Distinct normalized title+outcome keys with >= 1 market: %d", len(by_title))
 
     candidate_pairs: list = []
     for norm_title, members in by_title.items():
@@ -1746,6 +2002,17 @@ def find_time_series_pairs(
                 # Same event_ticker means these are options within a multi-choice event,
                 # not separate time-series markets — skip them
                 if mA.event_ticker == mB.event_ticker:
+                    continue
+
+                # Identical wording across two events of one series is the
+                # same-title shape find_same_title_pairs now refuses (DR-02,
+                # DR-54): the deadline lives outside the wording, so these are
+                # two instances of one recurring fixture and there is no
+                # cumulative-deadline premise to trade. Without this conjunct
+                # the same-title gate would merely RELABEL such a pair as a
+                # time-series bet — main._dedup_pairs only ever dropped the
+                # time-series copy because a same-title copy existed.
+                if _identical_wording(mA, mB) and _same_series(mA, mB):
                     continue
 
                 # Deadline gap check: past 30 days too much of the market-implied
@@ -1812,7 +2079,7 @@ def find_time_series_pairs(
         if not group_pairs:
             continue
 
-        # Keep only the single best pair per normalized title group to avoid flooding
+        # Keep only the single best pair per normalized title+outcome group to avoid flooding
         # the portfolio with many near-identical positions. Tradeable pairs rank above
         # non-tradeable ones; within each tier, the largest pB - pA (the disputed
         # in-between probability) wins. pB > pA holds for every entry in group_pairs
@@ -1842,6 +2109,15 @@ def find_same_title_pairs(
     on the SAME_TITLE_CO_RESOLVE_PROB prior). The legs are NO on market_a at nA
     and YES on market_b at pB; nB is populated fail-soft for reporting only.
 
+    The two event tickers must belong to DIFFERENT series (_same_series). Two
+    events of one series are two instances of one recurring fixture — two ball
+    games, two 15-minute price windows, two MVE combos of different games — so
+    identical wording across them is one question asked about two different
+    events and the co-resolution prior does not apply at all: the 2026-09-15
+    sweep's own NPB pair was quoted 0.97 and 0.01 (DR-02, DR-54). Such
+    candidates are skipped and counted, and the count is reported once at the
+    end as an INFO line.
+
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
@@ -1852,8 +2128,10 @@ def find_same_title_pairs(
     under "Who will the next Pope be?") on different event tickers would be
     falsely paired as the same contract under the 95% co-resolution assumption.
 
-    Filters: different event_ticker (to exclude multi-choice options), both actively
-    priced (1%-99%), not in held_tickers. One best pair per title group.
+    Filters: different event_ticker (to exclude multi-choice options), different
+    event SERIES (to exclude two instances of one recurring fixture), both
+    actively priced (1%-99%), not in held_tickers. One best pair per title
+    group.
 
     Args:
         markets (list): ApiMarket objects to scan (already fetched by the
@@ -1865,7 +2143,8 @@ def find_same_title_pairs(
     Returns:
         list: CandidatePair objects, one per (event_title, title, subtitle)
             group that produced a pair, each carrying pair_type="same_title".
-            Empty if no group has two markets on different event_tickers.
+            Empty if no group has two markets on different event_tickers of
+            different event series.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     # warn_missing_close=False: both run modes call find_time_series_pairs on
@@ -1887,6 +2166,13 @@ def find_same_title_pairs(
             by_terms[(event_title, title, subtitle)].append(m)
 
     candidate_pairs: list = []
+    # Counted, not logged per pair. The rejection below fires per CANDIDATE
+    # pair — before the price parse and the 5% gate, so more often than the
+    # one-best-pair-per-group rows a run finally reports, of which the
+    # 2026-09-15 prod dry run had 71 of 75 pairing two DIFFERENT deadlines,
+    # i.e. two instances of one recurring fixture. One line each would bury the
+    # run's real output; one summary INFO after the loop instead.
+    series_skips = 0
     # members = all active markets that share this exact (event_title, title, subtitle)
     # key. Each entry is a separate market object from a different event — any two of
     # them are candidates for a same-title pair if their prices diverge.
@@ -1904,6 +2190,18 @@ def find_same_title_pairs(
                 # not separate markets asking the same question — skip them
                 if m_outer.event_ticker == m_inner.event_ticker:
                     continue
+
+                # Same wording, same series, different event: two instances of
+                # one recurring fixture (NPB game days, table-tennis matches,
+                # 15-minute price windows, MVE combos of different games) —
+                # two questions about two events, not one question listed
+                # twice, so the SAME_TITLE_CO_RESOLVE_PROB prior does not apply
+                # (DR-02, DR-54). The group key already guarantees the wording
+                # is identical, so the series test is the whole rule here.
+                if _same_series(m_outer, m_inner):
+                    series_skips += 1
+                    continue
+
                 try:
                     p_outer = float(m_outer.yes_ask_dollars)
                     p_inner = float(m_inner.yes_ask_dollars)
@@ -1962,6 +2260,12 @@ def find_same_title_pairs(
         # tradeable pairs wins; tradeable is preferred over non-tradeable
         group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
         candidate_pairs.append(group_pairs[0])
+
+    if series_skips:
+        logging.info(
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): %d", series_skips,
+        )
 
     logging.info(
         "Same-title pairs: %d total, %d tradeable",

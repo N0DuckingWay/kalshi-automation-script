@@ -15,6 +15,8 @@ The `_tmp_project_root` fixture below is applied to every test in this file
 (autouse) so those writes land under pytest's tmp_path instead of the real
 repo root.
 """
+import ast
+import inspect
 import json
 import logging
 import logging.handlers
@@ -372,8 +374,10 @@ class TestCatchUp:
         mock_run_job.assert_not_called()
 
     def test_blind_run_state_without_retries_key_counts_as_zero(self, tmp_path):
-        # A state file written before TS-01 has no "retries" key; _load_state's
-        # validation is untouched, so it must still load and read as attempt 0.
+        # A state file written before TS-01 has no "retries" key. DR-24's new
+        # _load_state validation only fires on a key that is PRESENT and
+        # non-int, so an absent one is still untouched and must load and
+        # read as attempt 0.
         now = datetime(2026, 9, 2, 10, 0)
         current_slot = scheduler._most_recent_slot(now)
         _write_state(
@@ -412,6 +416,111 @@ class TestCatchUp:
             scheduler._maybe_catch_up(now=now)
 
         mock_run_job.assert_not_called()
+
+    def test_non_int_retries_string_warns_and_is_read_as_zero(self, tmp_path, caplog):
+        # DR-24: a hand-edited state file with a string "retries" used to make
+        # _maybe_catch_up's `retries < SCHEDULER_BLIND_MAX_RETRIES` comparison
+        # raise TypeError. _load_state now degrades it to 0 (with a WARNING)
+        # before _maybe_catch_up ever sees it, so the blind slot is retried
+        # exactly as it would be for a freshly-absent "retries" key.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS, retries="2",
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job, \
+             caplog.at_level(logging.WARNING):
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_called_once_with(retries=1)
+        assert any(
+            "non-integer retries" in r.getMessage() for r in caplog.records
+        )
+
+    def test_null_retries_warns_and_is_read_as_zero(self, tmp_path, caplog):
+        # Same as above for a JSON null (Python None) rather than a string —
+        # the other shape a hand-edited or partially-written field can take.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=None,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job, \
+             caplog.at_level(logging.WARNING):
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_called_once_with(retries=1)
+        assert any(
+            "non-integer retries" in r.getMessage() for r in caplog.records
+        )
+
+    def test_non_int_exit_code_is_read_as_unknown_and_slot_not_retried(
+        self, tmp_path, caplog,
+    ):
+        # DR-24's exit_code guard never fixed a crash: `==` against a
+        # mismatched type doesn't raise, so a non-int exit_code always
+        # compared unequal to EXIT_NO_TRADEABLE_SHARDS and left the slot
+        # unretried, both before and after this guard existed. For the
+        # string case pinned here that makes it a typing-hygiene change
+        # only — the WARNING is new, the outcome ("30" == 30 is False) is
+        # not. (It is not a no-op for every non-int shape: a JSON float
+        # 30.0 compared EQUAL before this guard and is now read as unknown,
+        # so a hand-edited float exit_code would newly lose its blind-run
+        # retry. No writer produces one — _save_state always writes an int
+        # — so only a hand-edited file can reach that case.)
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(), exit_code="30",
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job, \
+             caplog.at_level(logging.WARNING):
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_not_called()
+        assert any(
+            "non-integer exit_code" in r.getMessage() for r in caplog.records
+        )
+
+
+class TestStartupCatchUp:
+    """DR-24: main() calls _startup_catch_up() instead of a bare
+    _maybe_catch_up(), so an exception _load_state's own validation didn't
+    catch still can't exit the daemon before the weekly job is registered."""
+
+    def test_maybe_catch_up_raising_is_logged_and_swallowed(self, caplog):
+        with patch(
+            "kalshi_betting.scheduler._maybe_catch_up", side_effect=TypeError("boom"),
+        ), caplog.at_level(logging.ERROR):
+            scheduler._startup_catch_up()  # must not raise
+
+        assert any(
+            "Startup catch-up check raised" in r.getMessage() for r in caplog.records
+        )
+
+    def test_main_calls_the_guarded_wrapper(self):
+        """DR-24: main() must call _startup_catch_up(), not _maybe_catch_up()
+        directly — a bare call can raise out of main() before the weekly job
+        is registered, exactly the failure this commit fixes. main() itself
+        spawns a real prod run and is never invoked by this suite, so the
+        call site is pinned on the source instead."""
+        tree = ast.parse(inspect.getsource(scheduler))
+        main_fn = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        called = {
+            sub.func.id
+            for sub in ast.walk(main_fn)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+        }
+        assert "_startup_catch_up" in called
+        assert "_maybe_catch_up" not in called
 
 
 class TestBlindRunRetry:

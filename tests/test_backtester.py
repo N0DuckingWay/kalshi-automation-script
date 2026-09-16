@@ -151,14 +151,108 @@ class TestNormalizedTitleGrouping:
         # Each lands alone, filtered out by len>=2
         assert groups == {}
 
+    def test_distinct_outcome_labels_separate_groups(self):
+        # DR-01: the subtitle is part of the time-series key too, not just the
+        # same-title one. Two strikes of a daily family share a title and
+        # differ only here.
+        mA = _md("A1", "EVT-SEP14", title="Solana price on Sep 14, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 14, 2026?")
+        mB = _md("B1", "EVT-SEP18", title="Solana price on Sep 18, 2026?",
+                 subtitle="$190 or above", event_title="Solana price on Sep 18, 2026?")
+        assert _group_by_normalized_title([mA, mB]) == {}
+
+    def test_identical_outcome_labels_at_two_deadlines_group(self):
+        mA = _md("A1", "EVT-SEP14", title="Solana price on Sep 14, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 14, 2026?")
+        mB = _md("B1", "EVT-SEP18", title="Solana price on Sep 18, 2026?",
+                 subtitle="$180 or above", event_title="Solana price on Sep 18, 2026?")
+        groups = _group_by_normalized_title([mA, mB])
+        assert len(groups) == 1
+        assert len(next(iter(groups.values()))) == 2
+
+    def test_old_cache_none_subtitle_still_groups_by_title_alone(self):
+        # Day slices written before the 2026-08 subtitle fix carry
+        # subtitle=None; time_series_group_key reads a non-str as absent, so
+        # such records keep the pre-DR-01 title-only grouping rather than
+        # raising. Backtest fidelity only — no live-money path reads them.
+        mA = _md("A1", "EVT-MAR", title="BTC over $80k by March 2026",
+                 event_title="BTC price tracker")
+        mB = _md("B1", "EVT-JUN", title="BTC over $80k by June 2026",
+                 event_title="BTC price tracker")
+        mA["subtitle"] = None
+        mB["subtitle"] = None
+        groups = _group_by_normalized_title([mA, mB])
+        assert len(groups) == 1
+        assert len(next(iter(groups.values()))) == 2
+
+
+class TestTimeSeriesOutcomeDiscriminator:
+    """DR-01 mirror: the backtester keys time-series groups through the same
+    scanner.time_series_group_key the live scanner uses.
+
+    Before this, both sides keyed on the date-stripped title alone, so the
+    backtester reproduced the live defect exactly and could never have
+    detected it: a whole daily strike family was one group, and _extract_pairs
+    emitted every early-strike x late-strike combination as a candidate.
+    """
+
+    _STRIKES = ("$180 or above", "$190 or above", "$200 or above", "$210 or above")
+    _EVENTS = (("KXSOLD-26SEP14", "14", "2026-09-14"), ("KXSOLD-26SEP18", "18", "2026-09-18"))
+
+    def _family(self, *, strike_in_subtitle: bool = True) -> list[dict]:
+        markets = []
+        for i, strike in enumerate(self._STRIKES):
+            for event_ticker, day, close_day in self._EVENTS:
+                title = f"Solana price on Sep {day}, 2026?"
+                markets.append({
+                    "ticker": f"{event_ticker}-T{i}",
+                    "event_ticker": event_ticker,
+                    "event_title": title,
+                    "title": title,
+                    "subtitle": strike if strike_in_subtitle else "",
+                    "close_time": f"{close_day}T21:00:00Z",
+                })
+        return markets
+
+    def test_each_strike_is_its_own_group(self):
+        groups = _group_by_normalized_title(self._family())
+        assert len(groups) == len(self._STRIKES)
+        for members in groups.values():
+            assert len({m["subtitle"] for m in members}) == 1
+            assert len(members) == 2
+
+    def test_extract_pairs_emits_no_cross_strike_candidate(self):
+        pairs = _extract_pairs(_group_by_normalized_title(self._family()))
+        assert len(pairs) == len(self._STRIKES)
+        for mA, mB, _canon, _group_key in pairs:
+            assert mA["subtitle"] == mB["subtitle"]
+
+    def test_without_the_discriminator_every_combination_is_a_candidate(self):
+        # The defect, reproduced: one group of eight, and _extract_pairs (which
+        # has no best-pair rule — that is run_backtest's job) materializes all
+        # 4 x 4 early/late combinations, 12 of which are cross-strike.
+        groups = _group_by_normalized_title(self._family(strike_in_subtitle=False))
+        assert len(groups) == 1
+        pairs = _extract_pairs(groups)
+        assert len(pairs) == 16
+        cross = [(a, b) for a, b, _, _ in pairs if a["ticker"][-2:] != b["ticker"][-2:]]
+        assert len(cross) == 12
+
 
 class TestExtractPairsCanonHandling:
     def test_three_tuple_key_uses_title_not_event(self):
         # Build a same-title group with a 3-tuple key and verify canon is the
         # market title (key[1]), not the event title (key[0]).
-        mA = _md("A1", "EVT-A", title="Republicans win majority",
+        #
+        # RE-PINNED (DR-02/DR-54): the event tickers used to be EVT-A/EVT-B,
+        # which share the series prefix "EVT" — _extract_pairs now reads that
+        # as two instances of one recurring fixture and forms no pair, so the
+        # assertion below would have failed for a reason that has nothing to do
+        # with canon selection. Two DIFFERENT series restore the shape the
+        # same-title strategy was built for.
+        mA = _md("A1", "EVA-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
-        mB = _md("B1", "EVT-B", title="Republicans win majority",
+        mB = _md("B1", "EVB-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
@@ -182,6 +276,133 @@ class TestExtractPairsCanonHandling:
         assert canons == {"Trump"}
         group_keys = {group_key for _, _, _, group_key in pairs}
         assert len(group_keys) == 2, "distinct events must yield distinct group_keys"
+
+
+class TestOneEventSeriesIsTwoFixturesBacktest:
+    """DR-02 / DR-54 mirror: _extract_pairs refuses two events of ONE series.
+
+    The rule is the live scanner's, applied to cached records through
+    backtester._same_series_dicts / _identical_wording_dicts, which derive the
+    series prefix from the same scanner.event_series the live path uses. Both
+    branches of _extract_pairs carry it: the 3-tuple (same-title) branch on the
+    series alone, because the group key already guarantees identical wording,
+    and the string (time-series) branch on the conjunct, because there the
+    wording is only date-stripped-equal.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, subtitle="Yes", event_title=""):
+        return {
+            "ticker": ticker,
+            "event_ticker": event_ticker,
+            "event_title": event_title,
+            "title": title,
+            "subtitle": subtitle,
+            "close_time": close_time,
+        }
+
+    @classmethod
+    def _npb(cls):
+        # The real sandbox pair: one fixture listed on two game days.
+        title = "Fukuoka Hawks vs Orix Buffaloes: First Inning Run?"
+        event_title = "Fukuoka Hawks vs Orix Buffaloes: First Inning Run"
+        return [
+            cls._rec("KXNPBRFI-26SEP160500FUKORI-Y", "KXNPBRFI-26SEP160500FUKORI",
+                     title, "2026-09-18T09:00:00Z", event_title=event_title),
+            cls._rec("KXNPBRFI-26SEP150500FUKORI-Y", "KXNPBRFI-26SEP150500FUKORI",
+                     title, "2026-09-17T09:00:00Z", event_title=event_title),
+        ]
+
+    def test_same_title_branch_rejects_two_game_days_of_one_fixture(self):
+        assert _extract_pairs(_group_by_exact_title(self._npb())) == []
+
+    def test_time_series_branch_rejects_the_same_two_records(self):
+        # Grouping still puts them together (their wording is identical, so it
+        # is trivially date-stripped-equal) — the conjunct is what drops them.
+        groups = _group_by_normalized_title(self._npb())
+        assert len(groups) == 1
+        assert _extract_pairs(groups) == []
+
+    def test_two_combo_events_are_rejected(self):
+        # Every MVE combo sits under KXMVECROSSCATEGORY, so two combos with
+        # identical leg wording are combos of DIFFERENT games. The prefix is
+        # the part before the FIRST hyphen, so the SHARD1 segment does not
+        # split these into two series.
+        recs = [
+            self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
+                      "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
+                      "Parlay", "2026-09-15T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+            self._rec("KXMVECROSSCATEGORY-SHARD1-S93FFD638F77-Y",
+                      "KXMVECROSSCATEGORY-SHARD1-S93FFD638F77",
+                      "Parlay", "2026-09-15T20:00:00Z",
+                      subtitle="All legs hit", event_title="Cross-category combo"),
+        ]
+        assert _extract_pairs(_group_by_exact_title(recs)) == []
+        assert _extract_pairs(_group_by_normalized_title(recs)) == []
+
+    def test_two_different_series_asking_one_question_still_pair(self):
+        recs = [
+            self._rec("KXFEDDEC-26-T25", "KXFEDDEC-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+            self._rec("FEDCUTDEC-26-T25", "FEDCUTDEC-26",
+                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+        ]
+        pairs = _extract_pairs(_group_by_exact_title(recs))
+        assert len(pairs) == 1
+        assert {pairs[0][0]["ticker"], pairs[0][1]["ticker"]} == {
+            "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
+        }
+
+    def test_a_dated_pair_of_one_series_is_untouched(self):
+        # The deadline lives IN the wording, so _identical_wording_dicts is
+        # False and the time-series conjunct never fires. ELIGIBILITY only —
+        # a "price on <date>" family is a snapshot family, not a cumulative
+        # one, and the premise-violation counter is what judges that (see the
+        # live mirror, TestOneEventSeriesIsTwoFixtures::
+        # test_a_dated_pair_of_one_series_is_untouched).
+        recs = [
+            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
+                      "Solana price on Sep 14, 2026?", "2026-09-14T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title="Solana price on Sep 14, 2026?"),
+            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
+                      "Solana price on Sep 18, 2026?", "2026-09-18T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title="Solana price on Sep 18, 2026?"),
+        ]
+        pairs = _extract_pairs(_group_by_normalized_title(recs))
+        assert len(pairs) == 1
+
+    def test_an_unreadable_event_ticker_fails_closed(self):
+        # A record whose fixture identity cannot be read must NOT be replayed
+        # on the 95% co-resolution prior — the same direction the live helper
+        # fails in.
+        recs = [
+            self._rec("A1", "", "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
+                      event_title="Fed December decision"),
+            self._rec("B1", "FEDCUTDEC-26", "Fed cuts rates in December?",
+                      "2026-12-10T19:00:00Z", event_title="Fed December decision"),
+        ]
+        assert _extract_pairs(_group_by_exact_title(recs)) == []
+        assert backtester._same_series_dicts(recs[0], recs[1]) is True
+
+    def test_a_missing_event_ticker_key_also_fails_closed(self):
+        # Old cache records predate nothing here, but .get() must not raise and
+        # an absent key must read as unknown, not as a distinct series.
+        assert backtester._same_series_dicts({}, {"event_ticker": "KXSOLD-26SEP14"}) is True
+
+    def test_identical_wording_mirror_reads_missing_keys_as_empty(self):
+        assert backtester._identical_wording_dicts({}, {}) is True
+        assert backtester._identical_wording_dicts(
+            {"title": "Q", "subtitle": "Yes", "event_title": "E"},
+            {"title": "Q", "subtitle": "Yes", "event_title": "E"},
+        ) is True
+        assert backtester._identical_wording_dicts(
+            {"title": "Q by March"}, {"title": "Q by June"},
+        ) is False
 
 
 class TestOldCacheToleranceMissingTickAndSubtitleFields:
@@ -217,9 +438,14 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
         assert len(groups) == 1
 
     def test_extract_pairs_same_title_handles_missing_fields(self):
-        mA = self._old_style_dict("A1", "EVT-A", "Republicans win majority",
+        # RE-PINNED (DR-02/DR-54): EVT-A/EVT-B share the series prefix "EVT",
+        # which _extract_pairs now refuses as two instances of one recurring
+        # fixture. The tickers name two DIFFERENT series so this test keeps
+        # pinning what it is for — that an old cache record missing the tick
+        # and subtitle keys still pairs.
+        mA = self._old_style_dict("A1", "EVA-1", "Republicans win majority",
                                    "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
-        mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
+        mB = self._old_style_dict("B1", "EVB-1", "Republicans win majority",
                                    "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
@@ -1037,10 +1263,21 @@ def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
 
 def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
-    filtering by the same margin-inclusive close-time gap and event_ticker
-    rule _extract_pairs applies, but without any sorting/windowing. Written
+    filtering by the same margin-inclusive close-time gap, the same
+    event_ticker rule AND the same one-series rule (DR-02/DR-54) that
+    _extract_pairs applies, but without any sorting/windowing. Written
     standalone (no backtester internals besides plain dict/date arithmetic)
     so it can serve as ground truth for the windowed implementation.
+
+    The one-series conjunct is spelled out here rather than imported, for the
+    same reason the rest is: an oracle that reuses the implementation cannot
+    falsify it. It is not dead weight on the current fixtures only by
+    accident — _build_synthetic_group's members carry no wording keys, so the
+    wording half is True for every pair in them and the distinct hyphen-less
+    event tickers are the only thing keeping the conjunct from firing. Add one
+    hyphenated shared-prefix ticker to that fixture and an oracle without this
+    clause diverges silently, which is exactly the "oracle replays the old
+    rule" failure CLAUDE.md records for the archive-walk parity tests.
     """
     result: set[frozenset] = set()
     n = len(members)
@@ -1060,6 +1297,14 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
                 continue
             if a["event_ticker"] == b["event_ticker"]:
                 continue
+            if ((a.get("title") or "", a.get("subtitle") or "",
+                 a.get("event_title") or "")
+                    == (b.get("title") or "", b.get("subtitle") or "",
+                        b.get("event_title") or "")):
+                sa = (a.get("event_ticker") or "").split("-", 1)[0].strip().upper()
+                sb = (b.get("event_ticker") or "").split("-", 1)[0].strip().upper()
+                if not sa or not sb or sa == sb:
+                    continue
             result.add(frozenset([a["ticker"], b["ticker"]]))
     return result
 
@@ -1800,15 +2045,27 @@ class TestEquityCurveFutureStartDate:
             lambda *a, **k: pytest.fail("fetch must be skipped for a future window"),
         )
 
-    def test_build_equity_curve_emits_one_row_for_a_future_start(self):
+    def test_build_equity_curve_emits_two_rows_for_a_future_start(self):
+        """Re-pinned from "one row" (DR-03): _build_equity_curve now opens every
+        curve one day BEFORE start_date at the untouched initial balance, so the
+        floored span produces the leading row plus start_date's own — two rows,
+        not one. The old single-row expectation described the curve that hid a
+        day-0 entry's outflow from pct_change and cummax; nothing about the
+        future-window guarantee this class exists for changed (the frame still
+        has its three columns and is still readable by .iloc).
+        """
         df = backtester._build_equity_curve([], self._FUTURE_START, 1234.0)
 
         assert list(df.columns) == ["date", "portfolio_value", "daily_return"]
-        assert len(df) == 1
-        assert df["date"].iloc[0] == self._FUTURE_START
+        assert len(df) == 2
+        assert df["date"].iloc[0] == self._FUTURE_START - timedelta(days=1)
+        assert df["date"].iloc[1] == self._FUTURE_START
+        # Nothing can enter before start_date, and start_date is in the future,
+        # so both rows sit at the initial balance and neither moves.
         assert df["portfolio_value"].iloc[0] == pytest.approx(1234.0)
-        # No prior day to compare against, so the single row's return is flat.
+        assert df["portfolio_value"].iloc[1] == pytest.approx(1234.0)
         assert df["daily_return"].iloc[0] == pytest.approx(0.0)
+        assert df["daily_return"].iloc[1] == pytest.approx(0.0)
 
     def test_run_backtest_returns_the_empty_shape_for_a_future_start(self, monkeypatch):
         self._fetch_should_not_be_called(monkeypatch)
@@ -1841,6 +2098,157 @@ class TestEquityCurveFutureStartDate:
         assert list(result.primary.equity_df.columns) == [
             "date", "portfolio_value", "daily_return"]
         assert result.primary.equity_df["portfolio_value"].iloc[-1] == pytest.approx(2000.0)
+
+
+class TestEquityCurveOpensAtTheInitialBalance:
+    """A trade entering on start_date itself must show its outflow as a real
+    daily return and a real drawdown (DR-03).
+
+    The default backtest window starts on a Monday (--start-date 2024-01-01),
+    which is exactly the kind of day _find_entry can open a trade on, and the
+    curve used to apply that day's outflow to its FIRST row. pct_change and
+    cummax both read the first row as the baseline, so the entire day-0 stake
+    was invisible: on this fixture the dashboard reported max drawdown 0.0% on a
+    run that lost 99.98% of its balance on day one, and the per-k sweep table
+    divided by the depleted opening (+133,804.3%) while the performance card
+    divided by initial_balance (-75.4%) — one run reported two ways on one page.
+
+    The fixture reproduces the 2026-09-15 dry-run sweep's shape: $10,000 in,
+    everything committed on start_date ($9,998.16 all-in across both legs of two
+    pairs), $2,462.00 back 29 days later, a closing portfolio of $2,463.84. It
+    takes two trades because one cannot do it: a BacktestTrade's winning
+    settlement pays its own contract count, and a pair's two leg prices sum to
+    less than $1, so a single winning trade always pays back MORE than it cost.
+    The big pair therefore settles in the time-series in-between cell (A=NO,
+    B=YES — both legs worthless, the whole stake lost) and the small one in the
+    never-by-B win cell (A=NO, B=NO — the NO on B pays n).
+    """
+
+    _START = date(2026, 6, 1)      # a Monday, comfortably in the past
+    _EXIT = date(2026, 6, 30)
+    _HOLDING_DAYS = (_EXIT - _START).days
+    _INITIAL = 10_000.0
+
+    # Winner: YES on the earlier leg at 0.15, NO on the later at 0.40.
+    _WIN_N, _WIN_PA, _WIN_NB = 2462, 0.15, 0.40
+    # Loser: YES at 0.25, NO at 0.30 — settles in the in-between cell.
+    _LOSS_N, _LOSS_PA, _LOSS_NB = 14850, 0.25, 0.30
+
+    def _trade(self, n: int, pA: float, nB: float, outcome_b: str,
+               payoff: float) -> backtester.BacktestTrade:
+        """One coherent time-series BacktestTrade.
+
+        The loss cell (outcome_b="yes") pays nothing; the never-by-B win cell
+        (outcome_b="no") pays n, the count of NO contracts held on market B.
+        Fees are the real two-leg taker fees at these prices, so the outflow the
+        equity curve subtracts is the one the backtester would have recorded.
+        """
+        cost = n * (pA + nB)
+        fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
+        profit = payoff - cost - fees
+        expected_payoff = n * (1.0 - pA - nB) - fees
+        return backtester.BacktestTrade(
+            pair_type="time_series",
+            ticker_a="TICK-A", ticker_b="TICK-B",
+            title_a="Will BTC exceed $80k by June?",
+            title_b="Will BTC exceed $80k by July?",
+            category="Crypto",
+            entry_date=self._START, exit_date=self._EXIT,
+            entry_pA=pA, entry_pB=0.60, entry_nA=1.0 - pA, entry_nB=nB,
+            n=n,
+            total_cost=cost, fees=fees,
+            outcome_a="no", outcome_b=outcome_b,
+            actual_payoff=payoff,
+            profit=profit,
+            profit_ratio=profit / (cost + fees),
+            monthly_profit_ratio=profit / (cost + fees) * 30 / self._HOLDING_DAYS,
+            kelly_fraction=0.2,
+            expected_payoff=expected_payoff,
+            slippage=profit - expected_payoff,
+            holding_days=self._HOLDING_DAYS,
+            balance_at_entry=self._INITIAL,
+            deadline_gap_days=7,
+        )
+
+    def _trades(self) -> list[backtester.BacktestTrade]:
+        return [
+            self._trade(self._LOSS_N, self._LOSS_PA, self._LOSS_NB,
+                        outcome_b="yes", payoff=0.0),
+            self._trade(self._WIN_N, self._WIN_PA, self._WIN_NB,
+                        outcome_b="no", payoff=float(self._WIN_N)),
+        ]
+
+    def _curve(self) -> pd.DataFrame:
+        return backtester._build_equity_curve(
+            self._trades(), self._START, self._INITIAL)
+
+    def test_the_fixture_commits_the_whole_balance_on_day_zero(self):
+        # Guards the numbers every other test in this class reads: both pairs
+        # enter on start_date for $9,998.16 all-in out of $10,000.
+        outflow = sum(t.total_cost + t.fees for t in self._trades())
+        assert outflow == pytest.approx(9998.16)
+        assert all(t.entry_date == self._START for t in self._trades())
+
+        # ...and that each leg's payoff is the cell the backtester would
+        # actually have paid, so the class docstring's settlement claims are
+        # checked rather than asserted: hand-written literals would stay green
+        # through a change to _settlement_receipt's time-series table.
+        for t in self._trades():
+            assert t.actual_payoff == backtester._settlement_receipt(
+                t.n, t.outcome_a, t.outcome_b, t.pair_type)
+
+    def test_leading_row_is_the_untouched_initial_balance(self):
+        eq = self._curve()
+
+        assert eq["date"].iloc[0] == self._START - timedelta(days=1)
+        assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
+        assert eq["daily_return"].iloc[0] == pytest.approx(0.0)
+
+    def test_day_zero_outflow_is_a_real_daily_return(self):
+        eq = self._curve()
+
+        # Row 1 is start_date: the whole stake left the portfolio that day.
+        assert eq["date"].iloc[1] == self._START
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(1.84)
+        assert eq["daily_return"].iloc[1] < 0
+        assert eq["daily_return"].iloc[1] == pytest.approx(-0.999816, abs=1e-6)
+
+    def test_max_drawdown_sees_the_day_zero_trough(self):
+        from kalshi_betting.dashboard import _max_drawdown
+
+        eq = self._curve()
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        assert max_dd == pytest.approx(-0.9998, abs=1e-4)
+        assert trough == self._START
+
+    def test_sweep_row_and_performance_card_report_one_return(self):
+        # _srow (inside _section_interval_discount) divides by the curve's
+        # iloc[0]; _section_performance divides by initial_balance. With the
+        # leading row those bases are the same number, so the two cells on one
+        # page can no longer disagree.
+        from kalshi_betting import dashboard
+
+        eq = self._curve()
+        final = float(eq["portfolio_value"].iloc[-1])
+        opening = float(eq["portfolio_value"].iloc[0])
+
+        assert final == pytest.approx(2463.84)
+        assert opening == pytest.approx(self._INITIAL)
+        assert (final - opening) / opening == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-9)
+
+        trades = self._trades()
+        point = backtester.SweepPoint(
+            k=TIME_SERIES_INTERVAL_PROB_DISCOUNT, trades=trades, equity_df=eq)
+        sweep = backtester.BacktestSweep(
+            primary=point, points=[point], calibration=None)
+
+        # Both render the same headline percentage, -75.4%.
+        assert "-75.4%" in dashboard._section_interval_discount(sweep)
+        assert "-75.4%" in dashboard._section_performance(
+            eq, trades, self._START, self._INITIAL)
 
 
 class TestDropCrossTypeDuplicates:
