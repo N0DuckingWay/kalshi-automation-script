@@ -590,6 +590,34 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
+# Annualization bases for the dashboard's risk-adjusted return metrics
+# (dashboard._sharpe / _sortino). TWO of them exist because the dashboard's
+# Benchmark Comparison table puts two series with DIFFERENT periodicities in
+# adjacent rows, and they must never share one factor:
+#
+#   * The strategy equity curve from backtester._build_equity_curve() has one
+#     row per CALENDAR day (it opens one day before start_date and runs through
+#     today, weekends and holidays included), i.e. ~365 periods per year.
+#   * The ^GSPC benchmark series is yfinance's daily close pct_change, which
+#     serves TRADING days only, i.e. ~252 periods per year.
+#
+# Annualizing a calendar-day series at 252 understates its MAGNITUDE by exactly
+# sqrt(365/252) = 1.2035 whenever the risk-free hurdle is 0 — the sign is
+# unchanged, so a negative Sharpe reads LESS bad at 252, not better-looking in
+# any meaningful sense. Verified on a series any reader can re-run, the negation
+# of tests/test_dashboard.py's _RETURNS: sharpe@252 = -2.4820064 vs
+# sharpe@365 = -2.9870951, ratio 1.2035002. At rf != 0 it is not a constant
+# rescale at all, because the per-period hurdle rf/periods_per_year moves too.
+#
+# dashboard._sharpe/_sortino default to the CALENDAR base: four of their five
+# call sites consume _build_equity_curve output, and the single trading-day
+# consumer is the external ^GSPC row, which passes TRADING_DAYS_PER_YEAR
+# explicitly. Defaulting to the majority case is the same fail-safe-default
+# rule scanner.leg_sides() and scanner._shard_index() follow — a future
+# in-module caller inherits the correct base rather than the wrong one.
+TRADING_DAYS_PER_YEAR: int  = 252
+CALENDAR_DAYS_PER_YEAR: int = 365
+
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair
 # execution of the selected portfolio (execute_trades). Each pool is sized
