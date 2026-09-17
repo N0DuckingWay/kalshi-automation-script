@@ -399,6 +399,60 @@ class IntervalCalibration:
     excluded_premise_violations: int
 
 
+@dataclass(frozen=True)
+class OutcomeLabelCoverage:
+    """
+    The outcome-label census over one backtest window's eligible markets.
+
+    Produced by _log_outcome_label_coverage() as it emits its log line, so the
+    page and the log can never report two different numbers or disagree about
+    where the warning floor sits — there is exactly ONE measurement, one pass
+    and one threshold comparison per run.
+
+    Holds five scalars and no reference to any market record: _prepare_entries
+    del's the eligible-market list immediately after pair extraction to lower
+    residency across the candlestick fetch (TS-07), and a carrier that kept
+    examples (sample tickers, a per-category breakdown) would pin every one of
+    those dicts alive past that statement.
+
+    The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
+    list after the _can_ever_enter prefilter, i.e. every record handed to the
+    two grouping calls. It is NOT the population the empirical k-hat is
+    computed over (_interval_calibration measures over entered, binarily
+    settled, non-premise-violating time-series candidates, a far smaller and
+    differently-selected subset). Any rendering of these numbers must be
+    phrased over the corpus, never over "the pairs behind k̂".
+
+    Attributes:
+        total (int): Eligible markets censused. Zero means the corpus was
+            empty, not that the census failed to run.
+        with_subtitle (int): Records carrying a non-blank `subtitle` — the
+            outcome discriminator in the time-series key and the third
+            component of the same-title key.
+        with_event_title (int): Records carrying a non-blank `event_title` —
+            the first component of the same-title key.
+        subtitle_fraction (float | None): with_subtitle / total, or None when
+            total is 0. None rather than 0.0 because the fraction is UNDEFINED
+            on an empty corpus, matching the helper's own empty-list branch,
+            which reports no coverage rather than 0%.
+        event_title_fraction (float | None): with_event_title / total, or None
+            when total is 0, for the same reason.
+        below_floor (bool): Whether subtitle_fraction fell below
+            config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION — the SAME comparison
+            the WARNING branches on, evaluated once and carried, so a reader of
+            the log and a reader of the dashboard can never be told different
+            things. False when total is 0 (nothing to warn about) and False
+            when only event_title coverage is low, which never escalates (see
+            config.py beside that constant for why).
+    """
+    total: int
+    with_subtitle: int
+    with_event_title: int
+    subtitle_fraction: float | None
+    event_title_fraction: float | None
+    below_floor: bool
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -423,10 +477,21 @@ class BacktestSweep:
             time-series candidate to measure. It hangs off the sweep rather
             than off any point because it is k-independent — one measurement
             valid for all of them (see _interval_calibration).
+        label_coverage (OutcomeLabelCoverage | None): The outcome-label census
+            over this run's eligible-market corpus, or None when no census was
+            taken (the Monday-feasibility short-circuit skips the fetch
+            entirely, and a hand-built sweep never had a corpus). It hangs off
+            the sweep for exactly the reason `calibration` does: one
+            measurement over one corpus, k-independent, valid at every point.
+            DEFAULTED so no existing construction breaks — but a caller that
+            omits it renders "not measured" on the dashboard rather than the
+            caveat, so the two production constructions in run_backtest_sweep()
+            must always pass it.
     """
     primary: SweepPoint
     points: list[SweepPoint]
     calibration: IntervalCalibration | None
+    label_coverage: OutcomeLabelCoverage | None = None
 
 
 @dataclass
@@ -1459,7 +1524,7 @@ def _log_rss(label: str) -> None:
     logging.info("Peak RSS %s: %.0f MiB", label, mib)
 
 
-def _log_outcome_label_coverage(markets: list[dict]) -> None:
+def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     """
     Census how many eligible markets carry an outcome label, and warn when few do.
 
@@ -1496,6 +1561,16 @@ def _log_outcome_label_coverage(markets: list[dict]) -> None:
     Advisory only: this reads the list and logs. No market, group, pair or
     entry is dropped, filtered or altered, and no count the run reports moves.
 
+    It also RETURNS what it just measured, so the same figure can reach the
+    dashboard (DR-66b): a run over a label-less cache used to log the warning
+    and then render a bare "Pooled empirical k̂" card with no caveat anywhere on
+    the page, while backtest.py's own closing line points the operator at that
+    page. Measuring and reporting in one function is a deliberate departure
+    from the check_shard_coverage / _log_shard_coverage pure-plus-loud split:
+    the single pass is the memory-sensitive part and must not be duplicated,
+    and the threshold must be evaluated exactly once so the log line and the
+    page cannot disagree about where the floor sits.
+
     Args:
         markets (list[dict]): The eligible market records, in the compact
             historical._market_to_dict form, exactly as handed to the two
@@ -1503,7 +1578,11 @@ def _log_outcome_label_coverage(markets: list[dict]) -> None:
             materialized, since this can be millions of records.
 
     Returns:
-        None
+        OutcomeLabelCoverage: The five scalars this census just logged, with
+            below_floor carrying the very comparison the WARNING branches on.
+            On an empty corpus, total 0 with both fractions None (undefined,
+            not zero) and below_floor False. Holds no reference to any record,
+            so it is safe to keep past _prepare_entries' `del markets`.
     """
     total = len(markets)
 
@@ -1514,7 +1593,13 @@ def _log_outcome_label_coverage(markets: list[dict]) -> None:
     # emits one line, so its ABSENCE always means this helper did not run.
     if not total:
         logging.info("Outcome-label coverage: no eligible markets to census")
-        return
+        # Fractions are None, not 0.0: undefined rather than zero, so a
+        # renderer can say "nothing to census" instead of "0% coverage".
+        return OutcomeLabelCoverage(
+            total=0, with_subtitle=0, with_event_title=0,
+            subtitle_fraction=None, event_title_fraction=None,
+            below_floor=False,
+        )
 
     # One pass, two counters. Blank/None/absent all read as "no label", the
     # same falsiness the two grouping helpers apply with `or ""`.
@@ -1534,7 +1619,13 @@ def _log_outcome_label_coverage(markets: list[dict]) -> None:
         with_event_title, with_event_title / total * 100.0,
     )
 
-    if subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION:
+    # Evaluated ONCE and carried out on the dataclass. The dashboard branches
+    # on this verdict rather than re-deriving it from the constant, so a
+    # future `<` that becomes a `<=` cannot make the page and the log fire on
+    # different conditions.
+    below_floor = subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION
+
+    if below_floor:
         logging.warning(
             "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
             "eligible markets carry no subtitle, so the time-series key falls "
@@ -1551,6 +1642,15 @@ def _log_outcome_label_coverage(markets: list[dict]) -> None:
             BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0,
         )
 
+    return OutcomeLabelCoverage(
+        total=total,
+        with_subtitle=with_subtitle,
+        with_event_title=with_event_title,
+        subtitle_fraction=subtitle_fraction,
+        event_title_fraction=with_event_title / total,
+        below_floor=below_floor,
+    )
+
 
 def _prepare_entries(
     hist_client: Any,
@@ -1558,7 +1658,7 @@ def _prepare_entries(
     start_date: date,
     use_cache: bool,
     max_horizon_days: int | None,
-) -> list[dict] | None:
+) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
 
@@ -1583,15 +1683,28 @@ def _prepare_entries(
             cap. Passed straight through to _find_entry() for each pair.
 
     Returns:
-        list[dict] | None: One record per pair that produced an entry, in scan
+        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
+            entries and this run's outcome-label census.
+
+            Element 0 is one record per pair that produced an entry, in scan
             order (time-series pairs first, then same-title), each shaped
             {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
             where "entry" is _find_entry()'s return dict (which already carries
             the possibly-swapped mA/mB). An empty list means no pair was ever
-            tradeable. Returns None — the codebase's
+            tradeable. It is None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
-            window at all" signal distinct from "nothing entered".
+            window at all" signal distinct from "nothing entered". NOTE that
+            the sentinel now lives on element 0: a caller that forgets to
+            unpack holds a 2-tuple, which is never None, so its
+            `if raw_entries is None` guard would silently go false.
+
+            Element 1 is the OutcomeLabelCoverage the census measured over the
+            eligible-market corpus — carried out so the dashboard can render
+            the same caveat the log warns about (DR-66b) — and is None on
+            exactly the feasibility-short-circuit path, where the fetch never
+            ran and there was no corpus to census. That is distinct from a
+            censused corpus of zero records, which carries total=0.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -1636,7 +1749,12 @@ def _prepare_entries(
         # run_backtest turns it into the same empty-result shape the zero-trade
         # path already produces, so backtest.py / generate_dashboard need no
         # changes to handle this early-exit.
-        return None
+        #
+        # The census is None here rather than an empty OutcomeLabelCoverage:
+        # the fetch never ran, so no corpus was ever censused. That reads on
+        # the page as "not measured", which is the truth, and is distinct from
+        # a corpus that WAS censused and held zero records.
+        return None, None
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
@@ -1706,7 +1824,13 @@ def _prepare_entries(
     # pre-DR-01 strike-blind title-only form — silently, with the run's pair
     # counts, trades, return and empirical k-hat all still reported as if it had
     # grouped correctly (DR-66). Advisory: it logs and changes nothing.
-    _log_outcome_label_coverage(markets)
+    #
+    # The measurement is carried out of this function (DR-66b) so the dashboard
+    # can render the same caveat beside the k-hat card it recommends a
+    # real-money constant from. It is five scalars with no reference to any
+    # record here, so holding it costs nothing and the `del markets` below is
+    # unaffected.
+    label_coverage = _log_outcome_label_coverage(markets)
 
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
@@ -1784,7 +1908,7 @@ def _prepare_entries(
         })
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
-    return raw_entries
+    return raw_entries, label_coverage
 
 
 def _simulate_at_discount(
@@ -2522,7 +2646,11 @@ def run_backtest(
 
     # The k-independent half: fetch, group, pair and locate each pair's first
     # tradeable Monday. None means the feasibility pre-check failed.
-    raw_entries = _prepare_entries(
+    #
+    # The outcome-label census rides out alongside the entries (DR-66b), but
+    # this entry point returns the historical two-tuple and feeds no dashboard,
+    # so it is discarded here — the census has already logged itself.
+    raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
     )
     if raw_entries is None:
@@ -2600,8 +2728,10 @@ def run_backtest_sweep(
 
     Returns:
         BacktestSweep: primary (the effective-discount result), points
-            (ascending by k, always containing primary) and calibration (None
-            when no time-series candidate was measurable).
+            (ascending by k, always containing primary), calibration (None
+            when no time-series candidate was measurable) and label_coverage
+            (the run's outcome-label census, None when the feasibility
+            short-circuit skipped the fetch).
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2614,14 +2744,17 @@ def run_backtest_sweep(
         simulation is possible at any discount: the result is a sweep holding
         one empty point (built by the same _simulate_at_discount() call every
         other point comes from, over an empty entry list, so its shape and its
-        resolved k cannot drift from a real one) and calibration=None. Callers
-        therefore need no special case for that path.
+        resolved k cannot drift from a real one), calibration=None and
+        label_coverage=None. Callers therefore need no special case for that
+        path.
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
     # The k-independent half — one fetch, one pairing, one entry sweep, reused
     # by every point below. None means the feasibility pre-check failed.
-    raw_entries = _prepare_entries(
+    # label_coverage is the run's outcome-label census, k-independent like the
+    # calibration below and carried on the sweep for the same reason.
+    raw_entries, label_coverage = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
     )
     if raw_entries is None:
@@ -2632,7 +2765,11 @@ def run_backtest_sweep(
         empty = _simulate_at_discount(
             [], start_date, initial_balance, k=interval_discount
         )
-        return BacktestSweep(primary=empty, points=[empty], calibration=None)
+        # label_coverage is None on this path by construction — the fetch was
+        # skipped, so nothing was censused. The dashboard renders that as "not
+        # measured" rather than as healthy coverage.
+        return BacktestSweep(primary=empty, points=[empty], calibration=None,
+                             label_coverage=None)
 
     # Measured from the k-independent entries, so it is valid for every point
     # below and is never filtered by any point's Kelly gate.
@@ -2685,7 +2822,8 @@ def run_backtest_sweep(
             raw_entries, start_date, initial_balance, k=point_k
         ))
 
-    return BacktestSweep(primary=primary, points=points, calibration=calibration)
+    return BacktestSweep(primary=primary, points=points, calibration=calibration,
+                         label_coverage=label_coverage)
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────

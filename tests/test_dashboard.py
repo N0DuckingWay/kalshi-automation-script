@@ -26,6 +26,7 @@ from kalshi_betting.backtester import (
     BacktestTrade,
     IntervalCalibration,
     IntervalCalibrationBucket,
+    OutcomeLabelCoverage,
     SweepPoint,
 )
 from kalshi_betting.config import (
@@ -313,6 +314,224 @@ class TestSectionIntervalDiscount:
         out = _section_interval_discount(sweep)
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
         assert "<script>alert(1)" not in out
+
+
+def _coverage(with_subtitle: int, total: int = 100) -> OutcomeLabelCoverage:
+    """An OutcomeLabelCoverage shaped exactly as the census produces one.
+
+    below_floor is computed here the same way the census computes it, so a
+    fixture can never claim a verdict its own numbers contradict — but the
+    DASHBOARD never recomputes it: it branches on the carried flag.
+    """
+    fraction = with_subtitle / total if total else None
+    return OutcomeLabelCoverage(
+        total=total,
+        with_subtitle=with_subtitle,
+        with_event_title=with_subtitle,
+        subtitle_fraction=fraction,
+        event_title_fraction=fraction,
+        below_floor=(fraction is not None
+                     and fraction < config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION),
+    )
+
+
+class TestOutcomeLabelCoverageIsRendered:
+    """DR-66b: the census that DR-66 taught the LOG to emit must also reach the
+    page.
+
+    The k̂ card beside it is a recommendation for the real-money constant
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT, and backtest.py's closing line points
+    the operator at the HTML — so a reader of that page must be able to tell a
+    label-less run from a good one. Before this, the strings "subtitle",
+    "coverage" and "strike-blind" were all absent from a 140kB dashboard
+    generated from a run whose census had logged 0.00% coverage.
+    """
+
+    @staticmethod
+    def _sweep(coverage) -> BacktestSweep:
+        points = _sweep_points([0.75])
+        return BacktestSweep(primary=points[0], points=points,
+                             calibration=_calibration(), label_coverage=coverage)
+
+    # ── Below the floor: the caveat, its consequence and its remedy ──────────
+
+    def test_the_banner_renders_below_the_floor(self):
+        out = _section_interval_discount(self._sweep(_coverage(2, total=100)))
+
+        # This run's own numbers, and the configured floor — never a figure
+        # measured on some other run (TS-07).
+        assert "2.00%" in out
+        assert f"{config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0:.2f}%" in out
+        # The consequence: the pair population is not the shipped scanner's.
+        assert "strike-blind" in out
+        assert "different strategy" in out
+        # The remedy, including the trap that --no-cache alone is not enough.
+        assert "backtest_cache/archive_days/" in out
+        assert "backtest_cache/live_days/" in out
+        assert "--no-cache" in out
+        assert "ALONE does not refresh the day slices" in out
+
+    def test_the_caveat_travels_with_the_khat_card(self):
+        # A reader who sees only the KPI cards — or screenshots them — must not
+        # get a bare recommendation. The label is SUFFIXED, never replaced.
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert "Pooled empirical k̂" in out
+        assert "Pooled empirical k̂ (see caveat above)" in out
+        # ...and the number is recoloured to the warning colour, which the
+        # healthy render does not do to it.
+        assert 'color:#F44336;">0.600' in out
+
+    def test_the_banner_precedes_the_cards(self):
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert out.index("strike-blind") < out.index("Pooled empirical k̂")
+
+    def test_the_section_still_renders_everything_else(self):
+        # The banner is additive: the table, the selector and the sweep table
+        # must all survive it.
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert "updatemenus" in out
+        assert "POOLED" in out
+        assert "k used (this run)" in out
+
+    # ── Healthy: the figure is still rendered, and the caveat is not ─────────
+
+    def test_healthy_coverage_renders_the_figure_without_a_banner(self):
+        out = _section_interval_discount(self._sweep(_coverage(97, total=100)))
+
+        # Present, so a reader can CONFIRM the run was clean. Absence of a
+        # warning must not be the only signal — that is indistinguishable from
+        # the feature not existing.
+        assert "Outcome-label coverage" in out
+        assert "97.00%" in out
+        assert "97 of 100 eligible markets" in out
+        # ...and no caveat anywhere.
+        assert "strike-blind" not in out
+        assert "different strategy" not in out
+        assert "see caveat above" not in out
+        assert "Pooled empirical k̂" in out
+
+    def test_the_verdict_is_carried_not_recomputed(self):
+        # The page must branch on the census's own flag so it and the log can
+        # never fire on different conditions. A carrier whose numbers look low
+        # but whose verdict says otherwise renders NO banner.
+        lying = OutcomeLabelCoverage(
+            total=100, with_subtitle=1, with_event_title=1,
+            subtitle_fraction=0.01, event_title_fraction=0.01,
+            below_floor=False,
+        )
+        out = _section_interval_discount(self._sweep(lying))
+        assert "1.00%" in out            # the figure is still reported
+        assert "strike-blind" not in out  # but the verdict was not re-derived
+
+    # ── The two "nothing to report" states ──────────────────────────────────
+
+    def test_coverage_none_renders_no_banner_and_no_none(self):
+        # An older caller, a hand-built sweep, or the Monday-feasibility
+        # short-circuit: no census was taken. That is neither healthy nor low.
+        out = _section_interval_discount(self._sweep(None))
+        assert "was not measured for this run" in out
+        assert "strike-blind" not in out
+        assert "see caveat above" not in out
+        # No "None%" — and no bare "None" anywhere in the rendered fragment.
+        assert "None" not in out
+        # Everything the section rendered before is untouched.
+        assert "updatemenus" in out and "POOLED" in out
+        assert "Pooled empirical k̂" in out and "0.600" in out
+
+    def test_a_defaulted_sweep_still_renders(self):
+        # label_coverage is defaulted, so a construction that predates it must
+        # render the not-measured line rather than crash.
+        points = _sweep_points([0.75])
+        out = _section_interval_discount(
+            BacktestSweep(primary=points[0], points=points, calibration=None))
+        assert "was not measured for this run" in out
+        assert "None" not in out
+
+    def test_an_empty_corpus_is_not_reported_as_zero_percent(self):
+        # total == 0 makes the fraction UNDEFINED, not 0%: warning there would
+        # manufacture a drift alarm out of a corpus that simply has no records.
+        empty = OutcomeLabelCoverage(
+            total=0, with_subtitle=0, with_event_title=0,
+            subtitle_fraction=None, event_title_fraction=None,
+            below_floor=False,
+        )
+        out = _section_interval_discount(self._sweep(empty))
+        assert "no eligible markets to census" in out
+        assert "0.00%" not in out
+        assert "strike-blind" not in out
+        assert "None" not in out
+
+    def test_the_placeholder_path_is_untouched(self):
+        # The sweep-less placeholder must gain nothing: that page shows no k̂
+        # card either, so there is no number there to caveat.
+        out = _section_interval_discount(None)
+        assert "No interval-discount sweep for this run." in out
+        assert "Outcome-label coverage" not in out
+        assert "updatemenus" not in out
+
+
+class TestGenerateDashboardHeaderNotice:
+    """A strike-blind corpus changes WHICH PAIRS EXIST, so it taints every
+    STRATEGY-DERIVED section — the one-line header notice is the pointer for a
+    reader who never scrolls to the interval-discount section.
+
+    Deliberately not "all seven": _section_benchmark plots a yfinance ^GSPC
+    download, an external index series with no pair population behind it, so it
+    is unaffected. The notice said "every figure on this page" until that was
+    corrected; over-warning is the safe direction, but a caveat that overstates
+    its own scope is the thing a reader learns to discount.
+
+    generate_dashboard() is exercised here rather than only the section builder
+    because a unit test that does not prove the string reaches the rendered
+    page is exactly the gap DR-66b is about. yfinance is stubbed out, so this
+    stays offline; _section_benchmark already degrades on a failed download.
+    """
+
+    @staticmethod
+    def _offline(monkeypatch, tmp_path):
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    def _page(self, monkeypatch, tmp_path, **kwargs) -> str:
+        self._offline(monkeypatch, tmp_path)
+        out_path = dashboard.generate_dashboard(
+            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]),
+            date(2026, 1, 5), 1000.0, **kwargs)
+        return out_path.read_text(encoding="utf-8")
+
+    def test_the_notice_renders_below_the_floor(self, monkeypatch, tmp_path):
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration(),
+                              label_coverage=_coverage(2))
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+
+        assert ("the pairs behind every strategy-derived figure on this page "
+                "were grouped") in page
+        assert "strike-blind" in page
+        # The section's own full caveat is there too, with the remedy.
+        assert "ALONE does not refresh the day slices" in page
+
+    def test_no_notice_at_healthy_coverage(self, monkeypatch, tmp_path):
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration(),
+                              label_coverage=_coverage(97))
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+
+        assert "strike-blind" not in page
+        # ...but the figure itself is on the page, so a clean run is confirmable.
+        assert "97.00%" in page
+
+    def test_the_four_positional_call_still_works(self, monkeypatch, tmp_path):
+        # Constraint: no new parameter, and the pre-existing positional call
+        # renders as before — placeholder section, no coverage line, no notice.
+        page = self._page(monkeypatch, tmp_path)
+        assert "Kalshi Arbitrage Backtest" in page
+        assert "No interval-discount sweep for this run." in page
+        assert "strike-blind" not in page
+        assert "Outcome-label coverage" not in page
 
 
 class TestTitleEscaping:

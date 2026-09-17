@@ -57,8 +57,9 @@ import plotly.graph_objects as go
 import yfinance as yf
 from plotly.subplots import make_subplots
 
-from .backtester import BacktestSweep, BacktestTrade
+from .backtester import BacktestSweep, BacktestTrade, OutcomeLabelCoverage
 from .config import (
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
@@ -615,14 +616,129 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
 # ─── Section 4: Interval Discount (k) Calibration ────────────────────────────
 
+def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
+    """
+    Render the outcome-label census as a line, or as a banner when it is low.
+
+    The figure this prints is the one backtester._log_outcome_label_coverage()
+    already logged — the SAME measurement from the same single pass over the
+    same corpus, carried through BacktestSweep.label_coverage — so the page and
+    the log can never report two different numbers. The below-floor verdict is
+    likewise the carried one, never re-derived here: the constant is imported
+    only to PRINT where the floor sits.
+
+    Rendered even when coverage is healthy (DR-66b). Absence of a warning must
+    not be the only signal a run was clean, because that is indistinguishable
+    from the check not existing — which is precisely the silence DR-66 closed
+    on the log side.
+
+    The population is the run's ELIGIBLE-MARKET CORPUS, not the far smaller
+    subset the empirical k-hat is measured over, so every string here is
+    phrased over "eligible markets" and never over "the pairs behind k̂". The
+    one claim that legitimately spans both populations is the banner's
+    consequence sentence, which says what a strike-blind corpus does to the
+    cards beside it.
+
+    Every number is this run's own count, its own percentage, or the
+    configured floor — no measurement from another run is baked in (TS-07) —
+    and the text is static prose besides, with no Kalshi-controlled free text,
+    so it needs no html.escape (unlike _crow's bucket label).
+
+    Args:
+        coverage (backtester.OutcomeLabelCoverage | None): The census carried
+            on the sweep. None means no census was taken (the Monday
+            feasibility short-circuit skipped the fetch, or the sweep was hand
+            built), which is rendered as "not measured" rather than as either
+            healthy or low coverage.
+
+    Returns:
+        str: One HTML block — a red banner when the census fell below the
+            floor, otherwise a single grey line. Never the empty string, so the
+            section always says something about this run's corpus.
+    """
+    if coverage is None:
+        return ("<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                "Outcome-label coverage was not measured for this run.</p>")
+
+    if not coverage.total:
+        return ("<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                "Outcome-label coverage: no eligible markets to census.</p>")
+
+    # Both fractions are non-None whenever total is non-zero (the carrier's own
+    # contract), so these format calls are safe and no "None%" can render.
+    subtitle_pct = coverage.subtitle_fraction * 100.0
+    event_pct = coverage.event_title_fraction * 100.0
+    figures = (
+        f"subtitle on {coverage.with_subtitle:,} of {coverage.total:,} "
+        f"eligible markets ({subtitle_pct:.2f}%), event_title on "
+        f"{coverage.with_event_title:,} ({event_pct:.2f}%)"
+    )
+
+    if not coverage.below_floor:
+        # The floor applies to SUBTITLE coverage alone, and the event_title
+        # figure beside it is not merely uninformative — it runs the WRONG WAY.
+        # Measured full-file on the two assembled caches: 12.11% event_title on
+        # the label-BLIND 2026-05-01 corpus against 2.87% on the healthy
+        # 2026-09-07 one, because event titles are resolved separately by
+        # historical._load_or_build_event_titles under a capped per-ticker
+        # fallback over an overwhelmingly MVE corpus. So a reader who takes the
+        # lower number as the worse one reads a clean run as broken and a
+        # broken run as clean. config.py records why it never escalates; that
+        # comment reaches a codebase reader, and this clause reaches the
+        # operator this page exists for.
+        return ("<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                f"Outcome-label coverage: {figures}. The floor applies to "
+                "subtitle coverage only — near-zero event_title coverage is "
+                "normal on an MVE-heavy corpus, does not escalate, and is not "
+                "a health signal in either direction.</p>")
+
+    # Below the floor: the same consequence and remedy the WARNING carries,
+    # placed where a reader of the k-hat card cannot miss it.
+    return (
+        "<div style=\"font-family:sans-serif;font-size:14px;color:#B71C1C;"
+        "background:#FFEBEE; border-left:6px solid #F44336; border-radius:6px;"
+        "padding:14px 18px; margin:16px 0;\">"
+        f"<b>Outcome-label coverage is {subtitle_pct:.2f}%, below the "
+        f"{BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0:.2f}% floor</b> "
+        f"({figures}). Most eligible markets carry no subtitle, so the "
+        "time-series grouping key fell back to the bare normalized title — the "
+        "strike-blind grouping the live scanner no longer uses — and the "
+        "same-title key lost its outcome discriminator. The pairs behind the "
+        "k&#770; below, the per-k table and every other strategy-derived "
+        "section of this page (the &#94;GSPC benchmark trace, having no pair "
+        "population behind it, is unaffected) "
+        "were therefore formed from a different pair population than the "
+        "shipped scanner would produce: treat this run's potential-pair "
+        "counts, trades, returns and empirical k&#770; as describing a "
+        "different strategy. "
+        "<b>Remedy:</b> delete <code>backtest_cache/archive_days/</code> and "
+        "<code>backtest_cache/live_days/</code>, then re-run with "
+        "<code>--no-cache</code> (equivalently, also delete the assembled "
+        "<code>backtest_cache/settled_markets_*.json</code>); "
+        "<code>--no-cache</code> ALONE does not refresh the day slices, which "
+        "are reused unconditionally."
+        "</div>"
+    )
+
+
 def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     """
     Build the "Interval Discount (k) Calibration" HTML section.
 
     Reports how the hand-set time-series interval discount k compares with what
     the replayed history actually did, and lets the reader switch the equity
-    curve between every k the run simulated. Three parts:
+    curve between every k the run simulated. Four parts:
 
+      0. The outcome-label coverage of the run's eligible-market corpus — a
+         grey line when healthy, and a red banner ABOVE the KPI cards when it
+         fell below config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION (DR-66b). The
+         k-hat beside it is a recommendation for the real-money constant
+         TIME_SERIES_INTERVAL_PROB_DISCOUNT, and a label-less cache makes it
+         describe a strategy the shipped scanner does not implement; the
+         backtest log has warned about that since DR-66 while this page said
+         nothing at all. The banner sits with the cards, and the k-hat card is
+         recoloured and its label suffixed, so the caveat travels with the
+         number even in a screenshot of the cards alone.
       1. KPI cards — the run's configured (effective) k, the pooled empirical
          k-hat, and the delta between them.
       2. The calibration table — one row per deadline-gap bucket plus the
@@ -639,8 +755,9 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     (Brier / log loss), which is a different measurement entirely.
 
     Takes the BacktestSweep whole rather than its parts — it already carries
-    .calibration, .points and .primary.k, and passing those separately would
-    create copies that could disagree with each other.
+    .calibration, .points, .primary.k and .label_coverage, and passing those
+    separately would create copies that could disagree with each other. That
+    is why carrying the census needed no signature change here.
 
     Scope limit: the dropdown drives THIS section only. Every other section
     reflects the primary k, since return / drawdown / trade count is what one
@@ -666,6 +783,13 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     # every OTHER section on this page was rendered at.
     configured_k = sweep.primary.k
     cal = sweep.calibration
+    # The outcome-label census, carried k-independently on the sweep exactly as
+    # the calibration is. None means no census was taken, not healthy coverage.
+    coverage = sweep.label_coverage
+    coverage_html = _label_coverage_html(coverage)
+    # One verdict, read off the carrier rather than re-derived from the
+    # constant, so this page and the backtest log fire on the same condition.
+    tainted = coverage is not None and coverage.below_floor
 
     # ── KPI cards ────────────────────────────────────────────────────────────
     pooled_k = cal.pooled.empirical_k if cal is not None else None
@@ -673,8 +797,15 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     # this is the override. Calling it "configured" would misattribute the
     # override to config.py, which this feature never writes.
     kpi_parts = [_kpi("k used (this run)", f"{configured_k:.3f}", "#2196F3")]
+    # On a label-less corpus the k-hat is arithmetically correct for the pairs
+    # it was handed and those are not the pairs the shipped scanner forms, so
+    # the card itself carries the caveat: a reader who screenshots the cards,
+    # or who reads only the number, must not see a bare recommendation. The
+    # label is SUFFIXED, never replaced — "Pooled empirical k̂" stays intact.
+    khat_label = "Pooled empirical k̂" + (" (see caveat above)" if tainted else "")
+    khat_color = "#F44336" if tainted else "#2196F3"
     if pooled_k is None:
-        kpi_parts.append(_kpi("Pooled empirical k̂", "—"))
+        kpi_parts.append(_kpi(khat_label, "—"))
         kpi_parts.append(_kpi("k̂ − k", "—"))
     else:
         delta = pooled_k - configured_k
@@ -682,7 +813,7 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
         # k̂ above the configured k means the in-between cell landed more often
         # than the sizer assumed (it was sizing too big) — flag that red; a
         # negative delta means the run was conservative.
-        kpi_parts.append(_kpi("Pooled empirical k̂", f"{pooled_k:.3f}", "#2196F3"))
+        kpi_parts.append(_kpi(khat_label, f"{pooled_k:.3f}", khat_color))
         kpi_parts.append(_kpi("k̂ − k", f"{delta:+.3f}",
                               "#F44336" if delta > 0 else "#4CAF50"))
     kpis = "".join(kpi_parts)
@@ -872,6 +1003,8 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
 
     return (
         _SECTION_STYLE.format(title="Interval Discount (k) Calibration")
+        # Above the cards, so the caveat is read before the number it qualifies.
+        + coverage_html
         + kpis
         + cal_table
         + _fig_html(fig, height=450)
@@ -1259,9 +1392,17 @@ def generate_dashboard(
         sweep (BacktestSweep | None): The full sweep payload from
             backtester.run_backtest_sweep(), rendered by the interval-discount
             section. Passed whole rather than unpacked — it already carries the
-            calibration, every swept point and the primary k, and splitting it
-            would create copies that could disagree. None (default) renders that
-            section's placeholder.
+            calibration, every swept point, the primary k and the run's
+            outcome-label census, and splitting it would create copies that
+            could disagree. None (default) renders that section's placeholder —
+            and therefore no coverage line either, which is honest: that path
+            shows no k̂ card to caveat.
+
+            When its label_coverage is below
+            config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION, a one-line notice is
+            also emitted under the Period line, because a strike-blind corpus
+            changes which pairs exist and so taints all seven sections, not
+            just the one that renders the census (DR-66b).
         interval_discount (float | None): The interval discount `trades` were
             SIZED at, threaded into the Risk section's Kelly scatter. Separate
             from `sweep` because that scatter needs it even on a run that
@@ -1275,6 +1416,24 @@ def generate_dashboard(
     """
     ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
+
+    # A label-less corpus taints EVERY section, not just the interval-discount
+    # one: it changes which pairs were formed, so the trades, the returns and
+    # the risk figures on this page all describe a different pair population
+    # (DR-66b). The section carries the full caveat and the remedy; this is the
+    # one-line pointer at the top so a reader who never scrolls that far still
+    # knows. Read off the sweep this function already receives — no new
+    # parameter — so the four-positional call renders exactly as before.
+    header_note = ""
+    if sweep is not None and sweep.label_coverage is not None \
+            and sweep.label_coverage.below_floor:
+        header_note = (
+            '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+            "Outcome-label coverage for this run is below the floor — the "
+            "pairs behind every strategy-derived figure on this page were "
+            "grouped strike-blind. See Interval Discount (k) Calibration below."
+            "</p>"
+        )
 
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
@@ -1309,6 +1468,7 @@ def generate_dashboard(
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>
+{header_note}
 {''.join(sections)}
 </body>
 </html>"""

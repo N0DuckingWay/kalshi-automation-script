@@ -2185,6 +2185,102 @@ class TestOutcomeLabelCoverageCensus:
         assert len(self._census_records(caplog, "WARNING")) == 1
 
 
+class TestOutcomeLabelCoverageIsCarried:
+    """DR-66b: the census must also cross out of _prepare_entries, because that
+    is the only scope the eligible-market list exists in and its lifetime must
+    not be extended (TS-07).
+
+    The carrier is a RETURN VALUE rather than an optional sink precisely
+    because a sink can be forgotten — which would reproduce, in the mechanism
+    built to close DR-66's silence, exactly that silence.
+    """
+
+    def test_the_census_returns_what_it_logged(self, caplog):
+        markets = [{"subtitle": "Yes", "event_title": "E"}] * 3 + [{}] * 7
+        with caplog.at_level("INFO"):
+            coverage = backtester._log_outcome_label_coverage(markets)
+
+        assert coverage.total == 10
+        assert coverage.with_subtitle == 3
+        assert coverage.with_event_title == 3
+        assert coverage.subtitle_fraction == pytest.approx(0.30)
+        assert coverage.event_title_fraction == pytest.approx(0.30)
+        # The same number reached the log, so page and log cannot disagree.
+        assert any("30.00%" in r.getMessage() for r in caplog.records)
+
+    def test_the_below_floor_flag_is_the_warning_s_own_condition(self):
+        floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION
+        assert floor == 0.50
+        # One market either side of the floor, and exactly on it.
+        low = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 49 + [{}] * 51)
+        exact = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 50 + [{}] * 50)
+        high = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 51 + [{}] * 49)
+        assert low.below_floor is True
+        # Strictly below: a run sitting exactly on the floor is not warned on,
+        # matching the `<` the WARNING branches on.
+        assert exact.below_floor is False
+        assert high.below_floor is False
+
+    def test_an_empty_corpus_reports_undefined_not_zero(self):
+        coverage = backtester._log_outcome_label_coverage([])
+        assert coverage.total == 0
+        # None, not 0.0 — the fraction is undefined on an empty corpus, and a
+        # 0.0 here would render as "0% coverage" and warn.
+        assert coverage.subtitle_fraction is None
+        assert coverage.event_title_fraction is None
+        assert coverage.below_floor is False
+
+    def test_the_carrier_holds_no_market_reference(self):
+        # _prepare_entries del's the record list right after pair extraction to
+        # lower residency across the candlestick fetch. A carrier holding
+        # examples would pin every record alive past that statement.
+        coverage = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y", "event_title": "E"}])
+        for value in astuple(coverage):
+            assert isinstance(value, (int, float, bool, type(None)))
+
+    def test_the_sweep_carries_the_census(self, monkeypatch):
+        # It hangs off BacktestSweep, not off a SweepPoint: it is k-independent,
+        # exactly like the calibration beside it — one measurement, valid at
+        # every swept discount.
+        census = backtester.OutcomeLabelCoverage(
+            total=4, with_subtitle=1, with_event_title=1,
+            subtitle_fraction=0.25, event_title_fraction=0.25,
+            below_floor=True,
+        )
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: ([], census))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.label_coverage is census
+
+    def test_the_infeasible_window_carries_no_census(self, monkeypatch):
+        # The fetch never ran, so nothing was censused — None, distinct from a
+        # censused corpus that held zero records.
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: (None, None))
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.label_coverage is None
+        assert result.calibration is None
+
+    def test_run_backtest_keeps_its_two_tuple(self, monkeypatch):
+        # Constraint: run_backtest's signature and return type are unchanged —
+        # it unpacks and discards the census, which has already logged itself.
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: ([], None))
+        out = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                           start_date=date(2026, 1, 1), initial_balance=1000.0)
+        assert isinstance(out, tuple) and len(out) == 2
+        trades, equity = out
+        assert trades == []
+        assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
+
+
 class TestRunBacktestFeasibilityPreCheck:
     """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
     ever be entered, so run_backtest must skip the fetch entirely rather than
@@ -3193,7 +3289,7 @@ class TestRunBacktestTimeSeriesFlow:
 
         # _run's monkeypatches are still in force, so the prologue replays the
         # very same fixture markets and candles run_backtest just consumed.
-        raw_entries = backtester._prepare_entries(
+        raw_entries, _coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 1, 1), True, None
         )
         point = backtester._simulate_at_discount(
@@ -3212,9 +3308,15 @@ class TestRunBacktestTimeSeriesFlow:
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: pytest.fail("fetch must be skipped"))
         today = date.today()
-        assert backtester._prepare_entries(
+        # The sentinel lives on ELEMENT 0 of the returned pair: a caller that
+        # forgot to unpack would hold a 2-tuple, which is never None, so its
+        # guard would silently go false. Assert the shape explicitly.
+        raw_entries, coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), today + timedelta(days=1), True, None
-        ) is None
+        )
+        assert raw_entries is None
+        # No census either: the fetch never ran, so there was no corpus.
+        assert coverage is None
 
     def _prepared(self, monkeypatch, result_a, result_b, eb_yes=None, eb_no=None):
         # _run installs the fixture's fetch monkeypatches and leaves them in
@@ -3222,9 +3324,10 @@ class TestRunBacktestTimeSeriesFlow:
         # candles run_backtest just consumed (the idiom
         # test_default_k_equals_explicit_config_k already uses).
         self._run(monkeypatch, result_a, result_b, eb_yes=eb_yes, eb_no=eb_no)
-        return backtester._prepare_entries(
+        raw_entries, _coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 1, 1), True, None
         )
+        return raw_entries
 
     def test_calibration_is_k_independent(self, monkeypatch):
         # The in-between cell: this pair is exactly what the discount models.
@@ -3776,7 +3879,7 @@ class TestSimulationsAreLabelledWithTheirDiscount:
 
     def test_every_swept_point_is_distinguishable(self, monkeypatch, caplog):
         monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", [0.50, 0.75])
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -3788,7 +3891,7 @@ class TestSimulationsAreLabelledWithTheirDiscount:
         assert len(completions) == len({c.split(":")[0] for c in completions})
 
     def test_the_primary_slot_is_announced(self, monkeypatch, caplog):
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -3843,11 +3946,13 @@ class TestFeasibilityWindowIsMeasuredInUTC:
         reached = []
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: reached.append(True) or [])
-        out = backtester._prepare_entries(
+        out, coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), self._START, False, None,
         )
         assert reached == [True]
         assert out == []
+        # The fetch ran, so a census was taken — over an empty corpus.
+        assert coverage is not None and coverage.total == 0
 
     def test_a_genuinely_infeasible_window_still_short_circuits(self, monkeypatch):
         # GUARD: moving to UTC must not disarm the check. Tuesday to Friday
@@ -3857,9 +3962,11 @@ class TestFeasibilityWindowIsMeasuredInUTC:
             backtester, "fetch_all_settled_markets",
             lambda *a, **k: pytest.fail("fetch must be skipped"),
         )
+        # Element 0 carries the sentinel; element 1 is None because no corpus
+        # was ever censused on this path.
         assert backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 8, 25), False, None,
-        ) is None
+        ) == (None, None)
 
     def test_the_local_date_is_not_what_is_measured(self, monkeypatch):
         # Pins the seam itself: the frozen instant's LOCAL date is behind its
