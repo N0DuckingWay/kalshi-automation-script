@@ -1980,6 +1980,211 @@ class TestPrepareEntriesMemoryInstrumentation:
         assert observed == {"EA": True, "EB": True, "EC": False}
 
 
+class TestOutcomeLabelCoverageCensus:
+    """DR-66: a cache written before the 2026-08-14 yes_sub_title ingest fix
+    carries subtitle=None on nearly every record, so the time-series key
+    collapses to the pre-DR-01 strike-blind title-only form. The run still
+    reports pair counts, trades, a return and an empirical k-hat for the
+    real-money TIME_SERIES_INTERVAL_PROB_DISCOUNT, and nothing said the numbers
+    describe a different strategy. The census is that missing signal.
+
+    The measured coverages behind the threshold live in config.py beside
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, never in these tests and never in an
+    emitted string.
+    """
+
+    CENSUS = "Outcome-label coverage"
+    WARN_MARK = "below the"
+
+    @staticmethod
+    def _census_records(caplog, level):
+        return [r.getMessage() for r in caplog.records
+                if r.levelname == level
+                and r.getMessage().startswith(
+                    TestOutcomeLabelCoverageCensus.CENSUS)]
+
+    @staticmethod
+    def _labelled(n: int) -> list[dict]:
+        return [_md(f"T{i}", f"EV{i}", title="Q", subtitle=f"strike {i}",
+                    event_title="Event") for i in range(n)]
+
+    @staticmethod
+    def _unlabelled(n: int) -> list[dict]:
+        # Exactly the shape of a pre-fix cache record: subtitle null, and the
+        # event_title that the bounded fallback never resolved.
+        return [_md(f"T{i}", f"EV{i}", title="Q") | {"subtitle": None,
+                                                     "event_title": ""}
+                for i in range(n)]
+
+    def test_warning_fires_on_a_label_less_market_list(self, caplog):
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(self._unlabelled(100))
+        warnings = self._census_records(caplog, "WARNING")
+        assert len(warnings) == 1
+        # The consequence: which key degrades, and that the headline numbers
+        # are therefore about a different strategy.
+        assert "strike-blind" in warnings[0]
+        assert "different strategy" in warnings[0]
+        # The remedy, exactly as CLAUDE.md's subtitle-drift gotcha states it:
+        # both slice stores, plus --no-cache, and the explicit note that
+        # --no-cache alone does not refresh the slices.
+        assert "backtest_cache/archive_days/" in warnings[0]
+        assert "backtest_cache/live_days/" in warnings[0]
+        assert "--no-cache ALONE does not refresh the day slices" in warnings[0]
+
+    def test_no_warning_on_a_fully_labelled_list(self, caplog):
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(self._labelled(100))
+        assert self._census_records(caplog, "WARNING") == []
+        # The INFO census is unconditional — it is the only signal, so it must
+        # be present on a healthy run too.
+        info = self._census_records(caplog, "INFO")
+        assert len(info) == 1
+        assert "subtitle on 100 (100.00%)" in info[0]
+
+    def test_blank_event_title_alone_does_not_warn(self, caplog):
+        """event_title coverage is reported, never escalated: it is near zero
+        on a HEALTHY cache, because the corpus is overwhelmingly MVE combos
+        whose titles the bulk listings exclude and whose per-ticker fallback is
+        capped. Warning on it would fire every run."""
+        markets = [m | {"event_title": ""} for m in self._labelled(100)]
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(markets)
+        assert self._census_records(caplog, "WARNING") == []
+        assert "event_title on 0 (0.00%)" in self._census_records(caplog, "INFO")[0]
+
+    @pytest.mark.parametrize(("labelled", "total", "warns"), [
+        # Strictly below the floor warns; exactly at it does not.
+        (49, 100, True),
+        (50, 100, False),
+        (51, 100, False),
+    ])
+    def test_threshold_is_strictly_below(self, caplog, labelled, total, warns):
+        assert backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION == 0.50
+        markets = self._labelled(labelled) + self._unlabelled(total - labelled)
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(markets)
+        assert bool(self._census_records(caplog, "WARNING")) is warns
+
+    def test_empty_list_does_not_raise_and_does_not_warn(self, caplog):
+        """Coverage over an empty list is undefined, not zero: dividing would
+        raise, and warning would manufacture a drift alarm out of a corpus with
+        no records at all. One INFO line still goes out, so the census line's
+        absence always means the helper did not run."""
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage([])
+        assert self._census_records(caplog, "WARNING") == []
+        info = self._census_records(caplog, "INFO")
+        assert info == ["Outcome-label coverage: no eligible markets to census"]
+
+    def test_census_quotes_only_this_runs_numbers(self, caplog):
+        # A line emitted on every run must carry no measurement from another
+        # run (TS-07). Every numeric token here is this call's own count, a
+        # percentage derived from it, or the configured floor.
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(
+                self._labelled(1) + self._unlabelled(3))
+        info = self._census_records(caplog, "INFO")[0]
+        warning = self._census_records(caplog, "WARNING")[0]
+        assert re.findall(r"\d+(?:\.\d+)?", info) == [
+            "4", "1", "25.00", "1", "25.00",
+        ]
+        floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0
+        assert re.findall(r"\d+(?:\.\d+)?", warning) == [
+            "25.00", f"{floor:.2f}",
+        ]
+
+    def test_it_reads_the_list_once_without_materializing_another(self):
+        """The list can be millions of records and the surrounding code is
+        memory-tuned (TS-07), so the census must not build a second list. A
+        one-shot iterable stands in for the real list: a second pass over it
+        would see nothing and miscount."""
+        markets = self._labelled(4) + self._unlabelled(6)
+
+        class _OnePassList(list):
+            passes = 0
+
+            def __iter__(self):
+                _OnePassList.passes += 1
+                return super().__iter__()
+
+        probe = _OnePassList(markets)
+        backtester._log_outcome_label_coverage(probe)
+        assert _OnePassList.passes == 1
+
+    # ── The census is advisory: it must move no number the run reports ──
+
+    @staticmethod
+    def _markets() -> list[dict]:
+        # A genuine time-series pair, label-less in exactly the way a pre-fix
+        # cache is, so the census fires on the run below.
+        return [
+            {"ticker": "EA", "event_ticker": "EVA", "event_title": "",
+             "title": "Team wins by February 1, 2026", "subtitle": None,
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "EB", "event_ticker": "EVB", "event_title": "",
+             "title": "Team wins by February 14, 2026", "subtitle": None,
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-14T00:00:00+00:00",
+             "settlement_ts": "2026-02-14T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch):
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    def test_census_changes_no_backtest_result(self, monkeypatch):
+        """Advisory only. Running with the census replaced by a no-op must
+        produce the same trades and the same equity curve — if it does not, the
+        census is filtering or consuming something it only meant to read."""
+        with_census_trades, with_census_equity = self._run(monkeypatch)
+        monkeypatch.setattr(backtester, "_log_outcome_label_coverage",
+                            lambda _markets: None)
+        without_trades, without_equity = self._run(monkeypatch)
+
+        assert [astuple(t) for t in with_census_trades] == \
+               [astuple(t) for t in without_trades]
+        pd.testing.assert_frame_equal(with_census_equity, without_equity)
+        # Guard against the comparison being vacuous.
+        assert len(with_census_trades) == 1
+
+    def test_census_is_logged_inside_the_grouping_window(self, monkeypatch, caplog):
+        # After the RSS/RAM-budget lines and before the pair counts, i.e. while
+        # `markets` is still alive — it is del'd right after pair extraction.
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records]
+        rss_at = next(i for i, m in enumerate(messages)
+                      if m.startswith("Peak RSS before grouping"))
+        census_at = next(i for i, m in enumerate(messages)
+                         if m.startswith(self.CENSUS))
+        pairs_at = next(i for i, m in enumerate(messages)
+                        if m.startswith("Potential pairs:"))
+        assert rss_at < census_at < pairs_at
+
+    def test_a_real_run_on_a_label_less_cache_warns(self, monkeypatch, caplog):
+        # End to end: the run still produces its trade and its numbers, and the
+        # operator is now told those numbers describe a different strategy.
+        with caplog.at_level("INFO"):
+            trades, _ = self._run(monkeypatch)
+        assert len(trades) == 1
+        assert len(self._census_records(caplog, "WARNING")) == 1
+
+
 class TestRunBacktestFeasibilityPreCheck:
     """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
     ever be entered, so run_backtest must skip the fetch entirely rather than

@@ -127,6 +127,7 @@ import pandas as pd
 
 from .config import (
     BACKTEST_MARKETS_RAM_WARN,
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
@@ -1458,6 +1459,99 @@ def _log_rss(label: str) -> None:
     logging.info("Peak RSS %s: %.0f MiB", label, mib)
 
 
+def _log_outcome_label_coverage(markets: list[dict]) -> None:
+    """
+    Census how many eligible markets carry an outcome label, and warn when few do.
+
+    Both backtest grouping keys are built from fields a stale cache may simply
+    not have. `subtitle` is the outcome discriminator in the time-series key
+    (scanner.time_series_group_key) and the third component of the same-title
+    key (event_title, title, subtitle); `event_title` is the first component of
+    the latter. A record whose subtitle is blank keys by title alone — the
+    pre-DR-01 strike-blind grouping the live scanner was fixed to stop using —
+    and a blank event_title collapses the same-title key toward (title,
+    subtitle), the direction that manufactures cross-event false positives
+    under the 0.95 co-resolution prior (TS-11).
+
+    The defect this closes is the SILENCE, not the grouping (DR-66). A backtest
+    over a cache written before the 2026-08-14 yes_sub_title ingest fix reports
+    potential-pair counts, trade counts, a return figure and an empirical k-hat
+    recommendation for the real-money constant
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT, all describing a strategy the shipped
+    code does not implement — and neither the backtest log nor the dashboard
+    said so, making such a run indistinguishable in its own output from a run
+    on a good cache. The live scanner's own "Distinct normalized title+outcome
+    keys" counter cannot cover this: it lives in find_time_series_pairs, which
+    the backtester never calls, and it moves the OTHER way here — it detects
+    the one-leg-labelled case, where keys SPLIT, whereas a wholesale-blank
+    cache makes keys MERGE.
+
+    Only subtitle coverage escalates to WARNING. event_title coverage shares
+    the INFO line but is never warned on, because it is legitimately near zero
+    on a healthy cache; the reasoning and the measured coverages behind both
+    decisions live in config.py beside BACKTEST_OUTCOME_LABEL_WARN_FRACTION, so
+    that no figure from another run is baked into a string emitted on every run
+    (TS-07).
+
+    Advisory only: this reads the list and logs. No market, group, pair or
+    entry is dropped, filtered or altered, and no count the run reports moves.
+
+    Args:
+        markets (list[dict]): The eligible market records, in the compact
+            historical._market_to_dict form, exactly as handed to the two
+            grouping calls below. Counted in ONE pass with no second list
+            materialized, since this can be millions of records.
+
+    Returns:
+        None
+    """
+    total = len(markets)
+
+    # An empty list has no coverage to report: the fraction is undefined, not
+    # zero, so warning here would manufacture a drift alarm out of a corpus
+    # that simply has no records — a cause the surrounding "Total settled
+    # markets" and "Eligibility prefilter" lines already name. The census still
+    # emits one line, so its ABSENCE always means this helper did not run.
+    if not total:
+        logging.info("Outcome-label coverage: no eligible markets to census")
+        return
+
+    # One pass, two counters. Blank/None/absent all read as "no label", the
+    # same falsiness the two grouping helpers apply with `or ""`.
+    with_subtitle = 0
+    with_event_title = 0
+    for m in markets:
+        if m.get("subtitle"):
+            with_subtitle += 1
+        if m.get("event_title"):
+            with_event_title += 1
+
+    subtitle_fraction = with_subtitle / total
+    logging.info(
+        "Outcome-label coverage over %d eligible markets: subtitle on %d "
+        "(%.2f%%), event_title on %d (%.2f%%)",
+        total, with_subtitle, subtitle_fraction * 100.0,
+        with_event_title, with_event_title / total * 100.0,
+    )
+
+    if subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION:
+        logging.warning(
+            "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
+            "eligible markets carry no subtitle, so the time-series key falls "
+            "back to the bare normalized title — the strike-blind grouping the "
+            "live scanner no longer uses — and the same-title key loses its "
+            "outcome discriminator. Treat this run's potential-pair counts, "
+            "trades, returns and empirical interval-discount recommendation as "
+            "describing a different strategy from the shipped one. Remedy: "
+            "delete backtest_cache/archive_days/ and backtest_cache/live_days/, "
+            "then re-run with --no-cache (equivalently, also delete the "
+            "assembled backtest_cache/settled_markets_*.json); --no-cache ALONE "
+            "does not refresh the day slices, which are reused unconditionally",
+            subtitle_fraction * 100.0,
+            BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0,
+        )
+
+
 def _prepare_entries(
     hist_client: Any,
     live_client,
@@ -1604,6 +1698,15 @@ def _prepare_entries(
             "lists on top of them",
             len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
         )
+
+    # Census the two fields the grouping keys below are built from, while the
+    # record list is still alive (it is del'd a few lines down). A cache
+    # predating the 2026-08-14 yes_sub_title ingest fix carries subtitle=None on
+    # nearly every record, which makes the time-series key collapse to the
+    # pre-DR-01 strike-blind title-only form — silently, with the run's pair
+    # counts, trades, return and empirical k-hat all still reported as if it had
+    # grouped correctly (DR-66). Advisory: it logs and changes nothing.
+    _log_outcome_label_coverage(markets)
 
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
