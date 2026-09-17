@@ -392,7 +392,16 @@ class TestNoMappingVerdict:
             v2_probe, "signed_request_json",
             lambda *a, **k: {"order_id": "x"},  # no fill_count at all
         )
-        client = probe_client([0, 0])
+        # DR-60 gave this branch the re-read _non_object_body_fail already had,
+        # so it now makes a third position read and sleeps once. The assertion
+        # below is unchanged, and the fixture edit is hygiene rather than a
+        # necessity: with the old two-entry list the third read exhausts the
+        # MagicMock side_effect, trader._position_count fail-softs the
+        # StopIteration to None and this still passes — but it would really
+        # sleep 1s and silently exercise that swallow. The re-read behaviour
+        # itself is pinned by TestUnreadableFillCountsChecksTheAccount.
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: None)
+        client = probe_client([0, 0, 0])
         assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._FAIL
 
 
@@ -721,6 +730,112 @@ class TestNonObjectOrderBody:
         monkeypatch.setattr(v2_probe, "signed_request_json", lambda *a, **k: KILLED)
         client = probe_client([0, 0])
         assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._PASS
+
+
+class TestUnreadableFillCountsChecksTheAccount:
+    """DR-60: a JSON-OBJECT body whose fill counts cannot be read leaves the
+    probe in exactly the state _non_object_body_fail handles one step earlier —
+    a real ask submitted, a 2xx back, and no idea what it did — so it takes the
+    same remedy.
+
+    Before this, the branch decided from a SINGLE un-refreshed position read
+    (DR-21's re-read is gated on `filled`, which is None and therefore falsy
+    here) and printed a warning only when that read was truthy. A lagging
+    ledger printed `Position after the NO buy: 0.0`, no warning at all, and
+    returned FAIL while a real 0.01 NO position was open on the production
+    account; a FAILED lookup (None) printed nothing either, collapsed into
+    "flat" by the same bare truthiness test DR-58 forbade.
+    """
+
+    # Both shapes _fill_counts reports as unreadable on a real dict body: no
+    # count fields at all, and one of the two present without the other.
+    _UNREADABLE_BODIES = [
+        {"order": {"status": "executed"}},
+        {"fill_count": "0.01"},
+    ]
+
+    @staticmethod
+    def _arm(monkeypatch, response, reads: list):
+        """Hand `response` back from the submission seam and script the reads.
+
+        Returns (submitted bodies, observed reads, sleep durations) — the same
+        shape TestNonObjectOrderBody._arm returns, because the two classes pin
+        the same helper from its two call sites.
+        """
+        submitted: list = []
+
+        def post(client, method, path, *, query=None, body=None):
+            submitted.append(body)
+            return response
+
+        monkeypatch.setattr(v2_probe, "signed_request_json", post)
+
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return submitted, observed, slept
+
+    @pytest.mark.parametrize("body", _UNREADABLE_BODIES)
+    def test_a_flat_first_read_is_re_read_and_surfaces_the_position(
+        self, body, monkeypatch, capsys,
+    ):
+        # start flat, the ledger lags at 0 straight after the fill, the re-read
+        # finds the 0.01 NO position the operator has to flatten.
+        submitted, observed, slept = self._arm(monkeypatch, body, [0, 0, -0.01])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == [0, 0, -0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # Only the opening ask went out — the close rests on a mapping this
+        # unreadable response proved nothing about.
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert "FLATTEN IT MANUALLY" in printed
+
+    def test_an_unreadable_position_says_check_it_manually(self, monkeypatch, capsys):
+        # None is "the lookup failed", never "the account is flat".
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, None, None],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, None, None]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "CHECK IT MANUALLY" in printed
+        assert "FLATTEN IT MANUALLY" not in printed
+
+    def test_a_persistently_flat_account_says_so_rather_than_staying_silent(
+        self, monkeypatch, capsys,
+    ):
+        # Still FAIL (nothing was proven), but a checked-and-flat account must
+        # be distinguishable from a step that never looked.
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, 0, 0],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "nothing to flatten" in printed
+        assert "FLATTEN IT MANUALLY" not in printed
+
+    def test_a_nonzero_first_read_is_not_re_read(self, monkeypatch, capsys):
+        # A ledger that already moved is evidence; don't spend a second read.
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, -0.01],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, -0.01]
+        assert slept == []
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
 
 
 def shard_statuses(transfers_active: bool = True, shards: tuple = (0, 1)) -> dict:

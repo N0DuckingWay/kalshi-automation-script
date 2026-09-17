@@ -96,7 +96,18 @@ Notes:
     restores the position read and the warning, NOT the reduce-only close —
     an unreadable body proves nothing about the mapping that close rests on,
     so the step ends at FAIL with the position left for a human, exactly as a
-    disproven mapping does.
+    disproven mapping does. A body that IS an object but whose fill counts are
+    absent or unparseable leaves the probe in that same state one step later;
+    in the NO-buy step (_step_no_mapping) that branch now reports through the
+    same helper _non_object_body_fail uses, _recheck_and_report_position: the
+    ledger is re-read once when the first read is flat or unreadable, and
+    lookup-failed, position-open and genuinely-flat are three distinct printed
+    outcomes (DR-60). That is TWO of the branches in this state, not all of
+    them: _step_unfillable_ask's own unreadable-fill-counts branch returns FAIL
+    above its only post-submission position read, and both steps' submission-
+    EXCEPTION handlers decide from one un-refreshed read. Those three are
+    recorded residuals — see CLAUDE.md's DR-60 bullet — so nothing here should
+    be read as a module-wide guarantee.
 
     CONFIRMATION. Nothing is submitted until the request body has been printed
     and the operator has typed "yes" — unless --yes was passed, which is for a
@@ -430,6 +441,85 @@ def _report_fee(data: dict, price_str: str) -> None:
     )
 
 
+def _recheck_and_report_position(
+    client: Any, ticker: str, observed: float | None
+) -> None:
+    """
+    Re-read a flat-or-unreadable position once, then name which of three states
+    the account is in.
+
+    THE SINGLE DEFINITION of the re-read-and-report tail, so that the callers
+    that do run it cannot drift apart. It has exactly TWO call sites:
+    `_non_object_body_fail` (a 2xx body that is not a JSON object at all —
+    DR-58, itself reached from BOTH submission-response readers) and
+    `_step_no_mapping`'s unreadable-fill-counts branch (a genuine JSON object
+    whose `fill_count`/`remaining_count` cannot be read — DR-60). They used to
+    disagree: the first re-read and printed three distinct outcomes, while the
+    second decided from a SINGLE un-refreshed read and printed nothing at all
+    unless that read was truthy — so a lagging ledger and a FAILED lookup both
+    came out as silence while a real 0.01 position was open on the production
+    account.
+
+    THREE OTHER BRANCHES sit in the same state and deliberately do NOT call
+    this — recorded as residuals, not as coverage: `_step_unfillable_ask`'s own
+    unreadable-fill-counts branch, which returns _FAIL above its only
+    post-submission position read (that step was explicitly out of DR-60's
+    scope; its ask is designed to be unfillable, but its own DR-58 comment
+    already argues an unreadable 2xx body is not proof it was killed), and both
+    steps' post-submission EXCEPTION handlers, which decide from a single
+    un-refreshed read. Widening to them is a separate change, and the word
+    "SINGLE DEFINITION" above is about this tail's ONE implementation, never a
+    claim that every such branch runs it.
+
+    The re-read fires on `None` (the lookup itself failed) as well as on an
+    exact `0`, which EXTENDS DR-21's read-after-write-lag reasoning rather than
+    restating it: DR-21's own re-read in `_step_no_mapping` fires only on an
+    exactly-zero read because a non-zero one is already the evidence that step
+    wants. Here neither `None` nor `0` is evidence of anything, and collapsing
+    `None` into "flat" is precisely the silent branch this exists to prevent.
+    A first read that already moved is evidence and is NOT re-polled.
+
+    The retried `trader._position_count` is used deliberately (never the
+    single-shot `_position_count_once`): the probe is a human-supervised tool
+    with 0.01 contracts at stake and no unhedged-window latency budget, so a
+    transient 429 must not read as "state unknown". This is the same choice
+    DR-21's re-read makes, and the same one that must never be copied into
+    `trader._confirm_v2_no_mapping`.
+
+    Args:
+        client (Any): Authenticated prod KalshiClient.
+        ticker (str): The market the order was submitted against.
+        observed (float | None): The position the caller already read AND PRINTED —
+            `float` (possibly 0) or `None` when that lookup failed. The caller
+            prints it because only the caller knows what to call the read;
+            this function prints only the re-read and the verdict.
+
+    Returns:
+        None: Everything it has to say it prints. The caller owns the verdict,
+            which is _FAIL at both of today's call sites.
+    """
+    if observed is None or observed == 0:
+        # A ledger that reads flat (or fails) straight after a submission is
+        # usually read-after-write lag, not proof of a kill — re-read ONCE
+        # before concluding anything, exactly as DR-21 established.
+        time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
+        # Cross-module: the account's ledger is the only remaining evidence.
+        observed = trader._position_count(client, ticker)
+        print(f"Position after re-read: {observed}")
+    if observed is None:
+        print(
+            f"*** Could not read the position on {ticker}. CHECK IT MANUALLY and "
+            "FLATTEN ANYTHING YOU FIND. ***"
+        )
+    elif observed:
+        print(
+            f"*** A {observed} position is OPEN on {ticker}. FLATTEN IT MANUALLY in "
+            "the Kalshi UI. ***"
+        )
+    else:
+        print(f"The account reads flat on {ticker} — nothing to flatten.")
+
+
 def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> str:
     """
     Report a submitted order whose 2xx body is not a JSON object, and check the
@@ -461,14 +551,13 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     `_execute_one` into its position-DELTA resolution path. No such caller
     exists above the probe, so raising here resolves nothing.
 
-    The position is read, and re-read ONCE after
-    `trader._V2_MAPPING_RECHECK_DELAY_SECONDS` when the first read is flat or
-    unreadable. That EXTENDS DR-21's read-after-write-lag reasoning rather than
-    restating it: DR-21's re-read in `_step_no_mapping` fires only on an
-    exactly-zero read, and this one fires on `None` (lookup failed) as well,
-    because collapsing `None` into "flat" is precisely the silent branch this
-    guard exists to prevent. All three outcomes are printed distinctly: an
-    unreadable position, an open position, and a genuinely flat account.
+    The position is read here and handed to `_recheck_and_report_position`,
+    which re-reads ONCE after `trader._V2_MAPPING_RECHECK_DELAY_SECONDS` when
+    that first read is flat or unreadable and then prints all three outcomes
+    distinctly — an unreadable position, an open position, and a genuinely flat
+    account. That helper is shared with `_step_no_mapping`'s
+    unreadable-fill-counts branch, which is the same epistemic state one step
+    later (DR-60); see its docstring for why the re-read fires on `None` too.
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -488,25 +577,10 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     # what this order did.
     stranded = trader._position_count(client, ticker)
     print(f"Position after the non-object {label} response: {stranded}")
-    if stranded is None or stranded == 0:
-        # A ledger that reads flat (or fails) straight after a submission is
-        # usually read-after-write lag, not proof of a kill — re-read ONCE
-        # before concluding anything, exactly as DR-21 established.
-        time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
-        stranded = trader._position_count(client, ticker)
-        print(f"Position after re-read: {stranded}")
-    if stranded is None:
-        print(
-            f"*** Could not read the position on {ticker}. CHECK IT MANUALLY and "
-            "FLATTEN ANYTHING YOU FIND. ***"
-        )
-    elif stranded:
-        print(
-            f"*** A {stranded} position is OPEN on {ticker}. FLATTEN IT MANUALLY in "
-            "the Kalshi UI. ***"
-        )
-    else:
-        print(f"The account reads flat on {ticker} — nothing to flatten.")
+    # Shared with _step_no_mapping's unreadable-fill-counts branch: the one
+    # definition of "re-read a flat-or-unreadable ledger once, then say which
+    # of the three states the account is in" (DR-60).
+    _recheck_and_report_position(client, ticker, stranded)
     return _FAIL
 
 
@@ -523,7 +597,14 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
       3. Submit the NO-buy body built by trader._build_no_order_v2 (side "ask"
          per _V2_LEG_SIDE). A 2xx body that is not a JSON object is a FAIL that
          still checks the account (_non_object_body_fail), never a traceback
-         out of the fill readers (DR-58).
+         out of the fill readers (DR-58). A body that IS an object but whose
+         fill_count/remaining_count cannot be read is the same epistemic state
+         one step later — a real order, a 2xx, and no idea what it did — and
+         takes the same remedy through the shared
+         _recheck_and_report_position: the ledger is refreshed once and the
+         account is reported as unreadable, open or genuinely flat, where this
+         branch used to decide from one un-refreshed read and print nothing at
+         all for the first two (DR-60). The verdict stays FAIL.
       4. Re-read the position. PASS half one iff it went NEGATIVE, which is
          Kalshi's unified-ledger convention for a NO position. A position of
          exactly 0 after a reported full fill is read ONCE more, after
@@ -555,8 +636,9 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
 
     Returns:
         str: _PASS only when the position went negative AND came back to zero;
-            _FAIL on any contrary evidence, an error, an unreadable (non-object)
-            2xx response body, or a position left open —
+            _FAIL on any contrary evidence, an error, a 2xx response body that
+            cannot be read (a non-object body, or an object whose fill counts
+            are missing), or a position left open —
             this includes declining the SECOND (closing) confirmation, since a
             real position is open by then and declining to close it is not a
             neutral outcome; _NEUTRAL only when the step never reached a
@@ -661,15 +743,26 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         # trader._confirm_v2_no_mapping assumes: re-read ONCE, here, before
         # any of the sign branches below, so a re-read that comes back
         # positive (mapping disproven) or None (lookup failed) still takes
-        # its own branch instead of falling through (DR-21).
+        # its own branch instead of falling through (DR-21). This is
+        # deliberately NOT _recheck_and_report_position: that helper reports a
+        # terminal FAIL, while this re-read feeds the sign branches below, and
+        # its gate is narrower (`filled` truthy AND exactly zero, never None —
+        # a failed lookup here has its own `after is None` branch). Collapsing
+        # the two would silently change the `filled is True` path.
         time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
         after = trader._position_count(client, ticker)
         print(f"Position after re-read: {after}")
     _report_fee(data, body["price"])
 
     if filled is None:
-        if after:
-            print(f"*** Position open on {ticker} — FLATTEN IT MANUALLY. ***")
+        # The order went out, the exchange returned 2xx, and the body cannot
+        # say what happened — the same state _non_object_body_fail handles one
+        # step earlier, so it takes the same remedy (DR-60). This branch used
+        # to decide from the single un-refreshed read above (the DR-21 re-read
+        # is gated on `filled`, which is falsy here) and to print nothing for
+        # either a lagging ledger or a FAILED lookup, while a real 0.01
+        # position could be open.
+        _recheck_and_report_position(client, ticker, after)
         return _FAIL
     if not filled:
         if after == 0:
