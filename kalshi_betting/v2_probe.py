@@ -88,7 +88,20 @@ Notes:
     (_http.signed_request_json — single-shot, retry-free, non-2xx raises) and
     reads fill_count/remaining_count itself via trader._parse_fixed_point,
     keeping the same Decimal comparison and the same "unparseable means
-    ambiguous, never a non-fill" semantics. A 2xx body that is not a JSON
+    ambiguous, never a non-fill" semantics. Neither order step collapses a
+    non-conforming response into a clean kill, and both apply the SAME test for
+    what a true kill is (nothing filled, the full count still remaining):
+    _step_no_mapping classifies the counts into THREE outcomes rather than
+    two — a complete fill, a true kill, and a fill-or-kill invariant violation
+    (partial, over-fill, stale remainder) — where it used to call a partial
+    fill a kill and report the account as "still flat" (DR-20);
+    _step_unfillable_ask tests for the same true kill and FAILs anything else,
+    naming the counts, as it always has. Their REMEDIES still differ, and only
+    the kill test is shared: that step's ask is meant to be unfillable, so it
+    folds a complete fill into the same FAIL, and it reports the account from a
+    single un-refreshed read (a residual, below). Both are stricter than
+    trader._v2_fill_status, which reads only fill_count and so cannot see a
+    surprise confined to remaining_count. A 2xx body that is not a JSON
     OBJECT at all (`"accepted"`, `[]`, `123`, `true`, `null`) is handled one
     step earlier, by _non_object_body_fail: the fill readers would raise
     AttributeError out of a real, possibly-filled submission, killing the probe
@@ -102,20 +115,26 @@ Notes:
     same helper _non_object_body_fail uses, _recheck_and_report_position: the
     ledger is re-read once when the first read is flat or unreadable, and
     lookup-failed, position-open and genuinely-flat are three distinct printed
-    outcomes (DR-60). That is TWO of the branches in this state, not all of
-    them: _step_unfillable_ask's own unreadable-fill-counts branch returns FAIL
-    above its only post-submission position read, and both steps' submission-
-    EXCEPTION handlers decide from one un-refreshed read. Those three are
-    recorded residuals — see CLAUDE.md's DR-60 bullet — so nothing here should
-    be read as a module-wide guarantee.
+    outcomes (DR-60). That is not every branch in this state:
+    _step_unfillable_ask's own unreadable-fill-counts branch returns FAIL above
+    its only post-submission position read, its `not killed` branch names the
+    counts but reports the account from one un-refreshed read and never says
+    FLATTEN, and both steps' submission-EXCEPTION handlers decide from one
+    un-refreshed read too. Those four are recorded residuals — see CLAUDE.md's
+    DR-60 bullet — so nothing here should be read as a module-wide guarantee.
 
     CONFIRMATION. Nothing is submitted until the request body has been printed
     and the operator has typed "yes" — unless --yes was passed, which is for a
     second or third run once the operator has already seen the bodies.
 
     EXIT CODES: 0 = the executed step PASSED, 1 = something FAILED, 2 =
-    NEUTRAL (the step could not be run to a conclusion — no fill, no liquidity,
-    the OPENING confirmation was declined, or a skipped transfer step). A
+    NEUTRAL (the step could not be run to a conclusion — a TRUE kill with
+    nothing filled and the account flat, no liquidity, the OPENING confirmation
+    was declined, or a skipped transfer step, including a --dest-shard that IS
+    the source shard, refused before any POST — DR-22). A PARTIAL or
+    otherwise non-conforming fill-or-kill response is NOT neutral: it is the
+    protocol violation the probe exists to catch, so it is a FAIL that names
+    the counts and re-reads the account (DR-20). A
     prompt declined once a position is already open (e.g. the unfillable-ask
     step's closing confirmation) is scored FAIL, not NEUTRAL — declining to
     close a real open position is not a neutral outcome, and the printed
@@ -412,8 +431,10 @@ def _report_fee(data: dict, price_str: str) -> None:
     real size flows through it.
 
     Args:
-        data (dict): Parsed V2 order response body; average_fee_paid may be
-            absent when nothing filled.
+        data (dict): Parsed V2 order response body; average_fee_paid is
+            typically absent when nothing filled, but this function reads no
+            fill counts and so cannot assert that — see the printed wording
+            below (DR-20).
         price_str (str): The limit price the order was submitted at, used as
             the model's price input.
 
@@ -424,7 +445,15 @@ def _report_fee(data: dict, price_str: str) -> None:
     order = inner if isinstance(inner, dict) else data
     charged = order.get("average_fee_paid")
     if charged is None:
-        print("Fee check: response carried no average_fee_paid (nothing filled).")
+        # Deliberately does NOT claim "nothing filled": this function never
+        # reads fill_count/remaining_count, and on a PARTIAL fill that claim
+        # was a second, independent false assertion of an empty fill printed
+        # right above the verdict (DR-20).
+        print(
+            "Fee check: response carried no average_fee_paid, so there is no charged fee "
+            "to compare (the raw response body and the verdict below, not this line, say "
+            "what filled)."
+        )
         return
     try:
         price = float(price_str)
@@ -449,24 +478,29 @@ def _recheck_and_report_position(
     the account is in.
 
     THE SINGLE DEFINITION of the re-read-and-report tail, so that the callers
-    that do run it cannot drift apart. It has exactly TWO call sites:
+    that do run it cannot drift apart. It has exactly THREE call sites:
     `_non_object_body_fail` (a 2xx body that is not a JSON object at all —
-    DR-58, itself reached from BOTH submission-response readers) and
+    DR-58, itself reached from BOTH submission-response readers),
     `_step_no_mapping`'s unreadable-fill-counts branch (a genuine JSON object
-    whose `fill_count`/`remaining_count` cannot be read — DR-60). They used to
-    disagree: the first re-read and printed three distinct outcomes, while the
-    second decided from a SINGLE un-refreshed read and printed nothing at all
-    unless that read was truthy — so a lagging ledger and a FAILED lookup both
-    came out as silence while a real 0.01 position was open on the production
-    account.
+    whose `fill_count`/`remaining_count` cannot be read — DR-60), and
+    `_step_no_mapping`'s fill-or-kill invariant-violation branch (counts that
+    ARE readable but describe a partial fill, an over-fill or a stale
+    remainder — DR-20). The first two used to disagree: the first re-read and
+    printed three distinct outcomes, while the second decided from a SINGLE
+    un-refreshed read and printed nothing at all unless that read was truthy —
+    so a lagging ledger and a FAILED lookup both came out as silence while a
+    real 0.01 position was open on the production account.
 
-    THREE OTHER BRANCHES sit in the same state and deliberately do NOT call
+    FOUR OTHER BRANCHES sit in the same state and deliberately do NOT call
     this — recorded as residuals, not as coverage: `_step_unfillable_ask`'s own
     unreadable-fill-counts branch, which returns _FAIL above its only
     post-submission position read (that step was explicitly out of DR-60's
     scope; its ask is designed to be unfillable, but its own DR-58 comment
-    already argues an unreadable 2xx body is not proof it was killed), and both
-    steps' post-submission EXCEPTION handlers, which decide from a single
+    already argues an unreadable 2xx body is not proof it was killed);
+    `_step_unfillable_ask`'s `not killed` branch, the direct sibling of DR-20's
+    new one, which names the counts and FAILs but decides its account report
+    from a single un-refreshed read and never says FLATTEN; and both steps'
+    post-submission EXCEPTION handlers, which likewise decide from a single
     un-refreshed read. Widening to them is a separate change, and the word
     "SINGLE DEFINITION" above is about this tail's ONE implementation, never a
     claim that every such branch runs it.
@@ -605,6 +639,17 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          account is reported as unreadable, open or genuinely flat, where this
          branch used to decide from one un-refreshed read and print nothing at
          all for the first two (DR-60). The verdict stays FAIL.
+      3a. Classify the readable counts into THREE outcomes, not two: a
+         complete fill, a true kill (nothing filled, the full count still
+         remaining), and anything else — a partial fill, an over-fill or a
+         stale remainder. That third class is a fill-or-kill invariant
+         violation, so it FAILs naming the actual counts and reports the
+         account through the same _recheck_and_report_position tail. It used
+         to collapse into "not filled" and, with a lagging ledger, print
+         "killed unfilled and the account is still flat" and exit NEUTRAL
+         while a real fraction of a contract was open (DR-20). Judging on
+         BOTH counts is deliberately stricter than trader._v2_fill_status,
+         which reads fill_count alone — see the comment at the test.
       4. Re-read the position. PASS half one iff it went NEGATIVE, which is
          Kalshi's unified-ledger convention for a NO position. A position of
          exactly 0 after a reported full fill is read ONCE more, after
@@ -638,13 +683,15 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         str: _PASS only when the position went negative AND came back to zero;
             _FAIL on any contrary evidence, an error, a 2xx response body that
             cannot be read (a non-object body, or an object whose fill counts
-            are missing), or a position left open —
-            this includes declining the SECOND (closing) confirmation, since a
-            real position is open by then and declining to close it is not a
-            neutral outcome; _NEUTRAL only when the step never reached a
-            verdict with no position at risk (no liquidity, no fill, or
-            declining the FIRST (opening) confirmation, before any order was
-            submitted).
+            are missing), a readable response that is neither a complete fill
+            nor a true kill (a fill-or-kill invariant violation — DR-20), or a
+            position left open — this includes declining the SECOND (closing)
+            confirmation, since a real position is open by then and declining
+            to close it is not a neutral outcome; _NEUTRAL only when the step
+            never reached a verdict with no position at risk: no liquidity, a
+            TRUE kill (nothing filled, the full count remaining) against a
+            genuinely flat account, or declining the FIRST (opening)
+            confirmation, before any order was submitted.
     """
     print("\n===== STEP: no-mapping (the V2 NO-leg mapping gate) =====")
 
@@ -727,7 +774,22 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         return _non_object_body_fail(client, ticker, data, "NO buy")
 
     fill, remaining = _fill_counts(data)
+    # TWO orthogonal questions, never one boolean: `filled` answers "was this a
+    # complete fill" and `conforming` answers "is this a shape fill-or-kill is
+    # allowed to produce at all". Together they name the three readable
+    # outcomes the branches below dispatch on — complete fill, true kill,
+    # invariant violation — plus the unreadable one (`filled = None`).
+    # Collapsing everything non-full into `filled = False` reported a PARTIAL
+    # fill (0.005 filled, 0.005 remaining) as a clean kill, skipped the DR-21
+    # re-read — which is gated on `filled` — and printed "killed unfilled and
+    # the account is still flat" while a real 0.005 position was open on the
+    # production account (DR-20). The sibling step _step_unfillable_ask already
+    # classified this way. `conforming` is left True in the unreadable case and
+    # is only safe to read because the `filled is None` branch below returns
+    # BEFORE it is tested — keep that order, or an unreadable body falls
+    # through to the "still flat" NEUTRAL and reintroduces DR-60.
     filled: bool | None
+    conforming = True
     if fill is None or remaining is None:
         # Same reading the live path forces: unparseable fill fields mean the
         # outcome is UNKNOWN, not that nothing filled.
@@ -735,6 +797,23 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         filled = None
     else:
         filled = remaining == 0 and fill == PROBE_COUNT
+        # A fill-or-kill either fills completely or comes back with the full
+        # count still remaining. Anything else is an invariant violation and is
+        # exactly what this probe exists to catch before real size flows.
+        # ATTRIBUTION, precisely, because the FAIL below quotes it: trader's
+        # _v2_fill_status reads ONLY fill_count, so it raises — rather than
+        # guess a status — on a PARTIAL or an OVER-fill, where fill_count is
+        # neither the requested count nor zero. It never reads remaining_count
+        # at all, so a STALE REMAINDER (fill_count == count with a non-zero
+        # remaining_count) books as "executed" there, and a kill whose
+        # remaining_count is not the full count books as "canceled". This test
+        # reads BOTH counts, so the probe deliberately holds a STRICTER
+        # contract than the live reader on exactly those two shapes: an
+        # unexpected remaining_count is itself a finding on the one gate that
+        # decides whether the bot stays on V2, and the sibling
+        # _step_unfillable_ask has tested both counts since it was written, so
+        # the two steps agree about what a kill is.
+        conforming = filled or (fill == 0 and remaining == PROBE_COUNT)
 
     after = trader._position_count(client, ticker)
     print(f"Position after the NO buy: {after}")
@@ -762,6 +841,26 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         # is gated on `filled`, which is falsy here) and to print nothing for
         # either a lagging ledger or a FAILED lookup, while a real 0.01
         # position could be open.
+        _recheck_and_report_position(client, ticker, after)
+        return _FAIL
+    if not conforming:
+        # A real order, a 2xx, and a response the fill-or-kill contract says
+        # cannot happen: the counts are readable but describe a partial fill,
+        # an over-fill or a stale remainder. Never NEUTRAL and never a claim
+        # that the account is flat — some of the order may have landed, so the
+        # ledger is re-read and reported through the same shared tail the
+        # unreadable-body branches use (DR-20).
+        print(
+            f"{_FAIL}: the fill-or-kill neither filled completely nor came back killed — "
+            f"fill_count={fill} remaining_count={remaining} against a count of "
+            f"{PROBE_COUNT_STR}. A fill-or-kill may only do one of those two things. The "
+            "live path raises rather than guess a status whenever fill_count is neither "
+            "the requested count nor zero (trader._v2_fill_status), but it reads no "
+            "remaining_count at all — so a surprise confined to that field would pass it "
+            "as a clean fill or a clean kill. This probe checks both counts deliberately. "
+            "*** CHECK THE ACCOUNT. *** Set config.ORDER_API_VERSION = \"legacy\" to hold "
+            "the bot on the legacy order path."
+        )
         _recheck_and_report_position(client, ticker, after)
         return _FAIL
     if not filled:
@@ -1010,8 +1109,9 @@ def _step_transfer(client: Any, ticker: str, assume_yes: bool, dest_shard: int) 
     trader._execute_transfer and trader._await_transfer_settlement, so a pass
     here is a pass for the code the live path runs.
 
-    Skipped (NEUTRAL, never FAIL) whenever the exchange says the move is not
-    available: no per-shard status breakdown at all, no destination shard
+    Skipped (NEUTRAL, never FAIL) whenever the move is not available: the
+    destination IS the source shard (DR-22 — a self-transfer is refused before
+    any POST), no per-shard status breakdown at all, no destination shard
     advertised, or intra_exchange_transfers_active false on either endpoint.
 
     Args:
@@ -1020,7 +1120,10 @@ def _step_transfer(client: Any, ticker: str, assume_yes: bool, dest_shard: int) 
             signature.
         assume_yes (bool): Skip the interactive confirmation (--yes).
         dest_shard (int): Destination shard for the round trip (--dest-shard,
-            default 1).
+            default 1). Must differ from _TRANSFER_SOURCE_SHARD; equal is a
+            NEUTRAL refusal, and a shard the exchange does not advertise (any
+            negative value, or an unknown index) is refused by the advertised-
+            shard guard below.
 
     Returns:
         str: _PASS when the cent lands on the destination shard and comes back;
@@ -1028,6 +1131,27 @@ def _step_transfer(client: Any, ticker: str, assume_yes: bool, dest_shard: int) 
             when the step is skipped or the operator declines.
     """
     print("\n===== STEP: transfer (inter-shard collateral round trip) =====")
+
+    # Refuse a self-transfer BEFORE any I/O, and before any POST. The two
+    # existing guards below (is the shard advertised, are its transfers active)
+    # are both satisfied by the source shard by construction, so --dest-shard 0
+    # used to POST a real, non-idempotent, never-retried transfer whose source
+    # and destination were the same shard. Net-zero, so no money can go
+    # missing, but it cannot raise the shard's balance by the probe cent the
+    # settlement target demands: the poll burned the full
+    # TRANSFER_SETTLE_TIMEOUT_SECONDS and then reported a FALSE "MONEY MAY BE
+    # IN FLIGHT" (DR-22). Guarded here rather than in argparse because
+    # _step_transfer is what spends the money and is reachable from main()'s
+    # step dispatch and from any future caller, not only from the CLI.
+    if dest_shard == _TRANSFER_SOURCE_SHARD:
+        print(
+            f"{_NEUTRAL}: --dest-shard {dest_shard} IS the source shard "
+            f"({_TRANSFER_SOURCE_SHARD}), so this would POST a self-transfer that cannot "
+            "raise that shard's balance — the settlement poll would then burn "
+            f"{config.TRANSFER_SETTLE_TIMEOUT_SECONDS}s and report money in flight that "
+            "never moved. Nothing was submitted; pick a different destination shard."
+        )
+        return _NEUTRAL
 
     # Same read main.py does before every run; None means single-shard semantics.
     statuses = scanner.fetch_shard_statuses(client)
@@ -1154,8 +1278,10 @@ def main(argv: list | None = None) -> int:
 
     Returns:
         int: 0 when the step PASSED, 1 when it FAILED, 2 when it was NEUTRAL
-            (no verdict reached — no fill, no liquidity, skipped, or aborted at
-            the confirmation prompt). Only a 0 from BOTH no-mapping and
+            (no verdict reached — a TRUE kill with the account flat, no
+            liquidity, skipped, or aborted at the confirmation prompt; a
+            partial or otherwise non-conforming fill-or-kill response is a
+            FAIL, not a NEUTRAL — DR-20). Only a 0 from BOTH no-mapping and
             unfillable-ask is evidence that the V2 order path may be trusted
             to run unsupervised.
     """
@@ -1180,7 +1306,11 @@ def main(argv: list | None = None) -> int:
     )
     parser.add_argument(
         "--dest-shard", type=int, default=_TRANSFER_DEST_SHARD_DEFAULT,
-        help="Destination shard for --step transfer (default: 1, the combos shard).",
+        help=(
+            "Destination shard for --step transfer (default: 1, the combos shard). Must "
+            f"not be the source shard ({_TRANSFER_SOURCE_SHARD}) — a self-transfer is "
+            "refused before any POST."
+        ),
     )
     parser.add_argument(
         "--yes", action="store_true",
