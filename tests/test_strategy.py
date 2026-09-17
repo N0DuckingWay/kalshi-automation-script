@@ -9,7 +9,7 @@ import ast
 import inspect
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -150,9 +150,15 @@ _TS_PA, _TS_PB, _TS_NA, _TS_NB = 0.30, 0.60, 0.70, 0.40
 def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
     """Uncapped Kelly f* = p - (1-p)/b for a time-series pair, from the config
     helpers alone — the oracle every sizer (strategy, dashboard, backtester)
-    must agree with."""
-    net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-    b = net_spread / (pA + nB)
+    must agree with.
+
+    b divides by the dollars AT RISK, which include the fee: a losing pair loses
+    total_cost_with_fees, not just the contracts' cost (DR-62). This is NOT the
+    reported TradeSpec.profit_ratio, whose denominator is fee-less.
+    """
+    fee = fee_per_pair_approx(pA, nB)
+    net_spread = (1.0 - pA - nB) - fee
+    b = net_spread / (pA + nB + fee)
     p = time_series_profit_prob(pA, pB)
     return p - (1.0 - p) / b
 
@@ -334,21 +340,23 @@ class TestComputeTradeTimeSeries:
         assert result.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB))
         assert result.kelly_p == pytest.approx(0.775)
         expected_f = _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
-        # ~0.1884 — below the 20% cap, so Kelly (not the cap) sizes this pair
-        assert expected_f == pytest.approx(0.1884, abs=1e-4)
+        # ~0.1620 — below the 20% cap, so Kelly (not the cap) sizes this pair.
+        # (0.1884 under the pre-DR-62 fee-less Kelly denominator; the gate is
+        # strictly tighter now, so every size is the same or smaller.)
+        assert expected_f == pytest.approx(0.1620, abs=1e-4)
         assert expected_f < BUDGET_FRACTION
         assert result.kelly_fraction == pytest.approx(expected_f)
 
     def test_flow_through_dollar_figures(self):
-        # Kelly budget 1884.08 → raw n 2691, shrunk by the fee loop to 2575:
-        # cost 1802.50, exact fees 37.86 + 43.26 = 81.12, cash out 1883.62,
-        # win-scenario profit 2575 * 0.30 - 81.12 = 691.38
+        # Kelly budget 1620.11 → raw n 2314, shrunk by the fee loop to 2214:
+        # cost 1549.80, exact fees 32.55 + 37.20 = 69.75, cash out 1619.55,
+        # win-scenario profit 2214 * 0.30 - 69.75 = 594.45
         result = compute_trade(self._pair(), 1_000_000)
         assert result is not None
-        assert result.x == 2575
-        assert result.total_cost == pytest.approx(1802.50)
-        assert result.total_cost_with_fees == pytest.approx(1883.62)
-        assert result.min_payoff == pytest.approx(691.38)
+        assert result.x == 2214
+        assert result.total_cost == pytest.approx(1549.80)
+        assert result.total_cost_with_fees == pytest.approx(1619.55)
+        assert result.min_payoff == pytest.approx(594.45)
         assert result.total_cost_with_fees <= 10_000.0 * result.kelly_fraction + 1e-9
 
     def test_min_payoff_is_the_win_scenario_profit(self):
@@ -369,9 +377,12 @@ class TestComputeTradeTimeSeries:
         assert compute_trade(self._pair(nB=0.50), 1_000_000) is None
 
     def test_wide_gap_is_capped_at_budget_fraction(self):
-        # 0.30 → 0.70 with NO ask 0.30: f* ≈ 0.214 → capped to BUDGET_FRACTION
-        assert _ts_kelly_fraction(0.30, 0.70, 0.30) > BUDGET_FRACTION
-        result = compute_trade(self._pair(pB=0.70, nB=0.30), 1_000_000)
+        # 0.30 → 0.85 with NO ask 0.15: f* ≈ 0.216 → capped to BUDGET_FRACTION.
+        # The gap had to widen from 0.40 to 0.55 with the fee-inclusive Kelly
+        # denominator (DR-62): at the old 0.30 → 0.70 / 0.30 fixture f* is now
+        # 0.1905, just under the cap, so the cap no longer binds there.
+        assert _ts_kelly_fraction(0.30, 0.85, 0.15) > BUDGET_FRACTION
+        result = compute_trade(self._pair(pB=0.85, nB=0.15), 1_000_000)
         assert result is not None
         assert result.kelly_fraction == pytest.approx(BUDGET_FRACTION)
 
@@ -412,12 +423,14 @@ def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     """Uncapped Kelly fraction for a pair priced at (price_a, price_b).
 
     Mirrors compute_trade's formula so a test can state, in its own terms, what
-    the old whole-book average would have concluded about a book.
+    the old whole-book average would have concluded about a book. b carries the
+    fee in its denominator, as compute_trade's kelly_b does (DR-62).
     """
-    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+    fee = fee_per_pair_approx(price_a, price_b)
+    net_spread = (1.0 - price_a - price_b) - fee
     if net_spread <= 0:
         return -1.0
-    b = net_spread / (price_a + price_b)
+    b = net_spread / (price_a + price_b + fee)
     p = strategy._kelly_p_at(pair, price_a)
     return p - (1.0 - p) / b
 
@@ -585,12 +598,13 @@ class TestTimeSeriesKellyParity:
 
     def test_dashboard_fraction_uses_leg_prices_not_nA_pB(self):
         # On this fixture nA + pB = 1.30 — the old leg mapping would return 0.0
-        # (no spread), not the ~0.1884 the live sizer computes
-        assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.18
+        # (no spread), not the ~0.1620 the live sizer computes
+        assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
     def test_dashboard_same_title_unchanged(self):
         # Same-title still prices nA + pB on the fixed prior; nB is ignored
-        expected_b = ((1.0 - 0.20 - 0.30) - fee_per_pair_approx(0.20, 0.30)) / 0.50
+        fee = fee_per_pair_approx(0.20, 0.30)
+        expected_b = ((1.0 - 0.20 - 0.30) - fee) / (0.50 + fee)
         expected = SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) / expected_b
         assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title") == pytest.approx(expected)
         assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.99, "same_title") == pytest.approx(expected)
@@ -665,6 +679,260 @@ class TestTimeSeriesKellyParity:
         # disagree about what a series is.
         assert _function_calls(backtester, "_same_series_dicts", "event_series")
         assert _function_calls(scanner, "_same_series", "event_series")
+
+
+# ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────
+
+# The reproduction fixture: a time-series pair every scanner gate admits —
+# pB - pA = 0.82 clears even the 30% long-gap tier and the leg sum 0.37 is far
+# under the 0.85 price ceiling — whose TRUE expected value is negative once the
+# losing cell's fee is counted. Under the pre-DR-62 fee-less Kelly denominator
+# f* = +0.0113 and this pair was sized and submitted with real money.
+_DR62_PA, _DR62_PB, _DR62_NB = 0.16, 0.98, 0.21
+
+
+def _fee_less_kelly_fraction(pA: float, pB: float, nB: float) -> float:
+    """The PRE-DR-62 time-series Kelly fraction: net_spread over the fee-LESS
+    cost (price_a + price_b). Kept only so the tests below can state, in their
+    own terms, what the old gate concluded — never what the code now does."""
+    net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
+    p = time_series_profit_prob(pA, pB)
+    return p - (1.0 - p) / (net_spread / (pA + nB))
+
+
+def _fee_shrunk_n(kelly_f: float, price_a: float, price_b: float, balance: float) -> int:
+    """compute_trade's budget-to-contracts step (capped Kelly budget, then the
+    exact-fee shrink loop), so a test can size the SAME pair under a different
+    Kelly fraction and compare the two counts."""
+    budget = balance * min(BUDGET_FRACTION, kelly_f)
+    n = int(budget / (price_a + price_b))
+    fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
+    while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget:
+        n -= 1
+        fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
+    return n
+
+
+def _backtester_trades(pA: float, pB: float, nA: float, nB: float) -> list:
+    """Replay ONE time-series pair through backtester._simulate_at_discount and
+    return the trades it entered (empty when its Kelly gate rejected the pair).
+
+    Goes through the real Pass 1b/Pass 2 code rather than re-deriving the
+    formula in the test, which is the whole point: the backtester replays the
+    live admission rule, so a divergence here is a divergence nothing else in
+    the suite would catch.
+    """
+    entry_date = date(2026, 1, 5)
+    mA = {"ticker": "EA", "title": "A", "result": "yes",
+          "close_time": "2026-02-01T00:00:00+00:00",
+          "settlement_ts": "2026-02-14T00:00:00+00:00"}
+    mB = {"ticker": "EB", "title": "B", "result": "yes",
+          "close_time": "2026-02-14T00:00:00+00:00",
+          "settlement_ts": "2026-02-14T00:00:00+00:00"}
+    rec = {
+        "pair_type": "time_series",
+        "canon": "dr62 pair",
+        "group_key": "dr62",
+        "entry": {"mA": mA, "mB": mB, "pA": pA, "pB": pB, "nA": nA, "nB": nB,
+                  "entry_date": entry_date, "gap_days": 13},
+    }
+    return backtester._simulate_at_discount([rec], entry_date, 10_000.0).trades
+
+
+def _backtester_kelly_fraction(pA: float, pB: float, nA: float, nB: float) -> float:
+    """The capped Kelly fraction the backtester puts on that one trade."""
+    trades = _backtester_trades(pA, pB, nA, nB)
+    assert len(trades) == 1
+    return trades[0].kelly_fraction
+
+
+class TestKellyRiskIncludesFees:
+    """Kelly's "b" divides by the dollars actually AT RISK, and the fee is one
+    of them: a losing pair loses total_cost_with_fees in full, so the fee-less
+    denominator made f* > 0 whenever p*net_spread > q*(price_a + price_b) while
+    true positive EV needs p*net_spread > q*(price_a + price_b + fee). The gate
+    overstated EV by exactly q*fee on every pair (DR-62).
+
+    What the fixed gate guarantees is positive EV under the CONTINUOUS fee
+    approximation — nothing about the ceiling-rounded exact fee the trade is
+    charged. fee_per_pair_approx sits below fee_leg_exact, so a spec on the
+    boundary can still be EV-negative on its own fields at single-digit n; that
+    residual is pinned by test_small_n_can_still_be_ev_negative_on_exact_fees
+    rather than papered over."""
+
+    def test_the_headline_fixture_is_rejected(self):
+        # THE pin. Accepted before DR-62, rejected now.
+        assert _fee_less_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB) > 0
+        assert _ts_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB) < 0
+        pair = make_pair(pA=_DR62_PA, pB=_DR62_PB, nA=0.85, nB=_DR62_NB,
+                         pair_type="time_series")
+        assert compute_trade(pair, 1_000_000) is None
+
+    def test_the_headline_fixtures_true_ev_is_negative(self):
+        # Stated in EV terms rather than in Kelly terms, so the two readings of
+        # this pair are side by side: what the old gate implicitly modelled,
+        # and what the module's own settlement model says.
+        fee = fee_per_pair_approx(_DR62_PA, _DR62_NB)
+        net_spread = (1.0 - _DR62_PA - _DR62_NB) - fee
+        p = time_series_profit_prob(_DR62_PA, _DR62_PB)
+        q = 1.0 - p
+        ev_fee_less = p * net_spread - q * (_DR62_PA + _DR62_NB)
+        ev_true = p * net_spread - q * (_DR62_PA + _DR62_NB + fee)
+        assert ev_fee_less > 0
+        assert ev_true < 0
+        # The gap between the two readings is exactly q * fee, always
+        assert ev_fee_less - ev_true == pytest.approx(q * fee)
+
+    def test_the_overstatement_is_q_times_the_fee_for_any_pair(self):
+        # Not a property of the fixture: the two EV expressions differ by q*fee
+        # for every price pair, which is why same-title (q = 0.05) is immune
+        # and the time-series bet (q = k*(pB - pA)) is not.
+        for price_a, price_b, p in ((0.30, 0.40, 0.775), (0.20, 0.30, 0.95),
+                                    (0.16, 0.21, 0.385)):
+            fee = fee_per_pair_approx(price_a, price_b)
+            net_spread = (1.0 - price_a - price_b) - fee
+            q = 1.0 - p
+            ev_fee_less = p * net_spread - q * (price_a + price_b)
+            ev_true = p * net_spread - q * (price_a + price_b + fee)
+            assert ev_fee_less - ev_true == pytest.approx(q * fee)
+
+    def test_a_profitable_pair_is_still_accepted_and_sizes_no_larger(self):
+        # The gate is strictly TIGHTER, never looser: the same pair still
+        # trades, at the same count or a smaller one.
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB,
+                         pair_type="time_series")
+        spec = compute_trade(pair, 1_000_000)
+        assert spec is not None
+        fee_less_f = _fee_less_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
+        assert spec.kelly_fraction < fee_less_f
+        old_n = _fee_shrunk_n(fee_less_f, _TS_PA, _TS_NB, 10_000.0)
+        assert 0 < spec.x <= old_n
+
+    def test_same_title_verdict_is_unchanged_on_the_reference_pair(self):
+        # q is the fixed 1 - SAME_TITLE_CO_RESOLVE_PROB = 0.05, so q*fee is
+        # small: the fraction barely moves and the accept/reject verdict is
+        # identical on both a profitable and an unprofitable same-title pair.
+        # NOT a universal — the name scopes it to this fixture on purpose.
+        # Measured over the same-title admissible region on a whole-cent grid,
+        # 12 of 4,465 price points DO flip (0.27%), always accept -> reject
+        # (e.g. nA 0.28 / pB 0.64: +0.0256 fee-less, -0.0048 fee-inclusive);
+        # test_a_flipping_same_title_pair_is_now_rejected pins one of them.
+        nA, pB = 0.20, 0.30
+        fee = fee_per_pair_approx(nA, pB)
+        net_spread = (1.0 - nA - pB) - fee
+        q = 1.0 - SAME_TITLE_CO_RESOLVE_PROB
+        fee_less = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB))
+        fee_incl = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB + fee))
+        assert (fee_less > 0) == (fee_incl > 0)
+        assert fee_incl == pytest.approx(fee_less, abs=0.01)
+        spec = compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"), 1_000_000)
+        assert spec is not None
+        # Both readings are far above the cap, so the sizing is byte-identical
+        assert spec.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        # ...and a same-title pair with no spread is still rejected either way
+        assert compute_trade(make_pair(nA=0.60, pB=0.50, pair_type="same_title"),
+                             1_000_000) is None
+
+    def test_a_flipping_same_title_pair_is_now_rejected(self):
+        # "Effectively immune" is not "immune": a thin minority of same-title
+        # price points inside the admissible region (pA - pB >= 0.05, legs
+        # <= 0.95) do change verdict, and the flip is always accept -> reject.
+        # Pinned so the immunity claim is never read as a universal.
+        nA, pB = 0.28, 0.64
+        fee = fee_per_pair_approx(nA, pB)
+        net_spread = (1.0 - nA - pB) - fee
+        q = 1.0 - SAME_TITLE_CO_RESOLVE_PROB
+        fee_less = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB))
+        fee_incl = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB + fee))
+        assert fee_less > 0 > fee_incl
+        assert compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"),
+                             1_000_000) is None
+
+    @pytest.mark.parametrize("kwargs", [
+        {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB,
+         "pair_type": "time_series"},
+        {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"},
+    ])
+    def test_accepted_specs_have_positive_ev_on_their_own_fields(self, kwargs):
+        # A spot-check on THESE fixtures, not a property of the gate. The gate
+        # prices with fee_per_pair_approx, which UNDERESTIMATES the
+        # ceiling-rounded fee_leg_exact that min_payoff and total_cost_with_fees
+        # are built from — so the identity only holds at sizes where the two
+        # converge. Both fixtures size in the thousands, where the rounding is
+        # negligible; test_small_n_can_still_be_ev_negative_on_exact_fees below
+        # pins the residual at the other end so it is documented rather than
+        # rediscovered.
+        spec = compute_trade(make_pair(**kwargs), 1_000_000)
+        assert spec is not None
+        assert spec.x > 100  # the regime this identity is asserted for
+        q = 1.0 - spec.kelly_p
+        assert spec.kelly_p * spec.min_payoff - q * spec.total_cost_with_fees > 0
+
+    def test_small_n_can_still_be_ev_negative_on_exact_fees(self):
+        # The residual the gate does NOT close, pinned so nobody restates the
+        # guarantee as "positive EV on the spec's own fields". Accepted at
+        # n = 30, yet p*min_payoff - q*total_cost_with_fees is a half-cent
+        # NEGATIVE, entirely because the exact per-leg fee is ceiling-rounded
+        # above fee_per_pair_approx. compute_trade's min_payoff > 0 check bounds
+        # this regime; it does not eliminate it.
+        pair = make_pair(pA=0.12, pB=0.33, nA=0.88, nB=0.70,
+                         pair_type="time_series")
+        spec = compute_trade(pair, 1_000_000)
+        assert spec is not None
+        assert spec.x == 30
+        assert spec.min_payoff > 0  # the backstop that bounds the shortfall
+        q = 1.0 - spec.kelly_p
+        ev = spec.kelly_p * spec.min_payoff - q * spec.total_cost_with_fees
+        assert ev == pytest.approx(-0.005, abs=1e-3)
+        # ...and the approximation the gate priced with says the opposite
+        price_a, price_b = leg_prices(spec.pair)
+        approx_fee = fee_per_pair_approx(price_a, price_b) * spec.x
+        assert approx_fee < spec.total_cost_with_fees - spec.total_cost
+
+    def test_all_three_sizers_agree_by_value(self):
+        # CLAUDE.md's AST pins cover WHICH helper each sizer calls, never the
+        # arithmetic around it — so the fee-inclusive denominator is pinned here
+        # by value, across strategy, dashboard and the backtester.
+        expected = _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
+        live = compute_trade(
+            make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB,
+                      pair_type="time_series"),
+            1_000_000,
+        )
+        assert live is not None
+        assert live.kelly_fraction == pytest.approx(expected)
+        assert dashboard._kelly_fraction(
+            _TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") == pytest.approx(expected)
+        assert _backtester_kelly_fraction(
+            _TS_PA, _TS_PB, _TS_NA, _TS_NB) == pytest.approx(expected)
+        # None of the three is the pre-DR-62 value
+        assert expected < _fee_less_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
+
+    def test_the_backtester_also_rejects_the_headline_fixture(self):
+        # The backtest replays the live admission rule, which is why no
+        # backtest could ever have surfaced this — so the mirror is pinned on
+        # the rejection too, not only on the value.
+        assert _backtester_trades(_DR62_PA, _DR62_PB, 0.85, _DR62_NB) == []
+        # Sanity: the same harness DOES enter the profitable fixture, so the
+        # emptiness above is the Kelly gate and not a broken fixture.
+        assert len(_backtester_trades(_TS_PA, _TS_PB, _TS_NA, _TS_NB)) == 1
+
+    def test_reported_profit_ratio_keeps_the_fee_less_denominator(self):
+        # The split is deliberate: Kelly's b is the fee-INCLUSIVE risk, while
+        # TradeSpec.profit_ratio stays return-on-contract-cost so
+        # monthly_profit_ratio (select_portfolio's ranking key) and the prod
+        # log's Profit Ratio column keep their published meaning.
+        spec = compute_trade(
+            make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB,
+                      pair_type="time_series"),
+            1_000_000,
+        )
+        assert spec is not None
+        price_a, price_b = leg_prices(spec.pair)
+        fee = fee_per_pair_approx(price_a, price_b)
+        net_spread = (1.0 - price_a - price_b) - fee
+        assert spec.profit_ratio == pytest.approx(net_spread / (price_a + price_b))
+        assert spec.profit_ratio != pytest.approx(net_spread / (price_a + price_b + fee))
 
 
 class TestSelectPortfolio:

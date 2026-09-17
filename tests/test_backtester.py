@@ -1099,7 +1099,7 @@ class TestActiveTickerRelease:
     nA+pB = 0.60+0.30 = 0.90 <= 0.95. Time-series TX/TZ: TX is the earlier
     contract and TZ (later) is priced 0.35 higher, clearing the 30% long-gap
     tier; legs pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval
-    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.204 — positive, so
+    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so
     the pair really is entered. TX/TY as a time-series pair (13-day gap, TY
     earlier at 0.30 vs TX 0.40) misses the 15% tier, and TY/TZ is 31 days
     apart — beyond MAX_DEADLINE_GAP_DAYS — so TX/TZ is the only time-series
@@ -2636,7 +2636,7 @@ class TestRunBacktestCrossTypeDedup:
     # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
     # Time-series copy: the later contract is priced 0.30 higher, clearing the
     # 15% short-gap tier; legs pA+nB = 0.30+0.40 = 0.70 <= 0.85, and under the
-    # interval discount the Kelly fraction is ~0.188 — positive, so BOTH
+    # interval discount the Kelly fraction is ~0.162 — positive, so BOTH
     # copies form in Pass 1 and the dedup under test is not vacuous.
     _CANDLES = {
         "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
@@ -2796,12 +2796,14 @@ class TestRunBacktestTimeSeriesFlow:
 
     Legs are YES on EA at 0.30 and NO on EB at 0.40: gap 0.30 >= 0.15, cost
     0.70 <= 0.85, fee_approx 0.0315 < 0.30 => entry. Pass 1: net 0.2685,
-    b 0.3836, p = 1 - 0.75*0.30 = 0.775, f* = 0.1884 (below the 0.20 cap, so
-    Kelly sizes it). Pass 2: budget 1884.08 => raw n 2691, shrunk to 2575 by
-    the fee loop (cost 1802.50, exact fees 81.12, cash out 1883.62), win
-    profit 691.38. Settlement: event by EA => +691.38; never by EB =>
-    +691.38; in between => -1883.62; EA yes / EB no is a premise violation
-    and is excluded with a counted WARNING.
+    b 0.3671 (= net / (0.70 + 0.0315) — DR-62 put the fee in Kelly's
+    denominator; it was 0.3836 over the fee-less 0.70), p = 1 - 0.75*0.30 =
+    0.775, f* = 0.1620 (was 0.1884; still below the 0.20 cap, so Kelly sizes
+    it). Pass 2: budget 1620.11 => raw n 2314, shrunk to 2214 by the fee loop
+    (cost 1549.80, exact fees 69.75, cash out 1619.55), win profit 594.45.
+    Settlement: event by EA => +594.45; never by EB => +594.45; in between =>
+    -1619.55; EA yes / EB no is a premise violation and is excluded with a
+    counted WARNING.
     """
 
     _PA, _NA = 0.30, 0.70   # EA (earlier) YES / NO ask
@@ -2852,9 +2854,12 @@ class TestRunBacktestTimeSeriesFlow:
     @staticmethod
     def _expected_kelly(pA, nB, pB):
         # p - (1 - p)/b computed from the config helpers, so this pins the
-        # model THROUGH run_backtest rather than a hardcoded number
-        net = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-        b = net / (pA + nB)
+        # model THROUGH run_backtest rather than a hardcoded number. b's
+        # denominator carries the fee: the losing cell loses cost + fees, so
+        # that is the capital actually at risk (DR-62).
+        fee = fee_per_pair_approx(pA, nB)
+        net = (1.0 - pA - nB) - fee
+        b = net / (pA + nB + fee)
         p = time_series_profit_prob(pA, pB)
         return p - (1.0 - p) / b
 
@@ -2868,19 +2873,21 @@ class TestRunBacktestTimeSeriesFlow:
         assert t.entry_nA == pytest.approx(self._NA)
         assert t.entry_nB == pytest.approx(self._NB)
         expected_f = self._expected_kelly(self._PA, self._NB, self._PB)
-        assert expected_f == pytest.approx(0.1884, abs=5e-4)
+        # 0.1884 before DR-62 put the fee in Kelly's denominator; the gate is
+        # strictly tighter now, so this pair sizes smaller than it used to.
+        assert expected_f == pytest.approx(0.1620, abs=5e-4)
         assert expected_f < BUDGET_FRACTION  # Kelly, not the cap, sized this pair
         assert t.kelly_fraction == pytest.approx(expected_f)
         assert t.balance_at_entry == pytest.approx(10_000.0)
-        assert t.n == 2575
+        assert t.n == 2214
         # Sized on the LEG prices (pA + nB), never on (nA + pB)
-        assert t.total_cost == pytest.approx(2575 * (self._PA + self._NB))
-        assert t.total_cost == pytest.approx(1802.50)
+        assert t.total_cost == pytest.approx(2214 * (self._PA + self._NB))
+        assert t.total_cost == pytest.approx(1549.80)
         assert t.fees == pytest.approx(
-            fee_leg_exact(2575, self._PA) + fee_leg_exact(2575, self._NB))
-        assert t.fees == pytest.approx(81.12)
+            fee_leg_exact(2214, self._PA) + fee_leg_exact(2214, self._NB))
+        assert t.fees == pytest.approx(69.75)
         assert t.total_cost + t.fees <= 10_000.0 * t.kelly_fraction + 1e-9
-        assert t.expected_payoff == pytest.approx(691.38)
+        assert t.expected_payoff == pytest.approx(594.45)
 
     def test_event_by_earlier_deadline_wins(self, monkeypatch):
         # EA yes, EB yes: YES on EA pays n, NO on EB worthless
@@ -2888,10 +2895,10 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(trades) == 1
         t = trades[0]
         self._assert_entry_and_sizing(t)
-        assert t.actual_payoff == pytest.approx(2575.0)
-        assert t.profit == pytest.approx(691.38)
+        assert t.actual_payoff == pytest.approx(2214.0)
+        assert t.profit == pytest.approx(594.45)
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_594.45)
 
     def test_event_never_by_later_deadline_wins(self, monkeypatch):
         # EA no, EB no: NO on EB pays n, YES on EA worthless
@@ -2899,10 +2906,10 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(trades) == 1
         t = trades[0]
         self._assert_entry_and_sizing(t)
-        assert t.actual_payoff == pytest.approx(2575.0)
-        assert t.profit == pytest.approx(691.38)
+        assert t.actual_payoff == pytest.approx(2214.0)
+        assert t.profit == pytest.approx(594.45)
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_594.45)
 
     def test_event_in_between_loses_the_full_stake(self, monkeypatch):
         # EA no, EB yes: both legs worthless — the loss cell
@@ -2911,10 +2918,10 @@ class TestRunBacktestTimeSeriesFlow:
         t = trades[0]
         self._assert_entry_and_sizing(t)
         assert t.actual_payoff == pytest.approx(0.0)
-        assert t.profit == pytest.approx(-1883.62)
+        assert t.profit == pytest.approx(-1619.55)
         assert t.profit == pytest.approx(-(t.total_cost + t.fees))
-        assert t.slippage == pytest.approx(-1883.62 - 691.38)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1883.62)
+        assert t.slippage == pytest.approx(-1619.55 - 594.45)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1619.55)
 
     def test_premise_violation_is_excluded_and_warned(self, monkeypatch, caplog):
         # EA yes, EB no cannot happen for a cumulative-deadline pair: the
@@ -2941,15 +2948,18 @@ class TestRunBacktestTimeSeriesFlow:
                        for r in caplog.records)
 
     def test_wide_gap_is_capped_at_budget_fraction(self, monkeypatch):
-        # Later candle 0.70 / 0.30: gap 0.40, legs 0.60, p = 0.70 — the
-        # uncapped Kelly fraction is ~0.214, so BUDGET_FRACTION binds.
-        trades, _ = self._run(monkeypatch, "yes", "yes", eb_yes=0.70, eb_no=0.30)
+        # Later candle 0.85 / 0.15: gap 0.55, legs 0.45, p = 0.5875 — the
+        # uncapped Kelly fraction is ~0.216, so BUDGET_FRACTION binds. The gap
+        # had to widen from 0.40 to 0.55 when DR-62 put the fee into Kelly's
+        # denominator: at the old 0.70 / 0.30 candle f* is now 0.1905, just
+        # under the cap, so that fixture no longer exercises the cap at all.
+        trades, _ = self._run(monkeypatch, "yes", "yes", eb_yes=0.85, eb_no=0.15)
         assert len(trades) == 1
         t = trades[0]
         assert t.pair_type == "time_series"
-        assert t.entry_nB == pytest.approx(0.30)
-        uncapped = self._expected_kelly(self._PA, 0.30, 0.70)
-        assert uncapped == pytest.approx(0.214, abs=1e-3)
+        assert t.entry_nB == pytest.approx(0.15)
+        uncapped = self._expected_kelly(self._PA, 0.15, 0.85)
+        assert uncapped == pytest.approx(0.216, abs=1e-3)
         assert uncapped > BUDGET_FRACTION
         assert t.kelly_fraction == pytest.approx(BUDGET_FRACTION)
         assert t.total_cost + t.fees <= 10_000.0 * BUDGET_FRACTION + 1e-9

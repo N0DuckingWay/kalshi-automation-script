@@ -918,8 +918,8 @@ class TestRunDevLiveShapeReplay:
             for r in captured["results"] if r.status == "simulated"
         )
 
-        # Sized against the $1,000 sandbox balance at f* ~ 0.1884 the pair
-        # would buy 257 contracts; the 100-contract book depth caps it, so
+        # Sized against the $1,000 sandbox balance at f* ~ 0.1620 the pair
+        # would buy 231 contracts; the 100-contract book depth caps it, so
         # x == y == 100. total_cost = 100 x (0.30 + 0.40) = 70.00 and profit
         # if won = 100 x (1 - 0.70) - exact fees (1.47 + 1.68) = 26.85.
         ts_result = next(

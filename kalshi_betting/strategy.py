@@ -104,11 +104,16 @@ class TradeSpec:
             scenario (A=NO, B=YES) loses total_cost_with_fees in full. Always > 0
             for trades that reach execution; the field name is kept for the
             reporter/trader consumers.
-        profit_ratio (float): Return on cost in a win scenario, net of the
-            continuous fee approximation:
+        profit_ratio (float): Return on the CONTRACTS' cost in a win scenario,
+            net of the continuous fee approximation:
             ((1 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)) /
-            (price_a + price_b). This is "b" in the Kelly formula below (see
-            compute_trade()'s net_spread/profit_ratio computation).
+            (price_a + price_b). Reporting and ranking only — it feeds
+            monthly_profit_ratio, which select_portfolio sorts on, and the prod
+            log's Profit Ratio column. It is NOT "b" in the Kelly formula:
+            Kelly's b divides the same numerator by the dollars actually AT RISK
+            (price_a + price_b + fee_per_pair_approx(...)), because the losing
+            cell loses total_cost_with_fees in full. The two are deliberately
+            distinct quantities — see compute_trade().
         days_to_close (int): Calendar days until the later-closing market resolves. >= 1.
         monthly_profit_ratio (float): Profit ratio normalized to a 30-day period:
             profit_ratio * 30 / days_to_close. Used for portfolio ranking.
@@ -266,7 +271,9 @@ class _Sizing(NamedTuple):
         price_a (float): market_a's leg price at n, dollars in (0, 1).
         price_b (float): market_b's leg price at n, dollars in (0, 1).
         p (float): Probability of profit at that price.
-        profit_ratio (float): Kelly's "b" at that price.
+        profit_ratio (float): REPORTED return on the contracts' cost at that
+            price — net_spread / (price_a + price_b). Not Kelly's "b", whose
+            denominator also carries the fee; see _evaluate_size.
         kelly_fraction (float): Kelly fraction, capped at BUDGET_FRACTION.
         budget_dollars (float): Contract-only budget the fee shrink measures against.
     """
@@ -385,24 +392,46 @@ def _evaluate_size(
 
     # Subtract the continuous fee approximation from the gross spread to get the
     # net edge. A zero or negative net_spread means the trade costs more than it pays.
-    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+    fee_approx = fee_per_pair_approx(price_a, price_b)
+    net_spread = (1.0 - price_a - price_b) - fee_approx
     if net_spread <= 0:
         return None
 
-    # profit_ratio is the net return per dollar invested — this is "b" in the Kelly formula
+    # REPORTED return on the contracts' cost, net of the fee approximation. This
+    # is what feeds monthly_profit_ratio (select_portfolio's ranking key) and the
+    # prod log's Profit Ratio column. It is deliberately NOT Kelly's "b" — its
+    # denominator excludes the fee; see kelly_b below.
     profit_ratio = net_spread / (price_a + price_b)
 
     # Probability of profit at the price of THIS size — not at the pair's stored
     # pA, which is only one point on the book
     p = _kelly_p_at(pair, price_a)
     q = 1.0 - p
-    # b is the net payoff per dollar risked (same as profit_ratio)
-    b = profit_ratio
+    # Kelly's "b" is the win payoff per dollar AT RISK, and the dollars at risk
+    # include the fee: fees are cash out the door at execution, and the losing
+    # cell loses total_cost_with_fees in full (see TradeSpec.min_payoff). Using
+    # the fee-less cost as the denominator made f* > 0 whenever
+    # p*net_spread > q*(price_a + price_b), while true positive EV needs
+    # p*net_spread > q*(price_a + price_b + fee) — the gate overstated EV by
+    # exactly q*fee on every pair, which for a time-series bet (q = k*(pB - pA),
+    # routinely > 0.5) admitted marginal pairs with negative true EV (DR-62).
+    # A DIFFERENT quantity from profit_ratio above; do not collapse the two.
+    kelly_b = net_spread / (price_a + price_b + fee_approx)
 
-    # Kelly formula: f* = p - q/b. A negative result means negative expected value.
-    kelly_fraction = p - q / b
+    # Kelly formula: f* = p - q/b. With the fee-inclusive risk above, f* > 0 is
+    # exactly the condition p*net_spread > q*(cost + fee) — positive expected
+    # value under the CONTINUOUS fee approximation. It is not the whole
+    # guarantee: fee_per_pair_approx UNDERESTIMATES the ceiling-rounded
+    # fee_leg_exact that min_payoff and total_cost_with_fees are actually built
+    # from, so a spec sitting within roughly q*(exact - approx fee)/net_spread of
+    # the boundary can still be marginally EV-negative on its own exact-fee
+    # fields at single-digit n. That residual is the small-n rounding regime the
+    # min_payoff > 0 check below exists for; it bounds the residual without
+    # eliminating it.
+    kelly_fraction = p - q / kelly_b
     if kelly_fraction <= 0:
-        # Kelly says don't bet — expected value is negative despite the positive spread
+        # Kelly says don't bet — expected value is not positive once the fee is
+        # counted on both sides of the wager
         return None
 
     # Cap at BUDGET_FRACTION (20%) to avoid over-concentrating in a single pair
@@ -505,16 +534,40 @@ def compute_trade(pair: CandidatePair, balance_cents: int) -> TradeSpec | None:
     (pA, nB) for time_series.
 
     Kelly formula used:
-        b = net_spread / (price_a + price_b)   [net profit per dollar risked]
-        f* = p - (1-p)/b                        [optimal Kelly fraction]
+        fee = fee_per_pair_approx(price_a, price_b)
+        net_spread = (1 − price_a − price_b) − fee   [win payoff per contract pair]
+        b = net_spread / (price_a + price_b + fee)   [payoff per dollar AT RISK]
+        f* = p - (1-p)/b                             [optimal Kelly fraction]
         f_capped = min(BUDGET_FRACTION, f*)
 
-    Where net_spread = (1 − price_a − price_b) − fee_per_pair_approx(price_a, price_b)
-    and p comes from _kelly_p (the co-resolution prior for same_title; the
+    The fee sits in the DENOMINATOR as well as the numerator, and that is the
+    whole point: fees are cash out the door at execution, so a losing pair loses
+    total_cost_with_fees, not price_a + price_b. With the fee-less denominator
+    the gate passed whenever p*net_spread > q*(price_a + price_b) while true
+    positive EV needs p*net_spread > q*(price_a + price_b + fee), overstating EV
+    by exactly q*fee on every pair (DR-62). f* > 0 now means positive expected
+    value under the CONTINUOUS fee approximation. It does NOT mean positive EV
+    on the spec's own exact-fee fields: fee_per_pair_approx underestimates the
+    ceiling-rounded fee_leg_exact that min_payoff and total_cost_with_fees carry,
+    so a spec within roughly q*(exact - approx fee)/net_spread of the boundary
+    can still be marginally EV-negative at single-digit n (measured: at a
+    $10,000 balance, pA=0.12 / pB=0.33 / nB=0.70 accepts at n=30 with
+    p*min_payoff - q*total_cost_with_fees = -$0.005). The min_payoff > 0 check
+    below bounds that small-n residual; it does not eliminate it. Note also that
+    b is NOT the reported TradeSpec.profit_ratio, which keeps the fee-less
+    denominator as a return-on-contract-cost figure.
+
+    p comes from _kelly_p (the co-resolution prior for same_title; the
     discounted in-between model for time_series). For a time-series pair the
     result is a directional bet: f* is only positive when the modelled loss
     probability k * (pB - pA) is small enough relative to b, and a wide book
     (large price_a + price_b for the same YES-ask gap) drives it negative.
+    Same-title pairs are barely moved by the fee-inclusive denominator (q is the
+    fixed 1 − SAME_TITLE_CO_RESOLVE_PROB = 0.05, so q*fee is small — though not
+    zero: on a whole-cent grid over the same-title admissible region 12 of 4,465
+    price points, 0.27%, change verdict, always accept -> reject); the
+    time-series bet is moved far more, since q = k*(pB − pA) routinely exceeds
+    0.5 on exactly the wide-gap pairs the strategy targets.
 
     Args:
         pair (CandidatePair): The candidate pair. Must have tradeable=True.

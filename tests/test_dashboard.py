@@ -119,21 +119,25 @@ class TestKellyFraction:
     prices time-series pairs through config.time_series_profit_prob."""
 
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1884
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620.
+        # b's denominator carries the fee — the dollars at risk include it,
+        # because a losing pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
-        net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-        b = net_spread / (pA + nB)
+        fee = fee_per_pair_approx(pA, nB)
+        net_spread = (1.0 - pA - nB) - fee
+        b = net_spread / (pA + nB + fee)
         p = time_series_profit_prob(pA, pB)
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(p - (1 - p) / b)
-        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1884, abs=1e-4)
+        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1620, abs=1e-4)
 
     def test_time_series_wide_book_clamps_to_zero(self):
         assert _kelly_fraction(0.30, 0.70, 0.60, 0.50, "time_series") == 0.0
 
     def test_same_title_prices_nA_pB_on_the_prior(self):
         nA, pB = 0.20, 0.30
-        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
-        b = net_spread / (nA + pB)
+        fee = fee_per_pair_approx(nA, pB)
+        net_spread = (1.0 - nA - pB) - fee
+        b = net_spread / (nA + pB + fee)
         p = SAME_TITLE_CO_RESOLVE_PROB
         assert _kelly_fraction(0.70, nA, pB, 0.65, "same_title") == pytest.approx(p - (1 - p) / b)
 
@@ -174,10 +178,10 @@ class TestKellyFractionIntervalDiscount:
 
     def test_explicit_k_wins_over_a_monkeypatched_constant(self, monkeypatch):
         # The constant is set to the never-trade value; the explicit k must
-        # still produce the configured-k fixture's ~0.1884 fraction.
+        # still produce the configured-k fixture's ~0.1620 fraction.
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
-                               "time_series", k=0.75) == pytest.approx(0.1884, abs=1e-4)
+                               "time_series", k=0.75) == pytest.approx(0.1620, abs=1e-4)
         # ...and with no override the patched constant governs, proving the
         # sentinel is resolved at call time rather than bound at def time.
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,

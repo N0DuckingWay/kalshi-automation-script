@@ -249,7 +249,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
     Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
     shows the same theoretical Kelly the live sizer would compute (before the
-    BUDGET_FRACTION cap). The legs are mapped exactly like scanner.leg_prices:
+    BUDGET_FRACTION cap) — including the fee-inclusive Kelly denominator
+    b = net_spread / (price_a + price_b + fee), since the losing cell loses the
+    fee too (DR-62). The legs are mapped exactly like scanner.leg_prices:
     a same_title pair costs nA + pB (NO on A, YES on B) and is priced on the
     SAME_TITLE_CO_RESOLVE_PROB prior; a time_series pair costs pA + nB (YES on
     the earlier contract A, NO on the later contract B) and is priced on
@@ -291,10 +293,16 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
         price_a, price_b = nA, pB
         p = SAME_TITLE_CO_RESOLVE_PROB
     cost = price_a + price_b
-    net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+    fee_approx = fee_per_pair_approx(price_a, price_b)
+    net_spread = (1.0 - price_a - price_b) - fee_approx
     if cost <= 0 or net_spread <= 0:
         return 0.0
-    b = net_spread / cost
+    # Kelly's "b" divides by the dollars AT RISK, which include the fee — a
+    # losing pair loses cost + fees (DR-62). Mirrors strategy._evaluate_size's
+    # kelly_b and backtester._simulate_at_discount's kelly_b_entry; if this kept
+    # the fee-less denominator the Risk section would plot a model the live
+    # sizer no longer uses.
+    b = net_spread / (cost + fee_approx)
     q = 1.0 - p
     return max(0.0, p - q / b)
 

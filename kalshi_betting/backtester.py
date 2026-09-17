@@ -1767,8 +1767,19 @@ def _simulate_at_discount(
 
         # ── Kelly fraction (sizing happens in Pass 2 against the checkpoint) ──
         # Compute the net spread on the leg prices after the continuous fee approximation
-        net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+        fee_approx = fee_per_pair_approx(price_a, price_b)
+        net_spread = (1.0 - price_a - price_b) - fee_approx
+        # REPORTED/RANKED return on the contracts' cost (feeds
+        # entry_monthly_ratio, Pass 2's look-ahead-free sort key) — the mirror
+        # of strategy.TradeSpec.profit_ratio, fee-less denominator and all.
         profit_ratio_entry = net_spread / (price_a + price_b) if net_spread > 0 else 0.0
+        # Kelly's "b": the SAME numerator over the dollars actually at risk,
+        # which include the fee — a losing pair loses cost + fees, not cost
+        # (DR-62). A DIFFERENT quantity from profit_ratio_entry above; mirrors
+        # strategy._evaluate_size's kelly_b exactly, so live and backtest admit
+        # the same pairs. Do not collapse the two back together.
+        kelly_b_entry = (net_spread / (price_a + price_b + fee_approx)
+                         if net_spread > 0 else 0.0)
 
         # Probability model. time_series: the discounted market-implied
         # in-between mass, 1 - k * (pB - pA), from config.time_series_profit_prob
@@ -1783,8 +1794,9 @@ def _simulate_at_discount(
              if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
         q = 1.0 - p
 
-        # Kelly formula: f* = p - q/b; negative means no edge
-        kelly_f = (p - q / profit_ratio_entry) if profit_ratio_entry > 0 else -1.0
+        # Kelly formula: f* = p - q/b; non-positive means no positive expected
+        # value once the fee is counted on the losing side too (DR-62)
+        kelly_f = (p - q / kelly_b_entry) if kelly_b_entry > 0 else -1.0
         if kelly_f <= 0:
             # Kelly fraction is non-positive — the pair has no positive expected value
             continue
