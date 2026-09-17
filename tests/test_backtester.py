@@ -2169,17 +2169,26 @@ class TestEquityCurveFutureStartDate:
 
 
 class TestEquityCurveOpensAtTheInitialBalance:
-    """A trade entering on start_date itself must show its outflow as a real
-    daily return and a real drawdown (DR-03).
+    """A trade entering on start_date itself must show its day-0 charges as a
+    real daily return and a real drawdown (DR-03).
 
     The default backtest window starts on a Monday (--start-date 2024-01-01),
     which is exactly the kind of day _find_entry can open a trade on, and the
-    curve used to apply that day's outflow to its FIRST row. pct_change and
-    cummax both read the first row as the baseline, so the entire day-0 stake
-    was invisible: on this fixture the dashboard reported max drawdown 0.0% on a
-    run that lost 99.98% of its balance on day one, and the per-k sweep table
-    divided by the depleted opening (+133,804.3%) while the performance card
+    curve used to apply that day's charges to its FIRST row. pct_change and
+    cummax both read the first row as the baseline, so day 0 was invisible to
+    both: on this fixture the dashboard reported max drawdown 0.0% on a run that
+    ended day one holding $1.84 of CASH out of its $10,000, and the per-k sweep
+    table divided by the depleted opening (+133,804.3%) while the performance card
     divided by initial_balance (-75.4%) — one run reported two ways on one page.
+
+    DR-61 changed WHAT day 0 costs without touching that guarantee. The curve is
+    now a portfolio value rather than a cash balance (open positions are carried
+    at cost), so this fixture's day-0 step is its $476.56 of taker fees rather
+    than the whole $9,998.16 stake, and the stake's actual LOSS lands on the
+    exit date where it is realized. The leading row is still what keeps the
+    cummax peak at $10,000 instead of at the already-charged $9,523.44, and
+    still what makes the two report bases agree — so this class keeps pinning
+    the leading row, at the figures the current accounting produces.
 
     The fixture reproduces the 2026-09-15 dry-run sweep's shape: $10,000 in,
     everything committed on start_date ($9,998.16 all-in across both legs of two
@@ -2208,8 +2217,11 @@ class TestEquityCurveOpensAtTheInitialBalance:
 
         The loss cell (outcome_b="yes") pays nothing; the never-by-B win cell
         (outcome_b="no") pays n, the count of NO contracts held on market B.
-        Fees are the real two-leg taker fees at these prices, so the outflow the
-        equity curve subtracts is the one the backtester would have recorded.
+        Fees are the real two-leg taker fees at these prices, so the two steps
+        the equity curve takes — the entry-day fees and the exit-day realized
+        P&L — are the ones the backtester would have recorded. (Under DR-61 the
+        curve no longer subtracts the whole outflow on the entry date: the
+        contracts bought with it are carried at cost until settlement.)
         """
         cost = n * (pA + nB)
         fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
@@ -2272,24 +2284,71 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
         assert eq["daily_return"].iloc[0] == pytest.approx(0.0)
 
-    def test_day_zero_outflow_is_a_real_daily_return(self):
+    def test_day_zero_charge_is_a_real_daily_return(self):
+        """Re-pinned for DR-61 (was: "outflow", -99.98% on day 0).
+
+        Row 1 is start_date. Both pairs commit $9,998.16 that day, but $9,521.60
+        of it buys contracts that are still held, so the only value that LEAVES
+        the portfolio is the $476.56 of taker fees. That step is still a real,
+        visible negative return — it just measures a real cost instead of
+        measuring deployment.
+        """
+        fees = sum(t.fees for t in self._trades())
+        assert fees == pytest.approx(476.56)
+
         eq = self._curve()
 
-        # Row 1 is start_date: the whole stake left the portfolio that day.
         assert eq["date"].iloc[1] == self._START
-        assert eq["portfolio_value"].iloc[1] == pytest.approx(1.84)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(
+            self._INITIAL - fees)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(9523.44)
         assert eq["daily_return"].iloc[1] < 0
-        assert eq["daily_return"].iloc[1] == pytest.approx(-0.999816, abs=1e-6)
+        assert eq["daily_return"].iloc[1] == pytest.approx(-0.047656, abs=1e-6)
 
-    def test_max_drawdown_sees_the_day_zero_trough(self):
+    def test_max_drawdown_sees_the_realized_loss(self):
+        """Re-pinned for DR-61 (was: a -99.98% trough on start_date).
+
+        The trough is now the EXIT date, where the losing pair's stake is
+        actually written off, and its magnitude is the run's realized loss —
+        which for a monotonically declining run equals the total return. The old
+        -99.98% trough on start_date was the deployment artefact DR-61 removed.
+        """
         from kalshi_betting.dashboard import _max_drawdown
 
         eq = self._curve()
         max_dd, trough = _max_drawdown(
             eq["portfolio_value"].set_axis(eq["date"]))
 
-        assert max_dd == pytest.approx(-0.9998, abs=1e-4)
-        assert trough == self._START
+        assert trough == self._EXIT
+        assert max_dd == pytest.approx(-0.753616, abs=1e-6)
+        # Nothing ever rose above the opening, so the deepest drawdown and the
+        # total return are the same number — a coherence the cash-only curve
+        # could not produce (-99.98% drawdown against a -75.4% return).
+        final = float(eq["portfolio_value"].iloc[-1])
+        assert max_dd == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-9)
+
+    def test_the_leading_row_is_what_keeps_the_day_zero_fee_in_the_drawdown(self):
+        """DR-03's mechanism, re-pinned under DR-61's accounting.
+
+        Day 0 is a decline (the fees), so without the leading row the cummax
+        peak would be the already-charged $9,523.44 and the reported drawdown
+        would be shallower by exactly that fee. Dropping the leading row from
+        the same curve reproduces the understatement, which is what makes the
+        leading row measurable rather than merely asserted.
+        """
+        from kalshi_betting.dashboard import _max_drawdown
+
+        eq = self._curve()
+        with_leading, _ = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+        without_leading, _ = _max_drawdown(
+            eq["portfolio_value"].iloc[1:].set_axis(eq["date"].iloc[1:]))
+
+        assert with_leading < without_leading
+        assert with_leading == pytest.approx(-0.753616, abs=1e-6)
+        # Same trough, shallower peak: 2463.84 / 9523.44 - 1.
+        assert without_leading == pytest.approx(-0.741287, abs=1e-6)
 
     def test_sweep_row_and_performance_card_report_one_return(self):
         # _srow (inside _section_interval_discount) divides by the curve's
@@ -2317,6 +2376,200 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert "-75.4%" in dashboard._section_interval_discount(sweep)
         assert "-75.4%" in dashboard._section_performance(
             eq, trades, self._START, self._INITIAL)
+
+
+class TestEquityCurveCarriesOpenPositionsAtCost:
+    """The equity curve must not report capital DEPLOYMENT as loss (DR-61).
+
+    _build_equity_curve used to accumulate cash alone, so an open position was
+    carried at ZERO for its whole holding period and the curve dived on the
+    entry date and recovered on the exit date whether the trade won or lost.
+    Every risk figure on the dashboard reads that series — the "Max Drawdown"
+    KPI, the "Drawdown (%)" chart, _sharpe/_sortino via the derived
+    "daily_return" column, the per-k sweep table's drawdown and Sharpe columns,
+    and the benchmark row that sits in the same column as ^GSPC's genuine
+    mark-to-market drawdown — so all of them measured peak deployment.
+
+    The real 2026-05-01 run is the proof: its k=1.00 point had THREE trades, all
+    three profitable and a +4.8% return, and the rendered table reported a max
+    drawdown of -60.0%; its k=0.40 point reported -100.0% (total ruin) against a
+    final balance of $4,655.87. This fixture reproduces that shape — three
+    winning time-series pairs all entering on one Monday, committing $6,227.91
+    of $10,000, which the cash-only curve read as a -62.3% drawdown.
+
+    An open position is now carried at its COST BASIS, so the only moves left
+    are the entry-day fees and the realized P&L at settlement.
+    """
+
+    _START = date(2026, 5, 25)     # a Monday, comfortably in the past
+    _INITIAL = 10_000.0
+    # (n, pA, nB, exit_date) — the never-by-B win cell (A=NO, B=NO) pays n on
+    # the NO leg held against market B, so every one of these is profitable.
+    _WINNERS = [
+        (4800, 0.15, 0.40, date(2026, 6, 15)),
+        (3600, 0.20, 0.35, date(2026, 6, 29)),
+        (2400, 0.25, 0.30, date(2026, 7, 13)),
+    ]
+
+    def _trade(self, n: int, pA: float, nB: float, exit_date: date,
+               outcome_b: str, payoff: float) -> backtester.BacktestTrade:
+        """One coherent time-series BacktestTrade entering on _START.
+
+        outcome_b="no" is the never-by-B win cell and pays n; outcome_b="yes"
+        is the in-between cell, where both legs expire worthless. Fees are the
+        real two-leg taker fees at these prices.
+        """
+        cost = n * (pA + nB)
+        fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
+        profit = payoff - cost - fees
+        holding_days = (exit_date - self._START).days
+        return backtester.BacktestTrade(
+            pair_type="time_series",
+            ticker_a="TICK-A", ticker_b="TICK-B",
+            title_a="Will BTC exceed $80k by June?",
+            title_b="Will BTC exceed $80k by July?",
+            category="Crypto",
+            entry_date=self._START, exit_date=exit_date,
+            entry_pA=pA, entry_pB=0.60, entry_nA=1.0 - pA, entry_nB=nB,
+            n=n,
+            total_cost=cost, fees=fees,
+            outcome_a="no", outcome_b=outcome_b,
+            actual_payoff=payoff,
+            profit=profit,
+            profit_ratio=profit / (cost + fees),
+            monthly_profit_ratio=profit / (cost + fees) * 30 / holding_days,
+            kelly_fraction=0.2,
+            expected_payoff=n * (1.0 - pA - nB) - fees,
+            slippage=profit - (n * (1.0 - pA - nB) - fees),
+            holding_days=holding_days,
+            balance_at_entry=self._INITIAL,
+            deadline_gap_days=7,
+        )
+
+    def _all_winners(self) -> list[backtester.BacktestTrade]:
+        return [self._trade(n, pA, nB, exit_date, outcome_b="no",
+                            payoff=float(n))
+                for n, pA, nB, exit_date in self._WINNERS]
+
+    @staticmethod
+    def _cash_only_final(trades, initial: float) -> float:
+        """The pre-DR-61 curve's closing value, computed the old way.
+
+        Cash-only accounting and cost-basis carry differ only in the PATH
+        between entry and settlement, so this is what lets the tests below
+        assert the endpoint is untouched without needing the old code.
+        """
+        return initial + sum(t.actual_payoff - t.total_cost - t.fees
+                             for t in trades)
+
+    def test_the_fixture_is_the_real_runs_shape(self):
+        # Guards every number the tests below read: three trades, all
+        # profitable, all entering on one day, committing 62.3% of the balance.
+        trades = self._all_winners()
+        assert len(trades) == 3
+        assert all(t.profit > 0 for t in trades)
+        assert all(t.entry_date == self._START for t in trades)
+        assert sum(t.total_cost + t.fees for t in trades) == pytest.approx(6227.91)
+        # ...and each payoff is the cell _settlement_receipt would have paid,
+        # so "all profitable" is checked rather than asserted.
+        for t in trades:
+            assert t.actual_payoff == backtester._settlement_receipt(
+                t.n, t.outcome_a, t.outcome_b, t.pair_type)
+
+    def test_an_all_profitable_run_has_no_deployment_drawdown(self):
+        """THE headline pin. Fails on the cash-only curve, which reports
+        -62.3% here (the real run reported -60.0% on the same shape)."""
+        from kalshi_betting.dashboard import _max_drawdown
+
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        fees = sum(t.fees for t in trades)
+        # The only realized cost a winning run can carry is its taker fees, so
+        # the deepest drawdown is exactly those, on the day they were charged.
+        assert max_dd == pytest.approx(-fees / self._INITIAL, abs=1e-12)
+        assert max_dd == pytest.approx(-0.028791, abs=1e-6)
+        assert trough == self._START
+        # Nowhere near the deployment artefact this replaced.
+        assert max_dd > -0.05
+
+    def test_the_curve_is_flat_while_the_positions_are_open(self):
+        """Shape documentation, NOT a DR-61 discriminator — it passes on the
+        cash-only builder too (measured in the negative control), since cash is
+        also flat between the entry day and the first settlement, just at a
+        lower level, and a run of winners is monotone under both accountings.
+        The discriminating pins are the drawdown and entry-step tests below.
+        """
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        by_date = dict(zip(eq["date"], eq["portfolio_value"], strict=True))
+
+        entry_value = by_date[self._START]
+        # Every day between the entry and the first settlement holds three open
+        # positions at cost and sees no cash move at all.
+        for offset in range(1, (date(2026, 6, 15) - self._START).days):
+            assert by_date[self._START + timedelta(days=offset)] == pytest.approx(
+                entry_value)
+
+        # After day 0 a run of winners can only climb: each settlement returns
+        # more than the position it writes off.
+        post = eq["portfolio_value"].iloc[1:].tolist()
+        assert all(b >= a - 1e-9 for a, b in zip(post, post[1:], strict=False))
+
+    def test_the_entry_day_step_is_the_fees_and_nothing_else(self):
+        """Fees are NOT capitalised into the carrying value: they buy nothing
+        that can be sold on, so they hit the day they are charged."""
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+
+        fees = sum(t.fees for t in trades)
+        assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(
+            self._INITIAL - fees)
+
+    def test_a_losing_trade_still_produces_a_real_drawdown(self):
+        """The fix must not flatten genuine losses — only deployment."""
+        from kalshi_betting.dashboard import _max_drawdown
+
+        exit_date = date(2026, 6, 15)
+        loser = self._trade(4800, 0.15, 0.40, exit_date,
+                            outcome_b="yes", payoff=0.0)
+        assert loser.profit < 0
+
+        eq = backtester._build_equity_curve([loser], self._START, self._INITIAL)
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        # The whole stake is written off on the settlement date, not on entry.
+        assert trough == exit_date
+        final = self._INITIAL + loser.profit
+        assert eq["portfolio_value"].iloc[-1] == pytest.approx(final)
+        assert max_dd == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-12)
+        assert max_dd == pytest.approx(-0.276348, abs=1e-6)
+
+    def test_total_return_and_final_balance_are_unchanged(self):
+        """Only the PATH moves: the endpoint must match the cash-only curve's
+        to the last cent, on a MIXED fixture (two winners and a loser)."""
+        winners = self._all_winners()[:2]
+        loser = self._trade(2400, 0.25, 0.30, date(2026, 7, 13),
+                            outcome_b="yes", payoff=0.0)
+        trades = [*winners, loser]
+
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        final = float(eq["portfolio_value"].iloc[-1])
+
+        assert final == pytest.approx(
+            self._cash_only_final(trades, self._INITIAL), abs=1e-9)
+        # ...and therefore so does the total return both report bases divide out
+        # (the leading row is the untouched initial balance — DR-03).
+        opening = float(eq["portfolio_value"].iloc[0])
+        assert opening == pytest.approx(self._INITIAL)
+        assert (final - opening) / opening == pytest.approx(
+            (self._cash_only_final(trades, self._INITIAL) - self._INITIAL)
+            / self._INITIAL, abs=1e-12)
 
 
 class TestDropCrossTypeDuplicates:

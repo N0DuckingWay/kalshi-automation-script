@@ -12,6 +12,7 @@ so these tests stay fully offline. Both sites are Kalshi-controlled
 interval-discount section is tested the same way: _section_interval_discount()
 is driven from a hand-built BacktestSweep, never through generate_dashboard().
 """
+import dataclasses
 import math
 import re
 from datetime import date, timedelta
@@ -19,7 +20,7 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from kalshi_betting import config, dashboard
+from kalshi_betting import backtester, config, dashboard
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -629,3 +630,65 @@ class TestCalendarAnnualizationAtTheUnpinnedCallSites:
         # series, exactly like the performance card's.
         assert "updatemenus" in out
         assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR] * len(points)
+
+
+class TestDeploymentIsNotRenderedAsDrawdown:
+    """DR-61, at the render sites: the "Max Drawdown" KPI and the per-k sweep
+    table must report realized loss, not capital deployment.
+
+    backtester._build_equity_curve used to accumulate cash alone, so an open
+    position was carried at ZERO and the curve dived on entry and recovered at
+    settlement whatever the outcome. A real 2026-05-01 run rendered "Max
+    Drawdown -60.0%" for a k=1.00 point with three trades, all three
+    profitable and a +4.8% return.
+
+    This fixture is that shape in miniature: two winning time-series pairs on
+    $10, committing $7.34 of it on day one. Cash-only accounting renders
+    -73.4%; cost-basis carry renders the $0.34 of taker fees, -3.4%. The curve
+    is built by the REAL builder rather than make_equity(), because what is
+    under test is what that builder puts in the column.
+    """
+
+    _START = date(2026, 1, 5)
+    _INITIAL = 10.0
+
+    def _trades(self) -> list[BacktestTrade]:
+        first = make_trade()                       # entered 01-05, exits 01-12
+        second = dataclasses.replace(first, exit_date=date(2026, 1, 19),
+                                     holding_days=14)
+        return [first, second]
+
+    def _equity(self) -> pd.DataFrame:
+        return backtester._build_equity_curve(
+            self._trades(), self._START, self._INITIAL)
+
+    def test_the_fixture_is_all_winners_and_mostly_deployed(self):
+        trades = self._trades()
+        assert all(t.profit > 0 for t in trades)
+        assert all(t.entry_date == self._START for t in trades)
+        assert sum(t.total_cost + t.fees for t in trades) == pytest.approx(7.34)
+        assert sum(t.fees for t in trades) == pytest.approx(0.34)
+
+    def test_performance_card_renders_the_fees_not_the_deployment(self):
+        out = dashboard._section_performance(
+            self._equity(), self._trades(), self._START, self._INITIAL)
+
+        assert "Max Drawdown" in out
+        # The fees, on the day they were charged — not the -73.4% the
+        # deployment used to read as.
+        assert "-3.4% (2026-01-05)" in out
+        assert "-73.4%" not in out
+        # The endpoint is untouched by DR-61, so the headline return is the
+        # same number cash-only accounting produced.
+        assert "+26.6%" in out
+
+    def test_per_k_sweep_row_renders_the_same_drawdown(self):
+        point = SweepPoint(k=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+                           trades=self._trades(), equity_df=self._equity())
+        out = _section_interval_discount(
+            BacktestSweep(primary=point, points=[point], calibration=None))
+
+        assert "-3.4%" in out
+        assert "-73.4%" not in out
+        # Same base as the performance card's (DR-03's leading row).
+        assert "+26.6%" in out

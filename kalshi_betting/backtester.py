@@ -317,7 +317,9 @@ class SweepPoint:
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return], opening one row before the
             run's start_date at the initial balance and flat at it when trades
-            is empty.
+            is empty. portfolio_value is cash plus open positions carried at
+            cost, so it moves only on realized costs and P&L, never on
+            deployment (see _build_equity_curve).
     """
     k: float
     trades: list[BacktestTrade]
@@ -2380,7 +2382,9 @@ def run_backtest(
             (empty if none were ever entered). equity_df has columns
             [date, portfolio_value, daily_return], one row per day from
             start_date - 1 day (the untouched initial balance) through today,
-            flat at initial_balance if trades is empty.
+            flat at initial_balance if trades is empty. portfolio_value is cash
+            plus open positions carried at cost, so deploying capital does not
+            move it (see _build_equity_curve).
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2579,22 +2583,63 @@ def _build_equity_curve(
     """
     Construct a daily equity curve DataFrame from the list of backtest trades.
 
-    For each trade, subtracts the full cash outlay (total_cost + fees, both paid
-    at execution) from cash on the entry_date and adds the gross settlement
-    receipt (actual_payoff) on the exit_date. This models a simple accounting
-    treatment where capital is deployed on entry and returned at settlement,
-    with each dollar counted exactly once.
+    "portfolio_value" is a PORTFOLIO VALUE, not a cash balance: it is cash plus
+    the carrying value of every position still open on that date, where an open
+    position is carried at its COST BASIS (total_cost) for its whole holding
+    period. So committing capital does not move the curve, and the only two
+    moves a trade can make are real economic ones:
+      * entry_date: -fees. Cash falls by total_cost + fees while the contracts
+        bought with it enter the portfolio at total_cost, so the net step is the
+        taker fee alone. Fees are deliberately NOT capitalised into the carrying
+        value — they buy nothing that can be sold on, they are realized the
+        moment the order fills, and capitalising them would make the trade look
+        free on the day it was actually charged.
+      * exit_date: +(actual_payoff - total_cost). The position is written off at
+        cost and the gross settlement receipt credited, so the step is exactly
+        the realized P&L before fees. Summed over both dates a trade moves the
+        curve by actual_payoff - total_cost - fees, i.e. its own `profit`.
+
+    Carrying at cost rather than marking to market daily is a deliberate choice
+    (DR-61), and NOT because the prices are missing. A true daily mark-to-market
+    off each leg's candles would need a per-day quote for every open position on
+    every calendar day of the window, and those quotes are already fetched:
+    _fetch_candles_parallel requests each leg's WHOLE hourly series (start_date
+    midnight UTC through one day past that market's close) and disk-caches it
+    per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
+    entry-checkpoint prices only, so candles_by_ticker is a local that dies with
+    _prepare_entries, and mark-to-market means threading a per-day series
+    through raw_entries and _simulate_at_discount into this function and
+    deciding what to carry on a day a leg has no candle at all. Cost-basis carry
+    is the minimal change that makes the derived metrics mean what their labels
+    say; do not price the rejected alternative as a new multi-hour fetch. The
+    cost of the choice is that an unrealized swing inside the holding period is
+    invisible, so drawdown here is REALIZED drawdown and is a lower bound on the
+    intraperiod one.
+
+    This matters because the curve is the sole input to every risk figure on the
+    dashboard: the "Max Drawdown" KPI, the "Drawdown (%)" chart, _sharpe and
+    _sortino (which read the derived "daily_return" column), the per-k sweep
+    table's drawdown and Sharpe columns, and the benchmark row that sits in the
+    same column as ^GSPC's genuine mark-to-market drawdown. While the curve was
+    cash-only an open position was carried at ZERO, so every one of those read
+    capital DEPLOYMENT as loss: a real 2026-05-01 run with three trades, all
+    three profitable and a +4.8% return, reported a max drawdown of -60.0%, and
+    a k=0.40 point reported -100.0% (total ruin) against a final balance of
+    $4,655.87. Do not reintroduce cash-only accounting here.
 
     The curve opens one day before start_date at the untouched initial balance,
-    so a trade entering on start_date itself shows its outflow as a real
+    so a trade entering on start_date itself shows its day-0 cost as a real
     pct_change and a real decline from the cummax peak. Without that leading row
-    the day-0 stake was invisible to both (DR-03), and the per-k sweep table's
+    the day-0 step was invisible to both (DR-03), and the per-k sweep table's
     iloc[0] base was the post-outflow balance while the performance card's base
-    was initial_balance — one run reported two ways on one page.
+    was initial_balance — one run reported two ways on one page. That guarantee
+    is independent of what the day-0 step contains: under DR-61 it is the fees
+    rather than the whole stake, and it is still the leading row that keeps the
+    cummax peak at initial_balance instead of at the already-charged value.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
-            exit_date, total_cost, and actual_payoff populated.
+            exit_date, total_cost, fees and actual_payoff populated.
         start_date (date): The first TRADING date of the window; the curve opens
             one row earlier, on start_date - 1 day, at the untouched initial
             balance.
@@ -2606,7 +2651,8 @@ def _build_equity_curve(
             start_date to today (UTC) — and, when start_date is itself in the
             future, exactly those two rows — with columns:
             - "date" (date): Calendar date.
-            - "portfolio_value" (float): Cumulative portfolio value in dollars.
+            - "portfolio_value" (float): Cash plus open positions at cost, in
+              dollars (see above).
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
             Never zero rows: a column-less DataFrame would violate this contract
             and crash the "daily_return" assignment below, as well as every
@@ -2626,33 +2672,47 @@ def _build_equity_curve(
     span_days = max((today - start_date).days + 1, 1)
     # The curve opens one day BEFORE start_date at the untouched initial
     # balance. start_date itself can carry a Monday-09:00 entry (the default
-    # 2024-01-01 is a Monday), and applying that day's outflow to the FIRST
-    # row hid the entire day-0 stake from pct_change and cummax: max drawdown
-    # 0.0% and Sortino 0.00 on a run that lost 99.98% on day one, and the
-    # per-k table's "opening" was the post-outflow balance (DR-03). No trade
-    # can enter before start_date, so the leading row is always flat.
+    # 2024-01-01 is a Monday), and applying that day's charges to the FIRST
+    # row hides them from pct_change and cummax entirely: the pre-DR-03 curve
+    # reported max drawdown 0.0% and Sortino 0.00 on a run that ended the day
+    # with $1.84 of CASH out of its $10,000, and the per-k table's "opening"
+    # was the already-charged balance. No trade can enter before start_date, so the
+    # leading row is always flat.
     dates = [start_date - timedelta(days=1)] + [
         start_date + timedelta(days=i) for i in range(span_days)
     ]
 
-    # Accumulate cash inflows and outflows per date
+    # Two accumulators, because a portfolio is cash PLUS whatever is still
+    # open. Tracking cash alone carried every open position at zero, which made
+    # the curve dive on entry and recover at settlement whether the trade won
+    # or lost — deployment reported as drawdown (DR-61, see the docstring).
     cash_changes: dict[date, float] = defaultdict(float)
+    position_changes: dict[date, float] = defaultdict(float)
     for t in trades:
-        # Capital leaves the portfolio on entry day (contract cost + taker fees)
+        # Cash leaves the portfolio on entry day (contract cost + taker fees)
         cash_changes[t.entry_date] -= t.total_cost + t.fees
-        # Gross settlement receipt returns to the portfolio on exit day
-        cash_changes[t.exit_date]  += t.actual_payoff
+        # ...but the contracts it bought are an ASSET held until settlement, so
+        # they re-enter the portfolio at cost and only the fees are a realized
+        # day-one charge. Fees are deliberately not capitalised: they are gone
+        # the moment the order fills and nothing can be sold on for them.
+        position_changes[t.entry_date] += t.total_cost
+        # At settlement the position is written off at cost and the gross
+        # receipt credited, so the step is exactly the realized pre-fee P&L.
+        cash_changes[t.exit_date]      += t.actual_payoff
+        position_changes[t.exit_date]  -= t.total_cost
 
     rows = []
     cash = initial_balance
+    open_positions = 0.0
     for d in dates:
-        # Apply any net cash change for this day (may be zero if no trades entered/exited)
-        cash += cash_changes.get(d, 0.0)
-        rows.append({"date": d, "portfolio_value": cash})
+        # Apply any net change for this day (may be zero if nothing entered/exited)
+        cash           += cash_changes.get(d, 0.0)
+        open_positions += position_changes.get(d, 0.0)
+        rows.append({"date": d, "portfolio_value": cash + open_positions})
 
     df = pd.DataFrame(rows)
     # Compute fractional daily returns; the leading initial-balance row has no
     # prior day so it gets 0.0, and start_date's own row is the first one that
-    # can show a day-0 outflow as a real return.
+    # can show a day-0 charge as a real return.
     df["daily_return"] = df["portfolio_value"].pct_change().fillna(0.0)
     return df
