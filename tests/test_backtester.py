@@ -200,11 +200,21 @@ class TestTimeSeriesOutcomeDiscriminator:
     _STRIKES = ("$180 or above", "$190 or above", "$200 or above", "$210 or above")
     _EVENTS = (("KXSOLD-26SEP14", "14", "2026-09-14"), ("KXSOLD-26SEP18", "18", "2026-09-18"))
 
-    def _family(self, *, strike_in_subtitle: bool = True) -> list[dict]:
+    def _family(self, *, strike_in_subtitle: bool = True,
+                snapshot_wording: bool = False) -> list[dict]:
+        """Two deadline events of one daily family, four strikes each.
+
+        The titles are CUMULATIVE ("price by <date>"), mirroring the live
+        fixture: DR-01 is about the outcome label in the grouping key and must
+        keep being tested on a family the deadline rule admits.
+        `snapshot_wording=True` returns the original "price ON <date>" shape —
+        a real KXSOLD family — which that rule now refuses outright.
+        """
+        preposition = "on" if snapshot_wording else "by"
         markets = []
         for i, strike in enumerate(self._STRIKES):
             for event_ticker, day, close_day in self._EVENTS:
-                title = f"Solana price on Sep {day}, 2026?"
+                title = f"Solana price {preposition} Sep {day}, 2026?"
                 markets.append({
                     "ticker": f"{event_ticker}-T{i}",
                     "event_ticker": event_ticker,
@@ -214,6 +224,15 @@ class TestTimeSeriesOutcomeDiscriminator:
                     "close_time": f"{close_day}T21:00:00Z",
                 })
         return markets
+
+    def test_a_snapshot_family_yields_no_candidate(self):
+        # Mirror of the live TestOutcomeDiscriminator::
+        # test_a_snapshot_family_forms_no_pairs_at_all. The eight markets still
+        # GROUP — the key is untouched — but no candidate survives, because
+        # SOL >= $180 on Sep 14 does not imply SOL >= $180 on Sep 18.
+        groups = _group_by_normalized_title(self._family(snapshot_wording=True))
+        assert len(groups) == len(self._STRIKES)
+        assert _extract_pairs(groups) == []
 
     def test_each_strike_is_its_own_group(self):
         groups = _group_by_normalized_title(self._family())
@@ -410,18 +429,32 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         # one, and the premise-violation counter is what judges that (see the
         # live mirror, TestOneEventSeriesIsTwoFixtures::
         # test_a_dated_pair_of_one_series_is_untouched).
-        recs = [
-            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
-                      "Solana price on Sep 14, 2026?", "2026-09-14T21:00:00Z",
-                      subtitle="$180 or above",
-                      event_title="Solana price on Sep 14, 2026?"),
-            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
-                      "Solana price on Sep 18, 2026?", "2026-09-18T21:00:00Z",
-                      subtitle="$180 or above",
-                      event_title="Solana price on Sep 18, 2026?"),
-        ]
+        recs = self._sold_family("by")
         pairs = _extract_pairs(_group_by_normalized_title(recs))
         assert len(pairs) == 1
+
+    def _sold_family(self, preposition: str) -> list[dict]:
+        """One KXSOLD strike listed by two deadline events of ONE series."""
+        return [
+            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
+                      f"Solana price {preposition} Sep 14, 2026?", "2026-09-14T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title=f"Solana price {preposition} Sep 14, 2026?"),
+            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
+                      f"Solana price {preposition} Sep 18, 2026?", "2026-09-18T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title=f"Solana price {preposition} Sep 18, 2026?"),
+        ]
+
+    def test_the_snapshot_spelling_of_that_same_family_is_now_refused(self):
+        # Mirror of the live TestOneEventSeriesIsTwoFixtures::
+        # test_the_snapshot_spelling_of_that_same_family_is_now_refused. The
+        # one-series rule still does not fire (the legs are worded
+        # differently), so this is the cumulative-deadline rule's verdict
+        # alone, on the very fixture that used to document the gap.
+        recs = self._sold_family("on")
+        assert backtester._identical_wording_dicts(recs[0], recs[1]) is False
+        assert _extract_pairs(_group_by_normalized_title(recs)) == []
 
     def test_an_unreadable_event_ticker_fails_closed(self):
         # A record whose fixture identity cannot be read must NOT be replayed
@@ -1300,11 +1333,22 @@ class TestCanEverEnter:
 
 
 def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
-    """Minimal time-series group member for _extract_pairs windowing tests."""
+    """Minimal time-series group member for _extract_pairs windowing tests.
+
+    The title names this member's OWN close date as a cumulative deadline, the
+    shape a real two-deadline family has. That is load-bearing, not decoration:
+    _extract_pairs refuses any pair whose wording does not state two different
+    "by <date>" deadlines, so members with no wording would make every
+    windowing test below assert emptiness against emptiness — the performance
+    smoke test would fail loudly, but the oracle-equivalence tests would go
+    VACUOUS, which is worse. All titles still normalize to "q " so the members
+    stay in ONE group, which is what these tests are about.
+    """
     m = {"ticker": ticker, "event_ticker": event_ticker}
     if close_d is not None:
         m["close_time"] = datetime(close_d.year, close_d.month, close_d.day,
                                     tzinfo=UTC).isoformat()
+        m["title"] = f"Q by {close_d:%B %d, %Y}"
     return m
 
 
@@ -1328,14 +1372,34 @@ def _naive_series(event_ticker: object) -> str:
             else prefix)
 
 
+def _naive_cumulative_deadline(m: dict) -> str | None:
+    """Oracle-local restatement of the cumulative-deadline spans a member's
+    wording states, or None when it states none.
+
+    Deliberately NOT scanner.deadline_profile: an oracle that reuses the
+    implementation cannot falsify it. _ts_member builds exactly one shape —
+    "Q by <Month> <day>, <year>" — so the oracle only has to recognise that
+    shape, and any drift between it and the real tables shows up as a
+    disagreement rather than being silently inherited.
+    """
+    title = m.get("title") or ""
+    match = re.search(
+        r"\bby\s+(?:January|February|March|April|May|June|July|August|September"
+        r"|October|November|December)\s+\d{1,2},\s+\d{4}",
+        title, re.IGNORECASE,
+    )
+    return match.group(0).lower() if match else None
+
+
 def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
     filtering by the same margin-inclusive close-time gap, the same
-    event_ticker rule AND the same one-series rule (DR-02/DR-54/DR-55) that
-    _extract_pairs applies, but without any sorting/windowing. Written
-    standalone (no backtester internals besides plain dict/date arithmetic and
-    _naive_series' restatement of the series identity) so it can serve as
-    ground truth for the windowed implementation.
+    event_ticker rule, the same one-series rule (DR-02/DR-54/DR-55) AND the
+    same cumulative-deadline rule that _extract_pairs applies, but without any
+    sorting/windowing. Written standalone (no backtester internals besides
+    plain dict/date arithmetic, _naive_series' restatement of the series
+    identity and _naive_cumulative_deadline's of the deadline spans) so it can
+    serve as ground truth for the windowed implementation.
 
     The one-series conjunct is spelled out here rather than imported, for the
     same reason the rest is: an oracle that reuses the implementation cannot
@@ -1364,6 +1428,13 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
             if abs((db - da).days) > margin_days:
                 continue
             if a["event_ticker"] == b["event_ticker"]:
+                continue
+            # Both legs must state a cumulative deadline, and two DIFFERENT
+            # ones — the restatement of _extract_pairs' cumulative-deadline
+            # conjunct.
+            deadline_a = _naive_cumulative_deadline(a)
+            deadline_b = _naive_cumulative_deadline(b)
+            if deadline_a is None or deadline_b is None or deadline_a == deadline_b:
                 continue
             if ((a.get("title") or "", a.get("subtitle") or "",
                  a.get("event_title") or "")
@@ -2911,15 +2982,22 @@ class TestDropCrossTypeDuplicates:
 
 
 class TestRunBacktestCrossTypeDedup:
-    """End-to-end proof that run_backtest applies the cross-type dedup (C4).
+    """The cross-type collision the dedup (C4) exists for can no longer arise
+    from the two finders, and this pins WHY.
 
     Fixture shape: two markets sharing an identical (event_title, title,
     subtitle) — so _group_by_exact_title pairs them as same_title — whose
     titles therefore also normalize to one key, so _group_by_normalized_title
-    pairs the SAME two tickers as time_series. Distinct close dates 7 days
-    apart keep the time-series copy inside the short (<= 15 day) tier, so it
-    genuinely qualifies at the 15% threshold rather than being filtered out
-    by _find_entry.
+    GROUPS the same two tickers for time_series too.
+
+    That used to yield both copies, which is what _drop_cross_type_duplicates
+    was built to resolve. It no longer can: a time-series pair must state two
+    DIFFERENT cumulative deadlines, and identical wording cannot state two of
+    anything. The two conditions are now mutually exclusive on one ticker pair,
+    so Pass 1 produces the same-title copy alone and the dedup has nothing to
+    drop. The helper stays — it is still the right thing to do if a collision
+    ever arises another way — and TestDropCrossTypeDuplicates unit-tests it
+    directly; what changed is that the FINDERS no longer manufacture one.
     """
 
     _MARKETS = [
@@ -2935,24 +3013,28 @@ class TestRunBacktestCrossTypeDedup:
     # DA (earlier, closes Feb 1) yes 0.30 / no 0.70; DB (later, Feb 8) yes
     # 0.60 / no 0.40 — the flow-through fixture. Same-title copy: DB is the
     # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
-    # Time-series copy: the later contract is priced 0.30 higher, clearing the
-    # 15% short-gap tier; legs pA+nB = 0.30+0.40 = 0.70 <= 0.85, and under the
-    # interval discount the Kelly fraction is ~0.162 — positive, so BOTH
-    # copies form in Pass 1 and the dedup under test is not vacuous.
+    # The time-series copy would once have formed too — the later contract is
+    # priced 0.30 higher, clearing the 15% short-gap tier, with legs
+    # pA+nB = 0.30+0.40 = 0.70 <= 0.85 and a positive Kelly fraction. It is now
+    # refused earlier than any of that, at extraction: both legs are worded
+    # "Q", so they state no deadline at all, let alone two different ones.
     _CANDLES = {
         "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
         "DB": [_candle(_MONDAY_TS, 0.60, 0.40)],
     }
 
-    def test_fixture_lands_in_both_groupings(self):
-        # The whole test rests on this pair being discovered twice, so assert it
-        # directly rather than trusting the grouping helpers to stay aligned.
+    def test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate(self):
+        # GROUPING is untouched by the cumulative-deadline rule, so the pair is
+        # still discovered by both keys...
         assert len(_group_by_exact_title(self._MARKETS)) == 1
         assert len(_group_by_normalized_title(self._MARKETS)) == 1
+        # ...but only the same-title branch produces a candidate. The legs are
+        # worded identically, so they state one deadline, not two, and the
+        # time-series branch refuses them.
         assert len(_extract_pairs(_group_by_exact_title(self._MARKETS))) == 1
-        assert len(_extract_pairs(_group_by_normalized_title(self._MARKETS))) == 1
+        assert _extract_pairs(_group_by_normalized_title(self._MARKETS)) == []
 
-    def test_time_series_duplicate_is_dropped_before_pass_two(self, monkeypatch):
+    def test_no_time_series_duplicate_reaches_the_dedup(self, monkeypatch):
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: self._MARKETS)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2981,11 +3063,13 @@ class TestRunBacktestCrossTypeDedup:
                     if c["pair_type"] == pair_type
                     and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
 
-        # Pass 1 really does produce BOTH copies of this ticker pair — without
-        # that, the dedup under test would be vacuous.
+        # Pass 1 produces the same-title copy ONLY: identical wording cannot
+        # state two different deadlines, so the time-series copy is refused at
+        # extraction and never reaches the dedup at all.
         assert len(_typed(seen["in"], "same_title")) == 1
-        assert len(_typed(seen["in"], "time_series")) == 1
-        # ...and only the same-title copy survives into Pass 2.
+        assert _typed(seen["in"], "time_series") == []
+        # The dedup is therefore a no-op here, and the same-title copy is
+        # carried into Pass 2 unchanged.
         assert len(_typed(seen["out"], "same_title")) == 1
         assert _typed(seen["out"], "time_series") == []
 

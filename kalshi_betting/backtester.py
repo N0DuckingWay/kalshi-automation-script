@@ -104,15 +104,22 @@ Notes:
     Time-series pairs buy YES on the earlier-closing contract (market A) and
     NO on the later one (market B) — scanner.leg_sides is the only source of
     truth for the sides, and _settlement_receipt pays by side. Their
-    settlement table therefore has exactly three cells: event by A (A=YES,
+    settlement table therefore has exactly three cells (the premise behind
+    that table — both legs being cumulative "by <date>" markets — is screened
+    in _extract_pairs through scanner.cumulative_deadline_pair, the same helper
+    the live finder uses): event by A (A=YES,
     B=YES — YES-on-A pays n), never by B (A=NO, B=NO — NO-on-B pays n), and in
     between (A=NO, B=YES — both legs worthless, the full stake is lost). A=YES
     with B=NO is impossible for a cumulative-deadline pair: a candidate that
     settled that way is excluded from Pass 1 (never traded, never paid) and
     counted, and one summary WARNING reports the count. Kalshi does list
-    snapshot-style markets ("on <date>"), so that counter is the only signal
-    that the normalized-title grouping admitted a non-cumulative pair — the
-    live scanner cannot detect it from prices.
+    snapshot-style markets ("on <date>"), which the normalized-title grouping
+    puts in one group with cumulative ones; _extract_pairs now refuses such a
+    pair up front on its WORDING (scanner.cumulative_deadline_pair, shared with
+    the live finder), so this counter is no longer the only signal that one was
+    admitted — it is DEFENCE IN DEPTH behind a text heuristic, and a non-zero
+    count now means that heuristic had a false negative rather than that
+    nothing was watching.
 """
 import logging
 import resource
@@ -150,7 +157,16 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
 )
-from .scanner import event_series, leg_sides, time_series_group_key
+from .scanner import (
+    DEADLINE_CUMULATIVE,
+    DEADLINE_SNAPSHOT,
+    DEADLINE_UNKNOWN,
+    cumulative_deadline_pair,
+    deadline_profile,
+    event_series,
+    leg_sides,
+    time_series_group_key,
+)
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -437,6 +453,22 @@ class OutcomeLabelCoverage:
             which reports no coverage rather than 0%.
         event_title_fraction (float | None): with_event_title / total, or None
             when total is 0, for the same reason.
+        cumulative_markets (int): Records whose wording states a cumulative
+            "by <date>" deadline (scanner.deadline_phrasing). Only a pair of
+            these can be a time-series candidate, so a ZERO here on a non-empty
+            corpus means this run can produce no time-series trade at all — the
+            one reading of this census that is actionable on its own.
+        snapshot_markets (int): Records whose wording is a snapshot ("price ON
+            <date>", "in <Month>", "after <date>"). Refused as time-series legs.
+        unknown_deadline_markets (int): Records whose wording names no deadline
+            shape at all — the deadline may live in the event ticker, but
+            nothing the pair-finders read can prove it, so they are refused too.
+            Expected to dominate a combo-heavy corpus.
+
+            These three are DESCRIPTIVE and carry no warning floor, unlike
+            subtitle coverage: the cumulative FRACTION has no healthy baseline
+            (most Kalshi markets are not deadline markets at all), so any
+            threshold would be arbitrary and would fire on every run.
         below_floor (bool): Whether subtitle_fraction fell below
             config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION — the SAME comparison
             the WARNING branches on, evaluated once and carried, so a reader of
@@ -451,6 +483,12 @@ class OutcomeLabelCoverage:
     subtitle_fraction: float | None
     event_title_fraction: float | None
     below_floor: bool
+    # Declared AFTER below_floor deliberately: this dataclass is frozen but not
+    # kw_only, so appending is the only way to add a field without reordering
+    # every positional construction.
+    cumulative_markets: int = 0
+    snapshot_markets: int = 0
+    unknown_deadline_markets: int = 0
 
 
 @dataclass
@@ -789,6 +827,38 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
     return not sa or not sb or sa == sb
 
 
+def _deadline_profile_dict(m: dict) -> tuple:
+    """
+    Dict-world mirror of scanner._market_deadline_profile over cached records.
+
+    Only the FIELD EXTRACTION is mirrored — the classification itself is
+    scanner.deadline_profile, called here, so the live finder and this one can
+    never disagree about what counts as a cumulative-deadline market (pinned by
+    AST in tests/test_strategy.py).
+
+    Every key is read with `.get(...) or ""`, matching _identical_wording_dicts:
+    a cached record legitimately carries subtitle=None (historical
+    ._market_to_dict stores `subtitle or yes_sub_title`, which is None when the
+    payload had neither), and old records predate `event_title` entirely.
+
+    One divergence to know, which no AST pin can catch: `event_title` reaches
+    essentially every LIVE market but only a small fraction of cached ones (see
+    config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION for the measured coverage), so
+    a market whose deadline is spelled only in its event title reads as
+    cumulative live and as unknown here. That makes this path strictly more
+    conservative than the live one, never less.
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+
+    Returns:
+        tuple[str, tuple[str, ...]]: The record's (verdict, deadline spans).
+    """
+    return deadline_profile(
+        m.get("event_title") or "", m.get("title") or "", m.get("subtitle") or "",
+    )
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
@@ -969,6 +1039,11 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             event_tickers of different event series.
     """
     pairs = []
+    # Time-series candidates refused as not one question at two cumulative
+    # deadlines. Reported once at the end of the call (silent at zero) — this
+    # function previously reported nothing at all about refused pairs, so a
+    # rule that can empty the strategy had no signal on this path.
+    phrasing_skips = 0
     for key, members in groups.items():
         if isinstance(key, str):
             canon = key
@@ -996,6 +1071,15 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             dated.sort(key=lambda pair: pair[0])
             margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
             n = len(dated)
+            # Classify each member's wording ONCE, positionally, then compare
+            # the cheap results pairwise below. The sweep is O(n * window), so
+            # classifying per CANDIDATE would re-run the regex tables roughly
+            # thirty times more often than per member — measurable against
+            # TestExtractPairsPerformanceSmoke's 50,000-member group. Scoped to
+            # this group and dropped with it: a corpus-wide ticker->verdict map
+            # would add residency in exactly the place TS-07 did work to
+            # reduce it.
+            group_profiles = [_deadline_profile_dict(m) for _d, m in dated]
             for i in range(n):
                 close_a, mA = dated[i]
                 for j in range(i + 1, n):
@@ -1011,6 +1095,20 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                     # of one recurring fixture, not one question at two
                     # deadlines (DR-02, DR-54).
                     if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                        continue
+                    # Mirror of the scanner's cumulative-deadline rule, through
+                    # the SAME scanner.cumulative_deadline_pair: the two legs
+                    # must be one question at two different "by <date>"
+                    # deadlines. A snapshot family ("price ON <date>") groups
+                    # here exactly as it does live — the grouping key is
+                    # untouched — and is refused here exactly as it is live.
+                    # Deliberately a separate check from the one-series
+                    # conjunct above, not fused into it: they refuse different
+                    # shapes for different reasons.
+                    if not cumulative_deadline_pair(
+                        group_profiles[i], group_profiles[j]
+                    ):
+                        phrasing_skips += 1
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
@@ -1033,6 +1131,12 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
+    if phrasing_skips:
+        logging.info(
+            "Time-series candidates skipped as not a cumulative-deadline pair "
+            "(snapshot wording, no stated deadline, or one deadline stated twice): %d",
+            phrasing_skips,
+        )
     return pairs
 
 
@@ -1601,15 +1705,20 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             below_floor=False,
         )
 
-    # One pass, two counters. Blank/None/absent all read as "no label", the
+    # One pass, five counters. Blank/None/absent all read as "no label", the
     # same falsiness the two grouping helpers apply with `or ""`.
     with_subtitle = 0
     with_event_title = 0
+    phrasing: dict = defaultdict(int)
     for m in markets:
         if m.get("subtitle"):
             with_subtitle += 1
         if m.get("event_title"):
             with_event_title += 1
+        # Folded into this pass rather than given its own: the corpus can be
+        # millions of records, and a second walk would double the cost of a
+        # measurement that is advisory either way.
+        phrasing[_deadline_profile_dict(m)[0]] += 1
 
     subtitle_fraction = with_subtitle / total
     logging.info(
@@ -1617,6 +1726,20 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
         "(%.2f%%), event_title on %d (%.2f%%)",
         total, with_subtitle, subtitle_fraction * 100.0,
         with_event_title, with_event_title / total * 100.0,
+    )
+    # ALWAYS logged, never only on a shortfall: a rule that can empty the
+    # time-series strategy must not be detectable solely by the absence of a
+    # warning (DR-66's lesson). "cumulative 0" on a non-empty corpus is the
+    # actionable reading — it says this run can produce no time-series trade,
+    # whether because the corpus genuinely holds no deadline families or
+    # because the phrasing tables stopped matching.
+    logging.info(
+        "Deadline phrasing over %d eligible markets: %d cumulative, %d snapshot, "
+        "%d with no stated deadline",
+        total,
+        phrasing[DEADLINE_CUMULATIVE],
+        phrasing[DEADLINE_SNAPSHOT],
+        phrasing[DEADLINE_UNKNOWN],
     )
 
     # Evaluated ONCE and carried out on the dataclass. The dashboard branches
@@ -1649,6 +1772,9 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
         subtitle_fraction=subtitle_fraction,
         event_title_fraction=with_event_title / total,
         below_floor=below_floor,
+        cumulative_markets=phrasing[DEADLINE_CUMULATIVE],
+        snapshot_markets=phrasing[DEADLINE_SNAPSHOT],
+        unknown_deadline_markets=phrasing[DEADLINE_UNKNOWN],
     )
 
 
@@ -2110,14 +2236,18 @@ def _simulate_at_discount(
         })
 
     if premise_violations:
-        # Summary-warning idiom (silent at zero): the only signal that the
-        # normalized-title grouping admitted non-cumulative pairs — the live
-        # scanner cannot detect this from prices.
+        # Summary-warning idiom (silent at zero). This used to be the ONLY
+        # signal that the grouping had admitted a non-cumulative pair; since
+        # _extract_pairs screens both legs' wording, it is defence in depth
+        # behind that heuristic, and a non-zero count is now itself a finding —
+        # it means a pair whose wording read as two cumulative deadlines
+        # settled in a way only a non-cumulative pair can.
         logging.warning(
             "Excluded %d time-series candidate(s) whose settlement violated the "
             "cumulative-deadline premise (earlier YES, later NO) — the "
             "normalized-title group likely mixes snapshot markets ('on <date>') "
-            "with cumulative ones ('by <date>')",
+            "with cumulative ones ('by <date>'), and the wording screen in "
+            "_extract_pairs did not catch it",
             premise_violations,
         )
 

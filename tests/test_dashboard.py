@@ -915,3 +915,68 @@ class TestDeploymentIsNotRenderedAsDrawdown:
         assert "-73.4%" not in out
         # Same base as the performance card's (DR-03's leading row).
         assert "+26.6%" in out
+
+
+class TestDeadlinePhrasingIsRendered:
+    """The phrasing census must reach the PAGE, not only the log.
+
+    DR-66b's lesson: a run whose log said 0.00% coverage produced a dashboard
+    containing none of the words that would have warned its reader. The same
+    applies here — the cumulative-deadline rule decides which pairs exist at
+    all, so a reader of the k̂ card has to be able to see how much of the
+    corpus it admitted.
+    """
+
+    @staticmethod
+    def _coverage(**kw):
+        base = {
+            "total": 1000, "with_subtitle": 1000, "with_event_title": 30,
+            "subtitle_fraction": 1.0, "event_title_fraction": 0.03,
+            "below_floor": False, "cumulative_markets": 120,
+            "snapshot_markets": 300, "unknown_deadline_markets": 580,
+        }
+        base.update(kw)
+        return backtester.OutcomeLabelCoverage(**base)
+
+    def test_healthy_run_states_the_mix(self):
+        html = dashboard._deadline_phrasing_html(self._coverage())
+        assert "Deadline phrasing" in html
+        assert "120 of 1,000 eligible markets" in html
+        assert "12.00%" in html
+        assert "300" in html and "580" in html
+
+    def test_zero_cumulative_says_so_in_its_own_sentence(self):
+        # The one reading that is actionable without a threshold.
+        html = dashboard._deadline_phrasing_html(
+            self._coverage(cumulative_markets=0, snapshot_markets=400,
+                           unknown_deadline_markets=600)
+        )
+        assert "could not have produced a time-series trade" in html
+
+    def test_a_healthy_mix_carries_no_such_claim(self):
+        html = dashboard._deadline_phrasing_html(self._coverage())
+        assert "could not have produced" not in html
+
+    @pytest.mark.parametrize("coverage", [None, "empty"])
+    def test_no_corpus_renders_nothing(self, coverage):
+        # The outcome-label block above already says which case it was; a
+        # second "nothing to report" line would be noise.
+        arg = None if coverage is None else self._coverage(
+            total=0, with_subtitle=0, with_event_title=0,
+            subtitle_fraction=None, event_title_fraction=None,
+            cumulative_markets=0, snapshot_markets=0,
+            unknown_deadline_markets=0,
+        )
+        assert dashboard._deadline_phrasing_html(arg) == ""
+
+    def test_it_reaches_the_rendered_section(self):
+        # The helper is wired into the section, not merely defined — the whole
+        # point of DR-66b is that a measurement which never reaches the page is
+        # indistinguishable from one that was never taken.
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration(),
+                              label_coverage=self._coverage())
+        html = _section_interval_discount(sweep)
+        assert "Deadline phrasing" in html
+        assert "120 of 1,000 eligible markets" in html

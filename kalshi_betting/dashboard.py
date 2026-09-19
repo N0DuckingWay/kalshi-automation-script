@@ -260,7 +260,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
     market-implied probability of the single loss cell (A=NO, B=YES; the event
     first happens between the deadlines). The two win cells are event by A
     (A=YES, hence B=YES) and never by B (A=NO, B=NO); A=YES/B=NO is impossible
-    for a cumulative-deadline pair. Returns 0.0 when there is no edge.
+    for a cumulative-deadline pair, a premise both pair-finders now screen for
+    in the legs' wording (scanner.deadline_phrasing). Returns 0.0 when there is
+    no edge.
 
     The optional k must be whatever interval discount the plotted trades were
     actually SIZED at (backtester.SweepPoint.k). Leaving it None on a run that
@@ -616,6 +618,60 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
 # ─── Section 4: Interval Discount (k) Calibration ────────────────────────────
 
+def _deadline_phrasing_html(coverage: OutcomeLabelCoverage | None) -> str:
+    """
+    Render how this run's eligible markets are worded: cumulative, snapshot, or undated.
+
+    A time-series pair is only formed between two CUMULATIVE-deadline markets
+    ("will X happen BY <date>"), because only there does the earlier deadline's
+    event nest inside the later one's. This line is what makes the size of that
+    filter visible on the page rather than only in the log.
+
+    DESCRIPTIVE, with no floor and no banner — deliberately unlike the
+    outcome-label census above. The cumulative FRACTION has no healthy
+    baseline: most Kalshi markets are not deadline markets at all, so any
+    threshold would be arbitrary and would fire on every run, training the
+    operator to ignore it. The reading that IS actionable needs no threshold —
+    zero cumulative markets on a non-empty corpus means this run could not have
+    produced a time-series trade whatever else the page says — so that case
+    gets its own sentence.
+
+    Args:
+        coverage (backtester.OutcomeLabelCoverage | None): The census carried
+            on the sweep. None or an empty corpus renders nothing, because the
+            block above has already said why there is nothing to report.
+
+    Returns:
+        str: One grey HTML line, or "" when there is no corpus to describe.
+    """
+    if coverage is None or not coverage.total:
+        # The outcome-label block above already states which of these it was;
+        # a second "nothing to report" line would only add noise.
+        return ""
+
+    total = coverage.total
+    cumulative = coverage.cumulative_markets
+    body = (
+        f"Deadline phrasing: {cumulative:,} of {total:,} eligible markets state a "
+        f"cumulative &ldquo;by &lt;date&gt;&rdquo; deadline "
+        f"({cumulative / total * 100.0:.2f}%), "
+        f"{coverage.snapshot_markets:,} are snapshots "
+        f"(&ldquo;on &lt;date&gt;&rdquo;, &ldquo;in &lt;month&gt;&rdquo;), and "
+        f"{coverage.unknown_deadline_markets:,} state no deadline in their wording. "
+        "Only a pair of cumulative markets can become a time-series candidate; "
+        "the other two are refused, because their probabilities do not nest."
+    )
+    if not cumulative:
+        body += (
+            " <strong>No eligible market was read as cumulative, so this run "
+            "could not have produced a time-series trade at all.</strong>"
+        )
+    return (
+        "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+        f"{body}</p>"
+    )
+
+
 def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
     """
     Render the outcome-label census as a line, or as a banner when it is low.
@@ -786,7 +842,7 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     # The outcome-label census, carried k-independently on the sweep exactly as
     # the calibration is. None means no census was taken, not healthy coverage.
     coverage = sweep.label_coverage
-    coverage_html = _label_coverage_html(coverage)
+    coverage_html = _label_coverage_html(coverage) + _deadline_phrasing_html(coverage)
     # One verdict, read off the carrier rather than re-derived from the
     # constant, so this page and the backtest log fire on the same condition.
     tainted = coverage is not None and coverage.below_floor

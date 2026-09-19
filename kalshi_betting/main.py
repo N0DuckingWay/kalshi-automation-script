@@ -197,7 +197,10 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
     Formats the deadline-gap-tiered time-series thresholds and the same-title
     threshold straight from config.py so this message can never drift out of
     sync with the values `min_price_diff_for_gap()` and the pair-finders
-    actually enforce.
+    actually enforce. Names the cumulative-deadline requirement too: since
+    that rule landed, price is no longer the only reason a time-series
+    candidate can be absent, and an operator reading this line would otherwise
+    go looking at the thresholds for a result the WORDING decided.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -208,7 +211,8 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
         str: The fully formatted log message, ready to pass to logging.info().
     """
     thresholds = (
-        "time-series: later-closing leg priced "
+        "time-series: both legs worded as cumulative deadlines "
+        "(“by <date>”, two different ones) with the later-closing leg priced "
         f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
         "earlier (deadline-gap-tiered), or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff"

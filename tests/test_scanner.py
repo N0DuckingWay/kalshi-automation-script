@@ -400,32 +400,56 @@ class TestOutcomeDiscriminator:
         ("$210 or above", 0.07, 0.37),
     )
 
-    def _family(self, *, strike_in_subtitle: bool = True) -> list:
+    def _family(self, *, strike_in_subtitle: bool = True,
+                snapshot_wording: bool = False) -> list:
         """Two deadline events of one daily family, four strikes each.
 
         Both titles normalize to the same string, so with an empty subtitle the
         whole family collapses into one group — which is exactly the shape
         `strike_in_subtitle=False` reproduces.
+
+        The titles are CUMULATIVE ("above $X by <date>"), because DR-01 is
+        about the outcome label in the grouping key and must keep being tested
+        on a family the deadline rule admits. `snapshot_wording=True` returns
+        the original "Solana price ON <date>" shape — a real KXSOLD family,
+        which that rule now refuses outright (see
+        test_a_snapshot_family_forms_no_pairs_at_all).
         """
+        early = "on Sep 14, 2026" if snapshot_wording else "by Sep 14, 2026"
+        late = "on Sep 18, 2026" if snapshot_wording else "by Sep 18, 2026"
         markets = []
         for i, (strike, pA, pB) in enumerate(self._STRIKES):
             markets.append(_mock_market(
                 ticker=f"KXSOLD-26SEP14-T{i}", event_ticker="KXSOLD-26SEP14",
-                title="Solana price on Sep 14, 2026?",
-                event_title="Solana price on Sep 14, 2026?",
+                title=f"Solana price {early}?",
+                event_title=f"Solana price {early}?",
                 subtitle=strike if strike_in_subtitle else "",
                 yes_ask=pA, no_ask=round(1.0 - pA, 4),
                 close_time=self._EARLY_CLOSE,
             ))
             markets.append(_mock_market(
                 ticker=f"KXSOLD-26SEP18-T{i}", event_ticker="KXSOLD-26SEP18",
-                title="Solana price on Sep 18, 2026?",
-                event_title="Solana price on Sep 18, 2026?",
+                title=f"Solana price {late}?",
+                event_title=f"Solana price {late}?",
                 subtitle=strike if strike_in_subtitle else "",
                 yes_ask=pB, no_ask=round(1.0 - pB, 4),
                 close_time=self._LATE_CLOSE,
             ))
         return markets
+
+    def test_a_snapshot_family_forms_no_pairs_at_all(self):
+        # The wording this fixture ORIGINALLY carried, and a real KXSOLD
+        # family: "Solana price ON Sep 14/18, 2026?". Both titles normalize to
+        # "solana price on ?" so all eight markets still GROUP together — the
+        # grouping key is deliberately untouched — but no pair survives,
+        # because SOL >= $180 on Sep 14 does not imply SOL >= $180 on Sep 18
+        # and the trade has no premise. This is the counterpart of the
+        # cross-strike pins below: they check WHICH cumulative pairs form,
+        # this checks that a snapshot family forms none.
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(),
+            markets=self._family(snapshot_wording=True),
+        ) == []
 
     def test_one_pair_per_strike_and_no_cross_strike_pair(self):
         pairs = find_time_series_pairs(
@@ -484,14 +508,21 @@ class TestOutcomeDiscriminator:
         assert len(pairs) == 1
 
     def test_trailing_punctuation_in_the_outcome_label_is_one_key(self):
+        # Each event title names its own deadline, as a real two-deadline
+        # family does — without one the wording states no deadline anywhere and
+        # the cumulative-deadline rule refuses the pair before the subtitle
+        # normalization under test is ever reached. Same re-pinning
+        # test_mve_option_label_at_two_deadlines_still_pairs needed for DR-02.
         mA = _mock_market(
             ticker="MAR-TRUMP", event_ticker="ELECT-MAR", title="Trump",
-            event_title="Presidential Election Winner", subtitle="Donald Trump",
+            event_title="Presidential Election Winner by March 2026",
+            subtitle="Donald Trump",
             yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 3, 1, tzinfo=UTC),
         )
         mB = _mock_market(
             ticker="JUN-TRUMP", event_ticker="ELECT-JUN", title="Trump",
-            event_title="Presidential Election Winner", subtitle="Donald Trump.",
+            event_title="Presidential Election Winner by June 2026",
+            subtitle="Donald Trump.",
             yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 11, tzinfo=UTC),
         )
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
@@ -737,35 +768,52 @@ class TestOneEventSeriesIsTwoFixtures:
             "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
         }
 
-    def test_a_dated_pair_of_one_series_is_untouched(self):
-        # The deadline lives IN the wording, so _identical_wording is False and
-        # the time-series conjunct never fires — a daily family's two deadline
-        # events are two events of one series and must keep pairing.
-        #
-        # This pins ELIGIBILITY only. A "price on <date>" family is a SNAPSHOT
-        # family, not a cumulative-deadline one (SOL >= $180 on Sep 14 does not
-        # imply SOL >= $180 on Sep 18), and CLAUDE.md's time-series paragraph
-        # already records that shape as the premise violation the backtester
-        # counts and excludes. Whether such a pair should be traded at all is
-        # that question, not this rule's: all this asserts is that the
-        # one-series rule is not what decides it.
+    @staticmethod
+    def _sold_family(preposition: str) -> tuple:
+        """One KXSOLD strike listed by two deadline events of ONE series."""
         mA = _mock_market(
             ticker="KXSOLD-26SEP14-T180", event_ticker="KXSOLD-26SEP14",
-            title="Solana price on Sep 14, 2026?", subtitle="$180 or above",
+            title=f"Solana price {preposition} Sep 14, 2026?", subtitle="$180 or above",
             event_title="Solana price", yes_ask=0.30, no_ask=0.70,
             close_time=datetime(2026, 9, 14, 21, tzinfo=UTC),
         )
         mB = _mock_market(
             ticker="KXSOLD-26SEP18-T180", event_ticker="KXSOLD-26SEP18",
-            title="Solana price on Sep 18, 2026?", subtitle="$180 or above",
+            title=f"Solana price {preposition} Sep 18, 2026?", subtitle="$180 or above",
             event_title="Solana price", yes_ask=0.60, no_ask=0.40,
             close_time=datetime(2026, 9, 18, 21, tzinfo=UTC),
         )
+        return mA, mB
+
+    def test_a_dated_pair_of_one_series_is_untouched(self):
+        # The deadline lives IN the wording, so _identical_wording is False and
+        # the time-series conjunct never fires — a daily family's two deadline
+        # events are two events of one series and must keep pairing.
+        #
+        # Re-pinned on CUMULATIVE wording: this asserts what the ONE-SERIES
+        # rule does, and it must keep doing it on a pair the deadline rule
+        # admits, or the assertion would pass for the wrong reason.
+        mA, mB = self._sold_family("by")
         pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
         assert len(pairs) == 1
         assert (pairs[0].market_a.ticker, pairs[0].market_b.ticker) == (
             "KXSOLD-26SEP14-T180", "KXSOLD-26SEP18-T180"
         )
+
+    def test_the_snapshot_spelling_of_that_same_family_is_now_refused(self):
+        # The question the comment on this test used to defer. A
+        # "price ON <date>" family is a SNAPSHOT family, not a
+        # cumulative-deadline one (SOL >= $180 on Sep 14 does not imply
+        # SOL >= $180 on Sep 18), so there is no in-between mass to dispute and
+        # pA + nB < 1 is accidental rather than structural. The one-series rule
+        # still does not fire — the two legs are worded differently — so this
+        # is the deadline rule's verdict alone, on the very fixture that used
+        # to document the gap.
+        mA, mB = self._sold_family("on")
+        assert scanner._identical_wording(mA, mB) is False
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
 
     def test_skipping_the_widest_candidate_promotes_the_next_one(self):
         # The rule is not only subtractive. Both finders keep ONE best pair per
@@ -978,6 +1026,219 @@ class TestTimeSeriesGroupKey:
         )
 
 
+class TestCumulativeDeadlineRule:
+    """deadline_phrasing() separates "will X happen BY <date>" (cumulative —
+    nested, so a later deadline can only add probability) from "what is X ON
+    <date>" (a snapshot, which does not nest at all).
+
+    This is the premise the time-series bet rests on. Before this rule the
+    scanner asserted it and never checked it: normalize_title strips a dated
+    snapshot title just as readily as a dated deadline one, so
+    "Bitcoin price on Sep 15, 2026?" and "... on Sep 18, 2026?" both normalize
+    to "bitcoin price on ?" and landed in ONE time-series group.
+    """
+
+    @pytest.mark.parametrize("title, expected", [
+        # ── cumulative: an event that may happen at any time up to a deadline
+        ("Will BTC exceed $80k by March 2026?", scanner.DEADLINE_CUMULATIVE),
+        ("Will BTC exceed $80k by March 01, 2026", scanner.DEADLINE_CUMULATIVE),
+        ("Will Z happen by December 11, 2026?", scanner.DEADLINE_CUMULATIVE),
+        ("Will X happen before Oct 1, 2026?", scanner.DEADLINE_CUMULATIVE),
+        ("Will X happen prior to the end of the year?", scanner.DEADLINE_CUMULATIVE),
+        ("Will X happen no later than Dec 31, 2026?", scanner.DEADLINE_CUMULATIVE),
+        ("Will X resolve by Q1 2026?", scanner.DEADLINE_CUMULATIVE),
+        ("Will X happen by 12/31/2026?", scanner.DEADLINE_CUMULATIVE),
+        # ── snapshot: a state measured at one instant, or over a window that
+        # does not nest
+        ("Bitcoin price on Sep 15, 2026?", scanner.DEADLINE_SNAPSHOT),
+        ("Solana price on Sep 14, 2026?", scanner.DEADLINE_SNAPSHOT),
+        ("Highest temperature in NYC on Oct 1", scanner.DEADLINE_SNAPSHOT),
+        ("Will X happen on June 30, 2026", scanner.DEADLINE_SNAPSHOT),
+        ("S&P 500 at the close on Dec 31, 2026?", scanner.DEADLINE_SNAPSHOT),
+        ("BTC price at 12:00 on Sep 15", scanner.DEADLINE_SNAPSHOT),
+        # ── unknown: no deadline shape in the wording at all
+        ("Fed cuts rates?", scanner.DEADLINE_UNKNOWN),
+        ("Michal Olbrycht wins", scanner.DEADLINE_UNKNOWN),
+    ])
+    def test_title_classification(self, title, expected):
+        assert scanner.deadline_phrasing("", title, "") == expected
+
+    def test_in_a_month_is_a_window_not_a_deadline(self):
+        # "top 10 in October" does not nest inside "top 10 in November" — the
+        # two are disjoint windows, so P is not monotone in the date and there
+        # is no in-between mass to dispute. The FIDE Oct/Nov markets are this
+        # shape and used to pair.
+        assert scanner.deadline_phrasing("", "Top 10 in October", "") == scanner.DEADLINE_SNAPSHOT
+        assert scanner.deadline_phrasing(
+            "", "Will the Fed cut rates in December 2026?", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+
+    def test_after_a_date_inverts_the_monotonicity_and_is_refused(self):
+        # "after June 30" carries LOWER probability the later the date, so the
+        # earlier/later leg assignment means the opposite of what it says and
+        # pA + nB < 1 stops holding.
+        #
+        # Two ways _DATE_PATTERNS lands such a market in a time-series group,
+        # both measured against the real patterns: the year-less shape strips
+        # its preposition along with the date, so a "by" title and an "after"
+        # title collapse onto ONE key; and two "after" titles at different
+        # dates collapse onto one key with each other. Only this table
+        # separates them.
+        assert normalize_title("Will X happen by March 1") == normalize_title(
+            "Will X happen after March 1"
+        )
+        assert normalize_title("Will X happen after March 1, 2026") == normalize_title(
+            "Will X happen after June 1, 2026"
+        )
+        assert scanner.deadline_phrasing(
+            "", "Will X happen after March 1, 2026", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+
+    def test_an_incidental_after_does_not_refuse_a_real_deadline(self):
+        # "after" only rejects when it introduces a DATE. Without the date-token
+        # requirement this title would be refused for naming the halving.
+        assert scanner.deadline_phrasing(
+            "", "Will BTC top $100k by Dec 31, 2026, after the halving?", "",
+        ) == scanner.DEADLINE_CUMULATIVE
+        assert scanner.deadline_phrasing(
+            "", "Will the ETF named after Smith launch by June 2026?", "",
+        ) == scanner.DEADLINE_CUMULATIVE
+
+    @pytest.mark.parametrize("title", [
+        "Will the Fed cut by 50 bps in December 2026?",
+        "Will Team A win by 10 points?",
+        "Will the bill pass by a 2/3 majority?",
+    ])
+    def test_by_a_quantity_is_not_a_deadline(self, title):
+        # "by" must be followed by a DATE token. These are magnitudes, and the
+        # first of them is a real Kalshi shape whose two months merge into one
+        # normalized group.
+        assert scanner.deadline_phrasing("", title, "") != scanner.DEADLINE_CUMULATIVE
+
+    @pytest.mark.parametrize("args", [
+        (None, None, None),
+        (MagicMock(), MagicMock(), MagicMock()),
+        (123, [], {}),
+    ])
+    def test_non_string_fields_read_as_absent_and_never_raise(self, args):
+        # Same fail-safe-by-type rule leg_sides and strategy._depth_levels
+        # follow. Real: historical._market_to_dict stores subtitle as
+        # `subtitle or yes_sub_title`, which is None when both are absent.
+        assert scanner.deadline_phrasing(*args) == scanner.DEADLINE_UNKNOWN
+
+
+class TestSubContractDeadlineWins:
+    """Across fields the precedence is subtitle -> title -> event_title: the
+    SUB-CONTRACT is the thing that actually resolves, so its wording is the
+    most authoritative statement of what the contract settles on.
+
+    This is the half of the rule that keeps MVE markets eligible. It must not
+    open a hole in the snapshot refusals, and the reason it does not is
+    structural: a snapshot family's subtitle is a bare strike with no marker at
+    all, so the verdict falls straight through to the title.
+    """
+
+    def test_sub_contract_deadline_overrides_a_snapshot_event_title(self):
+        assert scanner.deadline_phrasing(
+            "Bitcoin price on Sep 15, 2026?", "Bitcoin price?", "$80,000 by June 30",
+        ) == scanner.DEADLINE_CUMULATIVE
+
+    def test_deadline_in_the_sub_contract_alone_is_cumulative(self):
+        assert scanner.deadline_phrasing(
+            "BTC milestones", "Will BTC hit a new high", "$80,000 by June 30",
+        ) == scanner.DEADLINE_CUMULATIVE
+
+    def test_deadline_in_the_event_title_alone_is_cumulative(self):
+        # The MVE shape: the option label carries no date, the parent event does.
+        assert scanner.deadline_phrasing(
+            "Presidential Election Winner by March 2026", "Trump", "Donald Trump",
+        ) == scanner.DEADLINE_CUMULATIVE
+
+    def test_bare_strike_sub_contract_falls_through_to_a_snapshot_title(self):
+        # THE regression guard for the override: the KXBTCD/KXSOLD daily
+        # families must still be refused.
+        assert scanner.deadline_phrasing(
+            "Bitcoin price on Sep 15, 2026 at 5pm EDT?",
+            "Bitcoin price on Sep 15, 2026?",
+            "$82,750 or above",
+        ) == scanner.DEADLINE_SNAPSHOT
+
+    def test_a_clock_time_is_not_a_date_token(self):
+        # An intraday family must not fail OPEN through its own sub-contract
+        # now that the subtitle leads. "by 5pm" names no date, so the verdict
+        # falls through rather than reading as a cumulative deadline.
+        assert scanner.deadline_phrasing(
+            "", "Bitcoin price?", "$82,750 or above by 5pm",
+        ) != scanner.DEADLINE_CUMULATIVE
+
+    def test_a_dateless_combo_ticket_is_unknown(self):
+        # A combo ticket's wording names its legs but never its date, so it
+        # fails closed — correct, since such a pair never had the premise.
+        assert scanner.deadline_phrasing(
+            "Cross-category combo", "Parlay", "All legs hit",
+        ) == scanner.DEADLINE_UNKNOWN
+
+
+class TestCumulativeDeadlinePairPredicate:
+    """cumulative_deadline_pair() requires BOTH legs cumulative AND two
+    genuinely different stated deadlines."""
+
+    @staticmethod
+    def _pair(a, b):
+        return scanner.cumulative_deadline_pair(
+            scanner.deadline_profile(*a), scanner.deadline_profile(*b),
+        )
+
+    def test_two_deadlines_of_one_question_pair(self):
+        assert self._pair(
+            ("", "Will BTC exceed $80k by March 2026?", ""),
+            ("", "Will BTC exceed $80k by June 2026?", ""),
+        ) is True
+
+    @pytest.mark.parametrize("early, late", [
+        ("by Dec 31, 2026", "by Dec 20, 2026"),   # same month, different day
+        ("by March 2026", "by March 2027"),       # same month, different year
+        ("by Sep 14", "by Sep 18"),               # year-less daily family
+    ])
+    def test_deadlines_differing_only_in_their_day_or_year_still_pair(self, early, late):
+        # The span capture has to take the WHOLE date. An earlier draft stopped
+        # at the month, so "by March 2026" and "by March 2027" both read as
+        # "by march 20" (the day group ate half the year) and were refused.
+        assert self._pair(
+            ("", f"Will X happen {early}?", ""), ("", f"Will X happen {late}?", ""),
+        ) is True
+
+    def test_one_deadline_stated_twice_is_not_a_two_deadline_pair(self):
+        assert self._pair(
+            ("", "Will X happen by Dec 31, 2026?", ""),
+            ("", "Will X happen by Dec 31, 2026?", ""),
+        ) is False
+
+    def test_a_snapshot_leg_refuses_the_pair(self):
+        assert self._pair(
+            ("Solana price on Sep 14, 2026?", "Solana price on Sep 14, 2026?", "$180 or above"),
+            ("Solana price on Sep 18, 2026?", "Solana price on Sep 18, 2026?", "$180 or above"),
+        ) is False
+
+    def test_a_cumulative_leg_naming_no_comparable_date_is_refused(self):
+        # "within 30 days" establishes the KIND of question but names no date,
+        # so the two deadlines cannot be shown to differ — fail closed.
+        assert self._pair(
+            ("", "Will X happen within 30 days?", ""),
+            ("", "Will X happen within 60 days?", ""),
+        ) is False
+
+    def test_unknown_wording_fails_closed(self):
+        assert self._pair(
+            ("TT Elite Series", "Michal Olbrycht wins", "Yes"),
+            ("TT Elite Series", "Michal Olbrycht wins", "Yes"),
+        ) is False
+
+    def test_order_independent(self):
+        a = ("", "Will X happen by March 2026?", "")
+        b = ("", "Will X happen by June 2026?", "")
+        assert self._pair(a, b) == self._pair(b, a)
+
 def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = None):
     """Build an earlier/later mock market pair gap_days apart, one question at
     two deadlines.
@@ -1080,14 +1341,21 @@ class TestTimeSeriesTieredThreshold:
         # qualifies — the filter is directional (the later leg must be pricier)
         assert self._scan(10, pA=0.65, pB=0.30) == []
 
-    def test_wide_later_book_is_candidate_but_untradeable(self):
-        # A 30% YES-ask gap qualifies as a candidate, but with LATE's NO ask
-        # at 0.75 the legs cost pA + nB = 1.05 — no win scenario covers that,
-        # so the pair is carried as untradeable (visible in the dev sheet).
+    def test_wide_later_book_is_not_a_candidate_at_all(self):
+        # A 30% YES-ask gap clears the tier, but with LATE's NO ask at 0.75 the
+        # legs cost pA + nB = 1.05. The structural invariant of a
+        # cumulative-deadline pair is that buying YES at pA and NO at nB costs
+        # LESS than the $1 a win pays, so this is not a candidate at all.
+        #
+        # RE-PINNED: it used to be carried as an untradeable row. That was not
+        # free — both finders keep ONE pair per group, so a pair no trade can
+        # ever come from could win the slot and block a sound runner-up. The
+        # explicit skip in find_time_series_pairs is what removes it; the
+        # tradeable flag alone never did.
         mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.60, nB=0.75)
-        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
-        assert pair.tradeable is False
-        assert pair.nB == pytest.approx(0.75)
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
 
     def test_same_event_ticker_never_pairs(self):
         # Two options inside the same multi-choice event share an event_ticker
