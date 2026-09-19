@@ -594,6 +594,47 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
+# Outcome-label (subtitle) coverage below which backtester._prepare_entries
+# escalates its coverage census from INFO to WARNING (DR-66).
+#
+# The subtitle is the outcome discriminator in BOTH backtest grouping keys —
+# the time-series key scanner.time_series_group_key() builds, and the third
+# component of the same-title key (event_title, title, subtitle). A record whose
+# subtitle is blank keys by title alone, which is exactly the pre-DR-01
+# strike-blind grouping the live scanner was fixed to stop using. So a backtest
+# over a cache written before the 2026-08-14 yes_sub_title ingest fix silently
+# replays that defect: its potential-pair counts, trade counts, return figure
+# and — worst — its empirical k-hat recommendation for the real-money constant
+# TIME_SERIES_INTERVAL_PROB_DISCOUNT all describe a strategy the shipped code
+# does not implement, and nothing in the log or the dashboard said so. The
+# census is the signal; the defect it closes is the silence, not the grouping.
+#
+# The threshold sits in the middle of an enormous measured gap, so its exact
+# value is not load-bearing. Measured 2026-09-17 by streaming the assembled
+# caches on disk (this is the ONLY place, with the matching CLAUDE.md note, that
+# records these figures — the census itself prints only the running process's
+# own numbers, per TS-07):
+#   * settled_markets_2026-05-01_... , written 2026-08-03, i.e. PRE-fix:
+#     2,344,886 records, 2,301,327 of them blank — 1.86% coverage.
+#   * settled_markets_2026-09-07_... and settled_markets_2026-09-14_... , both
+#     written POST-fix: 1,089,165 and 3,138,115 records, and ZERO blank
+#     subtitles in either — 100.00% coverage.
+# Half is therefore ~48 points below the observed healthy floor and ~48 above
+# the observed defective value. Below it, most of the corpus groups on the wrong
+# key regardless of what the rest of it does.
+#
+# event_title coverage is censused on the same INFO line but deliberately does
+# NOT escalate, even though a blank event_title collapses the same-title key
+# toward (title, subtitle) — the TS-11 direction. It is legitimately near zero
+# on a HEALTHY cache (0.57% and 2.87% on the two post-fix caches above), because
+# the corpus is overwhelmingly MVE combo markets, whose titles the bulk
+# get_events listings exclude by API design and whose per-ticker fallback is
+# capped at EVENT_TITLE_FALLBACK_MAX_LOOKUPS. Warning on it would fire on every
+# run and train the operator to ignore the line.
+#
+# Advisory only: the census drops, filters and alters nothing.
+BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
+
 # Annualization bases for the dashboard's risk-adjusted return metrics
 # (dashboard._sharpe / _sortino). TWO of them exist because the dashboard's
 # Benchmark Comparison table puts two series with DIFFERENT periodicities in

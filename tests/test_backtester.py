@@ -1099,7 +1099,7 @@ class TestActiveTickerRelease:
     nA+pB = 0.60+0.30 = 0.90 <= 0.95. Time-series TX/TZ: TX is the earlier
     contract and TZ (later) is priced 0.35 higher, clearing the 30% long-gap
     tier; legs pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval
-    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.204 — positive, so
+    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so
     the pair really is entered. TX/TY as a time-series pair (13-day gap, TY
     earlier at 0.30 vs TX 0.40) misses the 15% tier, and TY/TZ is 31 days
     apart — beyond MAX_DEADLINE_GAP_DAYS — so TX/TZ is the only time-series
@@ -1980,6 +1980,307 @@ class TestPrepareEntriesMemoryInstrumentation:
         assert observed == {"EA": True, "EB": True, "EC": False}
 
 
+class TestOutcomeLabelCoverageCensus:
+    """DR-66: a cache written before the 2026-08-14 yes_sub_title ingest fix
+    carries subtitle=None on nearly every record, so the time-series key
+    collapses to the pre-DR-01 strike-blind title-only form. The run still
+    reports pair counts, trades, a return and an empirical k-hat for the
+    real-money TIME_SERIES_INTERVAL_PROB_DISCOUNT, and nothing said the numbers
+    describe a different strategy. The census is that missing signal.
+
+    The measured coverages behind the threshold live in config.py beside
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, never in these tests and never in an
+    emitted string.
+    """
+
+    CENSUS = "Outcome-label coverage"
+    WARN_MARK = "below the"
+
+    @staticmethod
+    def _census_records(caplog, level):
+        return [r.getMessage() for r in caplog.records
+                if r.levelname == level
+                and r.getMessage().startswith(
+                    TestOutcomeLabelCoverageCensus.CENSUS)]
+
+    @staticmethod
+    def _labelled(n: int) -> list[dict]:
+        return [_md(f"T{i}", f"EV{i}", title="Q", subtitle=f"strike {i}",
+                    event_title="Event") for i in range(n)]
+
+    @staticmethod
+    def _unlabelled(n: int) -> list[dict]:
+        # Exactly the shape of a pre-fix cache record: subtitle null, and the
+        # event_title that the bounded fallback never resolved.
+        return [_md(f"T{i}", f"EV{i}", title="Q") | {"subtitle": None,
+                                                     "event_title": ""}
+                for i in range(n)]
+
+    def test_warning_fires_on_a_label_less_market_list(self, caplog):
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(self._unlabelled(100))
+        warnings = self._census_records(caplog, "WARNING")
+        assert len(warnings) == 1
+        # The consequence: which key degrades, and that the headline numbers
+        # are therefore about a different strategy.
+        assert "strike-blind" in warnings[0]
+        assert "different strategy" in warnings[0]
+        # The remedy, exactly as CLAUDE.md's subtitle-drift gotcha states it:
+        # both slice stores, plus --no-cache, and the explicit note that
+        # --no-cache alone does not refresh the slices.
+        assert "backtest_cache/archive_days/" in warnings[0]
+        assert "backtest_cache/live_days/" in warnings[0]
+        assert "--no-cache ALONE does not refresh the day slices" in warnings[0]
+
+    def test_no_warning_on_a_fully_labelled_list(self, caplog):
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(self._labelled(100))
+        assert self._census_records(caplog, "WARNING") == []
+        # The INFO census is unconditional — it is the only signal, so it must
+        # be present on a healthy run too.
+        info = self._census_records(caplog, "INFO")
+        assert len(info) == 1
+        assert "subtitle on 100 (100.00%)" in info[0]
+
+    def test_blank_event_title_alone_does_not_warn(self, caplog):
+        """event_title coverage is reported, never escalated: it is near zero
+        on a HEALTHY cache, because the corpus is overwhelmingly MVE combos
+        whose titles the bulk listings exclude and whose per-ticker fallback is
+        capped. Warning on it would fire every run."""
+        markets = [m | {"event_title": ""} for m in self._labelled(100)]
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(markets)
+        assert self._census_records(caplog, "WARNING") == []
+        assert "event_title on 0 (0.00%)" in self._census_records(caplog, "INFO")[0]
+
+    @pytest.mark.parametrize(("labelled", "total", "warns"), [
+        # Strictly below the floor warns; exactly at it does not.
+        (49, 100, True),
+        (50, 100, False),
+        (51, 100, False),
+    ])
+    def test_threshold_is_strictly_below(self, caplog, labelled, total, warns):
+        assert backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION == 0.50
+        markets = self._labelled(labelled) + self._unlabelled(total - labelled)
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(markets)
+        assert bool(self._census_records(caplog, "WARNING")) is warns
+
+    def test_empty_list_does_not_raise_and_does_not_warn(self, caplog):
+        """Coverage over an empty list is undefined, not zero: dividing would
+        raise, and warning would manufacture a drift alarm out of a corpus with
+        no records at all. One INFO line still goes out, so the census line's
+        absence always means the helper did not run."""
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage([])
+        assert self._census_records(caplog, "WARNING") == []
+        info = self._census_records(caplog, "INFO")
+        assert info == ["Outcome-label coverage: no eligible markets to census"]
+
+    def test_census_quotes_only_this_runs_numbers(self, caplog):
+        # A line emitted on every run must carry no measurement from another
+        # run (TS-07). Every numeric token here is this call's own count, a
+        # percentage derived from it, or the configured floor.
+        with caplog.at_level("INFO"):
+            backtester._log_outcome_label_coverage(
+                self._labelled(1) + self._unlabelled(3))
+        info = self._census_records(caplog, "INFO")[0]
+        warning = self._census_records(caplog, "WARNING")[0]
+        assert re.findall(r"\d+(?:\.\d+)?", info) == [
+            "4", "1", "25.00", "1", "25.00",
+        ]
+        floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0
+        assert re.findall(r"\d+(?:\.\d+)?", warning) == [
+            "25.00", f"{floor:.2f}",
+        ]
+
+    def test_it_reads_the_list_once_without_materializing_another(self):
+        """The list can be millions of records and the surrounding code is
+        memory-tuned (TS-07), so the census must not build a second list. A
+        one-shot iterable stands in for the real list: a second pass over it
+        would see nothing and miscount."""
+        markets = self._labelled(4) + self._unlabelled(6)
+
+        class _OnePassList(list):
+            passes = 0
+
+            def __iter__(self):
+                _OnePassList.passes += 1
+                return super().__iter__()
+
+        probe = _OnePassList(markets)
+        backtester._log_outcome_label_coverage(probe)
+        assert _OnePassList.passes == 1
+
+    # ── The census is advisory: it must move no number the run reports ──
+
+    @staticmethod
+    def _markets() -> list[dict]:
+        # A genuine time-series pair, label-less in exactly the way a pre-fix
+        # cache is, so the census fires on the run below.
+        return [
+            {"ticker": "EA", "event_ticker": "EVA", "event_title": "",
+             "title": "Team wins by February 1, 2026", "subtitle": None,
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-01T00:00:00+00:00",
+             "settlement_ts": "2026-02-01T12:00:00+00:00"},
+            {"ticker": "EB", "event_ticker": "EVB", "event_title": "",
+             "title": "Team wins by February 14, 2026", "subtitle": None,
+             "result": "yes",
+             "open_time": "2026-01-01T00:00:00+00:00",
+             "close_time": "2026-02-14T00:00:00+00:00",
+             "settlement_ts": "2026-02-14T12:00:00+00:00"},
+        ]
+
+    def _run(self, monkeypatch):
+        candles = {
+            "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        }
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: self._markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=10_000.0,
+        )
+
+    def test_census_changes_no_backtest_result(self, monkeypatch):
+        """Advisory only. Running with the census replaced by a no-op must
+        produce the same trades and the same equity curve — if it does not, the
+        census is filtering or consuming something it only meant to read."""
+        with_census_trades, with_census_equity = self._run(monkeypatch)
+        monkeypatch.setattr(backtester, "_log_outcome_label_coverage",
+                            lambda _markets: None)
+        without_trades, without_equity = self._run(monkeypatch)
+
+        assert [astuple(t) for t in with_census_trades] == \
+               [astuple(t) for t in without_trades]
+        pd.testing.assert_frame_equal(with_census_equity, without_equity)
+        # Guard against the comparison being vacuous.
+        assert len(with_census_trades) == 1
+
+    def test_census_is_logged_inside_the_grouping_window(self, monkeypatch, caplog):
+        # After the RSS/RAM-budget lines and before the pair counts, i.e. while
+        # `markets` is still alive — it is del'd right after pair extraction.
+        with caplog.at_level("INFO"):
+            self._run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records]
+        rss_at = next(i for i, m in enumerate(messages)
+                      if m.startswith("Peak RSS before grouping"))
+        census_at = next(i for i, m in enumerate(messages)
+                         if m.startswith(self.CENSUS))
+        pairs_at = next(i for i, m in enumerate(messages)
+                        if m.startswith("Potential pairs:"))
+        assert rss_at < census_at < pairs_at
+
+    def test_a_real_run_on_a_label_less_cache_warns(self, monkeypatch, caplog):
+        # End to end: the run still produces its trade and its numbers, and the
+        # operator is now told those numbers describe a different strategy.
+        with caplog.at_level("INFO"):
+            trades, _ = self._run(monkeypatch)
+        assert len(trades) == 1
+        assert len(self._census_records(caplog, "WARNING")) == 1
+
+
+class TestOutcomeLabelCoverageIsCarried:
+    """DR-66b: the census must also cross out of _prepare_entries, because that
+    is the only scope the eligible-market list exists in and its lifetime must
+    not be extended (TS-07).
+
+    The carrier is a RETURN VALUE rather than an optional sink precisely
+    because a sink can be forgotten — which would reproduce, in the mechanism
+    built to close DR-66's silence, exactly that silence.
+    """
+
+    def test_the_census_returns_what_it_logged(self, caplog):
+        markets = [{"subtitle": "Yes", "event_title": "E"}] * 3 + [{}] * 7
+        with caplog.at_level("INFO"):
+            coverage = backtester._log_outcome_label_coverage(markets)
+
+        assert coverage.total == 10
+        assert coverage.with_subtitle == 3
+        assert coverage.with_event_title == 3
+        assert coverage.subtitle_fraction == pytest.approx(0.30)
+        assert coverage.event_title_fraction == pytest.approx(0.30)
+        # The same number reached the log, so page and log cannot disagree.
+        assert any("30.00%" in r.getMessage() for r in caplog.records)
+
+    def test_the_below_floor_flag_is_the_warning_s_own_condition(self):
+        floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION
+        assert floor == 0.50
+        # One market either side of the floor, and exactly on it.
+        low = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 49 + [{}] * 51)
+        exact = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 50 + [{}] * 50)
+        high = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y"}] * 51 + [{}] * 49)
+        assert low.below_floor is True
+        # Strictly below: a run sitting exactly on the floor is not warned on,
+        # matching the `<` the WARNING branches on.
+        assert exact.below_floor is False
+        assert high.below_floor is False
+
+    def test_an_empty_corpus_reports_undefined_not_zero(self):
+        coverage = backtester._log_outcome_label_coverage([])
+        assert coverage.total == 0
+        # None, not 0.0 — the fraction is undefined on an empty corpus, and a
+        # 0.0 here would render as "0% coverage" and warn.
+        assert coverage.subtitle_fraction is None
+        assert coverage.event_title_fraction is None
+        assert coverage.below_floor is False
+
+    def test_the_carrier_holds_no_market_reference(self):
+        # _prepare_entries del's the record list right after pair extraction to
+        # lower residency across the candlestick fetch. A carrier holding
+        # examples would pin every record alive past that statement.
+        coverage = backtester._log_outcome_label_coverage(
+            [{"subtitle": "Y", "event_title": "E"}])
+        for value in astuple(coverage):
+            assert isinstance(value, (int, float, bool, type(None)))
+
+    def test_the_sweep_carries_the_census(self, monkeypatch):
+        # It hangs off BacktestSweep, not off a SweepPoint: it is k-independent,
+        # exactly like the calibration beside it — one measurement, valid at
+        # every swept discount.
+        census = backtester.OutcomeLabelCoverage(
+            total=4, with_subtitle=1, with_event_title=1,
+            subtitle_fraction=0.25, event_title_fraction=0.25,
+            below_floor=True,
+        )
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: ([], census))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.label_coverage is census
+
+    def test_the_infeasible_window_carries_no_census(self, monkeypatch):
+        # The fetch never ran, so nothing was censused — None, distinct from a
+        # censused corpus that held zero records.
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: (None, None))
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.label_coverage is None
+        assert result.calibration is None
+
+    def test_run_backtest_keeps_its_two_tuple(self, monkeypatch):
+        # Constraint: run_backtest's signature and return type are unchanged —
+        # it unpacks and discards the census, which has already logged itself.
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: ([], None))
+        out = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                           start_date=date(2026, 1, 1), initial_balance=1000.0)
+        assert isinstance(out, tuple) and len(out) == 2
+        trades, equity = out
+        assert trades == []
+        assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
+
+
 class TestRunBacktestFeasibilityPreCheck:
     """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
     ever be entered, so run_backtest must skip the fetch entirely rather than
@@ -2169,17 +2470,26 @@ class TestEquityCurveFutureStartDate:
 
 
 class TestEquityCurveOpensAtTheInitialBalance:
-    """A trade entering on start_date itself must show its outflow as a real
-    daily return and a real drawdown (DR-03).
+    """A trade entering on start_date itself must show its day-0 charges as a
+    real daily return and a real drawdown (DR-03).
 
     The default backtest window starts on a Monday (--start-date 2024-01-01),
     which is exactly the kind of day _find_entry can open a trade on, and the
-    curve used to apply that day's outflow to its FIRST row. pct_change and
-    cummax both read the first row as the baseline, so the entire day-0 stake
-    was invisible: on this fixture the dashboard reported max drawdown 0.0% on a
-    run that lost 99.98% of its balance on day one, and the per-k sweep table
-    divided by the depleted opening (+133,804.3%) while the performance card
+    curve used to apply that day's charges to its FIRST row. pct_change and
+    cummax both read the first row as the baseline, so day 0 was invisible to
+    both: on this fixture the dashboard reported max drawdown 0.0% on a run that
+    ended day one holding $1.84 of CASH out of its $10,000, and the per-k sweep
+    table divided by the depleted opening (+133,804.3%) while the performance card
     divided by initial_balance (-75.4%) — one run reported two ways on one page.
+
+    DR-61 changed WHAT day 0 costs without touching that guarantee. The curve is
+    now a portfolio value rather than a cash balance (open positions are carried
+    at cost), so this fixture's day-0 step is its $476.56 of taker fees rather
+    than the whole $9,998.16 stake, and the stake's actual LOSS lands on the
+    exit date where it is realized. The leading row is still what keeps the
+    cummax peak at $10,000 instead of at the already-charged $9,523.44, and
+    still what makes the two report bases agree — so this class keeps pinning
+    the leading row, at the figures the current accounting produces.
 
     The fixture reproduces the 2026-09-15 dry-run sweep's shape: $10,000 in,
     everything committed on start_date ($9,998.16 all-in across both legs of two
@@ -2208,8 +2518,11 @@ class TestEquityCurveOpensAtTheInitialBalance:
 
         The loss cell (outcome_b="yes") pays nothing; the never-by-B win cell
         (outcome_b="no") pays n, the count of NO contracts held on market B.
-        Fees are the real two-leg taker fees at these prices, so the outflow the
-        equity curve subtracts is the one the backtester would have recorded.
+        Fees are the real two-leg taker fees at these prices, so the two steps
+        the equity curve takes — the entry-day fees and the exit-day realized
+        P&L — are the ones the backtester would have recorded. (Under DR-61 the
+        curve no longer subtracts the whole outflow on the entry date: the
+        contracts bought with it are carried at cost until settlement.)
         """
         cost = n * (pA + nB)
         fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
@@ -2272,24 +2585,71 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
         assert eq["daily_return"].iloc[0] == pytest.approx(0.0)
 
-    def test_day_zero_outflow_is_a_real_daily_return(self):
+    def test_day_zero_charge_is_a_real_daily_return(self):
+        """Re-pinned for DR-61 (was: "outflow", -99.98% on day 0).
+
+        Row 1 is start_date. Both pairs commit $9,998.16 that day, but $9,521.60
+        of it buys contracts that are still held, so the only value that LEAVES
+        the portfolio is the $476.56 of taker fees. That step is still a real,
+        visible negative return — it just measures a real cost instead of
+        measuring deployment.
+        """
+        fees = sum(t.fees for t in self._trades())
+        assert fees == pytest.approx(476.56)
+
         eq = self._curve()
 
-        # Row 1 is start_date: the whole stake left the portfolio that day.
         assert eq["date"].iloc[1] == self._START
-        assert eq["portfolio_value"].iloc[1] == pytest.approx(1.84)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(
+            self._INITIAL - fees)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(9523.44)
         assert eq["daily_return"].iloc[1] < 0
-        assert eq["daily_return"].iloc[1] == pytest.approx(-0.999816, abs=1e-6)
+        assert eq["daily_return"].iloc[1] == pytest.approx(-0.047656, abs=1e-6)
 
-    def test_max_drawdown_sees_the_day_zero_trough(self):
+    def test_max_drawdown_sees_the_realized_loss(self):
+        """Re-pinned for DR-61 (was: a -99.98% trough on start_date).
+
+        The trough is now the EXIT date, where the losing pair's stake is
+        actually written off, and its magnitude is the run's realized loss —
+        which for a monotonically declining run equals the total return. The old
+        -99.98% trough on start_date was the deployment artefact DR-61 removed.
+        """
         from kalshi_betting.dashboard import _max_drawdown
 
         eq = self._curve()
         max_dd, trough = _max_drawdown(
             eq["portfolio_value"].set_axis(eq["date"]))
 
-        assert max_dd == pytest.approx(-0.9998, abs=1e-4)
-        assert trough == self._START
+        assert trough == self._EXIT
+        assert max_dd == pytest.approx(-0.753616, abs=1e-6)
+        # Nothing ever rose above the opening, so the deepest drawdown and the
+        # total return are the same number — a coherence the cash-only curve
+        # could not produce (-99.98% drawdown against a -75.4% return).
+        final = float(eq["portfolio_value"].iloc[-1])
+        assert max_dd == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-9)
+
+    def test_the_leading_row_is_what_keeps_the_day_zero_fee_in_the_drawdown(self):
+        """DR-03's mechanism, re-pinned under DR-61's accounting.
+
+        Day 0 is a decline (the fees), so without the leading row the cummax
+        peak would be the already-charged $9,523.44 and the reported drawdown
+        would be shallower by exactly that fee. Dropping the leading row from
+        the same curve reproduces the understatement, which is what makes the
+        leading row measurable rather than merely asserted.
+        """
+        from kalshi_betting.dashboard import _max_drawdown
+
+        eq = self._curve()
+        with_leading, _ = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+        without_leading, _ = _max_drawdown(
+            eq["portfolio_value"].iloc[1:].set_axis(eq["date"].iloc[1:]))
+
+        assert with_leading < without_leading
+        assert with_leading == pytest.approx(-0.753616, abs=1e-6)
+        # Same trough, shallower peak: 2463.84 / 9523.44 - 1.
+        assert without_leading == pytest.approx(-0.741287, abs=1e-6)
 
     def test_sweep_row_and_performance_card_report_one_return(self):
         # _srow (inside _section_interval_discount) divides by the curve's
@@ -2317,6 +2677,200 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert "-75.4%" in dashboard._section_interval_discount(sweep)
         assert "-75.4%" in dashboard._section_performance(
             eq, trades, self._START, self._INITIAL)
+
+
+class TestEquityCurveCarriesOpenPositionsAtCost:
+    """The equity curve must not report capital DEPLOYMENT as loss (DR-61).
+
+    _build_equity_curve used to accumulate cash alone, so an open position was
+    carried at ZERO for its whole holding period and the curve dived on the
+    entry date and recovered on the exit date whether the trade won or lost.
+    Every risk figure on the dashboard reads that series — the "Max Drawdown"
+    KPI, the "Drawdown (%)" chart, _sharpe/_sortino via the derived
+    "daily_return" column, the per-k sweep table's drawdown and Sharpe columns,
+    and the benchmark row that sits in the same column as ^GSPC's genuine
+    mark-to-market drawdown — so all of them measured peak deployment.
+
+    The real 2026-05-01 run is the proof: its k=1.00 point had THREE trades, all
+    three profitable and a +4.8% return, and the rendered table reported a max
+    drawdown of -60.0%; its k=0.40 point reported -100.0% (total ruin) against a
+    final balance of $4,655.87. This fixture reproduces that shape — three
+    winning time-series pairs all entering on one Monday, committing $6,227.91
+    of $10,000, which the cash-only curve read as a -62.3% drawdown.
+
+    An open position is now carried at its COST BASIS, so the only moves left
+    are the entry-day fees and the realized P&L at settlement.
+    """
+
+    _START = date(2026, 5, 25)     # a Monday, comfortably in the past
+    _INITIAL = 10_000.0
+    # (n, pA, nB, exit_date) — the never-by-B win cell (A=NO, B=NO) pays n on
+    # the NO leg held against market B, so every one of these is profitable.
+    _WINNERS = [
+        (4800, 0.15, 0.40, date(2026, 6, 15)),
+        (3600, 0.20, 0.35, date(2026, 6, 29)),
+        (2400, 0.25, 0.30, date(2026, 7, 13)),
+    ]
+
+    def _trade(self, n: int, pA: float, nB: float, exit_date: date,
+               outcome_b: str, payoff: float) -> backtester.BacktestTrade:
+        """One coherent time-series BacktestTrade entering on _START.
+
+        outcome_b="no" is the never-by-B win cell and pays n; outcome_b="yes"
+        is the in-between cell, where both legs expire worthless. Fees are the
+        real two-leg taker fees at these prices.
+        """
+        cost = n * (pA + nB)
+        fees = fee_leg_exact(n, pA) + fee_leg_exact(n, nB)
+        profit = payoff - cost - fees
+        holding_days = (exit_date - self._START).days
+        return backtester.BacktestTrade(
+            pair_type="time_series",
+            ticker_a="TICK-A", ticker_b="TICK-B",
+            title_a="Will BTC exceed $80k by June?",
+            title_b="Will BTC exceed $80k by July?",
+            category="Crypto",
+            entry_date=self._START, exit_date=exit_date,
+            entry_pA=pA, entry_pB=0.60, entry_nA=1.0 - pA, entry_nB=nB,
+            n=n,
+            total_cost=cost, fees=fees,
+            outcome_a="no", outcome_b=outcome_b,
+            actual_payoff=payoff,
+            profit=profit,
+            profit_ratio=profit / (cost + fees),
+            monthly_profit_ratio=profit / (cost + fees) * 30 / holding_days,
+            kelly_fraction=0.2,
+            expected_payoff=n * (1.0 - pA - nB) - fees,
+            slippage=profit - (n * (1.0 - pA - nB) - fees),
+            holding_days=holding_days,
+            balance_at_entry=self._INITIAL,
+            deadline_gap_days=7,
+        )
+
+    def _all_winners(self) -> list[backtester.BacktestTrade]:
+        return [self._trade(n, pA, nB, exit_date, outcome_b="no",
+                            payoff=float(n))
+                for n, pA, nB, exit_date in self._WINNERS]
+
+    @staticmethod
+    def _cash_only_final(trades, initial: float) -> float:
+        """The pre-DR-61 curve's closing value, computed the old way.
+
+        Cash-only accounting and cost-basis carry differ only in the PATH
+        between entry and settlement, so this is what lets the tests below
+        assert the endpoint is untouched without needing the old code.
+        """
+        return initial + sum(t.actual_payoff - t.total_cost - t.fees
+                             for t in trades)
+
+    def test_the_fixture_is_the_real_runs_shape(self):
+        # Guards every number the tests below read: three trades, all
+        # profitable, all entering on one day, committing 62.3% of the balance.
+        trades = self._all_winners()
+        assert len(trades) == 3
+        assert all(t.profit > 0 for t in trades)
+        assert all(t.entry_date == self._START for t in trades)
+        assert sum(t.total_cost + t.fees for t in trades) == pytest.approx(6227.91)
+        # ...and each payoff is the cell _settlement_receipt would have paid,
+        # so "all profitable" is checked rather than asserted.
+        for t in trades:
+            assert t.actual_payoff == backtester._settlement_receipt(
+                t.n, t.outcome_a, t.outcome_b, t.pair_type)
+
+    def test_an_all_profitable_run_has_no_deployment_drawdown(self):
+        """THE headline pin. Fails on the cash-only curve, which reports
+        -62.3% here (the real run reported -60.0% on the same shape)."""
+        from kalshi_betting.dashboard import _max_drawdown
+
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        fees = sum(t.fees for t in trades)
+        # The only realized cost a winning run can carry is its taker fees, so
+        # the deepest drawdown is exactly those, on the day they were charged.
+        assert max_dd == pytest.approx(-fees / self._INITIAL, abs=1e-12)
+        assert max_dd == pytest.approx(-0.028791, abs=1e-6)
+        assert trough == self._START
+        # Nowhere near the deployment artefact this replaced.
+        assert max_dd > -0.05
+
+    def test_the_curve_is_flat_while_the_positions_are_open(self):
+        """Shape documentation, NOT a DR-61 discriminator — it passes on the
+        cash-only builder too (measured in the negative control), since cash is
+        also flat between the entry day and the first settlement, just at a
+        lower level, and a run of winners is monotone under both accountings.
+        The discriminating pins are the drawdown and entry-step tests below.
+        """
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        by_date = dict(zip(eq["date"], eq["portfolio_value"], strict=True))
+
+        entry_value = by_date[self._START]
+        # Every day between the entry and the first settlement holds three open
+        # positions at cost and sees no cash move at all.
+        for offset in range(1, (date(2026, 6, 15) - self._START).days):
+            assert by_date[self._START + timedelta(days=offset)] == pytest.approx(
+                entry_value)
+
+        # After day 0 a run of winners can only climb: each settlement returns
+        # more than the position it writes off.
+        post = eq["portfolio_value"].iloc[1:].tolist()
+        assert all(b >= a - 1e-9 for a, b in zip(post, post[1:], strict=False))
+
+    def test_the_entry_day_step_is_the_fees_and_nothing_else(self):
+        """Fees are NOT capitalised into the carrying value: they buy nothing
+        that can be sold on, so they hit the day they are charged."""
+        trades = self._all_winners()
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+
+        fees = sum(t.fees for t in trades)
+        assert eq["portfolio_value"].iloc[0] == pytest.approx(self._INITIAL)
+        assert eq["portfolio_value"].iloc[1] == pytest.approx(
+            self._INITIAL - fees)
+
+    def test_a_losing_trade_still_produces_a_real_drawdown(self):
+        """The fix must not flatten genuine losses — only deployment."""
+        from kalshi_betting.dashboard import _max_drawdown
+
+        exit_date = date(2026, 6, 15)
+        loser = self._trade(4800, 0.15, 0.40, exit_date,
+                            outcome_b="yes", payoff=0.0)
+        assert loser.profit < 0
+
+        eq = backtester._build_equity_curve([loser], self._START, self._INITIAL)
+        max_dd, trough = _max_drawdown(
+            eq["portfolio_value"].set_axis(eq["date"]))
+
+        # The whole stake is written off on the settlement date, not on entry.
+        assert trough == exit_date
+        final = self._INITIAL + loser.profit
+        assert eq["portfolio_value"].iloc[-1] == pytest.approx(final)
+        assert max_dd == pytest.approx(
+            (final - self._INITIAL) / self._INITIAL, abs=1e-12)
+        assert max_dd == pytest.approx(-0.276348, abs=1e-6)
+
+    def test_total_return_and_final_balance_are_unchanged(self):
+        """Only the PATH moves: the endpoint must match the cash-only curve's
+        to the last cent, on a MIXED fixture (two winners and a loser)."""
+        winners = self._all_winners()[:2]
+        loser = self._trade(2400, 0.25, 0.30, date(2026, 7, 13),
+                            outcome_b="yes", payoff=0.0)
+        trades = [*winners, loser]
+
+        eq = backtester._build_equity_curve(trades, self._START, self._INITIAL)
+        final = float(eq["portfolio_value"].iloc[-1])
+
+        assert final == pytest.approx(
+            self._cash_only_final(trades, self._INITIAL), abs=1e-9)
+        # ...and therefore so does the total return both report bases divide out
+        # (the leading row is the untouched initial balance — DR-03).
+        opening = float(eq["portfolio_value"].iloc[0])
+        assert opening == pytest.approx(self._INITIAL)
+        assert (final - opening) / opening == pytest.approx(
+            (self._cash_only_final(trades, self._INITIAL) - self._INITIAL)
+            / self._INITIAL, abs=1e-12)
 
 
 class TestDropCrossTypeDuplicates:
@@ -2383,7 +2937,7 @@ class TestRunBacktestCrossTypeDedup:
     # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
     # Time-series copy: the later contract is priced 0.30 higher, clearing the
     # 15% short-gap tier; legs pA+nB = 0.30+0.40 = 0.70 <= 0.85, and under the
-    # interval discount the Kelly fraction is ~0.188 — positive, so BOTH
+    # interval discount the Kelly fraction is ~0.162 — positive, so BOTH
     # copies form in Pass 1 and the dedup under test is not vacuous.
     _CANDLES = {
         "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
@@ -2543,12 +3097,14 @@ class TestRunBacktestTimeSeriesFlow:
 
     Legs are YES on EA at 0.30 and NO on EB at 0.40: gap 0.30 >= 0.15, cost
     0.70 <= 0.85, fee_approx 0.0315 < 0.30 => entry. Pass 1: net 0.2685,
-    b 0.3836, p = 1 - 0.75*0.30 = 0.775, f* = 0.1884 (below the 0.20 cap, so
-    Kelly sizes it). Pass 2: budget 1884.08 => raw n 2691, shrunk to 2575 by
-    the fee loop (cost 1802.50, exact fees 81.12, cash out 1883.62), win
-    profit 691.38. Settlement: event by EA => +691.38; never by EB =>
-    +691.38; in between => -1883.62; EA yes / EB no is a premise violation
-    and is excluded with a counted WARNING.
+    b 0.3671 (= net / (0.70 + 0.0315) — DR-62 put the fee in Kelly's
+    denominator; it was 0.3836 over the fee-less 0.70), p = 1 - 0.75*0.30 =
+    0.775, f* = 0.1620 (was 0.1884; still below the 0.20 cap, so Kelly sizes
+    it). Pass 2: budget 1620.11 => raw n 2314, shrunk to 2214 by the fee loop
+    (cost 1549.80, exact fees 69.75, cash out 1619.55), win profit 594.45.
+    Settlement: event by EA => +594.45; never by EB => +594.45; in between =>
+    -1619.55; EA yes / EB no is a premise violation and is excluded with a
+    counted WARNING.
     """
 
     _PA, _NA = 0.30, 0.70   # EA (earlier) YES / NO ask
@@ -2599,9 +3155,12 @@ class TestRunBacktestTimeSeriesFlow:
     @staticmethod
     def _expected_kelly(pA, nB, pB):
         # p - (1 - p)/b computed from the config helpers, so this pins the
-        # model THROUGH run_backtest rather than a hardcoded number
-        net = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-        b = net / (pA + nB)
+        # model THROUGH run_backtest rather than a hardcoded number. b's
+        # denominator carries the fee: the losing cell loses cost + fees, so
+        # that is the capital actually at risk (DR-62).
+        fee = fee_per_pair_approx(pA, nB)
+        net = (1.0 - pA - nB) - fee
+        b = net / (pA + nB + fee)
         p = time_series_profit_prob(pA, pB)
         return p - (1.0 - p) / b
 
@@ -2615,19 +3174,21 @@ class TestRunBacktestTimeSeriesFlow:
         assert t.entry_nA == pytest.approx(self._NA)
         assert t.entry_nB == pytest.approx(self._NB)
         expected_f = self._expected_kelly(self._PA, self._NB, self._PB)
-        assert expected_f == pytest.approx(0.1884, abs=5e-4)
+        # 0.1884 before DR-62 put the fee in Kelly's denominator; the gate is
+        # strictly tighter now, so this pair sizes smaller than it used to.
+        assert expected_f == pytest.approx(0.1620, abs=5e-4)
         assert expected_f < BUDGET_FRACTION  # Kelly, not the cap, sized this pair
         assert t.kelly_fraction == pytest.approx(expected_f)
         assert t.balance_at_entry == pytest.approx(10_000.0)
-        assert t.n == 2575
+        assert t.n == 2214
         # Sized on the LEG prices (pA + nB), never on (nA + pB)
-        assert t.total_cost == pytest.approx(2575 * (self._PA + self._NB))
-        assert t.total_cost == pytest.approx(1802.50)
+        assert t.total_cost == pytest.approx(2214 * (self._PA + self._NB))
+        assert t.total_cost == pytest.approx(1549.80)
         assert t.fees == pytest.approx(
-            fee_leg_exact(2575, self._PA) + fee_leg_exact(2575, self._NB))
-        assert t.fees == pytest.approx(81.12)
+            fee_leg_exact(2214, self._PA) + fee_leg_exact(2214, self._NB))
+        assert t.fees == pytest.approx(69.75)
         assert t.total_cost + t.fees <= 10_000.0 * t.kelly_fraction + 1e-9
-        assert t.expected_payoff == pytest.approx(691.38)
+        assert t.expected_payoff == pytest.approx(594.45)
 
     def test_event_by_earlier_deadline_wins(self, monkeypatch):
         # EA yes, EB yes: YES on EA pays n, NO on EB worthless
@@ -2635,10 +3196,10 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(trades) == 1
         t = trades[0]
         self._assert_entry_and_sizing(t)
-        assert t.actual_payoff == pytest.approx(2575.0)
-        assert t.profit == pytest.approx(691.38)
+        assert t.actual_payoff == pytest.approx(2214.0)
+        assert t.profit == pytest.approx(594.45)
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_594.45)
 
     def test_event_never_by_later_deadline_wins(self, monkeypatch):
         # EA no, EB no: NO on EB pays n, YES on EA worthless
@@ -2646,10 +3207,10 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(trades) == 1
         t = trades[0]
         self._assert_entry_and_sizing(t)
-        assert t.actual_payoff == pytest.approx(2575.0)
-        assert t.profit == pytest.approx(691.38)
+        assert t.actual_payoff == pytest.approx(2214.0)
+        assert t.profit == pytest.approx(594.45)
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_691.38)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_594.45)
 
     def test_event_in_between_loses_the_full_stake(self, monkeypatch):
         # EA no, EB yes: both legs worthless — the loss cell
@@ -2658,10 +3219,10 @@ class TestRunBacktestTimeSeriesFlow:
         t = trades[0]
         self._assert_entry_and_sizing(t)
         assert t.actual_payoff == pytest.approx(0.0)
-        assert t.profit == pytest.approx(-1883.62)
+        assert t.profit == pytest.approx(-1619.55)
         assert t.profit == pytest.approx(-(t.total_cost + t.fees))
-        assert t.slippage == pytest.approx(-1883.62 - 691.38)
-        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1883.62)
+        assert t.slippage == pytest.approx(-1619.55 - 594.45)
+        assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1619.55)
 
     def test_premise_violation_is_excluded_and_warned(self, monkeypatch, caplog):
         # EA yes, EB no cannot happen for a cumulative-deadline pair: the
@@ -2688,15 +3249,18 @@ class TestRunBacktestTimeSeriesFlow:
                        for r in caplog.records)
 
     def test_wide_gap_is_capped_at_budget_fraction(self, monkeypatch):
-        # Later candle 0.70 / 0.30: gap 0.40, legs 0.60, p = 0.70 — the
-        # uncapped Kelly fraction is ~0.214, so BUDGET_FRACTION binds.
-        trades, _ = self._run(monkeypatch, "yes", "yes", eb_yes=0.70, eb_no=0.30)
+        # Later candle 0.85 / 0.15: gap 0.55, legs 0.45, p = 0.5875 — the
+        # uncapped Kelly fraction is ~0.216, so BUDGET_FRACTION binds. The gap
+        # had to widen from 0.40 to 0.55 when DR-62 put the fee into Kelly's
+        # denominator: at the old 0.70 / 0.30 candle f* is now 0.1905, just
+        # under the cap, so that fixture no longer exercises the cap at all.
+        trades, _ = self._run(monkeypatch, "yes", "yes", eb_yes=0.85, eb_no=0.15)
         assert len(trades) == 1
         t = trades[0]
         assert t.pair_type == "time_series"
-        assert t.entry_nB == pytest.approx(0.30)
-        uncapped = self._expected_kelly(self._PA, 0.30, 0.70)
-        assert uncapped == pytest.approx(0.214, abs=1e-3)
+        assert t.entry_nB == pytest.approx(0.15)
+        uncapped = self._expected_kelly(self._PA, 0.15, 0.85)
+        assert uncapped == pytest.approx(0.216, abs=1e-3)
         assert uncapped > BUDGET_FRACTION
         assert t.kelly_fraction == pytest.approx(BUDGET_FRACTION)
         assert t.total_cost + t.fees <= 10_000.0 * BUDGET_FRACTION + 1e-9
@@ -2725,7 +3289,7 @@ class TestRunBacktestTimeSeriesFlow:
 
         # _run's monkeypatches are still in force, so the prologue replays the
         # very same fixture markets and candles run_backtest just consumed.
-        raw_entries = backtester._prepare_entries(
+        raw_entries, _coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 1, 1), True, None
         )
         point = backtester._simulate_at_discount(
@@ -2744,9 +3308,15 @@ class TestRunBacktestTimeSeriesFlow:
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: pytest.fail("fetch must be skipped"))
         today = date.today()
-        assert backtester._prepare_entries(
+        # The sentinel lives on ELEMENT 0 of the returned pair: a caller that
+        # forgot to unpack would hold a 2-tuple, which is never None, so its
+        # guard would silently go false. Assert the shape explicitly.
+        raw_entries, coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), today + timedelta(days=1), True, None
-        ) is None
+        )
+        assert raw_entries is None
+        # No census either: the fetch never ran, so there was no corpus.
+        assert coverage is None
 
     def _prepared(self, monkeypatch, result_a, result_b, eb_yes=None, eb_no=None):
         # _run installs the fixture's fetch monkeypatches and leaves them in
@@ -2754,9 +3324,10 @@ class TestRunBacktestTimeSeriesFlow:
         # candles run_backtest just consumed (the idiom
         # test_default_k_equals_explicit_config_k already uses).
         self._run(monkeypatch, result_a, result_b, eb_yes=eb_yes, eb_no=eb_no)
-        return backtester._prepare_entries(
+        raw_entries, _coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 1, 1), True, None
         )
+        return raw_entries
 
     def test_calibration_is_k_independent(self, monkeypatch):
         # The in-between cell: this pair is exactly what the discount models.
@@ -3308,7 +3879,7 @@ class TestSimulationsAreLabelledWithTheirDiscount:
 
     def test_every_swept_point_is_distinguishable(self, monkeypatch, caplog):
         monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", [0.50, 0.75])
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -3320,7 +3891,7 @@ class TestSimulationsAreLabelledWithTheirDiscount:
         assert len(completions) == len({c.split(":")[0] for c in completions})
 
     def test_the_primary_slot_is_announced(self, monkeypatch, caplog):
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -3375,11 +3946,13 @@ class TestFeasibilityWindowIsMeasuredInUTC:
         reached = []
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: reached.append(True) or [])
-        out = backtester._prepare_entries(
+        out, coverage = backtester._prepare_entries(
             MagicMock(), MagicMock(), self._START, False, None,
         )
         assert reached == [True]
         assert out == []
+        # The fetch ran, so a census was taken — over an empty corpus.
+        assert coverage is not None and coverage.total == 0
 
     def test_a_genuinely_infeasible_window_still_short_circuits(self, monkeypatch):
         # GUARD: moving to UTC must not disarm the check. Tuesday to Friday
@@ -3389,9 +3962,11 @@ class TestFeasibilityWindowIsMeasuredInUTC:
             backtester, "fetch_all_settled_markets",
             lambda *a, **k: pytest.fail("fetch must be skipped"),
         )
+        # Element 0 carries the sentinel; element 1 is None because no corpus
+        # was ever censused on this path.
         assert backtester._prepare_entries(
             MagicMock(), MagicMock(), date(2026, 8, 25), False, None,
-        ) is None
+        ) == (None, None)
 
     def test_the_local_date_is_not_what_is_measured(self, monkeypatch):
         # Pins the seam itself: the frozen instant's LOCAL date is behind its

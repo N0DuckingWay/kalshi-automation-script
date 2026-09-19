@@ -12,6 +12,7 @@ so these tests stay fully offline. Both sites are Kalshi-controlled
 interval-discount section is tested the same way: _section_interval_discount()
 is driven from a hand-built BacktestSweep, never through generate_dashboard().
 """
+import dataclasses
 import math
 import re
 from datetime import date, timedelta
@@ -19,12 +20,13 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from kalshi_betting import config, dashboard
+from kalshi_betting import backtester, config, dashboard
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
     IntervalCalibration,
     IntervalCalibrationBucket,
+    OutcomeLabelCoverage,
     SweepPoint,
 )
 from kalshi_betting.config import (
@@ -118,21 +120,25 @@ class TestKellyFraction:
     prices time-series pairs through config.time_series_profit_prob."""
 
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1884
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620.
+        # b's denominator carries the fee — the dollars at risk include it,
+        # because a losing pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
-        net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-        b = net_spread / (pA + nB)
+        fee = fee_per_pair_approx(pA, nB)
+        net_spread = (1.0 - pA - nB) - fee
+        b = net_spread / (pA + nB + fee)
         p = time_series_profit_prob(pA, pB)
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(p - (1 - p) / b)
-        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1884, abs=1e-4)
+        assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1620, abs=1e-4)
 
     def test_time_series_wide_book_clamps_to_zero(self):
         assert _kelly_fraction(0.30, 0.70, 0.60, 0.50, "time_series") == 0.0
 
     def test_same_title_prices_nA_pB_on_the_prior(self):
         nA, pB = 0.20, 0.30
-        net_spread = (1.0 - nA - pB) - fee_per_pair_approx(nA, pB)
-        b = net_spread / (nA + pB)
+        fee = fee_per_pair_approx(nA, pB)
+        net_spread = (1.0 - nA - pB) - fee
+        b = net_spread / (nA + pB + fee)
         p = SAME_TITLE_CO_RESOLVE_PROB
         assert _kelly_fraction(0.70, nA, pB, 0.65, "same_title") == pytest.approx(p - (1 - p) / b)
 
@@ -173,10 +179,10 @@ class TestKellyFractionIntervalDiscount:
 
     def test_explicit_k_wins_over_a_monkeypatched_constant(self, monkeypatch):
         # The constant is set to the never-trade value; the explicit k must
-        # still produce the configured-k fixture's ~0.1884 fraction.
+        # still produce the configured-k fixture's ~0.1620 fraction.
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
-                               "time_series", k=0.75) == pytest.approx(0.1884, abs=1e-4)
+                               "time_series", k=0.75) == pytest.approx(0.1620, abs=1e-4)
         # ...and with no override the patched constant governs, proving the
         # sentinel is resolved at call time rather than bound at def time.
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
@@ -308,6 +314,224 @@ class TestSectionIntervalDiscount:
         out = _section_interval_discount(sweep)
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
         assert "<script>alert(1)" not in out
+
+
+def _coverage(with_subtitle: int, total: int = 100) -> OutcomeLabelCoverage:
+    """An OutcomeLabelCoverage shaped exactly as the census produces one.
+
+    below_floor is computed here the same way the census computes it, so a
+    fixture can never claim a verdict its own numbers contradict — but the
+    DASHBOARD never recomputes it: it branches on the carried flag.
+    """
+    fraction = with_subtitle / total if total else None
+    return OutcomeLabelCoverage(
+        total=total,
+        with_subtitle=with_subtitle,
+        with_event_title=with_subtitle,
+        subtitle_fraction=fraction,
+        event_title_fraction=fraction,
+        below_floor=(fraction is not None
+                     and fraction < config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION),
+    )
+
+
+class TestOutcomeLabelCoverageIsRendered:
+    """DR-66b: the census that DR-66 taught the LOG to emit must also reach the
+    page.
+
+    The k̂ card beside it is a recommendation for the real-money constant
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT, and backtest.py's closing line points
+    the operator at the HTML — so a reader of that page must be able to tell a
+    label-less run from a good one. Before this, the strings "subtitle",
+    "coverage" and "strike-blind" were all absent from a 140kB dashboard
+    generated from a run whose census had logged 0.00% coverage.
+    """
+
+    @staticmethod
+    def _sweep(coverage) -> BacktestSweep:
+        points = _sweep_points([0.75])
+        return BacktestSweep(primary=points[0], points=points,
+                             calibration=_calibration(), label_coverage=coverage)
+
+    # ── Below the floor: the caveat, its consequence and its remedy ──────────
+
+    def test_the_banner_renders_below_the_floor(self):
+        out = _section_interval_discount(self._sweep(_coverage(2, total=100)))
+
+        # This run's own numbers, and the configured floor — never a figure
+        # measured on some other run (TS-07).
+        assert "2.00%" in out
+        assert f"{config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0:.2f}%" in out
+        # The consequence: the pair population is not the shipped scanner's.
+        assert "strike-blind" in out
+        assert "different strategy" in out
+        # The remedy, including the trap that --no-cache alone is not enough.
+        assert "backtest_cache/archive_days/" in out
+        assert "backtest_cache/live_days/" in out
+        assert "--no-cache" in out
+        assert "ALONE does not refresh the day slices" in out
+
+    def test_the_caveat_travels_with_the_khat_card(self):
+        # A reader who sees only the KPI cards — or screenshots them — must not
+        # get a bare recommendation. The label is SUFFIXED, never replaced.
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert "Pooled empirical k̂" in out
+        assert "Pooled empirical k̂ (see caveat above)" in out
+        # ...and the number is recoloured to the warning colour, which the
+        # healthy render does not do to it.
+        assert 'color:#F44336;">0.600' in out
+
+    def test_the_banner_precedes_the_cards(self):
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert out.index("strike-blind") < out.index("Pooled empirical k̂")
+
+    def test_the_section_still_renders_everything_else(self):
+        # The banner is additive: the table, the selector and the sweep table
+        # must all survive it.
+        out = _section_interval_discount(self._sweep(_coverage(2)))
+        assert "updatemenus" in out
+        assert "POOLED" in out
+        assert "k used (this run)" in out
+
+    # ── Healthy: the figure is still rendered, and the caveat is not ─────────
+
+    def test_healthy_coverage_renders_the_figure_without_a_banner(self):
+        out = _section_interval_discount(self._sweep(_coverage(97, total=100)))
+
+        # Present, so a reader can CONFIRM the run was clean. Absence of a
+        # warning must not be the only signal — that is indistinguishable from
+        # the feature not existing.
+        assert "Outcome-label coverage" in out
+        assert "97.00%" in out
+        assert "97 of 100 eligible markets" in out
+        # ...and no caveat anywhere.
+        assert "strike-blind" not in out
+        assert "different strategy" not in out
+        assert "see caveat above" not in out
+        assert "Pooled empirical k̂" in out
+
+    def test_the_verdict_is_carried_not_recomputed(self):
+        # The page must branch on the census's own flag so it and the log can
+        # never fire on different conditions. A carrier whose numbers look low
+        # but whose verdict says otherwise renders NO banner.
+        lying = OutcomeLabelCoverage(
+            total=100, with_subtitle=1, with_event_title=1,
+            subtitle_fraction=0.01, event_title_fraction=0.01,
+            below_floor=False,
+        )
+        out = _section_interval_discount(self._sweep(lying))
+        assert "1.00%" in out            # the figure is still reported
+        assert "strike-blind" not in out  # but the verdict was not re-derived
+
+    # ── The two "nothing to report" states ──────────────────────────────────
+
+    def test_coverage_none_renders_no_banner_and_no_none(self):
+        # An older caller, a hand-built sweep, or the Monday-feasibility
+        # short-circuit: no census was taken. That is neither healthy nor low.
+        out = _section_interval_discount(self._sweep(None))
+        assert "was not measured for this run" in out
+        assert "strike-blind" not in out
+        assert "see caveat above" not in out
+        # No "None%" — and no bare "None" anywhere in the rendered fragment.
+        assert "None" not in out
+        # Everything the section rendered before is untouched.
+        assert "updatemenus" in out and "POOLED" in out
+        assert "Pooled empirical k̂" in out and "0.600" in out
+
+    def test_a_defaulted_sweep_still_renders(self):
+        # label_coverage is defaulted, so a construction that predates it must
+        # render the not-measured line rather than crash.
+        points = _sweep_points([0.75])
+        out = _section_interval_discount(
+            BacktestSweep(primary=points[0], points=points, calibration=None))
+        assert "was not measured for this run" in out
+        assert "None" not in out
+
+    def test_an_empty_corpus_is_not_reported_as_zero_percent(self):
+        # total == 0 makes the fraction UNDEFINED, not 0%: warning there would
+        # manufacture a drift alarm out of a corpus that simply has no records.
+        empty = OutcomeLabelCoverage(
+            total=0, with_subtitle=0, with_event_title=0,
+            subtitle_fraction=None, event_title_fraction=None,
+            below_floor=False,
+        )
+        out = _section_interval_discount(self._sweep(empty))
+        assert "no eligible markets to census" in out
+        assert "0.00%" not in out
+        assert "strike-blind" not in out
+        assert "None" not in out
+
+    def test_the_placeholder_path_is_untouched(self):
+        # The sweep-less placeholder must gain nothing: that page shows no k̂
+        # card either, so there is no number there to caveat.
+        out = _section_interval_discount(None)
+        assert "No interval-discount sweep for this run." in out
+        assert "Outcome-label coverage" not in out
+        assert "updatemenus" not in out
+
+
+class TestGenerateDashboardHeaderNotice:
+    """A strike-blind corpus changes WHICH PAIRS EXIST, so it taints every
+    STRATEGY-DERIVED section — the one-line header notice is the pointer for a
+    reader who never scrolls to the interval-discount section.
+
+    Deliberately not "all seven": _section_benchmark plots a yfinance ^GSPC
+    download, an external index series with no pair population behind it, so it
+    is unaffected. The notice said "every figure on this page" until that was
+    corrected; over-warning is the safe direction, but a caveat that overstates
+    its own scope is the thing a reader learns to discount.
+
+    generate_dashboard() is exercised here rather than only the section builder
+    because a unit test that does not prove the string reaches the rendered
+    page is exactly the gap DR-66b is about. yfinance is stubbed out, so this
+    stays offline; _section_benchmark already degrades on a failed download.
+    """
+
+    @staticmethod
+    def _offline(monkeypatch, tmp_path):
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    def _page(self, monkeypatch, tmp_path, **kwargs) -> str:
+        self._offline(monkeypatch, tmp_path)
+        out_path = dashboard.generate_dashboard(
+            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]),
+            date(2026, 1, 5), 1000.0, **kwargs)
+        return out_path.read_text(encoding="utf-8")
+
+    def test_the_notice_renders_below_the_floor(self, monkeypatch, tmp_path):
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration(),
+                              label_coverage=_coverage(2))
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+
+        assert ("the pairs behind every strategy-derived figure on this page "
+                "were grouped") in page
+        assert "strike-blind" in page
+        # The section's own full caveat is there too, with the remedy.
+        assert "ALONE does not refresh the day slices" in page
+
+    def test_no_notice_at_healthy_coverage(self, monkeypatch, tmp_path):
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration(),
+                              label_coverage=_coverage(97))
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+
+        assert "strike-blind" not in page
+        # ...but the figure itself is on the page, so a clean run is confirmable.
+        assert "97.00%" in page
+
+    def test_the_four_positional_call_still_works(self, monkeypatch, tmp_path):
+        # Constraint: no new parameter, and the pre-existing positional call
+        # renders as before — placeholder section, no coverage line, no notice.
+        page = self._page(monkeypatch, tmp_path)
+        assert "Kalshi Arbitrage Backtest" in page
+        assert "No interval-discount sweep for this run." in page
+        assert "strike-blind" not in page
+        assert "Outcome-label coverage" not in page
 
 
 class TestTitleEscaping:
@@ -629,3 +853,65 @@ class TestCalendarAnnualizationAtTheUnpinnedCallSites:
         # series, exactly like the performance card's.
         assert "updatemenus" in out
         assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR] * len(points)
+
+
+class TestDeploymentIsNotRenderedAsDrawdown:
+    """DR-61, at the render sites: the "Max Drawdown" KPI and the per-k sweep
+    table must report realized loss, not capital deployment.
+
+    backtester._build_equity_curve used to accumulate cash alone, so an open
+    position was carried at ZERO and the curve dived on entry and recovered at
+    settlement whatever the outcome. A real 2026-05-01 run rendered "Max
+    Drawdown -60.0%" for a k=1.00 point with three trades, all three
+    profitable and a +4.8% return.
+
+    This fixture is that shape in miniature: two winning time-series pairs on
+    $10, committing $7.34 of it on day one. Cash-only accounting renders
+    -73.4%; cost-basis carry renders the $0.34 of taker fees, -3.4%. The curve
+    is built by the REAL builder rather than make_equity(), because what is
+    under test is what that builder puts in the column.
+    """
+
+    _START = date(2026, 1, 5)
+    _INITIAL = 10.0
+
+    def _trades(self) -> list[BacktestTrade]:
+        first = make_trade()                       # entered 01-05, exits 01-12
+        second = dataclasses.replace(first, exit_date=date(2026, 1, 19),
+                                     holding_days=14)
+        return [first, second]
+
+    def _equity(self) -> pd.DataFrame:
+        return backtester._build_equity_curve(
+            self._trades(), self._START, self._INITIAL)
+
+    def test_the_fixture_is_all_winners_and_mostly_deployed(self):
+        trades = self._trades()
+        assert all(t.profit > 0 for t in trades)
+        assert all(t.entry_date == self._START for t in trades)
+        assert sum(t.total_cost + t.fees for t in trades) == pytest.approx(7.34)
+        assert sum(t.fees for t in trades) == pytest.approx(0.34)
+
+    def test_performance_card_renders_the_fees_not_the_deployment(self):
+        out = dashboard._section_performance(
+            self._equity(), self._trades(), self._START, self._INITIAL)
+
+        assert "Max Drawdown" in out
+        # The fees, on the day they were charged — not the -73.4% the
+        # deployment used to read as.
+        assert "-3.4% (2026-01-05)" in out
+        assert "-73.4%" not in out
+        # The endpoint is untouched by DR-61, so the headline return is the
+        # same number cash-only accounting produced.
+        assert "+26.6%" in out
+
+    def test_per_k_sweep_row_renders_the_same_drawdown(self):
+        point = SweepPoint(k=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+                           trades=self._trades(), equity_df=self._equity())
+        out = _section_interval_discount(
+            BacktestSweep(primary=point, points=[point], calibration=None))
+
+        assert "-3.4%" in out
+        assert "-73.4%" not in out
+        # Same base as the performance card's (DR-03's leading row).
+        assert "+26.6%" in out

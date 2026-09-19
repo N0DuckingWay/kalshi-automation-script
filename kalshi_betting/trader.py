@@ -101,11 +101,21 @@ Notes:
     transient 429 there cannot duplicate a trade — but it CAN escalate an
     otherwise-resolvable ambiguity into a rollback or manual_review. Do not
     "unify" _position_count with the submission paths in either direction. The
-    one read that is deliberately NOT retried is _confirm_v2_no_mapping's, via
-    _position_count_once: it sits inside the unhedged window between the NO
-    leg's fill and the YES leg's submission, where ~62s of backoff is worse than an
-    unproven mapping (which merely proceeds unlatched). Both readers share one
-    parse, _read_position, so only the retry policy differs.
+    reads that are deliberately NOT retried go through _position_count_once,
+    and both sit inside the window where the NO leg MAY be filled (on the
+    re-read path that is precisely what is being determined) and is certainly
+    unhedged, because the YES leg has not been submitted — and where ~62s of
+    backoff is the worse outcome:
+    _confirm_v2_no_mapping's mapping check (which merely proceeds unlatched on
+    a failed read) and _execute_one's NO-leg ledger-lag RE-READ. Both readers
+    share one parse, _read_position, so only the retry policy differs.
+
+    A position delta of ZERO across an ambiguous submission is not a confirmed
+    non-fill on its own: a transport error can be raised after the exchange
+    filled the order, and the ledger is read-after-write lagged. Every such
+    branch re-reads once after _V2_MAPPING_RECHECK_DELAY_SECONDS and judges the
+    re-read, so the bot no longer unwinds a live hedge (DR-63) or walks away
+    from an unhedged fill reporting a clean non-fill (DR-64).
 
     Money units in this module: contract prices are DOLLARS (float, or Decimal
     on the V2 price path), balances and order costs are integer CENTS, and the
@@ -317,11 +327,15 @@ _V2_PRICE_QUANTUM = Decimal("0.0001")
 # API changes.
 _V2_NO_MAPPING_CONFIRMED = False
 
-# Pause before re-reading a ZERO position in the NO-mapping backstop: zero
-# immediately after a confirmed fill is most often read-after-write lag in the
-# positions ledger, not disproof (genuine disproof MOVES the position, the
-# wrong way — the delta is what is judged, never the absolute sign). One second
-# is far above observed ledger lag and far below any price-staleness concern.
+# Pause before re-reading a ZERO position delta. Named for its first caller,
+# the V2 NO-mapping backstop, but it is now the module's single ledger-lag
+# delay and _execute_one's two ambiguous-leg branches use it too: a position
+# that has not moved immediately after a fill the exchange may already have
+# processed is most often read-after-write lag in the positions ledger, not
+# evidence of a non-fill (and, in the backstop, not disproof — genuine
+# disproof MOVES the position, the wrong way; the delta is what is judged,
+# never the absolute sign). One second is far above observed ledger lag and
+# far below any price-staleness concern.
 _V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
 
 
@@ -1058,13 +1072,16 @@ def _position_count_once(client: Any, ticker: str) -> float | None:
     backoff at all: exactly one request, then success or None. It exists for
     callers whose latency budget is bounded by something other than the read —
     the same reasoning _await_transfer_settlement uses for its single-shot
-    balance reads. The one caller today is _confirm_v2_no_mapping, which runs
-    inside the window where the NO leg is filled and unhedged:
-    api_call_with_retry can hold a single call for ~62s of sleeps during a 429
-    storm, and because a failing endpoint never latches the mapping, EVERY V2
-    trade in such a storm would pay that stall with a naked NO-leg position
-    open. One failed read costs the mapping check nothing (it proceeds
-    unlatched and re-arms).
+    balance reads. Both callers run inside the window where the NO leg may be
+    filled and is certainly unhedged, because the YES leg has not been
+    submitted yet: _confirm_v2_no_mapping's mapping check, and _execute_one's
+    ledger-lag re-read on an ambiguous NO leg. api_call_with_retry can hold a
+    single call for ~62s of sleeps during a 429 storm, and because a failing
+    endpoint never latches the mapping, EVERY V2 trade in such a storm would
+    pay that stall with a naked NO-leg position open. A failed read costs
+    neither caller anything it cannot absorb: the mapping check proceeds
+    unlatched and re-arms, and the re-read degrades to an unknown delta, which
+    _execute_one already handles as manual_review with no order submitted.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1107,7 +1124,7 @@ def _position_count(client: Any, ticker: str) -> float | None:
     GET cannot duplicate a trade. Without the retry a single transient 429 here
     reads as "state unknown" and escalates a recoverable ambiguity into a
     rollback or manual_review. The single-shot sibling _position_count_once is
-    for the one caller that cannot afford the backoff (see its docstring).
+    for the two callers that cannot afford the backoff (see its docstring).
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1707,10 +1724,17 @@ def ensure_shard_collateral(
         the funds manually in the Kalshi UI.
       * A transfer POST raises -> logged as an error and NOT retried (the
         endpoint is not idempotent); its shard simply stays unfunded.
-      * Transfers accepted but not settled within
+      * Transfers accepted but NOT OBSERVED to land within
         config.TRANSFER_SETTLE_TIMEOUT_SECONDS -> logged CRITICAL with the
         in-flight transfer ids ("money is in flight"), and only the trades
-        needing a still-unfunded shard are dropped.
+        needing a still-unfunded shard are dropped. The verdict is the
+        settlement OBSERVATION, not the fact that a transfer was headed there:
+        a shard whose accepted transfers were all observed to land and merely
+        fell short of its deficit gets a WARNING naming the shortfall instead.
+        That warning states only what was observed and asserts no cause — the
+        shard may be short because a leg was blocked, because a POST raised,
+        or because there was no surplus left, and this function cannot tell
+        which.
 
     This is genuinely live, not a placeholder for a future migration: Kalshi
     moved all combo/MVE markets to shard 1, crypto to shard 2, and
@@ -1803,17 +1827,19 @@ def ensure_shard_collateral(
             cents / 100, source, dest, transfer_id,
         )
 
+    # What the accepted transfers can actually deliver per shard — the lesser
+    # of its requirement and its prior balance plus the cents moved toward it —
+    # so an unfundable shard can't stall the wait. This is also the yardstick
+    # the in-flight verdict below is measured against, which is why it is
+    # defined for both branches rather than only inside the wait.
+    awaitable = {
+        dest: min(required[dest], shard_balances.get(dest, 0) + moved)
+        for dest, moved in accepted_cents.items()
+        if dest in required
+    }
     if accepted_cents:
         # Acceptance is not settlement: block (bounded) until a fresh balance
-        # read proves the money landed before any order relies on it. Await
-        # only what the accepted transfers can actually deliver per shard —
-        # the lesser of its requirement and its prior balance plus the cents
-        # moved toward it — so an unfundable shard can't stall the wait.
-        awaitable = {
-            dest: min(required[dest], shard_balances.get(dest, 0) + moved)
-            for dest, moved in accepted_cents.items()
-            if dest in required
-        }
+        # read proves the money landed before any order relies on it.
         confirmed = _await_transfer_settlement(client, awaitable)
     else:
         # Nothing moved, so the opening balances are still the truth — don't
@@ -1825,16 +1851,55 @@ def ensure_shard_collateral(
         logging.info("All shard collateral requirements confirmed funded.")
         return portfolio
 
-    # MONEY IS IN FLIGHT applies only to shards an accepted transfer was headed
-    # for and that still read short — a shard whose transfer was never accepted
-    # is merely unfunded (already logged above), not ambiguous.
-    in_flight = sorted(s for s in unfunded if s in accepted_cents)
+    # MONEY IS IN FLIGHT means "an accepted transfer was not OBSERVED to land",
+    # and that is decided by the SETTLEMENT OBSERVATION, never by a shard's
+    # membership in accepted_cents (DR-65). `awaitable` is exactly what the
+    # accepted transfers could deliver, so a confirmed balance at or above it
+    # proves the money arrived; such a shard reads short only because the plan
+    # could not cover its whole deficit — an ordinary degraded outcome, not an
+    # ambiguous one. Keying on membership alone fired the critical on a
+    # transfer whose arrival the same log line's own `confirmed` map showed.
+    #
+    # Known residual: "landed" is inferred from a balance THRESHOLD against
+    # this run's opening shard_balances, not from the transfer's own status.
+    # An unrelated credit to the deficit shard of at least the accepted cents,
+    # arriving inside the poll while the transfer is genuinely stuck, would
+    # suppress this critical. The inverse (a debit) only over-reports, which
+    # is the safe direction, and the settle wait's success condition already
+    # carried the same aliasing.
+    in_flight = sorted(
+        s for s in unfunded if confirmed.get(s, 0) < awaitable.get(s, 0)
+    )
     if in_flight:
         logging.critical(
             "Collateral transfer(s) did not settle within %ss — MONEY IS IN FLIGHT, "
             "CHECK THE ACCOUNT. transfer_ids=%s; shard(s) still under-funded: %s "
             "(required %s, confirmed %s)",
             TRANSFER_SETTLE_TIMEOUT_SECONDS, accepted, in_flight, required, confirmed,
+        )
+    # Accepted, OBSERVED to land, and still short. Report only that — the code
+    # knows the shard is short but nothing about WHY: a planned leg may have
+    # been blocked by inactive transfers, its POST may have raised (which the
+    # server could still have accepted, leaving that shard out of
+    # accepted_cents entirely), or there may simply have been no surplus left.
+    # Asserting a cause here, or asserting the negative "nothing is in flight",
+    # would be an affirmative denial the observation does not support — and in
+    # the raised-POST case a false one. The shortfall is a normal degraded
+    # outcome, so it is a warning rather than a money-in-flight alarm.
+    settled_short = sorted(
+        s for s in unfunded if s in accepted_cents and s not in set(in_flight)
+    )
+    if settled_short:
+        logging.warning(
+            "Collateral transfer(s) to shard(s) %s were OBSERVED to land but did "
+            "not cover the full requirement. Shortfall in cents by shard: %s "
+            "(required %s, confirmed %s). See any transfer warnings/errors above "
+            "for what could not be moved. "
+            "Trades needing these shards are dropped below.",
+            settled_short,
+            {s: required[s] - confirmed.get(s, 0) for s in settled_short},
+            {s: required[s] for s in settled_short},
+            {s: confirmed.get(s, 0) for s in settled_short},
         )
 
     # Both legs must be payable — a funded NO leg with an unpayable YES leg is
@@ -1888,8 +1953,9 @@ def _confirm_v2_no_mapping(
     for every market.
 
     The position read here is _position_count_once — SINGLE-SHOT, never
-    retried, unlike every other position read in this module. It is the one
-    blocking call inside the window where the NO leg is filled and unhedged,
+    retried, one of the two such reads in this module (the other is
+    _execute_one's NO-leg ledger-lag re-read). It is a blocking call inside
+    the window where the NO leg is filled and unhedged,
     and api_call_with_retry's backoff can hold one call for ~62s of sleeps;
     worse, a failing endpoint never latches, so in a 429 storm EVERY V2 trade
     would pay that stall with a naked NO leg. Same trade-off, and the same
@@ -2032,20 +2098,38 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     network call sits between the NO leg's fill and the YES leg's submission —
     that gap is the unhedged window.
 
-    NO leg ambiguous resolves as: delta 0 → confirmed non-fill,
-    status="failed"; delta of exactly -no_leg.count (our NO buy — a held NO
-    reads negative on Kalshi's signed ledger) → unwind via _rollback_no_leg.
-    Anything else — the lookup failed, or the position moved by an amount this
-    order cannot explain — is status="manual_review" with NO automated unwind:
-    a reduce_only sell against a position this order may not own would
-    liquidate an unrelated holding.
+    A delta of ZERO is not taken at face value on either leg. A transport error
+    can be raised milliseconds after the exchange filled the order, and the
+    positions ledger is read-after-write lagged, so an unmoved first reading is
+    ambiguous rather than confirmatory (DR-63/DR-64 — the same reasoning
+    _confirm_v2_no_mapping already applies). Each ambiguous leg therefore
+    re-reads its own ticker ONCE after _V2_MAPPING_RECHECK_DELAY_SECONDS before
+    concluding "non-fill", and it is the re-read's delta that is judged. The NO
+    leg's re-read is SINGLE-SHOT (_position_count_once) because it sits in the
+    unhedged window; the YES leg's is the ordinary retried read, matching the
+    first read beside it, because a single-shot re-read that FAILS yields an
+    unknown delta and therefore manual_review, which leaves the NO leg
+    unhedged indefinitely — strictly worse than a bounded wait followed by a
+    correct unwind, and a recoverable ambiguity must not be escalated by a
+    transient 429. The residual: in the branch where the YES leg genuinely did
+    not fill, that retried re-read can delay the loss-floored unwind by up to
+    ~62s of backoff on top of the pause, which can turn a rolled_back into a
+    rollback_failed orphan. The first read beside it already carried that.
+
+    NO leg ambiguous resolves as: delta 0 on both readings → confirmed
+    non-fill, status="failed"; delta of exactly -no_leg.count (our NO buy — a
+    held NO reads negative on Kalshi's signed ledger) → unwind via
+    _rollback_no_leg. Anything else — either lookup failed, or the position
+    moved by an amount this order cannot explain — is status="manual_review"
+    with NO automated unwind: a reduce_only sell against a position this order
+    may not own would liquidate an unrelated holding.
 
     YES leg ambiguous resolves as: delta of exactly +yes_leg.count → the pair
-    actually completed, status="executed"; delta 0 → confirmed non-fill, roll
-    the NO leg back. Anything else — including an UNKNOWN state because the
-    lookup itself failed — is never auto-rolled-back (an automated unwind
-    could reverse a real fill we simply couldn't confirm) and is surfaced as
-    status="manual_review" for a human to check the account.
+    actually completed, status="executed"; delta 0 on both readings → confirmed
+    non-fill, roll the NO leg back. Anything else — including an UNKNOWN state
+    because a lookup itself failed — is never auto-rolled-back (an automated
+    unwind could reverse a real fill we simply couldn't confirm) and is
+    surfaced as status="manual_review" for a human to check the account.
 
     While the LEGACY order path is selected, a pair with a leg on a shard that
     endpoint cannot route to is refused before anything is submitted (see
@@ -2109,13 +2193,15 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     # and taking it now means no RETRYABLE network call sits between the NO
     # leg's fill and the YES leg's submission. Reading it after the NO leg
     # filled put a retryable lookup (up to ~62s of backoff) inside the window
-    # where the account holds an unhedged NO position. One exception, by
-    # design: on the V2 path, until the NO-leg mapping latches,
-    # _confirm_v2_no_mapping does one SINGLE-SHOT (never retried, so bounded by
-    # a single request) position read in that window — the mapping cannot be
-    # proven any other way, and a single-shot read is the same bounded-wait
-    # idiom _await_transfer_settlement uses. It costs at most one round trip
-    # and disappears for the rest of the process once confirmed.
+    # where the account holds an unhedged NO position. Two reads are exceptions
+    # to "nothing in that window", and both are SINGLE-SHOT (never retried, so
+    # each is bounded by a single request), which is what keeps the claim above
+    # true of RETRYABLE calls: on the V2 path, until the NO-leg mapping latches,
+    # _confirm_v2_no_mapping reads once there — the mapping cannot be proven any
+    # other way — and an ambiguous NO leg whose ledger reads unchanged re-reads
+    # once there after a 1s pause (DR-64). Both use the same bounded-wait idiom
+    # _await_transfer_settlement uses; the mapping read costs at most one round
+    # trip and disappears for the rest of the process once confirmed.
     before_no = _position_count(client, no_leg.market.ticker)
     before_yes = _position_count(client, yes_leg.market.ticker)
 
@@ -2149,7 +2235,34 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
         after_no = _position_count(client, no_leg.market.ticker)
         delta = _fill_delta(before_no, after_no)
         if delta is not None and abs(delta) < _DELTA_EPS:
-            # Confirmed non-fill: the position did not move at all
+            # A zero delta is only a CONFIRMED non-fill once the ledger has had
+            # a chance to catch up (DR-64). A transport error can be raised
+            # milliseconds after the exchange processed — and FILLED — the
+            # order, and the positions ledger is read-after-write lagged, so an
+            # unmoved first reading is ambiguous exactly as it is in
+            # _confirm_v2_no_mapping. Without this re-read the run walked away
+            # reporting "failed — nothing to unwind" while a full-size,
+            # UNHEDGED NO position was open, and no status in the
+            # EXIT_TRADES_NEED_ATTENTION set escalated it.
+            #
+            # The re-read is _position_count_once — SINGLE-SHOT. This is the
+            # unhedged window: the YES leg has not been submitted, so if the NO
+            # leg did fill the account is one-sided while we wait, and
+            # api_call_with_retry can hold one call for ~62s of backoff. The
+            # first read above stays retried (unchanged).
+            logging.info(
+                "NO leg (%s) raised for '%s' and the ledger reads unchanged —"
+                " re-reading once after %ss before calling it a non-fill",
+                no_leg.label, spec.pair.canonical_title,
+                _V2_MAPPING_RECHECK_DELAY_SECONDS,
+            )
+            time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
+            delta = _fill_delta(
+                before_no, _position_count_once(client, no_leg.market.ticker)
+            )
+        if delta is not None and abs(delta) < _DELTA_EPS:
+            # Confirmed non-fill: the position did not move at all, on two
+            # readings a short pause apart
             logging.error(
                 "NO leg (%s) submission failed for '%s' (position unchanged —"
                 " no fill): %s",
@@ -2222,6 +2335,41 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             # hedge.
             after_yes = _position_count(client, yes_leg.market.ticker)
             delta = _fill_delta(before_yes, after_yes)
+            if delta is not None and abs(delta) < _DELTA_EPS:
+                # A zero delta is only a CONFIRMED non-fill once the ledger has
+                # had a chance to catch up (DR-63). The YES leg's POST can reach
+                # the exchange and FILL milliseconds before the client sees a
+                # transport error, and the positions ledger is
+                # read-after-write lagged — so an unmoved first reading looked
+                # identical to a clean non-fill and sent the reduce-only unwind
+                # of a NO leg that was, in truth, hedging a real YES fill. That
+                # sold the hedge, left a full-size naked YES position open, and
+                # reported it as "rolled_back", which means flat.
+                #
+                # Retried (_position_count), unlike the NO-leg re-read above:
+                # this read's immediate neighbour is already retried, and the
+                # decision being protected — do not sell a live hedge — is
+                # exactly the ambiguity CLAUDE.md says the retry exists to
+                # preserve. The deciding argument is what a FAILED single-shot
+                # re-read would cost: an unknown delta, hence manual_review,
+                # which leaves the NO leg unhedged INDEFINITELY — strictly
+                # worse than a bounded wait and a correct unwind. The residual
+                # is the mirror of that: in the branch where the YES leg truly
+                # did not fill, the NO leg IS unhedged and this read can hold
+                # its loss-floored unwind for up to ~62s of backoff, long
+                # enough to turn a rolled_back into a rollback_failed orphan.
+                # The first read above already carried that same exposure.
+                logging.info(
+                    "YES leg (%s) raised for '%s' and the ledger reads"
+                    " unchanged — re-reading once after %ss before rolling the"
+                    " NO leg back",
+                    yes_leg.label, spec.pair.canonical_title,
+                    _V2_MAPPING_RECHECK_DELAY_SECONDS,
+                )
+                time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
+                delta = _fill_delta(
+                    before_yes, _position_count(client, yes_leg.market.ticker)
+                )
             if delta is not None and abs(delta - yes_leg.count) < _DELTA_EPS:
                 # Moved by exactly +yes_leg.count: our YES buy filled, pair
                 # complete

@@ -265,9 +265,10 @@ def positions_seq(*readings) -> MagicMock:
     reads BOTH baselines up front — the NO leg's ticker first, then the YES
     leg's, before either order is submitted, so no blocking call sits in the
     unhedged window between the NO leg's fill and the YES leg's submission —
-    and then once more after an ambiguous leg, so the script is consumed in
-    that order:
-        before_no, before_yes, [backstop], [after_no], [after_yes]
+    and then once (or twice) more after an ambiguous leg, so the script is
+    consumed in that order:
+        before_no, before_yes, [backstop], [after_no], [no lag re-read],
+        [after_yes], [yes lag re-read]
     (for the same-title default that is TICK-A, TICK-B, ...; for a
     time_series spec it is TICK-B, TICK-A, ...).
 
@@ -275,6 +276,14 @@ def positions_seq(*readings) -> MagicMock:
     read (see TestV2NoMappingBackstop); it hits the same client method, so it
     consumes a script entry like any other, but only on the V2 path and only
     while the mapping is unlatched.
+
+    The optional lag re-read slots (DR-63/DR-64) are consumed only when the
+    corresponding leg's first post-failure delta is ZERO: _execute_one then
+    re-reads that leg's ticker once, after a pause, before concluding
+    "confirmed non-fill". An ambiguous-leg test whose first reading is
+    unmoved therefore needs one MORE script entry than it did before those
+    findings; under-providing one raises StopIteration rather than repeating
+    the last reading.
 
     A flat return_value cannot express this: before and after would be equal,
     which is precisely the delta-0 "confirmed non-fill" case.
@@ -530,27 +539,35 @@ class TestNoLegExceptionDisambiguation:
     def _use_legacy(self, legacy_mode):
         """Exercises the legacy submission path's exception handling."""
 
-    def test_no_movement_is_failed(self):
-        # Exception + position unchanged → confirmed non-fill, no rollback sent
+    def test_no_movement_is_failed(self, monkeypatch):
+        # Exception + position unchanged → confirmed non-fill, no rollback sent.
+        # RE-PINNED (DR-64) from a three-entry script: a zero delta is only a
+        # confirmed non-fill once the LAG RE-READ has also come back zero, so
+        # the genuine-non-fill case now scripts a fourth, still-unmoved reading.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
-        # before_no, before_yes (both up front), then after_no
-        client.get_positions_without_preload_content = positions_seq(None, None, None)
+        # before_no, before_yes (both up front), then after_no, then the re-read
+        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert client.create_order_without_preload_content.call_count == 1
 
-    def test_external_no_position_unchanged_is_failed_not_unwound(self):
+    def test_external_no_position_unchanged_is_failed_not_unwound(self, monkeypatch):
         # REGRESSION (BS-01): the account already holds 10 NO contracts on
         # TICK-A from an earlier run, and our order genuinely did not fill.
         # The old absolute check (held_a != 0) unwound that unrelated holding;
         # the delta is 0, so this must be a clean "failed" with NO sell order.
+        # RE-PINNED (DR-64) from a three-entry script — the fourth reading is
+        # the lag re-read, still unmoved because this really is a non-fill.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", -10),   # before_no
             None,              # before_yes (taken up front, unused here)
             ("TICK-A", -10),   # after_no — unmoved
+            ("TICK-A", -10),   # lag re-read — still unmoved
         )
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
@@ -644,12 +661,16 @@ class TestYesLegExceptionDisambiguation:
         # No rollback order was submitted
         assert client.create_order_without_preload_content.call_count == 2
 
-    def test_external_yes_position_unchanged_rolls_back(self):
+    def test_external_yes_position_unchanged_rolls_back(self, monkeypatch):
         # HEADLINE REGRESSION (BS-01): the account already holds 5 YES
         # contracts on TICK-B, and YES leg did NOT fill. The old truthiness
         # check (`if held_b:`) read that stale holding as our fill and
         # reported "executed", leaving NO leg unhedged and the log claiming a
         # complete pair. The delta is 0, so NO leg must be rolled back.
+        # RE-PINNED (DR-63) from a three-entry script: a zero delta is only a
+        # confirmed non-fill once the LAG RE-READ has also come back zero, so
+        # the genuine-non-fill case scripts a fourth, still-unmoved reading.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # NO leg
@@ -660,19 +681,23 @@ class TestYesLegExceptionDisambiguation:
             None,              # before_no
             ("TICK-B", 5),     # before_yes — pre-existing external position
             ("TICK-B", 5),     # after_yes — unmoved
+            ("TICK-B", 5),     # lag re-read — still unmoved
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
         assert client.create_order_without_preload_content.call_count == 3
 
-    def test_no_position_at_all_rolls_back(self):
+    def test_no_position_at_all_rolls_back(self, monkeypatch):
+        # RE-PINNED (DR-63) from a three-entry script — the fourth reading is
+        # the lag re-read, still flat because this really is a non-fill.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         client = MagicMock()
         client.create_order_without_preload_content = MagicMock(side_effect=[
             order_resp("executed"),   # NO leg
             TimeoutError("timeout"),  # YES leg raises, truly unfilled
             order_resp("executed"),   # rollback fills
         ])
-        client.get_positions_without_preload_content = positions_seq(None, None, None)
+        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
 
@@ -714,6 +739,230 @@ class TestYesLegExceptionDisambiguation:
         assert result.status == "manual_review"
         # No rollback order was submitted — only NO leg and YES leg's attempt
         assert client.create_order_without_preload_content.call_count == 2
+
+
+class TestLedgerLagOnAmbiguousLegs:
+    """DR-63/DR-64: a position delta of ZERO is not on its own a confirmed
+    non-fill.
+
+    A transport error — urllib3.ProtocolError / ConnectionError /
+    ReadTimeoutError, the classes _http._TRANSIENT_NETWORK_ERRORS lists as
+    observed live — can be raised milliseconds AFTER the exchange processed and
+    FILLED the order, and Kalshi's positions ledger is read-after-write lagged.
+    A single post-failure read therefore returns the PRE-fill value, and the
+    bot concluded "no fill" on a leg that had filled:
+
+      * YES leg (DR-63): it submitted the reduce-only unwind of a NO leg that
+        was in truth hedging a real YES fill — selling the hedge, leaving a
+        full-size naked YES position open, and reporting "rolled_back", which
+        means flat.
+      * NO leg (DR-64): it returned "failed" ("nothing to unwind") with a
+        full-size UNHEDGED NO position open. "failed" is not in the set
+        main._run_prod maps to EXIT_TRADES_NEED_ATTENTION, so the run exited 0
+        and the Excel row read as a pair that never traded.
+
+    Each ambiguous branch now re-reads its own ticker ONCE after
+    trader._V2_MAPPING_RECHECK_DELAY_SECONDS and judges the re-read — the same
+    reasoning _confirm_v2_no_mapping applies (DR-21) and v2_probe applies twice
+    over (DR-60, DR-20). It does NOT touch the absolute-vs-delta rule, which
+    settles which QUANTITY is evidence, not how many times it is read.
+
+    The NO-leg re-read must be SINGLE-SHOT: it sits in the unhedged window (the
+    YES leg has not been submitted), where api_call_with_retry's ~62s of
+    backoff is the worse outcome. The YES-leg re-read is the ordinary retried
+    read, matching the first read beside it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mode, v2_mapping_confirmed):
+        """The production default path, with the NO-mapping backstop already
+        latched so it cannot consume these cases' position scripts."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        """Record (and skip) the ledger-lag pause."""
+        recorded: list[float] = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: recorded.append(s))
+        return recorded
+
+    @pytest.fixture
+    def readers(self, monkeypatch):
+        """Record which reader each position lookup went through.
+
+        Both readers hit the same client method, so a call count alone cannot
+        tell them apart; this wraps the module-level names _execute_one
+        resolves at call time and delegates to the real implementations, so
+        retry policy is unchanged and only the routing is observed.
+        """
+        seen: list[tuple[str, str]] = []
+        real_once = trader._position_count_once
+        real_retried = trader._position_count
+
+        def once(client, ticker):
+            seen.append(("once", ticker))
+            return real_once(client, ticker)
+
+        def retried(client, ticker):
+            seen.append(("retried", ticker))
+            return real_retried(client, ticker)
+
+        monkeypatch.setattr(trader, "_position_count_once", once)
+        monkeypatch.setattr(trader, "_position_count", retried)
+        return seen
+
+    def test_yes_leg_lagging_ledger_is_not_rolled_back(self, post, slept):
+        # DR-63: the YES POST reached the exchange and FILLED, then the client
+        # saw a transport error. The ledger lags on the first read and catches
+        # up on the second, so the pair is complete and the hedge must stay.
+        post.side_effect = [v2_resp(5), ConnectionError("Connection broken")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None,              # before_no baseline
+            None,              # before_yes baseline
+            ("TICK-B", 0),     # after_yes — ledger has not caught up yet
+            ("TICK-B", 5),     # lag re-read — the fill is visible: delta +5
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        assert result.status != "rolled_back"
+        assert result.status == "executed"
+        # Exactly the two leg submissions — NO unwind of a live hedge
+        assert post.call_count == 2
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert client.get_positions_without_preload_content.call_count == 4
+
+    def test_yes_leg_genuinely_unfilled_still_rolls_back(self, post, slept):
+        # Control: the ledger really is unmoved on BOTH readings, so today's
+        # rollback behaviour is unchanged.
+        post.side_effect = [v2_resp(5), ConnectionError("Connection broken"),
+                            v2_resp(5)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-B", 0), ("TICK-B", 0),
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        assert result.status == "rolled_back"
+        # NO leg, YES leg, then the unwind
+        assert post.call_count == 3
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    def test_yes_leg_reread_uses_the_retried_reader(self, post, slept, readers):
+        # The hedge is already in place here and the first read beside it is
+        # retried, so a transient 429 on the re-read must not escalate a
+        # recoverable ambiguity into manual_review.
+        post.side_effect = [v2_resp(5), ConnectionError("Connection broken")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-B", 0), ("TICK-B", 5),
+        ))
+        assert _execute_one(client, make_spec(x=5)).status == "executed"
+        assert readers == [
+            ("retried", "TICK-A"),   # before_no baseline
+            ("retried", "TICK-B"),   # before_yes baseline
+            ("retried", "TICK-B"),   # after_yes
+            ("retried", "TICK-B"),   # the lag re-read
+        ]
+
+    def test_yes_leg_failed_reread_is_manual_review_not_a_rollback(
+        self, post, slept
+    ):
+        # An unreadable re-read is the existing unattributable case: no unwind
+        # is submitted, because the YES leg may really have filled.
+        post.side_effect = [v2_resp(5), ConnectionError("Connection broken")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-B", 0), RuntimeError("positions endpoint down"),
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        assert result.status == "manual_review"
+        assert post.call_count == 2
+
+    def test_no_leg_lagging_ledger_is_unwound_not_reported_failed(
+        self, post, slept
+    ):
+        # DR-64: the NO POST reached the exchange and FILLED, then the client
+        # saw a transport error. The ledger lags on the first read; the re-read
+        # shows our -5, so the now-unhedged leg is unwound instead of being
+        # abandoned under a clean "failed".
+        post.side_effect = [ConnectionError("Connection broken"), v2_resp(5)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None,              # before_no baseline
+            None,              # before_yes baseline
+            ("TICK-A", 0),     # after_no — ledger has not caught up yet
+            ("TICK-A", -5),    # lag re-read — our NO buy is visible
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        assert result.status != "failed"
+        assert result.status == "rolled_back"
+        # The NO leg's (raising) submission, then the unwind — the YES leg is
+        # never sent, exactly as on the pre-existing delta=-count path
+        assert post.call_count == 2
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    def test_no_leg_genuinely_unfilled_still_fails(self, post, slept):
+        # Control: unmoved on BOTH readings, so today's "failed" is unchanged
+        # and nothing is submitted after the raising leg.
+        post.side_effect = [ConnectionError("Connection broken")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-A", 0), ("TICK-A", 0),
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        assert result.status == "failed"
+        assert "NO leg error" in result.error
+        assert post.call_count == 1
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    def test_no_leg_reread_uses_the_single_shot_reader(self, post, slept, readers):
+        # Load-bearing: this read sits in the unhedged window — the YES leg has
+        # not been submitted, so if the NO leg filled the account is one-sided
+        # while we wait, and api_call_with_retry can hold one call for ~62s.
+        post.side_effect = [ConnectionError("Connection broken"), v2_resp(5)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-A", 0), ("TICK-A", -5),
+        ))
+        assert _execute_one(client, make_spec(x=5)).status == "rolled_back"
+        assert readers == [
+            ("retried", "TICK-A"),   # before_no baseline
+            ("retried", "TICK-B"),   # before_yes baseline
+            ("retried", "TICK-A"),   # after_no (unchanged, still retried)
+            ("once", "TICK-A"),      # the lag re-read — SINGLE-SHOT
+        ]
+        # And specifically: the re-read did not go through the retried reader
+        assert ("retried", "TICK-A") not in readers[3:]
+
+    def test_no_leg_reread_carries_no_backoff(self, post, slept):
+        # Behavioural counterpart to the routing assertion above: a 429 on the
+        # re-read costs exactly ONE request and no sleeps from the retry
+        # wrapper, rather than up to six with ~62s of backoff between them.
+        #
+        # trader.time, _http.time and time are the same module object, so the
+        # `slept` fixture records BOTH the ledger-lag pause and anything
+        # api_call_with_retry would sleep — the assertion below is that the
+        # pause is the only one.
+        post.side_effect = [ConnectionError("Connection broken")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-A", 0), _StatusError(429),
+        ))
+        result = _execute_one(client, make_spec(x=5))
+        # Unreadable re-read -> unknown delta -> manual_review, no order sent
+        assert result.status == "manual_review"
+        assert "delta=None" in result.error
+        assert post.call_count == 1
+        assert client.get_positions_without_preload_content.call_count == 4
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    def test_a_moved_ledger_is_judged_without_a_re_read(self, post, slept):
+        # The re-read is triggered by a ZERO delta only: a first read that
+        # already answers the question must not pay the pause.
+        post.side_effect = [ConnectionError("Connection broken"), v2_resp(5)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, ("TICK-A", -5),
+        ))
+        assert _execute_one(client, make_spec(x=5)).status == "rolled_back"
+        assert slept == []
+        assert client.get_positions_without_preload_content.call_count == 3
 
 
 class TestPositionCountRetry:
@@ -1603,7 +1852,11 @@ class TestV2ExecuteOne:
         )
         assert _execute_one(client, make_spec()).status == "rolled_back"
 
-    def test_v2_leg_a_exception_with_no_position_is_failed(self, post):
+    def test_v2_leg_a_exception_with_no_position_is_failed(self, post, monkeypatch):
+        # The flat return_value answers the DR-64 lag re-read too — the ledger
+        # is unmoved on both readings, so this stays a confirmed non-fill; the
+        # sleep is patched out so the suite does not pay the real delay.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         post.side_effect = TimeoutError("timeout")
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
@@ -1635,9 +1888,10 @@ class TestV2ExecuteOne:
         assert result.status == "manual_review"
         assert post.call_count == 2
 
-    def test_v2_exactly_one_post_per_leg_no_retry_on_5xx(self, post):
+    def test_v2_exactly_one_post_per_leg_no_retry_on_5xx(self, post, monkeypatch):
         # A 5xx on an order submission must NEVER be retried: a second FoK
         # could fill the leg twice at a different price.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         post.side_effect = ApiException(status=500, reason="server error")
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
@@ -2012,7 +2266,13 @@ class TestDropLegacyUnroutable:
 class TestSettleAwaitTargeting:
     """Regression (adversarial review): the settle wait targets only shards an
     accepted transfer was headed for — an unfundable deficit shard must not
-    burn the timeout or miscast settled transfers as money-in-flight."""
+    burn the timeout or miscast settled transfers as money-in-flight.
+
+    DR-65 is the second half of the same idea, one step later: the in-flight
+    VERDICT must come from the settlement observation, not from a shard's
+    membership in accepted_cents. A shard whose accepted transfers all landed
+    and merely fell short of its deficit gets a shortfall WARNING; only cents
+    that were accepted and NOT observed to arrive keep the CRITICAL."""
 
     def _statuses(self, inactive_shard: int) -> dict:
         st = {i: shard_status() for i in (0, 1, 2)}
@@ -2042,6 +2302,100 @@ class TestSettleAwaitTargeting:
         )
         assert set(awaited) == {1}
         assert [s.pair.canonical_title for s in kept] == ["s1"]
+
+    def test_settled_but_short_transfer_is_a_shortfall_not_money_in_flight(
+        self, monkeypatch, caplog
+    ):
+        # DR-65: shard 3 needs $100 and holds nothing; shards 0 and 1 each hold
+        # $50 of surplus, but shard 1 cannot send. The shard-0 leg POSTs and
+        # its $50 LANDS — the settle wait targets min(required, prior + moved)
+        # = 5000c, sees it on the first read and returns immediately. Shard 3
+        # is still short of its full $100, and the in-flight test used to be
+        # bare membership in accepted_cents, so the run logged MONEY IS IN
+        # FLIGHT while the same line's own `confirmed` map showed the money had
+        # arrived. The money that WAS accepted is accounted for; why shard 3 is
+        # still short (here: shard 1 could not send, and its own warning says
+        # so) is not something the verdict knows or claims.
+        specs = [make_spec(shard_a=3, shard_b=3, cost_a=50.00, cost_b=50.00,
+                           title="needs shard 3")]
+        balances = {0: 5_000, 1: 5_000, 3: 0}
+        statuses = {0: shard_status(True), 1: shard_status(False),
+                    3: shard_status(True)}
+        post = MagicMock(return_value=transfer_resp("tidA"))
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        monkeypatch.setattr(
+            trader, "_await_transfer_settlement",
+            lambda client, required: {0: 0, 1: 5_000, 3: 5_000},
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            kept = ensure_shard_collateral(MagicMock(), specs, balances, statuses)
+        # Only the fundable leg was POSTed; the blocked one warned separately
+        assert post.call_count == 1
+        assert "MONEY IS IN FLIGHT" not in caplog.text
+        assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        warnings = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        assert "OBSERVED to land but did not cover" in warnings
+        # The shortfall itself is named: 10000c required, 5000c confirmed
+        assert "{3: 5000}" in warnings
+        # Degradation is unchanged — the underfunded spec is still dropped
+        assert kept == []
+
+    def test_accepted_transfer_that_never_lands_still_shouts(
+        self, monkeypatch, caplog
+    ):
+        # Control for the case above, same plan and the same partial coverage —
+        # but the accepted $50 is NOT observed on the shard. That is genuinely
+        # ambiguous and must keep the CRITICAL.
+        specs = [make_spec(shard_a=3, shard_b=3, cost_a=50.00, cost_b=50.00,
+                           title="needs shard 3")]
+        balances = {0: 5_000, 1: 5_000, 3: 0}
+        statuses = {0: shard_status(True), 1: shard_status(False),
+                    3: shard_status(True)}
+        monkeypatch.setattr(
+            trader, "signed_request_json",
+            MagicMock(return_value=transfer_resp("tidA")),
+        )
+        monkeypatch.setattr(
+            trader, "_await_transfer_settlement",
+            lambda client, required: {0: 0, 1: 5_000, 3: 0},
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            kept = ensure_shard_collateral(MagicMock(), specs, balances, statuses)
+        criticals = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL
+        )
+        assert "MONEY IS IN FLIGHT" in criticals
+        assert "tidA" in criticals
+        # A shard counted as in-flight is never ALSO reported as a settled
+        # shortfall — the two verdicts partition the unfunded shards an
+        # accepted transfer was headed for. (A shard whose transfer was
+        # never accepted is in NEITHER set; see
+        # test_no_false_money_in_flight_for_never_accepted_shards.)
+        assert "OBSERVED to land but did not cover" not in caplog.text
+        assert kept == []
+
+    def test_partially_landed_transfer_is_still_in_flight(self, monkeypatch, caplog):
+        # Half the accepted cents arrived, so part of the money is genuinely
+        # unaccounted for: the CRITICAL must not be softened to a shortfall.
+        specs = [make_spec(shard_a=3, shard_b=3, cost_a=50.00, cost_b=50.00,
+                           title="needs shard 3")]
+        balances = {0: 5_000, 1: 5_000, 3: 0}
+        statuses = {0: shard_status(True), 1: shard_status(False),
+                    3: shard_status(True)}
+        monkeypatch.setattr(
+            trader, "signed_request_json",
+            MagicMock(return_value=transfer_resp("tidA")),
+        )
+        monkeypatch.setattr(
+            trader, "_await_transfer_settlement",
+            lambda client, required: {0: 0, 1: 5_000, 3: 2_500},
+        )
+        with caplog.at_level(logging.INFO, logger="root"):
+            ensure_shard_collateral(MagicMock(), specs, balances, statuses)
+        assert "MONEY IS IN FLIGHT" in caplog.text
+        assert "OBSERVED to land but did not cover" not in caplog.text
 
     def test_no_false_money_in_flight_for_never_accepted_shards(self, monkeypatch, caplog):
         # Shard 2's transfer was never accepted (inactive) — its underfunding

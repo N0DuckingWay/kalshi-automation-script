@@ -392,7 +392,16 @@ class TestNoMappingVerdict:
             v2_probe, "signed_request_json",
             lambda *a, **k: {"order_id": "x"},  # no fill_count at all
         )
-        client = probe_client([0, 0])
+        # DR-60 gave this branch the re-read _non_object_body_fail already had,
+        # so it now makes a third position read and sleeps once. The assertion
+        # below is unchanged, and the fixture edit is hygiene rather than a
+        # necessity: with the old two-entry list the third read exhausts the
+        # MagicMock side_effect, trader._position_count fail-softs the
+        # StopIteration to None and this still passes — but it would really
+        # sleep 1s and silently exercise that swallow. The re-read behaviour
+        # itself is pinned by TestUnreadableFillCountsChecksTheAccount.
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: None)
+        client = probe_client([0, 0, 0])
         assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._FAIL
 
 
@@ -723,6 +732,257 @@ class TestNonObjectOrderBody:
         assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._PASS
 
 
+class TestUnreadableFillCountsChecksTheAccount:
+    """DR-60: a JSON-OBJECT body whose fill counts cannot be read leaves the
+    probe in exactly the state _non_object_body_fail handles one step earlier —
+    a real ask submitted, a 2xx back, and no idea what it did — so it takes the
+    same remedy.
+
+    Before this, the branch decided from a SINGLE un-refreshed position read
+    (DR-21's re-read is gated on `filled`, which is None and therefore falsy
+    here) and printed a warning only when that read was truthy. A lagging
+    ledger printed `Position after the NO buy: 0.0`, no warning at all, and
+    returned FAIL while a real 0.01 NO position was open on the production
+    account; a FAILED lookup (None) printed nothing either, collapsed into
+    "flat" by the same bare truthiness test DR-58 forbade.
+    """
+
+    # Both shapes _fill_counts reports as unreadable on a real dict body: no
+    # count fields at all, and one of the two present without the other.
+    _UNREADABLE_BODIES = [
+        {"order": {"status": "executed"}},
+        {"fill_count": "0.01"},
+    ]
+
+    @staticmethod
+    def _arm(monkeypatch, response, reads: list):
+        """Hand `response` back from the submission seam and script the reads.
+
+        Returns (submitted bodies, observed reads, sleep durations) — the same
+        shape TestNonObjectOrderBody._arm returns, because the two classes pin
+        the same helper from its two call sites.
+        """
+        submitted: list = []
+
+        def post(client, method, path, *, query=None, body=None):
+            submitted.append(body)
+            return response
+
+        monkeypatch.setattr(v2_probe, "signed_request_json", post)
+
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return submitted, observed, slept
+
+    @pytest.mark.parametrize("body", _UNREADABLE_BODIES)
+    def test_a_flat_first_read_is_re_read_and_surfaces_the_position(
+        self, body, monkeypatch, capsys,
+    ):
+        # start flat, the ledger lags at 0 straight after the fill, the re-read
+        # finds the 0.01 NO position the operator has to flatten.
+        submitted, observed, slept = self._arm(monkeypatch, body, [0, 0, -0.01])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == [0, 0, -0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # Only the opening ask went out — the close rests on a mapping this
+        # unreadable response proved nothing about.
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert "FLATTEN IT MANUALLY" in printed
+
+    def test_an_unreadable_position_says_check_it_manually(self, monkeypatch, capsys):
+        # None is "the lookup failed", never "the account is flat".
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, None, None],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, None, None]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "CHECK IT MANUALLY" in printed
+        assert "FLATTEN IT MANUALLY" not in printed
+
+    def test_a_persistently_flat_account_says_so_rather_than_staying_silent(
+        self, monkeypatch, capsys,
+    ):
+        # Still FAIL (nothing was proven), but a checked-and-flat account must
+        # be distinguishable from a step that never looked.
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, 0, 0],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "nothing to flatten" in printed
+        assert "FLATTEN IT MANUALLY" not in printed
+
+    def test_a_nonzero_first_read_is_not_re_read(self, monkeypatch, capsys):
+        # A ledger that already moved is evidence; don't spend a second read.
+        _, observed, slept = self._arm(
+            monkeypatch, {"order": {"status": "executed"}}, [0, -0.01],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, -0.01]
+        assert slept == []
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
+
+
+class TestNonConformingFillOrKill:
+    """DR-20: a fill-or-kill response that is neither a complete fill nor a
+    true kill is a PROTOCOL VIOLATION, not a clean kill.
+
+    `filled = remaining == 0 and fill == PROBE_COUNT` collapsed every non-full
+    outcome into one boolean. A partial fill therefore took the `not filled`
+    branch, where DR-21's re-read does not run (it is gated on `filled`), so a
+    lagging ledger printed "killed unfilled and the account is still flat" and
+    exited NEUTRAL while a real fraction of a contract was open on the
+    production account. The sibling step _step_unfillable_ask already got this
+    right; the two now agree about what a partial fill is.
+    """
+
+    # Every readable shape that is neither a complete fill nor a true kill,
+    # against a count of 0.01: a partial, an over-fill, and a stale remainder
+    # (the counts do not even sum to the order).
+    _NON_CONFORMING = [
+        ("0.005", "0.005"),
+        ("0.02", "0.00"),
+        ("0.01", "0.005"),
+    ]
+
+    @staticmethod
+    def _arm(monkeypatch, response, reads: list):
+        """Hand `response` back from the submission seam and script the reads.
+
+        Same shape as TestNonObjectOrderBody._arm /
+        TestUnreadableFillCountsChecksTheAccount._arm — all three classes pin
+        branches that end in the shared _recheck_and_report_position tail.
+        """
+        submitted: list = []
+
+        def post(client, method, path, *, query=None, body=None):
+            submitted.append(body)
+            return response
+
+        monkeypatch.setattr(v2_probe, "signed_request_json", post)
+
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return submitted, observed, slept
+
+    def test_partial_fill_with_a_lagging_ledger_fails_and_surfaces_the_position(
+        self, monkeypatch, capsys,
+    ):
+        # THE DR-20 case: half the probe count filled, the ledger has not
+        # caught up yet, and the old code called that "killed unfilled and the
+        # account is still flat" — NEUTRAL, no re-read, no warning.
+        submitted, observed, slept = self._arm(
+            monkeypatch, v2_resp("0.005", "0.005"), [0, 0, -0.005],
+        )
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        # The ledger really was re-read once before anything was reported.
+        assert observed == [0, 0, -0.005]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # Only the opening ask went out — the close rests on a mapping this
+        # response proved nothing about.
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert "fill_count=0.005" in printed
+        assert "remaining_count=0.005" in printed
+        assert "FLATTEN IT MANUALLY" in printed
+        # The false claim this bug was made of must be gone.
+        assert "still flat" not in printed
+
+    def test_partial_fill_with_a_genuinely_flat_ledger_still_fails(
+        self, monkeypatch, capsys,
+    ):
+        # A fill-or-kill invariant violation is a violation even if nothing
+        # ended up landing: the response shape is what is being judged.
+        _, observed, slept = self._arm(
+            monkeypatch, v2_resp("0.005", "0.005"), [0, 0, 0],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "fill_count=0.005" in printed
+        assert "remaining_count=0.005" in printed
+        # Checked-and-flat is reported, but never as "the kill left us flat".
+        assert "nothing to flatten" in printed
+        assert "still flat" not in printed
+
+    @pytest.mark.parametrize("fill, remaining", _NON_CONFORMING)
+    def test_no_non_conforming_shape_is_read_as_a_kill_or_a_fill(
+        self, fill, remaining, monkeypatch, capsys,
+    ):
+        # An over-fill and a stale remainder are as impossible as a partial;
+        # none of them may reach the kill NEUTRAL or the fill PASS.
+        submitted, observed, slept = self._arm(
+            monkeypatch, v2_resp(fill, remaining), [0, -0.01, -0.01],
+        )
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        # Only TWO of the three scripted reads are consumed — the baseline and
+        # the post-buy read — because that post-buy read has already MOVED, and
+        # _recheck_and_report_position does not re-poll a read that is itself
+        # evidence. No re-read means no delay either.
+        assert observed == [0, -0.01]
+        assert slept == []
+        assert len(submitted) == 1  # never goes on to the close
+        printed = capsys.readouterr().out
+        assert f"fill_count={fill}" in printed
+        assert f"remaining_count={remaining}" in printed
+        assert "still flat" not in printed
+        assert "CONFIRMED" not in printed
+
+    def test_a_true_kill_with_a_flat_account_is_still_neutral(self, monkeypatch, capsys):
+        # The correct path must not have regressed: a genuine kill against a
+        # genuinely flat account keeps its NEUTRAL verdict and its wording.
+        submitted, observed, slept = self._arm(monkeypatch, KILLED, [0, 0])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert observed == [0, 0]
+        assert slept == []
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert "killed unfilled and the account is still flat" in printed
+
+    def test_a_full_fill_still_passes(self, submits, monkeypatch):
+        # The conforming-fill path is untouched.
+        client = probe_client([0, -0.01, 0])
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        assert [b["body"]["side"] for b in submits] == ["ask", "bid"]
+
+    def test_the_fee_line_does_not_claim_nothing_filled(self, capsys):
+        # _report_fee reads no fill counts, so it cannot assert an empty fill —
+        # on a partial that was a second, independent false claim printed right
+        # above the verdict (DR-20).
+        v2_probe._report_fee({"order_id": "x"}, "0.4100")
+        printed = capsys.readouterr().out
+        assert "nothing filled" not in printed
+        assert "no average_fee_paid" in printed
+
+
 def shard_statuses(transfers_active: bool = True, shards: tuple = (0, 1)) -> dict:
     """Parsed fetch_shard_statuses shape for the transfer step."""
     return {
@@ -790,6 +1050,32 @@ class TestTransferStep:
         assert v2_probe._step_transfer(MagicMock(), None, True, 1) == v2_probe._FAIL
         # The return leg must NOT be attempted while the cent is in flight.
         assert executed == [(0, 1, 1)]
+
+    def test_self_transfer_is_refused_before_any_post(self, monkeypatch, capsys):
+        # DR-22: --dest-shard 0 IS the source shard. Both existing guards (is
+        # the shard advertised, are its transfers active) are satisfied by the
+        # source shard by construction, so this used to POST a real,
+        # non-idempotent, never-retried transfer that could not raise the
+        # shard's balance — the settlement poll then burned the full timeout
+        # and reported a FALSE "MONEY MAY BE IN FLIGHT".
+        statuses_read: list = []
+        monkeypatch.setattr(
+            v2_probe.scanner, "fetch_shard_statuses",
+            lambda c: statuses_read.append(c) or shard_statuses(),
+        )
+        monkeypatch.setattr(
+            trader, "_execute_transfer",
+            lambda *a, **k: pytest.fail("a self-transfer must never be POSTed"),
+        )
+        out = v2_probe._step_transfer(
+            MagicMock(), None, True, v2_probe._TRANSFER_SOURCE_SHARD
+        )
+        assert out == v2_probe._NEUTRAL
+        # Refused before ANY I/O, not merely before the POST.
+        assert statuses_read == []
+        printed = capsys.readouterr().out
+        assert "IS the source shard" in printed
+        assert "MONEY MAY BE IN FLIGHT" not in printed
 
     def test_dest_shard_argument_is_honored(self, monkeypatch):
         executed = self._arm(

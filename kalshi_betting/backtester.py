@@ -127,6 +127,7 @@ import pandas as pd
 
 from .config import (
     BACKTEST_MARKETS_RAM_WARN,
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
@@ -317,7 +318,9 @@ class SweepPoint:
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return], opening one row before the
             run's start_date at the initial balance and flat at it when trades
-            is empty.
+            is empty. portfolio_value is cash plus open positions carried at
+            cost, so it moves only on realized costs and P&L, never on
+            deployment (see _build_equity_curve).
     """
     k: float
     trades: list[BacktestTrade]
@@ -396,6 +399,60 @@ class IntervalCalibration:
     excluded_premise_violations: int
 
 
+@dataclass(frozen=True)
+class OutcomeLabelCoverage:
+    """
+    The outcome-label census over one backtest window's eligible markets.
+
+    Produced by _log_outcome_label_coverage() as it emits its log line, so the
+    page and the log can never report two different numbers or disagree about
+    where the warning floor sits — there is exactly ONE measurement, one pass
+    and one threshold comparison per run.
+
+    Holds five scalars and no reference to any market record: _prepare_entries
+    del's the eligible-market list immediately after pair extraction to lower
+    residency across the candlestick fetch (TS-07), and a carrier that kept
+    examples (sample tickers, a per-category breakdown) would pin every one of
+    those dicts alive past that statement.
+
+    The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
+    list after the _can_ever_enter prefilter, i.e. every record handed to the
+    two grouping calls. It is NOT the population the empirical k-hat is
+    computed over (_interval_calibration measures over entered, binarily
+    settled, non-premise-violating time-series candidates, a far smaller and
+    differently-selected subset). Any rendering of these numbers must be
+    phrased over the corpus, never over "the pairs behind k̂".
+
+    Attributes:
+        total (int): Eligible markets censused. Zero means the corpus was
+            empty, not that the census failed to run.
+        with_subtitle (int): Records carrying a non-blank `subtitle` — the
+            outcome discriminator in the time-series key and the third
+            component of the same-title key.
+        with_event_title (int): Records carrying a non-blank `event_title` —
+            the first component of the same-title key.
+        subtitle_fraction (float | None): with_subtitle / total, or None when
+            total is 0. None rather than 0.0 because the fraction is UNDEFINED
+            on an empty corpus, matching the helper's own empty-list branch,
+            which reports no coverage rather than 0%.
+        event_title_fraction (float | None): with_event_title / total, or None
+            when total is 0, for the same reason.
+        below_floor (bool): Whether subtitle_fraction fell below
+            config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION — the SAME comparison
+            the WARNING branches on, evaluated once and carried, so a reader of
+            the log and a reader of the dashboard can never be told different
+            things. False when total is 0 (nothing to warn about) and False
+            when only event_title coverage is low, which never escalates (see
+            config.py beside that constant for why).
+    """
+    total: int
+    with_subtitle: int
+    with_event_title: int
+    subtitle_fraction: float | None
+    event_title_fraction: float | None
+    below_floor: bool
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -420,10 +477,21 @@ class BacktestSweep:
             time-series candidate to measure. It hangs off the sweep rather
             than off any point because it is k-independent — one measurement
             valid for all of them (see _interval_calibration).
+        label_coverage (OutcomeLabelCoverage | None): The outcome-label census
+            over this run's eligible-market corpus, or None when no census was
+            taken (the Monday-feasibility short-circuit skips the fetch
+            entirely, and a hand-built sweep never had a corpus). It hangs off
+            the sweep for exactly the reason `calibration` does: one
+            measurement over one corpus, k-independent, valid at every point.
+            DEFAULTED so no existing construction breaks — but a caller that
+            omits it renders "not measured" on the dashboard rather than the
+            caveat, so the two production constructions in run_backtest_sweep()
+            must always pass it.
     """
     primary: SweepPoint
     points: list[SweepPoint]
     calibration: IntervalCalibration | None
+    label_coverage: OutcomeLabelCoverage | None = None
 
 
 @dataclass
@@ -1456,13 +1524,141 @@ def _log_rss(label: str) -> None:
     logging.info("Peak RSS %s: %.0f MiB", label, mib)
 
 
+def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
+    """
+    Census how many eligible markets carry an outcome label, and warn when few do.
+
+    Both backtest grouping keys are built from fields a stale cache may simply
+    not have. `subtitle` is the outcome discriminator in the time-series key
+    (scanner.time_series_group_key) and the third component of the same-title
+    key (event_title, title, subtitle); `event_title` is the first component of
+    the latter. A record whose subtitle is blank keys by title alone — the
+    pre-DR-01 strike-blind grouping the live scanner was fixed to stop using —
+    and a blank event_title collapses the same-title key toward (title,
+    subtitle), the direction that manufactures cross-event false positives
+    under the 0.95 co-resolution prior (TS-11).
+
+    The defect this closes is the SILENCE, not the grouping (DR-66). A backtest
+    over a cache written before the 2026-08-14 yes_sub_title ingest fix reports
+    potential-pair counts, trade counts, a return figure and an empirical k-hat
+    recommendation for the real-money constant
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT, all describing a strategy the shipped
+    code does not implement — and neither the backtest log nor the dashboard
+    said so, making such a run indistinguishable in its own output from a run
+    on a good cache. The live scanner's own "Distinct normalized title+outcome
+    keys" counter cannot cover this: it lives in find_time_series_pairs, which
+    the backtester never calls, and it moves the OTHER way here — it detects
+    the one-leg-labelled case, where keys SPLIT, whereas a wholesale-blank
+    cache makes keys MERGE.
+
+    Only subtitle coverage escalates to WARNING. event_title coverage shares
+    the INFO line but is never warned on, because it is legitimately near zero
+    on a healthy cache; the reasoning and the measured coverages behind both
+    decisions live in config.py beside BACKTEST_OUTCOME_LABEL_WARN_FRACTION, so
+    that no figure from another run is baked into a string emitted on every run
+    (TS-07).
+
+    Advisory only: this reads the list and logs. No market, group, pair or
+    entry is dropped, filtered or altered, and no count the run reports moves.
+
+    It also RETURNS what it just measured, so the same figure can reach the
+    dashboard (DR-66b): a run over a label-less cache used to log the warning
+    and then render a bare "Pooled empirical k̂" card with no caveat anywhere on
+    the page, while backtest.py's own closing line points the operator at that
+    page. Measuring and reporting in one function is a deliberate departure
+    from the check_shard_coverage / _log_shard_coverage pure-plus-loud split:
+    the single pass is the memory-sensitive part and must not be duplicated,
+    and the threshold must be evaluated exactly once so the log line and the
+    page cannot disagree about where the floor sits.
+
+    Args:
+        markets (list[dict]): The eligible market records, in the compact
+            historical._market_to_dict form, exactly as handed to the two
+            grouping calls below. Counted in ONE pass with no second list
+            materialized, since this can be millions of records.
+
+    Returns:
+        OutcomeLabelCoverage: The five scalars this census just logged, with
+            below_floor carrying the very comparison the WARNING branches on.
+            On an empty corpus, total 0 with both fractions None (undefined,
+            not zero) and below_floor False. Holds no reference to any record,
+            so it is safe to keep past _prepare_entries' `del markets`.
+    """
+    total = len(markets)
+
+    # An empty list has no coverage to report: the fraction is undefined, not
+    # zero, so warning here would manufacture a drift alarm out of a corpus
+    # that simply has no records — a cause the surrounding "Total settled
+    # markets" and "Eligibility prefilter" lines already name. The census still
+    # emits one line, so its ABSENCE always means this helper did not run.
+    if not total:
+        logging.info("Outcome-label coverage: no eligible markets to census")
+        # Fractions are None, not 0.0: undefined rather than zero, so a
+        # renderer can say "nothing to census" instead of "0% coverage".
+        return OutcomeLabelCoverage(
+            total=0, with_subtitle=0, with_event_title=0,
+            subtitle_fraction=None, event_title_fraction=None,
+            below_floor=False,
+        )
+
+    # One pass, two counters. Blank/None/absent all read as "no label", the
+    # same falsiness the two grouping helpers apply with `or ""`.
+    with_subtitle = 0
+    with_event_title = 0
+    for m in markets:
+        if m.get("subtitle"):
+            with_subtitle += 1
+        if m.get("event_title"):
+            with_event_title += 1
+
+    subtitle_fraction = with_subtitle / total
+    logging.info(
+        "Outcome-label coverage over %d eligible markets: subtitle on %d "
+        "(%.2f%%), event_title on %d (%.2f%%)",
+        total, with_subtitle, subtitle_fraction * 100.0,
+        with_event_title, with_event_title / total * 100.0,
+    )
+
+    # Evaluated ONCE and carried out on the dataclass. The dashboard branches
+    # on this verdict rather than re-deriving it from the constant, so a
+    # future `<` that becomes a `<=` cannot make the page and the log fire on
+    # different conditions.
+    below_floor = subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION
+
+    if below_floor:
+        logging.warning(
+            "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
+            "eligible markets carry no subtitle, so the time-series key falls "
+            "back to the bare normalized title — the strike-blind grouping the "
+            "live scanner no longer uses — and the same-title key loses its "
+            "outcome discriminator. Treat this run's potential-pair counts, "
+            "trades, returns and empirical interval-discount recommendation as "
+            "describing a different strategy from the shipped one. Remedy: "
+            "delete backtest_cache/archive_days/ and backtest_cache/live_days/, "
+            "then re-run with --no-cache (equivalently, also delete the "
+            "assembled backtest_cache/settled_markets_*.json); --no-cache ALONE "
+            "does not refresh the day slices, which are reused unconditionally",
+            subtitle_fraction * 100.0,
+            BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0,
+        )
+
+    return OutcomeLabelCoverage(
+        total=total,
+        with_subtitle=with_subtitle,
+        with_event_title=with_event_title,
+        subtitle_fraction=subtitle_fraction,
+        event_title_fraction=with_event_title / total,
+        below_floor=below_floor,
+    )
+
+
 def _prepare_entries(
     hist_client: Any,
     live_client,
     start_date: date,
     use_cache: bool,
     max_horizon_days: int | None,
-) -> list[dict] | None:
+) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
 
@@ -1487,15 +1683,28 @@ def _prepare_entries(
             cap. Passed straight through to _find_entry() for each pair.
 
     Returns:
-        list[dict] | None: One record per pair that produced an entry, in scan
+        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
+            entries and this run's outcome-label census.
+
+            Element 0 is one record per pair that produced an entry, in scan
             order (time-series pairs first, then same-title), each shaped
             {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
             where "entry" is _find_entry()'s return dict (which already carries
             the possibly-swapped mA/mB). An empty list means no pair was ever
-            tradeable. Returns None — the codebase's
+            tradeable. It is None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
-            window at all" signal distinct from "nothing entered".
+            window at all" signal distinct from "nothing entered". NOTE that
+            the sentinel now lives on element 0: a caller that forgets to
+            unpack holds a 2-tuple, which is never None, so its
+            `if raw_entries is None` guard would silently go false.
+
+            Element 1 is the OutcomeLabelCoverage the census measured over the
+            eligible-market corpus — carried out so the dashboard can render
+            the same caveat the log warns about (DR-66b) — and is None on
+            exactly the feasibility-short-circuit path, where the fetch never
+            ran and there was no corpus to census. That is distinct from a
+            censused corpus of zero records, which carries total=0.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -1540,7 +1749,12 @@ def _prepare_entries(
         # run_backtest turns it into the same empty-result shape the zero-trade
         # path already produces, so backtest.py / generate_dashboard need no
         # changes to handle this early-exit.
-        return None
+        #
+        # The census is None here rather than an empty OutcomeLabelCoverage:
+        # the fetch never ran, so no corpus was ever censused. That reads on
+        # the page as "not measured", which is the truth, and is distinct from
+        # a corpus that WAS censused and held zero records.
+        return None, None
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
@@ -1602,6 +1816,21 @@ def _prepare_entries(
             "lists on top of them",
             len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
         )
+
+    # Census the two fields the grouping keys below are built from, while the
+    # record list is still alive (it is del'd a few lines down). A cache
+    # predating the 2026-08-14 yes_sub_title ingest fix carries subtitle=None on
+    # nearly every record, which makes the time-series key collapse to the
+    # pre-DR-01 strike-blind title-only form — silently, with the run's pair
+    # counts, trades, return and empirical k-hat all still reported as if it had
+    # grouped correctly (DR-66). Advisory: it logs and changes nothing.
+    #
+    # The measurement is carried out of this function (DR-66b) so the dashboard
+    # can render the same caveat beside the k-hat card it recommends a
+    # real-money constant from. It is five scalars with no reference to any
+    # record here, so holding it costs nothing and the `del markets` below is
+    # unaffected.
+    label_coverage = _log_outcome_label_coverage(markets)
 
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
@@ -1679,7 +1908,7 @@ def _prepare_entries(
         })
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
-    return raw_entries
+    return raw_entries, label_coverage
 
 
 def _simulate_at_discount(
@@ -1765,8 +1994,19 @@ def _simulate_at_discount(
 
         # ── Kelly fraction (sizing happens in Pass 2 against the checkpoint) ──
         # Compute the net spread on the leg prices after the continuous fee approximation
-        net_spread = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+        fee_approx = fee_per_pair_approx(price_a, price_b)
+        net_spread = (1.0 - price_a - price_b) - fee_approx
+        # REPORTED/RANKED return on the contracts' cost (feeds
+        # entry_monthly_ratio, Pass 2's look-ahead-free sort key) — the mirror
+        # of strategy.TradeSpec.profit_ratio, fee-less denominator and all.
         profit_ratio_entry = net_spread / (price_a + price_b) if net_spread > 0 else 0.0
+        # Kelly's "b": the SAME numerator over the dollars actually at risk,
+        # which include the fee — a losing pair loses cost + fees, not cost
+        # (DR-62). A DIFFERENT quantity from profit_ratio_entry above; mirrors
+        # strategy._evaluate_size's kelly_b exactly, so live and backtest admit
+        # the same pairs. Do not collapse the two back together.
+        kelly_b_entry = (net_spread / (price_a + price_b + fee_approx)
+                         if net_spread > 0 else 0.0)
 
         # Probability model. time_series: the discounted market-implied
         # in-between mass, 1 - k * (pB - pA), from config.time_series_profit_prob
@@ -1781,8 +2021,9 @@ def _simulate_at_discount(
              if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
         q = 1.0 - p
 
-        # Kelly formula: f* = p - q/b; negative means no edge
-        kelly_f = (p - q / profit_ratio_entry) if profit_ratio_entry > 0 else -1.0
+        # Kelly formula: f* = p - q/b; non-positive means no positive expected
+        # value once the fee is counted on the losing side too (DR-62)
+        kelly_f = (p - q / kelly_b_entry) if kelly_b_entry > 0 else -1.0
         if kelly_f <= 0:
             # Kelly fraction is non-positive — the pair has no positive expected value
             continue
@@ -2380,7 +2621,9 @@ def run_backtest(
             (empty if none were ever entered). equity_df has columns
             [date, portfolio_value, daily_return], one row per day from
             start_date - 1 day (the untouched initial balance) through today,
-            flat at initial_balance if trades is empty.
+            flat at initial_balance if trades is empty. portfolio_value is cash
+            plus open positions carried at cost, so deploying capital does not
+            move it (see _build_equity_curve).
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2403,7 +2646,11 @@ def run_backtest(
 
     # The k-independent half: fetch, group, pair and locate each pair's first
     # tradeable Monday. None means the feasibility pre-check failed.
-    raw_entries = _prepare_entries(
+    #
+    # The outcome-label census rides out alongside the entries (DR-66b), but
+    # this entry point returns the historical two-tuple and feeds no dashboard,
+    # so it is discarded here — the census has already logged itself.
+    raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
     )
     if raw_entries is None:
@@ -2481,8 +2728,10 @@ def run_backtest_sweep(
 
     Returns:
         BacktestSweep: primary (the effective-discount result), points
-            (ascending by k, always containing primary) and calibration (None
-            when no time-series candidate was measurable).
+            (ascending by k, always containing primary), calibration (None
+            when no time-series candidate was measurable) and label_coverage
+            (the run's outcome-label census, None when the feasibility
+            short-circuit skipped the fetch).
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2495,14 +2744,17 @@ def run_backtest_sweep(
         simulation is possible at any discount: the result is a sweep holding
         one empty point (built by the same _simulate_at_discount() call every
         other point comes from, over an empty entry list, so its shape and its
-        resolved k cannot drift from a real one) and calibration=None. Callers
-        therefore need no special case for that path.
+        resolved k cannot drift from a real one), calibration=None and
+        label_coverage=None. Callers therefore need no special case for that
+        path.
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
     # The k-independent half — one fetch, one pairing, one entry sweep, reused
     # by every point below. None means the feasibility pre-check failed.
-    raw_entries = _prepare_entries(
+    # label_coverage is the run's outcome-label census, k-independent like the
+    # calibration below and carried on the sweep for the same reason.
+    raw_entries, label_coverage = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
     )
     if raw_entries is None:
@@ -2513,7 +2765,11 @@ def run_backtest_sweep(
         empty = _simulate_at_discount(
             [], start_date, initial_balance, k=interval_discount
         )
-        return BacktestSweep(primary=empty, points=[empty], calibration=None)
+        # label_coverage is None on this path by construction — the fetch was
+        # skipped, so nothing was censused. The dashboard renders that as "not
+        # measured" rather than as healthy coverage.
+        return BacktestSweep(primary=empty, points=[empty], calibration=None,
+                             label_coverage=None)
 
     # Measured from the k-independent entries, so it is valid for every point
     # below and is never filtered by any point's Kelly gate.
@@ -2566,7 +2822,8 @@ def run_backtest_sweep(
             raw_entries, start_date, initial_balance, k=point_k
         ))
 
-    return BacktestSweep(primary=primary, points=points, calibration=calibration)
+    return BacktestSweep(primary=primary, points=points, calibration=calibration,
+                         label_coverage=label_coverage)
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────
@@ -2579,22 +2836,63 @@ def _build_equity_curve(
     """
     Construct a daily equity curve DataFrame from the list of backtest trades.
 
-    For each trade, subtracts the full cash outlay (total_cost + fees, both paid
-    at execution) from cash on the entry_date and adds the gross settlement
-    receipt (actual_payoff) on the exit_date. This models a simple accounting
-    treatment where capital is deployed on entry and returned at settlement,
-    with each dollar counted exactly once.
+    "portfolio_value" is a PORTFOLIO VALUE, not a cash balance: it is cash plus
+    the carrying value of every position still open on that date, where an open
+    position is carried at its COST BASIS (total_cost) for its whole holding
+    period. So committing capital does not move the curve, and the only two
+    moves a trade can make are real economic ones:
+      * entry_date: -fees. Cash falls by total_cost + fees while the contracts
+        bought with it enter the portfolio at total_cost, so the net step is the
+        taker fee alone. Fees are deliberately NOT capitalised into the carrying
+        value — they buy nothing that can be sold on, they are realized the
+        moment the order fills, and capitalising them would make the trade look
+        free on the day it was actually charged.
+      * exit_date: +(actual_payoff - total_cost). The position is written off at
+        cost and the gross settlement receipt credited, so the step is exactly
+        the realized P&L before fees. Summed over both dates a trade moves the
+        curve by actual_payoff - total_cost - fees, i.e. its own `profit`.
+
+    Carrying at cost rather than marking to market daily is a deliberate choice
+    (DR-61), and NOT because the prices are missing. A true daily mark-to-market
+    off each leg's candles would need a per-day quote for every open position on
+    every calendar day of the window, and those quotes are already fetched:
+    _fetch_candles_parallel requests each leg's WHOLE hourly series (start_date
+    midnight UTC through one day past that market's close) and disk-caches it
+    per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
+    entry-checkpoint prices only, so candles_by_ticker is a local that dies with
+    _prepare_entries, and mark-to-market means threading a per-day series
+    through raw_entries and _simulate_at_discount into this function and
+    deciding what to carry on a day a leg has no candle at all. Cost-basis carry
+    is the minimal change that makes the derived metrics mean what their labels
+    say; do not price the rejected alternative as a new multi-hour fetch. The
+    cost of the choice is that an unrealized swing inside the holding period is
+    invisible, so drawdown here is REALIZED drawdown and is a lower bound on the
+    intraperiod one.
+
+    This matters because the curve is the sole input to every risk figure on the
+    dashboard: the "Max Drawdown" KPI, the "Drawdown (%)" chart, _sharpe and
+    _sortino (which read the derived "daily_return" column), the per-k sweep
+    table's drawdown and Sharpe columns, and the benchmark row that sits in the
+    same column as ^GSPC's genuine mark-to-market drawdown. While the curve was
+    cash-only an open position was carried at ZERO, so every one of those read
+    capital DEPLOYMENT as loss: a real 2026-05-01 run with three trades, all
+    three profitable and a +4.8% return, reported a max drawdown of -60.0%, and
+    a k=0.40 point reported -100.0% (total ruin) against a final balance of
+    $4,655.87. Do not reintroduce cash-only accounting here.
 
     The curve opens one day before start_date at the untouched initial balance,
-    so a trade entering on start_date itself shows its outflow as a real
+    so a trade entering on start_date itself shows its day-0 cost as a real
     pct_change and a real decline from the cummax peak. Without that leading row
-    the day-0 stake was invisible to both (DR-03), and the per-k sweep table's
+    the day-0 step was invisible to both (DR-03), and the per-k sweep table's
     iloc[0] base was the post-outflow balance while the performance card's base
-    was initial_balance — one run reported two ways on one page.
+    was initial_balance — one run reported two ways on one page. That guarantee
+    is independent of what the day-0 step contains: under DR-61 it is the fees
+    rather than the whole stake, and it is still the leading row that keeps the
+    cummax peak at initial_balance instead of at the already-charged value.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
-            exit_date, total_cost, and actual_payoff populated.
+            exit_date, total_cost, fees and actual_payoff populated.
         start_date (date): The first TRADING date of the window; the curve opens
             one row earlier, on start_date - 1 day, at the untouched initial
             balance.
@@ -2606,7 +2904,8 @@ def _build_equity_curve(
             start_date to today (UTC) — and, when start_date is itself in the
             future, exactly those two rows — with columns:
             - "date" (date): Calendar date.
-            - "portfolio_value" (float): Cumulative portfolio value in dollars.
+            - "portfolio_value" (float): Cash plus open positions at cost, in
+              dollars (see above).
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
             Never zero rows: a column-less DataFrame would violate this contract
             and crash the "daily_return" assignment below, as well as every
@@ -2626,33 +2925,47 @@ def _build_equity_curve(
     span_days = max((today - start_date).days + 1, 1)
     # The curve opens one day BEFORE start_date at the untouched initial
     # balance. start_date itself can carry a Monday-09:00 entry (the default
-    # 2024-01-01 is a Monday), and applying that day's outflow to the FIRST
-    # row hid the entire day-0 stake from pct_change and cummax: max drawdown
-    # 0.0% and Sortino 0.00 on a run that lost 99.98% on day one, and the
-    # per-k table's "opening" was the post-outflow balance (DR-03). No trade
-    # can enter before start_date, so the leading row is always flat.
+    # 2024-01-01 is a Monday), and applying that day's charges to the FIRST
+    # row hides them from pct_change and cummax entirely: the pre-DR-03 curve
+    # reported max drawdown 0.0% and Sortino 0.00 on a run that ended the day
+    # with $1.84 of CASH out of its $10,000, and the per-k table's "opening"
+    # was the already-charged balance. No trade can enter before start_date, so the
+    # leading row is always flat.
     dates = [start_date - timedelta(days=1)] + [
         start_date + timedelta(days=i) for i in range(span_days)
     ]
 
-    # Accumulate cash inflows and outflows per date
+    # Two accumulators, because a portfolio is cash PLUS whatever is still
+    # open. Tracking cash alone carried every open position at zero, which made
+    # the curve dive on entry and recover at settlement whether the trade won
+    # or lost — deployment reported as drawdown (DR-61, see the docstring).
     cash_changes: dict[date, float] = defaultdict(float)
+    position_changes: dict[date, float] = defaultdict(float)
     for t in trades:
-        # Capital leaves the portfolio on entry day (contract cost + taker fees)
+        # Cash leaves the portfolio on entry day (contract cost + taker fees)
         cash_changes[t.entry_date] -= t.total_cost + t.fees
-        # Gross settlement receipt returns to the portfolio on exit day
-        cash_changes[t.exit_date]  += t.actual_payoff
+        # ...but the contracts it bought are an ASSET held until settlement, so
+        # they re-enter the portfolio at cost and only the fees are a realized
+        # day-one charge. Fees are deliberately not capitalised: they are gone
+        # the moment the order fills and nothing can be sold on for them.
+        position_changes[t.entry_date] += t.total_cost
+        # At settlement the position is written off at cost and the gross
+        # receipt credited, so the step is exactly the realized pre-fee P&L.
+        cash_changes[t.exit_date]      += t.actual_payoff
+        position_changes[t.exit_date]  -= t.total_cost
 
     rows = []
     cash = initial_balance
+    open_positions = 0.0
     for d in dates:
-        # Apply any net cash change for this day (may be zero if no trades entered/exited)
-        cash += cash_changes.get(d, 0.0)
-        rows.append({"date": d, "portfolio_value": cash})
+        # Apply any net change for this day (may be zero if nothing entered/exited)
+        cash           += cash_changes.get(d, 0.0)
+        open_positions += position_changes.get(d, 0.0)
+        rows.append({"date": d, "portfolio_value": cash + open_positions})
 
     df = pd.DataFrame(rows)
     # Compute fractional daily returns; the leading initial-balance row has no
     # prior day so it gets 0.0, and start_date's own row is the first one that
-    # can show a day-0 outflow as a real return.
+    # can show a day-0 charge as a real return.
     df["daily_return"] = df["portfolio_value"].pct_change().fillna(0.0)
     return df
