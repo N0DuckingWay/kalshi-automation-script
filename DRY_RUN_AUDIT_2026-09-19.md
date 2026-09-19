@@ -839,12 +839,15 @@ values only, so such an edit passes.
   quantum). An editor "fixing" the near-miss to 6 dp would emit off-grid price strings.
   Relatedly, "`ceil_to_tick`, `v2_limit_price`, `v2_effective_cap` … only re-exported by
   `trader.py`" over-claims — only the first two have trader aliases.
-- **"Five scanner sites carry `PRICE_EPSILON`"** — there are six in `scanner.py` (2088, 2256,
-  2948, 3046, 3151, **3186**) plus a seventh in `strategy.py:333`. *Agents disagreed on
-  whether this is an error*: the uncounted sites are TS-08 reachability-cap comparisons, a
-  different class from the TS-09 threshold tests the paragraph enumerates. Recorded as
-  editorial, because the paragraph ends "the AST parity pins do NOT check this constant, so a
-  missed mirror is silent divergence" — i.e. the enumeration is meant to be the checklist.
+- **"Five scanner sites carry `PRICE_EPSILON`"** — **resolved: the enumeration is correct,
+  and this is NOT a doc defect.** Two agents read it as an undercount (six in `scanner.py`:
+  2088, 2256, 2948, 3046, 3151, **3186**, plus `strategy.py:333`). Two others, including the
+  parity agent that ran the 24,576-case differential, established the right reading: CLAUDE.md
+  enumerates the **five TS-09 threshold sites** plus two backtester mirrors = seven, all
+  present and all in agreement. `scanner.py:3186` and `strategy.py:333` are **TS-08
+  reachability-cap** comparisons — a different class, added later, and not what the paragraph
+  is enumerating. Recorded here only so the next sweep does not re-litigate it. The *real*
+  issue behind it is coverage, not counting: only **2 of the 7** are pinned — see Appendix B.
 - **`tests/test_strategy.py::test_ast_backtester_prices_through_helper`** is a method of
   `TestTimeSeriesKellyParity`; the quoted node ID collects nothing.
 - **`config.time_series_profit_prob`'s docstring names `backtester.run_backtest`** as one of
