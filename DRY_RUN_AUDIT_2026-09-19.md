@@ -20,6 +20,11 @@ claims A and B, concurrency and resources, and an adversarial money-loss red tea
 Each agent wrote and **ran** harnesses against the real modules with `MagicMock` clients —
 314 harness scripts in total — rather than reading code.
 
+**Phase 1b — mutation testing.** The parity agent additionally broke each live/backtest
+mirror on a *copy* of the repo and ran the full 1385-test suite against each (29 mutations,
+one full run each) to measure which invariants the suite actually protects. Results in the
+appendix — **8 mutations survive**, and they are precisely where silent divergence can live.
+
 **Phase 2 — 4 adversarial verifiers**, each tasked with *refuting* the 14 highest-impact
 findings and writing its own repro from scratch rather than re-running the originals.
 **This round overturned or downgraded 6 of the 14.** Where a verifier corrected a
@@ -38,6 +43,7 @@ Confidence notation used throughout:
 |---|---|---|
 | P1 | 4 | Real money / unhedged position / money-visibility |
 | P2 | 12 | Correctness, run-killing crashes, availability |
+| P2b | 4 | Live-vs-backtest parity (backtest fidelity) |
 | P3 | 9 | Silent drops and observability gaps |
 | P4 | 14 | Documentation defects with a concrete mis-edit hazard |
 | — | 6 | Refuted or downgraded in phase 2 — **do not act on these** |
@@ -1184,3 +1190,174 @@ Recorded so a future sweep does not re-derive it. All figures are from executed 
 **Testing note.** Almost every finding above is unpinned — that is *why* it survived 1385
 tests. Each fix should land with the test named in its entry, or the next sweep will find it
 again.
+
+---
+
+## P2b — Live-vs-backtest parity
+
+Baseline parity is good and was measured, not assumed: **24,576 exhaustive whole-cent grid
+cases** (6 pair-type/gap combinations) plus 3,000 randomized cases, pushing ONE synthetic
+universe through **both** pipelines end to end with the identical float prices, produced
+**zero** admit/reject or sizing disagreements. The tier test, `min_price_diff_for_gap`, the
+`1 - tier` ceiling, `MAX_DEADLINE_GAP_DAYS` and its band edges, both grouping keys, the
+one-series rule, the leg mapping, Kelly `p`, Kelly's fee-inclusive `b`, the fee-less
+`profit_ratio`, the budget shrink and `SAME_TITLE_CO_RESOLVE_PROB` all agree exactly.
+
+The four divergences that remain all bias the **same way**: the backtest is never stricter
+than live, so every backtest return figure is optimistic by their combined amount.
+
+### DRA-40 — The one-best-pair-per-group rule sits on OPPOSITE sides of the price/Kelly gates
+**`scanner.py:2117`, `:2310` vs `backtester.py:2117-2124`** · severity **medium** · parity
+
+Live picks one pair per group **inside the finder**, where the only gate applied is the
+continuous-fee `tradeable` check — the `1 - tier` leg-price ceiling lives downstream in
+`enrich_with_orderbook_prices` and the Kelly gate in `strategy._evaluate_size`. Nothing
+re-opens the group when the chosen pair dies there, so a group whose widest-gap candidate
+later fails either gate yields **nothing**. The backtester's `best_by_group` runs **after**
+`_find_entry` (which applies the ceiling) and after `kelly_f <= 0: continue`, so the
+runner-up is promoted and a trade is booked on tickers the live pipeline never had a
+candidate for.
+
+Measured: over 1,200 randomized 3-market groups, **19 time-series and 18 same-title groups**
+produce a backtest trade where live produces none — **11.4% of all backtest-trading
+time-series groups** in that population. Worked example: live emits only (M0,M1) (widest
+gap), enrichment finds no qualifying level, the run trades nothing; the backtest rejects
+(M0,M1), accepts (M0,M2), and books **587 contracts for $475.47**.
+
+`backtester.py:2110` records the *tie-break* difference ("mirrors the live scanners' CONCEPT
+… not their tie-break rule") but not this far larger one. CLAUDE.md's DR-54 note
+("removing a group's top candidate PROMOTES the runner-up") describes promotion for a skip
+**inside** the finder loop; a ceiling/Kelly rejection happens outside it, so live never
+promotes.
+
+**This is the same defect family as DRA-07 and should be fixed in one change.** DRA-07 is
+the settlement filters sitting before the dedup; this is the ceiling and Kelly gates sitting
+before it. Option (a) below fixes both.
+
+**Fix.** (a) *Backtest-side, cheapest and preserves live behaviour:* build `best_by_group`
+from the pre-Kelly `_extract_pairs` output using the live tie-break (`tradeable` first, then
+the signed price gap read off the entry), so a group that loses its top candidate downstream
+yields nothing, exactly as live does. (b) *Live-side:* keep all of a group's tradeable
+candidates through enrichment and apply the one-pair-per-group rule in
+`strategy.select_portfolio`, after the ceiling and Kelly gates — this changes real-money
+behaviour and needs its own review. Say which in CLAUDE.md.
+
+### DRA-41 — TS-08 reachability has NO backtest mirror, and CLAUDE.md never records the asymmetry
+**`strategy.py:290`, `:380`, `:690` vs `backtester.py:2237`** · severity **medium** ·
+parity / doc-defect
+
+`grep -c reachab kalshi_betting/backtester.py` finds no reachability logic at all. The
+backtest sizes against the candle's top-of-book quote with no depth cap and no FoK-limit cap
+(`n = int(budget / (price_a + price_b))`, capped by nothing), so it routinely books sizes the
+live fill-or-kill order could never fill. Because a candle quote is the TOP of book and any
+live prefix average is ≥ it, **the bias is one-sided for every pair**: backtest price ≤ live
+price ⇒ backtest `net_spread`, Kelly fraction and size are all ≥ live's.
+
+Measured on one pair: flat deep book → both size 3,802. Put a two-level ladder on either leg
+and live returns **300** while the backtest still books **3,802** — a **12.7× oversize**.
+With 5 contracts of top-of-book depth, live returns **5** against 3,802.
+
+CLAUDE.md's TS-08 section names three application sites, all live, and never says the
+backtester mirrors none of it — in a file that elsewhere says "the backtester's `_find_entry`
+mirrors all of it" (of the tiered filter) and "a missed mirror is silent divergence". The
+silence reads as "mirrored".
+
+**Fix — doc-only, and it is the cheap half.** Add one sentence to CLAUDE.md's TS-08
+paragraph: the backtester mirrors NONE of it (no book exists in candle data), backtest sizes
+are therefore an **upper bound** on live sizes, and a backtest return figure is optimistic by
+whatever the live depth/FoK cap removes. If fidelity is ever wanted, note that a candle
+carries no depth, so a real mirror needs a depth source that does not exist today — say that
+too, so nobody re-derives it.
+
+### DRA-42 — `_find_entry` records only the FIRST qualifying Monday, defeating the ticker-release parity Pass 2 claims
+**`backtester.py:1099` vs `:2196-2206`** · severity **low** · parity
+
+Pass 2 releases a ticker on its trade's exit date precisely so a later candidate can reuse
+it, "mirror[ing] the live bot's rule precisely". But `_find_entry` `return`s inside the
+`_monday_timestamps` loop, so every candidate carries exactly ONE entry date — a candidate
+blocked on that Monday is dropped permanently, where a live weekly run would re-scan and
+enter it once `get_held_tickers` released the ticker. The release happens; the re-entry it
+exists to enable cannot.
+
+Measured: X/Y and X/Z both first qualify 2026-03-02; X/Y wins and blocks ticker X until it
+settles 2026-03-10. X/Z is never reconsidered. Fed the same candidate at 2026-03-16 — what
+live would do — it produces a **2,915-contract trade** the backtest reports as never having
+existed.
+
+**Fix.** Either have `_find_entry` return every qualifying checkpoint and let Pass 2 take the
+first unblocked one, or — much cheaper — record the scan window on the entry and, when Pass 2
+skips for a ticker conflict, re-try at the first Monday on/after the blocking trade's exit
+date still inside that window. If neither, amend the Pass-2 comment: the mirror is partial
+and the backtest under-counts re-entries.
+
+### DRA-43 — `--max-horizon-days` is a DATE span in the backtest and a DATETIME span live
+**`backtester.py:1269` vs `scanner.py:1029`** · severity **low** · parity
+
+Live compares tz-aware close *datetimes* against `now + N days`; the backtester compares
+close *dates* against the checkpoint *date*, discarding the 09:00 time of day on both sides.
+The backtest's window therefore runs to 23:59 on day N — up to ~15 hours wider — and the skew
+is one-sided: **the backtest is never stricter**.
+
+Measured: `--max-horizon-days 14`, checkpoint 2026-03-02 09:00 UTC, later leg closing
+2026-03-16 23:00 UTC (true span 14d 14h). Live's cutoff is 2026-03-16 09:00 UTC so the market
+is dropped before pairing and the pair never exists; `_find_entry` measures 14 days by date
+and enters.
+
+The docstring's stated difference is the reference *point* ("relative to each simulated
+checkpoint rather than real-world now"), not the resolution.
+
+**Fix.** Compare datetimes in `_find_entry` — the time-series branch already parses them —
+with the current date arithmetic as the naive/aware `TypeError` fallback, exactly as the gap
+computation beside it does. Same-title needs the two datetimes parsed there too.
+
+---
+
+## Appendix B — What the test suite actually protects (mutation testing)
+
+The AST parity pins verify **only that a name is called somewhere in a function body**.
+`tests/test_strategy.py::_function_calls` finds the named `FunctionDef` and returns True if
+any `ast.Call` inside it names the callee — it checks no arguments, branch, polarity or
+conjunction. Two concrete gaps: a swapped `pA`/`pB` passes the Kelly-helper pin, and a `""`
+second argument passes the group-key pin (the subtitle is the whole point of DR-01).
+
+To find out whether the semantic gaps are covered *elsewhere*, each mirror was broken on a
+**copy** of the repo and the full 1385-test suite run against it — 29 mutations, one full run
+each. **15 of 19 backtester mutations and 6 of 10 live mutations are caught.** The 8
+survivors are where silent divergence can actually live:
+
+| Mutation (on a repo COPY) | Suite result |
+|---|---|
+| backtester: `gap < threshold - PRICE_EPSILON` → `gap < threshold` | **1385 passed** |
+| backtester: ceiling `+ PRICE_EPSILON` removed | **1385 passed** |
+| backtester: `profit_ratio_entry` given Kelly's fee-INCLUSIVE denominator (DR-62's "do not collapse the two") | **1385 passed** |
+| backtester: `_find_entry`'s fee/profitability gate disabled | **1385 passed** |
+| scanner: enrichment ceiling `+ PRICE_EPSILON` removed | **1385 passed** |
+| scanner: `validate_pair_price` ceiling `+ PRICE_EPSILON` removed | **1385 passed** |
+| scanner: `ref_yes is None` fallback tier `- PRICE_EPSILON` removed | **1385 passed** |
+| strategy: `_reachable_contracts` cap `+ PRICE_EPSILON` removed | **1385 passed** |
+
+So **2 of the 7 `PRICE_EPSILON` sites CLAUDE.md enumerates are pinned** (the two finder tier
+tests, by `TestPriceEpsilonThresholds`); the other five, plus the two reachability-cap sites,
+are not. The price point they would break at is the one CLAUDE.md already documents:
+`0.35 - 0.20 == 0.14999999999999997`, a hair under the 15% tier.
+
+Note the fourth survivor is **not** redundant: disabling `_find_entry`'s fee gate changes no
+trade (the Kelly gate re-rejects them) but *does* change `_interval_calibration`, whose k̂
+population is `_find_entry`'s output — and k̂ is the recommendation for the real-money
+discount constant.
+
+This is a **test-coverage gap, not a code defect** — the constant is present and correct at
+all seven sites, and the 24,576-case differential shows live and backtest agreeing. It is
+recorded so the fixes above land with pins that would actually catch a regression.
+
+Everything CLAUDE.md claims is pinned **by value** genuinely is: removing the fee from the
+backtester's `kelly_b_entry` fails `TestKellyRiskIncludesFees::test_all_three_sizers_agree_by_value`,
+`::test_the_backtester_also_rejects_the_headline_fixture`, and three `TestRunBacktestTimeSeriesFlow`
+tests.
+
+**One more negative result worth keeping.** `main._dedup_pairs` vs
+`_drop_cross_type_duplicates`: the whole whole-cent admissible region was brute-forced
+(5 gap tiers × 99³ price points) looking for a point where the same-title copy fails Kelly
+but the time-series copy of the same two tickers passes — which the position of
+`_drop_cross_type_duplicates` after the Kelly gate would resurrect. **0 such points exist**:
+when both copies exist the leg prices are the same two numbers and `p = 0.95` dominates.
