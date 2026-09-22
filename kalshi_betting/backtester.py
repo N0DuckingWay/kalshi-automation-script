@@ -18,7 +18,15 @@ Dependencies:
     grouping key, shared with the live scanner), event_series (the single
     definition of an event's series IDENTITY — the literal prefix, with every
     combo (KXMVE*) prefix collapsed onto one family — so the live and backtest
-    one-series rules can never disagree) and leg_sides from
+    one-series rules can never disagree), leg_sides, deadline_profile and
+    cumulative_deadline_pair (the single definition of whether two legs are a
+    two-cumulative-deadline pair, over the DEADLINE_CUMULATIVE/
+    DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants), deadline_pair_refusal
+    (the single definition of WHY a candidate is not one — DR-72; built on the
+    same three verdicts cumulative_deadline_pair reads, so the boolean and the
+    reason can never disagree) and its
+    REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/REFUSED_SAME_DEADLINE
+    constants from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
@@ -118,8 +126,11 @@ Notes:
     pair up front on its WORDING (scanner.cumulative_deadline_pair, shared with
     the live finder), so this counter is no longer the only signal that one was
     admitted — it is DEFENCE IN DEPTH behind a text heuristic, and a non-zero
-    count now means that heuristic had a false negative rather than that
-    nothing was watching.
+    count now means one of the WARNING's named causes fired, most likely a
+    wording false negative — though legs genuinely nested but ordered on an
+    early REALIZED close, or strike-blind grouping on a cache without
+    subtitles, can also produce it (DR-72) — rather than that nothing was
+    watching.
 """
 import logging
 import resource
@@ -161,7 +172,11 @@ from .scanner import (
     DEADLINE_CUMULATIVE,
     DEADLINE_SNAPSHOT,
     DEADLINE_UNKNOWN,
+    REFUSED_NO_STATED_DEADLINE,
+    REFUSED_SAME_DEADLINE,
+    REFUSED_SNAPSHOT,
     cumulative_deadline_pair,
+    deadline_pair_refusal,
     deadline_profile,
     event_series,
     leg_sides,
@@ -1060,10 +1075,14 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     """
     pairs = []
     # Time-series candidates refused as not one question at two cumulative
-    # deadlines. Reported once at the end of the call (silent at zero) — this
-    # function previously reported nothing at all about refused pairs, so a
-    # rule that can empty the strategy had no signal on this path.
-    phrasing_skips = 0
+    # deadlines, split by REASON (DR-72) — the mirror of the live scanner's
+    # split, over deadline_pair_refusal, the one shared definition. Reported
+    # once at the end of the call (silent at zero) — this function previously
+    # reported nothing at all about refused pairs, so a rule that can empty
+    # the strategy had no signal on this path.
+    snapshot_skips = 0
+    no_deadline_skips = 0
+    same_deadline_skips = 0
     for key, members in groups.items():
         if isinstance(key, str):
             canon = key
@@ -1128,7 +1147,19 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                     if not cumulative_deadline_pair(
                         group_profiles[i], group_profiles[j]
                     ):
-                        phrasing_skips += 1
+                        # Same decision as cumulative_deadline_pair, re-asked
+                        # for its REASON (DR-72) through the one shared
+                        # deadline_pair_refusal, so the verdict here and the
+                        # boolean just tested can never disagree.
+                        reason = deadline_pair_refusal(
+                            group_profiles[i], group_profiles[j]
+                        )
+                        if reason == REFUSED_SNAPSHOT:
+                            snapshot_skips += 1
+                        elif reason == REFUSED_NO_STATED_DEADLINE:
+                            no_deadline_skips += 1
+                        elif reason == REFUSED_SAME_DEADLINE:
+                            same_deadline_skips += 1
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
@@ -1151,11 +1182,30 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
-    if phrasing_skips:
+    # Mirror of the live scanner's three-way split (DR-72), each silent at
+    # zero: within the deadline-gap window this sweep already restricted
+    # itself to, before any price filter runs (this function does no price
+    # filtering at all — see the docstring).
+    if snapshot_skips:
         logging.info(
-            "Time-series candidates skipped as not a cumulative-deadline pair "
-            "(snapshot wording, no stated deadline, or one deadline stated twice): %d",
-            phrasing_skips,
+            "Time-series candidates refused because a leg's deciding field "
+            "is snapshot wording (within the deadline-gap window, before "
+            "price filters): %d",
+            snapshot_skips,
+        )
+    if no_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "carries no recognised deadline wording or no comparable date "
+            "(within the deadline-gap window, before price filters): %d",
+            no_deadline_skips,
+        )
+    if same_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because the two deciding fields "
+            "state the same deadline, or truncate to one (within the "
+            "deadline-gap window, before price filters): %d",
+            same_deadline_skips,
         )
     return pairs
 
@@ -2269,15 +2319,26 @@ def _simulate_at_discount(
         # Summary-warning idiom (silent at zero). This used to be the ONLY
         # signal that the grouping had admitted a non-cumulative pair; since
         # _extract_pairs screens both legs' wording, it is defence in depth
-        # behind that heuristic, and a non-zero count is now itself a finding —
-        # it means a pair whose wording read as two cumulative deadlines
-        # settled in a way only a non-cumulative pair can.
+        # behind that heuristic, and a non-zero count is now itself a finding
+        # — it means a pair whose wording read as two cumulative deadlines
+        # settled as an apparently non-nesting pair. That is most likely a
+        # wording false negative, but it is not the only mechanism: it can
+        # also be a genuinely nested pair whose legs were ordered on an early
+        # REALIZED close (ranking them by scheduled close would have kept the
+        # nesting), or strike-blind grouping on a cache without subtitles.
+        # DR-72 widens the named CAUSES beyond the single "mixed snapshot
+        # family" guess this line used to make — see the cause list below,
+        # and CLAUDE.md's strategy-change gotcha for what each one means.
         logging.warning(
             "Excluded %d time-series candidate(s) whose settlement violated the "
             "cumulative-deadline premise (earlier YES, later NO) — the "
-            "normalized-title group likely mixes snapshot markets ('on <date>') "
-            "with cumulative ones ('by <date>'), and the wording screen in "
-            "_extract_pairs did not catch it",
+            "pair passed the wording screen in _extract_pairs but still settled "
+            "as a non-nesting pair. Most likely a wording false negative (e.g. "
+            "snapshot markets, or recurring windows worded 'before <date>', "
+            "read as cumulative); legs ordered on an early REALIZED close (a "
+            "later-deadline leg that resolved YES before the earlier leg's "
+            "deadline); or strike-blind grouping on a cache without subtitles "
+            "(see the outcome-label coverage line)",
             premise_violations,
         )
 
@@ -2564,10 +2625,15 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
     Two properties of the population to keep in mind when reading the number:
 
       - Premise violations (earlier YES, later NO) are excluded from the
-        denominator entirely. Such a pair is not a cumulative-deadline pair at
-        all, so it is neither an in-between event nor a valid non-event, and
-        leaving it in would bias the rate in an arbitrary direction. They are
-        counted separately on the result. That count is NOT the same quantity
+        denominator entirely. Such a pair is most likely not a cumulative-
+        deadline pair at all (a wording false negative), though a genuinely
+        nested pair ordered on an early REALIZED close, or strike-blind
+        grouping on a cache without subtitles, can also land here (DR-72).
+        Either way it is neither a clean in-between event nor a valid
+        non-event, and leaving it in would bias the rate in an arbitrary
+        direction, so it is excluded regardless of which cause produced it.
+        They are counted separately on the result. That count is NOT the
+        same quantity
         as _simulate_at_discount()'s `premise_violations`, whose WARNING is
         emitted per simulated discount: that counter sits AFTER the Kelly
         gate, so it sees only Kelly-passing candidates and is generally
@@ -2589,8 +2655,10 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
         IntervalCalibration | None: The report, or None when there is nothing
             to report — no time-series candidate produced a usable
             observation AND none was excluded as a premise violation (the
-            codebase's return-None-on-nothing-to-say convention, which lets
-            the caller stay silent rather than logging an empty table).
+            codebase's return-None-on-nothing-to-say convention). Unlike most
+            such conventions here, this None is NOT silent at the caller
+            (DR-72): _log_interval_calibration logs one explanatory line for
+            it rather than nothing at all.
     """
     observations: list[_TimeSeriesOutcome] = []
     excluded = 0
@@ -2612,8 +2680,10 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
             continue
 
         # Earlier YES with later NO is impossible for a cumulative-deadline
-        # pair: the grouping admitted a non-cumulative one. Excluded from the
-        # denominator and counted for the report.
+        # pair: most likely the grouping admitted a non-cumulative one (a
+        # wording false negative), though a genuinely nested pair inverted by
+        # early-REALIZED-close leg ordering can land here too (DR-72).
+        # Excluded from the denominator and counted for the report either way.
         if outcome_a == "yes" and outcome_b == "no":
             excluded += 1
             continue
@@ -2629,8 +2699,9 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
 
     if not observations and not excluded:
         # Nothing measurable and nothing excluded — a same-title-only (or
-        # empty) run. None keeps the caller silent instead of printing an
-        # all-zero table.
+        # empty) run. None keeps the caller from printing an all-zero table
+        # (the caller itself is no longer silent on None — DR-72 — it logs
+        # one explanatory line instead).
         return None
 
     buckets: list[IntervalCalibrationBucket] = []
@@ -2667,9 +2738,15 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
     (pure comparison) is split from main._log_shard_coverage (decides how
     loudly to report): the measurement stays testable and reusable without log
     noise, and this decides the presentation. Follows the file's summary-line
-    idiom — silent when there is nothing to report (calibration is None, i.e.
-    no time-series candidate), and the premise-violation line is silent at
-    zero.
+    idiom for its SUB-counts — the premise-violation line is silent at zero —
+    but the top-level None case is no longer silent (DR-72): absence of a
+    warning must never be the only signal (the DR-66 lesson), and a truly
+    empty log line here read exactly like "nothing was logged because this
+    run has not gotten here yet", indistinguishable from a hang or a crash
+    upstream. calibration is None precisely when no time-series candidate
+    produced a usable observation and none was excluded as a premise
+    violation — see _interval_calibration's Returns — and that fact is now
+    stated explicitly rather than implied by silence.
 
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
     config.py, and the live sizer keeps reading
@@ -2678,12 +2755,16 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
-            result. None logs nothing at all.
+            result. None logs one explanatory line and returns.
 
     Returns:
         None
     """
     if calibration is None:
+        logging.info(
+            "Interval-discount calibration: no time-series candidate entry "
+            "in this window — empirical k_hat is not measurable"
+        )
         return
 
     logging.info(
@@ -2935,8 +3016,9 @@ def run_backtest_sweep(
     # below and is never filtered by any point's Kelly gate.
     calibration = _interval_calibration(raw_entries)
     # Reported here rather than inside the measurement, mirroring the
-    # check_shard_coverage / _log_shard_coverage split: silent when there was
-    # nothing to measure.
+    # check_shard_coverage / _log_shard_coverage split. Sub-counts inside the
+    # report stay silent at zero, but calibration is None is itself now
+    # reported with one explanatory line rather than nothing at all (DR-72).
     _log_interval_calibration(calibration)
 
     # The run's actual result. interval_discount is handed over verbatim —

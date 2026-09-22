@@ -30,9 +30,13 @@ Dependencies:
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
     main.py and backtester.py), and the scanning functions consumed by
     main.py and backtester.py (which also imports time_series_group_key,
-    leg_sides, and deadline_profile/cumulative_deadline_pair, so the live
-    scanner and the backtester group time-series candidates AND decide their
-    eligibility through one definition each). Depends on the KalshiClient
+    event_series, leg_sides, deadline_profile/cumulative_deadline_pair, so
+    the live scanner and the backtester group time-series candidates AND
+    decide their eligibility through one definition each, and
+    deadline_pair_refusal with its REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/
+    REFUSED_SAME_DEADLINE constants and the DEADLINE_CUMULATIVE/
+    DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
+    on WHY a candidate was refused (DR-72)). Depends on the KalshiClient
     produced by auth.py.
 
 Notes:
@@ -1247,12 +1251,94 @@ def _market_deadline_profile(market: Any) -> tuple:
     )
 
 
+# deadline_pair_refusal()'s three refusal reasons, named by the DECIDING
+# FIELD'S shape (DR-69) rather than by the pair's whole wording — each
+# constant's own docstring below says exactly what it means and, for
+# REFUSED_SAME_DEADLINE, the one caveat on reading it. Bare module-level
+# strings, the same internal-vocabulary idiom as DEADLINE_CUMULATIVE /
+# DEADLINE_SNAPSHOT / DEADLINE_UNKNOWN above — callers import the constants
+# and deadline_pair_refusal rather than compare against string literals
+# (DR-72).
+REFUSED_SNAPSHOT = "snapshot"
+"""Either leg's deciding field verdict is DEADLINE_SNAPSHOT: a snapshot
+wording ("price ON <date>", "top 10 in October", "after <date>") does not
+nest, so the pair has no cumulative-deadline premise regardless of what the
+other leg's field says."""
+
+REFUSED_NO_STATED_DEADLINE = "no_stated_deadline"
+"""Either leg is not DEADLINE_CUMULATIVE at all (DEADLINE_UNKNOWN — no field
+named a deadline shape), OR its deciding field named the KIND of question
+without a comparable date ("within 30 days", "at any time" — its
+deadline_profile() spans are then empty). Both read as "nothing here to
+compare a deadline against"."""
+
+REFUSED_SAME_DEADLINE = "same_deadline"
+"""Both legs are cumulative and both name a comparable deadline, but the two
+DECIDING fields' span sets are equal: one deadline stated twice, not two
+different ones — a same-title shape, not a two-deadline family. Caveat: the
+spans compared are normalized strings (_deadline_spans), so a deadline phrase
+that TRUNCATES the same way on both legs can read as equal even when the raw
+wording differs; this reason cannot distinguish "truly one deadline" from
+"two deadlines the parser happened to truncate alike"."""
+
+
+def deadline_pair_refusal(profile_a: tuple, profile_b: tuple) -> str | None:
+    """
+    Why a candidate is not a two-cumulative-deadline pair, or None when it is.
+
+    The single definition of time-series eligibility (DR-72): cumulative_
+    deadline_pair() is built on this function
+    (`deadline_pair_refusal(...) is None`), so the boolean verdict and the
+    refusal REASON can never disagree — there is exactly one place a future
+    change to the rule has to happen. Precedence is order-independent and
+    total, so exactly one of four outcomes always applies:
+
+      1. REFUSED_SNAPSHOT — either leg's DECIDING field verdict is
+         DEADLINE_SNAPSHOT. Checked first: a snapshot verdict disproves the
+         nesting premise outright regardless of the other leg's field or
+         whether either names a comparable date.
+      2. REFUSED_NO_STATED_DEADLINE — otherwise, either leg is not
+         DEADLINE_CUMULATIVE, or its deciding field's deadline spans are
+         empty (DR-69: the spans come from the deciding field alone, never a
+         less specific field that happens to name a date).
+      3. REFUSED_SAME_DEADLINE — otherwise, both legs are cumulative with
+         comparable spans, but the two span sets are equal.
+      4. None — both legs are cumulative, both name a comparable deadline,
+         and the two span sets differ: a genuine two-cumulative-deadline pair.
+
+    Args:
+        profile_a (tuple): First leg's (verdict, spans) from deadline_profile().
+        profile_b (tuple): Second leg's, same shape.
+
+    Returns:
+        str | None: One of REFUSED_SNAPSHOT, REFUSED_NO_STATED_DEADLINE,
+            REFUSED_SAME_DEADLINE, or None when the pair is eligible.
+    """
+    verdict_a, spans_a = profile_a
+    verdict_b, spans_b = profile_b
+    if verdict_a == DEADLINE_SNAPSHOT or verdict_b == DEADLINE_SNAPSHOT:
+        return REFUSED_SNAPSHOT
+    if (
+        verdict_a != DEADLINE_CUMULATIVE
+        or verdict_b != DEADLINE_CUMULATIVE
+        or not spans_a
+        or not spans_b
+    ):
+        return REFUSED_NO_STATED_DEADLINE
+    if spans_a == spans_b:
+        return REFUSED_SAME_DEADLINE
+    return None
+
+
 def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
     """
     True when two markets are one question asked at two different CUMULATIVE deadlines.
 
     The eligibility rule for a time-series pair, applied by BOTH finders on
-    precomputed deadline_profile() results. Requires, in order:
+    precomputed deadline_profile() results. Defined through
+    deadline_pair_refusal() (DR-72): True exactly when that function returns
+    None, so the two can never disagree about which pairs are eligible. In
+    plain terms this requires, in order:
 
       1. Both legs classify DEADLINE_CUMULATIVE. Fails CLOSED — a leg whose
          wording is a snapshot ("price on <date>", "top 10 in October",
@@ -1279,14 +1365,7 @@ def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
         bool: True only when both legs are cumulative and the deadlines their
             deciding fields state differ. Order-independent.
     """
-    verdict_a, spans_a = profile_a
-    verdict_b, spans_b = profile_b
-    if verdict_a != DEADLINE_CUMULATIVE or verdict_b != DEADLINE_CUMULATIVE:
-        return False
-    # Both legs must NAME a deadline, and the two must not be the same one.
-    if not spans_a or not spans_b:
-        return False
-    return spans_a != spans_b
+    return deadline_pair_refusal(profile_a, profile_b) is None
 
 
 def _normalize_subtitle(subtitle: str) -> str:
@@ -2531,10 +2610,24 @@ def find_time_series_pairs(
     )
 
     # Candidates refused because the two legs are not one question at two
-    # cumulative deadlines, and because their leg prices already sum to $1 or
-    # more. Counted here, reported once after the loop (silent at zero) —
-    # the same summary idiom find_same_title_pairs uses for its series skips.
-    phrasing_skips = 0
+    # cumulative deadlines, split by REASON (DR-72) rather than folded into
+    # one counter: a snapshot leg, a leg naming no comparable deadline, and
+    # two legs naming the SAME deadline are three different findings with
+    # three different remedies, and collapsing them hid which one applied.
+    # Plus the price-sum skip below. All reported once after the loop
+    # (silent at zero) — the same summary idiom find_same_title_pairs uses
+    # for its series skips. The checks themselves are NOT reordered: the
+    # wording check still runs strictly before the price-sum check, so this
+    # split cannot shift any candidate's count into price_sum_skips.
+    snapshot_skips = 0
+    no_deadline_skips = 0
+    same_deadline_skips = 0
+    # Candidates that named two DIFFERENT cumulative deadlines but were
+    # refused for being more than MAX_DEADLINE_GAP_DAYS apart — the wording
+    # was fine, only the gap wasn't. Reported separately below, since "worded
+    # right but too far apart" is a different signal than "not worded as two
+    # deadlines at all".
+    gap_cap_skips = 0
     price_sum_skips = 0
 
     candidate_pairs: list = []
@@ -2578,7 +2671,19 @@ def find_time_series_pairs(
                 if not cumulative_deadline_pair(
                     profiles[mA.ticker], profiles[mB.ticker]
                 ):
-                    phrasing_skips += 1
+                    # Same decision as cumulative_deadline_pair, re-asked for
+                    # its REASON (DR-72) — deadline_pair_refusal is the one
+                    # definition both calls share, so the verdict here and the
+                    # boolean just tested can never disagree.
+                    reason = deadline_pair_refusal(
+                        profiles[mA.ticker], profiles[mB.ticker]
+                    )
+                    if reason == REFUSED_SNAPSHOT:
+                        snapshot_skips += 1
+                    elif reason == REFUSED_NO_STATED_DEADLINE:
+                        no_deadline_skips += 1
+                    elif reason == REFUSED_SAME_DEADLINE:
+                        same_deadline_skips += 1
                     continue
 
                 # Deadline gap check: past 30 days too much of the market-implied
@@ -2586,6 +2691,12 @@ def find_time_series_pairs(
                 # Order-independent (same helper _pair_max_sum and the backtester use)
                 gap_days = deadline_gap_days(mA, mB)
                 if gap_days > MAX_DEADLINE_GAP_DAYS:
+                    # Wording was fine — the pair passed cumulative_deadline_pair
+                    # just above — only the gap wasn't. Counted separately from
+                    # the wording refusals above (DR-72): this is the live signal
+                    # that cumulative families exist but sit too far apart to
+                    # trade, not that the wording screen is failing.
+                    gap_cap_skips += 1
                     continue
 
                 try:
@@ -2675,12 +2786,45 @@ def find_time_series_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
-    if phrasing_skips:
-        # Summary idiom, silent at zero (see find_same_title_pairs' series skips).
+    # Three separate INFO lines, each silent at zero (DR-72) — the same
+    # summary idiom find_same_title_pairs uses for its series skips, split by
+    # REASON instead of folded into one "not a cumulative-deadline pair"
+    # count so a reader can tell a wording problem (snapshot families, no
+    # recognised deadline, one deadline said twice) from a distance problem
+    # (the gap-cap line below). All three count candidate pairs within a
+    # group, before the gap and price filters run.
+    if snapshot_skips:
         logging.info(
-            "Time-series candidates skipped as not a cumulative-deadline pair "
-            "(snapshot wording, no stated deadline, or one deadline stated twice): %d",
-            phrasing_skips,
+            "Time-series candidates refused because a leg's deciding field "
+            "is snapshot wording (counted before the gap and price filters): %d",
+            snapshot_skips,
+        )
+    if no_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "carries no recognised deadline wording or no comparable date "
+            "(counted before the gap and price filters): %d",
+            no_deadline_skips,
+        )
+    if same_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because the two deciding fields "
+            "state the same deadline, or truncate to one (counted before the "
+            "gap and price filters): %d",
+            same_deadline_skips,
+        )
+    if gap_cap_skips:
+        # The live signal that cumulative families exist but sit too far
+        # apart to trade — distinct from the wording refusals above, which
+        # mean the families themselves were never found to be cumulative at
+        # all. Can include wording false positives (a heuristic misread as
+        # cumulative that happens to also miss the gap cap).
+        logging.info(
+            "Time-series candidates worded as two different cumulative "
+            "deadlines, refused at the %d-day gap cap (tier and price not "
+            "evaluated): %d",
+            MAX_DEADLINE_GAP_DAYS,
+            gap_cap_skips,
         )
     if price_sum_skips:
         logging.info(

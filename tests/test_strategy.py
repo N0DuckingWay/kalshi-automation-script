@@ -700,6 +700,21 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "deadline_profile", "_deciding_field")
         assert _function_calls(scanner, "deadline_phrasing", "_deciding_field")
 
+    def test_ast_cumulative_deadline_pair_is_defined_through_refusal(self):
+        # DR-72: cumulative_deadline_pair() is `deadline_pair_refusal(...) is
+        # None`, so the boolean verdict and the refusal REASON both finders
+        # log can never disagree — there is exactly one place the rule lives.
+        assert _function_calls(scanner, "cumulative_deadline_pair", "deadline_pair_refusal")
+
+    def test_ast_both_finders_name_the_refusal_reason(self):
+        # Both finders keep deciding through cumulative_deadline_pair (the
+        # pin above is unchanged); on refusal they ALSO call
+        # deadline_pair_refusal directly to choose which of the three DR-72
+        # skip counters to increment, rather than re-deriving the reason from
+        # the profiles themselves or comparing string literals.
+        assert _function_calls(scanner, "find_time_series_pairs", "deadline_pair_refusal")
+        assert _function_calls(backtester, "_extract_pairs", "deadline_pair_refusal")
+
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror
         # helpers call scanner.event_series, so live and backtest can never

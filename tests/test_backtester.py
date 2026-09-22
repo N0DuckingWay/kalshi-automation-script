@@ -611,6 +611,127 @@ class TestDateTokenBoundaries:
         assert {a["ticker"], b["ticker"]} == {"PA-1", "PB-1"}
 
 
+class TestPhrasingSkipCounts:
+    """Backtester mirror of test_scanner.py::TestPhrasingSkipCounts (DR-72):
+    the single folded "not a cumulative-deadline pair" line is split into
+    three honest, separately-reported reasons here too, over
+    backtester._deadline_profile_dict rather than the live scanner's
+    attribute-based profile. Each reason gets its own two-member group on a
+    distinct series pair (EVA-x / EVB-x) so the DR-02 one-series conjunct —
+    which runs before the deadline check on this branch too — never fires
+    ahead of the check under test.
+    """
+
+    @staticmethod
+    def _stub_profiles(overrides: dict):
+        def fake(m):
+            return overrides[m["ticker"]]
+        return fake
+
+    @staticmethod
+    def _refusal_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Time-series candidates refused because")
+        ]
+
+    def test_each_reason_is_reported_once(self, monkeypatch, caplog):
+        # regression — fails on revert to the single folded counter, which
+        # reported one line instead of three, so none of the three
+        # exact-prefix assertions below would ever have matched.
+        #
+        # Each reason gets a DIFFERENT candidate count (1, 2, 3) — not just a
+        # different fixture — so a mutant that swaps which counter a reason
+        # increments cannot pass by coincidence: with every reason at count
+        # 1, such a swap still emits three "...: 1" lines and this test could
+        # not tell (mirrors test_scanner.py's TestPhrasingSkipCounts fix).
+        rec = TestDeadlineGuardFinders._rec
+        snap_a = rec("SNAP-A", "EVA-1", "Will Group Snap happen?", "2026-06-01T00:00:00Z")
+        snap_b = rec("SNAP-B", "EVB-1", "Will Group Snap happen?", "2026-06-05T00:00:00Z")
+        nod_a = rec("NOD-A", "EVA-2", "Will Group Nodate happen?", "2026-06-01T00:00:00Z")
+        nod_b = rec("NOD-B", "EVB-2", "Will Group Nodate happen?", "2026-06-05T00:00:00Z")
+        nod2_a = rec("NOD2-A", "EVA-4", "Will Group Nodate2 happen?", "2026-06-01T00:00:00Z")
+        nod2_b = rec("NOD2-B", "EVB-4", "Will Group Nodate2 happen?", "2026-06-05T00:00:00Z")
+        same_a = rec("SAME-A", "EVA-3", "Will Group Same happen?", "2026-06-01T00:00:00Z")
+        same_b = rec("SAME-B", "EVB-3", "Will Group Same happen?", "2026-06-05T00:00:00Z")
+        same2_a = rec("SAME2-A", "EVA-5", "Will Group Same2 happen?", "2026-06-01T00:00:00Z")
+        same2_b = rec("SAME2-B", "EVB-5", "Will Group Same2 happen?", "2026-06-05T00:00:00Z")
+        same3_a = rec("SAME3-A", "EVA-6", "Will Group Same3 happen?", "2026-06-01T00:00:00Z")
+        same3_b = rec("SAME3-B", "EVB-6", "Will Group Same3 happen?", "2026-06-05T00:00:00Z")
+        members = [
+            snap_a, snap_b,
+            nod_a, nod_b, nod2_a, nod2_b,
+            same_a, same_b, same2_a, same2_b, same3_a, same3_b,
+        ]
+
+        overrides = {
+            "SNAP-A": (scanner.DEADLINE_SNAPSHOT, ("on june 1, 2026",)),
+            "SNAP-B": (scanner.DEADLINE_CUMULATIVE, ("by june 10, 2026",)),
+            "NOD-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "NOD2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD2-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "SAME-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+        }
+        monkeypatch.setattr(
+            backtester, "_deadline_profile_dict", self._stub_profiles(overrides)
+        )
+
+        groups = _group_by_normalized_title(members)
+        assert len(groups) == 6  # six distinct titles -> six groups
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(groups)
+        assert pairs == []
+
+        lines = self._refusal_lines(caplog)
+        assert len(lines) == 3
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field is snapshot wording"
+            ) and line.endswith(": 1")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field carries no recognised deadline wording or no "
+                "comparable date"
+            ) and line.endswith(": 2")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because the two deciding "
+                "fields state the same deadline, or truncate to one"
+            ) and line.endswith(": 3")
+            for line in lines
+        )
+        # This function does no gap-window logging of its own (the sweep
+        # window is a performance bound, not a reported filter) — mirrored
+        # here only to record that it stays absent.
+        assert not any("gap cap" in m for m in (r.getMessage() for r in caplog.records))
+
+    def test_silent_at_zero(self, caplog):
+        # control — kills a mutant that logs a refusal line unconditionally
+        # (dropping the `if snapshot_skips:` / etc. guards). A group whose
+        # one candidate pair is genuinely eligible must produce none of the
+        # three lines.
+        rec = TestDeadlineGuardFinders._rec
+        a = rec("OK-A", "EVA-1", "Will Group OK happen by June 1, 2026?", "2026-06-01T00:00:00Z")
+        b = rec("OK-B", "EVB-1", "Will Group OK happen by June 10, 2026?", "2026-06-10T00:00:00Z")
+        groups = TestDeadlineGuardFinders._one_group([a, b])
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(groups)
+        assert len(pairs) == 1
+        assert self._refusal_lines(caplog) == []
+
+
 class TestDeadlineProfileParity:
     """The live scanner (attribute-based) and the backtester (dict-based)
     field extraction must agree on every input, since only the field
@@ -3764,7 +3885,11 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(premise) == 1
         assert premise[0].startswith("Excluded 1 time-series candidate(s)")
         assert "earlier YES, later NO" in premise[0]
+        # DR-72: three named causes, not one guessed one.
         assert "snapshot markets" in premise[0]
+        assert "recurring windows" in premise[0]
+        assert "REALIZED close" in premise[0]
+        assert "outcome-label coverage" in premise[0]
         # Flat equity curve: nothing left and nothing came back
         assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
         assert equity["portfolio_value"].max() == pytest.approx(10_000.0)
@@ -4028,8 +4153,10 @@ class TestIntervalCalibration:
     """_interval_calibration: the k-independent empirical-discount measurement."""
 
     def test_returns_none_without_time_series_candidates(self):
-        # Summary-line idiom: nothing to say, so the caller stays silent
-        # rather than logging an all-zero table.
+        # None means there is no table to print (nothing measurable) — but
+        # since DR-72 the caller (_log_interval_calibration) is no longer
+        # silent on None: it logs one explanatory line instead of an
+        # all-zero table. See TestLogIntervalCalibration for that line.
         assert _interval_calibration([]) is None
         assert _interval_calibration([
             _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title"),
@@ -4141,16 +4268,22 @@ class TestIntervalCalibration:
 
 
 class TestLogIntervalCalibration:
-    """The report's presentation: silent when there is nothing to say."""
+    """The report's presentation: one line even when there is nothing to
+    measure (DR-72); sub-counts inside the report stay silent at zero."""
 
     @staticmethod
     def _messages(caplog):
         return [r.getMessage() for r in caplog.records]
 
-    def test_none_logs_nothing(self, caplog):
+    def test_none_logs_one_explanatory_line(self, caplog):
         with caplog.at_level("INFO"):
             _log_interval_calibration(None)
-        assert caplog.records == []
+        msgs = self._messages(caplog)
+        assert len(msgs) == 1
+        assert msgs[0] == (
+            "Interval-discount calibration: no time-series candidate entry "
+            "in this window — empirical k_hat is not measurable"
+        )
 
     def test_report_lines(self, caplog):
         calib = _interval_calibration([

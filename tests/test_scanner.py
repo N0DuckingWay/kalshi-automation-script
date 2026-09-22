@@ -14,6 +14,7 @@ from kalshi_betting import config, scanner
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     INCLUDE_MVE_MARKETS,
+    MAX_DEADLINE_GAP_DAYS,
     SAME_TITLE_LEG_SIDES,
     TIME_SERIES_LEG_SIDES,
 )
@@ -1573,6 +1574,62 @@ class TestCumulativeDeadlinePairPredicate:
         assert scanner.cumulative_deadline_pair(spanless, dated) is False
 
 
+class TestDeadlinePairRefusal:
+    """deadline_pair_refusal()'s precedence is total and order-independent
+    (DR-72): exactly one of its four outcomes — REFUSED_SNAPSHOT,
+    REFUSED_NO_STATED_DEADLINE, REFUSED_SAME_DEADLINE, or None — always
+    applies, and swapping the two profiles never changes which one.
+    cumulative_deadline_pair() is defined as
+    `deadline_pair_refusal(...) is None` (DR-72), so every case here also
+    pins that the two can never disagree about which pairs are eligible —
+    a regression here catches a future edit to either function that drifts
+    the boolean verdict away from the reason.
+    """
+
+    @pytest.mark.parametrize("profile_a, profile_b, expected", [
+        # snapshot + unknown -> snapshot: the snapshot verdict alone disproves
+        # the premise, regardless of what the other leg's field says.
+        (
+            (scanner.DEADLINE_SNAPSHOT, ("on june 1, 2026",)),
+            (scanner.DEADLINE_UNKNOWN, ()),
+            scanner.REFUSED_SNAPSHOT,
+        ),
+        # snapshot + spanless-cumulative -> snapshot, not no-stated-deadline:
+        # the snapshot check runs FIRST regardless of whether the other leg
+        # would independently have failed the span check too.
+        (
+            (scanner.DEADLINE_SNAPSHOT, ("on june 1, 2026",)),
+            (scanner.DEADLINE_CUMULATIVE, ()),
+            scanner.REFUSED_SNAPSHOT,
+        ),
+        # unknown + dated cumulative -> no-stated-deadline: one leg names no
+        # deadline shape at all, so there is nothing to compare it against.
+        (
+            (scanner.DEADLINE_UNKNOWN, ()),
+            (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            scanner.REFUSED_NO_STATED_DEADLINE,
+        ),
+        # equal spans -> same-deadline: both cumulative, both name a date,
+        # but it's the SAME date stated twice.
+        (
+            (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            scanner.REFUSED_SAME_DEADLINE,
+        ),
+        # Genuinely eligible: both cumulative, spans differ -> None.
+        (
+            (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            (scanner.DEADLINE_CUMULATIVE, ("by june 10, 2026",)),
+            None,
+        ),
+    ])
+    def test_precedence_is_order_independent(self, profile_a, profile_b, expected):
+        assert scanner.deadline_pair_refusal(profile_a, profile_b) == expected
+        assert scanner.deadline_pair_refusal(profile_b, profile_a) == expected
+        assert scanner.cumulative_deadline_pair(profile_a, profile_b) == (expected is None)
+        assert scanner.cumulative_deadline_pair(profile_b, profile_a) == (expected is None)
+
+
 class TestDeadlineGuardFinders:
     """Finder-level pins for the cumulative-deadline guard: the verdict gate,
     the span-presence check, and running the screen before best-pair
@@ -2085,6 +2142,181 @@ class TestPhrasingCensusLine:
         assert self._census_lines(caplog) == [
             "Deadline phrasing of actively priced markets: 0 cumulative, 0 snapshot, 5 unknown",
         ]
+
+
+class TestPhrasingSkipCounts:
+    """DR-72: the single "not a cumulative-deadline pair" skip counter is
+    split into three honest, separately-reported reasons. Each is exercised
+    with its own two-member group (so that group's one candidate pair has an
+    unambiguous, predictable refusal reason) on a distinct series pair
+    (EVA-x / EVB-x) so the DR-02 one-series conjunct — which runs BEFORE the
+    deadline check — never fires ahead of the check under test.
+    """
+
+    @staticmethod
+    def _stub_profiles(overrides: dict):
+        def fake(market):
+            return overrides[market.ticker]
+        return fake
+
+    @staticmethod
+    def _refusal_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Time-series candidates refused because")
+        ]
+
+    def test_each_reason_is_reported_once(self, monkeypatch, caplog):
+        # regression — fails on revert to the single folded counter, which
+        # reported one line ("not a cumulative-deadline pair...") instead of
+        # three, so none of the three exact-prefix assertions below would
+        # ever have matched.
+        #
+        # Each reason gets a DIFFERENT candidate count (1, 2, 3) — not just a
+        # different fixture — so a mutant that swaps which counter a reason
+        # increments (e.g. REFUSED_SNAPSHOT bumping same_deadline_skips)
+        # cannot pass by coincidence: with every reason at count 1, such a
+        # swap still emits three "...: 1" lines and this test could not tell.
+        snap_a = _mock_market(ticker="SNAP-A", event_ticker="EVA-1", title="Will Group Snap happen?")
+        snap_b = _mock_market(ticker="SNAP-B", event_ticker="EVB-1", title="Will Group Snap happen?")
+        nod_a = _mock_market(ticker="NOD-A", event_ticker="EVA-2", title="Will Group Nodate happen?")
+        nod_b = _mock_market(ticker="NOD-B", event_ticker="EVB-2", title="Will Group Nodate happen?")
+        nod2_a = _mock_market(ticker="NOD2-A", event_ticker="EVA-4", title="Will Group Nodate2 happen?")
+        nod2_b = _mock_market(ticker="NOD2-B", event_ticker="EVB-4", title="Will Group Nodate2 happen?")
+        same_a = _mock_market(ticker="SAME-A", event_ticker="EVA-3", title="Will Group Same happen?")
+        same_b = _mock_market(ticker="SAME-B", event_ticker="EVB-3", title="Will Group Same happen?")
+        same2_a = _mock_market(ticker="SAME2-A", event_ticker="EVA-5", title="Will Group Same2 happen?")
+        same2_b = _mock_market(ticker="SAME2-B", event_ticker="EVB-5", title="Will Group Same2 happen?")
+        same3_a = _mock_market(ticker="SAME3-A", event_ticker="EVA-6", title="Will Group Same3 happen?")
+        same3_b = _mock_market(ticker="SAME3-B", event_ticker="EVB-6", title="Will Group Same3 happen?")
+        markets = [
+            snap_a, snap_b,
+            nod_a, nod_b, nod2_a, nod2_b,
+            same_a, same_b, same2_a, same2_b, same3_a, same3_b,
+        ]
+
+        overrides = {
+            "SNAP-A": (scanner.DEADLINE_SNAPSHOT, ("on june 1, 2026",)),
+            "SNAP-B": (scanner.DEADLINE_CUMULATIVE, ("by june 10, 2026",)),
+            "NOD-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "NOD2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD2-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "SAME-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+        }
+        monkeypatch.setattr(
+            scanner, "_market_deadline_profile", self._stub_profiles(overrides)
+        )
+
+        with caplog.at_level(logging.INFO):
+            pairs = find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=markets,
+            )
+        assert pairs == []
+
+        lines = self._refusal_lines(caplog)
+        assert len(lines) == 3  # exactly one per reason, none folded together
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field is snapshot wording"
+            ) and line.endswith(": 1")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field carries no recognised deadline wording or no "
+                "comparable date"
+            ) and line.endswith(": 2")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because the two deciding "
+                "fields state the same deadline, or truncate to one"
+            ) and line.endswith(": 3")
+            for line in lines
+        )
+        # None of the six refused pairs ever reached the gap check.
+        assert not any("gap cap" in m for m in (r.getMessage() for r in caplog.records))
+
+    def test_silent_at_zero(self, caplog):
+        # control — kills a mutant that logs a refusal line unconditionally
+        # (dropping the `if snapshot_skips:` / etc. guards). A fixture where
+        # the one candidate pair in the group is genuinely eligible must
+        # produce none of the three lines.
+        a = _mock_market(
+            ticker="OK-A", event_ticker="EVA-1",
+            title="Will Group OK happen by June 1, 2026?",
+            yes_ask=0.10, no_ask=0.90, close_time=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        b = _mock_market(
+            ticker="OK-B", event_ticker="EVB-1",
+            title="Will Group OK happen by June 10, 2026?",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 6, 10, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(a)) == normalize_title(pair_key(b))
+        with caplog.at_level(logging.INFO):
+            pairs = find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=[a, b],
+            )
+        assert len(pairs) == 1
+        assert self._refusal_lines(caplog) == []
+
+
+class TestGapCapSkipLine:
+    """DR-72: a candidate WORDED as two different cumulative deadlines, but
+    refused only for sitting more than MAX_DEADLINE_GAP_DAYS apart, gets its
+    own line — distinct from the three wording-refusal reasons above, which
+    all mean the wording itself never established a genuine two-deadline
+    pair in the first place.
+    """
+
+    def test_two_cumulative_legs_45_days_apart(self, caplog):
+        # regression — fails on revert: before DR-72 this candidate was
+        # dropped by the bare `if gap_days > MAX_DEADLINE_GAP_DAYS: continue`
+        # with no counter or log line at all, so no "gap cap" line could ever
+        # appear.
+        mA = _mock_market(
+            ticker="GAP-A", event_ticker="EVA-1",
+            title="Will X happen by March 1, 2026?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="GAP-B", event_ticker="EVB-1",
+            title="Will X happen by April 15, 2026?",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 4, 15, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner.deadline_gap_days(mA, mB) == 45
+        assert scanner.cumulative_deadline_pair(
+            scanner._market_deadline_profile(mA),
+            scanner._market_deadline_profile(mB),
+        ) is True
+
+        with caplog.at_level(logging.INFO):
+            pairs = find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=[mA, mB],
+            )
+        assert pairs == []
+
+        msgs = [r.getMessage() for r in caplog.records]
+        gap_lines = [m for m in msgs if "gap cap" in m]
+        assert gap_lines == [
+            "Time-series candidates worded as two different cumulative "
+            f"deadlines, refused at the {MAX_DEADLINE_GAP_DAYS}-day gap cap "
+            "(tier and price not evaluated): 1",
+        ]
+        # The wording was fine — none of the three refusal-reason lines fire.
+        assert not any(
+            m.startswith("Time-series candidates refused because") for m in msgs
+        )
 
 
 # ── DR-70: the phrasing classifier is cheap, and its output does not move ─────
