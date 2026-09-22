@@ -16,7 +16,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester
+from kalshi_betting import backtester, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -483,6 +483,203 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         assert backtester._identical_wording_dicts(
             {"title": "Q by March"}, {"title": "Q by June"},
         ) is False
+
+
+class TestDeadlineGuardFinders:
+    """Backtester mirror of test_scanner.py::TestDeadlineGuardFinders — the
+    same fixtures, through the dict-based grouping/extraction path, so a
+    fail-open guard that is pinned live but unpinned in the backtester cannot
+    silently diverge: cumulative_deadline_pair is one shared helper, but each
+    path reaches it through its own field extraction.
+
+    Every test that asserts [] also asserts, inside the test, that its two
+    legs land in one _group_by_normalized_title group (so a normalize_title
+    drift cannot make the test pass vacuously by splitting the legs apart
+    before the guard under test is ever reached) and carries an in-test
+    positive control.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, event_title=""):
+        rec = _md(ticker, event_ticker, title=title, event_title=event_title)
+        rec["close_time"] = close_time
+        return rec
+
+    @staticmethod
+    def _one_group(markets):
+        groups = _group_by_normalized_title(markets)
+        assert len(groups) == 1
+        [members] = groups.values()
+        assert len(members) == len(markets)
+        return groups
+
+    def test_level_at_instant_legs_are_refused(self):
+        # control — kills M03full.
+        t1 = "Will BTC be above $100k at the close on Sep 30, 2026, before Oct 1, 2026?"
+        t2 = "Will BTC be above $100k at the close on Oct 9, 2026, before Oct 10, 2026?"
+        mA = self._rec("PA-1", "EVA-1", t1, "2026-09-30T00:00:00Z")
+        mB = self._rec("PB-1", "EVB-1", t2, "2026-10-09T00:00:00Z")
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 1, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 10, 2026",),
+        )
+        assert _extract_pairs(groups) == []
+
+        # Control: same fixture with "at the close on <date>," removed.
+        cA = self._rec(
+            "PA-1", "EVA-1", "Will BTC be above $100k before Oct 1, 2026?",
+            "2026-09-30T00:00:00Z",
+        )
+        cB = self._rec(
+            "PB-1", "EVB-1", "Will BTC be above $100k before Oct 10, 2026?",
+            "2026-10-09T00:00:00Z",
+        )
+        assert len(_extract_pairs(_group_by_normalized_title([cA, cB]))) == 1
+
+    def test_dated_leg_never_pairs_with_spanless_cumulative_leg(self):
+        # control — kills M02 at the finder level.
+        evt = "Will X happen at any time?"
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will X happen by March 1?", "2026-03-01T00:00:00Z",
+            event_title=evt,
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will X happen Mar 9?", "2026-03-09T00:00:00Z",
+            event_title=evt,
+        )
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: B names its own deadline.
+        mB2 = self._rec(
+            "PB-1", "EVB-1", "Will X happen by March 9?", "2026-03-09T00:00:00Z",
+            event_title=evt,
+        )
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB2]))) == 1
+
+    def test_dated_leg_never_pairs_with_unknown_leg(self):
+        # control — kills M02+M03a together (see test_scanner.py's mirror for
+        # why M03a alone cannot be isolated by this fixture).
+        mA = self._rec("PA-1", "EVA-1", "Will X happen by March 1?", "2026-03-01T00:00:00Z")
+        mB = self._rec("PB-1", "EVB-1", "Will X happen Mar 9?", "2026-03-09T00:00:00Z")
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_UNKNOWN, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: B named its own deadline instead.
+        mB2 = self._rec("PB-1", "EVB-1", "Will X happen by March 9?", "2026-03-09T00:00:00Z")
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB2]))) == 1
+
+
+class TestDeadlineProfileParity:
+    """The live scanner (attribute-based) and the backtester (dict-based)
+    field extraction must agree on every input, since only the field
+    EXTRACTION differs between the two paths — the classification itself is
+    one function, scanner.deadline_profile, called by both (pinned by AST in
+    test_strategy.py). An argument swap or a dropped subtitle in either
+    extraction helper would otherwise split the two paths silently, with
+    nothing to catch it: the AST pin only checks that deadline_profile is
+    called, never what it is called WITH.
+    """
+
+    # control — kills M23a/b/c/d/f/g (see test_missing_event_title_key_reads_
+    # as_absent below for the M23d case: a genuinely ABSENT "event_title" key,
+    # as distinct from a present-but-blank one).
+    @pytest.mark.parametrize("title, subtitle, event_title", [
+        # Conflicting markers across fields — subtitle decides.
+        ("Bitcoin price on Sep 15, 2026?", "$80,000 by June 30", ""),
+        # Conflicting markers — title decides over event_title, both
+        # directions.
+        ("Will X happen before Jan 1, 2027?", "", "Will X happen in 2026?"),
+        ("Top 10 in October?", "", "Will X happen by Dec 31, 2026?"),
+        # subtitle=None — a legitimate cached shape (historical._market_to_dict
+        # stores `subtitle or yes_sub_title`, which is None when both are
+        # absent) — must read as absent on both paths.
+        ("Will X happen?", None, ""),
+        # blank event_title.
+        ("Will X happen by March 1?", "", ""),
+    ])
+    def test_dict_and_live_extraction_agree(self, title, subtitle, event_title):
+        live_market = SimpleNamespace(
+            title=title, subtitle=subtitle or "", _event_title=event_title,
+        )
+        record = {"title": title, "subtitle": subtitle, "event_title": event_title}
+        assert (
+            backtester._deadline_profile_dict(record)
+            == scanner._market_deadline_profile(live_market)
+        )
+
+    def test_missing_event_title_key_reads_as_absent(self):
+        # control — old cache records predate "event_title" entirely (see
+        # _deadline_profile_dict's own docstring), which the parametrized
+        # cases above never exercise: every record there carries the key,
+        # with "" as its blank value, and `m.get("event_title") or ""` cannot
+        # tell a genuinely missing key from a present blank one. This case
+        # covers the record side; the live side's matching default is a
+        # market object with no _event_title attribute at all, exercising
+        # _market_deadline_profile's own getattr(..., "") default.
+        record = {"title": "Will X happen by March 1?", "subtitle": ""}
+        live_market = SimpleNamespace(title="Will X happen by March 1?", subtitle="")
+        assert "event_title" not in record
+        assert not hasattr(live_market, "_event_title")
+        assert (
+            backtester._deadline_profile_dict(record)
+            == scanner._market_deadline_profile(live_market)
+            == (scanner.DEADLINE_CUMULATIVE, ("by march 1",))
+        )
+
+
+class TestClassifyOncePerMarket:
+    """Backtester mirror of test_scanner.py::TestClassifyOncePerMarket.
+    Patches backtester.deadline_profile directly: deadline_profile is
+    imported BY NAME into backtester.py's module namespace, so patching
+    scanner.deadline_profile would never reach _deadline_profile_dict's call
+    at all.
+    """
+
+    def test_extract_pairs_classifies_each_member_once(self, monkeypatch):
+        # control — kills M11b (900 calls instead of 30 — one per candidate
+        # pair rather than one per group member).
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        members = []
+        for i in range(29):
+            d = base + timedelta(days=i)
+            rec = _md(f"T{i}", f"EVT{i}", title=f"Will X happen by {d:%B %d, %Y}?")
+            rec["close_time"] = d.isoformat()
+            members.append(rec)
+        # A duplicate deadline (same stated span as T5) forces a REAL
+        # phrasing refusal inside the group, exercising classify-once on the
+        # refusal path too.
+        d5 = base + timedelta(days=5)
+        dup = _md("T5DUP", "EVT5DUP", title=f"Will X happen by {d5:%B %d, %Y}?")
+        dup["close_time"] = (d5 + timedelta(hours=1)).isoformat()
+        members.append(dup)
+
+        groups = _group_by_normalized_title(members)
+        assert len(groups) == 1
+        [dated_members] = groups.values()
+
+        calls = {"n": 0}
+        original = backtester.deadline_profile
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(backtester, "deadline_profile", counting)
+        pairs = _extract_pairs(groups)
+        assert len(pairs) >= 1
+        assert calls["n"] == len(dated_members)
 
 
 class TestOldCacheToleranceMissingTickAndSubtitleFields:
@@ -3077,6 +3274,45 @@ class TestRunBacktestCrossTypeDedup:
         assert trades[0].pair_type == "same_title"
         # The same-title copy canonicalizes A as the pricier side (DB)
         assert (trades[0].ticker_a, trades[0].ticker_b) == ("DB", "DA")
+
+    def test_dated_identical_wording_is_same_title_only(self):
+        # control — kills a mutant that drops the spans-differ requirement
+        # (`return True` in place of `spans_a != spans_b`). The class
+        # docstring's exclusivity claim was cited to
+        # test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate
+        # above, whose fixture states NO deadline at all ("Q"), so it only
+        # ever exercises the spans-differ conjunct's "both empty" branch. This
+        # fixture states a deadline IDENTICALLY on two DIFFERENT series, so
+        # the refusal comes from the spans-differ conjunct alone (the two
+        # spans are equal) — the one-series rule does not fire here, since
+        # _same_series_dicts is False on two different series. Mirror of
+        # test_scanner.py::TestDeadlineGuardFinders::
+        # test_dated_identical_wording_is_same_title_only.
+        title = "Will X happen by Dec 31, 2026?"
+        mA = _md("A1", "EVA-1", title=title, event_title="EV")
+        mA["close_time"] = "2026-12-01T00:00:00Z"
+        mB = _md("B1", "EVB-1", title=title, event_title="EV")
+        mB["close_time"] = "2026-12-20T00:00:00Z"
+        assert len(_group_by_normalized_title([mA, mB])) == 1
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert backtester._identical_wording_dicts(mA, mB) is True
+        assert backtester._same_series_dicts(mA, mB) is False
+        assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
+        assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
+
+        # Positive control: B's wording states a DIFFERENT deadline on the
+        # same two series, same close times. The spans now differ, so the
+        # time-series pair forms — proving the [] above comes from the
+        # spans-differ conjunct rather than from the price tier, the deadline
+        # gap, or the two series being distinct.
+        mB3 = _md("B1", "EVB-1", title="Will X happen by Dec 20, 2026?", event_title="EV")
+        mB3["close_time"] = "2026-12-20T00:00:00Z"
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB3]))) == 1
 
 
 class TestCheckpointOpeningBalanceSizing:

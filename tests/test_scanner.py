@@ -1026,6 +1026,35 @@ class TestTimeSeriesGroupKey:
         )
 
 
+# One row per _CUMULATIVE_DEADLINE_PATTERNS[0] alternative (phrase, expected
+# span tuple), module-level so a later commit's own alternation-equivalence
+# test can reuse these exact strings as its hermetic reference set instead of
+# duplicating them (a duplicate copy can drift from this table with nothing
+# to catch it). Kept as a plain tuple, not nested in a class, for the same
+# reason. See TestCumulativeDeadlineRule.test_each_cumulative_entry_is_live.
+_CUMULATIVE_ENTRY_CASES = (
+    ("by 2027", ("by 2027",)),
+    ("through Oct 1, 2026", ("through oct 1, 2026",)),
+    ("until Oct 1, 2026", ("until oct 1, 2026",)),
+    ("no later than Oct 1, 2026", ("no later than oct 1, 2026",)),
+    ("on or before Oct 1, 2026", ("on or before oct 1, 2026",)),
+    ("up to Oct 1, 2026", ("up to oct 1, 2026",)),
+    ("prior to Oct 1, 2026", ("prior to oct 1, 2026",)),
+    ("by year-end", ("by year-end",)),
+    ("by EOY", ("by eoy",)),
+    ("by Friday", ("by friday",)),
+    ("by 2026-12-31", ("by 2026-12-31",)),
+    ("by the end of June", ("by the end of june",)),
+    ("by Q4 2026", ("by q4 2026",)),
+    # The two SPANLESS cumulative markers establish the KIND of question
+    # ("within N units", "at any time") without naming a comparable date —
+    # TestCumulativeDeadlinePairPredicate.test_spanless_cumulative_leg_is_
+    # refused is what makes that matter.
+    ("within 30 days", ()),
+    ("at any time", ()),
+)
+
+
 class TestCumulativeDeadlineRule:
     """deadline_phrasing() separates "will X happen BY <date>" (cumulative —
     nested, so a later deadline can only add probability) from "what is X ON
@@ -1125,6 +1154,91 @@ class TestCumulativeDeadlineRule:
         # follow. Real: historical._market_to_dict stores subtitle as
         # `subtitle or yes_sub_title`, which is None when both are absent.
         assert scanner.deadline_phrasing(*args) == scanner.DEADLINE_UNKNOWN
+
+    def test_conflicting_markers_across_fields(self):
+        # control — kills M04a, M04c. Cross-field precedence
+        # (subtitle -> title -> event_title) is only half pinned by
+        # TestSubContractDeadlineWins below (subtitle beats a snapshot EVENT
+        # title). These three put a DIFFERENT marker in two fields at once,
+        # so a field-order mutant is forced to pick the wrong one.
+        #
+        # The subtitle decides over a snapshot TITLE. Kills a title-checked-
+        # before-subtitle reorder (M04a).
+        assert scanner.deadline_phrasing(
+            "", "Bitcoin price on Sep 15, 2026?", "$80,000 by June 30",
+        ) == scanner.DEADLINE_CUMULATIVE
+        # With no subtitle marker, the TITLE decides over the event title —
+        # here the title is cumulative and the event title is a snapshot
+        # window ("in 2026"). Kills an event-title-checked-before-title
+        # reorder (M04c). This test calls deadline_phrasing directly, so it
+        # cannot observe an arg swap INSIDE _market_deadline_profile (M23e) —
+        # that one is pinned separately by
+        # TestDeadlineProfileParity::test_dict_and_live_extraction_agree in
+        # test_backtester.py, which calls _market_deadline_profile itself.
+        assert scanner.deadline_phrasing(
+            "Will X happen in 2026?", "Will X happen before Jan 1, 2027?", "",
+        ) == scanner.DEADLINE_CUMULATIVE
+        # Same field-order relation, the other direction: a snapshot TITLE
+        # beats a cumulative event title (the real KXCITYCHAMPS/FIDE shape).
+        assert scanner.deadline_phrasing(
+            "Will X happen by Dec 31, 2026?", "Top 10 in October?", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+
+    def test_snapshot_beats_cumulative_in_one_field(self):
+        # control — kills M05. WITHIN one field, a snapshot marker must be
+        # tested before a cumulative one, or a title naming both reads as
+        # cumulative. M05 swaps the two `if any(...)` blocks in
+        # _field_phrasing.
+        assert scanner.deadline_phrasing(
+            "", "Will BTC be above $100k at the close before Oct 1, 2026?", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+        assert scanner.deadline_phrasing(
+            "", "Will BTC be above $100k in Q3 2026 by Sep 30, 2026?", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+
+    @pytest.mark.parametrize("phrase", [
+        "on June 30", "on Friday", "on 9/30", "on 2026-09-30",
+        "in October", "in Q3", "in 2027", "during 2026", "for 2026",
+        "at the close", "at 5pm ET", "at 17:00", "as of Sep 1", "end of day",
+        "after March 1, 2026", "between 3 and 5",
+    ])
+    def test_each_snapshot_entry_is_live(self, phrase):
+        # control — kills a dropped _SNAPSHOT_PATTERNS entry: one phrase per
+        # table entry. A future edit that drops any single entry fails
+        # exactly the rows that depended on it, instead of hiding behind the
+        # others. This does not reach every branch WITHIN a multi-alternative
+        # entry (e.g. narrowing "at the close|open|end" to "at the close"
+        # alone still passes every row here) — that is a known residual, not
+        # a claim this test makes.
+        assert scanner.deadline_phrasing("", phrase, "") == scanner.DEADLINE_SNAPSHOT
+
+    def test_capitalised_and_november(self):
+        # control — kills a dropped re.IGNORECASE flag on either compiled
+        # table, or "November" dropped from the shared month list. Both must
+        # stay — plain member/flag drops a line-level diff would not
+        # otherwise catch.
+        assert scanner.deadline_phrasing(
+            "", "Before Oct 1, 2026", "",
+        ) == scanner.DEADLINE_CUMULATIVE
+        assert scanner.deadline_phrasing(
+            "", "On Nov 16, 2026", "",
+        ) == scanner.DEADLINE_SNAPSHOT
+        assert scanner.deadline_profile(
+            "", "Will X happen by November 30, 2026?", "",
+        ) == (scanner.DEADLINE_CUMULATIVE, ("by november 30, 2026",))
+
+    @pytest.mark.parametrize("phrase, spans", _CUMULATIVE_ENTRY_CASES)
+    def test_each_cumulative_entry_is_live(self, phrase, spans):
+        # control — kills a dropped or narrowed _CUMULATIVE_DEADLINE_PATTERNS[0]
+        # alternative (or, for the last two rows, a dropped spanless marker).
+        # One phrase per alternative, asserting the EXACT span _deadline_spans
+        # captures — a table entry that quietly stops matching, or starts
+        # truncating its span, fails its OWN parametrized row rather than
+        # hiding behind a nearby passing one (a shared for-loop would instead
+        # stop at the first failure and leave every later row unchecked).
+        assert scanner.deadline_profile("", f"Will X happen {phrase}?", "") == (
+            scanner.DEADLINE_CUMULATIVE, spans,
+        )
 
 
 class TestSubContractDeadlineWins:
@@ -1238,6 +1352,401 @@ class TestCumulativeDeadlinePairPredicate:
         a = ("", "Will X happen by March 2026?", "")
         b = ("", "Will X happen by June 2026?", "")
         assert self._pair(a, b) == self._pair(b, a)
+
+    def test_snapshot_leg_with_distinct_spans_is_refused(self):
+        # control — kills M03full (the whole verdict gate deleted). A leg's
+        # verdict deciding "cumulative" is required INDEPENDENTLY of whether
+        # the two legs' spans differ: a snapshot verdict refuses the pair
+        # even when both legs carry distinct dated spans, so a snapshot
+        # family that happens to spell "before <date>" cannot slip through on
+        # the span check alone. No test before this one ever put a span on a
+        # snapshot leg, so deleting the whole verdict gate
+        # (`if verdict_a != DEADLINE_CUMULATIVE or verdict_b != ...`) —
+        # M03full — passed the suite: every snapshot fixture had empty or
+        # identical spans and the span rule refused it on its own.
+        snap_a = (scanner.DEADLINE_SNAPSHOT, ("before oct 1, 2026",))
+        cum_b = (scanner.DEADLINE_CUMULATIVE, ("before oct 10, 2026",))
+        snap_b = (scanner.DEADLINE_SNAPSHOT, ("before oct 10, 2026",))
+        assert scanner.cumulative_deadline_pair(snap_a, cum_b) is False
+        assert scanner.cumulative_deadline_pair(cum_b, snap_a) is False
+        assert scanner.cumulative_deadline_pair(snap_a, snap_b) is False
+        assert scanner.cumulative_deadline_pair(snap_b, snap_a) is False
+
+    def test_spanless_cumulative_leg_is_refused(self):
+        # control — kills M02, which deletes `if not spans_a or not spans_b:
+        # return False`. Both legs must NAME a comparable deadline, not
+        # merely classify cumulative: a dated leg paired with a spanless one
+        # ("within 30 days", "at any time") can never be shown to state a
+        # DIFFERENT deadline.
+        #
+        # M03a alone (the verdict gate narrowed to refuse only snapshot, not
+        # unknown) is an EQUIVALENT mutant GLOBALLY, not just on this
+        # fixture: an UNKNOWN verdict always carries empty spans (deadline_
+        # phrasing returns unknown only when NO field matched any pattern in
+        # EITHER table, including _COMPILED_CUMULATIVE[0], the only pattern
+        # _deadline_spans reads — so if the verdict is unknown, that same
+        # pattern found nothing to capture either), so the span check refuses
+        # it unaided regardless of what the verdict gate does with an
+        # unknown verdict. Measured: M03a alone survives the full suite. That
+        # is exactly why TestDeadlineGuardFinders::
+        # test_dated_leg_never_pairs_with_unknown_leg pairs a dated leg with
+        # an UNKNOWN one instead of a spanless-cumulative one below — only
+        # that shape needs BOTH guards gone (M02+M03a) to be admitted, so
+        # only that shape can tell M02 and M03a apart.
+        dated = (scanner.DEADLINE_CUMULATIVE, ("by march 1",))
+        spanless = (scanner.DEADLINE_CUMULATIVE, ())
+        assert scanner.cumulative_deadline_pair(dated, spanless) is False
+        assert scanner.cumulative_deadline_pair(spanless, dated) is False
+
+
+class TestDeadlineGuardFinders:
+    """Finder-level pins for the cumulative-deadline guard: the verdict gate,
+    the span-presence check, and running the screen before best-pair
+    selection.
+
+    The predicate-level tests above prove the RULE; these prove
+    find_time_series_pairs actually APPLIES it end to end, on fixtures where
+    nothing else — the price tiers, the deadline-gap cap, the one-series rule
+    — would independently have refused the pair. Every test that asserts []
+    also asserts, inside the test, that its two legs share a group key (so a
+    fixture that silently stops grouping together — e.g. a normalize_title
+    drift — fails loudly instead of returning [] for the wrong reason) and
+    carries an in-test positive control: the same fixture, changed only in
+    the property under test, that returns exactly one pair.
+    """
+
+    def test_level_at_instant_legs_are_refused(self):
+        # control — kills M03full. "at the close on <date>," is a SNAPSHOT
+        # marker inside an otherwise cumulative-looking title. Both legs
+        # carry distinct dated spans, so only the verdict gate — not the span
+        # check — refuses this pair.
+        t1 = "Will BTC be above $100k at the close on Sep 30, 2026, before Oct 1, 2026?"
+        t2 = "Will BTC be above $100k at the close on Oct 9, 2026, before Oct 10, 2026?"
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1", title=t1,
+            yes_ask=0.10, no_ask=0.90, close_time=datetime(2026, 9, 30, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title=t2,
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 10, 9, tzinfo=UTC),
+        )
+        assert scanner.deadline_gap_days(mA, mB) == 9  # inside the short tier
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 1, 2026",),
+        )
+        assert scanner._market_deadline_profile(mB) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 10, 2026",),
+        )
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
+
+        # Control: the same gap and prices with "at the close on <date>,"
+        # removed — both legs read cumulative and the pair forms, proving the
+        # refusal above comes from the marker, not the fixture's price or gap.
+        cA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1",
+            title="Will BTC be above $100k before Oct 1, 2026?",
+            yes_ask=0.10, no_ask=0.90, close_time=datetime(2026, 9, 30, tzinfo=UTC),
+        )
+        cB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1",
+            title="Will BTC be above $100k before Oct 10, 2026?",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 10, 9, tzinfo=UTC),
+        )
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[cA, cB],
+        )) == 1
+
+    def test_dated_leg_never_pairs_with_spanless_cumulative_leg(self):
+        # control — kills M02 at the finder level (TestCumulativeDeadlinePair
+        # Predicate::test_spanless_cumulative_leg_is_refused kills it at the
+        # predicate level already; this proves find_time_series_pairs really
+        # applies that guard end to end). A shared event title carries a
+        # SPANLESS cumulative marker ("at any time"); A's own title also
+        # names a dated deadline, B's names none at all. Both legs still
+        # classify cumulative (title falls through to the event title for
+        # B), but B's spans are empty.
+        evt = "Will X happen at any time?"
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1", title="Will X happen by March 1?",
+            event_title=evt, yes_ask=0.20, no_ask=0.80,
+            close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="Will X happen Mar 9?",
+            event_title=evt, yes_ask=0.60, no_ask=0.40,
+            close_time=datetime(2026, 3, 9, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert scanner._market_deadline_profile(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
+
+        # Control: B titled "by March 9?" instead — now it names its own
+        # deadline and the pair forms.
+        mB2 = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="Will X happen by March 9?",
+            event_title=evt, yes_ask=0.60, no_ask=0.40,
+            close_time=datetime(2026, 3, 9, tzinfo=UTC),
+        )
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB2],
+        )) == 1
+
+    def test_dated_leg_never_pairs_with_unknown_leg(self):
+        # control — kills M02+M03a together (M03a alone is an equivalent
+        # mutant everywhere — see test_spanless_cumulative_leg_is_refused's
+        # comment — so only this shape, where the span check's own "both
+        # legs must name a span" arm is what M03a leaves undefended, can tell
+        # M02 and M03a apart). Same shape as the spanless-cumulative test
+        # above, without the shared event-title marker: B's title alone
+        # names no deadline at all, so B classifies UNKNOWN rather than
+        # spanless-cumulative. Reaching [] here needs BOTH guards — the
+        # verdict gate AND the span check.
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1", title="Will X happen by March 1?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="Will X happen Mar 9?",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 9, tzinfo=UTC),
+        )
+        # The group-key assertion matters here specifically: with no shared
+        # event_title, the ONLY reason mA and mB are ever compared at all is
+        # that their titles' date tokens strip to the same normalized key —
+        # a drift in _DATE_PATTERNS (e.g. losing the bare "Mon d" entry that
+        # strips "Mar 9") would split them into different groups and this
+        # test would read [] for a completely different reason, with the
+        # guard under test never even reached. Reproduced: deleting that
+        # _DATE_PATTERNS entry together with M02+M03a still returns [], but
+        # this assertion catches it where the bare `== []` below would not.
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert scanner._market_deadline_profile(mB) == (scanner.DEADLINE_UNKNOWN, ())
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
+
+        # Control: B titled "by March 9?" instead — now it names its own
+        # deadline, both legs classify cumulative, and the pair forms.
+        mB2 = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="Will X happen by March 9?",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 3, 9, tzinfo=UTC),
+        )
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB2],
+        )) == 1
+
+    def test_screen_runs_before_best_pair_selection(self):
+        # control — kills M26 (screening moved to run after selection). The
+        # DR-67 screen must run BEFORE the one-best-pair-per-group selection,
+        # or a refused candidate could still win the group's slot. Four
+        # markets, one normalized group: the WIDEST raw price gap (T1 vs T2,
+        # 0.90) pairs a cumulative leg with a snapshot ("after <date>") leg
+        # and is refused outright; the group's returned pair is instead the
+        # widest SURVIVING candidate (T1 vs T3, gap 0.30) — a genuinely
+        # different pair, not merely a smaller version of the refused one.
+        base = datetime(2026, 3, 1, tzinfo=UTC)
+        m1 = _mock_market(
+            ticker="T1", event_ticker="EVT1", title="Will X happen by March 1?",
+            yes_ask=0.05, no_ask=0.95, close_time=base,
+        )
+        m2 = _mock_market(
+            ticker="T2", event_ticker="EVT2", title="Will X happen after March 25?",
+            yes_ask=0.95, no_ask=0.05, close_time=base + timedelta(days=24),
+        )
+        m3 = _mock_market(
+            ticker="T3", event_ticker="EVT3", title="Will X happen by March 21?",
+            yes_ask=0.35, no_ask=0.65, close_time=base + timedelta(days=20),
+        )
+        m4 = _mock_market(
+            ticker="T4", event_ticker="EVT4", title="Will X happen by March 11?",
+            yes_ask=0.15, no_ask=0.85, close_time=base + timedelta(days=10),
+        )
+        assert scanner._market_deadline_profile(m2)[0] == scanner.DEADLINE_SNAPSHOT
+        [pair] = find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[m1, m2, m3, m4],
+        )
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("T1", "T3")
+        assert pair.pB - pair.pA == pytest.approx(0.30)
+
+    def test_dated_identical_wording_is_same_title_only(self):
+        # control — kills a mutant that drops the spans-differ requirement
+        # (`return True` in place of `spans_a != spans_b`). Identical wording
+        # that STATES a deadline is refused by the cumulative-deadline rule's
+        # spans-differ conjunct (the two spans are equal) — NOT by the
+        # one-series rule. The two legs sit on DIFFERENT series here, so
+        # _same_series is False and would not refuse the pair on its own;
+        # only the spans-differ check does. Mirror of
+        # test_backtester.py::TestRunBacktestCrossTypeDedup::
+        # test_dated_identical_wording_is_same_title_only.
+        title = "Will X happen by Dec 31, 2026?"
+        mA = _mock_market(
+            ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="B1", event_ticker="EVB-1", title=title, event_title="EV",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 12, 20, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert scanner._market_deadline_profile(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert scanner._identical_wording(mA, mB) is True
+        assert scanner._same_series(mA, mB) is False
+        assert len(find_same_title_pairs([mA, mB])) == 1
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
+
+        # Positive control: B's wording states a DIFFERENT deadline ("Dec
+        # 20" instead of "Dec 31") on the same two series, same prices, same
+        # close times. The spans now differ, so the time-series pair forms —
+        # proving the [] above comes from the spans-differ conjunct, not from
+        # the price tier, the deadline gap, or the two series being distinct.
+        mB3 = _mock_market(
+            ticker="B1", event_ticker="EVB-1", title="Will X happen by Dec 20, 2026?",
+            event_title="EV", yes_ask=0.60, no_ask=0.40,
+            close_time=datetime(2026, 12, 20, tzinfo=UTC),
+        )
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB3],
+        )) == 1
+
+
+class TestClassifyOncePerMarket:
+    """The classifier must run exactly ONCE PER MARKET, never once per
+    candidate PAIR — a group of N members produces O(N^2) candidate pairs, so
+    per-pair classification re-runs the regex tables an order of magnitude
+    more often (CLAUDE.md's "classifier is computed ONCE PER MARKET"
+    paragraph, and TestExtractPairsPerformanceSmoke's 50,000-member budget).
+    """
+
+    def test_live_finder_classifies_each_market_once(self, monkeypatch):
+        # control — kills M11a (901 calls instead of 31 — one per candidate
+        # pair rather than one per market).
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        markets = []
+        for i in range(29):
+            d = base + timedelta(days=i)
+            yes_ask = round(0.02 + i * 0.03, 2)
+            markets.append(_mock_market(
+                ticker=f"T{i}", event_ticker=f"EVT{i}",
+                title=f"Will X happen by {d:%B %d, %Y}?",
+                yes_ask=yes_ask, no_ask=round(1 - yes_ask, 2), close_time=d,
+            ))
+        # A duplicate deadline (same stated span as T5) forces a REAL phrasing
+        # refusal inside the group, so classify-once is exercised on the
+        # refusal path too, not only the accepted one — this keeps the pin
+        # alive even if a future change adds a classification call at the
+        # per-refusal site (rather than only at the up-front, once-per-market
+        # site this test currently observes through the monkeypatched
+        # deadline_profile).
+        d5 = base + timedelta(days=5)
+        markets.append(_mock_market(
+            ticker="T5DUP", event_ticker="EVT5DUP",
+            title=f"Will X happen by {d5:%B %d, %Y}?",
+            yes_ask=0.80, no_ask=0.20, close_time=d5 + timedelta(hours=1),
+        ))
+        # Deviation from the plan's C1 row: the plan's fixture puts an "after
+        # March 5, 2026" leg INSIDE the 30-market group, as the candidate the
+        # phrasing screen refuses. That title normalizes to
+        # "will x happen after ?" (the year strips), while the dated by-
+        # titles above normalize to "will x happen by ?" — so it lands in its
+        # OWN normalized group instead and is never compared against
+        # anything. The refused-candidate role the plan wanted is played by
+        # T5DUP above (a genuine duplicate-deadline refusal) instead. This
+        # leg is kept anyway — never compared, but still profiled once, since
+        # the live finder classifies every actively priced market up front,
+        # before grouping — so `calls["n"] == len(active)` still requires it
+        # to be seen exactly once.
+        markets.append(_mock_market(
+            ticker="EXTRA", event_ticker="EVTX",
+            title="Will X happen after March 5, 2026?",
+            yes_ask=0.50, no_ask=0.50, close_time=base + timedelta(days=5),
+        ))
+
+        calls = {"n": 0}
+        original = scanner.deadline_profile
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(scanner, "deadline_profile", counting)
+        active = _filter_active_markets(markets, None)
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+        assert len(pairs) >= 1
+        assert calls["n"] == len(active)
+
+
+class TestPhrasingCensusLine:
+    """The scanner half of the per-run phrasing census (the backtester
+    census, the dashboard rendering, and the skip-count summaries are pinned
+    separately). It is the ONE signal that separates "the exchange lists no
+    cumulative families right now" from "the phrasing tables are broken" (the
+    DR-66 lesson, applied to this rule). This is a CONTROL — it pins that the
+    census reports the true bucket counts, not merely that some line fires."""
+
+    def _markets(self, n_cumulative, n_snapshot, n_unknown):
+        markets = []
+        for i in range(n_cumulative):
+            markets.append(_mock_market(
+                ticker=f"C{i}", event_ticker=f"EVC{i}",
+                title=f"Will X happen by June {i + 1}, 2026?",
+            ))
+        for i in range(n_snapshot):
+            markets.append(_mock_market(
+                ticker=f"S{i}", event_ticker=f"EVS{i}",
+                title=f"Bitcoin price on Sep {15 + i}, 2026?",
+            ))
+        for i in range(n_unknown):
+            markets.append(_mock_market(
+                ticker=f"U{i}", event_ticker=f"EVU{i}", title=f"Fed cuts rates {i}?",
+            ))
+        return markets
+
+    @staticmethod
+    def _census_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Deadline phrasing of actively priced markets")
+        ]
+
+    def test_census_line_reports_each_bucket(self, caplog):
+        # control — kills the census line being deleted, demoted to
+        # logging.debug, or its snapshot/unknown bucket args swapped.
+        with caplog.at_level(logging.INFO):
+            find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=self._markets(3, 2, 5),
+            )
+        assert self._census_lines(caplog) == [
+            "Deadline phrasing of actively priced markets: 3 cumulative, 2 snapshot, 5 unknown",
+        ]
+
+    def test_all_unknown_reads_zero_cumulative(self, caplog):
+        # control — kills the census line being deleted (an all-zero-
+        # cumulative run must still say so explicitly, per the DR-66 lesson).
+        with caplog.at_level(logging.INFO):
+            find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=self._markets(0, 0, 5),
+            )
+        assert self._census_lines(caplog) == [
+            "Deadline phrasing of actively priced markets: 0 cumulative, 0 snapshot, 5 unknown",
+        ]
+
 
 def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = None):
     """Build an earlier/later mock market pair gap_days apart, one question at
