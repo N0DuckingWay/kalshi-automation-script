@@ -232,11 +232,29 @@ _DEADLINE_MONTH = (
     r"November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)"
 )
 _DEADLINE_WEEKDAY = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
-_DEADLINE_MONTH_FULL = rf"{_DEADLINE_MONTH}\.?(?:\s+\d{{1,2}}(?!\d))?(?:,?\s+\d{{4}})?"
+# The \b ends the month at a word boundary. Without it the abbreviations
+# matched the front of ordinary words: "by Dec(ision)", "produced by
+# Mar(vel) Studios" and "endorsed by Mar(co) Rubio" read as cumulative
+# deadlines (DR-68). The optional period still follows ("Sept."). \b also
+# rejects a digit or underscore directly after the month, so an unspaced
+# "by Sep30" reads unknown — the fail-closed direction on this CUMULATIVE
+# side (no market on the 2026-09-22 live snapshot is written that way). The
+# snapshot entries use _SNAPSHOT_MONTH below, which keeps that unspaced date.
+_DEADLINE_MONTH_FULL = rf"{_DEADLINE_MONTH}\b\.?(?:\s+\d{{1,2}}(?!\d))?(?:,?\s+\d{{4}})?"
+
+# The SNAPSHOT (reject) side ends a month at the next LETTER instead of at a
+# word boundary. "on Mars", "on declaring", "after Marvel" and "after Mayor"
+# are still not dates, but an unspaced "on Sep30" / "after Sep30" still is:
+# \b would reject that genuine date too, and narrowing a reject marker for a
+# genuine date fails OPEN (snapshot -> cumulative). The tables compile with
+# IGNORECASE, so [a-z] covers upper case as well (DR-68).
+_SNAPSHOT_MONTH = rf"{_DEADLINE_MONTH}(?![a-z])"
 
 # What may follow a deadline preposition for it to name a POINT IN TIME.
 # Requiring one of these is what stops "cut BY 50 bps", "win BY 10 points" and
-# "pass BY a 2/3 majority" from reading as deadlines.
+# "pass BY a 2/3 majority" from reading as deadlines. (That last one is stopped
+# by the article "a" alone; the m/d alternative's vote/majority/of lookahead is
+# what stops the article-less "pass by 2/3 majority" — DR-68.)
 #
 # The NOUN forms are not optional extras: _DATE_PATTERNS already strips
 # "by end of <Month>", "end of [the] year" and "Q1 2026", so a table that
@@ -250,10 +268,29 @@ _DEADLINE_MONTH_FULL = rf"{_DEADLINE_MONTH}\.?(?:\s+\d{{1,2}}(?!\d))?(?:,?\s+\d{
 # "price on <date>" title where its real shape is spelled.
 _DEADLINE_DATE_TOKEN = (
     rf"(?:{_DEADLINE_MONTH_FULL}"
-    rf"|{_DEADLINE_WEEKDAY}\b"
-    r"|\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    # A weekday keeps a MONTH-NAME date that follows it. Otherwise "by Friday,
+    # Sep 19, 2026" and "by Friday, Sep 26, 2026" both truncate to "by friday",
+    # read as one deadline stated twice, and a genuine pair 7 days apart is
+    # refused (DR-68). A numeric date after a weekday is still truncated.
+    # With no year or a 2-digit one the two titles do not share a group; with
+    # a 4-digit year ("by Friday, 9/19/2026") or an ISO date they do, both
+    # span "by friday", and the pair is refused as one deadline stated twice —
+    # a missed trade, never a false one (CLAUDE.md DR-67 Known residuals).
+    rf"|{_DEADLINE_WEEKDAY}\b(?:,?\s+{_DEADLINE_MONTH_FULL})?"
+    # A calendar m/d (month 1-12, day 1-31), not a fraction or vote share:
+    # "by 2/3 vote" and "ratified by 3/4 of states" are quantities, and
+    # "by 3/2027" is a month/year, not March 20 (DR-68).
+    r"|(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/(?:\d{4}|\d{2}))?\b"
+    r"(?!\s*(?:votes?|majority|supermajority|of)\b)"
     r"|\d{4}-\d{2}-\d{2}"
-    r"|20\d{2}\b"
+    # 2020-2099 only: "decrease by 2000" is an amount, not a year (DR-68).
+    # Season ranges ("before the 2027-28 season") deliberately stay a
+    # deadline: rejecting them refused 63 genuine markets (retirements,
+    # relocations, conference moves, a rule change) on the 2026-09-22 live
+    # snapshot, as on the 2026-09-21 one. The cost of keeping them is one
+    # recorded false positive ("2018-19 through 2025-26"; CLAUDE.md DR-67
+    # Known residuals).
+    r"|20[2-9]\d\b"
     r"|Q[1-4](?:\s+20\d{2})?\b"
     r"|(?:the\s+)?end\s+of\s+(?:the\s+)?(?:year|month|week|day)"
     r"|year[-\s]?end"
@@ -272,7 +309,9 @@ _CUMULATIVE_DEADLINE_PATTERNS = [
     rf"\s+(?:the\s+)?(?:end\s+of\s+(?:the\s+)?)?{_DEADLINE_DATE_TOKEN}",
     r"\bwithin\s+\d+\s+(?:hour|day|week|month|year)s?\b",
     r"\bat\s+any\s+(?:time|point)\b",
-    r"\bever\b",
+    # "ever" is deliberately NOT a marker (DR-68): it fired on names ("Worst
+    # Neighbor Ever", "Chaco For Ever") and on superlatives ("the hottest year
+    # ever"), none of which state a deadline.
 ]
 
 # SNAPSHOT: a state measured AT one instant, or over a WINDOW that does not
@@ -285,15 +324,35 @@ _CUMULATIVE_DEADLINE_PATTERNS = [
 # "after" requires a date token for the same reason "by" does — otherwise
 # "Will BTC top $100k by Dec 31, 2026, after the halving?" is wrongly refused.
 _SNAPSHOT_PATTERNS = [
-    rf"\bon\s+(?:{_DEADLINE_MONTH}\.?\s*\d{{0,2}}|{_DEADLINE_WEEKDAY}"
+    # "on THE Dec 6 CFP rankings" is the same snapshot as "on Dec 6", but only
+    # with a day: "on the May ballot" names no instant, and (?!\d) stops the
+    # day eating a year ("on the November 2026 ballot"). The month ends at the
+    # next letter (_SNAPSHOT_MONTH), so "on Mars" and "on declaring" are not
+    # dates while an unspaced "on Sep30" still is (DR-68).
+    rf"\bon\s+(?:the\s+{_SNAPSHOT_MONTH}\.?\s*\d{{1,2}}(?!\d)"
+    rf"|{_SNAPSHOT_MONTH}\.?\s*\d{{0,2}}|{_DEADLINE_WEEKDAY}"
     r"|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})",
     rf"\b(?:in|during|for)\s+(?:{_DEADLINE_MONTH}\b|Q[1-4]\b|20\d{{2}}\b)",
     r"\bat\s+(?:the\s+)?(?:close|open|end)\b",
-    r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|ET|EDT|EST|CT|PT|UTC|GMT)\b",
+    # The dotted forms end in a period, so a trailing \b required a following
+    # WORD character ("at 5 p.m.ET" matched; "at 5 p.m. ET" did not). They now
+    # need no boundary; the undotted forms keep theirs (DR-68).
+    r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:(?:am|pm|ET|EDT|EST|CT|PT|UTC|GMT)\b|a\.m\.|p\.m\.)",
     r"\bat\s+\d{1,2}:\d{2}\b",
     r"\bas\s+of\b",
     r"\bend\s+of\s+day\b",
-    rf"\bafter\s+(?:the\s+)?{_DEADLINE_DATE_TOKEN}",
+    # A REJECT marker, so its DATE alternatives stay as wide as they were
+    # before DR-68: narrowing a reject marker for a genuine date fails OPEN
+    # (snapshot -> cumulative), the direction this rule must never move for a
+    # genuine date. Hence the wide numeric alternatives (any m/d, any 20xx
+    # year) beside the tightened token, and _SNAPSHOT_MONTH beside the token's
+    # \b-bounded month so an unspaced "after Sep30" still matches. What DOES
+    # stop matching, deliberately, is a month-prefixed NON-date word — "after
+    # Mayor Adams resigns", "after Marvel's release", "after Decision Day" —
+    # which moves such a title snapshot -> cumulative, exactly as "on Mars"
+    # does in the "on" entry above (DR-68).
+    rf"\bafter\s+(?:the\s+)?(?:{_DEADLINE_DATE_TOKEN}"
+    rf"|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|20\d{{2}}\b|{_SNAPSHOT_MONTH})",
     r"\bbetween\s+\d",
 ]
 
@@ -1138,7 +1197,7 @@ def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
          DIFFER. Identical spans mean one deadline stated twice — two listings
          of the same question, which is a same-title shape, not a two-deadline
          family. Empty spans mean the wording established the KIND of question
-         ("within 30 days", "ever") without naming a date, so the two deadlines
+         ("within 30 days", "at any time") without naming a date, so the two deadlines
          cannot be shown to differ and the pair is refused.
 
     Args:

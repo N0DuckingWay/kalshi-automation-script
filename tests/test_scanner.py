@@ -1293,6 +1293,175 @@ class TestSubContractDeadlineWins:
         ) == scanner.DEADLINE_UNKNOWN
 
 
+class TestDateTokenBoundaries:
+    """DR-68: the phrasing tables' DATE tokens must name a date and nothing
+    else.
+
+    Before DR-68 the month abbreviations had no word boundary ("by Dec(ision)",
+    "by Mar(vel) Studios" read as cumulative deadlines, "on Mar(s)" as a
+    snapshot), any d/d fraction and any 20xx number read as a date ("by 2/3
+    vote", "by 2000"), "ever" was a cumulative marker (it fires on names), a
+    weekday truncated the date after it ("by Friday, Sep 19, 2026" and
+    "by Friday, Sep 26, 2026" both read "by friday", so a genuine pair was
+    refused as one deadline stated twice), "on THE <Month> <day>" was missed,
+    and the dotted clock forms needed a following word character.
+
+    Rows commented `regression` fail when DR-68 is reverted; rows commented
+    `control` pass either way and each names the mutant it kills. The controls
+    pin three things: the tightened tokens against over-tightening, the
+    snapshot (reject) markers against narrowing for a genuine date ("after
+    6/30 of this year", "on Sep30"), and the new "on the <Month> <day>"
+    snapshot branch against over-widening ("on the May ballot").
+    """
+
+    _UNKNOWN = (scanner.DEADLINE_UNKNOWN, ())
+
+    @pytest.mark.parametrize("title, expected", [
+        # regression — a month abbreviation at the front of an ordinary word is not a
+        # date (the \b after the month).
+        ("Callum Connor wins by Decision?", _UNKNOWN),
+        ("Will X be produced or distributed by Marvel Studios?", _UNKNOWN),
+        ("Will X be endorsed by Marco Rubio?", _UNKNOWN),
+        ("Will X be beaten by Novak Djokovic?", _UNKNOWN),
+        ("Will X be hosted by Mayor Adams?", _UNKNOWN),
+        # regression — a fraction, vote share or month/year is not a calendar m/d.
+        ("Will the bill pass by 2/3 vote?", _UNKNOWN),
+        ("Will X be ratified by 3/4 of states?", _UNKNOWN),
+        ("Will X happen by 13/45?", _UNKNOWN),
+        ("Will X happen by 3/2027?", _UNKNOWN),
+        # regression — each calendar range on its own: "13/45" is invalid on BOTH
+        # axes, so it cannot tell which check fired. A real day with month 13
+        # kills widening the month group to \d{1,2}; a real month with day 45
+        # kills widening the day group to \d{1,2}.
+        ("Will X happen by 13/12?", _UNKNOWN),
+        ("Will X happen by 3/45?", _UNKNOWN),
+        # regression — "ever" is no longer a cumulative marker.
+        ("Worst Neighbor Ever", _UNKNOWN),
+        ("Chaco For Ever", _UNKNOWN),
+        ("Will 2026 be the hottest year ever?", _UNKNOWN),
+        # regression — each lookahead word after a fraction is pinned on its own row
+        # (the article-free form of the "pass by a 2/3 majority" example,
+        # which the article "a" already stops).
+        ("Will the bill pass by 2/3 majority?", _UNKNOWN),
+        ("Will the bill pass by 2/3 supermajority?", _UNKNOWN),
+        ("Will the bill pass by 2/3 votes?", _UNKNOWN),
+        # regression — a pre-2020 number is an amount, not a year; the real deadline
+        # later in the title still decides.
+        ("Will spending decrease by 2000 before 2027?",
+         (scanner.DEADLINE_CUMULATIVE, ("before 2027",))),
+        # regression — kills widening the bare-year floor to 2010 (20[1-9]\d), which
+        # the "by 2000" row above cannot see.
+        ("Will spending decrease by 2015 before 2027?",
+         (scanner.DEADLINE_CUMULATIVE, ("before 2027",))),
+        # regression — "on Mars" / "on declaring" are not snapshot dates, so the real
+        # "before <date>" deadline decides instead of a false snapshot.
+        ("Will SpaceX land on Mars before 2030?",
+         (scanner.DEADLINE_CUMULATIVE, ("before 2030",))),
+        ("Will Trump decide on declaring a national emergency before Oct 1, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("before oct 1, 2026",))),
+        # regression — the "after" REJECT marker likewise no longer fires on a
+        # month-prefixed NON-date word; kills dropping the letter lookahead from
+        # its _SNAPSHOT_MONTH alternative ("after May(or)" would read snapshot).
+        ("Will X happen after Mayor Adams resigns, by Dec 31, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",))),
+        # regression — a weekday keeps the month-name date after it.
+        ("Will X happen by Friday, Sep 19, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("by friday, sep 19, 2026",))),
+        # control — kills a "\d{0,2}" (day made optional) mutant of the "on the"
+        # branch: "on the May ballot" names no instant, so the verdict comes
+        # from the real deadline.
+        ("Will X be on the May ballot before Oct 1, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("before oct 1, 2026",))),
+        # control — kills dropping the (?!\d) after the "on the" day: without it
+        # the day eats "20" of the year and the ballot reads as a snapshot.
+        ("Will X be on the November 2026 ballot by Aug 1, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("by aug 1, 2026",))),
+        # control — kills dropping the 2-digit-year branch of the calendar m/d.
+        ("Will X happen by 9/30/26?", (scanner.DEADLINE_CUMULATIVE, ("by 9/30/26",))),
+        # control — a genuine deadline must keep its whole span through the
+        # tightened tokens. Each row kills one mutant: dropping the m/d
+        # 4-digit-year branch (span "by 9/30")...
+        ("Will X happen by 9/30/2026?", (scanner.DEADLINE_CUMULATIVE, ("by 9/30/2026",))),
+        # ...dropping the days-10-29 alternative ([12]\d) of the m/d day group
+        # (every other m/d row uses day 30 or 31, so a genuine mid-month
+        # deadline would silently read unknown)...
+        ("Will X happen by 9/15/2026?", (scanner.DEADLINE_CUMULATIVE, ("by 9/15/2026",))),
+        # ...making the m/d year mandatory (a year-less "by 9/30" reads unknown)...
+        ("Will X happen by 9/30?", (scanner.DEADLINE_CUMULATIVE, ("by 9/30",))),
+        # ...moving the month's \b after the optional period (span "by sept")...
+        ("Will X happen by Sept. 30, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("by sept. 30, 2026",))),
+        # ...widening the snapshot "on the <Month> <day>" branch to "on <any
+        # words> <Month> <day>" (the verdict turns snapshot)...
+        ("Will X happen on or before Oct 1, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("on or before oct 1, 2026",))),
+        # ...moving the 2020-2099 year ahead of the ISO date (span "by 2026")...
+        ("Will X happen by 2026-12-31?", (scanner.DEADLINE_CUMULATIVE, ("by 2026-12-31",))),
+        # ...and rejecting season ranges (the verdict turns unknown).
+        ("Will X retire before the 2027-28 NFL season?",
+         (scanner.DEADLINE_CUMULATIVE, ("before the 2027",))),
+        # control — the undotted clock forms keep their trailing \b; kills
+        # dropping it, which would read "at 3 am(endments)" as a snapshot clock.
+        ("Will the bill stand at 3 amendments by Oct 1, 2026?",
+         (scanner.DEADLINE_CUMULATIVE, ("by oct 1, 2026",))),
+    ])
+    def test_profile(self, title, expected):
+        assert scanner.deadline_profile("", title, "") == expected
+
+    @pytest.mark.parametrize("title", [
+        # regression — "on THE <Month> <day>" is the same snapshot as "on <Month>
+        # <day>" (the CFP-rankings family used to read unknown).
+        "Ohio St. to be a top 25 ranked team on the Dec 6 CFP rankings",
+        # regression — the same branch with an UNSPACED day: its month ends at the
+        # next letter (_SNAPSHOT_MONTH), not at a word boundary, so this also
+        # kills a \b there, which would fail OPEN to the "before" deadline.
+        # (A letter lookahead in this branch is an equivalent mutant: its
+        # required day already excludes a letter after the month.)
+        "Will X be ranked on the Dec6 CFP rankings before Oct 1, 2026?",
+        # regression — a dotted clock form followed by a space ("5 p.m. ET").
+        "Will BTC be above 100k at 5 p.m. ET?",
+        # control — "after" is a REJECT marker and keeps its WIDE numeric
+        # alternatives; kills narrowing it to the tightened date token, which
+        # would fail OPEN (the 'of' lookahead and the 2020-2099 year).
+        "Will X happen by Dec 31, 2026, after 6/30 of this year?",
+        "Will X happen after 2019?",
+        # control — an UNSPACED genuine date still fires both older reject
+        # markers, as it did before DR-68. Kills a \b in the "on" entry's month
+        # (the first row) and dropping _SNAPSHOT_MONTH from the "after" entry
+        # (the second — the tightened token's \b-bounded month alone misses
+        # "Sep30"). Both mutants fail OPEN (snapshot -> cumulative).
+        "Will BTC be above $100k on Sep30, 2026, before Oct 1, 2026?",
+        "Will X happen by Dec 31, 2026, after Sep30, 2026?",
+    ])
+    def test_snapshot(self, title):
+        assert scanner.deadline_phrasing("", title, "") == scanner.DEADLINE_SNAPSHOT
+
+    def test_weekday_dated_legs_seven_days_apart_pair(self):
+        # regression — the live finder. Before DR-68 both legs' spans truncated to
+        # "by friday", so cumulative_deadline_pair read one deadline stated
+        # twice and refused a genuine pair 7 days apart. Mirror:
+        # test_backtester.py::TestDateTokenBoundaries.
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1",
+            title="Will X happen by Friday, Sep 19, 2026?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 9, 19, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1",
+            title="Will X happen by Friday, Sep 26, 2026?",
+            yes_ask=0.60, no_ask=0.38, close_time=datetime(2026, 9, 26, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 19, 2026",),
+        )
+        assert scanner._market_deadline_profile(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 26, 2026",),
+        )
+        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("PA-1", "PB-1")
+
+
 class TestCumulativeDeadlinePairPredicate:
     """cumulative_deadline_pair() requires BOTH legs cumulative AND two
     genuinely different stated deadlines."""

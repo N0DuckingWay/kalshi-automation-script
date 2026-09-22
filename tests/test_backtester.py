@@ -581,6 +581,36 @@ class TestDeadlineGuardFinders:
         assert len(_extract_pairs(_group_by_normalized_title([mA, mB2]))) == 1
 
 
+class TestDateTokenBoundaries:
+    """Backtester mirror of test_scanner.py::TestDateTokenBoundaries'
+    finder-level row (DR-68). The token rows themselves are pinned once, on
+    the shared scanner.deadline_profile; this proves the dict-based path
+    reaches the tightened weekday token too.
+    """
+
+    def test_weekday_dated_legs_seven_days_apart_pair(self):
+        # regression — before DR-68 both legs' spans truncated to "by friday", so the
+        # pair read as one deadline stated twice and was refused.
+        mA = TestDeadlineGuardFinders._rec(
+            "PA-1", "EVA-1", "Will X happen by Friday, Sep 19, 2026?",
+            "2026-09-19T00:00:00Z",
+        )
+        mB = TestDeadlineGuardFinders._rec(
+            "PB-1", "EVB-1", "Will X happen by Friday, Sep 26, 2026?",
+            "2026-09-26T00:00:00Z",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 19, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 26, 2026",),
+        )
+        [(a, b, _canon, key)] = _extract_pairs(groups)
+        assert isinstance(key, str)  # a string key is the time-series branch
+        assert {a["ticker"], b["ticker"]} == {"PA-1", "PB-1"}
+
+
 class TestDeadlineProfileParity:
     """The live scanner (attribute-based) and the backtester (dict-based)
     field extraction must agree on every input, since only the field
