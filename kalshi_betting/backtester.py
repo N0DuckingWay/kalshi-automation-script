@@ -1081,9 +1081,9 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             n = len(dated)
             # Classify each member's wording ONCE, positionally, then compare
             # the cheap results pairwise below. The sweep is O(n * window), so
-            # classifying per CANDIDATE would re-run the regex tables roughly
-            # thirty times more often than per member — measurable against
-            # TestExtractPairsPerformanceSmoke's 50,000-member group. Scoped to
+            # classifying per CANDIDATE would re-run the regex tables about 60x
+            # more often than per member (2 legs x ~31 in-window neighbours on
+            # TestExtractPairsPerformanceSmoke's 50,000-member group). Scoped to
             # this group and dropped with it: a corpus-wide ticker->verdict map
             # would add residency in exactly the place TS-07 did work to
             # reduce it.
@@ -1723,9 +1723,11 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             with_subtitle += 1
         if m.get("event_title"):
             with_event_title += 1
-        # Folded into this pass rather than given its own: the corpus can be
-        # millions of records, and a second walk would double the cost of a
-        # measurement that is advisory either way.
+        # Folded into this pass rather than given its own. The classifier, not
+        # the walk, dominates this pass (about 12 us vs 0.3 us per record after
+        # DR-70, measured on 200,000 records of the 2026-09-08 day slice,
+        # 2026-09-22), so a second walk would add little; what bounds the
+        # census on a multi-million-record corpus is the classifier's own cost.
         phrasing[_deadline_profile_dict(m)[0]] += 1
 
     subtitle_fraction = with_subtitle / total

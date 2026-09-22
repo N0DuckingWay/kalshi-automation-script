@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1187,8 +1188,8 @@ class TestCumulativeDeadlineRule:
     def test_snapshot_beats_cumulative_in_one_field(self):
         # control — kills M05. WITHIN one field, a snapshot marker must be
         # tested before a cumulative one, or a title naming both reads as
-        # cumulative. M05 swaps the two `if any(...)` blocks in
-        # _field_phrasing.
+        # cumulative. M05 swaps _field_phrasing's snapshot-table and
+        # cumulative-table tests (one alternation search each since DR-70).
         assert scanner.deadline_phrasing(
             "", "Will BTC be above $100k at the close before Oct 1, 2026?", "",
         ) == scanner.DEADLINE_SNAPSHOT
@@ -1213,13 +1214,17 @@ class TestCumulativeDeadlineRule:
         assert scanner.deadline_phrasing("", phrase, "") == scanner.DEADLINE_SNAPSHOT
 
     def test_capitalised_and_november(self):
-        # control — kills a dropped re.IGNORECASE flag on either compiled
-        # table, or "November" dropped from the shared month list. Both must
-        # stay — plain member/flag drops a line-level diff would not
-        # otherwise catch.
-        assert scanner.deadline_phrasing(
+        # control — kills a dropped re.IGNORECASE flag on either alternation
+        # (_ANY_SNAPSHOT / _ANY_CUMULATIVE, which decide the verdict since
+        # DR-70) or on _COMPILED_CUMULATIVE, whose index 0 _deadline_spans
+        # still reads (the "Before Oct 1, 2026" span below), or "November"
+        # dropped from the shared month list. A dropped flag on
+        # _COMPILED_SNAPSHOT, which since DR-70 only the tests read, is killed
+        # by TestAlternationEquivalence instead. All must stay — plain
+        # member/flag drops a line-level diff would not otherwise catch.
+        assert scanner.deadline_profile(
             "", "Before Oct 1, 2026", "",
-        ) == scanner.DEADLINE_CUMULATIVE
+        ) == (scanner.DEADLINE_CUMULATIVE, ("before oct 1, 2026",))
         assert scanner.deadline_phrasing(
             "", "On Nov 16, 2026", "",
         ) == scanner.DEADLINE_SNAPSHOT
@@ -2080,6 +2085,185 @@ class TestPhrasingCensusLine:
         assert self._census_lines(caplog) == [
             "Deadline phrasing of actively priced markets: 0 cumulative, 0 snapshot, 5 unknown",
         ]
+
+
+# ── DR-70: the phrasing classifier is cheap, and its output does not move ─────
+
+
+def _parametrize_values(test_func) -> list:
+    """The argvalues of test_func's single @pytest.mark.parametrize.
+
+    Read off the function object so the DR-70 equivalence test reuses the
+    DR-67/DR-68 tables' EXACT strings as its reference set instead of a second
+    copy that could drift from them (the reason _CUMULATIVE_ENTRY_CASES is
+    module-level). Raises ValueError if the test stops being parametrized, so
+    a refactor cannot silently empty the reference set.
+    """
+    [mark] = [m for m in getattr(test_func, "pytestmark", []) if m.name == "parametrize"]
+    return list(mark.args[1])
+
+
+def _phrasing_reference_strings() -> list:
+    """Every wording string the classifier tests above already pin, plus the
+    capitalisation cases, as one hermetic reference set for DR-70."""
+    strings = []
+    for phrase, _spans in _CUMULATIVE_ENTRY_CASES:
+        strings += [phrase, f"Will X happen {phrase}?"]
+    strings += _parametrize_values(TestCumulativeDeadlineRule.test_each_snapshot_entry_is_live)
+    strings += [t for t, _ in _parametrize_values(TestCumulativeDeadlineRule.test_title_classification)]
+    strings += _parametrize_values(TestCumulativeDeadlineRule.test_by_a_quantity_is_not_a_deadline)
+    strings += [t for t, _ in _parametrize_values(TestDateTokenBoundaries.test_profile)]
+    strings += _parametrize_values(TestDateTokenBoundaries.test_snapshot)
+    # Not parametrized upstream, so named here: the capitalised rows of
+    # TestCumulativeDeadlineRule.test_capitalised_and_november, and lower-case
+    # months. Every table string above spells a month capitalised and a
+    # preposition lower-case, exactly as the patterns do, so without these an
+    # alternation compiled WITHOUT re.IGNORECASE would agree with the
+    # reference on every row.
+    strings += [
+        "Before Oct 1, 2026", "On Nov 16, 2026", "BY DEC 31, 2026",
+        "Will X happen by november 30, 2026?", "bitcoin price on sep 15, 2026?",
+        "AT THE CLOSE", "Will X happen AFTER March 1, 2026?", "WITHIN 30 DAYS",
+    ]
+    # De-duplicated in order: several tables pin the same string, and one row
+    # per distinct string keeps the parametrized ids readable.
+    return list(dict.fromkeys(strings))
+
+
+_PHRASING_REFERENCE = _phrasing_reference_strings()
+
+
+def _reference_field_phrasing(text: str):
+    """_field_phrasing as it was before DR-70: every entry of each table
+    searched on its own, snapshot table first."""
+    if any(pat.search(text) for pat in scanner._COMPILED_SNAPSHOT):
+        return scanner.DEADLINE_SNAPSHOT
+    if any(pat.search(text) for pat in scanner._COMPILED_CUMULATIVE):
+        return scanner.DEADLINE_CUMULATIVE
+    return None
+
+
+class TestPhrasingTableInvariants:
+    """DR-70 tests each phrasing table with ONE precompiled alternation.
+    "Some entry matches somewhere" equals "the alternation matches somewhere"
+    only while every entry is alternation-safe. These are CONTROLS: they pin
+    the invariant the equivalence rests on, so a future table entry that
+    breaks it fails here rather than silently changing verdicts."""
+
+    @pytest.mark.parametrize(
+        "pattern", [*scanner._CUMULATIVE_DEADLINE_PATTERNS, *scanner._SNAPSHOT_PATTERNS],
+    )
+    def test_entry_has_no_group_and_no_inline_flag(self, pattern):
+        # control — kills a table entry that adds a capturing group (it would
+        # renumber every backreference after it in the alternation; zero
+        # groups also rules out backreferences, named groups and
+        # conditionals by construction) or an inline flag. A global one is
+        # legal only at position 0 of a pattern and every entry is wrapped in
+        # (?:...), so inside the alternation it fails to compile (Python
+        # 3.11+, the project floor) and the module would not import; scoped
+        # ones — positive "(?x:" or negative "(?-i:" — are forbidden too, to
+        # keep the rule one line.
+        assert re.compile(pattern).groups == 0
+        assert not re.search(r"\(\?[-aiLmsux]", pattern)
+
+    def test_alternations_are_group_free_and_case_insensitive(self):
+        # control — kills an alternation compiled without re.IGNORECASE (the
+        # per-pattern lists carry it, so the two would disagree on "Before
+        # Oct 1, 2026").
+        for alternation in (scanner._ANY_SNAPSHOT, scanner._ANY_CUMULATIVE):
+            assert alternation.groups == 0
+            assert alternation.flags & re.IGNORECASE
+
+
+class TestAlternationIsUsed:
+    """DR-70: _field_phrasing must read the precompiled alternations, not
+    loop over the per-pattern lists."""
+
+    def test_field_phrasing_reads_the_alternations(self, monkeypatch):
+        # regression — with both per-pattern lists emptied, the pre-DR-70
+        # loops (and a skip-only implementation) find nothing and return None.
+        monkeypatch.setattr(scanner, "_COMPILED_SNAPSHOT", [])
+        monkeypatch.setattr(scanner, "_COMPILED_CUMULATIVE", [])
+        assert scanner._field_phrasing("on June 30") == scanner.DEADLINE_SNAPSHOT
+        assert scanner._field_phrasing("Before Oct 1, 2026") == scanner.DEADLINE_CUMULATIVE
+
+
+class TestAlternationEquivalence:
+    """DR-70 must change no verdict. Hermetic: the reference set is the
+    strings the DR-67/DR-68 classifier tests above already pin."""
+
+    def test_reference_set_is_populated(self):
+        # control — keeps the parametrized test below from passing vacuously
+        # if a refactor ever empties or narrows the reference set.
+        assert len(_PHRASING_REFERENCE) >= 100
+        assert {_reference_field_phrasing(t) for t in _PHRASING_REFERENCE} == {
+            scanner.DEADLINE_SNAPSHOT, scanner.DEADLINE_CUMULATIVE, None,
+        }
+
+    @pytest.mark.parametrize("text", _PHRASING_REFERENCE)
+    def test_alternation_agrees_with_every_entry(self, text):
+        # control — kills an alternation compiled without re.IGNORECASE or
+        # joined from the wrong table. Each alternation is checked on its own
+        # as well as through _field_phrasing, so a cumulative-side divergence
+        # cannot hide behind a snapshot verdict.
+        assert bool(scanner._ANY_SNAPSHOT.search(text)) == any(
+            pat.search(text) for pat in scanner._COMPILED_SNAPSHOT
+        )
+        assert bool(scanner._ANY_CUMULATIVE.search(text)) == any(
+            pat.search(text) for pat in scanner._COMPILED_CUMULATIVE
+        )
+        assert scanner._field_phrasing(text) == _reference_field_phrasing(text)
+
+
+class _RaisingEq:
+    """A wording field whose == raises: proves _deciding_field's
+    duplicate-field skip never calls a non-str field's __eq__, directly or
+    reflected from a str comparison."""
+
+    __hash__ = None
+
+    def __eq__(self, other):
+        raise TypeError("a non-str field's __eq__ must never be called")
+
+
+class TestDuplicateFieldSkip:
+    """DR-70: _deciding_field skips a field identical to the one scanned just
+    before it. The skipped field could only have returned the same None."""
+
+    def test_identical_fields_are_scanned_once(self, monkeypatch):
+        # regression — the pre-DR-70 walk (and an alternation-only
+        # implementation) scans "x" three times.
+        calls = []
+        original = scanner._field_phrasing
+
+        def counting(text):
+            calls.append(text)
+            return original(text)
+
+        monkeypatch.setattr(scanner, "_field_phrasing", counting)
+        assert scanner.deadline_phrasing("x", "x", "x") == scanner.DEADLINE_UNKNOWN
+        assert calls == ["x"]
+        # In-test positive control: a DIFFERENT event title after two
+        # identical fields is still scanned, and still decides.
+        calls.clear()
+        assert scanner.deadline_phrasing(
+            "Will X happen by June 1, 2026?", "x", "x",
+        ) == scanner.DEADLINE_CUMULATIVE
+        assert calls == ["x", "Will X happen by June 1, 2026?"]
+
+    @pytest.mark.parametrize("fields", [
+        # control — kills dropping the isinstance guard from the skip test
+        # (`if text == previous`): the raising title is compared with the str
+        # subtitle scanned before it.
+        pytest.param(lambda: (_RaisingEq(), _RaisingEq(), "Trump"), id="raising-title"),
+        # control — kills keeping a non-str field as `previous`: the str
+        # title's comparison with it falls back to the reflected
+        # _RaisingEq.__eq__.
+        pytest.param(lambda: ("Trump", "Trump", _RaisingEq()), id="raising-subtitle"),
+        pytest.param(lambda: (float("nan"),) * 3, id="nan"),
+    ])
+    def test_non_str_fields_are_never_compared(self, fields):
+        assert scanner.deadline_phrasing(*fields()) == scanner.DEADLINE_UNKNOWN
 
 
 def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = None):

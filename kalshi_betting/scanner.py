@@ -361,6 +361,27 @@ _SNAPSHOT_PATTERNS = [
 
 _COMPILED_CUMULATIVE = [re.compile(p, re.IGNORECASE) for p in _CUMULATIVE_DEADLINE_PATTERNS]
 _COMPILED_SNAPSHOT = [re.compile(p, re.IGNORECASE) for p in _SNAPSHOT_PATTERNS]
+# One alternation per table for _field_phrasing's existence tests (DR-70).
+# "Some pattern matches somewhere" equals "the alternation matches somewhere"
+# as long as every entry compiles with zero capturing groups and no inline
+# flag, which tests/test_scanner.py::TestPhrasingTableInvariants pins. A group
+# would renumber any backreference after it; a global inline flag is legal
+# only at position 0 of a pattern and every entry is wrapped in (?:...), so
+# inside the alternation it fails to compile (Python 3.11+, the project
+# floor) and this module would not import. The test forbids scoped inline
+# flags too, positive or negative, to keep the rule one line. The two
+# searches per field that replace up to twelve (nine snapshot entries, three
+# cumulative) measured about 2x on their own: 45.7 -> 23.0 us/record through
+# deadline_profile on 200,000 records of the 2026-09-08 day slice
+# (2026-09-22); with _deciding_field's duplicate-field skip, 12.3. The
+# per-pattern lists stay: _deadline_spans needs index 0 alone, and the tests
+# use them as the equivalence reference.
+_ANY_CUMULATIVE = re.compile(
+    "|".join(f"(?:{p})" for p in _CUMULATIVE_DEADLINE_PATTERNS), re.IGNORECASE,
+)
+_ANY_SNAPSHOT = re.compile(
+    "|".join(f"(?:{p})" for p in _SNAPSHOT_PATTERNS), re.IGNORECASE,
+)
 
 # deadline_phrasing()'s three verdicts. Bare module-level strings, like the
 # pair_type and TradeResult.status vocabularies — config.py owns the tunable
@@ -1044,10 +1065,12 @@ def _field_phrasing(text: Any) -> str | None:
     if not isinstance(text, str) or not text:
         return None
     # Snapshot first: a field naming a measurement instant is a snapshot
-    # question regardless of what else it says.
-    if any(pat.search(text) for pat in _COMPILED_SNAPSHOT):
+    # question regardless of what else it says. Each table is tested with ONE
+    # search of its precompiled alternation, which matches exactly when some
+    # entry of that table does (DR-70; see _ANY_SNAPSHOT).
+    if _ANY_SNAPSHOT.search(text):
         return DEADLINE_SNAPSHOT
-    if any(pat.search(text) for pat in _COMPILED_CUMULATIVE):
+    if _ANY_CUMULATIVE.search(text):
         return DEADLINE_CUMULATIVE
     return None
 
@@ -1109,6 +1132,14 @@ def _deciding_field(event_title: Any, title: Any, subtitle: Any) -> tuple:
     "cumulative" while the event titles' different "by <date>" phrases made the
     two legs look like two deadlines.
 
+    A field identical to the one scanned just before it is skipped (DR-70):
+    the walk only reaches a field when every earlier one carried no marker,
+    so re-scanning the same string could only return that same None. Combo
+    titles repeat their subtitle verbatim — every one of the 163,898 combo
+    records among the first 200,000 of the 2026-09-08 day slice — which is
+    why the skip alone measured 45.7 -> 23.9 us/record there (2026-09-22),
+    and 12.3 together with _ANY_SNAPSHOT's one-search table test.
+
     Args:
         event_title (Any): Parent event title; a non-str reads as absent.
         title (Any): The market's question text; a non-str reads as absent.
@@ -1118,7 +1149,15 @@ def _deciding_field(event_title: Any, title: Any, subtitle: Any) -> tuple:
         tuple[str, str | None]: (verdict, deciding field text), or
             (DEADLINE_UNKNOWN, None) when no field names a deadline shape.
     """
+    # The duplicate-field skip compares only str against str, so a non-str
+    # field still reads as absent and never raises: its __eq__ is never
+    # called, neither directly nor reflected from a str comparison, because a
+    # non-str field is never kept as `previous` either.
+    previous = None
     for text in (subtitle, title, event_title):
+        if isinstance(text, str) and text == previous:
+            continue
+        previous = text if isinstance(text, str) else None
         verdict = _field_phrasing(text)
         if verdict is not None:
             return verdict, text
@@ -1158,7 +1197,9 @@ def deadline_profile(event_title: Any, title: Any, subtitle: Any) -> tuple:
     these and then compare the cheap results pairwise. That is a hard
     requirement rather than a tidy-up — the backtester's pair sweep runs on the
     order of a million comparisons for a single large group, where re-running
-    the regex tables per pair costs roughly thirty times more than per market.
+    the regex tables per pair makes about 60x more classifier calls than per
+    market (2 legs x ~31 in-window neighbours per member on
+    TestExtractPairsPerformanceSmoke's 50,000-member group).
 
     Both paths call this with their own three strings (the live scanner off
     ApiMarket attributes, the backtester off cached dict keys), so the FIELD
