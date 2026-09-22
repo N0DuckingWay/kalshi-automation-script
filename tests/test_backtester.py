@@ -4280,9 +4280,14 @@ class TestLogIntervalCalibration:
             _log_interval_calibration(None)
         msgs = self._messages(caplog)
         assert len(msgs) == 1
+        # "with a readable settlement" rather than a bare "no entry": the None
+        # branch is also taken when time-series entries DID exist but every one
+        # was dropped for an unreadable outcome, so the line must not claim
+        # more than the branch proves.
         assert msgs[0] == (
             "Interval-discount calibration: no time-series candidate entry "
-            "in this window — empirical k_hat is not measurable"
+            "with a readable settlement in this window — empirical k_hat is "
+            "not measurable"
         )
 
     def test_report_lines(self, caplog):

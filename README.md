@@ -105,7 +105,8 @@ main.py
   ├─ scanner.filter_markets_within_horizon() — optional --max-horizon-days cap (no-op if unset)
   ├─ scanner.find_time_series_pairs()   — time-series pair detection
   │                                        (both legs must be cumulative "by <date>"
-  │                                         deadlines at two different dates)
+  │                                         deadlines at two different dates, compared
+  │                                         as normalized strings — see the note above)
   ├─ scanner.find_same_title_pairs()    — same-title pair detection
   ├─ main._dedup_pairs()            — merge both lists, preferring same-title on overlap
   ├─ scanner.enrich_with_orderbook_prices() — validate depth; price each pair over the depth this balance could actually buy

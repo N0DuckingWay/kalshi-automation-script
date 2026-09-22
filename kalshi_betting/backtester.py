@@ -2789,7 +2789,8 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
     if calibration is None:
         logging.info(
             "Interval-discount calibration: no time-series candidate entry "
-            "in this window — empirical k_hat is not measurable"
+            "with a readable settlement in this window — empirical k_hat is "
+            "not measurable"
         )
         return
 

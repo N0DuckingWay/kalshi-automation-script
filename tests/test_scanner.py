@@ -1640,10 +1640,13 @@ class TestDeadlineGuardFinders:
     The predicate-level tests above prove the RULE; these prove
     find_time_series_pairs actually APPLIES it end to end, on fixtures where
     nothing else — the price tiers, the deadline-gap cap, the one-series rule
-    — would independently have refused the pair. Every test that asserts []
-    also asserts, inside the test, that its two legs share a group key (so a
-    fixture that silently stops grouping together — e.g. a normalize_title
-    drift — fails loudly instead of returning [] for the wrong reason) and
+    — would independently have refused the pair. Every test whose fixture
+    depends on its legs grouping together — which is every test that asserts
+    [], and test_screen_runs_before_best_pair_selection, which asserts a
+    specific surviving pair — also asserts, inside the test, that those legs
+    share a group key (so a fixture that silently stops grouping together —
+    e.g. a normalize_title drift — fails loudly instead of passing for the
+    wrong reason). Every test that asserts [] additionally
     carries an in-test positive control: the same fixture, changed only in
     the property under test, that returns exactly one pair.
     """
@@ -1805,6 +1808,16 @@ class TestDeadlineGuardFinders:
             yes_ask=0.15, no_ask=0.85, close_time=base + timedelta(days=10),
         )
         assert scanner._market_deadline_profile(m2)[0] == scanner.DEADLINE_SNAPSHOT
+        # The fixture only exercises M26 while all four legs share ONE group:
+        # if the refused leg fell out of the group, the asserted pair would
+        # still be returned and the mutant would survive un-noticed. The
+        # grouping of "after March 25?" rests on _DATE_PATTERNS, the list
+        # CLAUDE.md flags as the most regression-prone in the codebase, so
+        # pin it here rather than assume it.
+        assert len({
+            scanner.time_series_group_key(scanner.pair_key(m), m.subtitle)
+            for m in (m1, m2, m3, m4)
+        }) == 1
         [pair] = find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[m1, m2, m3, m4],
         )
