@@ -2606,7 +2606,16 @@ class TestOutcomeLabelCoverageIsCarried:
     """
 
     def test_the_census_returns_what_it_logged(self, caplog):
-        markets = [{"subtitle": "Yes", "event_title": "E"}] * 3 + [{}] * 7
+        # A shared corpus with pairwise-distinct, non-zero phrasing counts
+        # (DR-71): the 3 subtitled/event-titled records also carry a
+        # cumulative deadline, 2 are snapshots, 5 state no deadline at all.
+        cumulative = [{"subtitle": "Yes", "event_title": "E",
+                       "title": "Will X happen by Dec 31, 2026?"}
+                      for _ in range(3)]
+        snapshot = [{"title": "Bitcoin price on Sep 15, 2026?"}
+                    for _ in range(2)]
+        unknown = [{"title": "Q"} for _ in range(5)]
+        markets = cumulative + snapshot + unknown
         with caplog.at_level("INFO"):
             coverage = backtester._log_outcome_label_coverage(markets)
 
@@ -2617,6 +2626,33 @@ class TestOutcomeLabelCoverageIsCarried:
         assert coverage.event_title_fraction == pytest.approx(0.30)
         # The same number reached the log, so page and log cannot disagree.
         assert any("30.00%" in r.getMessage() for r in caplog.records)
+
+        # DR-71: the three phrasing fields equal the per-record
+        # scanner.deadline_phrasing tally...
+        tally = {"cumulative": 0, "snapshot": 0, "unknown": 0}
+        for m in markets:
+            verdict = scanner.deadline_phrasing(
+                m.get("event_title", ""), m.get("title", ""),
+                m.get("subtitle", ""))
+            tally[verdict] += 1
+        assert coverage.cumulative_markets == tally["cumulative"] == 3
+        assert coverage.snapshot_markets == tally["snapshot"] == 2
+        assert coverage.unknown_deadline_markets == tally["unknown"] == 5
+        # ...sum to the corpus...
+        assert (coverage.cumulative_markets + coverage.snapshot_markets
+                + coverage.unknown_deadline_markets) == coverage.total
+        # ...and equal the numbers in the logged INFO line, so the page (which
+        # reads these same fields) and the log can never disagree.
+        phrasing_lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == "INFO"
+            and r.getMessage().startswith("Deadline phrasing over")
+        ]
+        assert phrasing_lines == [
+            "Deadline phrasing over 10 eligible markets: 3 worded as a "
+            "cumulative deadline, 2 snapshot, 5 with no deadline wording the "
+            "classifier recognises"
+        ]
 
     def test_the_below_floor_flag_is_the_warning_s_own_condition(self):
         floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION
@@ -2642,6 +2678,35 @@ class TestOutcomeLabelCoverageIsCarried:
         assert coverage.subtitle_fraction is None
         assert coverage.event_title_fraction is None
         assert coverage.below_floor is False
+        # DR-71: the phrasing fields are a genuine measurement (zero markets
+        # of every kind), not an omission that happened to default to 0.
+        assert coverage.cumulative_markets == 0
+        assert coverage.snapshot_markets == 0
+        assert coverage.unknown_deadline_markets == 0
+
+    @pytest.mark.parametrize("omit", [
+        "cumulative_markets", "snapshot_markets", "unknown_deadline_markets",
+    ])
+    def test_the_phrasing_fields_are_required(self, omit):
+        # DR-71: before this, a forgotten phrasing keyword silently defaulted
+        # to 0, which would render the dashboard's strongest sentence ("could
+        # not have produced a time-series trade at all") as if it had been
+        # measured. A forgotten keyword is now a TypeError at construction —
+        # the same "cannot be forgotten" reasoning DR-66b used for returning
+        # the carrier in the first place. Parametrized over each of the three
+        # fields individually (C5-ADV-2): omitting all three at once only
+        # pins "at least one is required", and would survive a mutant that
+        # restored a default on just the trailing field(s).
+        kwargs = {
+            "total": 1, "with_subtitle": 1, "with_event_title": 1,
+            "subtitle_fraction": 1.0, "event_title_fraction": 1.0,
+            "below_floor": False,
+            "cumulative_markets": 1, "snapshot_markets": 0,
+            "unknown_deadline_markets": 0,
+        }
+        del kwargs[omit]
+        with pytest.raises(TypeError):
+            backtester.OutcomeLabelCoverage(**kwargs)
 
     def test_the_carrier_holds_no_market_reference(self):
         # _prepare_entries del's the record list right after pair extraction to
@@ -2660,6 +2725,7 @@ class TestOutcomeLabelCoverageIsCarried:
             total=4, with_subtitle=1, with_event_title=1,
             subtitle_fraction=0.25, event_title_fraction=0.25,
             below_floor=True,
+            cumulative_markets=1, snapshot_markets=1, unknown_deadline_markets=2,
         )
         monkeypatch.setattr(backtester, "_prepare_entries",
                             lambda *a, **k: ([], census))

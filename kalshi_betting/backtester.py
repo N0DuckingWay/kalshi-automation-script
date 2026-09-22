@@ -425,11 +425,12 @@ class OutcomeLabelCoverage:
     where the warning floor sits — there is exactly ONE measurement, one pass
     and one threshold comparison per run.
 
-    Holds five scalars and no reference to any market record: _prepare_entries
-    del's the eligible-market list immediately after pair extraction to lower
-    residency across the candlestick fetch (TS-07), and a carrier that kept
-    examples (sample tickers, a per-category breakdown) would pin every one of
-    those dicts alive past that statement.
+    Holds scalars only (counts, fractions and one verdict) and no reference to
+    any market record: _prepare_entries del's the eligible-market list
+    immediately after pair extraction to lower residency across the
+    candlestick fetch (TS-07), and a carrier that kept examples (sample
+    tickers, a per-category breakdown) would pin every one of those dicts
+    alive past that statement.
 
     The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
     list after the _can_ever_enter prefilter, i.e. every record handed to the
@@ -453,17 +454,21 @@ class OutcomeLabelCoverage:
             which reports no coverage rather than 0%.
         event_title_fraction (float | None): with_event_title / total, or None
             when total is 0, for the same reason.
-        cumulative_markets (int): Records whose wording states a cumulative
-            "by <date>" deadline (scanner.deadline_phrasing). Only a pair of
-            these can be a time-series candidate, so a ZERO here on a non-empty
-            corpus means this run can produce no time-series trade at all — the
-            one reading of this census that is actionable on its own.
-        snapshot_markets (int): Records whose wording is a snapshot ("price ON
-            <date>", "in <Month>", "after <date>"). Refused as time-series legs.
-        unknown_deadline_markets (int): Records whose wording names no deadline
-            shape at all — the deadline may live in the event ticker, but
-            nothing the pair-finders read can prove it, so they are refused too.
-            Expected to dominate a combo-heavy corpus.
+        cumulative_markets (int): Records worded as a cumulative "by <date>"
+            deadline (scanner.deadline_phrasing). Only a pair of these can be a
+            time-series candidate, so a ZERO here on a non-empty corpus means
+            this run can produce no time-series trade at all — the one reading
+            of this census that is actionable on its own.
+        snapshot_markets (int): Records worded as a snapshot ("price ON
+            <date>", "in <Month>", "after <date>"). Refused as a time-series
+            leg because a snapshot probability need not nest inside another's:
+            "after <date>" nests the wrong way, and a shared-start "after X and
+            before Y" window CAN nest — a known, accepted over-refusal.
+        unknown_deadline_markets (int): Records that carry no deadline wording
+            the classifier recognises — the deadline may live in the event
+            ticker, but nothing the pair-finders read can prove it, so nesting
+            cannot be shown and they are refused too. Expected to dominate a
+            combo-heavy corpus.
 
             These three are DESCRIPTIVE and carry no warning floor, unlike
             subtitle coverage: the cumulative FRACTION has no healthy baseline
@@ -483,12 +488,19 @@ class OutcomeLabelCoverage:
     subtitle_fraction: float | None
     event_title_fraction: float | None
     below_floor: bool
-    # Declared AFTER below_floor deliberately: this dataclass is frozen but not
-    # kw_only, so appending is the only way to add a field without reordering
-    # every positional construction.
-    cumulative_markets: int = 0
-    snapshot_markets: int = 0
-    unknown_deadline_markets: int = 0
+    # Declared AFTER below_floor: this dataclass is frozen but not kw_only, so
+    # appending is the only way to add a field without reordering every
+    # positional construction.
+    #
+    # REQUIRED, with no default (DR-71). A default of 0 let a construction
+    # that forgot them render the dashboard's strongest sentence ("could not
+    # have produced a time-series trade at all") as if it had been measured. A
+    # forgotten keyword is now a TypeError at construction — the same "cannot
+    # be forgotten" reasoning DR-66b used for returning the carrier in the
+    # first place.
+    cumulative_markets: int
+    snapshot_markets: int
+    unknown_deadline_markets: int
 
 
 @dataclass
@@ -1638,7 +1650,8 @@ def _log_rss(label: str) -> None:
 
 def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     """
-    Census how many eligible markets carry an outcome label, and warn when few do.
+    Census how many eligible markets carry an outcome label and how their
+    deadline wording classifies, and warn when few carry a label.
 
     Both backtest grouping keys are built from fields a stale cache may simply
     not have. `subtitle` is the outcome discriminator in the time-series key
@@ -1690,11 +1703,13 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             materialized, since this can be millions of records.
 
     Returns:
-        OutcomeLabelCoverage: The five scalars this census just logged, with
-            below_floor carrying the very comparison the WARNING branches on.
-            On an empty corpus, total 0 with both fractions None (undefined,
-            not zero) and below_floor False. Holds no reference to any record,
-            so it is safe to keep past _prepare_entries' `del markets`.
+        OutcomeLabelCoverage: Scalars only (counts, fractions and one
+            verdict) — the numbers this census just logged, with below_floor
+            carrying the very comparison the WARNING branches on. On an empty
+            corpus, total 0 with both fractions None (undefined, not zero),
+            below_floor False and all three phrasing counts 0. Holds no
+            reference to any record, so it is safe to keep past
+            _prepare_entries' `del markets`.
     """
     total = len(markets)
 
@@ -1706,11 +1721,15 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     if not total:
         logging.info("Outcome-label coverage: no eligible markets to census")
         # Fractions are None, not 0.0: undefined rather than zero, so a
-        # renderer can say "nothing to census" instead of "0% coverage".
+        # renderer can say "nothing to census" instead of "0% coverage". The
+        # three phrasing counts are passed explicitly (DR-71: they carry no
+        # default) because an empty corpus is itself a measurement — zero
+        # markets of every kind — not an omission.
         return OutcomeLabelCoverage(
             total=0, with_subtitle=0, with_event_title=0,
             subtitle_fraction=None, event_title_fraction=None,
             below_floor=False,
+            cumulative_markets=0, snapshot_markets=0, unknown_deadline_markets=0,
         )
 
     # One pass, five counters. Blank/None/absent all read as "no label", the
@@ -1744,8 +1763,9 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     # whether because the corpus genuinely holds no deadline families or
     # because the phrasing tables stopped matching.
     logging.info(
-        "Deadline phrasing over %d eligible markets: %d cumulative, %d snapshot, "
-        "%d with no stated deadline",
+        "Deadline phrasing over %d eligible markets: %d worded as a cumulative "
+        "deadline, %d snapshot, %d with no deadline wording the classifier "
+        "recognises",
         total,
         phrasing[DEADLINE_CUMULATIVE],
         phrasing[DEADLINE_SNAPSHOT],
@@ -1963,9 +1983,9 @@ def _prepare_entries(
     #
     # The measurement is carried out of this function (DR-66b) so the dashboard
     # can render the same caveat beside the k-hat card it recommends a
-    # real-money constant from. It is five scalars with no reference to any
-    # record here, so holding it costs nothing and the `del markets` below is
-    # unaffected.
+    # real-money constant from. It is scalars only (counts, fractions and one
+    # verdict) with no reference to any record here, so holding it costs
+    # nothing and the `del markets` below is unaffected.
     label_coverage = _log_outcome_label_coverage(markets)
 
     # Group settled markets into potential pairs using the same logic as the live scanner

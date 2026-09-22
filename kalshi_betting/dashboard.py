@@ -620,7 +620,8 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
 def _deadline_phrasing_html(coverage: OutcomeLabelCoverage | None) -> str:
     """
-    Render how this run's eligible markets are worded: cumulative, snapshot, or undated.
+    Render how this run's eligible markets are worded: cumulative, snapshot, or
+    no deadline wording the classifier recognises.
 
     A time-series pair is only formed between two CUMULATIVE-deadline markets
     ("will X happen BY <date>"), because only there does the earlier deadline's
@@ -634,7 +635,16 @@ def _deadline_phrasing_html(coverage: OutcomeLabelCoverage | None) -> str:
     operator to ignore it. The reading that IS actionable needs no threshold —
     zero cumulative markets on a non-empty corpus means this run could not have
     produced a time-series trade whatever else the page says — so that case
-    gets its own sentence.
+    gets its own sentence, but ONLY when the three counts actually add up to
+    the corpus (DR-71): a hand-built or stale coverage whose counts don't sum
+    to `total` is not a measurement this line can vouch for, so it reports the
+    raw counts and says so rather than asserting the verdict.
+
+    The two refusal reasons are reported separately (DR-71), because they are
+    refused for different reasons: a snapshot probability need not nest inside
+    another's ("after <date>" nests the wrong way; a shared-start "after X and
+    before Y" window CAN nest — a known, accepted over-refusal), while
+    unrecognised wording is refused because nesting simply cannot be shown.
 
     Args:
         coverage (backtester.OutcomeLabelCoverage | None): The census carried
@@ -651,21 +661,35 @@ def _deadline_phrasing_html(coverage: OutcomeLabelCoverage | None) -> str:
 
     total = coverage.total
     cumulative = coverage.cumulative_markets
+    snapshot = coverage.snapshot_markets
+    unknown = coverage.unknown_deadline_markets
+    # The three counts are a fresh census on a genuine run, so they always sum
+    # to total — but a hand-built or stale coverage (a test fixture, a carrier
+    # from before DR-71) can disagree, and reporting a verdict off numbers that
+    # don't even add up would be worse than saying nothing.
+    consistent = (cumulative + snapshot + unknown == total)
+
     body = (
-        f"Deadline phrasing: {cumulative:,} of {total:,} eligible markets state a "
-        f"cumulative &ldquo;by &lt;date&gt;&rdquo; deadline "
-        f"({cumulative / total * 100.0:.2f}%), "
-        f"{coverage.snapshot_markets:,} are snapshots "
-        f"(&ldquo;on &lt;date&gt;&rdquo;, &ldquo;in &lt;month&gt;&rdquo;), and "
-        f"{coverage.unknown_deadline_markets:,} state no deadline in their wording. "
-        "Only a pair of cumulative markets can become a time-series candidate; "
-        "the other two are refused, because their probabilities do not nest."
+        f"Deadline phrasing: {cumulative:,} of {total:,} eligible markets are "
+        f"worded as a cumulative &ldquo;by &lt;date&gt;&rdquo; deadline "
+        f"({cumulative / total * 100.0:.2f}%), {snapshot:,} are snapshots "
+        f"(&ldquo;on &lt;date&gt;&rdquo;, &ldquo;in &lt;month&gt;&rdquo;, "
+        f"&ldquo;after &lt;date&gt;&rdquo;), and {unknown:,} carry no deadline "
+        "wording the classifier recognises. "
+        "Only a pair of cumulative markets can become a time-series candidate: "
+        "snapshot wording is refused because such probabilities need not nest "
+        "(&ldquo;after &lt;date&gt;&rdquo; nests the wrong way; shared-start "
+        "&ldquo;after X and before Y&rdquo; windows can nest and are a known "
+        "over-refusal), and unrecognised wording because nesting cannot be "
+        "shown."
     )
-    if not cumulative:
+    if cumulative == 0 and consistent:
         body += (
             " <strong>No eligible market was read as cumulative, so this run "
             "could not have produced a time-series trade at all.</strong>"
         )
+    if not consistent:
+        body += " (counts do not sum to the corpus — not a verdict)"
     return (
         "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
         f"{body}</p>"

@@ -322,6 +322,12 @@ def _coverage(with_subtitle: int, total: int = 100) -> OutcomeLabelCoverage:
     below_floor is computed here the same way the census computes it, so a
     fixture can never claim a verdict its own numbers contradict — but the
     DASHBOARD never recomputes it: it branches on the carried flag.
+
+    The phrasing counts (7/11/82, always used with the default total=100 every
+    call site passes) are fixed, real numbers deliberately distinct from the
+    with_subtitle values the subtitle-coverage tests substring-match (2, 97,
+    1, ...), so the two families of assertions can never accidentally collide
+    (DR-71).
     """
     fraction = with_subtitle / total if total else None
     return OutcomeLabelCoverage(
@@ -332,6 +338,7 @@ def _coverage(with_subtitle: int, total: int = 100) -> OutcomeLabelCoverage:
         event_title_fraction=fraction,
         below_floor=(fraction is not None
                      and fraction < config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION),
+        cumulative_markets=7, snapshot_markets=11, unknown_deadline_markets=82,
     )
 
 
@@ -418,6 +425,7 @@ class TestOutcomeLabelCoverageIsRendered:
             total=100, with_subtitle=1, with_event_title=1,
             subtitle_fraction=0.01, event_title_fraction=0.01,
             below_floor=False,
+            cumulative_markets=7, snapshot_markets=11, unknown_deadline_markets=82,
         )
         out = _section_interval_discount(self._sweep(lying))
         assert "1.00%" in out            # the figure is still reported
@@ -454,6 +462,7 @@ class TestOutcomeLabelCoverageIsRendered:
             total=0, with_subtitle=0, with_event_title=0,
             subtitle_fraction=None, event_title_fraction=None,
             below_floor=False,
+            cumulative_markets=0, snapshot_markets=0, unknown_deadline_markets=0,
         )
         out = _section_interval_discount(self._sweep(empty))
         assert "no eligible markets to census" in out
@@ -980,3 +989,58 @@ class TestDeadlinePhrasingIsRendered:
         html = _section_interval_discount(sweep)
         assert "Deadline phrasing" in html
         assert "120 of 1,000 eligible markets" in html
+
+    # ── DR-71: honest labels, and a verdict only when the counts add up ──────
+
+    @staticmethod
+    def _corpus():
+        # A shared corpus with pairwise-distinct non-zero phrasing counts,
+        # rendered from the CENSUS's own return value rather than a hand-built
+        # carrier, so a swapped label pair (D1) is caught by the same object
+        # the log measured, not by a fixture that might itself assume it.
+        cumulative = [{"subtitle": "Yes", "event_title": "E",
+                       "title": "Will X happen by Dec 31, 2026?"}
+                      for _ in range(3)]
+        snapshot = [{"title": "Bitcoin price on Sep 15, 2026?"}
+                    for _ in range(2)]
+        unknown = [{"title": "Q"} for _ in range(5)]
+        return cumulative + snapshot + unknown
+
+    def test_from_census_states_each_bucket_with_the_right_label(self):
+        coverage = backtester._log_outcome_label_coverage(self._corpus())
+        html = dashboard._deadline_phrasing_html(coverage)
+        assert "3 of 10 eligible markets are worded as a cumulative" in html
+        assert "2 are snapshots" in html
+        assert "5 carry no deadline wording" in html
+        # The two refusal reasons are split, not folded into one sentence: a
+        # snapshot is refused because its probability need not nest, an
+        # unrecognised wording because nesting cannot be shown at all — and
+        # the old folded sentence ("their probabilities do not nest") must be
+        # gone, not merely joined by the new text.
+        assert "need not nest" in html
+        assert "known over-refusal" in html
+        assert "nesting cannot be shown" in html
+        assert "do not nest" not in html
+        # A consistent, non-zero corpus renders no mismatch caveat.
+        assert "counts do not sum to the corpus" not in html
+
+    @pytest.mark.parametrize("cumulative_markets,snapshot_markets,unknown_deadline_markets", [
+        (0, 1, 1),      # sum 2, UNDER total 1000
+        (0, 600, 600),  # sum 1200, OVER total 1000 — a `>=` consistency check
+                         # would wrongly accept this direction (C5-ADV-1)
+    ])
+    def test_mismatched_counts_render_no_verdict(
+        self, cumulative_markets, snapshot_markets, unknown_deadline_markets,
+    ):
+        # A carrier whose phrasing counts don't add up to the corpus (a stale
+        # carrier, a hand-built fixture) must not assert a verdict its own
+        # numbers cannot support, even when cumulative_markets is 0. Total is
+        # 1000 (the base fixture's default) in both directions.
+        mismatched = self._coverage(
+            cumulative_markets=cumulative_markets,
+            snapshot_markets=snapshot_markets,
+            unknown_deadline_markets=unknown_deadline_markets,
+        )
+        html = dashboard._deadline_phrasing_html(mismatched)
+        assert "could not have produced a time-series trade" not in html
+        assert "counts do not sum to the corpus" in html
