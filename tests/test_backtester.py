@@ -668,6 +668,118 @@ class TestDeadlineProfileParity:
             == (scanner.DEADLINE_CUMULATIVE, ("by march 1",))
         )
 
+    @pytest.mark.parametrize("title, live_event_title, spans", [
+        ("Will X cut by June 1, 2026?", "Will X cut by June 20, 2026?", ("by june 1, 2026",)),
+        ("Will X cut by June 20, 2026?", "Will X cut by June 1, 2026?", ("by june 20, 2026",)),
+    ])
+    def test_blank_cached_event_title_agrees_with_live(self, title, live_event_title, spans):
+        # regression — DR-69. Live ingest attaches an event title to nearly
+        # every market; most cached records carry "" there. When the TITLE
+        # decides, the event title must not change the profile, or the two
+        # paths judge the same market differently. Before DR-69 the live
+        # profile folded the event title's (different) date into the spans
+        # and the blank-event-title record did not, so these two disagreed.
+        live_market = SimpleNamespace(
+            title=title, subtitle="", _event_title=live_event_title,
+        )
+        record = {"title": title, "subtitle": "", "event_title": ""}
+        assert (
+            scanner._market_deadline_profile(live_market)
+            == backtester._deadline_profile_dict(record)
+            == (scanner.DEADLINE_CUMULATIVE, spans)
+        )
+
+
+class TestSpansFromDecidingField:
+    """Backtester mirror of test_scanner.py::TestSpansFromDecidingField (DR-69):
+    the same fixtures through the dict-based grouping and extraction path.
+    Spans come from the field that decided the verdict only, which can refuse
+    a pair the old all-field union admitted AND admit one it refused.
+
+    The fixtures carry their event title in the record, so this exercises the
+    rule on a cache that has event titles; the blank-event-title case is
+    TestDeadlineProfileParity::test_blank_cached_event_title_agrees_with_live.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, subtitle="", event_title=""):
+        rec = _md(ticker, event_ticker, title=title, subtitle=subtitle,
+                  event_title=event_title)
+        rec["close_time"] = close_time
+        return rec
+
+    def test_spanless_subtitle_cannot_borrow_event_title_spans(self):
+        # regression — before DR-69 _extract_pairs emitted this pair: the
+        # spanless "At any time" subtitle decided "cumulative" and borrowed
+        # the event titles' distinct dates.
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will SOL be above $180 on Sep 14, 2026?",
+            "2026-09-14T00:00:00Z", subtitle="At any time",
+            event_title="SOL above $180 by Sep 14, 2026?",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will SOL be above $180 on Sep 18, 2026?",
+            "2026-09-18T00:00:00Z", subtitle="At any time",
+            event_title="SOL above $180 by Sep 18, 2026?",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: the deciding subtitle names the two deadlines itself.
+        cA = self._rec(
+            "PA-1", "EVA-1", "Will SOL be above $180 on Sep 14, 2026?",
+            "2026-09-14T00:00:00Z", subtitle="By Sep 14, 2026",
+            event_title="SOL above $180 by Sep 14, 2026?",
+        )
+        cB = self._rec(
+            "PB-1", "EVB-1", "Will SOL be above $180 on Sep 18, 2026?",
+            "2026-09-18T00:00:00Z", subtitle="By Sep 18, 2026",
+            event_title="SOL above $180 by Sep 18, 2026?",
+        )
+        assert len(_extract_pairs(TestDeadlineGuardFinders._one_group([cA, cB]))) == 1
+
+    def test_deciding_field_spans_can_admit_a_pair(self):
+        # regression — before DR-69 this pair was refused: each event title
+        # names the OTHER leg's date, so the all-field span unions matched.
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will X cut by June 1, 2026?", "2026-06-01T00:00:00Z",
+            event_title="Will X cut by June 20, 2026?",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will X cut by June 20, 2026?", "2026-06-20T00:00:00Z",
+            event_title="Will X cut by June 1, 2026?",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 20, 2026",),
+        )
+        [(a, b, _canon, key)] = _extract_pairs(groups)
+        assert isinstance(key, str)  # a string key is the time-series branch
+        assert {a["ticker"], b["ticker"]} == {"PA-1", "PB-1"}
+
+    def test_mve_event_title_route_still_pairs(self):
+        # control — kills a mutant that stops _deciding_field falling through
+        # to the event title. Dateless option label, empty title, deadline in
+        # the parent event title (the deciding field).
+        mA = self._rec(
+            "PA-1", "EVA-1", "", "2026-03-01T00:00:00Z", subtitle="Trump",
+            event_title="Presidential Election Winner by March 1, 2026",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "", "2026-03-20T00:00:00Z", subtitle="Trump",
+            event_title="Presidential Election Winner by March 20, 2026",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1, 2026",),
+        )
+        assert len(_extract_pairs(groups)) == 1
+
 
 class TestClassifyOncePerMarket:
     """Backtester mirror of test_scanner.py::TestClassifyOncePerMarket.

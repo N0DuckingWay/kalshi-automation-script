@@ -844,9 +844,17 @@ def _deadline_profile_dict(m: dict) -> tuple:
     One divergence to know, which no AST pin can catch: `event_title` reaches
     essentially every LIVE market but only a small fraction of cached ones (see
     config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION for the measured coverage), so
-    a market whose deadline is spelled only in its event title reads as
-    cumulative live and as unknown here. That makes this path strictly more
-    conservative than the live one, never less.
+    a market whose DECIDING field is its event title (no marker in its subtitle
+    or title) reads as its event title's verdict live (cumulative for a
+    "by <date>" event title, snapshot for an "on <date>" one) and as unknown
+    here. At the
+    phrasing-rule level, where the cache carries subtitles, the backtest's
+    profile equals the live one or is unknown: the spans come only from the
+    field that decided the verdict (DR-69), so a blank event title cannot
+    change a profile the subtitle or title decided. (Before DR-69 the live
+    spans also folded in the event title's dates, so the two paths could
+    differ in either direction.) That is not a pipeline guarantee: a blank
+    cached event_title changes the time-series group key itself.
 
     Args:
         m (dict): A market dict in the compact historical._market_to_dict form.

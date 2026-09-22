@@ -692,7 +692,13 @@ class TestTimeSeriesKellyParity:
         # eligible. Same shape as the series-prefix pin below.
         assert _function_calls(scanner, "_market_deadline_profile", "deadline_profile")
         assert _function_calls(backtester, "_deadline_profile_dict", "deadline_profile")
-        assert _function_calls(scanner, "deadline_profile", "deadline_phrasing")
+        # DR-69: the field walk is _deciding_field, and BOTH the verdict
+        # (deadline_phrasing) and the verdict-plus-spans (deadline_profile)
+        # read it, so the spans can never come from a different field than
+        # the verdict. A second copy of the walk in either would re-open
+        # exactly that divergence.
+        assert _function_calls(scanner, "deadline_profile", "_deciding_field")
+        assert _function_calls(scanner, "deadline_phrasing", "_deciding_field")
 
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror

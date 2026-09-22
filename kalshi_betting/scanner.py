@@ -301,9 +301,12 @@ _DEADLINE_DATE_TOKEN = (
 # deadline can only add probability.
 #
 # Index 0 is load-bearing beyond this table: it is the ONE pattern whose match
-# _deadline_spans reuses as a comparable deadline span. The others establish
-# the kind of question without naming a single comparable date, so a pair that
-# rests only on them cannot prove its two deadlines differ and is refused.
+# _deadline_spans reuses as a comparable deadline span, read from the field
+# that DECIDED the verdict and no other (DR-69). The others establish the kind
+# of question without naming a single comparable date, so a leg whose deciding
+# field carries only them has no span, and a pair resting on such a leg cannot
+# prove its two deadlines differ and is refused — even when a less specific
+# field of that leg does name a date.
 _CUMULATIVE_DEADLINE_PATTERNS = [
     rf"\b(?:by|before|prior\s+to|no\s+later\s+than|on\s+or\s+before|up\s+to|through|until)"
     rf"\s+(?:the\s+)?(?:end\s+of\s+(?:the\s+)?)?{_DEADLINE_DATE_TOKEN}",
@@ -1088,46 +1091,63 @@ def deadline_phrasing(event_title: Any, title: Any, subtitle: Any) -> str:
     Returns:
         str: DEADLINE_CUMULATIVE, DEADLINE_SNAPSHOT, or DEADLINE_UNKNOWN.
     """
-    # Most specific field first; the first field carrying a marker decides.
-    for verdict in (
-        _field_phrasing(subtitle),
-        _field_phrasing(title),
-        _field_phrasing(event_title),
-    ):
-        if verdict is not None:
-            return verdict
-    return DEADLINE_UNKNOWN
+    # The field walk lives in _deciding_field, the one definition shared with
+    # deadline_profile, so the verdict and the spans can never be read off
+    # different fields (DR-69).
+    return _deciding_field(event_title, title, subtitle)[0]
 
 
-def _deadline_spans(event_title: Any, title: Any, subtitle: Any) -> tuple:
+def _deciding_field(event_title: Any, title: Any, subtitle: Any) -> tuple:
     """
-    The distinct deadline phrases a market's wording spells out, normalized.
+    The verdict and the one field that produced it: the classifier's single definition.
 
-    Collected across all three fields from _COMPILED_CUMULATIVE[0] — the only
-    pattern in that table whose match names a comparable point in time. Used by
-    cumulative_deadline_pair to prove two legs really do state DIFFERENT
-    deadlines: two contracts whose wording names the same deadline are one
-    question listed twice, not one question at two deadlines, whatever their
-    close times say.
+    Most specific field first (subtitle, then title, then event title); the
+    first field carrying a marker decides. deadline_phrasing returns the
+    verdict. deadline_profile also takes the deadline spans from the SAME
+    field, so a field that did not decide the verdict cannot lend a leg a span
+    (DR-69). Before this change, a spanless subtitle marker could decide
+    "cumulative" while the event titles' different "by <date>" phrases made the
+    two legs look like two deadlines.
 
     Args:
-        event_title (Any): The market's parent event title. Non-str is skipped.
-        title (Any): The market's own question text. Non-str is skipped.
-        subtitle (Any): The market's outcome label. Non-str is skipped.
+        event_title (Any): Parent event title; a non-str reads as absent.
+        title (Any): The market's question text; a non-str reads as absent.
+        subtitle (Any): The outcome label / sub-contract; a non-str reads as absent.
 
     Returns:
-        tuple[str, ...]: Sorted, de-duplicated, lower-cased, whitespace-collapsed
-            deadline phrases (e.g. ("by june 30",)). Empty when the wording
-            carries no comparable deadline — which cumulative_deadline_pair
-            treats as unprovable and refuses.
+        tuple[str, str | None]: (verdict, deciding field text), or
+            (DEADLINE_UNKNOWN, None) when no field names a deadline shape.
     """
-    spans = set()
     for text in (subtitle, title, event_title):
-        if not isinstance(text, str) or not text:
-            continue
-        for match in _COMPILED_CUMULATIVE[0].finditer(text):
-            spans.add(re.sub(r"\s+", " ", match.group(0)).strip().lower())
-    return tuple(sorted(spans))
+        verdict = _field_phrasing(text)
+        if verdict is not None:
+            return verdict, text
+    return DEADLINE_UNKNOWN, None
+
+
+def _deadline_spans(text: Any) -> tuple:
+    """
+    The distinct deadline phrases ONE wording field spells out, normalized.
+
+    Read from _COMPILED_CUMULATIVE[0], the only pattern whose match names a
+    comparable point in time. Called on the deciding field only (see
+    _deciding_field and DR-69). cumulative_deadline_pair compares these as
+    normalized STRINGS: one deadline spelled two ways reads as two deadlines,
+    and a truncated span can read two deadlines as one.
+
+    Args:
+        text (Any): The deciding field's text, or None. A non-str yields ().
+
+    Returns:
+        tuple[str, ...]: Sorted, de-duplicated, lower-cased,
+            whitespace-collapsed deadline phrases; () when there are none.
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    return tuple(sorted({
+        re.sub(r"\s+", " ", match.group(0)).strip().lower()
+        for match in _COMPILED_CUMULATIVE[0].finditer(text)
+    }))
 
 
 def deadline_profile(event_title: Any, title: Any, subtitle: Any) -> tuple:
@@ -1144,19 +1164,26 @@ def deadline_profile(event_title: Any, title: Any, subtitle: Any) -> tuple:
     ApiMarket attributes, the backtester off cached dict keys), so the FIELD
     EXTRACTION differs between them but the classification does not.
 
+    The spans come from the SAME field that decided the verdict, never from
+    the other two (DR-69): a less specific field that restates, or
+    contradicts, the deadline can neither lend a spanless deciding field a
+    date nor make two differing deciding fields look alike.
+
     Args:
         event_title (Any): The market's parent event title.
         title (Any): The market's own question text.
         subtitle (Any): The market's outcome label / sub-contract.
 
     Returns:
-        tuple[str, tuple[str, ...]]: (verdict, deadline spans) — see
-            deadline_phrasing and _deadline_spans.
+        tuple[str, tuple[str, ...]]: (verdict, deadline spans of the deciding
+            field). The spans are () when the verdict is unknown, and also when
+            the deciding field established the KIND of question without naming
+            a comparable date ("within 30 days", "at any time"), even if a less
+            specific field names one — see deadline_phrasing, _deciding_field
+            and _deadline_spans.
     """
-    return (
-        deadline_phrasing(event_title, title, subtitle),
-        _deadline_spans(event_title, title, subtitle),
-    )
+    verdict, text = _deciding_field(event_title, title, subtitle)
+    return verdict, _deadline_spans(text)
 
 
 def _market_deadline_profile(market: Any) -> tuple:
@@ -1194,19 +1221,22 @@ def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
          pricing on a premise requires proving it, not merely failing to
          disprove it.
       2. Both legs name at least one comparable deadline span, and the two sets
-         DIFFER. Identical spans mean one deadline stated twice — two listings
-         of the same question, which is a same-title shape, not a two-deadline
-         family. Empty spans mean the wording established the KIND of question
-         ("within 30 days", "at any time") without naming a date, so the two deadlines
-         cannot be shown to differ and the pair is refused.
+         DIFFER. The spans are those of each leg's DECIDING field only — the
+         field that produced its verdict (DR-69). Identical spans mean one
+         deadline stated twice — two listings of the same question, which is a
+         same-title shape, not a two-deadline family. Empty spans mean the
+         deciding field established the KIND of question ("within 30 days",
+         "at any time") without naming a date, even if a less specific field
+         names one (DR-69), so the two deadlines cannot be shown to differ and
+         the pair is refused.
 
     Args:
         profile_a (tuple): First leg's (verdict, spans) from deadline_profile().
         profile_b (tuple): Second leg's, same shape.
 
     Returns:
-        bool: True only when both legs are cumulative and their stated
-            deadlines differ. Order-independent.
+        bool: True only when both legs are cumulative and the deadlines their
+            deciding fields state differ. Order-independent.
     """
     verdict_a, spans_a = profile_a
     verdict_b, spans_b = profile_b
@@ -2345,7 +2375,8 @@ def find_time_series_pairs(
          it strips a dated deadline one, so such a family lands in ONE group
          here and used to be sized and traded. Fails CLOSED: wording that names
          no deadline at all is refused, because nothing the finder reads can
-         prove the premise.
+         prove the premise. Each leg's deadlines are read from the one field
+         that decided its verdict, never from the other two (DR-69).
       5. pA + nB < 1 — the structural invariant of a cumulative-deadline pair:
          the two legs must cost less than the $1 a win pays. Implied by
          tradeable below, but enforced here as a rule so a violating pair

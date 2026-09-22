@@ -1795,6 +1795,171 @@ class TestDeadlineGuardFinders:
         )) == 1
 
 
+class TestSpansFromDecidingField:
+    """DR-69: a leg's deadline spans come from the field that DECIDED its
+    verdict, and from no other field.
+
+    Before DR-69 the verdict came from ONE field (subtitle, then title, then
+    event title — the first carrying a marker) while the spans were gathered
+    from ALL THREE. So a spanless deciding field ("at any time") could borrow a
+    date from a field that decided nothing, and two legs whose deciding fields
+    stated different deadlines could be refused because another field restated
+    both. The change is not a pure tightening, so both directions are pinned
+    here. Mirror: test_backtester.py::TestSpansFromDecidingField.
+    """
+
+    @staticmethod
+    def _keys(*markets):
+        return {time_series_group_key(pair_key(m), m.subtitle) for m in markets}
+
+    def test_spanless_subtitle_cannot_borrow_event_title_spans(self):
+        # regression — before DR-69 this pair FORMED. The subtitle "At any
+        # time" decides "cumulative" but names no date; the event titles'
+        # distinct "by <date>" phrases used to be lent to it, so the two legs
+        # read as two different deadlines. The titles are snapshots ("on
+        # <date>") and never get a say: the subtitle outranks them.
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1",
+            title="Will SOL be above $180 on Sep 14, 2026?", subtitle="At any time",
+            event_title="SOL above $180 by Sep 14, 2026?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 9, 14, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1",
+            title="Will SOL be above $180 on Sep 18, 2026?", subtitle="At any time",
+            event_title="SOL above $180 by Sep 18, 2026?",
+            yes_ask=0.60, no_ask=0.38, close_time=datetime(2026, 9, 18, tzinfo=UTC),
+        )
+        assert len(self._keys(mA, mB)) == 1
+        # The event titles really do carry two distinct dates — the fixture
+        # exercises borrowing, not a pair with no date anywhere.
+        assert scanner.deadline_profile(mA._event_title, "", "") == (
+            scanner.DEADLINE_CUMULATIVE, ("by sep 14, 2026",),
+        )
+        assert scanner.deadline_profile(mB._event_title, "", "") == (
+            scanner.DEADLINE_CUMULATIVE, ("by sep 18, 2026",),
+        )
+        assert scanner._market_deadline_profile(mA) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert scanner._market_deadline_profile(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        ) == []
+
+        # Control: the deciding field itself names the two deadlines — same
+        # prices, gap and series — and the pair forms.
+        cA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1",
+            title="Will SOL be above $180 on Sep 14, 2026?", subtitle="By Sep 14, 2026",
+            event_title="SOL above $180 by Sep 14, 2026?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 9, 14, tzinfo=UTC),
+        )
+        cB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1",
+            title="Will SOL be above $180 on Sep 18, 2026?", subtitle="By Sep 18, 2026",
+            event_title="SOL above $180 by Sep 18, 2026?",
+            yes_ask=0.60, no_ask=0.38, close_time=datetime(2026, 9, 18, tzinfo=UTC),
+        )
+        assert len(self._keys(cA, cB)) == 1
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[cA, cB],
+        )) == 1
+
+    def test_deciding_field_spans_can_admit_a_pair(self):
+        # regression — the OTHER direction: before DR-69 this pair was
+        # REFUSED. Each title decides and states its own deadline, but each
+        # event title names the OTHER leg's date, so the all-field span unions
+        # were equal and the pair read as one deadline stated twice.
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1", title="Will X cut by June 1, 2026?",
+            event_title="Will X cut by June 20, 2026?",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="Will X cut by June 20, 2026?",
+            event_title="Will X cut by June 1, 2026?",
+            yes_ask=0.60, no_ask=0.38, close_time=datetime(2026, 6, 20, tzinfo=UTC),
+        )
+        assert len(self._keys(mA, mB)) == 1
+        # The union over all fields is identical on both legs — the old rule's
+        # reason for refusing.
+        def union(m):
+            return set(scanner.deadline_profile("", m.title, "")[1]) | set(
+                scanner.deadline_profile(m._event_title, "", "")[1]
+            )
+
+        assert union(mA) == union(mB) == {"by june 1, 2026", "by june 20, 2026"}
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",),
+        )
+        assert scanner._market_deadline_profile(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 20, 2026",),
+        )
+        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("PA-1", "PB-1")
+
+    def test_mve_event_title_route_still_pairs(self):
+        # control — kills a mutant that stops _deciding_field falling through
+        # to the event title (`for text in (subtitle, title):`). The MVE
+        # shape: an option label with no date and no title; the deadline lives
+        # in the parent EVENT title, which is then the deciding field and
+        # supplies the spans itself, so DR-69 keeps this route open.
+        mA = _mock_market(
+            ticker="PA-1", event_ticker="EVA-1", title="", subtitle="Trump",
+            event_title="Presidential Election Winner by March 1, 2026",
+            yes_ask=0.20, no_ask=0.80, close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="PB-1", event_ticker="EVB-1", title="", subtitle="Trump",
+            event_title="Presidential Election Winner by March 20, 2026",
+            yes_ask=0.60, no_ask=0.38, close_time=datetime(2026, 3, 20, tzinfo=UTC),
+        )
+        assert len(self._keys(mA, mB)) == 1
+        assert scanner._market_deadline_profile(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1, 2026",),
+        )
+        assert scanner._market_deadline_profile(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 20, 2026",),
+        )
+        assert len(find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        )) == 1
+
+    def test_span_normalization_folds_case_and_whitespace(self):
+        # control — kills M21 (the span's .lower() dropped) and M22 (its
+        # whitespace collapse dropped). One deadline spelled with a doubled
+        # space and one in capitals must still read as ONE deadline, or the
+        # pair would be taken as two deadlines when it is one stated twice.
+        spaced = scanner.deadline_profile("", "Will X happen by  June 30, 2026?", "")
+        shouted = scanner.deadline_profile("", "Will X happen BY JUNE 30, 2026?", "")
+        assert spaced == shouted == (scanner.DEADLINE_CUMULATIVE, ("by june 30, 2026",))
+        assert scanner.cumulative_deadline_pair(spaced, shouted) is False
+
+    def test_single_field_overlapping_spans_still_differ(self):
+        # control — kills a mutant that refuses any pair whose span sets
+        # share a phrase (`return set(spans_a).isdisjoint(spans_b)` in place
+        # of `spans_a != spans_b`). One field naming two deadlines, one of
+        # them shared with the other leg, still states a different SET.
+        a = scanner.deadline_profile("", "Will X happen by June 30 or by Dec 31, 2026?", "")
+        b = scanner.deadline_profile("", "Will X happen by June 30 or by Mar 31, 2027?", "")
+        assert a == (scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026", "by june 30"))
+        assert b == (scanner.DEADLINE_CUMULATIVE, ("by june 30", "by mar 31, 2027"))
+        assert scanner.cumulative_deadline_pair(a, b) is True
+
+    def test_cross_field_overlap_is_refused_by_design(self):
+        # regression — this pair outcome CHANGED with DR-69, deliberately
+        # (the phrasing verdict did not: both legs read cumulative before
+        # and after). Both
+        # legs' sub-contract reads "$1 by 2027": the subtitle decides, and it
+        # states ONE deadline, the same on both legs. The titles' differing
+        # "by June 30" / "by July 31" belong to a field that decided nothing,
+        # so they can no longer make the two legs look like two deadlines.
+        # Before DR-69 the all-field unions differed and this returned True.
+        a = scanner.deadline_profile("", "Y by June 30", "$1 by 2027")
+        b = scanner.deadline_profile("", "Y by July 31", "$1 by 2027")
+        assert a == b == (scanner.DEADLINE_CUMULATIVE, ("by 2027",))
+        assert scanner.cumulative_deadline_pair(a, b) is False
+
+
 class TestClassifyOncePerMarket:
     """The classifier must run exactly ONCE PER MARKET, never once per
     candidate PAIR — a group of N members produces O(N^2) candidate pairs, so
