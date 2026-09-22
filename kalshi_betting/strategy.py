@@ -184,7 +184,12 @@ def _kelly_p(pair: CandidatePair) -> float:
     (YES on the earlier contract, NO on the later) has three settlement cells:
     event by A's deadline (A=YES, hence B=YES; YES-on-A pays), never by B's
     (A=NO, B=NO; NO-on-B pays), and in between (A=NO, B=YES; total loss).
-    A=YES/B=NO is impossible for a cumulative-deadline pair. The YES-ask gap
+    A=YES/B=NO is impossible for a cumulative-deadline pair — a premise
+    scanner.find_time_series_pairs now screens both legs' WORDING for (a
+    heuristic, scanner.deadline_phrasing) rather than assuming, so a snapshot
+    family ("price ON <date>", whose probabilities do not nest) whose WORDING
+    says so never reaches this model; a level-at-one-instant family worded
+    "by <date>" still can (CLAUDE.md DR-67 Known residuals). The YES-ask gap
     pB - pA is the market-implied probability of the loss cell; the model
     believes only the fraction k of it. At k = 1 (take the market at face
     value) Kelly is <= 0 for every pair and nothing trades — the edge exists

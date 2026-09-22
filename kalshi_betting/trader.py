@@ -516,9 +516,10 @@ def _build_yes_order(leg: _Leg) -> CreateOrderRequest:
     the earlier deadline (both YES — this leg pays), it never happens by the
     later deadline (both NO — the NO leg pays), or it happens in between
     (earlier NO, later YES — both legs are worthless and the stake is lost);
-    earlier-YES with later-NO cannot occur for a cumulative-deadline pair.
-    buy_max_cost caps the total spend at the scanned price plus a small
-    slippage allowance.
+    earlier-YES with later-NO cannot occur for a cumulative-deadline pair,
+    which scanner.find_time_series_pairs screens both legs' wording for before
+    any such pair is sized. buy_max_cost caps the total spend at the scanned
+    price plus a small slippage allowance.
 
     Args:
         leg (_Leg): The YES leg from _ordered_legs. Uses leg.market for the

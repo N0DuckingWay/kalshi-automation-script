@@ -113,7 +113,10 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #
 # A time-series pair buys YES on the EARLIER-closing contract (market_a) and NO
 # on the LATER one (market_b) when the later contract's YES ask exceeds the
-# earlier's by at least the deadline-gap tier. The market-implied probability
+# earlier's by at least the deadline-gap tier, and when BOTH legs are worded as
+# cumulative "by <date>" deadlines (scanner.deadline_phrasing) — only then does
+# the earlier deadline's event nest inside the later one's, which is what makes
+# the model below meaningful at all. The market-implied probability
 # that the event first happens BETWEEN the two deadlines is (pB - pA); that is
 # the trade's single loss scenario (earlier NO, later YES). This constant is the
 # fraction of that market-implied in-between mass we believe — 0.75 means "the

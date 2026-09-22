@@ -11,7 +11,10 @@ Purpose:
     exact-matching the remainder together with the market's outcome label
     (time_series_group_key), traded as a directional bet (YES on the earlier
     contract, NO on the later) when the later contract is priced well above
-    the earlier; and (2)
+    the earlier AND both legs' wording states a CUMULATIVE deadline
+    ("by <date>") — deadline_phrasing refuses a snapshot family
+    ("price ON <date>"), whose probabilities do not nest and which the date
+    stripping would otherwise collapse into one group; and (2)
     same-title pairs — contracts with identical title and subtitle on
     different event tickers of DIFFERENT event series, traded as a
     near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
@@ -26,10 +29,15 @@ Dependencies:
     deadline_gap_days() (the only source of truth for which side each leg
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
     main.py and backtester.py), and the scanning functions consumed by
-    main.py and backtester.py (which also imports time_series_group_key and
-    leg_sides, so the live scanner and the backtester group time-series
-    candidates through one definition). Depends on the KalshiClient produced
-    by auth.py.
+    main.py and backtester.py (which also imports time_series_group_key,
+    event_series, leg_sides, deadline_profile/cumulative_deadline_pair, so
+    the live scanner and the backtester group time-series candidates AND
+    decide their eligibility through one definition each, and
+    deadline_pair_refusal with its REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/
+    REFUSED_SAME_DEADLINE constants and the DEADLINE_CUMULATIVE/
+    DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
+    on WHY a candidate was refused (DR-72)). Depends on the KalshiClient
+    produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -50,6 +58,20 @@ Notes:
     the 95% co-resolution prior nor the cumulative-deadline premise applies. Both
     finders carry the rule because the same two tickers qualify for both; see
     _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
+
+    The time-series finder additionally requires both legs to be CUMULATIVE-
+    deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
+    cumulative_deadline_pair) — compared as normalized strings, not parsed
+    calendar dates, so one deadline spelled two ways reads as two and a
+    truncated spelling can read two deadlines as one (see the DR-67 Known
+    residuals in CLAUDE.md). Kalshi lists SNAPSHOT markets too — "Bitcoin
+    price ON Sep 15, 2026?" — whose probabilities do not nest, so the trade has
+    no premise between two of them; and normalize_title erases a dated snapshot
+    title just as readily as a dated deadline one, which is what put such a
+    family in one group in the first place. The rule reads WORDING, not market
+    class: an MVE market whose sub-contract label is a "by <date>" phrase is
+    eligible like any other. It fails closed, and the backtester mirrors it —
+    see CLAUDE.md's cumulative-deadline gotcha.
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -132,7 +154,9 @@ _DATE_PATTERNS = [
     # Anchored to the preposition deliberately. A bare "<Month> <day>" would
     # also erase the date from SNAPSHOT titles ("... on June 30"), which would
     # put two snapshot markets of one family into a single time-series group —
-    # the premise violation the live scanner cannot detect from prices.
+    # the premise violation DR-67 now screens at pair formation on the legs'
+    # wording (this pattern only controls whether the two titles share a
+    # group; the backtester's counter is defence in depth behind it).
     # Anchored, this pattern fires only where the clause below already fired
     # and stranded a day, so no title that used to stay apart is merged.
     # The abbreviated spelling ("by Oct 1") is deliberately NOT covered: its
@@ -178,6 +202,210 @@ _EXPLICIT_DATE_PATTERNS = (
     _DATE_PATTERNS[12],
 )
 _COMPILED_EXPLICIT_DATES = [re.compile(p, re.IGNORECASE) for p in _EXPLICIT_DATE_PATTERNS]
+
+# ---------------------------------------------------------------------------
+# Cumulative-deadline vs. snapshot phrasing.
+#
+# A time-series pair buys YES on the earlier contract and NO on the later one.
+# That is only coherent when BOTH contracts are cumulative-deadline markets —
+# "will X happen BY <date>" — because only then is the event by the earlier
+# deadline nested inside the event by the later one. That nesting is what
+# rules out the A=YES/B=NO settlement cell entirely, and it is what makes the
+# FAIR VALUE of YES-A + NO-B at most $1 — not a guarantee that the quoted asks
+# do: a wide book can still quote pA + nB >= 1 on a genuine ladder, which is
+# why find_time_series_pairs skips that case explicitly rather than relying on
+# nesting to rule it out.
+#
+# Kalshi also lists SNAPSHOT markets — "what is X ON <date>", "X IN <Month>" —
+# which are NOT nested (SOL >= $180 on Sep 14 does not imply SOL >= $180 on
+# Sep 18). normalize_title strips a dated snapshot title just as readily as a
+# dated deadline one, so such a family lands in ONE time-series group and was
+# sized and traded on a premise it does not have. These tables are what
+# separates the two.
+#
+# DELIBERATELY SEPARATE FROM _DATE_PATTERNS, and must stay that way. That list
+# exists to ERASE dates so two deadlines of one question collapse onto one
+# grouping key; these exist to READ the surrounding preposition and decide what
+# KIND of question it is. Merging them would couple two different ordering
+# contracts — see CLAUDE.md's normalize_title pattern-order gotcha.
+# ---------------------------------------------------------------------------
+
+# Month and weekday spellings used only by the phrasing tables below.
+#
+# The month fragment takes an OPTIONAL day and an OPTIONAL year so a matched
+# span names the WHOLE deadline rather than just its month: _deadline_spans
+# compares those spans between two legs, and "by Dec 31" vs "by Dec 20" has to
+# read as two different deadlines. The `(?!\d)` on the day group stops it
+# eating the first two digits of a bare 4-digit year ("by March 2026" would
+# otherwise capture "by March 20"), which would make every deadline in a given
+# month look identical and silently refuse genuine pairs.
+_DEADLINE_MONTH = (
+    r"(?:January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)"
+)
+_DEADLINE_WEEKDAY = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+# The \b ends the month at a word boundary. Without it the abbreviations
+# matched the front of ordinary words: "by Dec(ision)", "produced by
+# Mar(vel) Studios" and "endorsed by Mar(co) Rubio" read as cumulative
+# deadlines (DR-68). The optional period still follows ("Sept."). \b also
+# rejects a digit or underscore directly after the month, so an unspaced
+# "by Sep30" reads unknown — the fail-closed direction on this CUMULATIVE
+# side (no market on the 2026-09-22 live snapshot is written that way). The
+# snapshot entries use _SNAPSHOT_MONTH below, which keeps that unspaced date.
+_DEADLINE_MONTH_FULL = rf"{_DEADLINE_MONTH}\b\.?(?:\s+\d{{1,2}}(?!\d))?(?:,?\s+\d{{4}})?"
+
+# The SNAPSHOT (reject) side ends a month at the next LETTER instead of at a
+# word boundary. "on Mars", "on declaring", "after Marvel" and "after Mayor"
+# are still not dates, but an unspaced "on Sep30" / "after Sep30" still is:
+# \b would reject that genuine date too, and narrowing a reject marker for a
+# genuine date fails OPEN (snapshot -> cumulative). The tables compile with
+# IGNORECASE, so [a-z] covers upper case as well (DR-68).
+_SNAPSHOT_MONTH = rf"{_DEADLINE_MONTH}(?![a-z])"
+
+# What may follow a deadline preposition for it to name a POINT IN TIME.
+# Requiring one of these is what stops "cut BY 50 bps", "win BY 10 points" and
+# "pass BY a 2/3 majority" from reading as deadlines. (That last one is stopped
+# by the article "a" alone; the m/d alternative's vote/majority/of lookahead is
+# what stops the article-less "pass by 2/3 majority" — DR-68.)
+#
+# The NOUN forms are not optional extras: _DATE_PATTERNS already strips
+# "by end of <Month>", "end of [the] year" and "Q1 2026", so a table that
+# accepted only "by <Month>" would refuse markets the grouping key already
+# treats as deadline-dated.
+#
+# A bare CLOCK TIME is deliberately ABSENT. "$82,750 or above by 5pm" must not
+# read as a cumulative deadline: the subtitle has top precedence in
+# deadline_phrasing, so an intraday snapshot family would otherwise fail OPEN
+# through its own sub-contract label instead of falling through to the
+# "price on <date>" title where its real shape is spelled.
+_DEADLINE_DATE_TOKEN = (
+    rf"(?:{_DEADLINE_MONTH_FULL}"
+    # A weekday keeps a MONTH-NAME date that follows it. Otherwise "by Friday,
+    # Sep 19, 2026" and "by Friday, Sep 26, 2026" both truncate to "by friday",
+    # read as one deadline stated twice, and a genuine pair 7 days apart is
+    # refused (DR-68). A numeric date after a weekday is still truncated.
+    # With no year or a 2-digit one the two titles do not share a group; with
+    # a 4-digit year ("by Friday, 9/19/2026") or an ISO date they do, both
+    # span "by friday", and the pair is refused as one deadline stated twice —
+    # a missed trade, never a false one (CLAUDE.md DR-67 Known residuals).
+    rf"|{_DEADLINE_WEEKDAY}\b(?:,?\s+{_DEADLINE_MONTH_FULL})?"
+    # A calendar m/d (month 1-12, day 1-31), not a fraction or vote share:
+    # "by 2/3 vote" and "ratified by 3/4 of states" are quantities, and
+    # "by 3/2027" is a month/year, not March 20 (DR-68).
+    r"|(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/(?:\d{4}|\d{2}))?\b"
+    r"(?!\s*(?:votes?|majority|supermajority|of)\b)"
+    r"|\d{4}-\d{2}-\d{2}"
+    # 2020-2099 only: "decrease by 2000" is an amount, not a year (DR-68).
+    # Season ranges ("before the 2027-28 season") deliberately stay a
+    # deadline: rejecting them refused 63 genuine markets (retirements,
+    # relocations, conference moves, a rule change) on the 2026-09-22 live
+    # snapshot, as on the 2026-09-21 one. The cost of keeping them is one
+    # recorded false positive ("2018-19 through 2025-26"; CLAUDE.md DR-67
+    # Known residuals).
+    r"|20[2-9]\d\b"
+    r"|Q[1-4](?:\s+20\d{2})?\b"
+    r"|(?:the\s+)?end\s+of\s+(?:the\s+)?(?:year|month|week|day)"
+    r"|year[-\s]?end"
+    r"|EOY\b)"
+)
+
+# CUMULATIVE: the event may happen at ANY time up to a deadline, so a later
+# deadline can only add probability.
+#
+# Index 0 is load-bearing beyond this table: it is the ONE pattern whose match
+# _deadline_spans reuses as a comparable deadline span, read from the field
+# that DECIDED the verdict and no other (DR-69). The others establish the kind
+# of question without naming a single comparable date, so a leg whose deciding
+# field carries only them has no span, and a pair resting on such a leg cannot
+# prove its two deadlines differ and is refused — even when a less specific
+# field of that leg does name a date.
+_CUMULATIVE_DEADLINE_PATTERNS = [
+    rf"\b(?:by|before|prior\s+to|no\s+later\s+than|on\s+or\s+before|up\s+to|through|until)"
+    rf"\s+(?:the\s+)?(?:end\s+of\s+(?:the\s+)?)?{_DEADLINE_DATE_TOKEN}",
+    r"\bwithin\s+\d+\s+(?:hour|day|week|month|year)s?\b",
+    r"\bat\s+any\s+(?:time|point)\b",
+    # "ever" is deliberately NOT a marker (DR-68): it fired on names ("Worst
+    # Neighbor Ever", "Chaco For Ever") and on superlatives ("the hottest year
+    # ever"), none of which state a deadline.
+]
+
+# SNAPSHOT: a state measured AT one instant, or over a WINDOW that does not
+# nest. Two entries deserve their reasoning spelled out:
+#   * "after <date>" INVERTS the monotonicity the trade rests on — a later
+#     "after" date carries LOWER probability, so the earlier/later leg
+#     assignment means the opposite of what it says.
+#   * "in <Month>" / "in <Year>" is a window, not a deadline: top-10 in October
+#     does not nest inside top-10 in November.
+# "after" requires a date token for the same reason "by" does — otherwise
+# "Will BTC top $100k by Dec 31, 2026, after the halving?" is wrongly refused.
+_SNAPSHOT_PATTERNS = [
+    # "on THE Dec 6 CFP rankings" is the same snapshot as "on Dec 6", but only
+    # with a day: "on the May ballot" names no instant, and (?!\d) stops the
+    # day eating a year ("on the November 2026 ballot"). The month ends at the
+    # next letter (_SNAPSHOT_MONTH), so "on Mars" and "on declaring" are not
+    # dates while an unspaced "on Sep30" still is (DR-68).
+    rf"\bon\s+(?:the\s+{_SNAPSHOT_MONTH}\.?\s*\d{{1,2}}(?!\d)"
+    rf"|{_SNAPSHOT_MONTH}\.?\s*\d{{0,2}}|{_DEADLINE_WEEKDAY}"
+    r"|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})",
+    rf"\b(?:in|during|for)\s+(?:{_DEADLINE_MONTH}\b|Q[1-4]\b|20\d{{2}}\b)",
+    r"\bat\s+(?:the\s+)?(?:close|open|end)\b",
+    # The dotted forms end in a period, so a trailing \b required a following
+    # WORD character ("at 5 p.m.ET" matched; "at 5 p.m. ET" did not). They now
+    # need no boundary; the undotted forms keep theirs (DR-68).
+    r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:(?:am|pm|ET|EDT|EST|CT|PT|UTC|GMT)\b|a\.m\.|p\.m\.)",
+    r"\bat\s+\d{1,2}:\d{2}\b",
+    r"\bas\s+of\b",
+    r"\bend\s+of\s+day\b",
+    # A REJECT marker, so its DATE alternatives stay as wide as they were
+    # before DR-68: narrowing a reject marker for a genuine date fails OPEN
+    # (snapshot -> cumulative), the direction this rule must never move for a
+    # genuine date. Hence the wide numeric alternatives (any m/d, any 20xx
+    # year) beside the tightened token, and _SNAPSHOT_MONTH beside the token's
+    # \b-bounded month so an unspaced "after Sep30" still matches. What DOES
+    # stop matching, deliberately, is a month-prefixed NON-date word — "after
+    # Mayor Adams resigns", "after Marvel's release", "after Decision Day" —
+    # which moves such a title snapshot -> cumulative, exactly as "on Mars"
+    # does in the "on" entry above (DR-68).
+    rf"\bafter\s+(?:the\s+)?(?:{_DEADLINE_DATE_TOKEN}"
+    rf"|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|20\d{{2}}\b|{_SNAPSHOT_MONTH})",
+    r"\bbetween\s+\d",
+]
+
+_COMPILED_CUMULATIVE = [re.compile(p, re.IGNORECASE) for p in _CUMULATIVE_DEADLINE_PATTERNS]
+_COMPILED_SNAPSHOT = [re.compile(p, re.IGNORECASE) for p in _SNAPSHOT_PATTERNS]
+# One alternation per table for _field_phrasing's existence tests (DR-70).
+# "Some pattern matches somewhere" equals "the alternation matches somewhere"
+# as long as every entry compiles with zero capturing groups and no inline
+# flag, which tests/test_scanner.py::TestPhrasingTableInvariants pins. A group
+# would renumber any backreference after it; a global inline flag is legal
+# only at position 0 of a pattern and every entry is wrapped in (?:...), so
+# inside the alternation it fails to compile (Python 3.11+, the project
+# floor) and this module would not import. The test forbids scoped inline
+# flags too, positive or negative, to keep the rule one line. The two
+# searches per field that replace up to twelve (nine snapshot entries, three
+# cumulative) measured about 2x on their own: 45.7 -> 23.0 us/record through
+# deadline_profile on 200,000 records of the 2026-09-08 day slice
+# (2026-09-22); with _deciding_field's duplicate-field skip, 12.3. The
+# per-pattern lists stay: _deadline_spans needs index 0 alone, and the tests
+# use them as the equivalence reference.
+_ANY_CUMULATIVE = re.compile(
+    "|".join(f"(?:{p})" for p in _CUMULATIVE_DEADLINE_PATTERNS), re.IGNORECASE,
+)
+_ANY_SNAPSHOT = re.compile(
+    "|".join(f"(?:{p})" for p in _SNAPSHOT_PATTERNS), re.IGNORECASE,
+)
+
+# deadline_phrasing()'s three verdicts. Bare module-level strings, like the
+# pair_type and TradeResult.status vocabularies — config.py owns the tunable
+# constants, not the internal enumerations.
+#
+# NOTE ON THE NAME: "snapshot" here means a MARKET SHAPE ("what is X on <date>"),
+# which is the sense CLAUDE.md, README.md and backtester.py's premise-violation
+# WARNING all use. It is unrelated to enrich_with_orderbook_prices' "mixed
+# snapshot" comment, which is about a stale vs. fresh PRICE quote.
+DEADLINE_CUMULATIVE = "cumulative"
+DEADLINE_SNAPSHOT = "snapshot"
+DEADLINE_UNKNOWN = "unknown"
 
 # Minimum ask price to consider a MARKET actively priced (not settled/illiquid).
 # Distinct from config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), which
@@ -507,9 +735,12 @@ class CandidatePair:
                    pays), never by B's (A=NO, B=NO; NO-on-B pays), or in
                    between (A=NO, B=YES; both legs worthless — the one loss
                    cell). A=YES with B=NO is impossible for a
-                   cumulative-deadline pair. This is a directional bet, not an
-                   arbitrage: it profits only if the market overstates the
-                   in-between probability (see config.time_series_profit_prob).
+                   cumulative-deadline pair, and find_time_series_pairs now
+                   screens both legs' WORDING for that premise (a heuristic,
+                   scanner.deadline_phrasing) instead of assuming it. This is
+                   a directional bet, not an arbitrage: it profits only if the
+                   market overstates the in-between probability (see
+                   config.time_series_profit_prob).
 
     Attributes:
         market_a (Any): same_title: the market with the higher YES ask (the
@@ -818,6 +1049,337 @@ def _same_series(mA: Any, mB: Any) -> bool:
     """
     sa, sb = event_series(mA.event_ticker), event_series(mB.event_ticker)
     return not sa or not sb or sa == sb
+
+
+def _field_phrasing(text: Any) -> str | None:
+    """
+    Classify ONE wording field, or None when it names no deadline shape at all.
+
+    Within a single field a SNAPSHOT marker beats a cumulative one, because the
+    snapshot markers name what the contract RESOLVES on while a stray "by" may
+    only be describing the route to it. Across fields the precedence is
+    different and deliberately so — see deadline_phrasing.
+
+    Args:
+        text (Any): One of a market's wording fields (event title, market
+            title, or outcome label). Anything that is not a non-empty str
+            reads as absent rather than raising — the same fail-safe-by-type
+            rule leg_sides and strategy._depth_levels follow, and the case is
+            real: historical._market_to_dict stores subtitle as
+            `m.get("subtitle") or m.get("yes_sub_title")`, which is None when
+            both are absent.
+
+    Returns:
+        str | None: DEADLINE_SNAPSHOT or DEADLINE_CUMULATIVE when the field
+            carries a marker; None when it carries none, so the caller can fall
+            through to a less specific field.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    # Snapshot first: a field naming a measurement instant is a snapshot
+    # question regardless of what else it says. Each table is tested with ONE
+    # search of its precompiled alternation, which matches exactly when some
+    # entry of that table does (DR-70; see _ANY_SNAPSHOT).
+    if _ANY_SNAPSHOT.search(text):
+        return DEADLINE_SNAPSHOT
+    if _ANY_CUMULATIVE.search(text):
+        return DEADLINE_CUMULATIVE
+    return None
+
+
+def deadline_phrasing(event_title: Any, title: Any, subtitle: Any) -> str:
+    """
+    Classify a market's wording as a cumulative deadline, a snapshot, or unknown.
+
+    The single definition of "is this a 'by <date>' market?", shared by the live
+    finder and the backtester's mirror (pinned by AST in tests/test_strategy.py)
+    so the two paths can never disagree about which pairs are eligible.
+
+    The three fields are scanned SEPARATELY and combined by MOST-SPECIFIC FIELD
+    WINS: subtitle, then title, then event title; the first field to yield a
+    verdict decides. They are never concatenated — joining them can manufacture
+    a match across a field boundary (a title ending "...on" beside a subtitle
+    beginning "June 30") and destroys the explanation of where a verdict came
+    from.
+
+    The subtitle leads because it is the SUB-CONTRACT — the thing that actually
+    resolves — so its own wording is the most authoritative statement of what
+    this contract settles on, and it must be able to override a parent event
+    title. That is what keeps an MVE market whose sub-contract is a
+    "by <date>" label eligible even when its parent event is titled in the
+    snapshot style. It does not weaken the snapshot refusals this exists for:
+    in the KXBTCD/KXSOLD daily families the subtitle is a bare strike
+    ("$82,750 or above") carrying no marker, so the verdict falls straight
+    through to the title, which is where "price ON Sep 15, 2026" lives.
+
+    Returns DEADLINE_UNKNOWN when no field names a deadline shape — the
+    deadline may still live in the event ticker or the close time, but nothing
+    the pair-finders read can prove it, and cumulative_deadline_pair fails
+    closed on that.
+
+    Args:
+        event_title (Any): The market's parent event title. Non-str reads as absent.
+        title (Any): The market's own question text. Non-str reads as absent.
+        subtitle (Any): The market's outcome label / sub-contract, ingested from
+            `subtitle` with a fallback to `yes_sub_title`. Non-str reads as absent.
+
+    Returns:
+        str: DEADLINE_CUMULATIVE, DEADLINE_SNAPSHOT, or DEADLINE_UNKNOWN.
+    """
+    # The field walk lives in _deciding_field, the one definition shared with
+    # deadline_profile, so the verdict and the spans can never be read off
+    # different fields (DR-69).
+    return _deciding_field(event_title, title, subtitle)[0]
+
+
+def _deciding_field(event_title: Any, title: Any, subtitle: Any) -> tuple:
+    """
+    The verdict and the one field that produced it: the classifier's single definition.
+
+    Most specific field first (subtitle, then title, then event title); the
+    first field carrying a marker decides. deadline_phrasing returns the
+    verdict. deadline_profile also takes the deadline spans from the SAME
+    field, so a field that did not decide the verdict cannot lend a leg a span
+    (DR-69). Before this change, a spanless subtitle marker could decide
+    "cumulative" while the event titles' different "by <date>" phrases made the
+    two legs look like two deadlines.
+
+    A field identical to the one scanned just before it is skipped (DR-70):
+    the walk only reaches a field when every earlier one carried no marker,
+    so re-scanning the same string could only return that same None. Combo
+    titles repeat their subtitle verbatim — every one of the 163,898 combo
+    records among the first 200,000 of the 2026-09-08 day slice — which is
+    why the skip alone measured 45.7 -> 23.9 us/record there (2026-09-22),
+    and 12.3 together with _ANY_SNAPSHOT's one-search table test.
+
+    Args:
+        event_title (Any): Parent event title; a non-str reads as absent.
+        title (Any): The market's question text; a non-str reads as absent.
+        subtitle (Any): The outcome label / sub-contract; a non-str reads as absent.
+
+    Returns:
+        tuple[str, str | None]: (verdict, deciding field text), or
+            (DEADLINE_UNKNOWN, None) when no field names a deadline shape.
+    """
+    # The duplicate-field skip compares only str against str, so a non-str
+    # field still reads as absent and never raises: its __eq__ is never
+    # called, neither directly nor reflected from a str comparison, because a
+    # non-str field is never kept as `previous` either.
+    previous = None
+    for text in (subtitle, title, event_title):
+        if isinstance(text, str) and text == previous:
+            continue
+        previous = text if isinstance(text, str) else None
+        verdict = _field_phrasing(text)
+        if verdict is not None:
+            return verdict, text
+    return DEADLINE_UNKNOWN, None
+
+
+def _deadline_spans(text: Any) -> tuple:
+    """
+    The distinct deadline phrases ONE wording field spells out, normalized.
+
+    Read from _COMPILED_CUMULATIVE[0], the only pattern whose match names a
+    comparable point in time. Called on the deciding field only (see
+    _deciding_field and DR-69). cumulative_deadline_pair compares these as
+    normalized STRINGS: one deadline spelled two ways reads as two deadlines,
+    and a truncated span can read two deadlines as one.
+
+    Args:
+        text (Any): The deciding field's text, or None. A non-str yields ().
+
+    Returns:
+        tuple[str, ...]: Sorted, de-duplicated, lower-cased,
+            whitespace-collapsed deadline phrases; () when there are none.
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    return tuple(sorted({
+        re.sub(r"\s+", " ", match.group(0)).strip().lower()
+        for match in _COMPILED_CUMULATIVE[0].finditer(text)
+    }))
+
+
+def deadline_profile(event_title: Any, title: Any, subtitle: Any) -> tuple:
+    """
+    A market's phrasing verdict and its deadline spans, computed in one call.
+
+    The memoizable unit: both finders classify each market ONCE into one of
+    these and then compare the cheap results pairwise. That is a hard
+    requirement rather than a tidy-up — the backtester's pair sweep runs on the
+    order of a million comparisons for a single large group, where re-running
+    the regex tables per pair makes about 60x more classifier calls than per
+    market (2 legs x ~31 in-window neighbours per member on
+    TestExtractPairsPerformanceSmoke's 50,000-member group).
+
+    Both paths call this with their own three strings (the live scanner off
+    ApiMarket attributes, the backtester off cached dict keys), so the FIELD
+    EXTRACTION differs between them but the classification does not.
+
+    The spans come from the SAME field that decided the verdict, never from
+    the other two (DR-69): a less specific field that restates, or
+    contradicts, the deadline can neither lend a spanless deciding field a
+    date nor make two differing deciding fields look alike.
+
+    Args:
+        event_title (Any): The market's parent event title.
+        title (Any): The market's own question text.
+        subtitle (Any): The market's outcome label / sub-contract.
+
+    Returns:
+        tuple[str, tuple[str, ...]]: (verdict, deadline spans of the deciding
+            field). The spans are () when the verdict is unknown, and also when
+            the deciding field established the KIND of question without naming
+            a comparable date ("within 30 days", "at any time"), even if a less
+            specific field names one — see deadline_phrasing, _deciding_field
+            and _deadline_spans.
+    """
+    verdict, text = _deciding_field(event_title, title, subtitle)
+    return verdict, _deadline_spans(text)
+
+
+def _market_deadline_profile(market: Any) -> tuple:
+    """
+    deadline_profile() for a live market object, read fail-soft by attribute.
+
+    Args:
+        market (Any): An ApiMarket (or any stand-in) exposing .title, .subtitle
+            and optionally ._event_title. Every attribute is read through
+            getattr with a "" default, the same partial-stub tolerance
+            _identical_wording applies.
+
+    Returns:
+        tuple[str, tuple[str, ...]]: The market's (verdict, deadline spans).
+    """
+    return deadline_profile(
+        getattr(market, "_event_title", "") or "",
+        getattr(market, "title", "") or "",
+        getattr(market, "subtitle", "") or "",
+    )
+
+
+# deadline_pair_refusal()'s three refusal reasons, named by the DECIDING
+# FIELD'S shape (DR-69) rather than by the pair's whole wording — each
+# constant's own docstring below says exactly what it means and, for
+# REFUSED_SAME_DEADLINE, the one caveat on reading it. Bare module-level
+# strings, the same internal-vocabulary idiom as DEADLINE_CUMULATIVE /
+# DEADLINE_SNAPSHOT / DEADLINE_UNKNOWN above — callers import the constants
+# and deadline_pair_refusal rather than compare against string literals
+# (DR-72).
+REFUSED_SNAPSHOT = "snapshot"
+"""Either leg's deciding field verdict is DEADLINE_SNAPSHOT: a snapshot
+wording ("price ON <date>", "top 10 in October", "after <date>") does not
+nest, so the pair has no cumulative-deadline premise regardless of what the
+other leg's field says."""
+
+REFUSED_NO_STATED_DEADLINE = "no_stated_deadline"
+"""Either leg is not DEADLINE_CUMULATIVE at all (DEADLINE_UNKNOWN — no field
+named a deadline shape), OR its deciding field named the KIND of question
+without a comparable date ("within 30 days", "at any time" — its
+deadline_profile() spans are then empty). Both read as "nothing here to
+compare a deadline against"."""
+
+REFUSED_SAME_DEADLINE = "same_deadline"
+"""Both legs are cumulative and both name a comparable deadline, but the two
+DECIDING fields' span sets are equal: one deadline stated twice, not two
+different ones — a same-title shape, not a two-deadline family. Caveat: the
+spans compared are normalized strings (_deadline_spans), so a deadline phrase
+that TRUNCATES the same way on both legs can read as equal even when the raw
+wording differs; this reason cannot distinguish "truly one deadline" from
+"two deadlines the parser happened to truncate alike"."""
+
+
+def deadline_pair_refusal(profile_a: tuple, profile_b: tuple) -> str | None:
+    """
+    Why a candidate is not a two-cumulative-deadline pair, or None when it is.
+
+    The single definition of time-series eligibility (DR-72): cumulative_
+    deadline_pair() is built on this function
+    (`deadline_pair_refusal(...) is None`), so the boolean verdict and the
+    refusal REASON can never disagree — there is exactly one place a future
+    change to the rule has to happen. Precedence is order-independent and
+    total, so exactly one of four outcomes always applies:
+
+      1. REFUSED_SNAPSHOT — either leg's DECIDING field verdict is
+         DEADLINE_SNAPSHOT. Checked first: a snapshot verdict disproves the
+         nesting premise outright regardless of the other leg's field or
+         whether either names a comparable date.
+      2. REFUSED_NO_STATED_DEADLINE — otherwise, either leg is not
+         DEADLINE_CUMULATIVE, or its deciding field's deadline spans are
+         empty (DR-69: the spans come from the deciding field alone, never a
+         less specific field that happens to name a date).
+      3. REFUSED_SAME_DEADLINE — otherwise, both legs are cumulative with
+         comparable spans, but the two span sets are equal.
+      4. None — both legs are cumulative, both name a comparable deadline,
+         and the two span sets differ: a genuine two-cumulative-deadline pair.
+
+    Args:
+        profile_a (tuple): First leg's (verdict, spans) from deadline_profile().
+        profile_b (tuple): Second leg's, same shape.
+
+    Returns:
+        str | None: One of REFUSED_SNAPSHOT, REFUSED_NO_STATED_DEADLINE,
+            REFUSED_SAME_DEADLINE, or None when the pair is eligible.
+    """
+    verdict_a, spans_a = profile_a
+    verdict_b, spans_b = profile_b
+    if verdict_a == DEADLINE_SNAPSHOT or verdict_b == DEADLINE_SNAPSHOT:
+        return REFUSED_SNAPSHOT
+    if (
+        verdict_a != DEADLINE_CUMULATIVE
+        or verdict_b != DEADLINE_CUMULATIVE
+        or not spans_a
+        or not spans_b
+    ):
+        return REFUSED_NO_STATED_DEADLINE
+    if spans_a == spans_b:
+        return REFUSED_SAME_DEADLINE
+    return None
+
+
+def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
+    """
+    True when two markets are one question asked at two different CUMULATIVE deadlines.
+
+    The eligibility rule for a time-series pair, applied by BOTH finders on
+    precomputed deadline_profile() results. Defined through
+    deadline_pair_refusal() (DR-72): True exactly when that function returns
+    None, so the two can never disagree about which pairs are eligible. In
+    plain terms this requires, in order:
+
+      1. Both legs classify DEADLINE_CUMULATIVE. Fails CLOSED — a leg whose
+         wording is a snapshot ("price on <date>", "top 10 in October",
+         "after <date>") or names no deadline at all is refused, because the
+         YES-on-earlier / NO-on-later trade has no premise without the nesting
+         that a cumulative deadline provides. Same direction as _same_series:
+         pricing on a premise requires proving it, not merely failing to
+         disprove it.
+      2. Both legs name at least one comparable deadline span, and the two sets
+         DIFFER. The spans are those of each leg's DECIDING field only — the
+         field that produced its verdict (DR-69). Identical spans mean one
+         deadline stated twice — two listings of the same question, which is a
+         same-title shape, not a two-deadline family. Empty spans mean the
+         deciding field established the KIND of question ("within 30 days",
+         "at any time") without naming a date, even if a less specific field
+         names one (DR-69), so the two deadlines cannot be shown to differ and
+         the pair is refused. Spans are compared as normalized STRINGS
+         (_deadline_spans), not as parsed calendar dates: one deadline spelled
+         two ways reads as two deadlines ("Oct 1, 2026" vs "October 1, 2026"),
+         and two deadlines truncated to one span read as one — fixed for a
+         weekday plus month-name date by DR-68 ("by Friday, Sep 19, 2026" no
+         longer truncates to "by friday"), other truncations remain (CLAUDE.md
+         DR-67 Known residuals).
+
+    Args:
+        profile_a (tuple): First leg's (verdict, spans) from deadline_profile().
+        profile_b (tuple): Second leg's, same shape.
+
+    Returns:
+        bool: True only when both legs are cumulative and the deadlines their
+            deciding fields state differ. Order-independent.
+    """
+    return deadline_pair_refusal(profile_a, profile_b) is None
 
 
 def _normalize_subtitle(subtitle: str) -> str:
@@ -1937,9 +2499,28 @@ def find_time_series_pairs(
          relabel the pair as a time-series bet and main._dedup_pairs — which
          drops the time-series copy only when a same-title copy exists — would
          have nothing to drop it against.
-      4. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
+      4. Both legs are CUMULATIVE-deadline markets ("will X happen BY
+         <date>") stating two DIFFERENT deadlines — cumulative_deadline_pair
+         over deadline_phrasing. Kalshi also lists SNAPSHOT markets ("Bitcoin
+         price ON Sep 15, 2026?"), whose probabilities do not nest: SOL >= $180
+         on Sep 14 does not imply SOL >= $180 on Sep 18, so there is no
+         in-between mass to dispute and nesting is what would make the fair
+         value of YES-A + NO-B at most $1 — on a snapshot pair it doesn't.
+         normalize_title strips a dated snapshot title exactly as it strips a
+         dated deadline one, so such a family lands in ONE group here and used
+         to be sized and traded. Fails CLOSED: wording that names no deadline
+         at all is refused, because nothing the finder reads can prove the
+         premise. Each leg's deadlines are read from the one field that
+         decided its verdict, never from the other two (DR-69).
+      5. Skips candidates whose leg ASK prices already sum to $1 or more. A
+         win pays only $1, so such a pair cannot profit in any cell. It is not
+         impossible: wide books quote it even on genuine ladders
+         (KXDEFAULT-28DEC31/-29DEC31 at 0.11 + 0.96 on 2026-09-21). It only
+         changes which NON-tradeable row represents a group, because tradeable
+         already requires 1 - pA - nB > fee.
+      6. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
          order-independently by deadline_gap_days()
-      5. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
+      7. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
          LATER-closing contract (B) must be priced higher than the earlier
          one (A) by at least the tier (15% when the deadlines are <= 15 days
          apart, 30% for 16-30 days). That gap is the market-implied
@@ -1962,9 +2543,12 @@ def find_time_series_pairs(
       - in between: A=NO, B=YES — both legs worthless, the full stake
         (pA + nB plus fees) is lost.
     A=YES with B=NO cannot occur for a cumulative-deadline pair (YES by the
-    earlier deadline implies YES by the later one); the backtester excludes
-    and counts a pair that settled that way as a premise violation. The flag
-    therefore says a win pays more than the pair costs, NOT that the pair
+    earlier deadline implies YES by the later one). That premise is now
+    screened on WORDING at pair formation by item 4 (a heuristic) rather than
+    merely assumed; the backtester's premise-violation counter remains as
+    defence in depth, since a text classifier over market wording is a
+    heuristic, not a proof. The flag therefore says a win pays more than the
+    pair costs, NOT that the pair
     cannot lose: this is a directional bet whose expected value is negative
     at market prices unless the market overstates the in-between probability
     (config.time_series_profit_prob). Same-title pairs (no deadline gap,
@@ -1988,7 +2572,10 @@ def find_time_series_pairs(
         list: CandidatePair objects, one per normalized title+outcome group
             that produced a pair, each carrying pair_type="time_series". Empty
             if no group has two markets on different event_tickers within the
-            deadline-gap cap whose wording is not identical across one series.
+            deadline-gap cap whose wording is not identical across one series
+            and states two different cumulative deadlines — the two deadlines
+            compared as normalized strings, not parsed calendar dates (see the
+            DR-67 Known residuals in CLAUDE.md).
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -2020,6 +2607,49 @@ def find_time_series_pairs(
 
     logging.info("Distinct normalized title+outcome keys with >= 1 market: %d", len(by_title))
 
+    # Classify each market's wording ONCE. Two reasons this is not done inside
+    # the candidate loop below: a group of N markets produces O(N^2) candidate
+    # pairs, so per-pair classification re-runs the regex tables an order of
+    # magnitude more often than needed; and the verdict is a property of the
+    # market, not of the pair.
+    profiles: dict = {m.ticker: _market_deadline_profile(m) for m in active}
+
+    # ALWAYS logged, not only when something is skipped. A rule that can empty
+    # the strategy must not be detectable solely by the absence of a warning —
+    # "cumulative: 0" is what separates "the exchange lists no cumulative
+    # families right now" from "the phrasing tables are broken" (the DR-66
+    # lesson applied to this rule).
+    phrasing_census: dict = defaultdict(int)
+    for verdict, _spans in profiles.values():
+        phrasing_census[verdict] += 1
+    logging.info(
+        "Deadline phrasing of actively priced markets: %d cumulative, %d snapshot, %d unknown",
+        phrasing_census[DEADLINE_CUMULATIVE],
+        phrasing_census[DEADLINE_SNAPSHOT],
+        phrasing_census[DEADLINE_UNKNOWN],
+    )
+
+    # Candidates refused because the two legs are not one question at two
+    # cumulative deadlines, split by REASON (DR-72) rather than folded into
+    # one counter: a snapshot leg, a leg naming no comparable deadline, and
+    # two legs naming the SAME deadline are three different findings with
+    # three different remedies, and collapsing them hid which one applied.
+    # Plus the price-sum skip below. All reported once after the loop
+    # (silent at zero) — the same summary idiom find_same_title_pairs uses
+    # for its series skips. The checks themselves are NOT reordered: the
+    # wording check still runs strictly before the price-sum check, so this
+    # split cannot shift any candidate's count into price_sum_skips.
+    snapshot_skips = 0
+    no_deadline_skips = 0
+    same_deadline_skips = 0
+    # Candidates that named two DIFFERENT cumulative deadlines but were
+    # refused for being more than MAX_DEADLINE_GAP_DAYS apart — the wording
+    # was fine, only the gap wasn't. Reported separately below, since "worded
+    # right but too far apart" is a different signal than "not worded as two
+    # deadlines at all".
+    gap_cap_skips = 0
+    price_sum_skips = 0
+
     candidate_pairs: list = []
     for norm_title, members in by_title.items():
         # Need at least two markets in a group to form any pair
@@ -2048,11 +2678,46 @@ def find_time_series_pairs(
                 if _identical_wording(mA, mB) and _same_series(mA, mB):
                     continue
 
+                # The pair must be one question asked at two different
+                # CUMULATIVE deadlines. Kalshi also lists SNAPSHOT markets
+                # ("Bitcoin price ON Sep 15, 2026?"), whose probabilities do
+                # not nest — SOL >= $180 on Sep 14 does not imply SOL >= $180
+                # on Sep 18 — so the YES-on-earlier / NO-on-later trade has no
+                # premise there at all, and nesting — which is what would make
+                # the fair value of YES-A + NO-B at most $1 — does not hold on
+                # a snapshot pair. normalize_title strips a dated snapshot
+                # title just as readily as a dated deadline one, so such a
+                # family lands in ONE group here and was previously sized and
+                # traded. Fails CLOSED on wording that names no deadline.
+                if not cumulative_deadline_pair(
+                    profiles[mA.ticker], profiles[mB.ticker]
+                ):
+                    # Same decision as cumulative_deadline_pair, re-asked for
+                    # its REASON (DR-72) — deadline_pair_refusal is the one
+                    # definition both calls share, so the verdict here and the
+                    # boolean just tested can never disagree.
+                    reason = deadline_pair_refusal(
+                        profiles[mA.ticker], profiles[mB.ticker]
+                    )
+                    if reason == REFUSED_SNAPSHOT:
+                        snapshot_skips += 1
+                    elif reason == REFUSED_NO_STATED_DEADLINE:
+                        no_deadline_skips += 1
+                    elif reason == REFUSED_SAME_DEADLINE:
+                        same_deadline_skips += 1
+                    continue
+
                 # Deadline gap check: past 30 days too much of the market-implied
                 # in-between probability is genuine for the trade to dispute it.
                 # Order-independent (same helper _pair_max_sum and the backtester use)
                 gap_days = deadline_gap_days(mA, mB)
                 if gap_days > MAX_DEADLINE_GAP_DAYS:
+                    # Wording was fine — the pair passed cumulative_deadline_pair
+                    # just above — only the gap wasn't. Counted separately from
+                    # the wording refusals above (DR-72): this is the live signal
+                    # that cumulative families exist but sit too far apart to
+                    # trade, not that the wording screen is failing.
+                    gap_cap_skips += 1
                     continue
 
                 try:
@@ -2088,6 +2753,34 @@ def find_time_series_pairs(
                 if pB - pA < min_price_diff_for_gap(gap_days) - PRICE_EPSILON:
                     continue
 
+                # Skips candidates whose leg ASK prices already sum to $1 or
+                # more. A win pays only $1, so such a pair cannot profit in
+                # any cell. It is not impossible: wide books quote it even on
+                # genuine ladders (KXDEFAULT-28DEC31/-29DEC31 at 0.11 + 0.96
+                # on 2026-09-21) — nesting makes the fair value of YES-A +
+                # NO-B at most $1, not the quoted asks. It is already IMPLIED
+                # by tradeable below (which requires 1 - pA - nB > fee), but
+                # only as a flag — a violating pair was still constructed and
+                # could win this group's one-pair slot at the sort below,
+                # blocking a sound runner-up. Skipping it outright only
+                # changes which NON-tradeable row represents such a group.
+                #
+                # The epsilon runs the OPPOSITE way from the qualifying-level
+                # filters in enrich_with_orderbook_prices/validate_pair_price,
+                # which ADD it to a keep bound so a level exactly on the bound
+                # is not dropped for float noise. This is the REJECT side: the
+                # skip condition is strictly pA + nB < 1, so a sum that is
+                # really 1.0 but evaluates to 0.9999999 must still be refused.
+                # Subtracting tightens by at most PRICE_EPSILON (1e-6), two
+                # orders of magnitude below the finest tick, so it can never
+                # reject a genuinely sub-$1 pair (TS-09's rule is "never
+                # reject for representation noise", and this honours it) — in
+                # practice it is defensive and inert on every Kalshi grid
+                # (4-dp prices; complementary pairs sum to exactly 1.0).
+                if pA + nB >= 1.0 - PRICE_EPSILON:
+                    price_sum_skips += 1
+                    continue
+
                 # tradeable=True when a win scenario (YES-on-A or NO-on-B paying $1)
                 # covers both leg prices plus the approximate fees — the leg prices
                 # are pA and nB, not nA/pB. This is not a guarantee against the
@@ -2119,6 +2812,52 @@ def find_time_series_pairs(
         # (see the directional filter above), so no abs() is needed.
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
+
+    # Three separate INFO lines, each silent at zero (DR-72) — the same
+    # summary idiom find_same_title_pairs uses for its series skips, split by
+    # REASON instead of folded into one "not a cumulative-deadline pair"
+    # count so a reader can tell a wording problem (snapshot families, no
+    # recognised deadline, one deadline said twice) from a distance problem
+    # (the gap-cap line below). All three count candidate pairs within a
+    # group, before the gap and price filters run.
+    if snapshot_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "is snapshot wording (counted before the gap and price filters): %d",
+            snapshot_skips,
+        )
+    if no_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "carries no recognised deadline wording or no comparable date "
+            "(counted before the gap and price filters): %d",
+            no_deadline_skips,
+        )
+    if same_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because the two deciding fields "
+            "state the same deadline, or truncate to one (counted before the "
+            "gap and price filters): %d",
+            same_deadline_skips,
+        )
+    if gap_cap_skips:
+        # The live signal that cumulative families exist but sit too far
+        # apart to trade — distinct from the wording refusals above, which
+        # mean the families themselves were never found to be cumulative at
+        # all. Can include wording false positives (a heuristic misread as
+        # cumulative that happens to also miss the gap cap).
+        logging.info(
+            "Time-series candidates worded as two different cumulative "
+            "deadlines, refused at the %d-day gap cap (tier and price not "
+            "evaluated): %d",
+            MAX_DEADLINE_GAP_DAYS,
+            gap_cap_skips,
+        )
+    if price_sum_skips:
+        logging.info(
+            "Time-series candidates skipped for a leg price sum at or above $1: %d",
+            price_sum_skips,
+        )
 
     logging.info(
         "Time-series pairs: %d total, %d tradeable",

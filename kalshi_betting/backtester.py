@@ -18,7 +18,15 @@ Dependencies:
     grouping key, shared with the live scanner), event_series (the single
     definition of an event's series IDENTITY — the literal prefix, with every
     combo (KXMVE*) prefix collapsed onto one family — so the live and backtest
-    one-series rules can never disagree) and leg_sides from
+    one-series rules can never disagree), leg_sides, deadline_profile and
+    cumulative_deadline_pair (the single definition of whether two legs are a
+    two-cumulative-deadline pair, over the DEADLINE_CUMULATIVE/
+    DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants), deadline_pair_refusal
+    (the single definition of WHY a candidate is not one — DR-72; built on the
+    same three verdicts cumulative_deadline_pair reads, so the boolean and the
+    reason can never disagree) and its
+    REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/REFUSED_SAME_DEADLINE
+    constants from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
@@ -104,15 +112,25 @@ Notes:
     Time-series pairs buy YES on the earlier-closing contract (market A) and
     NO on the later one (market B) — scanner.leg_sides is the only source of
     truth for the sides, and _settlement_receipt pays by side. Their
-    settlement table therefore has exactly three cells: event by A (A=YES,
+    settlement table therefore has exactly three cells (the premise behind
+    that table — both legs being cumulative "by <date>" markets — is screened
+    in _extract_pairs through scanner.cumulative_deadline_pair, the same helper
+    the live finder uses): event by A (A=YES,
     B=YES — YES-on-A pays n), never by B (A=NO, B=NO — NO-on-B pays n), and in
     between (A=NO, B=YES — both legs worthless, the full stake is lost). A=YES
     with B=NO is impossible for a cumulative-deadline pair: a candidate that
     settled that way is excluded from Pass 1 (never traded, never paid) and
     counted, and one summary WARNING reports the count. Kalshi does list
-    snapshot-style markets ("on <date>"), so that counter is the only signal
-    that the normalized-title grouping admitted a non-cumulative pair — the
-    live scanner cannot detect it from prices.
+    snapshot-style markets ("on <date>"), which the normalized-title grouping
+    puts in one group with cumulative ones; _extract_pairs now refuses such a
+    pair up front on its WORDING (scanner.cumulative_deadline_pair, shared with
+    the live finder), so this counter is no longer the only signal that one was
+    admitted — it is DEFENCE IN DEPTH behind a text heuristic, and a non-zero
+    count now means one of the WARNING's named causes fired, most likely a
+    wording false negative — though legs genuinely nested but ordered on an
+    early REALIZED close, or strike-blind grouping on a cache without
+    subtitles, can also produce it (DR-72) — rather than that nothing was
+    watching.
 """
 import logging
 import resource
@@ -150,7 +168,20 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
 )
-from .scanner import event_series, leg_sides, time_series_group_key
+from .scanner import (
+    DEADLINE_CUMULATIVE,
+    DEADLINE_SNAPSHOT,
+    DEADLINE_UNKNOWN,
+    REFUSED_NO_STATED_DEADLINE,
+    REFUSED_SAME_DEADLINE,
+    REFUSED_SNAPSHOT,
+    cumulative_deadline_pair,
+    deadline_pair_refusal,
+    deadline_profile,
+    event_series,
+    leg_sides,
+    time_series_group_key,
+)
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -409,11 +440,12 @@ class OutcomeLabelCoverage:
     where the warning floor sits — there is exactly ONE measurement, one pass
     and one threshold comparison per run.
 
-    Holds five scalars and no reference to any market record: _prepare_entries
-    del's the eligible-market list immediately after pair extraction to lower
-    residency across the candlestick fetch (TS-07), and a carrier that kept
-    examples (sample tickers, a per-category breakdown) would pin every one of
-    those dicts alive past that statement.
+    Holds scalars only (counts, fractions and one verdict) and no reference to
+    any market record: _prepare_entries del's the eligible-market list
+    immediately after pair extraction to lower residency across the
+    candlestick fetch (TS-07), and a carrier that kept examples (sample
+    tickers, a per-category breakdown) would pin every one of those dicts
+    alive past that statement.
 
     The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
     list after the _can_ever_enter prefilter, i.e. every record handed to the
@@ -437,6 +469,26 @@ class OutcomeLabelCoverage:
             which reports no coverage rather than 0%.
         event_title_fraction (float | None): with_event_title / total, or None
             when total is 0, for the same reason.
+        cumulative_markets (int): Records worded as a cumulative "by <date>"
+            deadline (scanner.deadline_phrasing). Only a pair of these can be a
+            time-series candidate, so a ZERO here on a non-empty corpus means
+            this run can produce no time-series trade at all — the one reading
+            of this census that is actionable on its own.
+        snapshot_markets (int): Records worded as a snapshot ("price ON
+            <date>", "in <Month>", "after <date>"). Refused as a time-series
+            leg because a snapshot probability need not nest inside another's:
+            "after <date>" nests the wrong way, and a shared-start "after X and
+            before Y" window CAN nest — a known, accepted over-refusal.
+        unknown_deadline_markets (int): Records that carry no deadline wording
+            the classifier recognises — the deadline may live in the event
+            ticker, but nothing the pair-finders read can prove it, so nesting
+            cannot be shown and they are refused too. Expected to dominate a
+            combo-heavy corpus.
+
+            These three are DESCRIPTIVE and carry no warning floor, unlike
+            subtitle coverage: the cumulative FRACTION has no healthy baseline
+            (most Kalshi markets are not deadline markets at all), so any
+            threshold would be arbitrary and would fire on every run.
         below_floor (bool): Whether subtitle_fraction fell below
             config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION — the SAME comparison
             the WARNING branches on, evaluated once and carried, so a reader of
@@ -451,6 +503,19 @@ class OutcomeLabelCoverage:
     subtitle_fraction: float | None
     event_title_fraction: float | None
     below_floor: bool
+    # Declared AFTER below_floor: this dataclass is frozen but not kw_only, so
+    # appending is the only way to add a field without reordering every
+    # positional construction.
+    #
+    # REQUIRED, with no default (DR-71). A default of 0 let a construction
+    # that forgot them render the dashboard's strongest sentence ("could not
+    # have produced a time-series trade at all") as if it had been measured. A
+    # forgotten keyword is now a TypeError at construction — the same "cannot
+    # be forgotten" reasoning DR-66b used for returning the carrier in the
+    # first place.
+    cumulative_markets: int
+    snapshot_markets: int
+    unknown_deadline_markets: int
 
 
 @dataclass
@@ -789,6 +854,46 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
     return not sa or not sb or sa == sb
 
 
+def _deadline_profile_dict(m: dict) -> tuple:
+    """
+    Dict-world mirror of scanner._market_deadline_profile over cached records.
+
+    Only the FIELD EXTRACTION is mirrored — the classification itself is
+    scanner.deadline_profile, called here, so the live finder and this one can
+    never disagree about what counts as a cumulative-deadline market (pinned by
+    AST in tests/test_strategy.py).
+
+    Every key is read with `.get(...) or ""`, matching _identical_wording_dicts:
+    a cached record legitimately carries subtitle=None (historical
+    ._market_to_dict stores `subtitle or yes_sub_title`, which is None when the
+    payload had neither), and old records predate `event_title` entirely.
+
+    One divergence to know, which no AST pin can catch: `event_title` reaches
+    essentially every LIVE market but only a small fraction of cached ones (see
+    config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION for the measured coverage), so
+    a market whose DECIDING field is its event title (no marker in its subtitle
+    or title) reads as its event title's verdict live (cumulative for a
+    "by <date>" event title, snapshot for an "on <date>" one) and as unknown
+    here. At the
+    phrasing-rule level, where the cache carries subtitles, the backtest's
+    profile equals the live one or is unknown: the spans come only from the
+    field that decided the verdict (DR-69), so a blank event title cannot
+    change a profile the subtitle or title decided. (Before DR-69 the live
+    spans also folded in the event title's dates, so the two paths could
+    differ in either direction.) That is not a pipeline guarantee: a blank
+    cached event_title changes the time-series group key itself.
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+
+    Returns:
+        tuple[str, tuple[str, ...]]: The record's (verdict, deadline spans).
+    """
+    return deadline_profile(
+        m.get("event_title") or "", m.get("title") or "", m.get("subtitle") or "",
+    )
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
@@ -923,6 +1028,16 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     the conjunct, because there the wording is only date-stripped-equal and a
     genuine cumulative pair (deadline IN the wording) must survive.
 
+    For string-keyed (time-series) groups only, both legs must also be
+    CUMULATIVE-deadline markets ("will X happen BY <date>") stating two
+    DIFFERENT deadlines — scanner.cumulative_deadline_pair over
+    scanner.deadline_phrasing, the same helper find_time_series_pairs' item 4
+    calls, applied here through _deadline_profile_dict (DR-67). A snapshot
+    family ("price ON <date>") groups here exactly as it does live — the
+    grouping key is untouched — and is refused here exactly as it is live,
+    a heuristic over wording rather than a proof. 3-tuple-keyed (same-title)
+    groups have no deadline concept and are untouched by this rule.
+
     The pair type is NOT a parameter: the shape of each group key (see below)
     decides which sweep applies, and run_backtest() attaches the pair_type
     label to each returned tuple itself.
@@ -966,9 +1081,19 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
             iteration order. Empty if no group has two members on different
-            event_tickers of different event series.
+            event_tickers of different event series whose wording, for a
+            string-keyed group, states two different cumulative deadlines.
     """
     pairs = []
+    # Time-series candidates refused as not one question at two cumulative
+    # deadlines, split by REASON (DR-72) — the mirror of the live scanner's
+    # split, over deadline_pair_refusal, the one shared definition. Reported
+    # once at the end of the call (silent at zero) — this function previously
+    # reported nothing at all about refused pairs, so a rule that can empty
+    # the strategy had no signal on this path.
+    snapshot_skips = 0
+    no_deadline_skips = 0
+    same_deadline_skips = 0
     for key, members in groups.items():
         if isinstance(key, str):
             canon = key
@@ -996,6 +1121,15 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             dated.sort(key=lambda pair: pair[0])
             margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
             n = len(dated)
+            # Classify each member's wording ONCE, positionally, then compare
+            # the cheap results pairwise below. The sweep is O(n * window), so
+            # classifying per CANDIDATE would re-run the regex tables about 60x
+            # more often than per member (2 legs x ~31 in-window neighbours on
+            # TestExtractPairsPerformanceSmoke's 50,000-member group). Scoped to
+            # this group and dropped with it: a corpus-wide ticker->verdict map
+            # would add residency in exactly the place TS-07 did work to
+            # reduce it.
+            group_profiles = [_deadline_profile_dict(m) for _d, m in dated]
             for i in range(n):
                 close_a, mA = dated[i]
                 for j in range(i + 1, n):
@@ -1011,6 +1145,32 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                     # of one recurring fixture, not one question at two
                     # deadlines (DR-02, DR-54).
                     if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                        continue
+                    # Mirror of the scanner's cumulative-deadline rule, through
+                    # the SAME scanner.cumulative_deadline_pair: the two legs
+                    # must be one question at two different "by <date>"
+                    # deadlines. A snapshot family ("price ON <date>") groups
+                    # here exactly as it does live — the grouping key is
+                    # untouched — and is refused here exactly as it is live.
+                    # Deliberately a separate check from the one-series
+                    # conjunct above, not fused into it: they refuse different
+                    # shapes for different reasons.
+                    if not cumulative_deadline_pair(
+                        group_profiles[i], group_profiles[j]
+                    ):
+                        # Same decision as cumulative_deadline_pair, re-asked
+                        # for its REASON (DR-72) through the one shared
+                        # deadline_pair_refusal, so the verdict here and the
+                        # boolean just tested can never disagree.
+                        reason = deadline_pair_refusal(
+                            group_profiles[i], group_profiles[j]
+                        )
+                        if reason == REFUSED_SNAPSHOT:
+                            snapshot_skips += 1
+                        elif reason == REFUSED_NO_STATED_DEADLINE:
+                            no_deadline_skips += 1
+                        elif reason == REFUSED_SAME_DEADLINE:
+                            same_deadline_skips += 1
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
@@ -1033,6 +1193,31 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
+    # Mirror of the live scanner's three-way split (DR-72), each silent at
+    # zero: within the deadline-gap window this sweep already restricted
+    # itself to, before any price filter runs (this function does no price
+    # filtering at all — see the docstring).
+    if snapshot_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "is snapshot wording (within the deadline-gap window, before "
+            "price filters): %d",
+            snapshot_skips,
+        )
+    if no_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because a leg's deciding field "
+            "carries no recognised deadline wording or no comparable date "
+            "(within the deadline-gap window, before price filters): %d",
+            no_deadline_skips,
+        )
+    if same_deadline_skips:
+        logging.info(
+            "Time-series candidates refused because the two deciding fields "
+            "state the same deadline, or truncate to one (within the "
+            "deadline-gap window, before price filters): %d",
+            same_deadline_skips,
+        )
     return pairs
 
 
@@ -1118,10 +1303,17 @@ def _find_entry(
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract —
-        decided on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        decided on the close DATETIMES, like scanner.find_time_series_pairs
         sorts its group members, so two contracts closing on the same UTC date
-        at different times of day are ordered rather than tied — and an
-        entry requires pB − pA >= the deadline-gap-tiered threshold from
+        at different times of day are ordered rather than tied. That parity is
+        on the datetime-vs-date fix only, not on what close_time MEANS: live
+        reads the SCHEDULED close of a still-open market, this function reads
+        the REALIZED close Kalshi recorded for a settled one, which for an
+        event that resolved early can sit before the original schedule — a
+        later-deadline leg that resolved early is ordered first on the
+        realized gap, a recorded pre-existing residual, not something this
+        function's datetime ordering fixes (CLAUDE.md TS-06). An entry
+        additionally requires pB − pA >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the LATER contract priced higher by at least the tier is the anomaly
         the strategy disputes (the market implies an outsized probability that
@@ -1198,7 +1390,7 @@ def _find_entry(
         # Never swap by price — the trade only exists when the LATER contract
         # is priced higher (checked per Monday below).
         #
-        # Decide on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        # Decide on the close DATETIMES, like scanner.find_time_series_pairs
         # sorts on m.close_time. Two contracts closing on the same UTC date at
         # different times are a valid zero-day-gap pair (live data shows 9
         # distinct close dates across 43 distinct times of day), and deciding on
@@ -1213,6 +1405,14 @@ def _find_entry(
         # mix (reachable from a hand-edited cache, since every live timestamp is
         # tz-aware), per this file's "can't parse it = unknown, not an error"
         # convention.
+        #
+        # That parity is on the datetime-vs-date fix only, not on what
+        # close_time MEANS: live reads the SCHEDULED close of a still-open
+        # market, this reads the REALIZED close Kalshi recorded for a settled
+        # one, which for an event that resolved early can sit before the
+        # original schedule — a later-deadline leg that resolved early is
+        # ordered first on the realized gap. Recorded, pre-existing residual
+        # (CLAUDE.md TS-06); not fixed by this datetime ordering.
         dt_a = _parse_iso_datetime(mA.get("close_time"))
         dt_b = _parse_iso_datetime(mB.get("close_time"))
         try:
@@ -1526,7 +1726,8 @@ def _log_rss(label: str) -> None:
 
 def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     """
-    Census how many eligible markets carry an outcome label, and warn when few do.
+    Census how many eligible markets carry an outcome label and how their
+    deadline wording classifies, and warn when few carry a label.
 
     Both backtest grouping keys are built from fields a stale cache may simply
     not have. `subtitle` is the outcome discriminator in the time-series key
@@ -1578,11 +1779,13 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             materialized, since this can be millions of records.
 
     Returns:
-        OutcomeLabelCoverage: The five scalars this census just logged, with
-            below_floor carrying the very comparison the WARNING branches on.
-            On an empty corpus, total 0 with both fractions None (undefined,
-            not zero) and below_floor False. Holds no reference to any record,
-            so it is safe to keep past _prepare_entries' `del markets`.
+        OutcomeLabelCoverage: Scalars only (counts, fractions and one
+            verdict) — the numbers this census just logged, with below_floor
+            carrying the very comparison the WARNING branches on. On an empty
+            corpus, total 0 with both fractions None (undefined, not zero),
+            below_floor False and all three phrasing counts 0. Holds no
+            reference to any record, so it is safe to keep past
+            _prepare_entries' `del markets`.
     """
     total = len(markets)
 
@@ -1594,22 +1797,33 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     if not total:
         logging.info("Outcome-label coverage: no eligible markets to census")
         # Fractions are None, not 0.0: undefined rather than zero, so a
-        # renderer can say "nothing to census" instead of "0% coverage".
+        # renderer can say "nothing to census" instead of "0% coverage". The
+        # three phrasing counts are passed explicitly (DR-71: they carry no
+        # default) because an empty corpus is itself a measurement — zero
+        # markets of every kind — not an omission.
         return OutcomeLabelCoverage(
             total=0, with_subtitle=0, with_event_title=0,
             subtitle_fraction=None, event_title_fraction=None,
             below_floor=False,
+            cumulative_markets=0, snapshot_markets=0, unknown_deadline_markets=0,
         )
 
-    # One pass, two counters. Blank/None/absent all read as "no label", the
+    # One pass, five counters. Blank/None/absent all read as "no label", the
     # same falsiness the two grouping helpers apply with `or ""`.
     with_subtitle = 0
     with_event_title = 0
+    phrasing: dict = defaultdict(int)
     for m in markets:
         if m.get("subtitle"):
             with_subtitle += 1
         if m.get("event_title"):
             with_event_title += 1
+        # Folded into this pass rather than given its own. The classifier, not
+        # the walk, dominates this pass (about 12 us vs 0.3 us per record after
+        # DR-70, measured on 200,000 records of the 2026-09-08 day slice,
+        # 2026-09-22), so a second walk would add little; what bounds the
+        # census on a multi-million-record corpus is the classifier's own cost.
+        phrasing[_deadline_profile_dict(m)[0]] += 1
 
     subtitle_fraction = with_subtitle / total
     logging.info(
@@ -1617,6 +1831,21 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
         "(%.2f%%), event_title on %d (%.2f%%)",
         total, with_subtitle, subtitle_fraction * 100.0,
         with_event_title, with_event_title / total * 100.0,
+    )
+    # ALWAYS logged, never only on a shortfall: a rule that can empty the
+    # time-series strategy must not be detectable solely by the absence of a
+    # warning (DR-66's lesson). "cumulative 0" on a non-empty corpus is the
+    # actionable reading — it says this run can produce no time-series trade,
+    # whether because the corpus genuinely holds no deadline families or
+    # because the phrasing tables stopped matching.
+    logging.info(
+        "Deadline phrasing over %d eligible markets: %d worded as a cumulative "
+        "deadline, %d snapshot, %d with no deadline wording the classifier "
+        "recognises",
+        total,
+        phrasing[DEADLINE_CUMULATIVE],
+        phrasing[DEADLINE_SNAPSHOT],
+        phrasing[DEADLINE_UNKNOWN],
     )
 
     # Evaluated ONCE and carried out on the dataclass. The dashboard branches
@@ -1649,6 +1878,9 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
         subtitle_fraction=subtitle_fraction,
         event_title_fraction=with_event_title / total,
         below_floor=below_floor,
+        cumulative_markets=phrasing[DEADLINE_CUMULATIVE],
+        snapshot_markets=phrasing[DEADLINE_SNAPSHOT],
+        unknown_deadline_markets=phrasing[DEADLINE_UNKNOWN],
     )
 
 
@@ -1827,9 +2059,9 @@ def _prepare_entries(
     #
     # The measurement is carried out of this function (DR-66b) so the dashboard
     # can render the same caveat beside the k-hat card it recommends a
-    # real-money constant from. It is five scalars with no reference to any
-    # record here, so holding it costs nothing and the `del markets` below is
-    # unaffected.
+    # real-money constant from. It is scalars only (counts, fractions and one
+    # verdict) with no reference to any record here, so holding it costs
+    # nothing and the `del markets` below is unaffected.
     label_coverage = _log_outcome_label_coverage(markets)
 
     # Group settled markets into potential pairs using the same logic as the live scanner
@@ -2110,14 +2342,29 @@ def _simulate_at_discount(
         })
 
     if premise_violations:
-        # Summary-warning idiom (silent at zero): the only signal that the
-        # normalized-title grouping admitted non-cumulative pairs — the live
-        # scanner cannot detect this from prices.
+        # Summary-warning idiom (silent at zero). This used to be the ONLY
+        # signal that the grouping had admitted a non-cumulative pair; since
+        # _extract_pairs screens both legs' wording, it is defence in depth
+        # behind that heuristic, and a non-zero count is now itself a finding
+        # — it means a pair whose wording read as two cumulative deadlines
+        # settled as an apparently non-nesting pair. That is most likely a
+        # wording false negative, but it is not the only mechanism: it can
+        # also be a genuinely nested pair whose legs were ordered on an early
+        # REALIZED close (ranking them by scheduled close would have kept the
+        # nesting), or strike-blind grouping on a cache without subtitles.
+        # DR-72 widens the named CAUSES beyond the single "mixed snapshot
+        # family" guess this line used to make — see the cause list below,
+        # and CLAUDE.md's strategy-change gotcha for what each one means.
         logging.warning(
             "Excluded %d time-series candidate(s) whose settlement violated the "
             "cumulative-deadline premise (earlier YES, later NO) — the "
-            "normalized-title group likely mixes snapshot markets ('on <date>') "
-            "with cumulative ones ('by <date>')",
+            "pair passed the wording screen in _extract_pairs but still settled "
+            "as a non-nesting pair. Most likely a wording false negative (e.g. "
+            "snapshot markets, or recurring windows worded 'before <date>', "
+            "read as cumulative); legs ordered on an early REALIZED close (a "
+            "later-deadline leg that resolved YES before the earlier leg's "
+            "deadline); or strike-blind grouping on a cache without subtitles "
+            "(see the outcome-label coverage line)",
             premise_violations,
         )
 
@@ -2404,10 +2651,15 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
     Two properties of the population to keep in mind when reading the number:
 
       - Premise violations (earlier YES, later NO) are excluded from the
-        denominator entirely. Such a pair is not a cumulative-deadline pair at
-        all, so it is neither an in-between event nor a valid non-event, and
-        leaving it in would bias the rate in an arbitrary direction. They are
-        counted separately on the result. That count is NOT the same quantity
+        denominator entirely. Such a pair is most likely not a cumulative-
+        deadline pair at all (a wording false negative), though a genuinely
+        nested pair ordered on an early REALIZED close, or strike-blind
+        grouping on a cache without subtitles, can also land here (DR-72).
+        Either way it is neither a clean in-between event nor a valid
+        non-event, and leaving it in would bias the rate in an arbitrary
+        direction, so it is excluded regardless of which cause produced it.
+        They are counted separately on the result. That count is NOT the
+        same quantity
         as _simulate_at_discount()'s `premise_violations`, whose WARNING is
         emitted per simulated discount: that counter sits AFTER the Kelly
         gate, so it sees only Kelly-passing candidates and is generally
@@ -2429,8 +2681,10 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
         IntervalCalibration | None: The report, or None when there is nothing
             to report — no time-series candidate produced a usable
             observation AND none was excluded as a premise violation (the
-            codebase's return-None-on-nothing-to-say convention, which lets
-            the caller stay silent rather than logging an empty table).
+            codebase's return-None-on-nothing-to-say convention). Unlike most
+            such conventions here, this None is NOT silent at the caller
+            (DR-72): _log_interval_calibration logs one explanatory line for
+            it rather than nothing at all.
     """
     observations: list[_TimeSeriesOutcome] = []
     excluded = 0
@@ -2452,8 +2706,10 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
             continue
 
         # Earlier YES with later NO is impossible for a cumulative-deadline
-        # pair: the grouping admitted a non-cumulative one. Excluded from the
-        # denominator and counted for the report.
+        # pair: most likely the grouping admitted a non-cumulative one (a
+        # wording false negative), though a genuinely nested pair inverted by
+        # early-REALIZED-close leg ordering can land here too (DR-72).
+        # Excluded from the denominator and counted for the report either way.
         if outcome_a == "yes" and outcome_b == "no":
             excluded += 1
             continue
@@ -2469,8 +2725,9 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
 
     if not observations and not excluded:
         # Nothing measurable and nothing excluded — a same-title-only (or
-        # empty) run. None keeps the caller silent instead of printing an
-        # all-zero table.
+        # empty) run. None keeps the caller from printing an all-zero table
+        # (the caller itself is no longer silent on None — DR-72 — it logs
+        # one explanatory line instead).
         return None
 
     buckets: list[IntervalCalibrationBucket] = []
@@ -2507,9 +2764,15 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
     (pure comparison) is split from main._log_shard_coverage (decides how
     loudly to report): the measurement stays testable and reusable without log
     noise, and this decides the presentation. Follows the file's summary-line
-    idiom — silent when there is nothing to report (calibration is None, i.e.
-    no time-series candidate), and the premise-violation line is silent at
-    zero.
+    idiom for its SUB-counts — the premise-violation line is silent at zero —
+    but the top-level None case is no longer silent (DR-72): absence of a
+    warning must never be the only signal (the DR-66 lesson), and a truly
+    empty log line here read exactly like "nothing was logged because this
+    run has not gotten here yet", indistinguishable from a hang or a crash
+    upstream. calibration is None precisely when no time-series candidate
+    produced a usable observation and none was excluded as a premise
+    violation — see _interval_calibration's Returns — and that fact is now
+    stated explicitly rather than implied by silence.
 
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
     config.py, and the live sizer keeps reading
@@ -2518,12 +2781,17 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
-            result. None logs nothing at all.
+            result. None logs one explanatory line and returns.
 
     Returns:
         None
     """
     if calibration is None:
+        logging.info(
+            "Interval-discount calibration: no time-series candidate entry "
+            "with a readable settlement in this window — empirical k_hat is "
+            "not measurable"
+        )
         return
 
     logging.info(
@@ -2775,8 +3043,9 @@ def run_backtest_sweep(
     # below and is never filtered by any point's Kelly gate.
     calibration = _interval_calibration(raw_entries)
     # Reported here rather than inside the measurement, mirroring the
-    # check_shard_coverage / _log_shard_coverage split: silent when there was
-    # nothing to measure.
+    # check_shard_coverage / _log_shard_coverage split. Sub-counts inside the
+    # report stay silent at zero, but calibration is None is itself now
+    # reported with one explanatory line rather than nothing at all (DR-72).
     _log_interval_calibration(calibration)
 
     # The run's actual result. interval_discount is handed over verbatim —

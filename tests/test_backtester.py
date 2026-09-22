@@ -16,7 +16,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester
+from kalshi_betting import backtester, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -200,11 +200,21 @@ class TestTimeSeriesOutcomeDiscriminator:
     _STRIKES = ("$180 or above", "$190 or above", "$200 or above", "$210 or above")
     _EVENTS = (("KXSOLD-26SEP14", "14", "2026-09-14"), ("KXSOLD-26SEP18", "18", "2026-09-18"))
 
-    def _family(self, *, strike_in_subtitle: bool = True) -> list[dict]:
+    def _family(self, *, strike_in_subtitle: bool = True,
+                snapshot_wording: bool = False) -> list[dict]:
+        """Two deadline events of one daily family, four strikes each.
+
+        The titles are CUMULATIVE ("price by <date>"), mirroring the live
+        fixture: DR-01 is about the outcome label in the grouping key and must
+        keep being tested on a family the deadline rule admits.
+        `snapshot_wording=True` returns the original "price ON <date>" shape —
+        a real KXSOLD family — which that rule now refuses outright.
+        """
+        preposition = "on" if snapshot_wording else "by"
         markets = []
         for i, strike in enumerate(self._STRIKES):
             for event_ticker, day, close_day in self._EVENTS:
-                title = f"Solana price on Sep {day}, 2026?"
+                title = f"Solana price {preposition} Sep {day}, 2026?"
                 markets.append({
                     "ticker": f"{event_ticker}-T{i}",
                     "event_ticker": event_ticker,
@@ -214,6 +224,15 @@ class TestTimeSeriesOutcomeDiscriminator:
                     "close_time": f"{close_day}T21:00:00Z",
                 })
         return markets
+
+    def test_a_snapshot_family_yields_no_candidate(self):
+        # Mirror of the live TestOutcomeDiscriminator::
+        # test_a_snapshot_family_forms_no_pairs_at_all. The eight markets still
+        # GROUP — the key is untouched — but no candidate survives, because
+        # SOL >= $180 on Sep 14 does not imply SOL >= $180 on Sep 18.
+        groups = _group_by_normalized_title(self._family(snapshot_wording=True))
+        assert len(groups) == len(self._STRIKES)
+        assert _extract_pairs(groups) == []
 
     def test_each_strike_is_its_own_group(self):
         groups = _group_by_normalized_title(self._family())
@@ -410,18 +429,32 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         # one, and the premise-violation counter is what judges that (see the
         # live mirror, TestOneEventSeriesIsTwoFixtures::
         # test_a_dated_pair_of_one_series_is_untouched).
-        recs = [
-            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
-                      "Solana price on Sep 14, 2026?", "2026-09-14T21:00:00Z",
-                      subtitle="$180 or above",
-                      event_title="Solana price on Sep 14, 2026?"),
-            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
-                      "Solana price on Sep 18, 2026?", "2026-09-18T21:00:00Z",
-                      subtitle="$180 or above",
-                      event_title="Solana price on Sep 18, 2026?"),
-        ]
+        recs = self._sold_family("by")
         pairs = _extract_pairs(_group_by_normalized_title(recs))
         assert len(pairs) == 1
+
+    def _sold_family(self, preposition: str) -> list[dict]:
+        """One KXSOLD strike listed by two deadline events of ONE series."""
+        return [
+            self._rec("KXSOLD-26SEP14-T180", "KXSOLD-26SEP14",
+                      f"Solana price {preposition} Sep 14, 2026?", "2026-09-14T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title=f"Solana price {preposition} Sep 14, 2026?"),
+            self._rec("KXSOLD-26SEP18-T180", "KXSOLD-26SEP18",
+                      f"Solana price {preposition} Sep 18, 2026?", "2026-09-18T21:00:00Z",
+                      subtitle="$180 or above",
+                      event_title=f"Solana price {preposition} Sep 18, 2026?"),
+        ]
+
+    def test_the_snapshot_spelling_of_that_same_family_is_now_refused(self):
+        # Mirror of the live TestOneEventSeriesIsTwoFixtures::
+        # test_the_snapshot_spelling_of_that_same_family_is_now_refused. The
+        # one-series rule still does not fire (the legs are worded
+        # differently), so this is the cumulative-deadline rule's verdict
+        # alone, on the very fixture that used to document the gap.
+        recs = self._sold_family("on")
+        assert backtester._identical_wording_dicts(recs[0], recs[1]) is False
+        assert _extract_pairs(_group_by_normalized_title(recs)) == []
 
     def test_an_unreadable_event_ticker_fails_closed(self):
         # A record whose fixture identity cannot be read must NOT be replayed
@@ -450,6 +483,466 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         assert backtester._identical_wording_dicts(
             {"title": "Q by March"}, {"title": "Q by June"},
         ) is False
+
+
+class TestDeadlineGuardFinders:
+    """Backtester mirror of test_scanner.py::TestDeadlineGuardFinders — the
+    same fixtures, through the dict-based grouping/extraction path, so a
+    fail-open guard that is pinned live but unpinned in the backtester cannot
+    silently diverge: cumulative_deadline_pair is one shared helper, but each
+    path reaches it through its own field extraction.
+
+    Every test that asserts [] also asserts, inside the test, that its two
+    legs land in one _group_by_normalized_title group (so a normalize_title
+    drift cannot make the test pass vacuously by splitting the legs apart
+    before the guard under test is ever reached) and carries an in-test
+    positive control.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, event_title=""):
+        rec = _md(ticker, event_ticker, title=title, event_title=event_title)
+        rec["close_time"] = close_time
+        return rec
+
+    @staticmethod
+    def _one_group(markets):
+        groups = _group_by_normalized_title(markets)
+        assert len(groups) == 1
+        [members] = groups.values()
+        assert len(members) == len(markets)
+        return groups
+
+    def test_level_at_instant_legs_are_refused(self):
+        # control — kills M03full.
+        t1 = "Will BTC be above $100k at the close on Sep 30, 2026, before Oct 1, 2026?"
+        t2 = "Will BTC be above $100k at the close on Oct 9, 2026, before Oct 10, 2026?"
+        mA = self._rec("PA-1", "EVA-1", t1, "2026-09-30T00:00:00Z")
+        mB = self._rec("PB-1", "EVB-1", t2, "2026-10-09T00:00:00Z")
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 1, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_SNAPSHOT, ("before oct 10, 2026",),
+        )
+        assert _extract_pairs(groups) == []
+
+        # Control: same fixture with "at the close on <date>," removed.
+        cA = self._rec(
+            "PA-1", "EVA-1", "Will BTC be above $100k before Oct 1, 2026?",
+            "2026-09-30T00:00:00Z",
+        )
+        cB = self._rec(
+            "PB-1", "EVB-1", "Will BTC be above $100k before Oct 10, 2026?",
+            "2026-10-09T00:00:00Z",
+        )
+        assert len(_extract_pairs(_group_by_normalized_title([cA, cB]))) == 1
+
+    def test_dated_leg_never_pairs_with_spanless_cumulative_leg(self):
+        # control — kills M02 at the finder level.
+        evt = "Will X happen at any time?"
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will X happen by March 1?", "2026-03-01T00:00:00Z",
+            event_title=evt,
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will X happen Mar 9?", "2026-03-09T00:00:00Z",
+            event_title=evt,
+        )
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: B names its own deadline.
+        mB2 = self._rec(
+            "PB-1", "EVB-1", "Will X happen by March 9?", "2026-03-09T00:00:00Z",
+            event_title=evt,
+        )
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB2]))) == 1
+
+    def test_dated_leg_never_pairs_with_unknown_leg(self):
+        # control — kills M02+M03a together (see test_scanner.py's mirror for
+        # why M03a alone cannot be isolated by this fixture).
+        mA = self._rec("PA-1", "EVA-1", "Will X happen by March 1?", "2026-03-01T00:00:00Z")
+        mB = self._rec("PB-1", "EVB-1", "Will X happen Mar 9?", "2026-03-09T00:00:00Z")
+        groups = self._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_UNKNOWN, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: B named its own deadline instead.
+        mB2 = self._rec("PB-1", "EVB-1", "Will X happen by March 9?", "2026-03-09T00:00:00Z")
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB2]))) == 1
+
+
+class TestDateTokenBoundaries:
+    """Backtester mirror of test_scanner.py::TestDateTokenBoundaries'
+    finder-level row (DR-68). The token rows themselves are pinned once, on
+    the shared scanner.deadline_profile; this proves the dict-based path
+    reaches the tightened weekday token too.
+    """
+
+    def test_weekday_dated_legs_seven_days_apart_pair(self):
+        # regression — before DR-68 both legs' spans truncated to "by friday", so the
+        # pair read as one deadline stated twice and was refused.
+        mA = TestDeadlineGuardFinders._rec(
+            "PA-1", "EVA-1", "Will X happen by Friday, Sep 19, 2026?",
+            "2026-09-19T00:00:00Z",
+        )
+        mB = TestDeadlineGuardFinders._rec(
+            "PB-1", "EVB-1", "Will X happen by Friday, Sep 26, 2026?",
+            "2026-09-26T00:00:00Z",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 19, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by friday, sep 26, 2026",),
+        )
+        [(a, b, _canon, key)] = _extract_pairs(groups)
+        assert isinstance(key, str)  # a string key is the time-series branch
+        assert {a["ticker"], b["ticker"]} == {"PA-1", "PB-1"}
+
+
+class TestPhrasingSkipCounts:
+    """Backtester mirror of test_scanner.py::TestPhrasingSkipCounts (DR-72):
+    the single folded "not a cumulative-deadline pair" line is split into
+    three honest, separately-reported reasons here too, over
+    backtester._deadline_profile_dict rather than the live scanner's
+    attribute-based profile. Each reason gets its own two-member group on a
+    distinct series pair (EVA-x / EVB-x) so the DR-02 one-series conjunct —
+    which runs before the deadline check on this branch too — never fires
+    ahead of the check under test.
+    """
+
+    @staticmethod
+    def _stub_profiles(overrides: dict):
+        def fake(m):
+            return overrides[m["ticker"]]
+        return fake
+
+    @staticmethod
+    def _refusal_lines(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Time-series candidates refused because")
+        ]
+
+    def test_each_reason_is_reported_once(self, monkeypatch, caplog):
+        # regression — fails on revert to the single folded counter, which
+        # reported one line instead of three, so none of the three
+        # exact-prefix assertions below would ever have matched.
+        #
+        # Each reason gets a DIFFERENT candidate count (1, 2, 3) — not just a
+        # different fixture — so a mutant that swaps which counter a reason
+        # increments cannot pass by coincidence: with every reason at count
+        # 1, such a swap still emits three "...: 1" lines and this test could
+        # not tell (mirrors test_scanner.py's TestPhrasingSkipCounts fix).
+        rec = TestDeadlineGuardFinders._rec
+        snap_a = rec("SNAP-A", "EVA-1", "Will Group Snap happen?", "2026-06-01T00:00:00Z")
+        snap_b = rec("SNAP-B", "EVB-1", "Will Group Snap happen?", "2026-06-05T00:00:00Z")
+        nod_a = rec("NOD-A", "EVA-2", "Will Group Nodate happen?", "2026-06-01T00:00:00Z")
+        nod_b = rec("NOD-B", "EVB-2", "Will Group Nodate happen?", "2026-06-05T00:00:00Z")
+        nod2_a = rec("NOD2-A", "EVA-4", "Will Group Nodate2 happen?", "2026-06-01T00:00:00Z")
+        nod2_b = rec("NOD2-B", "EVB-4", "Will Group Nodate2 happen?", "2026-06-05T00:00:00Z")
+        same_a = rec("SAME-A", "EVA-3", "Will Group Same happen?", "2026-06-01T00:00:00Z")
+        same_b = rec("SAME-B", "EVB-3", "Will Group Same happen?", "2026-06-05T00:00:00Z")
+        same2_a = rec("SAME2-A", "EVA-5", "Will Group Same2 happen?", "2026-06-01T00:00:00Z")
+        same2_b = rec("SAME2-B", "EVB-5", "Will Group Same2 happen?", "2026-06-05T00:00:00Z")
+        same3_a = rec("SAME3-A", "EVA-6", "Will Group Same3 happen?", "2026-06-01T00:00:00Z")
+        same3_b = rec("SAME3-B", "EVB-6", "Will Group Same3 happen?", "2026-06-05T00:00:00Z")
+        members = [
+            snap_a, snap_b,
+            nod_a, nod_b, nod2_a, nod2_b,
+            same_a, same_b, same2_a, same2_b, same3_a, same3_b,
+        ]
+
+        overrides = {
+            "SNAP-A": (scanner.DEADLINE_SNAPSHOT, ("on june 1, 2026",)),
+            "SNAP-B": (scanner.DEADLINE_CUMULATIVE, ("by june 10, 2026",)),
+            "NOD-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "NOD2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "NOD2-B": (scanner.DEADLINE_UNKNOWN, ()),
+            "SAME-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME2-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-A": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+            "SAME3-B": (scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",)),
+        }
+        monkeypatch.setattr(
+            backtester, "_deadline_profile_dict", self._stub_profiles(overrides)
+        )
+
+        groups = _group_by_normalized_title(members)
+        assert len(groups) == 6  # six distinct titles -> six groups
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(groups)
+        assert pairs == []
+
+        lines = self._refusal_lines(caplog)
+        assert len(lines) == 3
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field is snapshot wording"
+            ) and line.endswith(": 1")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because a leg's deciding "
+                "field carries no recognised deadline wording or no "
+                "comparable date"
+            ) and line.endswith(": 2")
+            for line in lines
+        )
+        assert any(
+            line.startswith(
+                "Time-series candidates refused because the two deciding "
+                "fields state the same deadline, or truncate to one"
+            ) and line.endswith(": 3")
+            for line in lines
+        )
+        # This function does no gap-window logging of its own (the sweep
+        # window is a performance bound, not a reported filter) — mirrored
+        # here only to record that it stays absent.
+        assert not any("gap cap" in m for m in (r.getMessage() for r in caplog.records))
+
+    def test_silent_at_zero(self, caplog):
+        # control — kills a mutant that logs a refusal line unconditionally
+        # (dropping the `if snapshot_skips:` / etc. guards). A group whose
+        # one candidate pair is genuinely eligible must produce none of the
+        # three lines.
+        rec = TestDeadlineGuardFinders._rec
+        a = rec("OK-A", "EVA-1", "Will Group OK happen by June 1, 2026?", "2026-06-01T00:00:00Z")
+        b = rec("OK-B", "EVB-1", "Will Group OK happen by June 10, 2026?", "2026-06-10T00:00:00Z")
+        groups = TestDeadlineGuardFinders._one_group([a, b])
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(groups)
+        assert len(pairs) == 1
+        assert self._refusal_lines(caplog) == []
+
+
+class TestDeadlineProfileParity:
+    """The live scanner (attribute-based) and the backtester (dict-based)
+    field extraction must agree on every input, since only the field
+    EXTRACTION differs between the two paths — the classification itself is
+    one function, scanner.deadline_profile, called by both (pinned by AST in
+    test_strategy.py). An argument swap or a dropped subtitle in either
+    extraction helper would otherwise split the two paths silently, with
+    nothing to catch it: the AST pin only checks that deadline_profile is
+    called, never what it is called WITH.
+    """
+
+    # control — kills M23a/b/c/d/f/g (see test_missing_event_title_key_reads_
+    # as_absent below for the M23d case: a genuinely ABSENT "event_title" key,
+    # as distinct from a present-but-blank one).
+    @pytest.mark.parametrize("title, subtitle, event_title", [
+        # Conflicting markers across fields — subtitle decides.
+        ("Bitcoin price on Sep 15, 2026?", "$80,000 by June 30", ""),
+        # Conflicting markers — title decides over event_title, both
+        # directions.
+        ("Will X happen before Jan 1, 2027?", "", "Will X happen in 2026?"),
+        ("Top 10 in October?", "", "Will X happen by Dec 31, 2026?"),
+        # subtitle=None — a legitimate cached shape (historical._market_to_dict
+        # stores `subtitle or yes_sub_title`, which is None when both are
+        # absent) — must read as absent on both paths.
+        ("Will X happen?", None, ""),
+        # blank event_title.
+        ("Will X happen by March 1?", "", ""),
+    ])
+    def test_dict_and_live_extraction_agree(self, title, subtitle, event_title):
+        live_market = SimpleNamespace(
+            title=title, subtitle=subtitle or "", _event_title=event_title,
+        )
+        record = {"title": title, "subtitle": subtitle, "event_title": event_title}
+        assert (
+            backtester._deadline_profile_dict(record)
+            == scanner._market_deadline_profile(live_market)
+        )
+
+    def test_missing_event_title_key_reads_as_absent(self):
+        # control — old cache records predate "event_title" entirely (see
+        # _deadline_profile_dict's own docstring), which the parametrized
+        # cases above never exercise: every record there carries the key,
+        # with "" as its blank value, and `m.get("event_title") or ""` cannot
+        # tell a genuinely missing key from a present blank one. This case
+        # covers the record side; the live side's matching default is a
+        # market object with no _event_title attribute at all, exercising
+        # _market_deadline_profile's own getattr(..., "") default.
+        record = {"title": "Will X happen by March 1?", "subtitle": ""}
+        live_market = SimpleNamespace(title="Will X happen by March 1?", subtitle="")
+        assert "event_title" not in record
+        assert not hasattr(live_market, "_event_title")
+        assert (
+            backtester._deadline_profile_dict(record)
+            == scanner._market_deadline_profile(live_market)
+            == (scanner.DEADLINE_CUMULATIVE, ("by march 1",))
+        )
+
+    @pytest.mark.parametrize("title, live_event_title, spans", [
+        ("Will X cut by June 1, 2026?", "Will X cut by June 20, 2026?", ("by june 1, 2026",)),
+        ("Will X cut by June 20, 2026?", "Will X cut by June 1, 2026?", ("by june 20, 2026",)),
+    ])
+    def test_blank_cached_event_title_agrees_with_live(self, title, live_event_title, spans):
+        # regression — DR-69. Live ingest attaches an event title to nearly
+        # every market; most cached records carry "" there. When the TITLE
+        # decides, the event title must not change the profile, or the two
+        # paths judge the same market differently. Before DR-69 the live
+        # profile folded the event title's (different) date into the spans
+        # and the blank-event-title record did not, so these two disagreed.
+        live_market = SimpleNamespace(
+            title=title, subtitle="", _event_title=live_event_title,
+        )
+        record = {"title": title, "subtitle": "", "event_title": ""}
+        assert (
+            scanner._market_deadline_profile(live_market)
+            == backtester._deadline_profile_dict(record)
+            == (scanner.DEADLINE_CUMULATIVE, spans)
+        )
+
+
+class TestSpansFromDecidingField:
+    """Backtester mirror of test_scanner.py::TestSpansFromDecidingField (DR-69):
+    the same fixtures through the dict-based grouping and extraction path.
+    Spans come from the field that decided the verdict only, which can refuse
+    a pair the old all-field union admitted AND admit one it refused.
+
+    The fixtures carry their event title in the record, so this exercises the
+    rule on a cache that has event titles; the blank-event-title case is
+    TestDeadlineProfileParity::test_blank_cached_event_title_agrees_with_live.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, close_time, *, subtitle="", event_title=""):
+        rec = _md(ticker, event_ticker, title=title, subtitle=subtitle,
+                  event_title=event_title)
+        rec["close_time"] = close_time
+        return rec
+
+    def test_spanless_subtitle_cannot_borrow_event_title_spans(self):
+        # regression — before DR-69 _extract_pairs emitted this pair: the
+        # spanless "At any time" subtitle decided "cumulative" and borrowed
+        # the event titles' distinct dates.
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will SOL be above $180 on Sep 14, 2026?",
+            "2026-09-14T00:00:00Z", subtitle="At any time",
+            event_title="SOL above $180 by Sep 14, 2026?",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will SOL be above $180 on Sep 18, 2026?",
+            "2026-09-18T00:00:00Z", subtitle="At any time",
+            event_title="SOL above $180 by Sep 18, 2026?",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert backtester._deadline_profile_dict(mB) == (scanner.DEADLINE_CUMULATIVE, ())
+        assert _extract_pairs(groups) == []
+
+        # Control: the deciding subtitle names the two deadlines itself.
+        cA = self._rec(
+            "PA-1", "EVA-1", "Will SOL be above $180 on Sep 14, 2026?",
+            "2026-09-14T00:00:00Z", subtitle="By Sep 14, 2026",
+            event_title="SOL above $180 by Sep 14, 2026?",
+        )
+        cB = self._rec(
+            "PB-1", "EVB-1", "Will SOL be above $180 on Sep 18, 2026?",
+            "2026-09-18T00:00:00Z", subtitle="By Sep 18, 2026",
+            event_title="SOL above $180 by Sep 18, 2026?",
+        )
+        assert len(_extract_pairs(TestDeadlineGuardFinders._one_group([cA, cB]))) == 1
+
+    def test_deciding_field_spans_can_admit_a_pair(self):
+        # regression — before DR-69 this pair was refused: each event title
+        # names the OTHER leg's date, so the all-field span unions matched.
+        mA = self._rec(
+            "PA-1", "EVA-1", "Will X cut by June 1, 2026?", "2026-06-01T00:00:00Z",
+            event_title="Will X cut by June 20, 2026?",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "Will X cut by June 20, 2026?", "2026-06-20T00:00:00Z",
+            event_title="Will X cut by June 1, 2026?",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 1, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by june 20, 2026",),
+        )
+        [(a, b, _canon, key)] = _extract_pairs(groups)
+        assert isinstance(key, str)  # a string key is the time-series branch
+        assert {a["ticker"], b["ticker"]} == {"PA-1", "PB-1"}
+
+    def test_mve_event_title_route_still_pairs(self):
+        # control — kills a mutant that stops _deciding_field falling through
+        # to the event title. Dateless option label, empty title, deadline in
+        # the parent event title (the deciding field).
+        mA = self._rec(
+            "PA-1", "EVA-1", "", "2026-03-01T00:00:00Z", subtitle="Trump",
+            event_title="Presidential Election Winner by March 1, 2026",
+        )
+        mB = self._rec(
+            "PB-1", "EVB-1", "", "2026-03-20T00:00:00Z", subtitle="Trump",
+            event_title="Presidential Election Winner by March 20, 2026",
+        )
+        groups = TestDeadlineGuardFinders._one_group([mA, mB])
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by march 1, 2026",),
+        )
+        assert len(_extract_pairs(groups)) == 1
+
+
+class TestClassifyOncePerMarket:
+    """Backtester mirror of test_scanner.py::TestClassifyOncePerMarket.
+    Patches backtester.deadline_profile directly: deadline_profile is
+    imported BY NAME into backtester.py's module namespace, so patching
+    scanner.deadline_profile would never reach _deadline_profile_dict's call
+    at all.
+    """
+
+    def test_extract_pairs_classifies_each_member_once(self, monkeypatch):
+        # control — kills M11b (900 calls instead of 30 — one per candidate
+        # pair rather than one per group member).
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        members = []
+        for i in range(29):
+            d = base + timedelta(days=i)
+            rec = _md(f"T{i}", f"EVT{i}", title=f"Will X happen by {d:%B %d, %Y}?")
+            rec["close_time"] = d.isoformat()
+            members.append(rec)
+        # A duplicate deadline (same stated span as T5) forces a REAL
+        # phrasing refusal inside the group, exercising classify-once on the
+        # refusal path too.
+        d5 = base + timedelta(days=5)
+        dup = _md("T5DUP", "EVT5DUP", title=f"Will X happen by {d5:%B %d, %Y}?")
+        dup["close_time"] = (d5 + timedelta(hours=1)).isoformat()
+        members.append(dup)
+
+        groups = _group_by_normalized_title(members)
+        assert len(groups) == 1
+        [dated_members] = groups.values()
+
+        calls = {"n": 0}
+        original = backtester.deadline_profile
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(backtester, "deadline_profile", counting)
+        pairs = _extract_pairs(groups)
+        assert len(pairs) >= 1
+        assert calls["n"] == len(dated_members)
 
 
 class TestOldCacheToleranceMissingTickAndSubtitleFields:
@@ -1300,11 +1793,22 @@ class TestCanEverEnter:
 
 
 def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
-    """Minimal time-series group member for _extract_pairs windowing tests."""
+    """Minimal time-series group member for _extract_pairs windowing tests.
+
+    The title names this member's OWN close date as a cumulative deadline, the
+    shape a real two-deadline family has. That is load-bearing, not decoration:
+    _extract_pairs refuses any pair whose wording does not state two different
+    "by <date>" deadlines, so members with no wording would make every
+    windowing test below assert emptiness against emptiness — the performance
+    smoke test would fail loudly, but the oracle-equivalence tests would go
+    VACUOUS, which is worse. All titles still normalize to "q " so the members
+    stay in ONE group, which is what these tests are about.
+    """
     m = {"ticker": ticker, "event_ticker": event_ticker}
     if close_d is not None:
         m["close_time"] = datetime(close_d.year, close_d.month, close_d.day,
                                     tzinfo=UTC).isoformat()
+        m["title"] = f"Q by {close_d:%B %d, %Y}"
     return m
 
 
@@ -1328,14 +1832,34 @@ def _naive_series(event_ticker: object) -> str:
             else prefix)
 
 
+def _naive_cumulative_deadline(m: dict) -> str | None:
+    """Oracle-local restatement of the cumulative-deadline spans a member's
+    wording states, or None when it states none.
+
+    Deliberately NOT scanner.deadline_profile: an oracle that reuses the
+    implementation cannot falsify it. _ts_member builds exactly one shape —
+    "Q by <Month> <day>, <year>" — so the oracle only has to recognise that
+    shape, and any drift between it and the real tables shows up as a
+    disagreement rather than being silently inherited.
+    """
+    title = m.get("title") or ""
+    match = re.search(
+        r"\bby\s+(?:January|February|March|April|May|June|July|August|September"
+        r"|October|November|December)\s+\d{1,2},\s+\d{4}",
+        title, re.IGNORECASE,
+    )
+    return match.group(0).lower() if match else None
+
+
 def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
     filtering by the same margin-inclusive close-time gap, the same
-    event_ticker rule AND the same one-series rule (DR-02/DR-54/DR-55) that
-    _extract_pairs applies, but without any sorting/windowing. Written
-    standalone (no backtester internals besides plain dict/date arithmetic and
-    _naive_series' restatement of the series identity) so it can serve as
-    ground truth for the windowed implementation.
+    event_ticker rule, the same one-series rule (DR-02/DR-54/DR-55) AND the
+    same cumulative-deadline rule that _extract_pairs applies, but without any
+    sorting/windowing. Written standalone (no backtester internals besides
+    plain dict/date arithmetic, _naive_series' restatement of the series
+    identity and _naive_cumulative_deadline's of the deadline spans) so it can
+    serve as ground truth for the windowed implementation.
 
     The one-series conjunct is spelled out here rather than imported, for the
     same reason the rest is: an oracle that reuses the implementation cannot
@@ -1364,6 +1888,13 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
             if abs((db - da).days) > margin_days:
                 continue
             if a["event_ticker"] == b["event_ticker"]:
+                continue
+            # Both legs must state a cumulative deadline, and two DIFFERENT
+            # ones — the restatement of _extract_pairs' cumulative-deadline
+            # conjunct.
+            deadline_a = _naive_cumulative_deadline(a)
+            deadline_b = _naive_cumulative_deadline(b)
+            if deadline_a is None or deadline_b is None or deadline_a == deadline_b:
                 continue
             if ((a.get("title") or "", a.get("subtitle") or "",
                  a.get("event_title") or "")
@@ -2196,7 +2727,16 @@ class TestOutcomeLabelCoverageIsCarried:
     """
 
     def test_the_census_returns_what_it_logged(self, caplog):
-        markets = [{"subtitle": "Yes", "event_title": "E"}] * 3 + [{}] * 7
+        # A shared corpus with pairwise-distinct, non-zero phrasing counts
+        # (DR-71): the 3 subtitled/event-titled records also carry a
+        # cumulative deadline, 2 are snapshots, 5 state no deadline at all.
+        cumulative = [{"subtitle": "Yes", "event_title": "E",
+                       "title": "Will X happen by Dec 31, 2026?"}
+                      for _ in range(3)]
+        snapshot = [{"title": "Bitcoin price on Sep 15, 2026?"}
+                    for _ in range(2)]
+        unknown = [{"title": "Q"} for _ in range(5)]
+        markets = cumulative + snapshot + unknown
         with caplog.at_level("INFO"):
             coverage = backtester._log_outcome_label_coverage(markets)
 
@@ -2207,6 +2747,33 @@ class TestOutcomeLabelCoverageIsCarried:
         assert coverage.event_title_fraction == pytest.approx(0.30)
         # The same number reached the log, so page and log cannot disagree.
         assert any("30.00%" in r.getMessage() for r in caplog.records)
+
+        # DR-71: the three phrasing fields equal the per-record
+        # scanner.deadline_phrasing tally...
+        tally = {"cumulative": 0, "snapshot": 0, "unknown": 0}
+        for m in markets:
+            verdict = scanner.deadline_phrasing(
+                m.get("event_title", ""), m.get("title", ""),
+                m.get("subtitle", ""))
+            tally[verdict] += 1
+        assert coverage.cumulative_markets == tally["cumulative"] == 3
+        assert coverage.snapshot_markets == tally["snapshot"] == 2
+        assert coverage.unknown_deadline_markets == tally["unknown"] == 5
+        # ...sum to the corpus...
+        assert (coverage.cumulative_markets + coverage.snapshot_markets
+                + coverage.unknown_deadline_markets) == coverage.total
+        # ...and equal the numbers in the logged INFO line, so the page (which
+        # reads these same fields) and the log can never disagree.
+        phrasing_lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == "INFO"
+            and r.getMessage().startswith("Deadline phrasing over")
+        ]
+        assert phrasing_lines == [
+            "Deadline phrasing over 10 eligible markets: 3 worded as a "
+            "cumulative deadline, 2 snapshot, 5 with no deadline wording the "
+            "classifier recognises"
+        ]
 
     def test_the_below_floor_flag_is_the_warning_s_own_condition(self):
         floor = backtester.BACKTEST_OUTCOME_LABEL_WARN_FRACTION
@@ -2232,6 +2799,35 @@ class TestOutcomeLabelCoverageIsCarried:
         assert coverage.subtitle_fraction is None
         assert coverage.event_title_fraction is None
         assert coverage.below_floor is False
+        # DR-71: the phrasing fields are a genuine measurement (zero markets
+        # of every kind), not an omission that happened to default to 0.
+        assert coverage.cumulative_markets == 0
+        assert coverage.snapshot_markets == 0
+        assert coverage.unknown_deadline_markets == 0
+
+    @pytest.mark.parametrize("omit", [
+        "cumulative_markets", "snapshot_markets", "unknown_deadline_markets",
+    ])
+    def test_the_phrasing_fields_are_required(self, omit):
+        # DR-71: before this, a forgotten phrasing keyword silently defaulted
+        # to 0, which would render the dashboard's strongest sentence ("could
+        # not have produced a time-series trade at all") as if it had been
+        # measured. A forgotten keyword is now a TypeError at construction —
+        # the same "cannot be forgotten" reasoning DR-66b used for returning
+        # the carrier in the first place. Parametrized over each of the three
+        # fields individually (C5-ADV-2): omitting all three at once only
+        # pins "at least one is required", and would survive a mutant that
+        # restored a default on just the trailing field(s).
+        kwargs = {
+            "total": 1, "with_subtitle": 1, "with_event_title": 1,
+            "subtitle_fraction": 1.0, "event_title_fraction": 1.0,
+            "below_floor": False,
+            "cumulative_markets": 1, "snapshot_markets": 0,
+            "unknown_deadline_markets": 0,
+        }
+        del kwargs[omit]
+        with pytest.raises(TypeError):
+            backtester.OutcomeLabelCoverage(**kwargs)
 
     def test_the_carrier_holds_no_market_reference(self):
         # _prepare_entries del's the record list right after pair extraction to
@@ -2250,6 +2846,7 @@ class TestOutcomeLabelCoverageIsCarried:
             total=4, with_subtitle=1, with_event_title=1,
             subtitle_fraction=0.25, event_title_fraction=0.25,
             below_floor=True,
+            cumulative_markets=1, snapshot_markets=1, unknown_deadline_markets=2,
         )
         monkeypatch.setattr(backtester, "_prepare_entries",
                             lambda *a, **k: ([], census))
@@ -2911,15 +3508,22 @@ class TestDropCrossTypeDuplicates:
 
 
 class TestRunBacktestCrossTypeDedup:
-    """End-to-end proof that run_backtest applies the cross-type dedup (C4).
+    """The cross-type collision the dedup (C4) exists for can no longer arise
+    from the two finders, and this pins WHY.
 
     Fixture shape: two markets sharing an identical (event_title, title,
     subtitle) — so _group_by_exact_title pairs them as same_title — whose
     titles therefore also normalize to one key, so _group_by_normalized_title
-    pairs the SAME two tickers as time_series. Distinct close dates 7 days
-    apart keep the time-series copy inside the short (<= 15 day) tier, so it
-    genuinely qualifies at the 15% threshold rather than being filtered out
-    by _find_entry.
+    GROUPS the same two tickers for time_series too.
+
+    That used to yield both copies, which is what _drop_cross_type_duplicates
+    was built to resolve. It no longer can: a time-series pair must state two
+    DIFFERENT cumulative deadlines, and identical wording cannot state two of
+    anything. The two conditions are now mutually exclusive on one ticker pair,
+    so Pass 1 produces the same-title copy alone and the dedup has nothing to
+    drop. The helper stays — it is still the right thing to do if a collision
+    ever arises another way — and TestDropCrossTypeDuplicates unit-tests it
+    directly; what changed is that the FINDERS no longer manufacture one.
     """
 
     _MARKETS = [
@@ -2935,24 +3539,28 @@ class TestRunBacktestCrossTypeDedup:
     # DA (earlier, closes Feb 1) yes 0.30 / no 0.70; DB (later, Feb 8) yes
     # 0.60 / no 0.40 — the flow-through fixture. Same-title copy: DB is the
     # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
-    # Time-series copy: the later contract is priced 0.30 higher, clearing the
-    # 15% short-gap tier; legs pA+nB = 0.30+0.40 = 0.70 <= 0.85, and under the
-    # interval discount the Kelly fraction is ~0.162 — positive, so BOTH
-    # copies form in Pass 1 and the dedup under test is not vacuous.
+    # The time-series copy would once have formed too — the later contract is
+    # priced 0.30 higher, clearing the 15% short-gap tier, with legs
+    # pA+nB = 0.30+0.40 = 0.70 <= 0.85 and a positive Kelly fraction. It is now
+    # refused earlier than any of that, at extraction: both legs are worded
+    # "Q", so they state no deadline at all, let alone two different ones.
     _CANDLES = {
         "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
         "DB": [_candle(_MONDAY_TS, 0.60, 0.40)],
     }
 
-    def test_fixture_lands_in_both_groupings(self):
-        # The whole test rests on this pair being discovered twice, so assert it
-        # directly rather than trusting the grouping helpers to stay aligned.
+    def test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate(self):
+        # GROUPING is untouched by the cumulative-deadline rule, so the pair is
+        # still discovered by both keys...
         assert len(_group_by_exact_title(self._MARKETS)) == 1
         assert len(_group_by_normalized_title(self._MARKETS)) == 1
+        # ...but only the same-title branch produces a candidate. The legs are
+        # worded "Q", so they state no deadline at all, and the time-series
+        # branch refuses them.
         assert len(_extract_pairs(_group_by_exact_title(self._MARKETS))) == 1
-        assert len(_extract_pairs(_group_by_normalized_title(self._MARKETS))) == 1
+        assert _extract_pairs(_group_by_normalized_title(self._MARKETS)) == []
 
-    def test_time_series_duplicate_is_dropped_before_pass_two(self, monkeypatch):
+    def test_no_time_series_duplicate_reaches_the_dedup(self, monkeypatch):
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: self._MARKETS)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2981,11 +3589,13 @@ class TestRunBacktestCrossTypeDedup:
                     if c["pair_type"] == pair_type
                     and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
 
-        # Pass 1 really does produce BOTH copies of this ticker pair — without
-        # that, the dedup under test would be vacuous.
+        # Pass 1 produces the same-title copy ONLY: identical wording cannot
+        # state two different deadlines, so the time-series copy is refused at
+        # extraction and never reaches the dedup at all.
         assert len(_typed(seen["in"], "same_title")) == 1
-        assert len(_typed(seen["in"], "time_series")) == 1
-        # ...and only the same-title copy survives into Pass 2.
+        assert _typed(seen["in"], "time_series") == []
+        # The dedup is therefore a no-op here, and the same-title copy is
+        # carried into Pass 2 unchanged.
         assert len(_typed(seen["out"], "same_title")) == 1
         assert _typed(seen["out"], "time_series") == []
 
@@ -2993,6 +3603,45 @@ class TestRunBacktestCrossTypeDedup:
         assert trades[0].pair_type == "same_title"
         # The same-title copy canonicalizes A as the pricier side (DB)
         assert (trades[0].ticker_a, trades[0].ticker_b) == ("DB", "DA")
+
+    def test_dated_identical_wording_is_same_title_only(self):
+        # control — kills a mutant that drops the spans-differ requirement
+        # (`return True` in place of `spans_a != spans_b`). The class
+        # docstring's exclusivity claim was cited to
+        # test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate
+        # above, whose fixture states NO deadline at all ("Q"), so it only
+        # ever exercises the spans-differ conjunct's "both empty" branch. This
+        # fixture states a deadline IDENTICALLY on two DIFFERENT series, so
+        # the refusal comes from the spans-differ conjunct alone (the two
+        # spans are equal) — the one-series rule does not fire here, since
+        # _same_series_dicts is False on two different series. Mirror of
+        # test_scanner.py::TestDeadlineGuardFinders::
+        # test_dated_identical_wording_is_same_title_only.
+        title = "Will X happen by Dec 31, 2026?"
+        mA = _md("A1", "EVA-1", title=title, event_title="EV")
+        mA["close_time"] = "2026-12-01T00:00:00Z"
+        mB = _md("B1", "EVB-1", title=title, event_title="EV")
+        mB["close_time"] = "2026-12-20T00:00:00Z"
+        assert len(_group_by_normalized_title([mA, mB])) == 1
+        assert backtester._deadline_profile_dict(mA) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert backtester._deadline_profile_dict(mB) == (
+            scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
+        )
+        assert backtester._identical_wording_dicts(mA, mB) is True
+        assert backtester._same_series_dicts(mA, mB) is False
+        assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
+        assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
+
+        # Positive control: B's wording states a DIFFERENT deadline on the
+        # same two series, same close times. The spans now differ, so the
+        # time-series pair forms — proving the [] above comes from the
+        # spans-differ conjunct rather than from the price tier, the deadline
+        # gap, or the two series being distinct.
+        mB3 = _md("B1", "EVB-1", title="Will X happen by Dec 20, 2026?", event_title="EV")
+        mB3["close_time"] = "2026-12-20T00:00:00Z"
+        assert len(_extract_pairs(_group_by_normalized_title([mA, mB3]))) == 1
 
 
 class TestCheckpointOpeningBalanceSizing:
@@ -3236,7 +3885,11 @@ class TestRunBacktestTimeSeriesFlow:
         assert len(premise) == 1
         assert premise[0].startswith("Excluded 1 time-series candidate(s)")
         assert "earlier YES, later NO" in premise[0]
+        # DR-72: three named causes, not one guessed one.
         assert "snapshot markets" in premise[0]
+        assert "recurring windows" in premise[0]
+        assert "REALIZED close" in premise[0]
+        assert "outcome-label coverage" in premise[0]
         # Flat equity curve: nothing left and nothing came back
         assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
         assert equity["portfolio_value"].max() == pytest.approx(10_000.0)
@@ -3500,8 +4153,10 @@ class TestIntervalCalibration:
     """_interval_calibration: the k-independent empirical-discount measurement."""
 
     def test_returns_none_without_time_series_candidates(self):
-        # Summary-line idiom: nothing to say, so the caller stays silent
-        # rather than logging an all-zero table.
+        # None means there is no table to print (nothing measurable) — but
+        # since DR-72 the caller (_log_interval_calibration) is no longer
+        # silent on None: it logs one explanatory line instead of an
+        # all-zero table. See TestLogIntervalCalibration for that line.
         assert _interval_calibration([]) is None
         assert _interval_calibration([
             _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title"),
@@ -3613,16 +4268,27 @@ class TestIntervalCalibration:
 
 
 class TestLogIntervalCalibration:
-    """The report's presentation: silent when there is nothing to say."""
+    """The report's presentation: one line even when there is nothing to
+    measure (DR-72); sub-counts inside the report stay silent at zero."""
 
     @staticmethod
     def _messages(caplog):
         return [r.getMessage() for r in caplog.records]
 
-    def test_none_logs_nothing(self, caplog):
+    def test_none_logs_one_explanatory_line(self, caplog):
         with caplog.at_level("INFO"):
             _log_interval_calibration(None)
-        assert caplog.records == []
+        msgs = self._messages(caplog)
+        assert len(msgs) == 1
+        # "with a readable settlement" rather than a bare "no entry": the None
+        # branch is also taken when time-series entries DID exist but every one
+        # was dropped for an unreadable outcome, so the line must not claim
+        # more than the branch proves.
+        assert msgs[0] == (
+            "Interval-discount calibration: no time-series candidate entry "
+            "with a readable settlement in this window — empirical k_hat is "
+            "not measurable"
+        )
 
     def test_report_lines(self, caplog):
         calib = _interval_calibration([

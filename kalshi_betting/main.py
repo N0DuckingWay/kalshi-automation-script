@@ -197,7 +197,10 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
     Formats the deadline-gap-tiered time-series thresholds and the same-title
     threshold straight from config.py so this message can never drift out of
     sync with the values `min_price_diff_for_gap()` and the pair-finders
-    actually enforce.
+    actually enforce. Names the cumulative-deadline requirement too: since
+    that rule landed, price is no longer the only reason a time-series
+    candidate can be absent, and an operator reading this line would otherwise
+    go looking at the thresholds for a result the WORDING decided.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -208,7 +211,8 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
         str: The fully formatted log message, ready to pass to logging.info().
     """
     thresholds = (
-        "time-series: later-closing leg priced "
+        "time-series: both legs worded as cumulative deadlines "
+        "(“by <date>”, two different ones) with the later-closing leg priced "
         f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
         "earlier (deadline-gap-tiered), or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff"
@@ -223,13 +227,18 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
     Merge two pair lists, excluding any pair from secondary that already appears in primary.
 
     A duplicate is defined as any pair whose frozenset of {ticker_a, ticker_b} already
-    exists in primary. This can occur when both the same-title scanner and the time-series
-    scanner detect the same two markets (a zero-day deadline gap is a valid short-tier
-    gap, so two listings of one question can satisfy both finders) — in that case the
-    same-title pair is preferred because it is the near-arbitrage: identical questions
-    must co-resolve, so its payoff is a floor, whereas the time-series pair is a
-    directional bet whose sizing rests on the discounted-gap estimate of the
-    in-between probability (config.time_series_profit_prob). This matches the
+    exists in primary. Since DR-67 the two finders cannot produce a cross-type
+    collision on one ticker pair: a same-title pair requires identical wording,
+    a time-series pair requires two DIFFERENT stated deadlines, and identical
+    wording states identical deadline spans, or none — never two different
+    ones. This function stays as a guard against a collision arising another
+    way (both finders have their own defences too — see the one-series and
+    cumulative-deadline gotchas in CLAUDE.md), and its preference is the same
+    as before: were a collision to occur, the same-title pair would be kept
+    because it is the near-arbitrage — identical questions must co-resolve, so
+    its payoff is a floor — whereas the time-series pair is a directional bet
+    whose sizing rests on the discounted-gap estimate of the in-between
+    probability (config.time_series_profit_prob). This matches the
     same_title > time_series tie-break already used by strategy.select_portfolio().
 
     Args:
