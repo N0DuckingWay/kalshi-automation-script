@@ -212,10 +212,13 @@ class TestSetupLogging:
 #       tradeable pair in dev (no held-ticker filtering) but never in prod.
 #
 # Every market above shares ONE close time (_CLOSE), so no time-series pair
-# with a real deadline gap exists among them. Any zero-gap time-series copy
-# the finder produces for these same-title groups (a zero-day gap is a valid
-# short-tier gap) is dropped by main._dedup_pairs in favour of the same-title
-# entry, so the candidate set of every replay is the same-title set only.
+# with a real deadline gap exists among them. Since DR-67 the time-series
+# finder does not even form a copy of these same-title groups: their titles
+# ("Will X happen?") state no cumulative "by <date>" deadline, so the wording
+# screen refuses them outright — a same-title pair requires identical wording
+# and a time-series pair requires two DIFFERENT stated deadlines, so the two
+# finders can no longer collide on one ticker pair (see main._dedup_pairs'
+# docstring). The candidate set of every replay is the same-title set only.
 #
 # An OPT-IN fifth group (_live_shape_client(include_time_series=True)) adds
 # the 2026-09 time-series fixture — TS-EARLY (closes _CLOSE, YES 0.30) /

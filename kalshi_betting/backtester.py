@@ -1028,6 +1028,16 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     the conjunct, because there the wording is only date-stripped-equal and a
     genuine cumulative pair (deadline IN the wording) must survive.
 
+    For string-keyed (time-series) groups only, both legs must also be
+    CUMULATIVE-deadline markets ("will X happen BY <date>") stating two
+    DIFFERENT deadlines — scanner.cumulative_deadline_pair over
+    scanner.deadline_phrasing, the same helper find_time_series_pairs' item 4
+    calls, applied here through _deadline_profile_dict (DR-67). A snapshot
+    family ("price ON <date>") groups here exactly as it does live — the
+    grouping key is untouched — and is refused here exactly as it is live,
+    a heuristic over wording rather than a proof. 3-tuple-keyed (same-title)
+    groups have no deadline concept and are untouched by this rule.
+
     The pair type is NOT a parameter: the shape of each group key (see below)
     decides which sweep applies, and run_backtest() attaches the pair_type
     label to each returned tuple itself.
@@ -1071,7 +1081,8 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
             iteration order. Empty if no group has two members on different
-            event_tickers of different event series.
+            event_tickers of different event series whose wording, for a
+            string-keyed group, states two different cumulative deadlines.
     """
     pairs = []
     # Time-series candidates refused as not one question at two cumulative
@@ -1292,10 +1303,17 @@ def _find_entry(
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract —
-        decided on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        decided on the close DATETIMES, like scanner.find_time_series_pairs
         sorts its group members, so two contracts closing on the same UTC date
-        at different times of day are ordered rather than tied — and an
-        entry requires pB − pA >= the deadline-gap-tiered threshold from
+        at different times of day are ordered rather than tied. That parity is
+        on the datetime-vs-date fix only, not on what close_time MEANS: live
+        reads the SCHEDULED close of a still-open market, this function reads
+        the REALIZED close Kalshi recorded for a settled one, which for an
+        event that resolved early can sit before the original schedule — a
+        later-deadline leg that resolved early is ordered first on the
+        realized gap, a recorded pre-existing residual, not something this
+        function's datetime ordering fixes (CLAUDE.md TS-06). An entry
+        additionally requires pB − pA >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the LATER contract priced higher by at least the tier is the anomaly
         the strategy disputes (the market implies an outsized probability that
@@ -1372,7 +1390,7 @@ def _find_entry(
         # Never swap by price — the trade only exists when the LATER contract
         # is priced higher (checked per Monday below).
         #
-        # Decide on the close DATETIMES, exactly as scanner.find_time_series_pairs
+        # Decide on the close DATETIMES, like scanner.find_time_series_pairs
         # sorts on m.close_time. Two contracts closing on the same UTC date at
         # different times are a valid zero-day-gap pair (live data shows 9
         # distinct close dates across 43 distinct times of day), and deciding on
@@ -1387,6 +1405,14 @@ def _find_entry(
         # mix (reachable from a hand-edited cache, since every live timestamp is
         # tz-aware), per this file's "can't parse it = unknown, not an error"
         # convention.
+        #
+        # That parity is on the datetime-vs-date fix only, not on what
+        # close_time MEANS: live reads the SCHEDULED close of a still-open
+        # market, this reads the REALIZED close Kalshi recorded for a settled
+        # one, which for an event that resolved early can sit before the
+        # original schedule — a later-deadline leg that resolved early is
+        # ordered first on the realized gap. Recorded, pre-existing residual
+        # (CLAUDE.md TS-06); not fixed by this datetime ordering.
         dt_a = _parse_iso_datetime(mA.get("close_time"))
         dt_b = _parse_iso_datetime(mB.get("close_time"))
         try:

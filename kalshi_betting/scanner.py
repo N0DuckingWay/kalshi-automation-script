@@ -61,7 +61,10 @@ Notes:
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
-    cumulative_deadline_pair). Kalshi lists SNAPSHOT markets too — "Bitcoin
+    cumulative_deadline_pair) — compared as normalized strings, not parsed
+    calendar dates, so one deadline spelled two ways reads as two and a
+    truncated spelling can read two deadlines as one (see the DR-67 Known
+    residuals in CLAUDE.md). Kalshi lists SNAPSHOT markets too — "Bitcoin
     price ON Sep 15, 2026?" — whose probabilities do not nest, so the trade has
     no premise between two of them; and normalize_title erases a dated snapshot
     title just as readily as a dated deadline one, which is what put such a
@@ -151,7 +154,9 @@ _DATE_PATTERNS = [
     # Anchored to the preposition deliberately. A bare "<Month> <day>" would
     # also erase the date from SNAPSHOT titles ("... on June 30"), which would
     # put two snapshot markets of one family into a single time-series group —
-    # the premise violation the live scanner cannot detect from prices.
+    # the premise violation DR-67 now screens at pair formation on the legs'
+    # wording (this pattern only controls whether the two titles share a
+    # group; the backtester's counter is defence in depth behind it).
     # Anchored, this pattern fires only where the clause below already fired
     # and stranded a day, so no title that used to stay apart is merged.
     # The abbreviated spelling ("by Oct 1") is deliberately NOT covered: its
@@ -204,9 +209,12 @@ _COMPILED_EXPLICIT_DATES = [re.compile(p, re.IGNORECASE) for p in _EXPLICIT_DATE
 # A time-series pair buys YES on the earlier contract and NO on the later one.
 # That is only coherent when BOTH contracts are cumulative-deadline markets —
 # "will X happen BY <date>" — because only then is the event by the earlier
-# deadline nested inside the event by the later one. That nesting is what makes
-# pA + nB < 1 structurally true and what rules out the A=YES/B=NO settlement
-# cell entirely.
+# deadline nested inside the event by the later one. That nesting is what
+# rules out the A=YES/B=NO settlement cell entirely, and it is what makes the
+# FAIR VALUE of YES-A + NO-B at most $1 — not a guarantee that the quoted asks
+# do: a wide book can still quote pA + nB >= 1 on a genuine ladder, which is
+# why find_time_series_pairs skips that case explicitly rather than relying on
+# nesting to rule it out.
 #
 # Kalshi also lists SNAPSHOT markets — "what is X ON <date>", "X IN <Month>" —
 # which are NOT nested (SOL >= $180 on Sep 14 does not imply SOL >= $180 on
@@ -324,8 +332,8 @@ _CUMULATIVE_DEADLINE_PATTERNS = [
 # SNAPSHOT: a state measured AT one instant, or over a WINDOW that does not
 # nest. Two entries deserve their reasoning spelled out:
 #   * "after <date>" INVERTS the monotonicity the trade rests on — a later
-#     "after" date carries LOWER probability, so pA + nB < 1 stops holding and
-#     the earlier/later leg assignment means the opposite of what it says.
+#     "after" date carries LOWER probability, so the earlier/later leg
+#     assignment means the opposite of what it says.
 #   * "in <Month>" / "in <Year>" is a window, not a deadline: top-10 in October
 #     does not nest inside top-10 in November.
 # "after" requires a date token for the same reason "by" does — otherwise
@@ -728,8 +736,8 @@ class CandidatePair:
                    between (A=NO, B=YES; both legs worthless — the one loss
                    cell). A=YES with B=NO is impossible for a
                    cumulative-deadline pair, and find_time_series_pairs now
-                   SCREENS both legs' wording for that premise
-                   (scanner.deadline_phrasing) instead of assuming it. This is
+                   screens both legs' WORDING for that premise (a heuristic,
+                   scanner.deadline_phrasing) instead of assuming it. This is
                    a directional bet, not an arbitrage: it profits only if the
                    market overstates the in-between probability (see
                    config.time_series_profit_prob).
@@ -1355,7 +1363,13 @@ def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
          deciding field established the KIND of question ("within 30 days",
          "at any time") without naming a date, even if a less specific field
          names one (DR-69), so the two deadlines cannot be shown to differ and
-         the pair is refused.
+         the pair is refused. Spans are compared as normalized STRINGS
+         (_deadline_spans), not as parsed calendar dates: one deadline spelled
+         two ways reads as two deadlines ("Oct 1, 2026" vs "October 1, 2026"),
+         and two deadlines truncated to one span read as one — fixed for a
+         weekday plus month-name date by DR-68 ("by Friday, Sep 19, 2026" no
+         longer truncates to "by friday"), other truncations remain (CLAUDE.md
+         DR-67 Known residuals).
 
     Args:
         profile_a (tuple): First leg's (verdict, spans) from deadline_profile().
@@ -2490,17 +2504,20 @@ def find_time_series_pairs(
          over deadline_phrasing. Kalshi also lists SNAPSHOT markets ("Bitcoin
          price ON Sep 15, 2026?"), whose probabilities do not nest: SOL >= $180
          on Sep 14 does not imply SOL >= $180 on Sep 18, so there is no
-         in-between mass to dispute and pA + nB < 1 is accidental rather than
-         structural. normalize_title strips a dated snapshot title exactly as
-         it strips a dated deadline one, so such a family lands in ONE group
-         here and used to be sized and traded. Fails CLOSED: wording that names
-         no deadline at all is refused, because nothing the finder reads can
-         prove the premise. Each leg's deadlines are read from the one field
-         that decided its verdict, never from the other two (DR-69).
-      5. pA + nB < 1 — the structural invariant of a cumulative-deadline pair:
-         the two legs must cost less than the $1 a win pays. Implied by
-         tradeable below, but enforced here as a rule so a violating pair
-         cannot occupy this group's one-pair slot ahead of a sound runner-up.
+         in-between mass to dispute and nesting is what would make the fair
+         value of YES-A + NO-B at most $1 — on a snapshot pair it doesn't.
+         normalize_title strips a dated snapshot title exactly as it strips a
+         dated deadline one, so such a family lands in ONE group here and used
+         to be sized and traded. Fails CLOSED: wording that names no deadline
+         at all is refused, because nothing the finder reads can prove the
+         premise. Each leg's deadlines are read from the one field that
+         decided its verdict, never from the other two (DR-69).
+      5. Skips candidates whose leg ASK prices already sum to $1 or more. A
+         win pays only $1, so such a pair cannot profit in any cell. It is not
+         impossible: wide books quote it even on genuine ladders
+         (KXDEFAULT-28DEC31/-29DEC31 at 0.11 + 0.96 on 2026-09-21). It only
+         changes which NON-tradeable row represents a group, because tradeable
+         already requires 1 - pA - nB > fee.
       6. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
          order-independently by deadline_gap_days()
       7. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
@@ -2527,10 +2544,11 @@ def find_time_series_pairs(
         (pA + nB plus fees) is lost.
     A=YES with B=NO cannot occur for a cumulative-deadline pair (YES by the
     earlier deadline implies YES by the later one). That premise is now
-    SCREENED at pair formation by item 4 rather than merely assumed; the
-    backtester's premise-violation counter remains as defence in depth, since
-    a text classifier over market wording is a heuristic, not a proof. The flag
-    therefore says a win pays more than the pair costs, NOT that the pair
+    screened on WORDING at pair formation by item 4 (a heuristic) rather than
+    merely assumed; the backtester's premise-violation counter remains as
+    defence in depth, since a text classifier over market wording is a
+    heuristic, not a proof. The flag therefore says a win pays more than the
+    pair costs, NOT that the pair
     cannot lose: this is a directional bet whose expected value is negative
     at market prices unless the market overstates the in-between probability
     (config.time_series_profit_prob). Same-title pairs (no deadline gap,
@@ -2555,7 +2573,9 @@ def find_time_series_pairs(
             that produced a pair, each carrying pair_type="time_series". Empty
             if no group has two markets on different event_tickers within the
             deadline-gap cap whose wording is not identical across one series
-            and states two different cumulative deadlines.
+            and states two different cumulative deadlines — the two deadlines
+            compared as normalized strings, not parsed calendar dates (see the
+            DR-67 Known residuals in CLAUDE.md).
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -2663,8 +2683,9 @@ def find_time_series_pairs(
                 # ("Bitcoin price ON Sep 15, 2026?"), whose probabilities do
                 # not nest — SOL >= $180 on Sep 14 does not imply SOL >= $180
                 # on Sep 18 — so the YES-on-earlier / NO-on-later trade has no
-                # premise there at all and pA + nB < 1 is accidental rather
-                # than structural. normalize_title strips a dated snapshot
+                # premise there at all, and nesting — which is what would make
+                # the fair value of YES-A + NO-B at most $1 — does not hold on
+                # a snapshot pair. normalize_title strips a dated snapshot
                 # title just as readily as a dated deadline one, so such a
                 # family lands in ONE group here and was previously sized and
                 # traded. Fails CLOSED on wording that names no deadline.
@@ -2732,24 +2753,30 @@ def find_time_series_pairs(
                 if pB - pA < min_price_diff_for_gap(gap_days) - PRICE_EPSILON:
                     continue
 
-                # The structural invariant of a cumulative-deadline pair:
-                # buying YES at pA and NO at nB must cost less than the $1 a
-                # win pays. It is already IMPLIED by tradeable below, but only
-                # as a flag — a violating pair was still constructed and could
-                # win this group's one-pair slot at the sort below, blocking a
-                # sound runner-up. Skipping it outright makes the invariant a
-                # rule rather than a side effect.
+                # Skips candidates whose leg ASK prices already sum to $1 or
+                # more. A win pays only $1, so such a pair cannot profit in
+                # any cell. It is not impossible: wide books quote it even on
+                # genuine ladders (KXDEFAULT-28DEC31/-29DEC31 at 0.11 + 0.96
+                # on 2026-09-21) — nesting makes the fair value of YES-A +
+                # NO-B at most $1, not the quoted asks. It is already IMPLIED
+                # by tradeable below (which requires 1 - pA - nB > fee), but
+                # only as a flag — a violating pair was still constructed and
+                # could win this group's one-pair slot at the sort below,
+                # blocking a sound runner-up. Skipping it outright only
+                # changes which NON-tradeable row represents such a group.
                 #
                 # The epsilon runs the OPPOSITE way from the qualifying-level
                 # filters in enrich_with_orderbook_prices/validate_pair_price,
                 # which ADD it to a keep bound so a level exactly on the bound
                 # is not dropped for float noise. This is the REJECT side: the
-                # invariant is strictly pA + nB < 1, so a sum that is really
-                # 1.0 but evaluates to 0.9999999 must still be refused.
+                # skip condition is strictly pA + nB < 1, so a sum that is
+                # really 1.0 but evaluates to 0.9999999 must still be refused.
                 # Subtracting tightens by at most PRICE_EPSILON (1e-6), two
                 # orders of magnitude below the finest tick, so it can never
                 # reject a genuinely sub-$1 pair (TS-09's rule is "never
-                # reject for representation noise", and this honours it).
+                # reject for representation noise", and this honours it) — in
+                # practice it is defensive and inert on every Kalshi grid
+                # (4-dp prices; complementary pairs sum to exactly 1.0).
                 if pA + nB >= 1.0 - PRICE_EPSILON:
                     price_sum_skips += 1
                     continue

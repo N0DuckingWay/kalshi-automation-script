@@ -158,9 +158,10 @@ class TestNormalizeTitle:
         # The pattern above is anchored to the deadline preposition on
         # purpose. A bare "<Month> <day>" would also erase the date from
         # SNAPSHOT titles, merging two markets that ask about two different
-        # days into one time-series group — the premise violation the live
-        # scanner cannot detect from prices. These two must stay apart, as
-        # they did before the pattern was added.
+        # days into one time-series group — the premise violation DR-67 now
+        # screens at pair formation on the legs' wording (this pattern only
+        # controls whether the two titles share a group). These two must
+        # stay apart, as they did before the pattern was added.
         a = normalize_title("Highest temperature in NYC on June 30")
         b = normalize_title("Highest temperature in NYC on July 1")
         assert a != b
@@ -807,8 +808,9 @@ class TestOneEventSeriesIsTwoFixtures:
         # "price ON <date>" family is a SNAPSHOT family, not a
         # cumulative-deadline one (SOL >= $180 on Sep 14 does not imply
         # SOL >= $180 on Sep 18), so there is no in-between mass to dispute and
-        # pA + nB < 1 is accidental rather than structural. The one-series rule
-        # still does not fire — the two legs are worded differently — so this
+        # nesting is what would make the fair value of YES-A + NO-B at most
+        # $1 — here it doesn't. The one-series rule still does not fire — the
+        # two legs are worded differently — so this
         # is the deadline rule's verdict alone, on the very fixture that used
         # to document the gap.
         mA, mB = self._sold_family("on")
@@ -1106,8 +1108,8 @@ class TestCumulativeDeadlineRule:
 
     def test_after_a_date_inverts_the_monotonicity_and_is_refused(self):
         # "after June 30" carries LOWER probability the later the date, so the
-        # earlier/later leg assignment means the opposite of what it says and
-        # pA + nB < 1 stops holding.
+        # earlier/later leg assignment means the opposite of what it says —
+        # the monotonicity the trade rests on inverts.
         #
         # Two ways _DATE_PATTERNS lands such a market in a time-series group,
         # both measured against the real patterns: the year-less shape strips
@@ -2602,9 +2604,10 @@ class TestTimeSeriesTieredThreshold:
 
     def test_wide_later_book_is_not_a_candidate_at_all(self):
         # A 30% YES-ask gap clears the tier, but with LATE's NO ask at 0.75 the
-        # legs cost pA + nB = 1.05. The structural invariant of a
-        # cumulative-deadline pair is that buying YES at pA and NO at nB costs
-        # LESS than the $1 a win pays, so this is not a candidate at all.
+        # legs cost pA + nB = 1.05. A win pays only $1, so a pair whose leg ASK
+        # prices already sum to $1 or more cannot profit in any cell — nesting
+        # only makes the FAIR VALUE of YES-A + NO-B at most $1, not the quoted
+        # asks — so this is not a candidate at all.
         #
         # RE-PINNED: it used to be carried as an untradeable row. That was not
         # free — both finders keep ONE pair per group, so a pair no trade can

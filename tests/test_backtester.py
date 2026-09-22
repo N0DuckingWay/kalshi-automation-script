@@ -3555,8 +3555,8 @@ class TestRunBacktestCrossTypeDedup:
         assert len(_group_by_exact_title(self._MARKETS)) == 1
         assert len(_group_by_normalized_title(self._MARKETS)) == 1
         # ...but only the same-title branch produces a candidate. The legs are
-        # worded identically, so they state one deadline, not two, and the
-        # time-series branch refuses them.
+        # worded "Q", so they state no deadline at all, and the time-series
+        # branch refuses them.
         assert len(_extract_pairs(_group_by_exact_title(self._MARKETS))) == 1
         assert _extract_pairs(_group_by_normalized_title(self._MARKETS)) == []
 
