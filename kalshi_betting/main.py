@@ -212,7 +212,7 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
     """
     thresholds = (
         "time-series: both legs worded as cumulative deadlines "
-        "(“by <date>”, two different ones) with the later-closing leg priced "
+        "(“by <date>”, two different ones) with the later leg priced "
         f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
         "earlier (deadline-gap-tiered), or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff"

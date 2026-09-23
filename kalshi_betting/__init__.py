@@ -9,7 +9,7 @@ Purpose:
     pairs are a near-arbitrage: one question listed twice at divergent prices,
     where buying NO on the pricier listing and YES on the cheaper one profits
     whenever the two co-resolve. Time-series pairs are a directional bet on
-    the interval between two deadlines: when the later-closing contract is
+    the interval between two deadlines: when the later contract is
     priced well above the earlier one, the bot buys YES on the earlier and NO
     on the later, winning if the event happens by the earlier deadline or
     never happens by the later one, and losing the stake if it first happens

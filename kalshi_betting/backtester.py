@@ -26,15 +26,18 @@ Dependencies:
     same three verdicts cumulative_deadline_pair reads, so the boolean and the
     reason can never disagree) and its
     REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/REFUSED_SAME_DEADLINE
-    constants from
+    constants, and stated_deadline / same_event_ladder with its SAME_DAY
+    sentinel (the single definition of which calendar day a rung's deadline
+    names and of how two rungs of one event are ordered and gapped — DR-73,
+    so the live and backtest ladder rules can never disagree), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob) plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
-    SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS and
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT from
+    SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS,
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS from
     config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py. Also
     depends on pandas (external) for the equity-curve DataFrame. Does NOT
@@ -158,6 +161,7 @@ from .config import (
     SETTLED_PREFILTER_CACHE_TAG,
     SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+    TIME_SERIES_SAME_EVENT_LADDERS,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -175,11 +179,14 @@ from .scanner import (
     REFUSED_NO_STATED_DEADLINE,
     REFUSED_SAME_DEADLINE,
     REFUSED_SNAPSHOT,
+    SAME_DAY,
     cumulative_deadline_pair,
     deadline_pair_refusal,
     deadline_profile,
     event_series,
     leg_sides,
+    same_event_ladder,
+    stated_deadline,
     time_series_group_key,
 )
 
@@ -285,9 +292,16 @@ class BacktestTrade:
             was sized against, shared by every trade entering that same date
             (mirroring the single balance read at the top of a live run).
         deadline_gap_days (int | None): Calendar days between the two legs'
-            close_times, carried out of _find_entry (which selected the price
-            tier and applied the MAX_DEADLINE_GAP_DAYS cutoff on exactly this
-            number) rather than recomputed. None for same_title, which has no
+            deadlines — their close_times for a cross-event pair, their two
+            STATED deadlines for a same-event ladder (DR-73), which is also
+            what ordered its legs. Carried out of _find_entry (which selected
+            the price tier and applied the MAX_DEADLINE_GAP_DAYS cutoff on
+            exactly this number) rather than recomputed, so the number
+            reported is always the one the pair was tiered on — for a ladder
+            the two quantities routinely disagree (measured on a 1,506-market
+            archive corpus: 101 of 408 ladder pairs have a ZERO-day close gap,
+            37 of them closing at the identical instant, while every stated
+            gap is in [1, 30]). None for same_title, which has no
             deadline-gap concept, and for any trade constructed without it
             (test fixtures). Reporting only — nothing sizes, prices or settles
             on this field.
@@ -318,10 +332,14 @@ class BacktestTrade:
     slippage: float         # profit - expected_payoff
     holding_days: int
     balance_at_entry: float  # checkpoint opening balance the Kelly budget used
-    # Calendar days between the two legs' close_times, carried out of
-    # _find_entry rather than recomputed. None for same_title (no deadline-gap
+    # Calendar days between the two legs' deadlines — their close_times for a
+    # cross-event pair, their two STATED deadlines for a same-event ladder
+    # (DR-73) — carried out of _find_entry rather than recomputed, so it is
+    # always the gap that chose the tier. None for same_title (no deadline-gap
     # concept) and for any trade constructed without it (test fixtures).
-    # Reporting only — nothing sizes, prices or settles on this field.
+    # Reporting only — nothing sizes, prices or settles on this field, but
+    # _interval_calibration DOES band k-hat on the same quantity via
+    # _TimeSeriesOutcome.gap_days, so a ladder's bands are stated-gap bands.
     deadline_gap_days: int | None = None
 
 
@@ -894,6 +912,72 @@ def _deadline_profile_dict(m: dict) -> tuple:
     )
 
 
+def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
+    """
+    Dict-world mirror of the field extraction scanner.stated_deadline() reads.
+
+    The arithmetic itself is scanner.stated_deadline, called here, so the live
+    finder and this path can never disagree about which calendar day a rung's
+    deadline names (pinned by AST in tests/test_strategy.py) — only the field
+    extraction differs, exactly as _deadline_profile_dict mirrors
+    scanner._market_deadline_profile. Every key is read with `.get(...) or ""`
+    for the same reason: a cached record legitimately carries subtitle=None,
+    and old records predate `event_title` entirely.
+
+    The profile is PASSED IN rather than recomputed, because _extract_pairs
+    classifies each group member exactly once and compares the cheap results
+    pairwise (DR-70). _find_entry, which holds no such memo, is a deliberate
+    bounded exemption — see its own comment.
+
+    Two cache-vs-live field divergences reach this reader, and NEITHER is the
+    one-directional guarantee DR-69 gives deadline_profile — that rule holds
+    because spans come only from the deciding field, while stated_deadline's
+    CROSS-CHECK reads all three fields, so blanking one can DISARM a refusal
+    the live path applies. Measured on the 2026-09-22 snapshot's 113,303
+    actively-statused markets, and again as ladder PAIRS through
+    _extract_pairs(..., same_event_ladders=True) on the same snapshot (378
+    ladders live):
+
+    * event_title, which reaches essentially every live market and only a
+      small fraction of cached ones. Mostly the narrow direction: 71 markets
+      read a date live and `unknown` from the cache shape, i.e. a missed
+      ladder. But 1 goes the OTHER way — KXACAREPEAL-29-29JAN20, whose event
+      title "before 2029" (2028-12-31) is disjoint from its own title and
+      subtitle ("Before Jan 20, 2029"), so live REFUSES it for a field
+      conflict and the blank-event_title cache dates it 2029-01-19. None reads
+      a DIFFERENT day, and at pair level the two shapes agree exactly (378
+      ladders either way, 0 extra, 0 missing).
+    * subtitle, which a cached record legitimately carries as None, and which
+      is the MATERIAL one because DR-69 makes it the deciding field: blanking
+      it moves the decision to the TITLE, so the rung reads a different day
+      rather than none. 649 markets live-only, 53 cache-only and 9 reading a
+      DIFFERENT day (e.g. KXMEDIARELEASEPRISONBREAK-30JAN01-27JAN01, subtitle
+      "Before Jan 1, 2027" live against the title's "before Jan 1, 2030" from
+      the cache shape). At pair level the subtitle-blank shape forms 246
+      ladders: 136 of the live 378 missed AND 4 admitted that the live finder
+      REFUSES (KXALIENS, KXGROK-GROK5, KXLEAVEGROUPKATSEYE, KXNEWGLENN, each
+      a Nov/Dec rung pair whose subtitle "Before November" states no year).
+
+    So a ladder-enabled backtest's pair population is NOT a subset of the live
+    one on a subtitle-blank corpus, and the k-hat the flip gate demands is
+    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual list and
+    the plan's own "prove the corpus before spending on it" step).
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+        profile (tuple): That record's (verdict, spans) from
+            _deadline_profile_dict().
+
+    Returns:
+        date | None: The last calendar day this rung's deadline includes, or
+            None when its wording states no single placeable day.
+    """
+    return stated_deadline(
+        profile,
+        m.get("event_title") or "", m.get("title") or "", m.get("subtitle") or "",
+    )
+
+
 def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
@@ -1012,11 +1096,14 @@ def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
     return kept
 
 
-def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
+def _extract_pairs(
+    groups: dict, *, same_event_ladders: bool | None = None,
+) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
-    the two markets have different event_tickers AND are not two events of one
-    series worded identically. No price filtering at this stage.
+    the two markets have different event_tickers — or, with same-event deadline
+    ladders enabled, are two dated cumulative rungs of ONE event — AND are not
+    two events of one series worded identically. No price filtering at this stage.
 
     The one-series rule (DR-02, DR-54) mirrors both live finders through
     _same_series_dicts / _identical_wording_dicts: two events resolving to one
@@ -1071,20 +1158,95 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     stay naive — the eligibility prefilter (_can_ever_enter, applied in
     run_backtest before grouping) keeps these groups small in practice.
 
+    SAME-EVENT DEADLINE LADDERS (DR-73), when same_event_ladders resolves
+    True, are the mirror of scanner.find_time_series_pairs' ladder branch: two
+    dated cumulative rungs of ONE event ("... before Sep 23, 2026?" and
+    "... by Oct 16, 2026?", both KXSPACEXSTARSHIP-14) are a time-series pair,
+    ordered by STATED deadline (scanner.stated_deadline / same_event_ladder)
+    and capped on the STATED gap, never on close_time. They come from a
+    SEPARATE per-event sub-pass over the same sorted `dated` list, carrying
+    POSITIONAL indexes because group_profiles is positional; the windowed
+    cross-event sweep above is untouched and still skips every same-event
+    candidate, so the two populations cannot overlap.
+
+    That sub-pass is deliberately UNWINDOWED. The close-date window exists
+    because _find_entry rejects a CROSS-EVENT pair on its close gap, but a
+    ladder is capped on its stated gap instead, and the two disagree
+    routinely: in the archive 681 of 1,821 dated same-event pairs have a close
+    gap of ZERO days (on the 101-slice sub-corpus, 101 of 408 ladder pairs, 37
+    of which close at the identical INSTANT — the weaker reading is the one
+    that matters, because _find_entry's cross-event branch orders on close
+    DATETIMES and a zero-day gap at two times of day is still orderable),
+    13 are ordered the wrong way round by realized close, and 463
+    would be admitted on their close gap with a stated gap beyond the cap —
+    against exactly 1 the other way, a pair whose stated gap is inside the cap
+    while its realized closes sit further apart, which a windowed sub-pass
+    would silently drop.
+
+    Complexity, stated honestly: the sub-pass is O(B^2) per event bucket,
+    NOT the O(N * window) the sweep pays. Measured bucket sizes (2026-09-22):
+    max 26 on the live snapshot's 113,303 markets (KXNHLHART-27, 3,704
+    same-event candidate pairs in all) — counted over every actively-STATUSED
+    market, which is what this function sees; the live funnel in the
+    TIME_SERIES_SAME_EVENT_LADDERS comment in config.py quotes 3,354 and max
+    bucket 21 for the same snapshot AFTER the live price filter
+    (scanner._filter_active_markets), so the two pairs of numbers describe two
+    populations rather than disagreeing. Also max 3 on
+    live_days/2026-09-08.json.gz (391,609 records, 6 candidate pairs); max 75
+    on the strike-blind legacy slices, where a blank subtitle collapses a
+    whole daily strike family onto one key — archive_days/2026-05-01.json.gz
+    reaches 615,266 candidate pairs that way. That last figure is why the
+    sub-pass does NO pairwise work at all while the switch is off (not even
+    the bucketing).
+
+    The LARGE_GROUP_WARN_THRESHOLD-style canary below covers ONE runaway event
+    bucket, and nothing more: it fires on a single same-event bucket past that
+    threshold, so it would stay silent through an exact repeat of the 615,266
+    figure above, whose largest bucket is 75. That is deliberate rather than
+    an oversight — the AGGREGATE cost is bounded by measurement instead, and
+    the measurement is small: on that same 2026-05-01 slice the whole
+    615,266-pair sub-pass costs +0.3 to +0.5 s against a ~19 s switch-off call
+    (measured 2026-09-23, two runs each way), and it is paid only with the
+    switch on. A per-call aggregate guard is the alternative and is
+    deliberately not built; if the cost ever stops being negligible, sum
+    len(idxs)*(len(idxs)-1)//2 across buckets here and warn past a second
+    threshold.
+
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
             compact historical._market_to_dict form). Keys are either a
             normalized title+outcome string (time-series groups) or an
             (event_title, title, subtitle) 3-tuple (same-title groups).
+        same_event_ladders (bool | None): Whether to run the same-event ladder
+            sub-pass. None (the default) resolves THIS MODULE's
+            TIME_SERIES_SAME_EVENT_LADDERS — the by-value binding of
+            config.TIME_SERIES_SAME_EVENT_LADDERS taken at import — at CALL
+            time, so a run-level override and a monkeypatch OF THAT NAME both
+            take effect, which a def-time default would silently ignore.
+            Patching config.TIME_SERIES_SAME_EVENT_LADDERS is a silent no-op
+            here, exactly as it is for scanner: this is NOT the
+            time_series_profit_prob(k=None) idiom, which works only because
+            that helper lives in config.py and reads config's own global. Has
+            no effect on 3-tuple-keyed (same-title) groups, which have no
+            deadline concept.
 
     Returns:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
-            iteration order. Empty if no group has two members on different
-            event_tickers of different event series whose wording, for a
-            string-keyed group, states two different cumulative deadlines.
+            iteration order — the cross-event sweep's pairs for a group first,
+            then that group's ladder pairs. Empty if no group has two members
+            on different event_tickers of different event series whose
+            wording, for a string-keyed group, states two different cumulative
+            deadlines, and no group holds an admissible ladder.
     """
     pairs = []
+    # Resolved at CALL time, never bound as a def-time default: the constant
+    # is what a test monkeypatches and what --same-event-ladders overrides for
+    # one run, and a `same_event_ladders: bool = TIME_SERIES_SAME_EVENT_LADDERS`
+    # default would freeze the import-time value and ignore both. Same idiom
+    # config.time_series_profit_prob uses for k (DR-73c).
+    ladders_on = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
+                  else same_event_ladders)
     # Time-series candidates refused as not one question at two cumulative
     # deadlines, split by REASON (DR-72) — the mirror of the live scanner's
     # split, over deadline_pair_refusal, the one shared definition. Reported
@@ -1094,6 +1256,33 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
     snapshot_skips = 0
     no_deadline_skips = 0
     same_deadline_skips = 0
+    # DR-73's same-event ladder sub-pass keeps its OWN counters, for the same
+    # reason the live branch does: they count candidates INSIDE one event, a
+    # population the three above have never seen, and folding them in blurs
+    # exactly the distinction DR-72 split apart. Each is silent at zero.
+    #
+    # Two of the live branch's counters have no mirror here, deliberately.
+    # ladder_disabled_skips is live-only: counting the disabled population
+    # here would mean enumerating every same-event pair just to feed a
+    # counter, which is 615,266 pairs on one real strike-blind day slice — the
+    # switch-off path must do no pairwise work at all. ladder_price_sum_skips
+    # has nothing to count: this function applies no price filter of any kind.
+    ladder_no_event_skips = 0
+    ladder_identical_wording_skips = 0
+    ladder_snapshot_skips = 0
+    ladder_no_deadline_skips = 0
+    ladder_same_deadline_skips = 0
+    ladder_undated_skips = 0
+    ladder_field_conflict_skips = 0
+    ladder_same_day_skips = 0
+    ladder_gap_cap_skips = 0
+    ladder_pairs = 0
+    # Whether this CALL saw any time-series group at all. _prepare_entries
+    # calls this function twice — once per grouping — and the ladder rule
+    # applies only to string keys, so without this the same-title call would
+    # log a permanent "ladder candidates: 0" that reads as the ladder pass
+    # having found nothing when it never ran.
+    saw_time_series_group = False
     for key, members in groups.items():
         if isinstance(key, str):
             canon = key
@@ -1113,6 +1302,7 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
         seen: set[frozenset] = set()
 
         if isinstance(key, str):
+            saw_time_series_group = True
             # Time-series: sort by close_time and sweep only the pairs within
             # the deadline-gap window (see docstring above) instead of the
             # naive O(n^2) double loop over the whole group.
@@ -1177,6 +1367,162 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
+
+            # ── DR-73: the same-event deadline ladder sub-pass ────────────
+            # A SEPARATE pass, not a relaxation of the sweep above, for two
+            # reasons. The sweep's `continue` on equal event tickers stays
+            # exactly as it was, so every cross-event count and every
+            # cross-event pair is untouched; and this pass is deliberately
+            # UNWINDOWED, because a ladder is capped on its STATED gap while
+            # the window bounds the CLOSE gap, and the two disagree
+            # routinely (see the docstring's measured 463-against-1).
+            #
+            # Gated on the resolved flag, and the gate wraps the BUCKETING as
+            # well as the pairwise loops: on a strike-blind legacy slice one
+            # event bucket reaches 75 members and a whole slice reaches
+            # 615,266 same-event candidate pairs, so a disabled census here
+            # would cost real time on every switch-off run to report a number
+            # nobody asked for. The live finder keeps that census instead,
+            # where its memoized profiles make it free.
+            if ladders_on:
+                # Positional indexes, NOT members: group_profiles is indexed
+                # by position in `dated`, and the stated-deadline memo below
+                # keys the same way.
+                event_buckets: dict[str, list[int]] = defaultdict(list)
+                for idx, (_d, m) in enumerate(dated):
+                    event_buckets[m.get("event_ticker") or ""].append(idx)
+
+                for event_ticker, idxs in event_buckets.items():
+                    if len(idxs) < 2:
+                        continue
+                    if not event_ticker:
+                        # Two members sharing an EMPTY event ticker share no
+                        # event at all, so nothing identifies the ladder they
+                        # would belong to. Fails closed, exactly as it did
+                        # before this pass existed; counted per CANDIDATE
+                        # pair so the number means the same thing as the live
+                        # finder's.
+                        ladder_no_event_skips += len(idxs) * (len(idxs) - 1) // 2
+                        continue
+                    if len(idxs) > LARGE_GROUP_WARN_THRESHOLD:
+                        # Visibility only, not a cap — the
+                        # LARGE_GROUP_WARN_THRESHOLD idiom applied to the one
+                        # quadratic loop in this function that has no window
+                        # bounding it. Measured maxima are 26 live and 75 on
+                        # a strike-blind legacy slice, so this cannot fire on
+                        # any corpus on disk today; it exists so a future one
+                        # cannot reintroduce the blow-up silently.
+                        logging.warning(
+                            "Same-event ladder bucket %r in group %r holds %d dated "
+                            "rungs — the ladder sub-pass is O(B^2) and unwindowed; "
+                            "verify this event is a deadline ladder and not a "
+                            "strike family grouped strike-blind",
+                            event_ticker, canon, len(idxs),
+                        )
+                    # Each rung's stated deadline, read ONCE per member and
+                    # only for the members that actually land in a >= 2
+                    # bucket (DR-70's rule: a group of N members yields
+                    # O(N^2) candidates, and one event's ladder is the
+                    # densest such group there is; an index appears in
+                    # exactly one bucket, so this whole map is one read per
+                    # member). Each value is a PAIR of readings — the
+                    # cross-checked deadline, and the same read with the
+                    # cross-check disarmed (stated_deadline consults only its
+                    # three FIELD arguments, so "" for all three leaves the
+                    # deciding field's own day) — which is what separates
+                    # "this rung states no placeable day" from "this rung's
+                    # own fields name irreconcilable days" when a refusal is
+                    # counted. Same two-value shape, and the same second
+                    # read, as the live finder's ladder_deadlines map.
+                    rung_deadlines = {
+                        idx: (
+                            _stated_deadline_dict(dated[idx][1], group_profiles[idx]),
+                            stated_deadline(group_profiles[idx], "", "", ""),
+                        )
+                        for idx in idxs
+                    }
+                    for x, i in enumerate(idxs):
+                        for j in idxs[x + 1:]:
+                            # Fresh per-candidate locals, never the bucket
+                            # entries: a ladder may SWAP its legs below, and
+                            # the same index reappears in every later
+                            # candidate of this bucket.
+                            mA = dated[i][1]
+                            mB = dated[j][1]
+                            if _identical_wording_dicts(mA, mB):
+                                # Same event AND identical wording: the
+                                # deadline is not in the wording, so there is
+                                # nothing here to order two rungs by (DR-02's
+                                # reasoning, one level in).
+                                # cumulative_deadline_pair below would refuse
+                                # it too, but counting it here keeps the
+                                # ladder counters about ladders — it is the
+                                # largest single ladder refusal live.
+                                ladder_identical_wording_skips += 1
+                                continue
+                            if not cumulative_deadline_pair(
+                                group_profiles[i], group_profiles[j]
+                            ):
+                                # The same three DR-72 reasons as the sweep
+                                # above, through the same one shared
+                                # deadline_pair_refusal, on their own
+                                # counters.
+                                reason = deadline_pair_refusal(
+                                    group_profiles[i], group_profiles[j]
+                                )
+                                if reason == REFUSED_SNAPSHOT:
+                                    ladder_snapshot_skips += 1
+                                elif reason == REFUSED_NO_STATED_DEADLINE:
+                                    ladder_no_deadline_skips += 1
+                                elif reason == REFUSED_SAME_DEADLINE:
+                                    ladder_same_deadline_skips += 1
+                                continue
+                            deadline_a, deciding_a = rung_deadlines[i]
+                            deadline_b, deciding_b = rung_deadlines[j]
+                            ladder = same_event_ladder(deadline_a, deadline_b)
+                            if ladder is None:
+                                # Two findings with different remedies,
+                                # counted apart: a rung whose wording states
+                                # no placeable day (a parser gap — year-less
+                                # wording, mostly) against one whose own
+                                # fields name irreconcilable days (stale
+                                # wording in one of them).
+                                if (deadline_a is None and deciding_a is not None) or (
+                                    deadline_b is None and deciding_b is not None
+                                ):
+                                    ladder_field_conflict_skips += 1
+                                else:
+                                    ladder_undated_skips += 1
+                                continue
+                            if ladder is SAME_DAY:
+                                # Both rungs name ONE calendar day — one
+                                # deadline spelled two ways ("by Mar 31,
+                                # 2027" beside "before Apr 1, 2027"), not a
+                                # two-rung ladder. Compared with `is`, never
+                                # truthiness: SAME_DAY is a non-empty string.
+                                ladder_same_day_skips += 1
+                                continue
+                            swap, stated_gap = ladder
+                            if stated_gap > MAX_DEADLINE_GAP_DAYS:
+                                # The ladder's OWN cap, on the STATED gap.
+                                # _find_entry re-applies it on the same
+                                # arithmetic, so this is the sweep's
+                                # window-plus-exact-cutoff contract mirrored
+                                # for ladders.
+                                ladder_gap_cap_skips += 1
+                                continue
+                            if swap:
+                                # market_a must be the EARLIER contract,
+                                # which for a ladder means the earlier STATED
+                                # deadline: the close_time sort above cannot
+                                # order rungs that close at one instant.
+                                mA, mB = mB, mA
+                            pair_key = frozenset([mA["ticker"], mB["ticker"]])
+                            if pair_key in seen:
+                                continue
+                            seen.add(pair_key)
+                            ladder_pairs += 1
+                            pairs.append((mA, mB, canon, key))
         else:
             # Same-title: no deadline-gap constraint, stays naive.
             for i, mA in enumerate(members):
@@ -1217,6 +1563,82 @@ def _extract_pairs(groups: dict) -> list[tuple[dict, dict, str, object]]:
             "state the same deadline, or truncate to one (within the "
             "deadline-gap window, before price filters): %d",
             same_deadline_skips,
+        )
+    # DR-73's own reporting, the mirror of the live finder's. Every line below
+    # counts candidates INSIDE one event — a population none of the counters
+    # above has ever seen — and each is silent at zero, so a run with the
+    # switch off adds no line at all to this function's output. They say
+    # "same-event sub-pass" rather than "within the deadline-gap window",
+    # because that sub-pass is deliberately unwindowed (see the docstring).
+    if ladder_no_event_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the shared event "
+            "ticker is empty (same-event sub-pass, before price filters): %d",
+            ladder_no_event_skips,
+        )
+    if ladder_identical_wording_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the two rungs' "
+            "wording is identical (the deadline is not in the wording): %d",
+            ladder_identical_wording_skips,
+        )
+    if ladder_snapshot_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deciding "
+            "field is snapshot wording: %d",
+            ladder_snapshot_skips,
+        )
+    if ladder_no_deadline_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deciding "
+            "field carries no recognised deadline wording or no comparable "
+            "date: %d",
+            ladder_no_deadline_skips,
+        )
+    if ladder_same_deadline_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the two rungs' "
+            "deciding fields state the same deadline, or truncate to one: %d",
+            ladder_same_deadline_skips,
+        )
+    if ladder_undated_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deadline "
+            "states no placeable calendar day (year-less wording, mostly — "
+            "see scanner._span_deadline): %d",
+            ladder_undated_skips,
+        )
+    if ladder_field_conflict_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's own "
+            "wording fields name irreconcilable days (stated_deadline's "
+            "cross-check): %d",
+            ladder_field_conflict_skips,
+        )
+    if ladder_same_day_skips:
+        logging.info(
+            "Same-event ladder candidates refused because both rungs name "
+            "one calendar day (one deadline spelled two ways): %d",
+            ladder_same_day_skips,
+        )
+    if ladder_gap_cap_skips:
+        logging.info(
+            "Same-event ladder candidates worded as two different cumulative "
+            "deadlines, refused at the %d-day STATED gap cap (price not "
+            "evaluated): %d",
+            MAX_DEADLINE_GAP_DAYS,
+            ladder_gap_cap_skips,
+        )
+    if ladders_on and saw_time_series_group:
+        # ALWAYS logged while the switch is on, zero included: a switch that
+        # silently produces nothing must be distinguishable from one that is
+        # working and finding nothing (DR-66). The live finder's counterpart
+        # counts pairs that SURVIVED its one-best-per-group contest; this one
+        # counts candidates, because that contest happens later here, in
+        # _simulate_at_discount.
+        logging.info(
+            "Same-event ladder candidates among the time-series candidates: %d",
+            ladder_pairs,
         )
     return pairs
 
@@ -1289,6 +1711,7 @@ def _find_entry(
     pair_type: str,
     start_date: date,
     max_horizon_days: int | None = None,
+    same_event_ladders: bool | None = None,
 ) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
@@ -1312,7 +1735,15 @@ def _find_entry(
         event that resolved early can sit before the original schedule — a
         later-deadline leg that resolved early is ordered first on the
         realized gap, a recorded pre-existing residual, not something this
-        function's datetime ordering fixes (CLAUDE.md TS-06). An entry
+        function's datetime ordering fixes (CLAUDE.md TS-06). A SAME-EVENT
+        DEADLINE LADDER is the one exception and is the point of DR-73: with
+        same_event_ladders resolved True, two markets sharing a non-empty
+        event_ticker are ordered and gapped on their STATED deadlines
+        (scanner.stated_deadline / same_event_ladder) instead, because a
+        settled event closes every rung at one instant — the realized-close
+        residual above is not a residual there but the normal case. Such a
+        pair returns None when either deadline cannot be read, or when both
+        rungs name one day. An entry
         additionally requires pB − pA >= the deadline-gap-tiered threshold from
         min_price_diff_for_gap (15% for gaps <= 15 days, 30% for 16-30 days) —
         the LATER contract priced higher by at least the tier is the anomaly
@@ -1325,7 +1756,11 @@ def _find_entry(
         the tier (and the 30-day cutoff) is the ABSOLUTE timedelta.days on the
         two close_time datetimes, exactly as scanner.deadline_gap_days computes
         it (order-independent) — not calendar-date subtraction, which counts a
-        day boundary the live path does not.
+        day boundary the live path does not. For a same-event ladder it is the
+        STATED deadline gap instead, exactly as scanner.same_event_ladder
+        computes it and as scanner.pair_gap_days hands it to the live
+        downstream sites; close_time is not consulted for the tier there at
+        all.
       - same_title: market A is canonicalized per Monday as the more expensive
         side (the two contracts ask the identical question, so direction is
         price-only); the legs are NO on market A (nA) and YES on market B (pB),
@@ -1350,6 +1785,18 @@ def _find_entry(
             (later close date − Monday) exceeds this is skipped (not rejected
             outright — a later Monday closer to the close dates may still
             qualify). None means no cap (default), matching live-path semantics.
+        same_event_ladders (bool | None): Whether two markets of ONE event may
+            be replayed as a time-series ladder, ordered and gapped on their
+            stated deadlines. None (the default) resolves THIS MODULE's
+            TIME_SERIES_SAME_EVENT_LADDERS (the by-value binding of
+            config.TIME_SERIES_SAME_EVENT_LADDERS taken at import) at CALL
+            time, so a run-level override and a monkeypatch of that name both
+            take effect; patching the config attribute itself is a silent
+            no-op here. Deliberately NOT triggered
+            by event_ticker equality alone: _extract_pairs only proposes a
+            same-event pair while the switch is on, but any other caller —
+            a test, a harness, a future entry point — must not get ladder
+            semantics from a pair it built itself while the switch is off.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -1376,7 +1823,14 @@ def _find_entry(
         return None
 
     # Scan up to (but not including) the day the earlier market closes —
-    # after that, the pair is no longer fully open for entry
+    # after that, the pair is no longer fully open for entry.
+    #
+    # close_time, NOT the stated deadline, even for a DR-73 ladder, and that
+    # is deliberate rather than an oversight: this bounds the window in which
+    # both rungs are still OPEN and have candles, which is an exchange fact
+    # about the listing. The stated deadline bounds the ORDER and the TIER,
+    # which is a fact about the question. min() is order-independent, so it is
+    # unaffected by any swap below.
     scan_end   = min(close_a, close_b) - timedelta(days=1)
     # Look back at most 1 year from scan_end to keep the scan window manageable
     scan_start = max(start_date, scan_end - timedelta(days=365))
@@ -1413,38 +1867,74 @@ def _find_entry(
         # original schedule — a later-deadline leg that resolved early is
         # ordered first on the realized gap. Recorded, pre-existing residual
         # (CLAUDE.md TS-06); not fixed by this datetime ordering.
-        dt_a = _parse_iso_datetime(mA.get("close_time"))
-        dt_b = _parse_iso_datetime(mB.get("close_time"))
-        try:
-            b_before_a = dt_b < dt_a
-        except TypeError:
-            b_before_a = close_b < close_a
+        # DR-73: a same-event deadline LADDER is the one time-series shape
+        # close_time cannot order or measure, so it is ordered and gapped on
+        # the two rungs' STATED deadlines instead. Gated on the resolved flag,
+        # never on event_ticker equality alone: _extract_pairs only proposes a
+        # same-event pair while the switch is on, but a caller that builds one
+        # itself must not silently get ladder semantics from a switched-off
+        # tree.
+        #
+        # The classification here IS per pair, and that is a deliberate,
+        # bounded exemption from DR-70's once-per-market rule: this function
+        # receives two market dicts and holds no memo to hang a per-market
+        # verdict on, and it runs once per CANDIDATE PAIR rather than once per
+        # pair of members — 975 ladder pairs over the whole 284-slice archive
+        # at the <= 30-day cap, at ~12.3 us a classification. _extract_pairs,
+        # which does face the O(N^2) enumeration, memoizes per member.
+        ladders_on = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
+                      else same_event_ladders)
+        event_a = mA.get("event_ticker") or ""
+        if ladders_on and event_a and event_a == (mB.get("event_ticker") or ""):
+            ladder = same_event_ladder(
+                _stated_deadline_dict(mA, _deadline_profile_dict(mA)),
+                _stated_deadline_dict(mB, _deadline_profile_dict(mB)),
+            )
+            # Fails CLOSED, like every other step of the ladder rule: a rung
+            # whose deadline cannot be read (None) gives no order and no gap,
+            # and two rungs naming ONE day (SAME_DAY) are one deadline spelled
+            # two ways rather than a ladder. Branch on `is`, never truthiness
+            # — SAME_DAY is a non-empty string, so `if ladder:` is true for it
+            # and unpacking it raises.
+            if ladder is None or ladder is SAME_DAY:
+                return None
+            b_before_a, gap_days = ladder
+        else:
+            dt_a = _parse_iso_datetime(mA.get("close_time"))
+            dt_b = _parse_iso_datetime(mB.get("close_time"))
+            try:
+                b_before_a = dt_b < dt_a
+            except TypeError:
+                b_before_a = close_b < close_a
+            # Deadline gap is loop-invariant: a wider gap carries more genuine
+            # in-between probability mass, so 16-30 day gaps demand the larger
+            # tier and gaps beyond MAX_DEADLINE_GAP_DAYS are never disputed.
+            # Measure it on the close_time DATETIMES parsed above, not on the
+            # dates: timedelta.days floors, while calendar-date subtraction
+            # counts day boundaries, so the two disagree by up to a day
+            # whenever the closes straddle midnight (2026-02-01T23:00Z vs
+            # 2026-02-17T01:00Z is gap 15 live but 16 by date). That one day
+            # flips both the tier boundary and the 30-day cutoff, so a
+            # backtest that is supposed to replay the live strategy must use
+            # the live arithmetic. The gap is order-independent (abs), which
+            # is why it is computed before the swap below rather than after —
+            # the swap cannot change it, and dt_a/dt_b are read nowhere else.
+            try:
+                # Identical arithmetic to scanner.deadline_gap_days (used by
+                # find_time_series_pairs / _pair_max_sum): absolute
+                # timedelta.days on tz-aware datetimes, so the result is
+                # order-independent
+                gap_days = abs(dt_b - dt_a).days
+            except TypeError:
+                # A naive/aware mix (only reachable from a hand-edited cache)
+                # can't be subtracted; fall back to the dates rather than
+                # raising, per this file's "can't parse it = unknown, not an
+                # error" convention
+                gap_days = abs(close_b - close_a).days
         if b_before_a:
             mA, mB = mB, mA
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
-            dt_a, dt_b = dt_b, dt_a
-        # Deadline gap is loop-invariant: a wider gap carries more genuine
-        # in-between probability mass, so 16-30 day gaps demand the larger
-        # tier and gaps beyond MAX_DEADLINE_GAP_DAYS are never disputed.
-        # Measure it on the close_time DATETIMES parsed above, not on the dates:
-        # timedelta.days floors, while calendar-date subtraction counts day
-        # boundaries, so the two disagree by up to a day whenever the closes
-        # straddle midnight (2026-02-01T23:00Z vs 2026-02-17T01:00Z is gap 15
-        # live but 16 by date). That one day flips both the tier boundary and
-        # the 30-day cutoff, so a backtest that is supposed to replay the live
-        # strategy must use the live arithmetic. The gap is order-independent
-        # (abs), so swapping dt_a/dt_b above cannot change it.
-        try:
-            # Identical arithmetic to scanner.deadline_gap_days (used by
-            # find_time_series_pairs / _pair_max_sum): absolute timedelta.days
-            # on tz-aware datetimes, so the result is order-independent
-            gap_days = abs(dt_b - dt_a).days
-        except TypeError:
-            # A naive/aware mix (only reachable from a hand-edited cache) can't
-            # be subtracted; fall back to the dates rather than raising, per
-            # this file's "can't parse it = unknown, not an error" convention
-            gap_days = abs(close_b - close_a).days
         if gap_days > MAX_DEADLINE_GAP_DAYS:
             return None
         # Tier the required price gap by deadline distance (15% for gaps
@@ -1463,10 +1953,16 @@ def _find_entry(
         entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
 
         # Optional opt-in bet-horizon cap: skip checkpoints where the
-        # later-closing leg (close_b, since time_series always keeps
-        # close_b >= close_a and same_title has no ordering) would close
-        # further out than max_horizon_days from THIS simulated checkpoint —
-        # a cheap comparison done before touching candle data
+        # later-closing leg would close further out than max_horizon_days from
+        # THIS simulated checkpoint — a cheap comparison done before touching
+        # candle data. Deliberately max(close_a, close_b) rather than close_b:
+        # same_title has no ordering at all, and since DR-73 a same-event
+        # LADDER is ordered by STATED deadline, so close_b >= close_a no longer
+        # holds for every time_series pair either (in the archive 13 dated
+        # same-event pairs are ordered the wrong way round by realized close,
+        # and 681 have a close gap of ZERO days). The max() keeps this correct
+        # under all three; close_time is read here ON PURPOSE, because this
+        # bounds when a market is still OPEN, not when its deadline falls.
         if max_horizon_days is not None and (max(close_a, close_b) - entry_date).days > max_horizon_days:
             continue
 
@@ -1890,6 +2386,7 @@ def _prepare_entries(
     start_date: date,
     use_cache: bool,
     max_horizon_days: int | None,
+    same_event_ladders: bool | None = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -1913,6 +2410,14 @@ def _prepare_entries(
             Monday checkpoint, a pair can only enter if the later-closing leg
             closes within max_horizon_days of THAT checkpoint. None applies no
             cap. Passed straight through to _find_entry() for each pair.
+        same_event_ladders (bool | None): Whether two dated cumulative rungs
+            of ONE event may pair (DR-73). None (the default) resolves this
+            module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
+            import) at call time; patching config itself is a silent no-op —
+            see _extract_pairs' own entry. Handed
+            verbatim to BOTH _extract_pairs() and _find_entry(), which is
+            load-bearing: the two must agree, or a pair this function
+            proposes is replayed under the other rule's ordering.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -2067,8 +2572,13 @@ def _prepare_entries(
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
-    ts_pairs     = _extract_pairs(ts_groups)
-    same_pairs   = _extract_pairs(same_groups)
+    # The ladder flag rides through unresolved (None included), so the two
+    # calls and the _find_entry sweep below all resolve the same constant at
+    # the same moment. The same-title call takes it too, for signature
+    # uniformity — 3-tuple-keyed groups have no deadline concept and the flag
+    # is inert there.
+    ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
+    same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders)
     # Release the group maps AND the record list together, before the
     # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
     # at function exit, which is where they were all freed before. Nothing
@@ -2125,6 +2635,10 @@ def _prepare_entries(
         entry = _find_entry(
             candles_a, candles_b, mA_orig, mB_orig, pair_type, start_date,
             max_horizon_days=max_horizon_days,
+            # Same unresolved flag _extract_pairs was handed: a same-event
+            # pair it proposed must be ordered and tiered by the same rule
+            # that admitted it (DR-73).
+            same_event_ladders=same_event_ladders,
         )
         if entry is None:
             continue
@@ -2349,9 +2863,11 @@ def _simulate_at_discount(
         # — it means a pair whose wording read as two cumulative deadlines
         # settled as an apparently non-nesting pair. That is most likely a
         # wording false negative, but it is not the only mechanism: it can
-        # also be a genuinely nested pair whose legs were ordered on an early
+        # also be a CROSS-EVENT pair whose legs were ordered on an early
         # REALIZED close (ranking them by scheduled close would have kept the
-        # nesting), or strike-blind grouping on a cache without subtitles.
+        # nesting) — cross-event only since DR-73, because a same-event ladder
+        # is ordered on its two STATED deadlines and never on close_time — or
+        # strike-blind grouping on a cache without subtitles.
         # DR-72 widens the named CAUSES beyond the single "mixed snapshot
         # family" guess this line used to make — see the cause list below,
         # and CLAUDE.md's strategy-change gotcha for what each one means.
@@ -2361,10 +2877,12 @@ def _simulate_at_discount(
             "pair passed the wording screen in _extract_pairs but still settled "
             "as a non-nesting pair. Most likely a wording false negative (e.g. "
             "snapshot markets, or recurring windows worded 'before <date>', "
-            "read as cumulative); legs ordered on an early REALIZED close (a "
+            "read as cumulative); legs ordered on an early REALIZED close — a "
             "later-deadline leg that resolved YES before the earlier leg's "
-            "deadline); or strike-blind grouping on a cache without subtitles "
-            "(see the outcome-label coverage line)",
+            "deadline, which is possible for CROSS-EVENT pairs only, since a "
+            "same-event ladder is ordered on its stated deadlines; or "
+            "strike-blind grouping on a cache without subtitles (see the "
+            "outcome-label coverage line)",
             premise_violations,
         )
 
@@ -2918,6 +3436,15 @@ def run_backtest(
     # The outcome-label census rides out alongside the entries (DR-66b), but
     # this entry point returns the historical two-tuple and feeds no dashboard,
     # so it is discarded here — the census has already logged itself.
+    #
+    # No same_event_ladders argument, deliberately: this function keeps its
+    # exact pre-DR-73 signature for every existing caller, and omitting the
+    # keyword leaves _prepare_entries' None sentinel to resolve this module's
+    # TIME_SERIES_SAME_EVENT_LADDERS (bound from config at import) at call
+    # time — the value live sizing uses. A harness that wants ladders here must
+    # patch backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config
+    # attribute, which this module never reads; the supported lever is
+    # run_backtest_sweep(same_event_ladders=...), which needs no patching.
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
     )
@@ -2943,6 +3470,7 @@ def run_backtest_sweep(
     max_horizon_days: int | None = None,
     interval_discount: float | None = None,
     sweep: bool = True,
+    same_event_ladders: bool | None = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them.
@@ -2993,6 +3521,19 @@ def run_backtest_sweep(
             config.INTERVAL_DISCOUNT_SWEEP. When False, points holds the
             primary alone — the escape hatch for a full-history run where the
             extra passes are not worth their time.
+        same_event_ladders (bool | None): Whether two dated cumulative rungs
+            of ONE event may pair for this run (DR-73). None (the default)
+            resolves this module's TIME_SERIES_SAME_EVENT_LADDERS (bound from
+            config at import) at call time — the value the live finder uses.
+            Passing it here is the SUPPORTED way to flip ladders for one
+            backtest and needs no monkeypatching at all; patching
+            config.TIME_SERIES_SAME_EVENT_LADDERS would be a silent no-op.
+            Passed straight through to
+            _prepare_entries(), so it is k-INDEPENDENT like everything else
+            there: it changes which pairs exist, not how any of them is
+            priced, and therefore applies identically to every swept point.
+            Like --interval-discount, it never reaches live sizing: nothing
+            here writes config.py.
 
     Returns:
         BacktestSweep: primary (the effective-discount result), points
@@ -3022,8 +3563,23 @@ def run_backtest_sweep(
     # by every point below. None means the feasibility pre-check failed.
     # label_coverage is the run's outcome-label census, k-independent like the
     # calibration below and carried on the sweep for the same reason.
+    # Logged with its SOURCE, not just its value: a run that reads the config
+    # and one that was handed the same value on the command line are different
+    # facts about what produced the numbers below, and DR-73's switch is the
+    # one input here that changes which PAIRS exist rather than how they are
+    # priced. Resolved for the log only — _prepare_entries takes the sentinel
+    # verbatim and resolves it itself, so there is exactly one resolution that
+    # the run actually depends on.
+    logging.info(
+        "Same-event deadline ladders (DR-73): %s (%s)",
+        "on" if (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
+                 else same_event_ladders) else "off",
+        "config.TIME_SERIES_SAME_EVENT_LADDERS" if same_event_ladders is None
+        else "run-level override",
+    )
     raw_entries, label_coverage = _prepare_entries(
-        hist_client, live_client, start_date, use_cache, max_horizon_days
+        hist_client, live_client, start_date, use_cache, max_horizon_days,
+        same_event_ladders=same_event_ladders,
     )
     if raw_entries is None:
         # Nothing can be simulated at any discount. Build the empty point

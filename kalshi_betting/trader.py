@@ -12,8 +12,9 @@ Purpose:
     _ordered_legs() from scanner.leg_sides / scanner.leg_prices — the ONLY
     source of truth for it in this module: for a same_title pair the NO leg is
     market_a (NO on the pricier contract, YES on the cheaper one); for a
-    time_series pair the NO leg is market_b (NO on the later-closing contract,
-    YES on the earlier one). Never hardcode spec.pair.market_a as the NO leg.
+    time_series pair the NO leg is market_b (NO on the later contract, YES on
+    the earlier one — later/earlier by close_time, or by STATED deadline for a
+    same-event ladder, DR-73). Never hardcode spec.pair.market_a as the NO leg.
     Both buy legs are price-protected against a book that moved since the
     pre-execution check, so such an order is killed instead of filling at a
     loss. If the YES leg fails, a rollback order is immediately submitted to
@@ -475,8 +476,9 @@ def _build_no_order(leg: _Leg) -> CreateOrderRequest:
     Build a legacy market (taker) order to buy NO contracts on one leg's market.
 
     This is always the FIRST-submitted leg of a pair (see _ordered_legs): NO
-    on the pricier contract of a same_title pair, or NO on the later-closing
-    contract of a time_series pair. fill_or_kill is used so the order succeeds
+    on the pricier contract of a same_title pair, or NO on the later contract
+    of a time_series pair (later by close_time, or by stated deadline for a
+    DR-73 ladder). fill_or_kill is used so the order succeeds
     atomically or fails entirely, preventing partial fills at the wrong price.
     buy_max_cost caps the total spend at the scanned price plus a small
     slippage allowance.
@@ -511,8 +513,8 @@ def _build_yes_order(leg: _Leg) -> CreateOrderRequest:
     the completed pair pays depends on the pair type. For a same_title pair
     (YES on the cheaper contract, NO held on the pricier one) one leg pays
     whenever the two contracts co-resolve, which is the pair's premise. For a
-    time_series pair (YES on the earlier-closing contract, NO held on the
-    later one) there are exactly three settlement cells: the event happens by
+    time_series pair (YES on the earlier contract, NO held on the later one —
+    ordered by close_time, or by stated deadline for a DR-73 ladder) there are exactly three settlement cells: the event happens by
     the earlier deadline (both YES — this leg pays), it never happens by the
     later deadline (both NO — the NO leg pays), or it happens in between
     (earlier NO, later YES — both legs are worthless and the stake is lost);

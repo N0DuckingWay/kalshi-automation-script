@@ -6,7 +6,8 @@ Last edited by: Zachary Hoffman
 Purpose:
     Command-line entry point for the Kalshi backtester. Parses CLI
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
-    --interval-discount, --no-sweep), configures logging to
+    --interval-discount, --no-sweep, --same-event-ladders /
+    --no-same-event-ladders), configures logging to
     kalshi_backtest.log, constructs the necessary API clients, delegates the
     full backtest simulation to backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report.
@@ -29,6 +30,22 @@ Notes:
     config.time_series_profit_prob with no override, so live trades always price
     on config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. Nothing here writes config.py
     — the calibration the run reports is a recommendation for a human to act on.
+
+    --same-event-ladders / --no-same-event-ladders (DR-73) is the same kind of
+    one-run override for config.TIME_SERIES_SAME_EVENT_LADDERS, and also never
+    reaches the live finder — scanner.py binds that constant at import. Unlike
+    k, it changes WHICH PAIRS EXIST rather than how they are priced, so it
+    applies identically to every swept discount and a run with it on is not
+    comparable to a baseline taken without it. It is the way to measure the
+    ladder strategy the switch gates before flipping the switch.
+
+    That setting reaches kalshi_backtest.log ONLY — the pre-fetch echo below
+    and run_backtest_sweep's resolved line. The HTML dashboard does not render
+    it, so a ladder-enabled run's dashboard is indistinguishable from a
+    switch-off one and must be labelled by hand. Recorded rather than fixed:
+    dashboard.py is outside DR-73's blast radius, and unlike DR-66b's
+    subtitle-coverage caveat this setting is chosen by the operator on the
+    command line rather than discovered by the run.
 """
 import argparse
 import logging
@@ -36,7 +53,11 @@ import logging.handlers
 from datetime import UTC, date, datetime
 
 from .backtester import run_backtest_sweep
-from .config import PROJECT_ROOT, TIME_SERIES_INTERVAL_PROB_DISCOUNT
+from .config import (
+    PROJECT_ROOT,
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+    TIME_SERIES_SAME_EVENT_LADDERS,
+)
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client
 
@@ -91,6 +112,18 @@ def main() -> None:
         "--no-sweep", action="store_true",
         help="Skip the k sweep; the dashboard's k selector will offer one value only",
     )
+    # BooleanOptionalAction gives --same-event-ladders and
+    # --no-same-event-ladders from one declaration; default=None is the "no
+    # override" sentinel run_backtest_sweep resolves at call time, exactly as
+    # --interval-discount's None resolves k. There is nothing to validate — the
+    # action can only ever yield True, False or None.
+    parser.add_argument(
+        "--same-event-ladders", action=argparse.BooleanOptionalAction, default=None,
+        help="Pair two dated cumulative rungs of ONE event as a time-series "
+             "ladder for this backtest (default: config."
+             "TIME_SERIES_SAME_EVENT_LADDERS). Affects the backtest only — the "
+             "live finder binds that constant at import.",
+    )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
@@ -139,10 +172,17 @@ def main() -> None:
     # what the dashboard is handed.
     effective_k = (TIME_SERIES_INTERVAL_PROB_DISCOUNT if args.interval_discount is None
                    else args.interval_discount)
+    # Same pre-fetch echo, same reason, for DR-73's switch: run_backtest_sweep
+    # logs the authoritative resolved value with its source, but this line
+    # lands BEFORE a multi-hour fetch so an operator can abort a run configured
+    # the wrong way round.
+    effective_ladders = (TIME_SERIES_SAME_EVENT_LADDERS if args.same_event_ladders is None
+                         else args.same_event_ladders)
 
     logging.info(
-        "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f",
+        "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
+        "on" if effective_ladders else "off",
     )
 
     # Always uses prod API — historical data only exists there.
@@ -158,6 +198,7 @@ def main() -> None:
         max_horizon_days=args.max_horizon_days,
         interval_discount=args.interval_discount,
         sweep=not args.no_sweep,
+        same_event_ladders=args.same_event_ladders,
     )  # returns BacktestSweep — primary point, one point per swept k, and the calibration
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep

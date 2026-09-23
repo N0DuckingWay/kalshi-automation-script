@@ -150,6 +150,58 @@ class TestNoSweepArgument:
         assert kwargs["use_cache"] is True
 
 
+class TestSameEventLaddersArgument:
+    """--same-event-ladders / --no-same-event-ladders (DR-73c)."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        # None is the "no override" sentinel _extract_pairs and _find_entry
+        # resolve against their own module's TIME_SERIES_SAME_EVENT_LADDERS at
+        # call time — the CLI must not pre-resolve it, exactly as it must not
+        # pre-resolve k.
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["same_event_ladders"] is None
+
+    def test_the_flag_turns_ladders_on(self, cli, monkeypatch):
+        _run(monkeypatch, "--same-event-ladders")
+        assert cli["sweep_kwargs"]["same_event_ladders"] is True
+
+    def test_the_negated_flag_turns_ladders_off(self, cli, monkeypatch):
+        # BooleanOptionalAction gives the --no- form from one declaration, and
+        # it must reach the sweep as an explicit False rather than as None —
+        # False overrides a switched-ON config, None defers to it.
+        _run(monkeypatch, "--no-same-event-ladders")
+        assert cli["sweep_kwargs"]["same_event_ladders"] is False
+
+    def test_it_threads_alongside_the_other_flags(self, cli, monkeypatch):
+        _run(monkeypatch, "--same-event-ladders", "--interval-discount", "0.4",
+             "--no-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert kwargs["same_event_ladders"] is True
+        assert kwargs["interval_discount"] == pytest.approx(0.4)
+        assert kwargs["sweep"] is False
+
+    def test_the_config_echo_names_the_effective_setting(self, cli, monkeypatch, caplog):
+        # Echoed BEFORE the fetch, beside k, so an operator can abort a
+        # multi-hour run configured the wrong way round.
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--same-event-ladders")
+        assert "ladders=on" in caplog.text
+
+    def test_the_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch,
+                                                             caplog):
+        # Patched to the NON-shipped value on purpose: with the constant set
+        # to its own default (False) this row passes for any implementation
+        # that ignores it entirely, including `bool(args.same_event_ladders)`
+        # — and would then print "off" on a genuinely ON run the moment the
+        # switch is flipped, which is exactly what this echo exists to catch.
+        # The module attribute is the seam, not config's: backtest.py binds
+        # the constant by value at import.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "ladders=on" in caplog.text
+
+
 class TestDashboardHandoff:
     """generate_dashboard gets the whole sweep plus the RESOLVED primary k."""
 

@@ -3,7 +3,7 @@ import dataclasses
 import json
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1632,6 +1632,788 @@ class TestDeadlinePairRefusal:
         assert scanner.cumulative_deadline_pair(profile_b, profile_a) == (expected is None)
 
 
+class TestStatedDeadline:
+    """DR-73a: reading a rung's wording as the LAST CALENDAR DAY its deadline
+    includes.
+
+    Every row drives the PUBLIC helper end to end — deadline_profile() over a
+    real title, then stated_deadline() over the same three fields — so the
+    rows pin the span table, the preposition split and the field cross-check
+    together, exactly as a finder will call them.
+
+    The refusals are as load-bearing as the acceptances and each one is
+    measured, not defensive: a year-less rung cannot be placed at all, an
+    article with no "end of" is a truncated season range, "until"/"up to" do
+    not say whether the named day counts, and a bare year behind "through" is
+    the recorded "2018-19 through 2025-26" false-cumulative residual. See
+    scanner._span_deadline.
+    """
+
+    @staticmethod
+    def _read(event_title="", title="", subtitle=""):
+        """Classify and read one market exactly as a finder does."""
+        profile = scanner.deadline_profile(event_title, title, subtitle)
+        return scanner.stated_deadline(profile, event_title, title, subtitle)
+
+    @pytest.mark.parametrize("span, expected", [
+        # Inclusive prepositions: the named day is the last one covered.
+        ("by Sep 23, 2026", date(2026, 9, 23)),
+        ("no later than Sep 23, 2026", date(2026, 9, 23)),
+        ("on or before Sep 23, 2026", date(2026, 9, 23)),
+        # Exclusive prepositions: the deadline stops the day BEFORE.
+        ("before Sep 23, 2026", date(2026, 9, 22)),
+        ("prior to Sep 23, 2026", date(2026, 9, 22)),
+        # Month granularity: inclusive covers the whole month, exclusive stops
+        # at the end of the previous one. The leap-year row is why the last
+        # day comes from calendar.monthrange rather than a fixed table.
+        ("by March 2026", date(2026, 3, 31)),
+        ("before March 2026", date(2026, 2, 28)),
+        ("before March 2024", date(2024, 2, 29)),
+        # Year granularity, the same two directions.
+        ("by 2027", date(2027, 12, 31)),
+        ("before 2026", date(2025, 12, 31)),
+        # ISO, INCLUSIVE only — a bare ISO date and one cut out of a full
+        # timestamp are indistinguishable, and they agree on the inclusive
+        # side. The exclusive side is in the refusal table below.
+        ("by 2026-03-15", date(2026, 3, 15)),
+        # A weekday in front of the date is noise; the date behind it names
+        # the day (DR-68 keeps the whole span rather than truncating it).
+        ("by Friday, Sep 19, 2026", date(2026, 9, 19)),
+        # "end of", month and year granularity, behind an inclusive
+        # preposition only. The article is allowed HERE and nowhere else.
+        ("by the end of 2027", date(2027, 12, 31)),
+        ("by end of 2027", date(2027, 12, 31)),
+        ("by the end of June 2027", date(2027, 6, 30)),
+        # "through" reads inclusive with a month-name date; it occurs live.
+        ("through June 30, 2027", date(2027, 6, 30)),
+    ])
+    def test_reads_the_last_included_day(self, span, expected):
+        assert self._read(title=f"Will the thing happen {span}?") == expected
+
+    @pytest.mark.parametrize("span", [
+        # A bare year behind "through" is a season range, not a deadline:
+        # CLAUDE.md's DR-67 residuals record "2018-19 through 2025-26"
+        # spanning as "through 2025". Accepting it would promote a known
+        # false-cumulative into a usable calendar date.
+        "through 2025",
+        # An article with no "end of" is what "Before the 2027-28 season"
+        # truncates to (105 such rungs in the live ladder population).
+        "before the 2027",
+        # ... but "end of" is exactly what makes an article meaningful, so
+        # the guard is `article and not end_of` and not a bare article test.
+        # "before the end of 2027" refuses for the OTHER reason: "end of"
+        # behind an exclusive preposition names the day before an unstated
+        # last day.
+        "before the end of 2027",
+        # Inclusivity not stated.
+        "until Dec 31, 2026",
+        "up to Dec 31, 2026",
+        # Year-less: nothing anchors the year, and guessing mis-orders a
+        # ladder crossing New Year (KXAPCALLSENATE-26AUG20 lists "Before
+        # Nov 4" (2026) beside "Before Jan 5" (2027)).
+        "before Nov 4",
+        "by Dec 31",
+        "before October",
+        "by Friday",
+        # Quarter and end-of-period nouns name a period this reader does not
+        # place; the phrasing table accepts them as deadline WORDING, which is
+        # why they have to be refused here rather than assumed absent.
+        "by Q1 2026",
+        "by end of Q4 2026",
+        "by year-end",
+        "by EOY",
+        # An article IMMEDIATELY in front of a bare year is the same season
+        # range as "before the 2027", reached past that guard because
+        # "end of" disarms it: KXCANADACUP-30's title truncates "the 2030-31
+        # season" to this span. The "by the end of 2027" row in the
+        # acceptance table above is the control that keeps this narrow.
+        "by the end of the 2030",
+        "by end of the 2030",
+        # A bare ISO behind an EXCLUSIVE preposition. _COMPILED_CUMULATIVE[0]
+        # cuts one out of a full timestamp, whose last included day is the
+        # NAMED one, so dating it a day early is this reader's only fail-OPEN
+        # direction — KXDIAZOUT-MDC lists five such rungs under one event
+        # ticker in backtest_cache/archive_days.
+        "before 2026-03-15",
+        "prior to 2026-03-15",
+        # A NUMERIC calendar date. _DEADLINE_DATE_TOKEN's m/d alternative
+        # spans one, so the phrase reaches this reader, but no accepted token
+        # is numeric-m/d and the shape occurs zero times in either candidate
+        # population.
+        "by 12/31/2026",
+        "before 12/31/2026",
+        # "end of" at DAY granularity names no period.
+        "by the end of Sep 23, 2026",
+        # An impossible calendar date states no day.
+        "by Feb 30, 2026",
+        # Below the 2020 floor the bare-year token shares with the phrasing
+        # table: "decrease by 2019" is an amount, not a deadline.
+        "by 2019",
+    ])
+    def test_refuses_wording_it_cannot_place(self, span):
+        assert self._read(title=f"Will the thing happen {span}?") is None
+
+    def test_the_bare_year_floor_matches_the_phrasing_table(self):
+        # _span_deadline shares _DEADLINE_DATE_TOKEN's 2020-2099 bound, so
+        # "decrease by 2019" is an amount rather than a deadline. On the
+        # finder path the phrasing table refuses "by 2019" first, so this row
+        # drives _span_deadline directly with a bare SPAN — not raw wording,
+        # which the anchored _STATED_SPAN rejects — to pin the floor itself.
+        assert scanner._span_deadline("by 2019") is None
+        assert scanner._span_deadline("by 2020") == date(2020, 12, 31)
+        assert scanner._span_deadline("by 2099") == date(2099, 12, 31)
+        assert scanner._span_deadline("by 2100") is None
+
+    def test_the_reader_is_not_a_wording_parser(self):
+        # _STATED_SPAN is anchored at both ends, so the string must begin with
+        # the preposition and end with the date token. Pinned because the
+        # docstring used to invite raw wording and C2/C3 feed this reader from
+        # market fields: a silent None on every market is indistinguishable
+        # from "this corpus has no dated ladders" (the DR-66 shape).
+        assert scanner._span_deadline("Will X happen by Dec 31, 2026?") is None
+        assert scanner._span_deadline("by Dec 31, 2026?") is None
+        assert scanner._span_deadline("resolved by Dec 31, 2026") is None
+        # Case and whitespace ARE normalized, which is all the docstring claims.
+        assert scanner._span_deadline("  BY   DEC 31,  2026  ") == date(2026, 12, 31)
+
+    def test_every_month_spelling_the_phrasing_table_matches_has_a_number(self):
+        # _STATED_MONTH_NUMBERS is a hand-written literal (it must not be read
+        # off the locale-sensitive calendar module — see its comment), so the
+        # anti-drift guarantee lives here: a spelling _DEADLINE_MONTH matches
+        # but this table lacks reads as None, silently removing that family
+        # from the ladder population.
+        alternation = scanner._DEADLINE_MONTH.removeprefix("(?:").removesuffix(")")
+        spellings = set()
+        for alternative in alternation.split("|"):
+            if alternative.endswith("?"):
+                spellings.add(alternative[:-1])  # "Sept?" -> "Sept"
+                spellings.add(alternative[:-2])  # "Sept?" -> "Sep"
+            else:
+                spellings.add(alternative)
+        assert len(spellings) >= 24
+        missing = sorted(s for s in spellings if s.lower() not in scanner._STATED_MONTH_NUMBERS)
+        assert missing == [], missing
+
+    def test_the_reader_covers_every_preposition_the_phrasing_table_can_span(self):
+        # Two separately-maintained preposition lists that must agree:
+        # _CUMULATIVE_DEADLINE_PATTERNS[0] decides which prepositions can
+        # APPEAR in a span, _STATED_SPAN plus the four tables decide which can
+        # be READ. A preposition added to the phrasing table alone makes every
+        # span carrying it read as None — the same silent family loss
+        # TestPhrasingTableInvariants exists to prevent on the tables above.
+        inner = scanner._CUMULATIVE_DEADLINE_PATTERNS[0].split("(?:", 1)[1].split(")", 1)[0]
+        spannable = {a.replace(r"\s+", " ") for a in inner.split("|")}
+        assert "no later than" in spannable and "prior to" in spannable
+        readable = (
+            scanner._STATED_INCLUSIVE | scanner._STATED_EXCLUSIVE
+            | scanner._STATED_THROUGH | scanner._STATED_AMBIGUOUS
+        )
+        assert spannable == readable, spannable ^ readable
+        # ... and _STATED_SPAN's own alternation is the same set again, or a
+        # table entry would be unreachable.
+        head = scanner._STATED_SPAN.pattern.split("^(", 1)[1].split(")", 1)[0]
+        assert set(head.split("|")) == readable
+
+    def test_a_non_str_span_reads_as_absent(self):
+        # Same fail-safe-by-type rule leg_sides and _depth_levels follow: a
+        # MagicMock auto-attribute must not raise out of the parser.
+        assert scanner._span_deadline(MagicMock()) is None
+        assert scanner._span_deadline(None) is None
+        assert scanner._span_deadline("") is None
+
+    def test_a_non_cumulative_verdict_has_no_stated_deadline(self):
+        # Fails closed exactly as cumulative_deadline_pair does: a snapshot
+        # or unknown leg has no nesting premise, so it has no ladder rung.
+        assert scanner.stated_deadline(
+            (scanner.DEADLINE_SNAPSHOT, ("by sep 23, 2026",)), "", "", ""
+        ) is None
+        assert scanner.stated_deadline((scanner.DEADLINE_UNKNOWN, ()), "", "", "") is None
+        assert scanner.stated_deadline(
+            (scanner.DEADLINE_CUMULATIVE, ()), "", "", ""
+        ) is None
+
+    def test_two_different_days_in_the_deciding_field_refuse(self):
+        # Ambiguity in the one field that decides is refused, not resolved:
+        # there is no more authoritative field to break the tie.
+        assert self._read(
+            title="Will it happen by Sep 23, 2026 or by Oct 16, 2026?"
+        ) is None
+
+    def test_one_day_stated_twice_in_the_deciding_field_still_reads(self):
+        # The converse: two spans naming the SAME day are not ambiguity.
+        assert self._read(
+            title="Will it happen by Sep 23, 2026 — by Sep 23, 2026?"
+        ) == date(2026, 9, 23)
+
+    def test_by_and_before_the_same_named_day_are_one_spelling(self):
+        # KXSPACEXSTARSHIP-14-26SEP23 on the 2026-09-22 live snapshot, and
+        # Kalshi's standard ladder template: the title says "before Sep 23,
+        # 2026" (last included day Sep 22) and the subtitle "By Sep 23, 2026"
+        # (Sep 23). The market's close_time is 2026-09-23T03:59Z — 23:59 on
+        # Sep 22 in New York — so those are ONE deadline named two ways, not a
+        # one-day disagreement, and the day-SET cross-check must read it.
+        # Comparing single last-included days instead refused all five rungs
+        # of the widest live ladder. The subtitle decides under DR-69.
+        assert self._read(
+            event_title="SpaceX Starship 14th launch?",
+            title="Will SpaceX launch another Starship before Sep 23, 2026?",
+            subtitle="By Sep 23, 2026",
+        ) == date(2026, 9, 23)
+
+    def test_a_bare_year_against_a_named_day_still_refuses(self):
+        # The day-SET check must not admit a field whose readings are
+        # DISJOINT from the deciding field's. SCOTREF-27's rungs title a bare
+        # year ("called before 2028" -> {2027-12-31, 2028-12-31}) against a
+        # subtitle "By Jan 1, 2028" -> {2028-01-01}: no reading in common, so
+        # the rung is refused. 30 of the 47 cross-field markets on the
+        # 2026-09-22 snapshot are this shape.
+        assert self._read(
+            title="New Scottish referendum called before 2028?",
+            subtitle="By Jan 1, 2028",
+        ) is None
+
+    def test_cross_field_conflict_refuses_starship_florida(self):
+        # KXSTARSHIPFL-26JUN-26OCT01, same snapshot: a stale sub-contract
+        # label ("Before 2026" -> 2025-12-31) against a title nine months
+        # later. 47 actively-priced cumulative markets on that snapshot state
+        # two different days across their own fields.
+        assert self._read(
+            event_title="When will SpaceX's Starship launch from Florida?",
+            title="Will SpaceX's Starship launch from Florida before Oct 1, 2026",
+            subtitle="Before 2026",
+        ) is None
+
+    def test_a_truncated_iso_timestamp_rung_is_refused(self):
+        # KXDIAZOUT-MDC-26APR01 as backtest_cache/archive_days holds it: a
+        # blank cached subtitle makes the TITLE decide, and the title's
+        # deadline is a full timestamp that _COMPILED_CUMULATIVE[0] cuts down
+        # to a bare ISO date. The market is open through 14:00 on Apr 1, so
+        # the last included day is Apr 1, not Mar 31 — and reading it a day
+        # early would turn a SAME_DAY refusal against a sibling worded "by
+        # Apr 1, 2026" into a 1-day ladder. Five rungs of that one event are
+        # in the cache; the reader refuses all five rather than guess.
+        assert self._read(
+            title="Will Miguel Díaz-Canel leave office before 2026-04-01T14:00:00.000Z?",
+        ) is None
+
+    def test_a_non_deciding_field_that_names_no_day_does_not_refuse(self):
+        # The cross-check refuses on DISAGREEMENT, never on silence: a
+        # year-less phrase elsewhere in the wording names no day to disagree
+        # with. Refusing on it would throw away the rungs DR-73 exists for.
+        assert self._read(
+            event_title="Will it happen before Nov 4?",
+            title="Will it happen by Sep 23, 2026?",
+        ) == date(2026, 9, 23)
+
+    def test_fields_that_agree_still_read(self):
+        # Two fields spelling the SAME day (one inclusive, one exclusive by a
+        # day) is agreement, not conflict.
+        assert self._read(
+            title="Will it happen before Apr 1, 2027?",
+            subtitle="By Mar 31, 2027",
+        ) == date(2027, 3, 31)
+
+    # control — kills a "refuse everything" mutant, which every refusal row
+    # above would pass. These are the SIX (preposition, token-shape) buckets
+    # that actually occur in the live same-event ladder candidate population
+    # (the 4,161 cumulative, span-carrying rungs of events holding >= 2 of
+    # them, on the .git/dr67-scratch 2026-09-22 snapshot of 113,303 markets,
+    # 3,951 of which read to a date), each with a real ticker and its measured
+    # rung count — the six counts sum to exactly that 3,951. Four small
+    # archive day slices add no shape these six do not already cover. If a
+    # future tightening refuses one of them it removes a whole live family
+    # from the strategy, silently.
+    @pytest.mark.parametrize("ticker, span, expected", [
+        # 2,834 rungs, e.g. KXXISUCCESSOR-45JAN01-DXUE
+        ("KXXISUCCESSOR-45JAN01-DXUE", "before Jan 1, 2045", date(2044, 12, 31)),
+        # 525 rungs
+        ("KXMILLENNIUMNEXT-45-BSD", "before 2045", date(2044, 12, 31)),
+        # 444 rungs
+        ("KXFEDHIKE-2-26DEC31", "by Dec 31, 2026", date(2026, 12, 31)),
+        # 127 rungs
+        ("KXTVSEASONRELEASETHELASTOFUS-26-OCT", "before Oct 2026", date(2026, 9, 30)),
+        # 19 rungs — the only live "through" family
+        ("KXNYCSTAT-HOME27-A275", "through June 30, 2027", date(2027, 6, 30)),
+        # 2 rungs
+        ("USCLIMATE-2025", "by 2025", date(2025, 12, 31)),
+    ])
+    def test_control_every_live_shape_still_reads(self, ticker, span, expected):
+        assert self._read(title=f"Will the thing happen {span}?") == expected, ticker
+
+
+class TestSameEventLadder:
+    """DR-73a: ordering two rungs of one event's ladder and measuring the gap.
+
+    Pure arithmetic over two already-read deadlines, so the live finder and
+    the backtester can share one definition. The three outcomes are kept
+    apart deliberately — a readable ladder, two rungs naming ONE day, and an
+    unreadable rung have different remedies and the callers count them
+    separately.
+    """
+
+    def test_orders_two_rungs_and_measures_the_gap(self):
+        assert scanner.same_event_ladder(date(2026, 9, 23), date(2026, 10, 16)) == (
+            False, 23,
+        )
+
+    def test_swap_is_true_when_the_second_argument_is_earlier(self):
+        # swap says "market_a must become market_b": the gap is
+        # order-independent, the ordering is not.
+        assert scanner.same_event_ladder(date(2026, 10, 16), date(2026, 9, 23)) == (
+            True, 23,
+        )
+
+    def test_the_same_day_is_its_own_outcome(self):
+        assert scanner.same_event_ladder(
+            date(2026, 9, 23), date(2026, 9, 23)
+        ) == scanner.SAME_DAY
+
+    def test_one_deadline_spelled_two_ways_is_the_same_day(self):
+        # "by Mar 31, 2027" and "before Apr 1, 2027" name the identical last
+        # included day. Without SAME_DAY this is a one-rung "ladder" with a
+        # gap of zero, which the tier arithmetic would happily price.
+        inclusive = scanner._span_deadline("by mar 31, 2027")
+        exclusive = scanner._span_deadline("before apr 1, 2027")
+        assert inclusive == exclusive == date(2027, 3, 31)
+        assert scanner.same_event_ladder(inclusive, exclusive) == scanner.SAME_DAY
+
+    def test_mixed_prepositions_one_day_apart_are_a_real_ladder(self):
+        # SCOTREF-27 is the one live event (of the 492 holding >= 2 dated
+        # cumulative rungs on the 2026-09-22 snapshot) that mixes an
+        # inclusive and an exclusive preposition, so the distinction is not
+        # theoretical. This row is its arithmetic: the two wordings below name
+        # days one apart, not the same day.
+        later = scanner._span_deadline("by jan 1, 2028")
+        earlier = scanner._span_deadline("before jan 1, 2028")
+        assert (later, earlier) == (date(2028, 1, 1), date(2027, 12, 31))
+        assert scanner.same_event_ladder(later, earlier) == (True, 1)
+
+    @pytest.mark.parametrize("bad", [
+        None,
+        "2026-09-23",
+        # datetime is a date SUBCLASS, so isinstance would admit it and the
+        # date - datetime subtraction would raise TypeError.
+        datetime(2026, 9, 23, tzinfo=UTC),
+    ])
+    def test_an_unreadable_deadline_is_none_on_either_side(self, bad):
+        assert scanner.same_event_ladder(bad, date(2026, 9, 23)) is None
+        assert scanner.same_event_ladder(date(2026, 9, 23), bad) is None
+
+    def test_a_magicmock_deadline_does_not_raise(self):
+        assert scanner.same_event_ladder(MagicMock(), MagicMock()) is None
+
+
+_LADDER_TITLE = "Will SpaceX launch another Starship %s?"
+
+
+def _ladder_rung(ticker, deadline_text, *, event="KXSTARSHIP-14", yes_ask, no_ask,
+                 close, event_title="", subtitle=""):
+    """One rung of a same-event cumulative deadline ladder (DR-73).
+
+    Every rung of one ladder shares an event_ticker and a title that differs
+    ONLY in its deadline, so normalize_title collapses them onto one
+    time_series_group_key — the shape KXSPACEXSTARSHIP-14 has live.
+    """
+    return _mock_market(
+        ticker=ticker, event_ticker=event, event_title=event_title,
+        subtitle=subtitle, title=_LADDER_TITLE % deadline_text,
+        yes_ask=yes_ask, no_ask=no_ask, close_time=close,
+    )
+
+
+def _assert_one_ladder_group(mA, mB):
+    """Every ladder fixture must actually BE a ladder before its rule is tested.
+
+    Two rungs the group key separates, or one the wording screen does not call
+    cumulative, would make a test pass for a reason that has nothing to do
+    with DR-73 — the way test_same_event_ticker_never_pairs went vacuous.
+    """
+    assert time_series_group_key(pair_key(mA), mA.subtitle) == \
+        time_series_group_key(pair_key(mB), mB.subtitle)
+    assert scanner._market_deadline_profile(mA)[0] == scanner.DEADLINE_CUMULATIVE
+    assert scanner._market_deadline_profile(mB)[0] == scanner.DEADLINE_CUMULATIVE
+    assert mA.event_ticker == mB.event_ticker
+
+
+class TestSameEventDeadlineLadders:
+    """DR-73: two rungs of ONE event's cumulative deadline ladder are a
+    time-series pair, behind config.TIME_SERIES_SAME_EVENT_LADDERS.
+
+    Kalshi lists a question's several deadlines as separate markets inside a
+    single event, and every previous version of this finder refused them as
+    "multi-choice options". The branch orders and tiers such a pair on its two
+    STATED deadlines, never on close_time — a settled or single-instant event
+    closes every rung together. The switch ships OFF, so every test that wants
+    the branch turns it on explicitly and every test here has a control.
+    """
+
+    def _scan(self, markets, monkeypatch, *, on=True):
+        if on:
+            monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
+
+    def _two_rungs(self, *, pA=0.20, pB=0.60, nB=0.40,
+                   early="by March 1, 2026", late="by March 20, 2026",
+                   close_a=datetime(2026, 3, 1, tzinfo=UTC),
+                   close_b=datetime(2026, 3, 20, tzinfo=UTC),
+                   event_title=""):
+        mA = _ladder_rung("RUNG-EARLY", early, yes_ask=pA, no_ask=round(1 - pA, 4),
+                          close=close_a, event_title=event_title)
+        mB = _ladder_rung("RUNG-LATE", late, yes_ask=pB, no_ask=nB,
+                          close=close_b, event_title=event_title)
+        _assert_one_ladder_group(mA, mB)
+        return mA, mB
+
+    # ── the admitted case ────────────────────────────────────────────────────
+
+    def test_two_dated_rungs_of_one_event_pair(self, monkeypatch):
+        mA, mB = self._two_rungs()
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1
+        pair = pairs[0]
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("RUNG-EARLY", "RUNG-LATE")
+        # 2026-03-01 -> 2026-03-20 is 19 days, which is the LONG tier: the
+        # 0.40 spread clears 0.30. Carried out on the pair so nothing
+        # downstream has to re-derive it from close_time.
+        assert pair.stated_gap_days == 19
+        assert pair.tradeable
+
+    def test_the_same_fixture_is_refused_with_the_switch_off(self, monkeypatch):
+        # control: the ONLY thing standing between this fixture and a pair is
+        # the switch, so the test above is not passing for some other reason.
+        mA, mB = self._two_rungs()
+        assert self._scan([mA, mB], monkeypatch, on=False) == []
+
+    def test_the_disabled_skip_is_counted_and_reported(self, monkeypatch, caplog):
+        mA, mB = self._two_rungs()
+        with caplog.at_level(logging.INFO):
+            self._scan([mA, mB], monkeypatch, on=False)
+        assert "same-event deadline ladders are disabled" in caplog.text
+        # DR-66: a switch that produces nothing must be distinguishable from a
+        # broken rule, so the count is reported rather than silently dropped.
+        assert caplog.text.rstrip().endswith("ladders are disabled "
+                                             "(config.TIME_SERIES_SAME_EVENT_LADDERS): 1") or \
+            "(config.TIME_SERIES_SAME_EVENT_LADDERS): 1" in caplog.text
+
+    def test_the_emitted_ladder_count_is_always_logged(self, monkeypatch, caplog):
+        mA, mB = self._two_rungs()
+        with caplog.at_level(logging.INFO):
+            self._scan([mA, mB], monkeypatch)
+        assert "Same-event ladder pairs among the time-series pairs: 1" in caplog.text
+
+    # ── ordering: the stated deadline, never close_time ─────────────────────
+
+    def test_legs_are_ordered_by_stated_deadline_not_close_time(self, monkeypatch):
+        # The Mar 1 rung closes a MONTH after the Mar 20 one, so the
+        # close_time sort hands this candidate to the loop the wrong way round
+        # and only the stated-deadline swap can fix it. market_a must be the
+        # earlier DEADLINE, because every leg-side, settlement and reporting
+        # contract downstream reads that position (leg_sides, _ordered_legs,
+        # _settlement_receipt).
+        mA, mB = self._two_rungs(
+            close_a=datetime(2026, 4, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 5, tzinfo=UTC),
+        )
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1
+        assert pairs[0].market_a.ticker == "RUNG-EARLY"
+        assert pairs[0].stated_gap_days == 19
+        # control: the gap is the STATED one (19), not the realized close gap
+        # (27 days), so the pair is priced on the tier its deadlines choose.
+        assert deadline_gap_days(mA, mB) == 27
+
+    def test_a_swap_does_not_leak_into_later_candidates(self, monkeypatch):
+        # mA/mB are per-candidate locals, not the loop variables: swapping the
+        # OUTER one in place would re-order every later candidate of that
+        # iteration. RUNG-EARLY is the outer member here (it closes first) and
+        # its Apr 10 sibling must still pair with it in the right order after
+        # the Mar 20 candidate has swapped.
+        early = _ladder_rung("RUNG-EARLY", "by April 5, 2026", yes_ask=0.20,
+                             no_ask=0.80, close=datetime(2026, 3, 1, tzinfo=UTC))
+        swapper = _ladder_rung("RUNG-SWAP", "by March 20, 2026", yes_ask=0.60,
+                               no_ask=0.40, close=datetime(2026, 3, 20, tzinfo=UTC))
+        later = _ladder_rung("RUNG-LATER", "by April 25, 2026", yes_ask=0.70,
+                             no_ask=0.30, close=datetime(2026, 4, 25, tzinfo=UTC))
+        _assert_one_ladder_group(early, swapper)
+        _assert_one_ladder_group(early, later)
+        pairs = self._scan([early, swapper, later], monkeypatch)
+        assert len(pairs) == 1
+        # The best pair of the group is EARLY(Apr 5) x LATER(Apr 25): spread
+        # 0.50, stated gap 20. If the Mar 20 candidate's swap had rewritten
+        # the outer variable, this pair would have been built from RUNG-SWAP.
+        assert (pairs[0].market_a.ticker, pairs[0].market_b.ticker) == (
+            "RUNG-EARLY", "RUNG-LATER")
+        assert pairs[0].stated_gap_days == 20
+
+    def test_rungs_that_close_at_one_instant_still_pair_on_the_stated_gap(self, monkeypatch):
+        # A settled event closes every rung at once — 681 of 1,821 dated
+        # same-event pairs in the archive have a close gap of ZERO days — so
+        # close_time cannot tier this pair at all.
+        one_instant = datetime(2026, 3, 20, tzinfo=UTC)
+        mA, mB = self._two_rungs(close_a=one_instant, close_b=one_instant)
+        assert deadline_gap_days(mA, mB) == 0
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1
+        assert pairs[0].stated_gap_days == 19
+
+    def test_the_stated_gap_chooses_the_tier_a_zero_close_gap_would_not(self, monkeypatch):
+        # control for the row above, and the reason the stated gap must travel
+        # with the pair: a 0.20 spread clears the SHORT tier (0.15) that a
+        # close gap of 0 days would select, and fails the LONG tier (0.30) the
+        # 19-day stated gap actually demands.
+        one_instant = datetime(2026, 3, 20, tzinfo=UTC)
+        mA, mB = self._two_rungs(pA=0.20, pB=0.40, nB=0.60,
+                                 close_a=one_instant, close_b=one_instant)
+        assert self._scan([mA, mB], monkeypatch) == []
+
+    # ── the gap cap, measured on the stated gap ─────────────────────────────
+
+    def test_a_31_day_stated_gap_is_refused_although_the_closes_are_30_apart(self, monkeypatch):
+        mA, mB = self._two_rungs(
+            early="by March 1, 2026", late="by April 1, 2026",
+            close_a=datetime(2026, 3, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 31, tzinfo=UTC),
+        )
+        assert deadline_gap_days(mA, mB) == 30  # within the cap on close_time
+        assert self._scan([mA, mB], monkeypatch) == []
+
+    def test_a_30_day_stated_gap_is_admitted(self, monkeypatch):
+        # control for the row above: one day narrower and the same fixture pairs.
+        mA, mB = self._two_rungs(
+            early="by March 1, 2026", late="by March 31, 2026",
+            close_a=datetime(2026, 3, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 31, tzinfo=UTC),
+        )
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1
+        assert pairs[0].stated_gap_days == MAX_DEADLINE_GAP_DAYS
+
+    # ── the refusals, each with its control ─────────────────────────────────
+
+    def test_a_rung_with_no_readable_year_is_refused(self, monkeypatch):
+        # Year-less wording states no placeable day, and guessing the year
+        # mis-orders a ladder crossing New Year. Both rungs are year-less here
+        # because normalize_title strips the PREPOSITION along with a
+        # year-less date ("by November 4" -> ""), so a year-less rung and a
+        # dated one never land in one group to begin with.
+        mA, mB = self._two_rungs(early="by November 4", late="by December 4")
+        assert scanner.stated_deadline(
+            scanner._market_deadline_profile(mA), "", mA.title, "") is None
+        assert self._scan([mA, mB], monkeypatch) == []
+
+    def test_the_same_rungs_dated_are_admitted(self, monkeypatch):
+        # control for the row above: the refusal is the missing YEAR, not the
+        # wording shape.
+        mA, mB = self._two_rungs(early="by November 4, 2026", late="by December 4, 2026",
+                                 close_a=datetime(2026, 11, 4, tzinfo=UTC),
+                                 close_b=datetime(2026, 12, 4, tzinfo=UTC))
+        # 2026-11-04 -> 2026-12-04 is 30 days, inside the cap, and the 0.40
+        # spread clears the LONG tier the gap selects.
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1 and pairs[0].stated_gap_days == 30
+
+    def test_two_rungs_naming_one_calendar_day_are_refused(self, monkeypatch):
+        # "by December 2026" and "by December 31, 2026" are ONE deadline
+        # spelled two ways (the month form's last included day IS the 31st),
+        # not a two-rung ladder — the SAME_DAY outcome. Their spans differ, so
+        # cumulative_deadline_pair admits them and only the date reader can
+        # tell.
+        mA, mB = self._two_rungs(early="by December 2026", late="by December 31, 2026",
+                                 close_a=datetime(2026, 12, 1, tzinfo=UTC),
+                                 close_b=datetime(2026, 12, 31, tzinfo=UTC))
+        assert scanner.cumulative_deadline_pair(
+            scanner._market_deadline_profile(mA), scanner._market_deadline_profile(mB))
+        assert self._scan([mA, mB], monkeypatch) == []
+
+    def test_a_rung_whose_own_fields_disagree_is_refused(self, monkeypatch):
+        # Both rungs sit under a stale event title naming an irreconcilable
+        # deadline ("before 2026" against titles in October and November
+        # 2026) — the KXSTARSHIPFL shape. stated_deadline's cross-check
+        # refuses the rung rather than trusting the deciding field alone.
+        mA, mB = self._two_rungs(
+            early="by October 1, 2026", late="by October 21, 2026",
+            close_a=datetime(2026, 10, 1, tzinfo=UTC),
+            close_b=datetime(2026, 10, 21, tzinfo=UTC),
+            event_title="Starship flights before 2026",
+        )
+        # 20 days apart deliberately: a wider fixture would be refused by the
+        # gap cap too, and would pass with the cross-check bypassed.
+        assert scanner.stated_deadline(
+            scanner._market_deadline_profile(mA),
+            mA._event_title, mA.title, mA.subtitle) is None
+        assert scanner.stated_deadline(
+            scanner._market_deadline_profile(mA), "", "", "") == date(2026, 10, 1)
+        assert self._scan([mA, mB], monkeypatch) == []
+
+    def test_the_same_rungs_under_a_dateless_event_title_are_admitted(self, monkeypatch):
+        # control: the ONLY difference from the row above is the stale event
+        # title, so that row is pinning the cross-check and not the gap cap.
+        mA, mB = self._two_rungs(
+            early="by October 1, 2026", late="by October 21, 2026",
+            close_a=datetime(2026, 10, 1, tzinfo=UTC),
+            close_b=datetime(2026, 10, 21, tzinfo=UTC),
+            event_title="Starship flights",
+        )
+        pairs = self._scan([mA, mB], monkeypatch)
+        assert len(pairs) == 1 and pairs[0].stated_gap_days == 20
+
+    def test_identical_wording_in_one_event_never_pairs(self, monkeypatch, caplog):
+        # Same event AND the same wording: the deadline is not in the wording,
+        # so there is nothing to order two rungs by (DR-02's reasoning one
+        # level in).
+        same = "by March 1, 2026"
+        mA = _ladder_rung("R1", same, yes_ask=0.20, no_ask=0.80,
+                          close=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _ladder_rung("R2", same, yes_ask=0.60, no_ask=0.40,
+                          close=datetime(2026, 3, 20, tzinfo=UTC))
+        _assert_one_ladder_group(mA, mB)
+        assert scanner._identical_wording(mA, mB)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], monkeypatch) == []
+        # Refused HERE, not downstream. cumulative_deadline_pair would also
+        # refuse it — identical wording states identical spans — but as
+        # "the two rungs state the same deadline", which is a different
+        # finding and would make that counter mean two things at once
+        # (DR-72's whole point).
+        assert "state the same deadline" not in caplog.text
+        # And COUNTED here, on its own silent-at-zero line. It is the largest
+        # single ladder refusal on the real snapshot (502 of 3,354), so a
+        # bare `continue` would drop 15% of the branch's input out of the
+        # funnel with nothing in the log to reconstruct it from.
+        assert (
+            "refused because the two rungs' wording is identical "
+            "(the deadline is not in the wording): 1"
+        ) in caplog.text
+
+    def test_an_empty_shared_event_ticker_never_pairs(self, monkeypatch, caplog):
+        # Two markets sharing an EMPTY event ticker share no event at all, so
+        # nothing identifies the ladder they would belong to — fails closed,
+        # and on its OWN line rather than being attributed to whichever check
+        # happens to follow.
+        mA = _ladder_rung("E1", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                          close=datetime(2026, 3, 1, tzinfo=UTC), event="")
+        mB = _ladder_rung("E2", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                          close=datetime(2026, 3, 20, tzinfo=UTC), event="")
+        _assert_one_ladder_group(mA, mB)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], monkeypatch) == []
+        assert (
+            "refused because the shared event ticker is empty: 1"
+        ) in caplog.text
+        # Control: the identical fixture with a real shared event ticker is
+        # admitted, so the refusal above is the empty ticker and nothing else.
+        gA = _ladder_rung("E1", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                          close=datetime(2026, 3, 1, tzinfo=UTC))
+        gB = _ladder_rung("E2", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                          close=datetime(2026, 3, 20, tzinfo=UTC))
+        assert len(self._scan([gA, gB], monkeypatch)) == 1
+
+    def test_a_snapshot_rung_in_one_event_never_pairs(self, monkeypatch, caplog):
+        # The wording screen is unchanged inside the branch: "Starship count
+        # ON <date>" does not nest, whether or not the two markets share an
+        # event.
+        mA = _mock_market(ticker="S1", event_ticker="KXSNAP-1",
+                          title="Starship flights on March 1, 2026",
+                          yes_ask=0.20, no_ask=0.80,
+                          close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _mock_market(ticker="S2", event_ticker="KXSNAP-1",
+                          title="Starship flights on March 20, 2026",
+                          yes_ask=0.60, no_ask=0.40,
+                          close_time=datetime(2026, 3, 20, tzinfo=UTC))
+        assert time_series_group_key(pair_key(mA), "") == \
+            time_series_group_key(pair_key(mB), "")
+        assert scanner._market_deadline_profile(mA)[0] == scanner.DEADLINE_SNAPSHOT
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], monkeypatch) == []
+        # And refused BY the wording screen, on its own counter. Without that
+        # screen the pair still fails — stated_deadline reads nothing off a
+        # snapshot verdict — but it would be reported as a rung whose deadline
+        # states no placeable day, which is a parser problem, not a
+        # wrong-kind-of-market one.
+        assert "deciding field is snapshot wording" in caplog.text
+        assert "states no placeable calendar day" not in caplog.text
+
+    # ── the mixed group ─────────────────────────────────────────────────────
+
+    def _mixed_group(self):
+        """One group holding a cross-event pair AND a wider same-event ladder."""
+        m1 = _mock_market(ticker="M1", event_ticker="EVA-1",
+                          title=_LADDER_TITLE % "by March 1, 2026",
+                          yes_ask=0.20, no_ask=0.80,
+                          close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        m2 = _mock_market(ticker="M2", event_ticker="EVB-1",
+                          title=_LADDER_TITLE % "by March 20, 2026",
+                          yes_ask=0.60, no_ask=0.40,
+                          close_time=datetime(2026, 3, 20, tzinfo=UTC))
+        m3 = _mock_market(ticker="M3", event_ticker="EVA-1",
+                          title=_LADDER_TITLE % "by March 15, 2026",
+                          yes_ask=0.95, no_ask=0.05,
+                          close_time=datetime(2026, 3, 15, tzinfo=UTC))
+        return m1, m2, m3
+
+    def test_a_wider_ladder_wins_the_groups_one_best_slot(self, monkeypatch):
+        pairs = self._scan(list(self._mixed_group()), monkeypatch)
+        assert len(pairs) == 1
+        # M1 x M3 (one event, spread 0.75) beats the cross-event M1 x M2
+        # (spread 0.40). Skipping is not only subtractive and neither is
+        # admitting: turning ladders on can DISPLACE a cross-event pair.
+        assert (pairs[0].market_a.ticker, pairs[0].market_b.ticker) == ("M1", "M3")
+        assert pairs[0].stated_gap_days == 14
+
+    def test_with_the_switch_off_the_cross_event_pair_is_returned_unchanged(self, monkeypatch):
+        # control, and the cross-event invariant: nothing about this pair —
+        # its legs, its prices, or its (absent) stated gap — moves.
+        pairs = self._scan(list(self._mixed_group()), monkeypatch, on=False)
+        assert len(pairs) == 1
+        assert (pairs[0].market_a.ticker, pairs[0].market_b.ticker) == ("M1", "M2")
+        assert pairs[0].stated_gap_days is None
+        assert (pairs[0].pA, pairs[0].pB, pairs[0].nB) == (0.20, 0.60, 0.40)
+
+
+class TestPairGapDays:
+    """DR-73: one reader for the gap every downstream tier is measured on.
+
+    A ladder carries its STATED gap; everything else is tiered on close_time.
+    Read by TYPE, never truthiness — a genuine 0-day stated gap is falsy and a
+    bool is not an int here.
+    """
+
+    def _pair(self, stated, *, close_gap=0):
+        mA = _mock_market(ticker="A", event_ticker="E1",
+                          close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _mock_market(ticker="B", event_ticker="E1",
+                          close_time=datetime(2026, 3, 1, tzinfo=UTC) + timedelta(days=close_gap))
+        return CandidatePair(
+            market_a=mA, market_b=mB, pA=0.20, pB=0.60, nA=0.80, tradeable=True,
+            canonical_title="t", pair_type="time_series", nB=0.40,
+            stated_gap_days=stated,
+        )
+
+    def test_a_ladder_reads_its_stated_gap(self):
+        assert scanner.pair_gap_days(self._pair(19, close_gap=0)) == 19
+
+    def test_a_non_ladder_reads_the_close_time_gap(self):
+        assert scanner.pair_gap_days(self._pair(None, close_gap=9)) == 9
+
+    def test_a_zero_day_stated_gap_is_not_falsy_back_to_close_time(self):
+        # control for a truthiness read: `stated or deadline_gap_days(...)`
+        # would return 9 here.
+        assert scanner.pair_gap_days(self._pair(0, close_gap=9)) == 0
+
+    @pytest.mark.parametrize("bad", [True, 19.0, "19", MagicMock()])
+    def test_anything_that_is_not_an_int_falls_back(self, bad):
+        # bool is an int SUBCLASS, so isinstance would read True as a one-day
+        # ladder — the same fail-safe-by-type rule leg_sides follows.
+        assert scanner.pair_gap_days(self._pair(bad, close_gap=9)) == 9
+
+    def test_the_ceiling_is_tiered_on_the_stated_gap(self):
+        # _pair_max_sum is the downstream re-derivation that matters: a ladder
+        # whose rungs closed at one instant must keep the LONG tier its stated
+        # gap chose, not drop to the short one a 0-day close gap implies.
+        assert scanner._pair_max_sum(self._pair(19, close_gap=0)) == pytest.approx(0.70)
+        assert scanner._pair_max_sum(self._pair(None, close_gap=0)) == pytest.approx(0.85)
+
+
 class TestDeadlineGuardFinders:
     """Finder-level pins for the cumulative-deadline guard: the verdict gate,
     the span-presence check, and running the screen before best-pair
@@ -2632,23 +3414,44 @@ class TestTimeSeriesTieredThreshold:
             MagicMock(), held_tickers=set(), markets=[mA, mB],
         ) == []
 
-    def test_same_event_ticker_never_pairs(self):
-        # Two options inside the same multi-choice event share an event_ticker
-        # and must not form a time-series pair, whatever the price gap
+    def _same_event_markets(self):
+        """Two DATED cumulative rungs sharing one event ticker.
+
+        RE-PINNED (DR-73): this fixture used to carry the undated wording
+        "Will BTC exceed $80k" on both markets, which DR-67 refuses for naming
+        no deadline and DR-02 refuses for being identical — so the test passed
+        with the same-event guard DELETED and pinned nothing. Dated, differing
+        titles clear both of those rules, leaving the same-event guard as the
+        only thing that can refuse the pair.
+        """
         from datetime import UTC, datetime
         mA = _mock_market(
             ticker="OPT-A", event_ticker="MVE-1",
-            title="Will BTC exceed $80k",
-            yes_ask=0.50, no_ask=0.50,
+            title="Will BTC exceed $80k by March 1, 2026",
+            yes_ask=0.30, no_ask=0.70,
             close_time=datetime(2026, 3, 1, tzinfo=UTC),
         )
         mB = _mock_market(
             ticker="OPT-B", event_ticker="MVE-1",
-            title="Will BTC exceed $80k",
-            yes_ask=0.30, no_ask=0.70,
+            title="Will BTC exceed $80k by March 11, 2026",
+            yes_ask=0.60, no_ask=0.40,
             close_time=datetime(2026, 3, 11, tzinfo=UTC),
         )
+        return mA, mB
+
+    def test_same_event_ticker_never_pairs(self):
+        # Two markets inside one event must not form a time-series pair while
+        # config.TIME_SERIES_SAME_EVENT_LADDERS is off — the shipped default.
+        mA, mB = self._same_event_markets()
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
+
+    def test_the_same_event_fixture_is_not_vacuous(self, monkeypatch):
+        # control: every OTHER rule admits this fixture, so the row above is
+        # pinning the same-event guard and nothing else.
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=list(
+            self._same_event_markets()))
+        assert len(pairs) == 1 and pairs[0].stated_gap_days == 10
 
     def test_different_titles_never_pair(self):
         # Markets asking different questions normalize to different keys and
@@ -3365,6 +4168,50 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.tradeable is True
         assert enriched.pB == pair.pB
         assert enriched.pA == pytest.approx(0.30)
+
+    def test_fallback_tier_is_the_stated_gap_for_a_ladder(self, caplog):
+        # DR-73, pinned BY VALUE because the AST pin beside it cannot see
+        # this: test_ast_pair_ceiling_reads_the_pair_gap only asserts that a
+        # pair_gap_days call is present and a deadline_gap_days call absent,
+        # which a shadowing `tier = min_price_diff_for_gap(abs((close_b -
+        # close_a).days))` after the real assignment satisfies too.
+        #
+        # A ladder whose rungs close at ONE instant (the shape a settled or
+        # single-instant event produces) with a STATED gap of 19 days must be
+        # held to the 0.30 long tier here, not the 0.15 one a 0-day close gap
+        # implies. The reference side is empty, so the fallback runs; the leg
+        # fills are pA 0.30 + nB 0.35 = 0.65, inside the stated tier's 0.70
+        # ceiling, and pB - avg_yes is 0.20 — between the two tiers, so the
+        # two readings disagree about this pair and only this value test says
+        # which one is right.
+        ladder = dataclasses.replace(
+            _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35),
+            stated_gap_days=19,
+        )
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(client, [ladder], _AMPLE_BALANCE_CENTS)
+
+        assert enriched.tradeable is False
+        drops = [
+            r for r in caplog.records
+            if "no longer prices above the YES leg fill" in r.getMessage()
+        ]
+        assert len(drops) == 1
+        # The rendered tier is the assertion: a close_time-derived tier says
+        # "0.15 tier" here and keeps the pair.
+        assert "clear the 0.30 tier" in drops[0].getMessage()
+
+        # Control: the SAME book and prices with no stated gap — the pair is a
+        # cross-event one closing 0 days apart, so the 0.15 tier applies and
+        # the 0.20 gap clears it. Proves the drop above comes from the stated
+        # gap, not from the fixture's prices.
+        plain = _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35)
+        assert plain.stated_gap_days is None
+        [kept] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35), [plain], _AMPLE_BALANCE_CENTS,
+        )
+        assert kept.tradeable is True
 
     def test_reference_refresh_costs_no_extra_orderbook_fetch(self):
         # The reference comes off an array _fetch_orderbook already returned,
