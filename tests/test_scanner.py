@@ -3,7 +3,7 @@ import dataclasses
 import json
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1630,6 +1630,277 @@ class TestDeadlinePairRefusal:
         assert scanner.deadline_pair_refusal(profile_b, profile_a) == expected
         assert scanner.cumulative_deadline_pair(profile_a, profile_b) == (expected is None)
         assert scanner.cumulative_deadline_pair(profile_b, profile_a) == (expected is None)
+
+
+class TestStatedDeadline:
+    """DR-73a: reading a rung's wording as the LAST CALENDAR DAY its deadline
+    includes.
+
+    Every row drives the PUBLIC helper end to end — deadline_profile() over a
+    real title, then stated_deadline() over the same three fields — so the
+    rows pin the span table, the preposition split and the field cross-check
+    together, exactly as a finder will call them.
+
+    The refusals are as load-bearing as the acceptances and each one is
+    measured, not defensive: a year-less rung cannot be placed at all, an
+    article with no "end of" is a truncated season range, "until"/"up to" do
+    not say whether the named day counts, and a bare year behind "through" is
+    the recorded "2018-19 through 2025-26" false-cumulative residual. See
+    scanner._span_deadline.
+    """
+
+    @staticmethod
+    def _read(event_title="", title="", subtitle=""):
+        """Classify and read one market exactly as a finder does."""
+        profile = scanner.deadline_profile(event_title, title, subtitle)
+        return scanner.stated_deadline(profile, event_title, title, subtitle)
+
+    @pytest.mark.parametrize("span, expected", [
+        # Inclusive prepositions: the named day is the last one covered.
+        ("by Sep 23, 2026", date(2026, 9, 23)),
+        ("no later than Sep 23, 2026", date(2026, 9, 23)),
+        ("on or before Sep 23, 2026", date(2026, 9, 23)),
+        # Exclusive prepositions: the deadline stops the day BEFORE.
+        ("before Sep 23, 2026", date(2026, 9, 22)),
+        ("prior to Sep 23, 2026", date(2026, 9, 22)),
+        # Month granularity: inclusive covers the whole month, exclusive stops
+        # at the end of the previous one. The leap-year row is why the last
+        # day comes from calendar.monthrange rather than a fixed table.
+        ("by March 2026", date(2026, 3, 31)),
+        ("before March 2026", date(2026, 2, 28)),
+        ("before March 2024", date(2024, 2, 29)),
+        # Year granularity, the same two directions.
+        ("by 2027", date(2027, 12, 31)),
+        ("before 2026", date(2025, 12, 31)),
+        # ISO.
+        ("by 2026-03-15", date(2026, 3, 15)),
+        ("before 2026-03-15", date(2026, 3, 14)),
+        # A weekday in front of the date is noise; the date behind it names
+        # the day (DR-68 keeps the whole span rather than truncating it).
+        ("by Friday, Sep 19, 2026", date(2026, 9, 19)),
+        # "end of", month and year granularity, behind an inclusive
+        # preposition only. The article is allowed HERE and nowhere else.
+        ("by the end of 2027", date(2027, 12, 31)),
+        ("by end of 2027", date(2027, 12, 31)),
+        ("by the end of June 2027", date(2027, 6, 30)),
+        # "through" reads inclusive with a month-name date; it occurs live.
+        ("through June 30, 2027", date(2027, 6, 30)),
+    ])
+    def test_reads_the_last_included_day(self, span, expected):
+        assert self._read(title=f"Will the thing happen {span}?") == expected
+
+    @pytest.mark.parametrize("span", [
+        # A bare year behind "through" is a season range, not a deadline:
+        # CLAUDE.md's DR-67 residuals record "2018-19 through 2025-26"
+        # spanning as "through 2025". Accepting it would promote a known
+        # false-cumulative into a usable calendar date.
+        "through 2025",
+        # An article with no "end of" is what "Before the 2027-28 season"
+        # truncates to (105 such rungs in the live ladder population).
+        "before the 2027",
+        # ... but "end of" is exactly what makes an article meaningful, so
+        # the guard is `article and not end_of` and not a bare article test.
+        # "before the end of 2027" refuses for the OTHER reason: "end of"
+        # behind an exclusive preposition names the day before an unstated
+        # last day.
+        "before the end of 2027",
+        # Inclusivity not stated.
+        "until Dec 31, 2026",
+        "up to Dec 31, 2026",
+        # Year-less: nothing anchors the year, and guessing mis-orders a
+        # ladder crossing New Year (KXAPCALLSENATE-26AUG20 lists "Before
+        # Nov 4" (2026) beside "Before Jan 5" (2027)).
+        "before Nov 4",
+        "by Dec 31",
+        "before October",
+        "by Friday",
+        # Quarter and end-of-period nouns name a period this reader does not
+        # place; the phrasing table accepts them as deadline WORDING, which is
+        # why they have to be refused here rather than assumed absent.
+        "by Q1 2026",
+        "by end of Q4 2026",
+        "by year-end",
+        "by EOY",
+        # "end of" at DAY granularity names no period.
+        "by the end of Sep 23, 2026",
+        # An impossible calendar date states no day.
+        "by Feb 30, 2026",
+        # Below the 2020 floor the bare-year token shares with the phrasing
+        # table: "decrease by 2019" is an amount, not a deadline.
+        "by 2019",
+    ])
+    def test_refuses_wording_it_cannot_place(self, span):
+        assert self._read(title=f"Will the thing happen {span}?") is None
+
+    def test_the_bare_year_floor_matches_the_phrasing_table(self):
+        # _span_deadline shares _DEADLINE_DATE_TOKEN's 2020-2099 bound, so
+        # "decrease by 2019" is an amount rather than a deadline. On the span
+        # path the phrasing table refuses it first, which is why this row
+        # drives the reader directly — its docstring documents raw wording as
+        # an accepted input.
+        assert scanner._span_deadline("by 2019") is None
+        assert scanner._span_deadline("by 2020") == date(2020, 12, 31)
+        assert scanner._span_deadline("by 2099") == date(2099, 12, 31)
+        assert scanner._span_deadline("by 2100") is None
+
+    def test_a_non_str_span_reads_as_absent(self):
+        # Same fail-safe-by-type rule leg_sides and _depth_levels follow: a
+        # MagicMock auto-attribute must not raise out of the parser.
+        assert scanner._span_deadline(MagicMock()) is None
+        assert scanner._span_deadline(None) is None
+        assert scanner._span_deadline("") is None
+
+    def test_a_non_cumulative_verdict_has_no_stated_deadline(self):
+        # Fails closed exactly as cumulative_deadline_pair does: a snapshot
+        # or unknown leg has no nesting premise, so it has no ladder rung.
+        assert scanner.stated_deadline(
+            (scanner.DEADLINE_SNAPSHOT, ("by sep 23, 2026",)), "", "", ""
+        ) is None
+        assert scanner.stated_deadline((scanner.DEADLINE_UNKNOWN, ()), "", "", "") is None
+        assert scanner.stated_deadline(
+            (scanner.DEADLINE_CUMULATIVE, ()), "", "", ""
+        ) is None
+
+    def test_two_different_days_in_the_deciding_field_refuse(self):
+        # Ambiguity in the one field that decides is refused, not resolved:
+        # there is no more authoritative field to break the tie.
+        assert self._read(
+            title="Will it happen by Sep 23, 2026 or by Oct 16, 2026?"
+        ) is None
+
+    def test_one_day_stated_twice_in_the_deciding_field_still_reads(self):
+        # The converse: two spans naming the SAME day are not ambiguity.
+        assert self._read(
+            title="Will it happen by Sep 23, 2026 — by Sep 23, 2026?"
+        ) == date(2026, 9, 23)
+
+    def test_cross_field_conflict_refuses_starship(self):
+        # KXSPACEXSTARSHIP-14-26SEP23 on the 2026-09-22 live snapshot: the
+        # subtitle decides the verdict (DR-69) and says 09-23, while the
+        # title says 09-22. One day is exactly the error that mis-orders two
+        # adjacent rungs, so the rung is refused rather than resolved by
+        # precedence.
+        assert self._read(
+            event_title="SpaceX Starship 14th launch?",
+            title="Will SpaceX launch another Starship before Sep 23, 2026?",
+            subtitle="By Sep 23, 2026",
+        ) is None
+
+    def test_cross_field_conflict_refuses_starship_florida(self):
+        # KXSTARSHIPFL-26JUN-26OCT01, same snapshot: a stale sub-contract
+        # label ("Before 2026" -> 2025-12-31) against a title nine months
+        # later. 47 actively-priced cumulative markets on that snapshot state
+        # two different days across their own fields.
+        assert self._read(
+            event_title="When will SpaceX's Starship launch from Florida?",
+            title="Will SpaceX's Starship launch from Florida before Oct 1, 2026",
+            subtitle="Before 2026",
+        ) is None
+
+    def test_a_non_deciding_field_that_names_no_day_does_not_refuse(self):
+        # The cross-check refuses on DISAGREEMENT, never on silence: a
+        # year-less phrase elsewhere in the wording names no day to disagree
+        # with. Refusing on it would throw away the rungs DR-73 exists for.
+        assert self._read(
+            event_title="Will it happen before Nov 4?",
+            title="Will it happen by Sep 23, 2026?",
+        ) == date(2026, 9, 23)
+
+    def test_fields_that_agree_still_read(self):
+        # Two fields spelling the SAME day (one inclusive, one exclusive by a
+        # day) is agreement, not conflict.
+        assert self._read(
+            title="Will it happen before Apr 1, 2027?",
+            subtitle="By Mar 31, 2027",
+        ) == date(2027, 3, 31)
+
+    # control — kills a "refuse everything" mutant, which every refusal row
+    # above would pass. These are the SIX span shapes that actually occur in
+    # the live same-event ladder candidate population (the 4,161 cumulative,
+    # span-carrying rungs of events holding >= 2 of them, on the
+    # .git/dr67-scratch 2026-09-22 snapshot of 113,303 markets, 3,940 of which
+    # read to a date), each with a real ticker and its measured rung count;
+    # four small archive day slices add no shape these six do not already
+    # cover. If a future tightening refuses one of
+    # them it removes a whole live family from the strategy, silently.
+    @pytest.mark.parametrize("ticker, span, expected", [
+        # 2,851 rungs, e.g. KXXISUCCESSOR-45JAN01-DXUE
+        ("KXXISUCCESSOR-45JAN01-DXUE", "before Jan 1, 2045", date(2044, 12, 31)),
+        # 526 rungs
+        ("KXMILLENNIUMNEXT-45-BSD", "before 2045", date(2044, 12, 31)),
+        # 447 rungs
+        ("KXFEDHIKE-2-26DEC31", "by Dec 31, 2026", date(2026, 12, 31)),
+        # 132 rungs
+        ("KXTVSEASONRELEASETHELASTOFUS-26-OCT", "before Oct 2026", date(2026, 9, 30)),
+        # 19 rungs — the only live "through" family
+        ("KXNYCSTAT-HOME27-A275", "through June 30, 2027", date(2027, 6, 30)),
+        # 3 rungs
+        ("USCLIMATE-2025", "by 2025", date(2025, 12, 31)),
+    ])
+    def test_control_every_live_shape_still_reads(self, ticker, span, expected):
+        assert self._read(title=f"Will the thing happen {span}?") == expected, ticker
+
+
+class TestSameEventLadder:
+    """DR-73a: ordering two rungs of one event's ladder and measuring the gap.
+
+    Pure arithmetic over two already-read deadlines, so the live finder and
+    the backtester can share one definition. The three outcomes are kept
+    apart deliberately — a readable ladder, two rungs naming ONE day, and an
+    unreadable rung have different remedies and the callers count them
+    separately.
+    """
+
+    def test_orders_two_rungs_and_measures_the_gap(self):
+        assert scanner.same_event_ladder(date(2026, 9, 23), date(2026, 10, 16)) == (
+            False, 23,
+        )
+
+    def test_swap_is_true_when_the_second_argument_is_earlier(self):
+        # swap says "market_a must become market_b": the gap is
+        # order-independent, the ordering is not.
+        assert scanner.same_event_ladder(date(2026, 10, 16), date(2026, 9, 23)) == (
+            True, 23,
+        )
+
+    def test_the_same_day_is_its_own_outcome(self):
+        assert scanner.same_event_ladder(
+            date(2026, 9, 23), date(2026, 9, 23)
+        ) == scanner.SAME_DAY
+
+    def test_one_deadline_spelled_two_ways_is_the_same_day(self):
+        # "by Mar 31, 2027" and "before Apr 1, 2027" name the identical last
+        # included day. Without SAME_DAY this is a one-rung "ladder" with a
+        # gap of zero, which the tier arithmetic would happily price.
+        inclusive = scanner._span_deadline("by mar 31, 2027")
+        exclusive = scanner._span_deadline("before apr 1, 2027")
+        assert inclusive == exclusive == date(2027, 3, 31)
+        assert scanner.same_event_ladder(inclusive, exclusive) == scanner.SAME_DAY
+
+    def test_mixed_prepositions_one_day_apart_are_a_real_ladder(self):
+        # SCOTREF-27 is the one live event (of the 492 holding >= 2 dated
+        # cumulative rungs on the 2026-09-22 snapshot) that mixes an
+        # inclusive and an exclusive preposition, so the distinction is not
+        # theoretical. This row is its arithmetic: the two wordings below name
+        # days one apart, not the same day.
+        later = scanner._span_deadline("by jan 1, 2028")
+        earlier = scanner._span_deadline("before jan 1, 2028")
+        assert (later, earlier) == (date(2028, 1, 1), date(2027, 12, 31))
+        assert scanner.same_event_ladder(later, earlier) == (True, 1)
+
+    @pytest.mark.parametrize("bad", [
+        None,
+        "2026-09-23",
+        # datetime is a date SUBCLASS, so isinstance would admit it and the
+        # date - datetime subtraction would raise TypeError.
+        datetime(2026, 9, 23, tzinfo=UTC),
+    ])
+    def test_an_unreadable_deadline_is_none_on_either_side(self, bad):
+        assert scanner.same_event_ladder(bad, date(2026, 9, 23)) is None
+        assert scanner.same_event_ladder(date(2026, 9, 23), bad) is None
+
+    def test_a_magicmock_deadline_does_not_raise(self):
+        assert scanner.same_event_ladder(MagicMock(), MagicMock()) is None
 
 
 class TestDeadlineGuardFinders:
