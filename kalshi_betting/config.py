@@ -109,6 +109,67 @@ SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 # land between the deadlines for the trade to dispute the market's number.
 MAX_DEADLINE_GAP_DAYS         = 30
 
+# Whether the time-series finders may pair two rungs of ONE event's cumulative
+# deadline LADDER (DR-73). Kalshi often lists a question's several deadlines as
+# separate markets inside a SINGLE event — "Will SpaceX launch another Starship
+# by Sep 23, 2026?" and "... by Oct 16, 2026?" are both KXSPACEXSTARSHIP-14 —
+# and both finders have refused every same-event candidate since the first
+# commit, on the rationale that a shared event ticker means multi-choice
+# OPTIONS. That is true of an MVE event's option labels and false of a dated
+# ladder, whose two rungs are the time-series premise itself: the earlier
+# deadline's event nests inside the later one's. A ladder pair is ordered and
+# tiered on the two STATED deadlines (scanner.stated_deadline /
+# same_event_ladder), never on close_time, which a settled or single-instant
+# event gives every rung alike.
+#
+# READ THIS BEFORE FLIPPING IT. What the switch buys and what it puts at risk,
+# measured rather than assumed:
+#
+#   Nesting holds for ladders, and does not for what we trade today. Over 284
+#   archive day slices, 1,821 same-event cumulative pairs read to two
+#   different stated deadlines and the impossible A=YES/B=NO cell occurs 0
+#   times (0 of the 975 within MAX_DEADLINE_GAP_DAYS). The CROSS-EVENT
+#   baseline on the same corpus is 2,872 of 22,080 — 13.01%. The premise
+#   violations in the archive come from the pairs this finder admits TODAY.
+#
+#   Live funnel (2026-09-22 snapshot, 113,303 markets, on which the finder
+#   emits 0 time-series and 0 same-title pairs with the switch off): 3,354
+#   same-event candidates -> 2,840 past the identical-wording and
+#   cumulative-wording checks -> 2,774 reading as two different calendar days
+#   -> 350 within the 30-day stated-gap cap -> 89 past the price tier -> 87
+#   past the pA + nB < $1 guard -> 24 pairs emitted, in 24 events and 23
+#   series, all tradeable.
+#
+#   Exposure. strategy.compute_trade + select_portfolio over those 24 pairs at
+#   a $10,000 balance size 17 trades and SELECT 6, deploying $9,803.66 — 98%
+#   of the balance — with an aggregate market-implied EV of -$3,039.94, i.e.
+#   -31% of what is deployed. Every one of the 24 is market-EV-negative by
+#   construction: the strategy only fires where it disbelieves the market by
+#   1 - TIME_SERIES_INTERVAL_PROB_DISCOUNT. The capital concentrates on the
+#   widest spreads, which is Kelly behaving correctly (the haircut is worth
+#   0.25 x (pB - pA) in absolute probability, so a 0.94 spread carries a
+#   23.5-point claimed edge against a 12c stake) — FOUR of the six sit exactly
+#   at the BUDGET_FRACTION cap and a fifth at f* = 0.17, the five together
+#   deploying $9,716.81. BUDGET_FRACTION caps each PAIR, not the portfolio,
+#   and under the MODEL's own probabilities those five lose together 12.7% of
+#   the time (53.5% at market prices), each losing its full stake.
+#
+#   Selection effect. The one-best-pair-per-group rule picks the LARGEST
+#   pB - pA in a group, and a stale quote is by definition one out of line
+#   with its neighbours, so the pair containing it has the inflated spread and
+#   is the one selected. It is not hypothetical: 45 of the 484 live events
+#   holding >= 2 dated cumulative rungs price a LATER deadline BELOW an
+#   earlier one, which is impossible if the rungs nest, so at least one quote
+#   in each is wrong (42 of the 251 same-event GROUPS the one-best rule
+#   actually contests). An intervening-rung staleness guard is the natural
+#   answer and is deliberately not built here.
+#
+# Off by default until the interval discount is calibrated where the capital
+# actually goes — k-hat in the widest (pB - pA > 0.60) band, not pooled: p and
+# b depend on the spread, not on the gap in days, and the only k-hat ever
+# computed (1.114) was measured on snapshot pairs DR-67 refuses and is void.
+TIME_SERIES_SAME_EVENT_LADDERS = False
+
 # ── Time-series strategy model (2026-09 inversion) ────────────────────────────
 #
 # A time-series pair buys YES on the EARLIER-closing contract (market_a) and NO
@@ -814,15 +875,21 @@ def min_price_diff_for_gap(gap_days: int) -> float:
     the earlier's by MIN_PRICE_DIFF_SHORT_GAP (15%) when the deadlines are up
     to SHORT_DEADLINE_GAP_DAYS (15 days, inclusive) apart, and by
     MIN_PRICE_DIFF_LONG_GAP (30%) for anything wider. The gap is a distance,
-    not a direction — scanner.deadline_gap_days() computes it order-
-    independently, and the direction (later leg pricier) is enforced by the
-    caller's own filter. Callers must already have enforced
+    not a direction — both of the things that measure it,
+    scanner.deadline_gap_days() over two close_times and
+    scanner.same_event_ladder() over two STATED deadlines (DR-73), are
+    order-independent, and the direction (later leg pricier) is enforced by
+    the caller's own filter. Downstream of pair formation the gap is read
+    through scanner.pair_gap_days(), which returns whichever of the two the
+    pair was admitted on. Callers must already have enforced
     gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
     does not reject over-cap gaps itself.
 
     Args:
-        gap_days (int): Calendar days between the two legs' deadlines.
-            Range: 0..MAX_DEADLINE_GAP_DAYS (caller-enforced).
+        gap_days (int): Calendar days between the two legs' deadlines —
+            their close_times for a cross-event pair, their stated deadlines
+            for a same-event ladder. Range: 0..MAX_DEADLINE_GAP_DAYS
+            (caller-enforced).
 
     Returns:
         float: The minimum required YES ask price difference (dollars, 0-1)

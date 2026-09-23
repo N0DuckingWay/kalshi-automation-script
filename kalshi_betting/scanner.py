@@ -36,8 +36,11 @@ Dependencies:
     deadline_pair_refusal with its REFUSED_SNAPSHOT/REFUSED_NO_STATED_DEADLINE/
     REFUSED_SAME_DEADLINE constants and the DEADLINE_CUMULATIVE/
     DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
-    on WHY a candidate was refused (DR-72)). Depends on the KalshiClient
-    produced by auth.py.
+    on WHY a candidate was refused (DR-72), and stated_deadline/
+    same_event_ladder with the SAME_DAY sentinel, the one definition of a
+    same-event deadline ladder's leg order and gap (DR-73)). pair_gap_days()
+    is the single reader of that gap for everything downstream of pair
+    formation. Depends on the KalshiClient produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -133,6 +136,7 @@ from .config import (
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
     TIME_SERIES_LEG_SIDES,
+    TIME_SERIES_SAME_EVENT_LADDERS,
     fee_per_pair_approx,
     max_affordable_pairs,
     min_price_diff_for_gap,
@@ -741,8 +745,13 @@ class CandidatePair:
                    near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
                    prior — which is why the finder only forms such a pair
                    across two DIFFERENT event series (see _same_series).
-      time_series: YES on market_a (the EARLIER-closing contract) at pA, NO on
-                   market_b (the later one) at nB. Three settlement cells
+      time_series: YES on market_a (the EARLIER contract) at pA, NO on
+                   market_b (the later one) at nB. "Earlier" means earlier by
+                   close_time for a cross-event pair, and earlier by STATED
+                   DEADLINE for a same-event ladder (DR-73), whose rungs a
+                   settled event closes at one instant — read the gap through
+                   pair_gap_days(), never by re-deriving it from close_time.
+                   Three settlement cells
                    exist: event by A's deadline (A=YES, hence B=YES; YES-on-A
                    pays), never by B's (A=NO, B=NO; NO-on-B pays), or in
                    between (A=NO, B=YES; both legs worthless — the one loss
@@ -756,9 +765,12 @@ class CandidatePair:
 
     Attributes:
         market_a (Any): same_title: the market with the higher YES ask (the
-            expensive side). time_series: the earlier-closing contract.
+            expensive side). time_series: the earlier contract — by close_time
+            for a cross-event pair, by STATED deadline for a same-event
+            ladder (DR-73).
         market_b (Any): same_title: the market with the lower YES ask (the
-            cheap side). time_series: the later-closing contract.
+            cheap side). time_series: the later contract, by the same
+            ordering.
         pA (float): YES ask price of market A in dollars (cost to buy YES on A).
             Range: [0, 1]. A leg price for time_series; reporting-only for
             same_title.
@@ -789,6 +801,15 @@ class CandidatePair:
             Range: [0, 1]. A leg price for time_series; populated fail-soft
             (0.0 when unparseable) for same_title, where it is reporting-only
             and never priced.
+        stated_gap_days (int | None): For a same-event ladder (DR-73), the
+            calendar-day gap between the two legs' STATED deadlines — the gap
+            that ordered the legs, chose the price tier and was checked
+            against MAX_DEADLINE_GAP_DAYS at pair formation, carried out
+            rather than recomputed because a settled or same-day-closing
+            event gives its rungs a close_time gap of zero. None for every
+            other pair, meaning "tier this pair on close_time". Read it
+            through pair_gap_days(), never by testing truthiness: a genuine
+            0-day stated gap is falsy.
         depth_levels (tuple): The pair's qualifying order-book depth as
             (price_a, price_b, qty) triples in MARKET order, ascending by
             combined price — oriented once by enrich_with_orderbook_prices via
@@ -811,6 +832,10 @@ class CandidatePair:
     # Qualifying (price_a, price_b, qty) depth in MARKET order, ascending by
     # combined price; () = not enriched. Read via prefix_fill_prices().
     depth_levels: tuple[tuple[float, float, float], ...] = ()
+    # DR-73: a same-event ladder's STATED deadline gap, which ordered the legs
+    # and chose the tier; None = tier this pair on close_time. Read via
+    # pair_gap_days(), never by truthiness (a 0-day stated gap is falsy).
+    stated_gap_days: int | None = None
 
 
 def leg_sides(pair_type: str) -> tuple[str, str]:
@@ -879,6 +904,42 @@ def deadline_gap_days(market_a: Any, market_b: Any) -> int:
         int: abs(market_b.close_time - market_a.close_time).days, >= 0.
     """
     return abs(market_b.close_time - market_a.close_time).days
+
+
+def pair_gap_days(pair: Any) -> int:
+    """
+    Return the deadline gap a pair's price tier and ceiling must be measured on.
+
+    One reader for the two quantities that can differ: a cross-event
+    time-series pair is tiered on its legs' close_time gap
+    (deadline_gap_days), while a same-event LADDER is tiered on the STATED
+    deadline gap the finder ordered its legs by and already checked against
+    MAX_DEADLINE_GAP_DAYS (DR-73). The two are not interchangeable — a
+    settled or single-instant event closes every rung of a ladder at the same
+    moment, so close_time would report a 0-day gap and silently drop such a
+    pair from the 30% tier to the 15% one — so every downstream re-derivation
+    of the tier goes through this helper rather than calling
+    deadline_gap_days() itself.
+
+    The stated gap is read by TYPE, not truthiness: a genuine 0-day stated gap
+    is falsy, and bool is deliberately not accepted (type(True) is bool, not
+    int), the same fail-safe-by-type rule leg_sides() and
+    strategy._depth_levels() follow — anything that is not exactly an int
+    (a MagicMock's auto-attribute, None, a float) falls back to close_time.
+
+    Args:
+        pair (Any): A CandidatePair, or any object exposing market_a/market_b
+            and optionally stated_gap_days.
+
+    Returns:
+        int: The pair's deadline gap in whole calendar days, >= 0.
+    """
+    stated = getattr(pair, "stated_gap_days", None)
+    # Exact type, not isinstance: bool is an int subclass, and True would
+    # otherwise be read as a one-day stated gap.
+    if type(stated) is int:
+        return stated
+    return deadline_gap_days(pair.market_a, pair.market_b)
 
 
 def normalize_title(title: str) -> str:
@@ -2980,7 +3041,20 @@ def find_time_series_pairs(
 
     A pair is eligible when:
       1. Both markets are actively priced: ask price in [1%, 99%]
-      2. Different event_tickers (rules out multi-choice options in the same event)
+      2. Different event_tickers (which rules out an MVE event's multi-choice
+         option labels) — UNLESS config.TIME_SERIES_SAME_EVENT_LADDERS is on
+         and the two markets are two rungs of ONE event's cumulative deadline
+         LADDER (DR-73). Kalshi lists a question's several deadlines as
+         separate markets inside a single event, and two such rungs are the
+         time-series premise itself. That branch demands a shared NON-EMPTY
+         event ticker, wording that is not identical, item 4's cumulative
+         verdict, and two deadlines that read to two DIFFERENT calendar dates
+         (stated_deadline / same_event_ladder) no more than
+         MAX_DEADLINE_GAP_DAYS apart — then orders the legs and tiers the
+         pair on those STATED deadlines, never on close_time, and carries the
+         gap out on CandidatePair.stated_gap_days. With the switch off (the
+         shipped default) every same-event candidate is skipped and counted,
+         exactly as it always was.
       3. NOT identical wording across two events of one series: when the raw
          (title, subtitle, event title) triple matches on both legs AND the two
          event tickers resolve to one series (_same_series, which collapses
@@ -3012,7 +3086,9 @@ def find_time_series_pairs(
          changes which NON-tradeable row represents a group, because tradeable
          already requires 1 - pA - nB > fee.
       6. Deadline gap <= MAX_DEADLINE_GAP_DAYS (30 days), measured
-         order-independently by deadline_gap_days()
+         order-independently by deadline_gap_days() for a cross-event pair and
+         by the two STATED deadlines for a same-event ladder — one number
+         either way afterwards, through pair_gap_days()
       7. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
          LATER-closing contract (B) must be priced higher than the earlier
          one (A) by at least the tier (15% when the deadlines are <= 15 days
@@ -3068,7 +3144,10 @@ def find_time_series_pairs(
             deadline-gap cap whose wording is not identical across one series
             and states two different cumulative deadlines — the two deadlines
             compared as normalized strings, not parsed calendar dates (see the
-            DR-67 Known residuals in CLAUDE.md).
+            DR-67 Known residuals in CLAUDE.md). A pair formed by the
+            same-event ladder branch (item 2, off by default) additionally
+            carries stated_gap_days, the calendar-day gap between its two
+            STATED deadlines; every other pair carries None there.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -3122,6 +3201,34 @@ def find_time_series_pairs(
         phrasing_census[DEADLINE_UNKNOWN],
     )
 
+    # DR-73: each rung's STATED deadline as a calendar date, read ONCE per
+    # market (DR-70's rule — a group of N markets produces O(N^2) candidate
+    # pairs, and one event's deadline ladder is the densest such group there
+    # is), never per candidate pair. Not computed at all while the switch is
+    # off, so a run with ladders disabled does exactly the work it did before.
+    #
+    # Each value is a PAIR of readings: the cross-checked deadline
+    # stated_deadline() reports, and the same read with the cross-check
+    # disarmed — it only ever reads the three FIELD arguments, so passing ""
+    # for all three leaves the deciding field's own day. The second is used
+    # for nothing but naming WHY a refused candidate was refused: a rung
+    # stating no placeable day at all reads None both ways, while one whose
+    # own fields name irreconcilable days reads None only with the
+    # cross-check on.
+    ladder_deadlines: dict = {}
+    if TIME_SERIES_SAME_EVENT_LADDERS:
+        for m in active:
+            profile = profiles[m.ticker]
+            ladder_deadlines[m.ticker] = (
+                stated_deadline(
+                    profile,
+                    getattr(m, "_event_title", "") or "",
+                    getattr(m, "title", "") or "",
+                    getattr(m, "subtitle", "") or "",
+                ),
+                stated_deadline(profile, "", "", ""),
+            )
+
     # Candidates refused because the two legs are not one question at two
     # cumulative deadlines, split by REASON (DR-72) rather than folded into
     # one counter: a snapshot leg, a leg naming no comparable deadline, and
@@ -3142,6 +3249,22 @@ def find_time_series_pairs(
     # deadlines at all".
     gap_cap_skips = 0
     price_sum_skips = 0
+    # DR-73's same-event ladder branch keeps its OWN counters rather than
+    # adding to the six above. They count a DIFFERENT population — candidates
+    # inside one event, which every previous version of this finder refused
+    # outright — and folding them in was measured to move snapshot_skips by 12
+    # and price_sum_skips by 2 on the 2026-09-22 snapshot, blurring exactly
+    # the distinction DR-72 had just split apart. Every one is silent at zero,
+    # so a run with the switch off adds a single line (the disabled count).
+    ladder_disabled_skips = 0
+    ladder_snapshot_skips = 0
+    ladder_no_deadline_skips = 0
+    ladder_same_deadline_skips = 0
+    ladder_undated_skips = 0
+    ladder_field_conflict_skips = 0
+    ladder_same_day_skips = 0
+    ladder_gap_cap_skips = 0
+    ladder_price_sum_skips = 0
 
     candidate_pairs: list = []
     for norm_title, members in by_title.items():
@@ -3149,69 +3272,182 @@ def find_time_series_pairs(
         if len(members) < 2:
             continue
 
-        # Sort ascending by close_time so mA is always the earlier-closing contract
+        # Sort ascending by close_time so a cross-event candidate's mA is
+        # always the earlier-closing contract. A same-event LADDER re-orders
+        # its own two legs on their STATED deadlines below (DR-73) — this
+        # sort cannot order those, because a ladder's rungs may close at one
+        # instant or in the opposite order to their deadlines.
         members_sorted = sorted(members, key=lambda m: m.close_time)
         group_pairs: list = []
 
-        for i, mA in enumerate(members_sorted):
-            for mB in members_sorted[i + 1:]:
-                # Same event_ticker means these are options within a multi-choice event,
-                # not separate time-series markets — skip them
+        for i, m_outer in enumerate(members_sorted):
+            for m_inner in members_sorted[i + 1:]:
+                # Fresh per-candidate locals, NEVER the loop variables: a
+                # same-event ladder is ordered by STATED deadline and may swap
+                # its legs below, and swapping the OUTER loop variable in
+                # place would leak into every later m_inner of this iteration.
+                # find_same_title_pairs already uses this idiom for exactly
+                # the same reason.
+                mA, mB = m_outer, m_inner
+                # A same-event ladder's gap is its STATED deadline gap; None
+                # means "this pair is tiered on close_time" (pair_gap_days).
+                stated_gap = None
+
                 if mA.event_ticker == mB.event_ticker:
-                    continue
-
-                # Identical wording across two events of one series is the
-                # same-title shape find_same_title_pairs now refuses (DR-02,
-                # DR-54): the deadline lives outside the wording, so these are
-                # two instances of one recurring fixture and there is no
-                # cumulative-deadline premise to trade. Without this conjunct
-                # the same-title gate would merely RELABEL such a pair as a
-                # time-series bet — main._dedup_pairs only ever dropped the
-                # time-series copy because a same-title copy existed.
-                if _identical_wording(mA, mB) and _same_series(mA, mB):
-                    continue
-
-                # The pair must be one question asked at two different
-                # CUMULATIVE deadlines. Kalshi also lists SNAPSHOT markets
-                # ("Bitcoin price ON Sep 15, 2026?"), whose probabilities do
-                # not nest — SOL >= $180 on Sep 14 does not imply SOL >= $180
-                # on Sep 18 — so the YES-on-earlier / NO-on-later trade has no
-                # premise there at all, and nesting — which is what would make
-                # the fair value of YES-A + NO-B at most $1 — does not hold on
-                # a snapshot pair. normalize_title strips a dated snapshot
-                # title just as readily as a dated deadline one, so such a
-                # family lands in ONE group here and was previously sized and
-                # traded. Fails CLOSED on wording that names no deadline.
-                if not cumulative_deadline_pair(
-                    profiles[mA.ticker], profiles[mB.ticker]
-                ):
-                    # Same decision as cumulative_deadline_pair, re-asked for
-                    # its REASON (DR-72) — deadline_pair_refusal is the one
-                    # definition both calls share, so the verdict here and the
-                    # boolean just tested can never disagree.
-                    reason = deadline_pair_refusal(
+                    # DR-73: two markets of ONE event. Every previous version
+                    # of this finder skipped these outright as "options
+                    # within a multi-choice event" — true of an MVE event's
+                    # option labels, but NOT of a cumulative deadline LADDER,
+                    # where Kalshi lists one question's several deadlines as
+                    # separate markets inside a single event ("Will SpaceX
+                    # launch another Starship by Sep 23, 2026?" and "... by
+                    # Oct 16, 2026?" are both KXSPACEXSTARSHIP-14). Two such
+                    # rungs are precisely the time-series premise: the earlier
+                    # deadline's event nests inside the later one's. The
+                    # switch ships OFF — see
+                    # config.TIME_SERIES_SAME_EVENT_LADDERS for the nesting
+                    # evidence and for the exposure turning it on would take.
+                    if not TIME_SERIES_SAME_EVENT_LADDERS:
+                        ladder_disabled_skips += 1
+                        continue
+                    if not mA.event_ticker:
+                        # Two markets sharing an EMPTY event ticker share no
+                        # event at all, so nothing identifies the ladder they
+                        # would belong to. Fails closed, exactly as it did
+                        # before this branch existed.
+                        continue
+                    if _identical_wording(mA, mB):
+                        # Same event AND identical wording: the deadline is
+                        # not in the wording, so there is nothing here to
+                        # order two rungs by — DR-02's reasoning, reached one
+                        # level in. cumulative_deadline_pair below would
+                        # refuse it too (identical wording states identical
+                        # spans), but refusing it here keeps the ladder
+                        # counters about ladders.
+                        continue
+                    if not cumulative_deadline_pair(
                         profiles[mA.ticker], profiles[mB.ticker]
-                    )
-                    if reason == REFUSED_SNAPSHOT:
-                        snapshot_skips += 1
-                    elif reason == REFUSED_NO_STATED_DEADLINE:
-                        no_deadline_skips += 1
-                    elif reason == REFUSED_SAME_DEADLINE:
-                        same_deadline_skips += 1
-                    continue
+                    ):
+                        # The same three DR-72 reasons as the cross-event
+                        # branch, on their own counters.
+                        reason = deadline_pair_refusal(
+                            profiles[mA.ticker], profiles[mB.ticker]
+                        )
+                        if reason == REFUSED_SNAPSHOT:
+                            ladder_snapshot_skips += 1
+                        elif reason == REFUSED_NO_STATED_DEADLINE:
+                            ladder_no_deadline_skips += 1
+                        elif reason == REFUSED_SAME_DEADLINE:
+                            ladder_same_deadline_skips += 1
+                        continue
 
-                # Deadline gap check: past 30 days too much of the market-implied
-                # in-between probability is genuine for the trade to dispute it.
-                # Order-independent (same helper _pair_max_sum and the backtester use)
-                gap_days = deadline_gap_days(mA, mB)
-                if gap_days > MAX_DEADLINE_GAP_DAYS:
-                    # Wording was fine — the pair passed cumulative_deadline_pair
-                    # just above — only the gap wasn't. Counted separately from
-                    # the wording refusals above (DR-72): this is the live signal
-                    # that cumulative families exist but sit too far apart to
-                    # trade, not that the wording screen is failing.
-                    gap_cap_skips += 1
-                    continue
+                    # Both rungs' deadlines as CALENDAR DATES, read once per
+                    # market above. cumulative_deadline_pair compares the two
+                    # spans as opaque strings, which establishes that they
+                    # DIFFER but not which is earlier nor by how many days —
+                    # and close_time answers neither for a ladder, whose rungs
+                    # a settled event closes at one instant (in the archive
+                    # 681 of 1,821 dated same-event pairs have a close gap of
+                    # zero days and 13 are ordered the wrong way round by
+                    # realized close).
+                    deadline_a, deciding_a = ladder_deadlines[mA.ticker]
+                    deadline_b, deciding_b = ladder_deadlines[mB.ticker]
+                    ladder = same_event_ladder(deadline_a, deadline_b)
+                    if ladder is None:
+                        # Two different findings, counted apart: a rung whose
+                        # wording states no placeable day (a parser gap —
+                        # year-less wording, mostly), and a rung whose own
+                        # fields name irreconcilable days (stale wording in
+                        # one of them). deciding_* is the same read with the
+                        # cross-check disarmed, so it is what separates them.
+                        if (deadline_a is None and deciding_a is not None) or (
+                            deadline_b is None and deciding_b is not None
+                        ):
+                            ladder_field_conflict_skips += 1
+                        else:
+                            ladder_undated_skips += 1
+                        continue
+                    if ladder is SAME_DAY:
+                        # Both rungs name ONE calendar day — one deadline
+                        # spelled two ways ("by Mar 31, 2027" beside "before
+                        # Apr 1, 2027"), not a two-rung ladder. Compared with
+                        # `is`, never truthiness: SAME_DAY is a non-empty
+                        # string and so is truthy.
+                        ladder_same_day_skips += 1
+                        continue
+                    swap, stated_gap = ladder
+                    if stated_gap > MAX_DEADLINE_GAP_DAYS:
+                        # The ladder's OWN gap cap, deliberately inside this
+                        # branch so gap_cap_skips below keeps counting exactly
+                        # the cross-event candidates it counts today.
+                        ladder_gap_cap_skips += 1
+                        continue
+                    if swap:
+                        # market_a must be the EARLIER contract, which for a
+                        # ladder means the earlier STATED deadline:
+                        # members_sorted ordered this group by close_time,
+                        # which a ladder's rungs can share outright.
+                        mA, mB = mB, mA
+                else:
+                    # Identical wording across two events of one series is the
+                    # same-title shape find_same_title_pairs now refuses (DR-02,
+                    # DR-54): the deadline lives outside the wording, so these are
+                    # two instances of one recurring fixture and there is no
+                    # cumulative-deadline premise to trade. Without this conjunct
+                    # the same-title gate would merely RELABEL such a pair as a
+                    # time-series bet — main._dedup_pairs only ever dropped the
+                    # time-series copy because a same-title copy existed.
+                    if _identical_wording(mA, mB) and _same_series(mA, mB):
+                        continue
+
+                    # The pair must be one question asked at two different
+                    # CUMULATIVE deadlines. Kalshi also lists SNAPSHOT markets
+                    # ("Bitcoin price ON Sep 15, 2026?"), whose probabilities do
+                    # not nest — SOL >= $180 on Sep 14 does not imply SOL >= $180
+                    # on Sep 18 — so the YES-on-earlier / NO-on-later trade has no
+                    # premise there at all, and nesting — which is what would make
+                    # the fair value of YES-A + NO-B at most $1 — does not hold on
+                    # a snapshot pair. normalize_title strips a dated snapshot
+                    # title just as readily as a dated deadline one, so such a
+                    # family lands in ONE group here and was previously sized and
+                    # traded. Fails CLOSED on wording that names no deadline.
+                    if not cumulative_deadline_pair(
+                        profiles[mA.ticker], profiles[mB.ticker]
+                    ):
+                        # Same decision as cumulative_deadline_pair, re-asked for
+                        # its REASON (DR-72) — deadline_pair_refusal is the one
+                        # definition both calls share, so the verdict here and the
+                        # boolean just tested can never disagree.
+                        reason = deadline_pair_refusal(
+                            profiles[mA.ticker], profiles[mB.ticker]
+                        )
+                        if reason == REFUSED_SNAPSHOT:
+                            snapshot_skips += 1
+                        elif reason == REFUSED_NO_STATED_DEADLINE:
+                            no_deadline_skips += 1
+                        elif reason == REFUSED_SAME_DEADLINE:
+                            same_deadline_skips += 1
+                        continue
+
+                    # Deadline gap check: past 30 days too much of the market-implied
+                    # in-between probability is genuine for the trade to dispute it.
+                    # Order-independent (same helper _pair_max_sum and the backtester use)
+                    gap_days = deadline_gap_days(mA, mB)
+                    if gap_days > MAX_DEADLINE_GAP_DAYS:
+                        # Wording was fine — the pair passed cumulative_deadline_pair
+                        # just above — only the gap wasn't. Counted separately from
+                        # the wording refusals above (DR-72): this is the live signal
+                        # that cumulative families exist but sit too far apart to
+                        # trade, not that the wording screen is failing.
+                        gap_cap_skips += 1
+                        continue
+
+                # A ladder's gap is its STATED gap, already capped inside the
+                # branch above; a cross-event pair re-reads the close_time gap
+                # the else branch just checked. One expression, so everything
+                # below — the tier, the ceiling, the pair itself — is measured
+                # on the same number the admission check used.
+                gap_days = stated_gap if stated_gap is not None else deadline_gap_days(mA, mB)
 
                 try:
                     pA = float(mA.yes_ask_dollars)
@@ -3271,7 +3507,13 @@ def find_time_series_pairs(
                 # practice it is defensive and inert on every Kalshi grid
                 # (4-dp prices; complementary pairs sum to exactly 1.0).
                 if pA + nB >= 1.0 - PRICE_EPSILON:
-                    price_sum_skips += 1
+                    # Counted on the ladder's own line when it is one, so a
+                    # ladder run cannot silently inflate the cross-event
+                    # count (DR-73).
+                    if stated_gap is not None:
+                        ladder_price_sum_skips += 1
+                    else:
+                        price_sum_skips += 1
                     continue
 
                 # tradeable=True when a win scenario (YES-on-A or NO-on-B paying $1)
@@ -3292,6 +3534,11 @@ def find_time_series_pairs(
                         canonical_title=norm_title,
                         pair_type="time_series",
                         nB=nB,
+                        # None for a cross-event pair (tier it on close_time);
+                        # the stated gap for a ladder, so pair_gap_days can
+                        # hand every downstream re-derivation the very number
+                        # this pair was admitted and tiered on (DR-73).
+                        stated_gap_days=stated_gap,
                     )
                 )
 
@@ -3350,6 +3597,80 @@ def find_time_series_pairs(
         logging.info(
             "Time-series candidates skipped for a leg price sum at or above $1: %d",
             price_sum_skips,
+        )
+
+    # DR-73's own reporting. Every line below counts candidates INSIDE one
+    # event — a population none of the counters above has ever seen — and each
+    # is silent at zero, so a run with the switch off adds exactly one line
+    # (the disabled count) to this finder's output.
+    if ladder_disabled_skips:
+        logging.info(
+            "Same-event candidates skipped because same-event deadline "
+            "ladders are disabled (config.TIME_SERIES_SAME_EVENT_LADDERS): %d",
+            ladder_disabled_skips,
+        )
+    if ladder_snapshot_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deciding "
+            "field is snapshot wording: %d",
+            ladder_snapshot_skips,
+        )
+    if ladder_no_deadline_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deciding "
+            "field carries no recognised deadline wording or no comparable "
+            "date: %d",
+            ladder_no_deadline_skips,
+        )
+    if ladder_same_deadline_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the two rungs' "
+            "deciding fields state the same deadline, or truncate to one: %d",
+            ladder_same_deadline_skips,
+        )
+    if ladder_undated_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's deadline "
+            "states no placeable calendar day (year-less wording, mostly — "
+            "see scanner._span_deadline): %d",
+            ladder_undated_skips,
+        )
+    if ladder_field_conflict_skips:
+        logging.info(
+            "Same-event ladder candidates refused because a rung's own "
+            "wording fields name irreconcilable days (stated_deadline's "
+            "cross-check): %d",
+            ladder_field_conflict_skips,
+        )
+    if ladder_same_day_skips:
+        logging.info(
+            "Same-event ladder candidates refused because both rungs name "
+            "one calendar day (one deadline spelled two ways): %d",
+            ladder_same_day_skips,
+        )
+    if ladder_gap_cap_skips:
+        logging.info(
+            "Same-event ladder candidates worded as two different cumulative "
+            "deadlines, refused at the %d-day STATED gap cap (tier and price "
+            "not evaluated): %d",
+            MAX_DEADLINE_GAP_DAYS,
+            ladder_gap_cap_skips,
+        )
+    if ladder_price_sum_skips:
+        logging.info(
+            "Same-event ladder candidates skipped for a leg price sum at or "
+            "above $1: %d",
+            ladder_price_sum_skips,
+        )
+    if TIME_SERIES_SAME_EVENT_LADDERS:
+        # ALWAYS logged while the switch is on, zero included: a switch that
+        # silently produces nothing must be distinguishable from one that is
+        # working and finding nothing (DR-66). Counted off the RETURNED pairs,
+        # after the one-best-per-group contest, so it says how many ladders
+        # actually reach the sizer rather than how many were proposed.
+        logging.info(
+            "Same-event ladder pairs among the time-series pairs: %d",
+            sum(1 for p in candidate_pairs if type(p.stated_gap_days) is int),
         )
 
     logging.info(
@@ -4057,8 +4378,10 @@ def _pair_max_sum(pair: Any) -> float:
     min_price_diff_for_gap() (sum <= 1 - MIN_PRICE_DIFF_SHORT_GAP when the
     deadlines are <= SHORT_DEADLINE_GAP_DAYS apart, sum <= 1 -
     MIN_PRICE_DIFF_LONG_GAP for wider gaps up to MAX_DEADLINE_GAP_DAYS). The
-    gap comes from deadline_gap_days(), which is order-independent, so the
-    ceiling does not depend on which leg closes first.
+    gap comes from pair_gap_days(), which is order-independent, so the
+    ceiling does not depend on which leg closes first — and which returns the
+    pair's STATED deadline gap for a same-event ladder (DR-73), whose rungs
+    can share a close_time entirely.
 
     Args:
         pair (CandidatePair): The pair whose ceiling is needed.
@@ -4067,8 +4390,11 @@ def _pair_max_sum(pair: Any) -> float:
         float: Maximum qualifying yes_price + no_price sum (dollars, 0-1).
     """
     if pair.pair_type == "time_series":
-        # Tier the ceiling by the same deadline gap used at candidate detection
-        gap_days = deadline_gap_days(pair.market_a, pair.market_b)
+        # Tier the ceiling by the same deadline gap used at candidate
+        # detection — the STATED gap for a same-event ladder, close_time
+        # otherwise (DR-73). Re-deriving it from close_time here would
+        # re-tier a ladder the finder already tiered.
+        gap_days = pair_gap_days(pair)
         return 1.0 - min_price_diff_for_gap(gap_days)
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
@@ -4272,9 +4598,9 @@ def enrich_with_orderbook_prices(
                 # `>`: a mixed-snapshot gap of a thousandth would otherwise pass,
                 # and as the gap shrinks time_series_profit_prob rises toward 1.0
                 # and Kelly sizes toward the BUDGET_FRACTION cap.
-                tier = min_price_diff_for_gap(
-                    deadline_gap_days(pair.market_a, pair.market_b)
-                )
+                # pair_gap_days, not deadline_gap_days: a same-event
+                # ladder is tiered on its STATED deadline gap (DR-73).
+                tier = min_price_diff_for_gap(pair_gap_days(pair))
                 direction_ok = (pair.pB - avg_yes) >= tier - PRICE_EPSILON
                 basis = (
                     f"scan-time reference ask {pair.pB:.4f} (later book's NO side "

@@ -290,3 +290,16 @@ class TestCreateNewOutput:
         with pytest.raises(PermissionError):
             config.create_new_output(tmp_path / "trade_log_x.xlsx")
         assert len(calls) == 1
+
+
+class TestSameEventLadderSwitch:
+    """DR-73: same-event deadline ladders ship OFF.
+
+    The switch changes which pairs exist, and turning it on was measured to
+    deploy 98% of a $10,000 balance into 6 trades at -31% market-implied EV
+    (see the constant's own comment). It must not be flipped by accident, and
+    a default flip must fail a test rather than reach a Monday prod run.
+    """
+
+    def test_same_event_ladders_ship_off(self):
+        assert config.TIME_SERIES_SAME_EVENT_LADDERS is False

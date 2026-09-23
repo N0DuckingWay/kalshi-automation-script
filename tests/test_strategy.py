@@ -715,6 +715,29 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_time_series_pairs", "deadline_pair_refusal")
         assert _function_calls(backtester, "_extract_pairs", "deadline_pair_refusal")
 
+    def test_ast_both_finders_apply_the_same_event_ladder_rule(self):
+        # DR-73: a same-event deadline ladder is ordered and tiered on its two
+        # STATED deadlines, so the live finder must reach BOTH halves of that
+        # arithmetic — stated_deadline (wording -> calendar day) and
+        # same_event_ladder (two days -> leg order and gap). Re-deriving
+        # either inside the finder is how the two paths drifted apart before
+        # (DR-01), and close_time cannot answer either question for a ladder
+        # whose rungs settle at one instant.
+        assert _function_calls(scanner, "find_time_series_pairs", "stated_deadline")
+        assert _function_calls(scanner, "find_time_series_pairs", "same_event_ladder")
+
+    def test_ast_pair_ceiling_reads_the_pair_gap(self):
+        # DR-73: everything downstream of pair formation reads the gap through
+        # pair_gap_days, which returns the STATED gap for a ladder and the
+        # close_time gap for everything else. _pair_max_sum calling
+        # deadline_gap_days itself would silently re-tier a ladder whose rungs
+        # share a close_time — from the 30% tier to the 15% one.
+        assert _function_calls(scanner, "_pair_max_sum", "pair_gap_days")
+        assert not _function_calls(scanner, "_pair_max_sum", "deadline_gap_days")
+        assert _function_calls(scanner, "enrich_with_orderbook_prices", "pair_gap_days")
+        assert not _function_calls(
+            scanner, "enrich_with_orderbook_prices", "deadline_gap_days")
+
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror
         # helpers call scanner.event_series, so live and backtest can never
