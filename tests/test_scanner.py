@@ -1672,9 +1672,10 @@ class TestStatedDeadline:
         # Year granularity, the same two directions.
         ("by 2027", date(2027, 12, 31)),
         ("before 2026", date(2025, 12, 31)),
-        # ISO.
+        # ISO, INCLUSIVE only — a bare ISO date and one cut out of a full
+        # timestamp are indistinguishable, and they agree on the inclusive
+        # side. The exclusive side is in the refusal table below.
         ("by 2026-03-15", date(2026, 3, 15)),
-        ("before 2026-03-15", date(2026, 3, 14)),
         # A weekday in front of the date is noise; the date behind it names
         # the day (DR-68 keeps the whole span rather than truncating it).
         ("by Friday, Sep 19, 2026", date(2026, 9, 19)),
@@ -1721,6 +1722,26 @@ class TestStatedDeadline:
         "by end of Q4 2026",
         "by year-end",
         "by EOY",
+        # An article IMMEDIATELY in front of a bare year is the same season
+        # range as "before the 2027", reached past that guard because
+        # "end of" disarms it: KXCANADACUP-30's title truncates "the 2030-31
+        # season" to this span. The "by the end of 2027" row in the
+        # acceptance table above is the control that keeps this narrow.
+        "by the end of the 2030",
+        "by end of the 2030",
+        # A bare ISO behind an EXCLUSIVE preposition. _COMPILED_CUMULATIVE[0]
+        # cuts one out of a full timestamp, whose last included day is the
+        # NAMED one, so dating it a day early is this reader's only fail-OPEN
+        # direction — KXDIAZOUT-MDC lists five such rungs under one event
+        # ticker in backtest_cache/archive_days.
+        "before 2026-03-15",
+        "prior to 2026-03-15",
+        # A NUMERIC calendar date. _DEADLINE_DATE_TOKEN's m/d alternative
+        # spans one, so the phrase reaches this reader, but no accepted token
+        # is numeric-m/d and the shape occurs zero times in either candidate
+        # population.
+        "by 12/31/2026",
+        "before 12/31/2026",
         # "end of" at DAY granularity names no period.
         "by the end of Sep 23, 2026",
         # An impossible calendar date states no day.
@@ -1734,14 +1755,64 @@ class TestStatedDeadline:
 
     def test_the_bare_year_floor_matches_the_phrasing_table(self):
         # _span_deadline shares _DEADLINE_DATE_TOKEN's 2020-2099 bound, so
-        # "decrease by 2019" is an amount rather than a deadline. On the span
-        # path the phrasing table refuses it first, which is why this row
-        # drives the reader directly — its docstring documents raw wording as
-        # an accepted input.
+        # "decrease by 2019" is an amount rather than a deadline. On the
+        # finder path the phrasing table refuses "by 2019" first, so this row
+        # drives _span_deadline directly with a bare SPAN — not raw wording,
+        # which the anchored _STATED_SPAN rejects — to pin the floor itself.
         assert scanner._span_deadline("by 2019") is None
         assert scanner._span_deadline("by 2020") == date(2020, 12, 31)
         assert scanner._span_deadline("by 2099") == date(2099, 12, 31)
         assert scanner._span_deadline("by 2100") is None
+
+    def test_the_reader_is_not_a_wording_parser(self):
+        # _STATED_SPAN is anchored at both ends, so the string must begin with
+        # the preposition and end with the date token. Pinned because the
+        # docstring used to invite raw wording and C2/C3 feed this reader from
+        # market fields: a silent None on every market is indistinguishable
+        # from "this corpus has no dated ladders" (the DR-66 shape).
+        assert scanner._span_deadline("Will X happen by Dec 31, 2026?") is None
+        assert scanner._span_deadline("by Dec 31, 2026?") is None
+        assert scanner._span_deadline("resolved by Dec 31, 2026") is None
+        # Case and whitespace ARE normalized, which is all the docstring claims.
+        assert scanner._span_deadline("  BY   DEC 31,  2026  ") == date(2026, 12, 31)
+
+    def test_every_month_spelling_the_phrasing_table_matches_has_a_number(self):
+        # _STATED_MONTH_NUMBERS is a hand-written literal (it must not be read
+        # off the locale-sensitive calendar module — see its comment), so the
+        # anti-drift guarantee lives here: a spelling _DEADLINE_MONTH matches
+        # but this table lacks reads as None, silently removing that family
+        # from the ladder population.
+        alternation = scanner._DEADLINE_MONTH.removeprefix("(?:").removesuffix(")")
+        spellings = set()
+        for alternative in alternation.split("|"):
+            if alternative.endswith("?"):
+                spellings.add(alternative[:-1])  # "Sept?" -> "Sept"
+                spellings.add(alternative[:-2])  # "Sept?" -> "Sep"
+            else:
+                spellings.add(alternative)
+        assert len(spellings) >= 24
+        missing = sorted(s for s in spellings if s.lower() not in scanner._STATED_MONTH_NUMBERS)
+        assert missing == [], missing
+
+    def test_the_reader_covers_every_preposition_the_phrasing_table_can_span(self):
+        # Two separately-maintained preposition lists that must agree:
+        # _CUMULATIVE_DEADLINE_PATTERNS[0] decides which prepositions can
+        # APPEAR in a span, _STATED_SPAN plus the four tables decide which can
+        # be READ. A preposition added to the phrasing table alone makes every
+        # span carrying it read as None — the same silent family loss
+        # TestPhrasingTableInvariants exists to prevent on the tables above.
+        inner = scanner._CUMULATIVE_DEADLINE_PATTERNS[0].split("(?:", 1)[1].split(")", 1)[0]
+        spannable = {a.replace(r"\s+", " ") for a in inner.split("|")}
+        assert "no later than" in spannable and "prior to" in spannable
+        readable = (
+            scanner._STATED_INCLUSIVE | scanner._STATED_EXCLUSIVE
+            | scanner._STATED_THROUGH | scanner._STATED_AMBIGUOUS
+        )
+        assert spannable == readable, spannable ^ readable
+        # ... and _STATED_SPAN's own alternation is the same set again, or a
+        # table entry would be unreachable.
+        head = scanner._STATED_SPAN.pattern.split("^(", 1)[1].split(")", 1)[0]
+        assert set(head.split("|")) == readable
 
     def test_a_non_str_span_reads_as_absent(self):
         # Same fail-safe-by-type rule leg_sides and _depth_levels follow: a
@@ -1774,16 +1845,31 @@ class TestStatedDeadline:
             title="Will it happen by Sep 23, 2026 — by Sep 23, 2026?"
         ) == date(2026, 9, 23)
 
-    def test_cross_field_conflict_refuses_starship(self):
-        # KXSPACEXSTARSHIP-14-26SEP23 on the 2026-09-22 live snapshot: the
-        # subtitle decides the verdict (DR-69) and says 09-23, while the
-        # title says 09-22. One day is exactly the error that mis-orders two
-        # adjacent rungs, so the rung is refused rather than resolved by
-        # precedence.
+    def test_by_and_before_the_same_named_day_are_one_spelling(self):
+        # KXSPACEXSTARSHIP-14-26SEP23 on the 2026-09-22 live snapshot, and
+        # Kalshi's standard ladder template: the title says "before Sep 23,
+        # 2026" (last included day Sep 22) and the subtitle "By Sep 23, 2026"
+        # (Sep 23). The market's close_time is 2026-09-23T03:59Z — 23:59 on
+        # Sep 22 in New York — so those are ONE deadline named two ways, not a
+        # one-day disagreement, and the day-SET cross-check must read it.
+        # Comparing single last-included days instead refused all five rungs
+        # of the widest live ladder. The subtitle decides under DR-69.
         assert self._read(
             event_title="SpaceX Starship 14th launch?",
             title="Will SpaceX launch another Starship before Sep 23, 2026?",
             subtitle="By Sep 23, 2026",
+        ) == date(2026, 9, 23)
+
+    def test_a_bare_year_against_a_named_day_still_refuses(self):
+        # The day-SET check must not admit a field whose readings are
+        # DISJOINT from the deciding field's. SCOTREF-27's rungs title a bare
+        # year ("called before 2028" -> {2027-12-31, 2028-12-31}) against a
+        # subtitle "By Jan 1, 2028" -> {2028-01-01}: no reading in common, so
+        # the rung is refused. 30 of the 47 cross-field markets on the
+        # 2026-09-22 snapshot are this shape.
+        assert self._read(
+            title="New Scottish referendum called before 2028?",
+            subtitle="By Jan 1, 2028",
         ) is None
 
     def test_cross_field_conflict_refuses_starship_florida(self):
@@ -1795,6 +1881,19 @@ class TestStatedDeadline:
             event_title="When will SpaceX's Starship launch from Florida?",
             title="Will SpaceX's Starship launch from Florida before Oct 1, 2026",
             subtitle="Before 2026",
+        ) is None
+
+    def test_a_truncated_iso_timestamp_rung_is_refused(self):
+        # KXDIAZOUT-MDC-26APR01 as backtest_cache/archive_days holds it: a
+        # blank cached subtitle makes the TITLE decide, and the title's
+        # deadline is a full timestamp that _COMPILED_CUMULATIVE[0] cuts down
+        # to a bare ISO date. The market is open through 14:00 on Apr 1, so
+        # the last included day is Apr 1, not Mar 31 — and reading it a day
+        # early would turn a SAME_DAY refusal against a sibling worded "by
+        # Apr 1, 2026" into a 1-day ladder. Five rungs of that one event are
+        # in the cache; the reader refuses all five rather than guess.
+        assert self._read(
+            title="Will Miguel Díaz-Canel leave office before 2026-04-01T14:00:00.000Z?",
         ) is None
 
     def test_a_non_deciding_field_that_names_no_day_does_not_refuse(self):
@@ -1815,26 +1914,27 @@ class TestStatedDeadline:
         ) == date(2027, 3, 31)
 
     # control — kills a "refuse everything" mutant, which every refusal row
-    # above would pass. These are the SIX span shapes that actually occur in
-    # the live same-event ladder candidate population (the 4,161 cumulative,
-    # span-carrying rungs of events holding >= 2 of them, on the
-    # .git/dr67-scratch 2026-09-22 snapshot of 113,303 markets, 3,940 of which
-    # read to a date), each with a real ticker and its measured rung count;
-    # four small archive day slices add no shape these six do not already
-    # cover. If a future tightening refuses one of
-    # them it removes a whole live family from the strategy, silently.
+    # above would pass. These are the SIX (preposition, token-shape) buckets
+    # that actually occur in the live same-event ladder candidate population
+    # (the 4,161 cumulative, span-carrying rungs of events holding >= 2 of
+    # them, on the .git/dr67-scratch 2026-09-22 snapshot of 113,303 markets,
+    # 3,951 of which read to a date), each with a real ticker and its measured
+    # rung count — the six counts sum to exactly that 3,951. Four small
+    # archive day slices add no shape these six do not already cover. If a
+    # future tightening refuses one of them it removes a whole live family
+    # from the strategy, silently.
     @pytest.mark.parametrize("ticker, span, expected", [
-        # 2,851 rungs, e.g. KXXISUCCESSOR-45JAN01-DXUE
+        # 2,834 rungs, e.g. KXXISUCCESSOR-45JAN01-DXUE
         ("KXXISUCCESSOR-45JAN01-DXUE", "before Jan 1, 2045", date(2044, 12, 31)),
-        # 526 rungs
+        # 525 rungs
         ("KXMILLENNIUMNEXT-45-BSD", "before 2045", date(2044, 12, 31)),
-        # 447 rungs
+        # 444 rungs
         ("KXFEDHIKE-2-26DEC31", "by Dec 31, 2026", date(2026, 12, 31)),
-        # 132 rungs
+        # 127 rungs
         ("KXTVSEASONRELEASETHELASTOFUS-26-OCT", "before Oct 2026", date(2026, 9, 30)),
         # 19 rungs — the only live "through" family
         ("KXNYCSTAT-HOME27-A275", "through June 30, 2027", date(2027, 6, 30)),
-        # 3 rungs
+        # 2 rungs
         ("USCLIMATE-2025", "by 2025", date(2025, 12, 31)),
     ])
     def test_control_every_live_shape_still_reads(self, ticker, span, expected):

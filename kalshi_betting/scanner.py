@@ -76,7 +76,9 @@ Notes:
     Reading a cumulative deadline as a CALENDAR DATE is a separate step from
     classifying one: stated_deadline() turns a rung's wording into the last
     day its deadline includes (refusing year-less wording, and refusing when
-    two of the market's own fields name different days), and
+    two of the market's own fields cannot be naming one day — judged on the
+    SET of days each phrase can mean, since Kalshi spells one deadline both
+    "before D" and "By D" inside a single market), and
     same_event_ladder() orders two such rungs and measures the gap between
     them — the arithmetic DR-73 needs to pair two rungs of ONE event's
     deadline ladder, where close_time cannot order them because a settled
@@ -1422,10 +1424,15 @@ _STATED_EXCLUSIVE = frozenset({"before", "prior to"})
 # Known residuals record "2018-19 through 2025-26" reading as the span
 # "through 2025", a season range rather than a deadline. Turning that span
 # into 2025-12-31 would promote a recorded false-cumulative residual into a
-# usable calendar date, and both live instances of the shape are exactly that
-# residual (KXNBANEWCHAMPION-27's "through 2025" off "2018-19 through
-# 2025-26", and KXNCAAWBCONFSTREAK-30BIGEASTCONN's "through 2030" off "through
-# the 2029-30 season"). A DATED "through" stays accepted and is a real
+# usable calendar date. Exactly two live markets carry the shape and neither
+# is a deadline: KXNBANEWCHAMPION-27-Y spans "through 2025" off a title
+# reading "(2018-19 through 2025-26)", which IS that residual; the other,
+# KXNCAAWBCONFSTREAK-30BIGEASTCONN-Y, spans "through 2030" off a SUBTITLE
+# reading "UConn to win the Big East Tournament through 2030" — a conjunction
+# over every season up to that year, anti-monotone in the date and so not a
+# deadline either. (Its TITLE's "through the 2029-30 season" spans "through
+# the 2029" and is refused by the article guard instead, which is why the
+# subtitle is the field to look at.) A DATED "through" stays accepted and is a real
 # fiscal-year shape: 14 live rungs span "through june 30, 2027"
 # (KXNYCSTAT-HOME27, KXNYCAFFORDABLE-27JUN30), 6 "through april 30, 2027".
 _STATED_THROUGH = frozenset({"through"})
@@ -1457,7 +1464,7 @@ _STATED_WEEKDAY_PREFIX = re.compile(rf"^{_DEADLINE_WEEKDAY}\b\.?,?\s*", re.IGNOR
 # beside a sibling's "Before Jan 5" (2027). Year-less spans therefore read as
 # None and the pair fails closed: 69 of the 4,161 live ladder candidate rungs
 # on the 2026-09-22 snapshot (42 naming a month and day, 27 a bare month), of
-# which 3,940 read to a date in all.
+# which 3,951 read to a date in all.
 _STATED_MONTH_DAY_YEAR = re.compile(
     rf"^({_DEADLINE_MONTH})\b\.?\s+(\d{{1,2}})(?!\d)\s*,?\s*(\d{{4}})$", re.IGNORECASE
 )
@@ -1470,15 +1477,30 @@ _STATED_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 # Month spelling -> month number, covering exactly the spellings
 # _DEADLINE_MONTH matches (full names, three-letter abbreviations, and the
-# four-letter "Sept"). Built from the calendar module so the two can never
-# drift apart by a typo.
+# four-letter "Sept"). Spelled out rather than read off calendar.month_name /
+# calendar.month_abbr: those are _localized_month objects backed by
+# strftime("%B"/"%b") and therefore LC_TIME-dependent, and this table is built
+# once at import — so one locale.setlocale() anywhere in the process (debugpy's
+# launcher calls it, so running under a debugger on a localized host is enough)
+# would replace every English key and silently blind _span_deadline to every
+# month-named deadline while bare years kept reading. It fails CLOSED (an
+# unknown spelling returns None), but invisibly, which is the DR-66 shape the
+# rest of DR-73 is careful about. TestStatedDeadline pins this table against
+# _DEADLINE_MONTH so the two still cannot drift apart by a typo.
 _STATED_MONTH_NUMBERS = {
-    name.lower(): number for number, name in enumerate(calendar.month_name) if name
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
 }
-_STATED_MONTH_NUMBERS.update(
-    {abbr.lower(): number for number, abbr in enumerate(calendar.month_abbr) if abbr}
-)
-_STATED_MONTH_NUMBERS["sept"] = 9
 
 
 def _last_included_day(start: date, end: date, inclusive: bool) -> date:
@@ -1514,10 +1536,15 @@ def _span_deadline(span: Any) -> date | None:
     Turn ONE deadline span into the last calendar day it includes, or None.
 
     Consumes a span as _deadline_spans produces it (a match of
-    _COMPILED_CUMULATIVE[0], lower-cased and whitespace-collapsed), and
-    re-normalizes so a caller may also pass raw wording.
+    _COMPILED_CUMULATIVE[0], lower-cased and whitespace-collapsed). The
+    case/whitespace normalization is repeated here so a hand-written span
+    still reads, NOT so raw wording can be passed: _STATED_SPAN is anchored at
+    both ends, so the string must BEGIN with the preposition and END with the
+    date token. "Will X happen by Dec 31, 2026?" reads as None, and so does
+    "by Dec 31, 2026?" on its one character of trailing punctuation. Callers
+    hand it spans from _deadline_spans(), never a raw field.
 
-    Refuses — returning None — in five measured cases, each of which fails
+    Refuses — returning None — in seven measured cases, each of which fails
     CLOSED into "this rung has no readable deadline":
 
       1. A YEAR-LESS token ("before Nov 4"). Nothing in the wording anchors
@@ -1527,16 +1554,41 @@ def _span_deadline(span: Any) -> date | None:
          season range truncates to ("Before the 2027-28 season"), not a
          deadline. The guard is `article and not end_of` precisely so
          "by the end of 2027" — an unambiguous 2027-12-31 — still reads.
-      3. "until" / "up to", whose inclusivity is not stated.
-      4. A bare year behind "through" (see _STATED_THROUGH).
-      5. An impossible calendar date ("Feb 30"), or "end of" at day
-         granularity, where the phrase names no period this reader can place.
+      3. An article IMMEDIATELY IN FRONT OF A BARE YEAR, which _STATED_SPAN
+         captures inside the "end of" group rather than in `article`
+         ("by the end of the 2030", one live market, KXCANADACUP-30's "by the
+         end of the 2030 season"). That is the same season-range truncation
+         as (2), reached past its guard because "end of" disarms it; the
+         discriminator is the "the" adjacent to the year, so
+         "by the end of 2027" still reads and "by end of the 2030" does not.
+      4. "until" / "up to", whose inclusivity is not stated.
+      5. A bare year behind "through" (see _STATED_THROUGH).
+      6. A bare ISO date behind an EXCLUSIVE preposition (see below).
+      7. An impossible calendar date ("Feb 30"), "end of" at day granularity,
+         or a NUMERIC calendar date ("by 12/31/2026" —
+         _DEADLINE_DATE_TOKEN's m/d alternative spans one, so the phrase
+         reaches this reader, but no accepted token is numeric-m/d and the
+         shape occurs zero times in either candidate population, so refusing
+         keeps the reader to the month-name/ISO forms that were measured).
 
-    Known residual: an ISO token cut from a full timestamp
-    ("before 2027-01-01T15:00:00Z") reads as a bare ISO date, so on the
-    EXCLUSIVE side it dates one day early. No ISO span appears anywhere in the
-    2026-09-22 live snapshot's ladder candidate population, nor in the four
-    archive day slices sampled alongside it.
+    Why an ISO date is accepted only behind an INCLUSIVE preposition:
+    _COMPILED_CUMULATIVE[0] cuts a bare ISO date out of a full timestamp, so
+    "before 2026-04-01T14:00:00.000Z" spans "before 2026-04-01" — whose last
+    INCLUDED day is the named one (the market is open through 14:00 on it),
+    not the day before. The shape is real and it is exactly what DR-73
+    targets: KXDIAZOUT-MDC lists FIVE such rungs under one event ticker in
+    backtest_cache/archive_days (titles "before 2026-02-01" … "before
+    2026-06-01", each closing at 14:00–15:00 UTC on the named day), where a
+    blank cached subtitle makes the truncated ISO the DECIDING span, and six
+    actively priced markets across KXDIAZOUT-MDC and KXLAIOUT-LCHI carry the
+    same wording live (there in a NON-deciding field, which stated_deadline's
+    cross-check still reads). Dating those one day early is the one FAIL-OPEN
+    direction in this reader — an ISO rung beside a sibling worded "by Apr 1,
+    2026" would read as a 1-day ladder instead of the SAME_DAY refusal it is —
+    so the exclusive side is refused rather than guessed. An inclusive ISO is
+    right under both readings (a timestamp's day and a bare date's day are the
+    same day) and stays accepted. No genuine, non-truncated exclusive ISO span
+    occurs in either candidate population, so nothing measured is lost.
 
     Args:
         span (Any): One deadline phrase. A non-str reads as absent rather than
@@ -1603,6 +1655,16 @@ def _span_deadline(span: Any) -> date | None:
         if bare_year is not None:
             if preposition in _STATED_THROUGH:
                 return None
+            if end_of is not None and end_of.strip().endswith("the"):
+                # "by the end of THE 2030" is what "... the 2030-31 season"
+                # truncates to (KXCANADACUP-30) — the same season range the
+                # article guard above refuses, reached past it because
+                # "end of" disarms that guard. The signature is the article
+                # ADJACENT to the bare year, which _STATED_SPAN captures
+                # inside this group, so the leading-article test cannot see
+                # it. "by the end of 2027" keeps its own article and still
+                # reads.
+                return None
             year = int(bare_year.group(1))
             return _last_included_day(
                 date(year, 1, 1), date(year, 12, 31), inclusive
@@ -1610,13 +1672,57 @@ def _span_deadline(span: Any) -> date | None:
 
         iso = _STATED_ISO.match(token)
         if iso is not None:
-            if end_of:
+            if end_of or not inclusive:
+                # A bare ISO date is indistinguishable from one
+                # _COMPILED_CUMULATIVE[0] cut out of a full timestamp, whose
+                # last INCLUDED day is the named one rather than the day
+                # before it — see the docstring's ISO paragraph and
+                # KXDIAZOUT-MDC's five archive rungs. Refuse rather than date
+                # an exclusive one a day early, which is this reader's one
+                # fail-OPEN direction.
                 return None
             named = date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
             return _last_included_day(named, named, inclusive)
     except (ValueError, OverflowError):
         return None
     return None
+
+
+# Rewrites the exclusive prepositions into "by" so _span_deadline can be asked
+# the OTHER question a span answers — which day does it NAME — without a
+# second parser. Anchored, so it only ever touches a span's own leading word.
+_STATED_EXCLUSIVE_PREFIX = re.compile(r"^(?:before|prior to)\b")
+
+
+def _span_days(span: Any) -> frozenset:
+    """
+    Both calendar days one span can be pointing at: the last it INCLUDES and the one it NAMES.
+
+    Kalshi routinely spells ONE deadline both ways inside a single market —
+    KXSPACEXSTARSHIP-14-26SEP23 is titled "... before Sep 23, 2026?" and
+    sub-titled "By Sep 23, 2026", and closes 2026-09-23T03:59Z, i.e. 23:59 on
+    Sep 22 in New York. Read as last-included days alone those are Sep 22 and
+    Sep 23, a one-day disagreement; read as alternatives they are one deadline.
+    stated_deadline's cross-check therefore compares field SETS and refuses
+    only when they are disjoint. The deciding field's own date is still the
+    single last-included day _span_deadline returns — this set widens what
+    counts as AGREEMENT, never what the helper reports.
+
+    Args:
+        span (Any): One deadline phrase, as _deadline_spans produces it. A
+            non-str, or one this reader cannot place, yields an empty set.
+
+    Returns:
+        frozenset[date]: Zero, one or two days. Empty means the span states no
+            placeable day, which the caller treats as silence rather than
+            disagreement.
+    """
+    last = _span_deadline(span)
+    if last is None:
+        return frozenset()
+    text = re.sub(r"\s+", " ", span).strip().lower()
+    named = _span_deadline(_STATED_EXCLUSIVE_PREFIX.sub("by", text, count=1))
+    return frozenset(day for day in (last, named) if day is not None)
 
 
 def stated_deadline(
@@ -1631,21 +1737,32 @@ def stated_deadline(
     sets leg order, the price tier and the 30-day cap, where being wrong is a
     mis-ordered or mis-tiered real-money trade rather than a missed pair — so
     this function additionally reads every OTHER wording field and refuses
-    when two of them name different days. That is not a reversal of DR-69: a
-    non-deciding field can only ever REFUSE here, never supply the date.
+    when one of them cannot be pointing at the deciding field's deadline at
+    all. That is not a reversal of DR-69: a non-deciding field can only ever
+    REFUSE here, never supply the date.
 
-    It is not hypothetical. 47 of the 4,697 actively priced cumulative
-    markets on the 2026-09-22 snapshot state two different days across their
-    own fields, including
-    KXSPACEXSTARSHIP-14-26SEP23 (title "before Sep 23" -> 09-22 against a
-    subtitle "By Sep 23" -> 09-23) and KXSTARSHIPFL-26JUN-26OCT01 (subtitle
-    "Before 2026" -> 2025-12-31 against a title "before Oct 1, 2026", nine
-    months apart).
+    Agreement is judged on _span_days SETS, not on single last-included days,
+    because Kalshi's own ladder template spells one deadline both ways in one
+    market ("before Sep 23, 2026" in the title, "By Sep 23, 2026" in the
+    subtitle). Compared as last-included days those look a day apart, and
+    refusing on it deleted every rung of KXSPACEXSTARSHIP-14 — the widest live
+    ladder — so the check asks whether the two fields have ANY reading in
+    common and refuses only when they are disjoint.
+
+    It is not hypothetical in either direction. Of the 4,697 actively priced
+    cumulative markets on the 2026-09-22 snapshot, 47 read two different
+    last-included days across their own fields: 30 name genuinely
+    irreconcilable days and are refused — KXSTARSHIPFL-26JUN-26OCT01 puts a
+    stale subtitle "Before 2026" -> 2025-12-31 against a title "before Oct 1,
+    2026", nine months apart — while 17 are one named day spelled two ways
+    (the five KXSPACEXSTARSHIP-14 rungs, EUEXIT-30, EUEXPANSION-30,
+    KXSATOSHIBTCYEAR-27, six KXGOVTCUTS-26 strikes and three more) and read
+    normally.
 
     Fails CLOSED, like cumulative_deadline_pair: a non-cumulative verdict, a
     deciding field naming no span, a span this reader cannot place, two
-    different days inside the deciding field, or any other field naming a
-    different day all return None.
+    different days inside the deciding field, or any other field whose
+    readings are disjoint from the deciding field's all return None.
 
     Args:
         profile (tuple): The market's (verdict, spans) from deadline_profile()
@@ -1666,22 +1783,28 @@ def stated_deadline(
         return None
     # The deciding field must name exactly one placeable day. Two spans in the
     # one field that decides is ambiguity in the authoritative place, so it is
-    # refused rather than resolved by precedence. The `len != 1` half is
-    # belt-and-braces for the VERDICT — the cross-check below re-reads the
-    # deciding field among the three, so two differing days there refuse
-    # anyway (a mutation of this clause alone survives, and is recorded as
-    # equivalent) — but it is load-bearing for DETERMINISM: pop() off a
-    # two-element set would otherwise return an arbitrary one of them.
+    # refused rather than resolved by precedence. The `len != 1` half is the
+    # ONLY thing that catches it now: the day-SET cross-check below asks
+    # whether each field has a reading in common with the deciding field's
+    # own set, and a field is trivially in common with itself, so it passes a
+    # two-day deciding field straight through. (Under the pre-fix
+    # single-day cross-check this clause was a recorded EQUIVALENT mutant; it
+    # is load-bearing again, and separately load-bearing for DETERMINISM,
+    # since pop() off a two-element set returns an arbitrary one of them.)
     deciding_days = {_span_deadline(span) for span in spans}
     if None in deciding_days or len(deciding_days) != 1:
         return None
     deadline = deciding_days.pop()
-    # The cross-check. A span this reader cannot place is IGNORED here (it
-    # names no day to disagree with); only a different readable day refuses.
+    # The cross-check, on _span_days SETS. A span this reader cannot place
+    # yields an EMPTY set and is IGNORED (it names no day to disagree with);
+    # only a field with readings entirely disjoint from the deciding field's
+    # refuses. Comparing single last-included days instead read Kalshi's own
+    # "before D" / "By D" template as a one-day conflict — see _span_days.
+    mine = frozenset().union(*(_span_days(span) for span in spans))
     for text in (subtitle, title, event_title):
         for span in _deadline_spans(text):
-            other = _span_deadline(span)
-            if other is not None and other != deadline:
+            other = _span_days(span)
+            if other and not (other & mine):
                 return None
     return deadline
 
@@ -1711,13 +1834,16 @@ def same_event_ladder(deadline_a: Any, deadline_b: Any) -> tuple | str | None:
     1 of the 492 live events holding >= 2 dated cumulative rungs mixes the two
     prepositions (2026-09-22 snapshot) — SCOTREF-27 lists a rung labelled
     "Before 2027" beside ones labelled "By Jan 1, 2028" / "2029" / "2030" — so
-    a reader that ignored it would place the first two on the same day of two
-    different years. (Counted over rungs dated from their DECIDING field
-    alone: three of SCOTREF-27's four rungs then fail stated_deadline's
-    cross-check, because each title says "called before 2028" where its
-    subtitle says "By Jan 1, 2028" — a day apart. The mixing count over the
-    cross-checked population is therefore 0, which is a fact about the
-    cross-check, not about the prepositions.) The SAME_DAY outcome is what stops
+    a reader that ignored the split would read those two rungs as 1 day apart
+    (2027-12-31 against 2028-01-01) instead of 366 (2026-12-31 against
+    2028-01-01), turning a pair MAX_DEADLINE_GAP_DAYS correctly refuses into
+    one admitted at the short-gap tier. (Counted over rungs dated from their
+    DECIDING field alone: three of SCOTREF-27's four rungs additionally name
+    a bare year in their titles — "called before 2028" against a subtitle "By
+    Jan 1, 2028" — whose readings are disjoint from the subtitle's, so
+    stated_deadline's cross-check refuses them and the mixing count over the
+    cross-checked population is 0. That is a fact about the cross-check, not
+    about the prepositions.) The SAME_DAY outcome is what stops
     the mirror image of that: two rungs whose wording differs ("by mar 31,
     2027" beside "before apr 1, 2027") but which name the identical last
     included day are one deadline spelled two ways, not a two-rung ladder.
@@ -1736,6 +1862,9 @@ def same_event_ladder(deadline_a: Any, deadline_b: Any) -> tuple | str | None:
             argument states the EARLIER deadline and gap_days is the
             order-independent calendar-day gap; the SAME_DAY constant when
             both name the same day; None when either deadline is unreadable.
+            Callers must branch on `is None` and `is SAME_DAY`: BOTH non-None
+            outcomes are truthy, so `if result: swap, gap = result` unpacks
+            the eight characters of the SAME_DAY string and raises ValueError.
     """
     # Exact-type tests, not isinstance: datetime passes isinstance(x, date) and
     # would raise TypeError when subtracted from a date.
