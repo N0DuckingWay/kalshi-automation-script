@@ -1851,15 +1851,36 @@ def _naive_cumulative_deadline(m: dict) -> str | None:
     return match.group(0).lower() if match else None
 
 
-def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[frozenset]:
+def _naive_stated_deadline(m: dict) -> date | None:
+    """Oracle-local restatement of the calendar day a member's deadline names.
+
+    Deliberately NOT scanner.stated_deadline, for the same reason
+    _naive_cumulative_deadline is not scanner.deadline_profile: an oracle that
+    reuses the implementation cannot falsify it. _ts_member builds exactly one
+    shape — "Q by <Month> <day>, <year>" — and "by" INCLUDES the named day, so
+    the last included day is that date itself.
+    """
+    span = _naive_cumulative_deadline(m)
+    if span is None:
+        return None
+    try:
+        return datetime.strptime(span, "by %B %d, %Y").date()
+    except ValueError:
+        return None
+
+
+def _naive_time_series_pairs(members: list[dict], margin_days: int,
+                             same_event_ladders: bool = False) -> set[frozenset]:
     """Independent oracle: naive O(n^2) double loop over the same group,
     filtering by the same margin-inclusive close-time gap, the same
-    event_ticker rule, the same one-series rule (DR-02/DR-54/DR-55) AND the
-    same cumulative-deadline rule that _extract_pairs applies, but without any
-    sorting/windowing. Written standalone (no backtester internals besides
-    plain dict/date arithmetic, _naive_series' restatement of the series
-    identity and _naive_cumulative_deadline's of the deadline spans) so it can
-    serve as ground truth for the windowed implementation.
+    event_ticker rule, the same one-series rule (DR-02/DR-54/DR-55), the same
+    cumulative-deadline rule AND, when same_event_ladders is set, the same
+    same-event deadline-ladder rule (DR-73) that _extract_pairs applies, but
+    without any sorting/windowing. Written standalone (no backtester internals
+    besides plain dict/date arithmetic, _naive_series' restatement of the
+    series identity, _naive_cumulative_deadline's of the deadline spans and
+    _naive_stated_deadline's of the calendar day one names) so it can serve as
+    ground truth for the windowed implementation.
 
     The one-series conjunct is spelled out here rather than imported, for the
     same reason the rest is: an oracle that reuses the implementation cannot
@@ -1870,6 +1891,12 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
     hyphenated shared-prefix ticker to that fixture and an oracle without this
     clause diverges silently, which is exactly the "oracle replays the old
     rule" failure CLAUDE.md records for the archive-walk parity tests.
+
+    The ladder clause must move in LOCKSTEP with _extract_pairs' sub-pass or
+    test_matches_naive_oracle_exactly fails: it is the whole point of an
+    oracle that it restates the rule rather than inheriting it. Note it
+    deliberately skips the close-time margin — the sub-pass is unwindowed,
+    because a ladder is capped on its STATED gap.
     """
     result: set[frozenset] = set()
     n = len(members)
@@ -1885,9 +1912,26 @@ def _naive_time_series_pairs(members: list[dict], margin_days: int) -> set[froze
             if not close_b_raw:
                 continue
             db = datetime.fromisoformat(close_b_raw).date()
-            if abs((db - da).days) > margin_days:
-                continue
             if a["event_ticker"] == b["event_ticker"]:
+                # DR-73: two rungs of ONE event, admitted only with ladders
+                # on, ordered and capped on their STATED deadlines and NOT
+                # subject to the close-time margin above.
+                if not (same_event_ladders and a["event_ticker"]):
+                    continue
+                if ((a.get("title") or "", a.get("subtitle") or "",
+                     a.get("event_title") or "")
+                        == (b.get("title") or "", b.get("subtitle") or "",
+                            b.get("event_title") or "")):
+                    continue
+                sda = _naive_stated_deadline(a)
+                sdb = _naive_stated_deadline(b)
+                if sda is None or sdb is None or sda == sdb:
+                    continue
+                if abs((sdb - sda).days) > MAX_DEADLINE_GAP_DAYS:
+                    continue
+                result.add(frozenset([a["ticker"], b["ticker"]]))
+                continue
+            if abs((db - da).days) > margin_days:
                 continue
             # Both legs must state a cumulative deadline, and two DIFFERENT
             # ones — the restatement of _extract_pairs' cumulative-deadline
@@ -1985,10 +2029,30 @@ class TestExtractPairsWindowedEquivalence:
             assert not (a["ticker"].startswith("B") and b["ticker"].startswith("A"))
 
     def test_same_event_ticker_pair_is_skipped(self):
+        # The switch-OFF pin for DR-73: SAMEEVT-1/-2 are a genuine two-rung
+        # ladder (one event, dated cumulative titles one day apart), so this
+        # is effective rather than vacuous — the row below admits exactly this
+        # pair with the switch on, which is what proves it.
         members = self._build_synthetic_group()
         windowed = _extract_pairs({"synthetic": members})
         pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
         assert frozenset(["SAMEEVT-1", "SAMEEVT-2"]) not in pair_tickers
+
+    def test_matches_naive_oracle_exactly_with_ladders_on(self):
+        # DR-73: the oracle carries the ladder rule too, so the sub-pass is
+        # checked against an independent restatement and not only against its
+        # own switch-off behaviour.
+        members = self._build_synthetic_group()
+        windowed = _extract_pairs({"synthetic": members}, same_event_ladders=True)
+        windowed_set = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
+        naive_set = _naive_time_series_pairs(members, MAX_DEADLINE_GAP_DAYS + 1,
+                                             same_event_ladders=True)
+        assert windowed_set == naive_set
+        # The switch-on set is exactly the switch-off set plus the one ladder,
+        # so this row cannot pass by both sides being wrong the same way.
+        off_set = {frozenset([a["ticker"], b["ticker"]])
+                   for a, b, _, _ in _extract_pairs({"synthetic": members})}
+        assert windowed_set - off_set == {frozenset(["SAMEEVT-1", "SAMEEVT-2"])}
 
     def test_missing_close_time_member_produces_no_pairs(self):
         members = self._build_synthetic_group()
@@ -1996,6 +2060,500 @@ class TestExtractPairsWindowedEquivalence:
         for a, b, _, _ in windowed:
             assert a["ticker"] != "NOCLOSE"
             assert b["ticker"] != "NOCLOSE"
+
+
+_BT_LADDER_TITLE = "Will SpaceX launch another Starship %s?"
+
+
+def _ladder_member(ticker, deadline_text, *, close, event="KXSTARSHIP-14",
+                   event_title="", subtitle=""):
+    """One rung of a same-event cumulative deadline ladder, in cache-dict form.
+
+    The dict-world mirror of tests/test_scanner.py's _ladder_rung, down to the
+    title template, so the two paths' DR-73 cases can be read side by side.
+    Every rung of one ladder shares an event_ticker and a title that differs
+    ONLY in its deadline, so _group_by_normalized_title collapses them onto one
+    key — the shape KXSPACEXSTARSHIP-14 has live.
+    """
+    return {
+        "ticker": ticker, "event_ticker": event, "event_title": event_title,
+        "title": _BT_LADDER_TITLE % deadline_text, "subtitle": subtitle,
+        "close_time": close.isoformat(),
+    }
+
+
+def _assert_one_ladder_group_dicts(mA, mB):
+    """Every ladder fixture must actually BE a ladder before its rule is tested.
+
+    Two rungs the group key separates, or one the wording screen does not call
+    cumulative, would make a test pass for a reason that has nothing to do
+    with DR-73 — the way test_same_event_ticker_never_pairs went vacuous on
+    the live path.
+    """
+    groups = _group_by_normalized_title([mA, mB])
+    assert len(groups) == 1, groups
+    assert backtester._deadline_profile_dict(mA)[0] == scanner.DEADLINE_CUMULATIVE
+    assert backtester._deadline_profile_dict(mB)[0] == scanner.DEADLINE_CUMULATIVE
+    assert mA["event_ticker"] == mB["event_ticker"]
+
+
+class TestExtractPairsSameEventLadders:
+    """DR-73c: backtester._extract_pairs mirrors the live ladder branch.
+
+    The dict-world mirror of tests/test_scanner.py::TestSameEventDeadlineLadders.
+    Both paths must apply the rule or a ladder-enabled live run would be
+    measured by a backtest that still refuses every same-event pair — the
+    both-paths requirement the wording and one-series rules already carry.
+    """
+
+    def _extract(self, members, *, on=True):
+        return _extract_pairs({"ladder": members}, same_event_ladders=on)
+
+    def _two_rungs(self, *, early="by March 1, 2026", late="by March 20, 2026",
+                   close_a=datetime(2026, 3, 1, tzinfo=UTC),
+                   close_b=datetime(2026, 3, 20, tzinfo=UTC),
+                   event_title=""):
+        mA = _ladder_member("RUNG-EARLY", early, close=close_a, event_title=event_title)
+        mB = _ladder_member("RUNG-LATE", late, close=close_b, event_title=event_title)
+        _assert_one_ladder_group_dicts(mA, mB)
+        return mA, mB
+
+    # ── the admitted case, and the switch ───────────────────────────────────
+
+    def test_two_dated_rungs_of_one_event_pair(self):
+        mA, mB = self._two_rungs()
+        pairs = self._extract([mA, mB])
+        assert len(pairs) == 1
+        assert (pairs[0][0]["ticker"], pairs[0][1]["ticker"]) == ("RUNG-EARLY", "RUNG-LATE")
+
+    def test_the_same_fixture_is_refused_with_the_switch_off(self):
+        # control: the ONLY thing standing between this fixture and a pair is
+        # the switch.
+        mA, mB = self._two_rungs()
+        assert self._extract([mA, mB], on=False) == []
+
+    def test_the_flag_resolves_true_false_and_none(self, monkeypatch):
+        # Resolved at CALL time, the k=None idiom: None must read the constant
+        # as it stands NOW, so a monkeypatched config and a run-level override
+        # both take effect. A def-time default would freeze the import-time
+        # value and silently ignore both.
+        mA, mB = self._two_rungs()
+        monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        assert len(_extract_pairs({"ladder": [mA, mB]})) == 1
+        assert len(_extract_pairs({"ladder": [mA, mB]}, same_event_ladders=None)) == 1
+        # An explicit False overrides a switched-ON config, and vice versa.
+        assert _extract_pairs({"ladder": [mA, mB]}, same_event_ladders=False) == []
+        monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", False)
+        assert _extract_pairs({"ladder": [mA, mB]}, same_event_ladders=None) == []
+        assert len(_extract_pairs({"ladder": [mA, mB]}, same_event_ladders=True)) == 1
+
+    def test_the_candidate_count_is_always_logged_while_on(self, caplog):
+        mA, mB = self._two_rungs()
+        with caplog.at_level(logging.INFO):
+            self._extract([mA, mB])
+        # DR-66: a switch that produces nothing must be distinguishable from a
+        # broken rule, so the count is logged at zero too.
+        assert "Same-event ladder candidates among the time-series candidates: 1" \
+            in caplog.text
+
+    def test_nothing_is_logged_with_the_switch_off(self, caplog):
+        mA, mB = self._two_rungs()
+        with caplog.at_level(logging.INFO):
+            self._extract([mA, mB], on=False)
+        assert "Same-event ladder" not in caplog.text
+
+    # ── ordering: the stated deadline, never close_time ─────────────────────
+
+    def test_legs_are_ordered_by_stated_deadline_not_close_time(self):
+        # The Mar 1 rung closes a MONTH after the Mar 20 one, so the close_time
+        # sort hands this candidate to the sub-pass the wrong way round and
+        # only the stated-deadline swap can fix it.
+        mA, mB = self._two_rungs(
+            close_a=datetime(2026, 4, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 5, tzinfo=UTC),
+        )
+        pairs = self._extract([mA, mB])
+        assert len(pairs) == 1
+        assert pairs[0][0]["ticker"] == "RUNG-EARLY"
+
+    def test_rungs_that_close_at_one_instant_still_pair(self):
+        # A settled event closes every rung at once — 681 of 1,821 dated
+        # same-event pairs in the archive have a close gap of ZERO days.
+        one_instant = datetime(2026, 3, 20, tzinfo=UTC)
+        mA, mB = self._two_rungs(close_a=one_instant, close_b=one_instant)
+        pairs = self._extract([mA, mB])
+        assert len(pairs) == 1
+        assert (pairs[0][0]["ticker"], pairs[0][1]["ticker"]) == ("RUNG-EARLY", "RUNG-LATE")
+
+    # ── the sub-pass is UNWINDOWED ──────────────────────────────────────────
+
+    def test_a_35_day_close_gap_with_a_20_day_stated_gap_is_still_formed(self):
+        # The cross-event sweep's MAX_DEADLINE_GAP_DAYS + 1 window would drop
+        # this pair before ever looking at it, which is exactly why the ladder
+        # sub-pass is separate and unwindowed: 463 archive pairs sit the other
+        # way round (close gap inside the cap, stated gap beyond it) and 1 sits
+        # this way, and a windowed sub-pass would silently lose it.
+        mA, mB = self._two_rungs(
+            early="by March 1, 2026", late="by March 21, 2026",
+            close_a=datetime(2026, 3, 1, tzinfo=UTC),
+            close_b=datetime(2026, 4, 5, tzinfo=UTC),
+        )
+        close_gap = (_parse_iso_date(mB["close_time"]) - _parse_iso_date(mA["close_time"])).days
+        assert close_gap == 35 > MAX_DEADLINE_GAP_DAYS + 1
+        pairs = self._extract([mA, mB])
+        assert len(pairs) == 1
+        assert (pairs[0][0]["ticker"], pairs[0][1]["ticker"]) == ("RUNG-EARLY", "RUNG-LATE")
+
+    # ── the gap cap, measured on the stated gap ─────────────────────────────
+
+    def test_a_31_day_stated_gap_is_refused_although_the_closes_are_30_apart(self, caplog):
+        mA, mB = self._two_rungs(
+            early="by March 1, 2026", late="by April 1, 2026",
+            close_a=datetime(2026, 3, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 31, tzinfo=UTC),
+        )
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        assert "refused at the 30-day STATED gap cap" in caplog.text
+
+    def test_a_30_day_stated_gap_is_admitted(self):
+        # control for the row above: one day narrower and the same fixture pairs.
+        mA, mB = self._two_rungs(
+            early="by March 1, 2026", late="by March 31, 2026",
+            close_a=datetime(2026, 3, 1, tzinfo=UTC),
+            close_b=datetime(2026, 3, 31, tzinfo=UTC),
+        )
+        assert len(self._extract([mA, mB])) == 1
+
+    # ── the refusals, each with its control ─────────────────────────────────
+
+    def test_a_rung_with_no_readable_year_is_refused(self, caplog):
+        mA, mB = self._two_rungs(early="by November 4", late="by December 4")
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        assert "states no placeable calendar day" in caplog.text
+
+    def test_the_same_rungs_dated_are_admitted(self):
+        # control: the refusal above is the missing YEAR, not the wording shape.
+        mA, mB = self._two_rungs(early="by November 4, 2026", late="by December 4, 2026",
+                                 close_a=datetime(2026, 11, 4, tzinfo=UTC),
+                                 close_b=datetime(2026, 12, 4, tzinfo=UTC))
+        assert len(self._extract([mA, mB])) == 1
+
+    def test_two_rungs_naming_one_calendar_day_are_refused(self, caplog):
+        # "by December 2026" and "by December 31, 2026" are ONE deadline
+        # spelled two ways — the SAME_DAY outcome. Their spans differ, so
+        # cumulative_deadline_pair admits them and only the date reader can tell.
+        mA, mB = self._two_rungs(early="by December 2026", late="by December 31, 2026",
+                                 close_a=datetime(2026, 12, 1, tzinfo=UTC),
+                                 close_b=datetime(2026, 12, 31, tzinfo=UTC))
+        assert scanner.cumulative_deadline_pair(
+            backtester._deadline_profile_dict(mA),
+            backtester._deadline_profile_dict(mB))
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        assert "both rungs name one calendar day" in caplog.text
+
+    def test_a_rung_whose_own_fields_disagree_is_refused(self, caplog):
+        # The KXSTARSHIPFL shape: a stale event title naming an irreconcilable
+        # deadline. stated_deadline's cross-check refuses the rung rather than
+        # trusting the deciding field alone.
+        mA, mB = self._two_rungs(
+            early="by October 1, 2026", late="by October 21, 2026",
+            close_a=datetime(2026, 10, 1, tzinfo=UTC),
+            close_b=datetime(2026, 10, 21, tzinfo=UTC),
+            event_title="Starship flights before 2026",
+        )
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        assert "name irreconcilable days" in caplog.text
+
+    def test_the_same_rungs_under_a_dateless_event_title_are_admitted(self):
+        # control: the ONLY difference from the row above is the stale event
+        # title, so that row pins the cross-check and not the gap cap.
+        mA, mB = self._two_rungs(
+            early="by October 1, 2026", late="by October 21, 2026",
+            close_a=datetime(2026, 10, 1, tzinfo=UTC),
+            close_b=datetime(2026, 10, 21, tzinfo=UTC),
+            event_title="Starship flights",
+        )
+        assert len(self._extract([mA, mB])) == 1
+
+    def test_identical_wording_in_one_event_never_pairs(self, caplog):
+        same = "by March 1, 2026"
+        mA = _ladder_member("R1", same, close=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _ladder_member("R2", same, close=datetime(2026, 3, 20, tzinfo=UTC))
+        _assert_one_ladder_group_dicts(mA, mB)
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        # Refused HERE, not downstream: cumulative_deadline_pair would refuse
+        # it as "the same deadline", a different finding (DR-72's whole point).
+        assert "the two rungs' wording is identical" in caplog.text
+        assert "state the same deadline" not in caplog.text
+
+    def test_an_empty_shared_event_ticker_never_pairs(self, caplog):
+        mA = _ladder_member("E1", "by March 1, 2026", event="",
+                            close=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _ladder_member("E2", "by March 20, 2026", event="",
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        _assert_one_ladder_group_dicts(mA, mB)
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        assert "the shared event ticker is empty" in caplog.text
+
+    def test_a_snapshot_rung_in_one_event_never_pairs(self, caplog):
+        mA = {"ticker": "S1", "event_ticker": "KXSNAP-1", "event_title": "",
+              "title": "Starship flights on March 1, 2026", "subtitle": "",
+              "close_time": "2026-03-01T00:00:00+00:00"}
+        mB = {"ticker": "S2", "event_ticker": "KXSNAP-1", "event_title": "",
+              "title": "Starship flights on March 20, 2026", "subtitle": "",
+              "close_time": "2026-03-20T00:00:00+00:00"}
+        assert len(_group_by_normalized_title([mA, mB])) == 1
+        assert backtester._deadline_profile_dict(mA)[0] == scanner.DEADLINE_SNAPSHOT
+        with caplog.at_level(logging.INFO):
+            assert self._extract([mA, mB]) == []
+        # Refused BY the wording screen, on its own counter — without it the
+        # pair still fails, but as a parser problem rather than a
+        # wrong-kind-of-market one.
+        assert "deciding field is snapshot wording" in caplog.text
+        assert "states no placeable calendar day" not in caplog.text
+
+    def test_a_large_same_event_bucket_warns(self, monkeypatch, caplog):
+        # The sub-pass is O(B^2) and unwindowed, so the only thing standing
+        # between a future corpus and a quadratic blow-up is this canary.
+        # Measured maxima are 26 live and 75 on a strike-blind legacy slice, so
+        # the real threshold cannot fire on anything on disk today — the
+        # threshold is lowered here rather than building a 1,000-rung fixture.
+        monkeypatch.setattr(backtester, "LARGE_GROUP_WARN_THRESHOLD", 2)
+        rungs = [_ladder_member(f"R{i}", f"by March {i}, 2026",
+                                close=datetime(2026, 3, i, tzinfo=UTC))
+                 for i in range(1, 5)]
+        with caplog.at_level(logging.WARNING):
+            self._extract(rungs)
+        assert "Same-event ladder bucket 'KXSTARSHIP-14'" in caplog.text
+        assert "holds 4 dated rungs" in caplog.text
+
+    def test_a_small_bucket_does_not_warn(self, monkeypatch, caplog):
+        # control: the canary is a size threshold, not a "ladders are on" notice.
+        monkeypatch.setattr(backtester, "LARGE_GROUP_WARN_THRESHOLD", 2)
+        mA, mB = self._two_rungs()
+        with caplog.at_level(logging.WARNING):
+            self._extract([mA, mB])
+        assert "Same-event ladder bucket" not in caplog.text
+
+    # ── the cross-event sweep is untouched ──────────────────────────────────
+
+    def test_cross_event_pairs_are_unchanged_by_the_switch(self):
+        # The sweep keeps its own `continue` on equal event tickers, so the two
+        # populations cannot overlap and no cross-event pair is re-ordered.
+        m1 = _ladder_member("M1", "by March 1, 2026", event="EVA-1",
+                            close=datetime(2026, 3, 1, tzinfo=UTC))
+        m2 = _ladder_member("M2", "by March 20, 2026", event="EVB-1",
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        m3 = _ladder_member("M3", "by March 15, 2026", event="EVA-1",
+                            close=datetime(2026, 3, 15, tzinfo=UTC))
+        off = [(a["ticker"], b["ticker"]) for a, b, _, _ in self._extract([m1, m2, m3], on=False)]
+        on = [(a["ticker"], b["ticker"]) for a, b, _, _ in self._extract([m1, m2, m3])]
+        assert off == [("M1", "M2"), ("M3", "M2")]
+        # Every cross-event pair survives in the same order, and the ladder is
+        # ADDED after them — this function keeps all pairs, so unlike the live
+        # finder's one-best contest nothing is displaced here.
+        assert on == off + [("M1", "M3")]
+
+
+class TestPrepareEntriesThreadsTheLadderFlag:
+    """DR-73c: _prepare_entries hands the SAME unresolved flag to both
+    _extract_pairs and _find_entry.
+
+    Load-bearing rather than cosmetic: if the two resolved it separately, or
+    one of them never received it, a pair one rule admitted would be replayed
+    under the other rule's ordering — a ladder formed on stated deadlines and
+    then entered on close_time, which is the inversion DR-73 exists to stop.
+    """
+
+    @pytest.mark.parametrize("passed", [None, True, False])
+    def test_both_callees_receive_the_same_sentinel(self, monkeypatch, passed):
+        seen: dict = {"extract": [], "entry": []}
+
+        def _fake_extract(groups, *, same_event_ladders=None):
+            seen["extract"].append(same_event_ladders)
+            return []
+
+        def _fake_entry(*args, **kwargs):
+            seen["entry"].append(kwargs.get("same_event_ladders", "MISSING"))
+            return None
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: [
+                                {"ticker": "T1", "event_ticker": "E1", "title": "Q",
+                                 "subtitle": "", "event_title": "EV", "result": "yes",
+                                 "close_time": "2026-02-01T00:00:00+00:00",
+                                 "settlement_ts": "2026-02-01T12:00:00+00:00"},
+                            ])
+        monkeypatch.setattr(backtester, "_extract_pairs", _fake_extract)
+        monkeypatch.setattr(backtester, "_find_entry", _fake_entry)
+        backtester._prepare_entries(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                    True, None, same_event_ladders=passed)
+        # Both groupings go through _extract_pairs; the 3-tuple call takes the
+        # flag too, where it is inert.
+        assert seen["extract"] == [passed, passed]
+
+    def test_find_entry_receives_it_too(self, monkeypatch):
+        seen: list = []
+
+        def _fake_entry(*args, **kwargs):
+            seen.append(kwargs.get("same_event_ladders", "MISSING"))
+            return None
+
+        markets = [
+            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+             "title": "Q by March 1, 2026", "subtitle": "", "result": "yes",
+             "close_time": "2026-03-01T00:00:00+00:00",
+             "settlement_ts": "2026-03-01T12:00:00+00:00"},
+            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+             "title": "Q by March 15, 2026", "subtitle": "", "result": "yes",
+             "close_time": "2026-03-15T00:00:00+00:00",
+             "settlement_ts": "2026-03-15T12:00:00+00:00"},
+        ]
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks", lambda *a, **k: [])
+        monkeypatch.setattr(backtester, "_find_entry", _fake_entry)
+        backtester._prepare_entries(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                    True, None, same_event_ladders=True)
+        assert seen and set(seen) == {True}
+
+
+class TestFindEntrySameEventLadders:
+    """DR-73c: _find_entry orders and gaps a same-event ladder on its STATED
+    deadlines, gated on the same flag as _extract_pairs.
+
+    Gated on the FLAG, never on event_ticker equality alone: _extract_pairs
+    only proposes a same-event pair while the switch is on, but any other
+    caller must not get ladder semantics from a switched-off tree.
+    """
+
+    def _rungs(self, *, early="by March 1, 2026", late="by March 20, 2026",
+               close_a=datetime(2026, 3, 20, tzinfo=UTC),
+               close_b=datetime(2026, 3, 20, tzinfo=UTC)):
+        return (_ladder_member("RUNG-EARLY", early, close=close_a),
+                _ladder_member("RUNG-LATE", late, close=close_b))
+
+    @staticmethod
+    def _candles(pA=0.20, pB=0.60, nA=0.80, nB=0.40):
+        return ([_candle(_MONDAY_TS, pA, nA)], [_candle(_MONDAY_TS, pB, nB)])
+
+    def _entry(self, mA, mB, *, on=True, prices=None):
+        ca, cb = prices if prices is not None else self._candles()
+        return _find_entry(ca, cb, mA, mB, "time_series", date(2026, 1, 1),
+                           same_event_ladders=on)
+
+    def test_rungs_closing_at_one_instant_enter_on_the_stated_gap(self):
+        # close_time gives a gap of 0 here, which would pick the SHORT tier;
+        # the stated deadlines are 19 days apart, which is the LONG one.
+        mA, mB = self._rungs()
+        entry = self._entry(mA, mB)
+        assert entry is not None
+        assert entry["gap_days"] == 19
+        assert entry["mA"]["ticker"] == "RUNG-EARLY"
+        assert entry["mB"]["ticker"] == "RUNG-LATE"
+
+    def test_the_stated_gap_chooses_a_tier_the_close_gap_would_not(self):
+        # control, and the reason the ladder gap must reach the tier: a 0.20
+        # spread clears the SHORT tier a 0-day close gap selects and fails the
+        # LONG tier the 19-day stated gap demands.
+        mA, mB = self._rungs()
+        prices = self._candles(pA=0.20, pB=0.40, nA=0.80, nB=0.60)
+        assert self._entry(mA, mB, prices=prices) is None
+        off = self._entry(mA, mB, on=False, prices=prices)
+        assert off is not None and off["gap_days"] == 0
+
+    def test_the_switch_off_reads_close_time_for_the_same_fixture(self):
+        # The gate is the FLAG, not the shared event ticker.
+        mA, mB = self._rungs()
+        off = self._entry(mA, mB, on=False)
+        assert off is not None and off["gap_days"] == 0
+
+    def test_a_ladder_whose_later_rung_closed_first_is_oriented_by_deadline(self):
+        # The Mar 1 rung closes a month AFTER the Mar 20 one — the
+        # early-resolution shape CLAUDE.md records as a backtest residual for
+        # cross-event pairs, and the normal case inside one event.
+        mA, mB = self._rungs(close_a=datetime(2026, 4, 1, tzinfo=UTC),
+                             close_b=datetime(2026, 3, 5, tzinfo=UTC))
+        entry = self._entry(mA, mB)
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "RUNG-EARLY"
+        assert entry["gap_days"] == 19
+        # control: on close_time the SAME two markets are ordered the other way
+        # round and gapped at 27 days, which is what the ladder rule exists to
+        # prevent. Their quotes are mirrored here only because the inverted
+        # ordering needs the inverted price direction to enter at all — no
+        # single quote pair can enter under both orderings, since each demands
+        # the opposite sign of pB - pA.
+        off = _find_entry([_candle(_MONDAY_TS, 0.60, 0.40)],
+                          [_candle(_MONDAY_TS, 0.20, 0.80)],
+                          mA, mB, "time_series", date(2026, 1, 1),
+                          same_event_ladders=False)
+        assert off is not None
+        assert off["mA"]["ticker"] == "RUNG-LATE"
+        assert off["gap_days"] == 27
+
+    def test_a_reversed_pair_is_swapped_and_its_candles_move_with_it(self):
+        # Passed LATE-first, and both rungs close at one instant, so close_time
+        # cannot re-order them at all — only the stated-deadline swap can. The
+        # swap must move candles_a/candles_b with mA/mB, or the entry reports
+        # the wrong market's prices; the quotes below are distinct enough that
+        # a swap of the markets alone would fail the direction test.
+        early, late = self._rungs()
+        entry = _find_entry([_candle(_MONDAY_TS, 0.60, 0.40)],
+                            [_candle(_MONDAY_TS, 0.20, 0.80)],
+                            late, early, "time_series", date(2026, 1, 1),
+                            same_event_ladders=True)
+        assert entry is not None
+        assert entry["mA"]["ticker"] == "RUNG-EARLY"
+        assert entry["mB"]["ticker"] == "RUNG-LATE"
+        assert entry["gap_days"] == 19
+        assert entry["pA"] == pytest.approx(0.20)
+        assert entry["pB"] == pytest.approx(0.60)
+        assert entry["nB"] == pytest.approx(0.40)
+        # control: with the switch off nothing re-orders them, so the pair is
+        # read the wrong way round and its direction test goes negative.
+        assert _find_entry([_candle(_MONDAY_TS, 0.60, 0.40)],
+                           [_candle(_MONDAY_TS, 0.20, 0.80)],
+                           late, early, "time_series", date(2026, 1, 1),
+                           same_event_ladders=False) is None
+
+    def test_a_31_day_stated_gap_returns_none(self):
+        mA, mB = self._rungs(early="by March 1, 2026", late="by April 1, 2026")
+        assert self._entry(mA, mB) is None
+        # control: the close gap is 0, so only the STATED cap can refuse it.
+        assert self._entry(mA, mB, on=False) is not None
+
+    def test_an_unreadable_deadline_returns_none(self):
+        # Fails CLOSED: a year-less rung states no placeable day, so the pair
+        # has no order and no gap and is not replayed at all.
+        mA, mB = self._rungs(early="by March 1", late="by March 20")
+        assert self._entry(mA, mB) is None
+
+    def test_two_rungs_naming_one_day_return_none(self):
+        # SAME_DAY, branched on with `is` — it is a non-empty string, so a
+        # truthiness test would fall through and unpacking it would raise.
+        mA, mB = self._rungs(early="by December 2026", late="by December 31, 2026",
+                             close_a=datetime(2026, 12, 31, tzinfo=UTC),
+                             close_b=datetime(2026, 12, 31, tzinfo=UTC))
+        assert self._entry(mA, mB) is None
+
+    def test_a_cross_event_pair_is_untouched_by_the_flag(self):
+        mA = _ladder_member("X1", "by March 1, 2026", event="EVA-1",
+                            close=datetime(2026, 3, 1, tzinfo=UTC))
+        mB = _ladder_member("X2", "by March 20, 2026", event="EVB-1",
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        on = self._entry(mA, mB)
+        off = self._entry(mA, mB, on=False)
+        assert on is not None and off is not None
+        assert on == off
+        # Ordered and gapped on close_time, as it always was.
+        assert on["gap_days"] == 19
 
 
 class TestRunBacktestEndToEndWithPrefilter:
@@ -4565,6 +5123,65 @@ class TestSimulationsAreLabelledWithTheirDiscount:
             )
         assert any("Simulating the primary interval discount" in r.getMessage()
                    for r in caplog.records)
+
+    @pytest.mark.parametrize("passed", [None, True, False])
+    def test_the_ladder_flag_reaches_prepare_entries_unresolved(self, monkeypatch,
+                                                                passed):
+        # DR-73c: the sentinel must survive the hand-off, or a run-level
+        # override and a monkeypatched constant would both be silently
+        # pre-resolved here instead of at the one place that reads them.
+        seen: dict = {}
+
+        def _fake(*args, **kwargs):
+            seen["ladders"] = kwargs.get("same_event_ladders", "MISSING")
+            return [], None
+
+        monkeypatch.setattr(backtester, "_prepare_entries", _fake)
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            same_event_ladders=passed,
+        )
+        assert seen["ladders"] is passed
+
+    @pytest.mark.parametrize("configured,expected", [(True, "on"), (False, "off")])
+    def test_the_resolved_ladder_setting_is_logged_with_its_source(
+        self, monkeypatch, caplog, configured, expected,
+    ):
+        monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            )
+        assert (f"Same-event deadline ladders (DR-73): {expected} "
+                "(config.TIME_SERIES_SAME_EVENT_LADDERS)") in caplog.text
+        # And an override says so, rather than looking like the configured value
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+                same_event_ladders=not configured,
+            )
+        other = "off" if expected == "on" else "on"
+        assert (f"Same-event deadline ladders (DR-73): {other} "
+                "(run-level override)") in caplog.text
+
+    def test_run_backtest_leaves_the_ladder_flag_to_the_config(self, monkeypatch):
+        # run_backtest keeps its exact pre-DR-73 signature, so it must pass no
+        # ladder argument at all — the None default is what resolves the
+        # constant at call time, i.e. the value live sizing uses.
+        seen: dict = {}
+
+        def _fake(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return None, None
+
+        monkeypatch.setattr(backtester, "_prepare_entries", _fake)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=1000.0)
+        assert "same_event_ladders" not in seen["kwargs"]
 
 
 class TestFeasibilityWindowIsMeasuredInUTC:

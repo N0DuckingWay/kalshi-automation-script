@@ -187,11 +187,14 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # b depend on the spread, not on the gap in days, and the only k-hat ever
 # computed (1.114) was measured on snapshot pairs DR-67 refuses and is void.
 #
-# TODAY ONLY THE LIVE FINDER IMPLEMENTS THIS. backtester._extract_pairs still
-# refuses every same-event candidate (DR-73c), so a ladder-enabled backtest —
-# and therefore the very k-hat the gate above demands — does not exist yet.
-# Flipping this before DR-73c lands would run live a strategy no backtest on
-# this tree can measure.
+# BOTH PATHS IMPLEMENT THIS since DR-73c: backtester._extract_pairs forms the
+# same pairs from a per-event sub-pass and _find_entry orders and gaps them on
+# the same stated deadlines, so a ladder-enabled backtest measures the strategy
+# a ladder-enabled live run would trade. backtest.py's
+# --same-event-ladders / --no-same-event-ladders overrides this constant for
+# ONE run, which is how the k-hat the gate above demands gets measured without
+# flipping the switch first; scanner.py binds the constant at import, so that
+# override never reaches the live finder.
 #
 # scanner.py binds this by VALUE at import (the SCANNER_MAX_PAGES idiom), so a
 # test or harness flipping it at runtime must patch
