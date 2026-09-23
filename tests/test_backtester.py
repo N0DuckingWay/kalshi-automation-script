@@ -1,5 +1,6 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import gc
+import inspect
 import logging
 import re
 import time
@@ -35,10 +36,13 @@ from kalshi_betting.backtester import (
     run_backtest_sweep,
 )
 from kalshi_betting.config import (
+    BACKTEST_DEFAULT_SPREAD_BAND,
     BUDGET_FRACTION,
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS,
     MVE_SERIES_FAMILY_PREFIX,
+    SPREAD_BAND_SWEEP_CEILINGS,
+    SPREAD_BAND_SWEEP_FLOORS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -5295,3 +5299,580 @@ class TestFeasibilityWindowIsMeasuredInUTC:
             pytest.skip("host is at or east of UTC; the two dates agree here")
         assert local_date.weekday() != 0        # Sunday locally
         assert self._UTC_INSTANT.date().weekday() == 0   # Monday in UTC
+
+
+# ─── PB2: band-aware entry detection, split at the band ──────────────────────
+
+# The Monday after _MONDAY_TS (2026-01-12 09:00 UTC) — the second checkpoint a
+# scan starting 2026-01-01 visits.
+_MONDAY2_TS = _MONDAY_TS + 7 * 86_400
+
+
+class TestPrepareEntriesGolden:
+    """_prepare_entries, now composed of _prepare_candidates and one
+    _entries_for_band pass at the default band, must produce EXACTLY the
+    entries it produced before the split.
+
+    The expected rows below are LITERALS captured by running main's
+    _prepare_entries (fe0a758, before the split existed) over this fixture —
+    not re-derived from the code under test, which would make the check
+    tautological. The fixture is the TestRunBacktestSweep EA/EB time-series
+    pair; a same-event ladder whose rungs close at one instant (so the stated
+    gap, not close_time, orders the legs and picks the 0.30 tier — Monday 1's
+    0.25 spread would clear the 0.15 tier a close gap of 0 picks, so the
+    ladder entering on Monday 2 is what proves the stated gap was used), with
+    the later rung listed first; a same-title pair whose B leg is the pricier
+    one (canonicalized by price); a cross-event time-series pair that never
+    qualifies (a pricier earlier contract on both Mondays); and two short-gap
+    cross-event pairs at the two extremes a band can act on — TA/TB at a
+    spread of exactly the 0.15 short tier and WA/WB at 0.98, the widest two
+    live [0.01, 0.99] YES asks can make. Those two are what let the capture
+    SEE a band: without them every grid band with floor <= 0.30 and ceiling
+    >= 0.40 reproduced the rows, so _prepare_entries could have silently
+    started banding with the golden still green. With them, any floor above
+    the short tier or ceiling below 0.98 moves the rows — i.e. every band
+    that could change an entry on any data (the band tests below pin both
+    directions). Both are voided (result ""), so they never trade. It is run
+    with ladders
+    on AND off. The fetch and candle seams are mocked exactly as
+    TestRunBacktestSweep mocks them.
+    """
+
+    _START = date(2026, 1, 1)
+
+    @staticmethod
+    def _markets() -> list[dict]:
+        def mk(ticker, event_ticker, event_title, title, result, close):
+            return {"ticker": ticker, "event_ticker": event_ticker,
+                    "event_title": event_title, "title": title, "subtitle": "",
+                    "result": result,
+                    "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": f"{close}T00:00:00+00:00",
+                    "settlement_ts": f"{close}T12:00:00+00:00"}
+        return [
+            mk("EA", "EVA", "EV", "Team wins by February 1, 2026", "yes", "2026-02-01"),
+            mk("EB", "EVB", "EV", "Team wins by February 14, 2026", "yes", "2026-02-14"),
+            mk("RUNG-LATE", "KXSTARSHIP-14", "",
+               "Will SpaceX launch another Starship by March 20, 2026?", "yes", "2026-03-20"),
+            mk("RUNG-EARLY", "KXSTARSHIP-14", "",
+               "Will SpaceX launch another Starship by March 1, 2026?", "no", "2026-03-20"),
+            mk("SA", "SERA-1", "EVS", "Q", "yes", "2026-02-01"),
+            mk("SB", "SERB-1", "EVS", "Q", "yes", "2026-02-01"),
+            mk("FA", "RAINA", "RAIN", "Rain falls by March 1, 2026", "no", "2026-03-01"),
+            mk("FB", "RAINB", "RAIN", "Rain falls by March 10, 2026", "no", "2026-03-10"),
+            mk("TA", "SNOWA", "SNOW", "Snow falls by February 1, 2026", "", "2026-02-01"),
+            mk("TB", "SNOWB", "SNOW", "Snow falls by February 10, 2026", "", "2026-02-10"),
+            mk("WA", "HAILA", "HAIL", "Hail falls by February 1, 2026", "", "2026-02-01"),
+            mk("WB", "HAILB", "HAIL", "Hail falls by February 10, 2026", "", "2026-02-10"),
+        ]
+
+    _CANDLES = {
+        "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+        "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        "RUNG-EARLY": [_candle(_MONDAY_TS, 0.20, 0.80), _candle(_MONDAY2_TS, 0.20, 0.80)],
+        "RUNG-LATE": [_candle(_MONDAY_TS, 0.45, 0.55), _candle(_MONDAY2_TS, 0.60, 0.40)],
+        "SA": [_candle(_MONDAY_TS, 0.35, 0.65)],
+        "SB": [_candle(_MONDAY_TS, 0.60, 0.40)],
+        "FA": [_candle(_MONDAY_TS, 0.50, 0.50), _candle(_MONDAY2_TS, 0.55, 0.45)],
+        "FB": [_candle(_MONDAY_TS, 0.40, 0.60), _candle(_MONDAY2_TS, 0.45, 0.55)],
+        # 9-day gap (the 0.15 tier): spread 0.45 - 0.30, exactly the tier;
+        # pA + nB = 0.80 <= 0.85
+        "TA": [_candle(_MONDAY_TS, 0.30, 0.70)],
+        "TB": [_candle(_MONDAY_TS, 0.45, 0.50)],
+        # 9-day gap: spread 0.99 - 0.01 = 0.98, the widest possible;
+        # pA + nB = 0.02
+        "WA": [_candle(_MONDAY_TS, 0.01, 0.99)],
+        "WB": [_candle(_MONDAY_TS, 0.99, 0.01)],
+    }
+
+    # (pair_type, canon, group_key, entry_date, pA, pB, nA, nB, gap_days,
+    #  ticker_a, ticker_b) — captured on main @ fe0a758.
+    _EA_EB = ("time_series", "ev | team wins by", "ev | team wins by",
+              date(2026, 1, 5), 0.3, 0.6, 0.7, 0.4, 13, "EA", "EB")
+    _LADDER = ("time_series", "will spacex launch another starship by ?",
+               "will spacex launch another starship by ?",
+               date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE")
+    _TA_TB = ("time_series", "snow | snow falls by", "snow | snow falls by",
+              date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB")
+    _WA_WB = ("time_series", "hail | hail falls by", "hail | hail falls by",
+              date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB")
+    _SAME_TITLE = ("same_title", "Q", ("EVS", "Q", ""),
+                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA")
+    _GOLDEN = {True: [_EA_EB, _LADDER, _TA_TB, _WA_WB, _SAME_TITLE],
+               False: [_EA_EB, _TA_TB, _WA_WB, _SAME_TITLE]}
+    # The census total main reported over the same fixture: every market is
+    # eligible (each spans a Monday on/after the start date).
+    _GOLDEN_CENSUS_TOTAL = 12
+
+    def _patch(self, monkeypatch):
+        markets = self._markets()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: self._CANDLES[ticker])
+
+    @staticmethod
+    def _rows(entries: list[dict]) -> list[tuple]:
+        rows = []
+        for rec in entries:
+            # The record and entry shapes are part of the contract too.
+            assert set(rec) == {"pair_type", "canon", "group_key", "entry"}
+            e = rec["entry"]
+            assert set(e) == {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
+            rows.append((rec["pair_type"], rec["canon"], rec["group_key"],
+                         e["entry_date"], e["pA"], e["pB"], e["nA"], e["nB"],
+                         e["gap_days"], e["mA"]["ticker"], e["mB"]["ticker"]))
+        return rows
+
+    def _prepare(self, monkeypatch, ladders):
+        self._patch(monkeypatch)
+        return backtester._prepare_entries(
+            MagicMock(), MagicMock(), self._START, True, None,
+            same_event_ladders=ladders,
+        )
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    def test_prepare_entries_reproduces_the_main_capture(self, monkeypatch, ladders):
+        entries, coverage = self._prepare(monkeypatch, ladders)
+        # Exact equality, floats included: every price here is a candle value
+        # passed through untouched, never arithmetic.
+        assert self._rows(entries) == self._GOLDEN[ladders]
+        assert coverage.total == self._GOLDEN_CENSUS_TOTAL
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    def test_the_two_halves_compose_to_the_capture(self, monkeypatch, ladders):
+        self._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), self._START, True, None,
+            same_event_ladders=ladders,
+        )
+        assert self._rows(backtester._entries_for_band(candidates)) == self._GOLDEN[ladders]
+        assert candidates.label_coverage.total == self._GOLDEN_CENSUS_TOTAL
+
+    @pytest.mark.parametrize("band", [None, (0.0, 1.0), BACKTEST_DEFAULT_SPREAD_BAND,
+                                      (0, 1), (-0.0, 1.0)])
+    def test_every_spelling_of_no_band_reproduces_the_capture(self, monkeypatch, band):
+        self._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), self._START, True, None, same_event_ladders=True,
+        )
+        rows = self._rows(backtester._entries_for_band(candidates, spread_band=band))
+        assert rows == self._GOLDEN[True]
+
+    def test_splitting_by_pair_type_concatenates_to_the_default(self, monkeypatch):
+        # The band sweep computes the same-title entries once and the
+        # time-series entries per band; ts + st must be the default call.
+        self._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), self._START, True, None, same_event_ladders=True,
+        )
+        ts = backtester._entries_for_band(candidates, pair_types=("time_series",))
+        st = backtester._entries_for_band(candidates, pair_types=("same_title",))
+        assert self._rows(ts) == [self._EA_EB, self._LADDER, self._TA_TB, self._WA_WB]
+        assert self._rows(st) == [self._SAME_TITLE]
+        assert self._rows(ts + st) == self._rows(backtester._entries_for_band(candidates))
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    def test_every_non_default_grid_band_changes_the_rows(self, monkeypatch, ladders):
+        # The capture is an oracle for "_prepare_entries applies NO band" only
+        # if every band the sweep can apply would move it. TA/TB (0.15) is
+        # refused by every non-zero grid floor and WA/WB (0.98) by every grid
+        # ceiling below 1.0, so of the 36 grid bands exactly one — the
+        # default — reproduces the rows.
+        self._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), self._START, True, None,
+            same_event_ladders=ladders,
+        )
+        reproducing = []
+        for lo in SPREAD_BAND_SWEEP_FLOORS:
+            for hi in SPREAD_BAND_SWEEP_CEILINGS:
+                rows = self._rows(
+                    backtester._entries_for_band(candidates, spread_band=(lo, hi)))
+                if rows == self._GOLDEN[ladders]:
+                    reproducing.append((lo, hi))
+        assert reproducing == [BACKTEST_DEFAULT_SPREAD_BAND]
+
+    @pytest.mark.parametrize(
+        "band,moves",
+        [
+            # Any floor above the short tier or ceiling below 0.98 moves the
+            # rows, on or off the grid ...
+            ((0.16, 1.0), True), ((0.0, 0.97), True), ((0.16, 0.99), True),
+            # ... and a band that can change no entry on any data does not: a
+            # floor at or below the short tier (every pair's tier is >= it)
+            # and a ceiling at or above 0.98 (no two live YES asks are wider).
+            ((0.15, 1.0), False), ((0.10, 0.98), False), ((0.0, 0.99), False),
+        ],
+    )
+    def test_the_capture_moves_exactly_for_an_effective_band(self, monkeypatch, band, moves):
+        self._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), self._START, True, None, same_event_ladders=True,
+        )
+        rows = self._rows(backtester._entries_for_band(candidates, spread_band=band))
+        assert (rows != self._GOLDEN[True]) is moves
+
+    def test_prepare_entries_runs_its_entry_pass_at_no_band(self, monkeypatch):
+        # A direct pin on the composition's arguments, beside the capture that
+        # pins their effect: one entry pass, spread_band None (the default
+        # band) and pair_types left at both types.
+        self._patch(monkeypatch)
+        real = backtester._entries_for_band
+        calls: list = []
+
+        def _spy(*args, **kwargs):
+            bound = inspect.signature(real).bind(*args, **kwargs)
+            bound.apply_defaults()
+            calls.append(dict(bound.arguments))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(backtester, "_entries_for_band", _spy)
+        entries, _ = backtester._prepare_entries(
+            MagicMock(), MagicMock(), self._START, True, None, same_event_ladders=True,
+        )
+        assert len(calls) == 1
+        assert calls[0]["spread_band"] is None
+        assert calls[0]["pair_types"] == ("time_series", "same_title")
+        assert self._rows(entries) == self._GOLDEN[True]
+
+
+class TestPrepareCandidates:
+    """_prepare_candidates is everything _prepare_entries did through the
+    candlestick fetch, and carries the inputs the entry pass must share with
+    pair extraction (the DR-73c agreement rule)."""
+
+    def test_the_infeasible_window_returns_none_before_any_fetch(self, monkeypatch):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must be skipped"))
+        assert backtester._prepare_candidates(
+            MagicMock(), MagicMock(), date(2099, 1, 1), True, None,
+        ) is None
+        # ... which _prepare_entries still reports as its (None, None) pair
+        assert backtester._prepare_entries(
+            MagicMock(), MagicMock(), date(2099, 1, 1), True, None,
+        ) == (None, None)
+
+    @pytest.mark.parametrize("ladders", [None, True, False])
+    def test_it_carries_start_horizon_and_the_unresolved_ladder_flag(
+        self, monkeypatch, ladders,
+    ):
+        TestPrepareEntriesGolden()._patch(monkeypatch)
+        c = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), date(2026, 1, 1), True, 45,
+            same_event_ladders=ladders,
+        )
+        assert c.start_date == date(2026, 1, 1)
+        assert c.max_horizon_days == 45
+        # UNRESOLVED: None stays None, so every entry pass hands _find_entry
+        # the same ARGUMENT _extract_pairs was handed (each resolves it at its
+        # own call time — see _Candidates for the one caveat that implies).
+        assert c.same_event_ladders is ladders
+
+    def test_pairs_are_in_scan_order_and_every_ticker_has_candles(self, monkeypatch):
+        TestPrepareEntriesGolden()._patch(monkeypatch)
+        c = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), date(2026, 1, 1), True, None,
+            same_event_ladders=True,
+        )
+        types = [pt for _, pt in c.all_pairs]
+        # EA/EB, the ladder, FA/FB, TA/TB and WA/WB, then the one same-title
+        # pair
+        assert types == ["time_series"] * 5 + ["same_title"]
+        for (mA, mB, _canon, _key), _pt in c.all_pairs:
+            assert mA["ticker"] in c.candles_by_ticker
+            assert mB["ticker"] in c.candles_by_ticker
+
+
+class TestEntriesForBand:
+    """_entries_for_band reads the start date, horizon and ladder flag FROM the
+    candidates — never as arguments — and hands the band verbatim to every
+    _find_entry call."""
+
+    @staticmethod
+    def _candidates(**overrides):
+        pair = ({"ticker": "A"}, {"ticker": "B"}, "canon", "key")
+        fields = {
+            "all_pairs": [(pair, "time_series"), (pair, "same_title")],
+            "candles_by_ticker": {"A": ["ca"], "B": ["cb"]},
+            "label_coverage": None,
+            "start_date": date(2026, 3, 2),
+            "max_horizon_days": 21,
+            "same_event_ladders": None,
+        }
+        fields.update(overrides)
+        return backtester._Candidates(**fields)
+
+    def test_the_entry_pass_takes_no_start_horizon_or_ladder_argument(self):
+        # Risk 2 of the plan: a second copy of any of these could disagree
+        # with the one extraction and the candle fetch used.
+        params = inspect.signature(backtester._entries_for_band).parameters
+        assert list(params) == ["candidates", "spread_band", "pair_types"]
+        assert params["pair_types"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.parametrize("ladders", [None, True, False])
+    def test_find_entry_receives_the_candidates_own_inputs(self, monkeypatch, ladders):
+        seen: list = []
+
+        def _spy(ca, cb, mA, mB, pair_type, start_date, **kwargs):
+            seen.append((ca, cb, pair_type, start_date, kwargs))
+            return None
+
+        monkeypatch.setattr(backtester, "_find_entry", _spy)
+        backtester._entries_for_band(
+            self._candidates(same_event_ladders=ladders), spread_band=(0.3, 0.6),
+        )
+        assert seen == [
+            (["ca"], ["cb"], pt, date(2026, 3, 2),
+             {"max_horizon_days": 21, "same_event_ladders": ladders,
+              "spread_band": (0.3, 0.6)})
+            for pt in ("time_series", "same_title")
+        ]
+
+    def test_pair_types_filters_without_reordering(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(backtester, "_find_entry",
+                            lambda *a, **k: seen.append(a[4]))
+        backtester._entries_for_band(self._candidates(), pair_types=("same_title",))
+        assert seen == ["same_title"]
+        seen.clear()
+        # Order of the pair_types tuple is irrelevant: scan order wins
+        backtester._entries_for_band(self._candidates(),
+                                     pair_types=("same_title", "time_series"))
+        assert seen == ["time_series", "same_title"]
+
+    @pytest.mark.parametrize("bad", [("time-series",), "time_series", ("same_title", "x")])
+    def test_an_unknown_pair_type_is_refused(self, bad):
+        with pytest.raises(ValueError, match="pair_types"):
+            backtester._entries_for_band(self._candidates(), pair_types=bad)
+
+    @pytest.mark.parametrize("empty", [(), ""])
+    def test_an_empty_pair_types_is_refused(self, monkeypatch, empty):
+        # An empty selection scans nothing and would read as a band with no
+        # tradeable pair.
+        monkeypatch.setattr(backtester, "_find_entry",
+                            lambda *a, **k: pytest.fail("nothing may be scanned"))
+        with pytest.raises(ValueError, match="pair_types"):
+            backtester._entries_for_band(self._candidates(), pair_types=empty)
+
+    @pytest.mark.parametrize(
+        "band,exc",
+        [((0.6, 0.3), ValueError), ((0.1, 0.2, 0.3), ValueError), (0.3, TypeError)],
+    )
+    @pytest.mark.parametrize(
+        "all_pairs,pair_types",
+        [
+            # No candidate at all
+            ([], ("time_series", "same_title")),
+            # Candidates exist, but none of the requested type
+            ([(({"ticker": "A"}, {"ticker": "B"}, "c", "k"), "same_title")],
+             ("time_series",)),
+        ],
+    )
+    def test_an_invalid_band_is_refused_even_with_nothing_to_scan(
+        self, monkeypatch, band, exc, all_pairs, pair_types,
+    ):
+        # Validated up front, not left to _find_entry: a pass that happens to
+        # scan no pair must not return [] for a band that could never apply.
+        monkeypatch.setattr(backtester, "_find_entry",
+                            lambda *a, **k: pytest.fail("nothing may be scanned"))
+        with pytest.raises(exc):
+            backtester._entries_for_band(
+                self._candidates(all_pairs=all_pairs), spread_band=band,
+                pair_types=pair_types,
+            )
+
+
+class TestFindEntrySpreadBand:
+    """_find_entry's backtest-only spread band: the floor is layered on the
+    deadline-gap tier (and the leg-price-sum ceiling stays 1 - that floor), the
+    ceiling refuses one Monday and lets the scan continue, and same-title
+    pairs never read the band."""
+
+    _START = date(2026, 1, 1)
+
+    @staticmethod
+    def _ts_markets():
+        # 13-day gap: the SHORT (0.15) tier, so any band floor above 0.15 is
+        # what binds.
+        mA = {"ticker": "EARLY", "event_ticker": "E1",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2",
+              "close_time": "2026-02-14T00:00:00+00:00"}
+        return mA, mB
+
+    def _ts(self, a_candles, b_candles, band):
+        mA, mB = self._ts_markets()
+        return _find_entry(a_candles, b_candles, mA, mB, "time_series", self._START,
+                           spread_band=band)
+
+    def _ts_one_monday(self, pA, pB, nB, band):
+        return self._ts([_candle(_MONDAY_TS, pA, 1.0 - pA)],
+                        [_candle(_MONDAY_TS, pB, nB)], band)
+
+    # ── band cases ──────────────────────────────────────────────────────────
+
+    def test_a_monday_above_the_ceiling_is_skipped_and_a_later_one_enters(self):
+        # Monday 1 spread 0.70 is above the 0.60 ceiling; Monday 2's 0.50 is
+        # inside 0.30-0.60. `continue`, never `return None`: the scan must
+        # reach Monday 2.
+        a = [_candle(_MONDAY_TS, 0.20, 0.80), _candle(_MONDAY2_TS, 0.20, 0.80)]
+        b = [_candle(_MONDAY_TS, 0.90, 0.10), _candle(_MONDAY2_TS, 0.70, 0.30)]
+        entry = self._ts(a, b, (0.30, 0.60))
+        assert entry is not None
+        assert entry["entry_date"] == date(2026, 1, 12)
+        assert entry["pB"] - entry["pA"] == pytest.approx(0.50)
+        # CONTROL: with no band Monday 1 itself enters, so the skip above is
+        # the ceiling's doing and nothing else's.
+        assert self._ts(a, b, None)["entry_date"] == date(2026, 1, 5)
+
+    def test_a_raised_floor_refuses_a_short_gap_spread_the_tier_admits(self):
+        # 0.30 - 0.10 = 0.20 clears the short tier (0.15) but not a 0.30 band
+        # floor. The candle is deliberately CROSSED (B's NO ask 0.55 is below
+        # 1 - its YES ask 0.30): candle closes are independent series, and
+        # only a crossed quote keeps pA + nB (0.65) inside the raised floor's
+        # own sum ceiling (0.70), so the refusal below is the floor's alone.
+        assert 0.10 + 0.55 <= 1.0 - 0.30
+        assert self._ts_one_monday(0.10, 0.30, 0.55, (0.30, 1.0)) is None
+        assert self._ts_one_monday(0.10, 0.30, 0.55, None) is not None
+
+    def test_the_raised_floor_also_lowers_the_leg_price_sum_ceiling(self):
+        # Short gap, spread 0.40 (above the 0.30 floor), pA + nB = 0.75: kept
+        # under the tier's 0.85 ceiling, refused under the raised floor's
+        # 1 - 0.30 = 0.70. Kills a sum ceiling left on the tier.
+        assert 0.20 + 0.55 == pytest.approx(0.75)
+        assert self._ts_one_monday(0.20, 0.60, 0.55, (0.30, 1.0)) is None
+        kept = self._ts_one_monday(0.20, 0.60, 0.55, (0.0, 1.0))
+        assert kept is not None and kept["entry_date"] == date(2026, 1, 5)
+
+    # ── epsilon on every band comparison (TS-09) ────────────────────────────
+
+    @pytest.mark.parametrize(
+        "label,pA,pB,nB,band,evaluates_to,bound",
+        [
+            # floor: 0.47 - 0.17 evaluates a hair UNDER the 0.30 floor
+            ("floor", 0.17, 0.47, 0.50, (0.30, 1.0), 0.47 - 0.17, 0.30),
+            # sum ceiling: 0.15 + 0.55 evaluates a hair OVER 1 - 0.30
+            ("sum ceiling", 0.15, 0.60, 0.55, (0.30, 1.0), 0.15 + 0.55, 0.70),
+            # ceiling: 0.90 - 0.30 evaluates a hair OVER the 0.60 ceiling
+            ("ceiling", 0.30, 0.90, 0.10, (0.0, 0.60), 0.90 - 0.30, 0.60),
+        ],
+    )
+    def test_a_value_exactly_on_a_band_bound_is_kept(
+        self, label, pA, pB, nB, band, evaluates_to, bound,
+    ):
+        # Guard the fixture first: each row must genuinely sit off its bound
+        # by float noise, or the row stops testing the epsilon at all.
+        assert evaluates_to != bound
+        assert evaluates_to == pytest.approx(bound, abs=1e-12)
+        assert {"floor": 0.29999999999999993, "sum ceiling": 0.7000000000000001,
+                "ceiling": 0.6000000000000001}[label] == evaluates_to
+        entry = self._ts_one_monday(pA, pB, nB, band)
+        assert entry is not None, f"{label} row was refused for float noise"
+
+    def test_the_default_ceiling_never_fires(self):
+        # The widest spread two live [0.01, 0.99] YES asks can make is 0.98;
+        # the default ceiling of 1.0 must keep it.
+        assert self._ts_one_monday(0.01, 0.99, 0.01, None) is not None
+
+    # ── the band on a ladder, and on nothing but time-series ────────────────
+
+    def test_a_same_event_ladder_honours_the_band_ceiling(self):
+        # Rungs closing at one instant, stated gap 19 (the 0.30 tier); spread
+        # 0.50 enters with no band and is refused above a 0.40 ceiling.
+        mA = _ladder_member("RUNG-EARLY", "by March 1, 2026",
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        mB = _ladder_member("RUNG-LATE", "by March 20, 2026",
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        ca, cb = [_candle(_MONDAY_TS, 0.20, 0.80)], [_candle(_MONDAY_TS, 0.70, 0.35)]
+
+        def entry(band):
+            return _find_entry(ca, cb, mA, mB, "time_series", self._START,
+                               same_event_ladders=True, spread_band=band)
+
+        assert entry(None)["gap_days"] == 19
+        assert entry((0.0, 0.40)) is None
+
+    @staticmethod
+    def _st_entry(pa_yes, pb_yes, band):
+        mA = {"ticker": "SA", "event_ticker": "SERA-1",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "SB", "event_ticker": "SERB-1",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        return _find_entry([_candle(_MONDAY_TS, pa_yes, 1.0 - pa_yes)],
+                           [_candle(_MONDAY_TS, pb_yes, 1.0 - pb_yes)],
+                           mA, mB, "same_title", date(2026, 1, 1), spread_band=band)
+
+    @pytest.mark.parametrize(
+        "band",
+        [(lo, hi) for lo in SPREAD_BAND_SWEEP_FLOORS for hi in SPREAD_BAND_SWEEP_CEILINGS]
+        + [(0.40, 0.45)],
+    )
+    @pytest.mark.parametrize("pa_yes,pb_yes", [(0.85, 0.15), (0.55, 0.45)])
+    def test_same_title_is_untouched_at_any_band(self, band, pa_yes, pb_yes):
+        # A 0.70 gap (above every ceiling) and a 0.10 gap (below every floor
+        # above 0.10) enter exactly as they do with no band.
+        default = self._st_entry(pa_yes, pb_yes, None)
+        assert default is not None
+        assert self._st_entry(pa_yes, pb_yes, band) == default
+
+    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    def test_an_invalid_band_is_refused_before_any_data_check(self, pair_type):
+        # Resolved before the close_time early return, so a caller bug
+        # surfaces even on a pair that could never enter.
+        with pytest.raises(ValueError, match="spread band"):
+            _find_entry([], [], {}, {}, pair_type, date(2026, 1, 1),
+                        spread_band=(0.6, 0.3))
+
+    @pytest.mark.parametrize("band,exc", [((0.1, 0.2, 0.3), ValueError), (0.3, TypeError)])
+    def test_a_malformed_band_raises_what_the_docstring_names(self, band, exc):
+        with pytest.raises(exc):
+            _find_entry([], [], {}, {}, "time_series", date(2026, 1, 1),
+                        spread_band=band)
+
+
+class TestBacktestTradePopulationLabels:
+    """BacktestTrade.event_ticker / same_event_ladder: reporting-only labels
+    set by _simulate_at_discount, so a report can split the ladder,
+    cross-event and same-title populations and group P&L by event."""
+
+    def test_a_ladder_a_cross_event_pair_and_a_same_title_pair(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        entries, _ = backtester._prepare_entries(
+            MagicMock(), MagicMock(), golden._START, True, None,
+            same_event_ladders=True,
+        )
+        point = backtester._simulate_at_discount(entries, golden._START, 10_000.0)
+        by_a = {t.ticker_a: t for t in point.trades}
+        assert set(by_a) == {"EA", "RUNG-EARLY", "SB"}
+        assert (by_a["EA"].event_ticker, by_a["EA"].same_event_ladder) == ("EVA", False)
+        assert (by_a["RUNG-EARLY"].event_ticker,
+                by_a["RUNG-EARLY"].same_event_ladder) == ("KXSTARSHIP-14", True)
+        # Market A of a same-title trade is the pricier side AFTER
+        # canonicalization (SB here), and a same-title pair is never a ladder.
+        assert (by_a["SB"].event_ticker, by_a["SB"].same_event_ladder) == ("SERB-1", False)
+
+    def test_two_missing_event_tickers_are_not_one_event(self):
+        # "" == "" must not read as a ladder: an unknown event cannot be
+        # shown to be one event.
+        def mk(ticker, close):
+            return {"ticker": ticker, "result": "yes",
+                    "close_time": f"{close}T00:00:00+00:00",
+                    "settlement_ts": f"{close}T12:00:00+00:00"}
+        entry = {"entry_date": date(2026, 1, 5), "pA": 0.30, "pB": 0.60,
+                 "nA": 0.70, "nB": 0.40, "gap_days": 13,
+                 "mA": mk("XA", "2026-02-01"), "mB": mk("XB", "2026-02-14")}
+        point = backtester._simulate_at_discount(
+            [{"pair_type": "time_series", "canon": "c", "group_key": "c",
+              "entry": entry}],
+            date(2026, 1, 1), 10_000.0,
+        )
+        assert len(point.trades) == 1
+        assert point.trades[0].event_ticker == ""
+        assert point.trades[0].same_event_ladder is False
+
+    def test_the_fields_default_for_a_hand_built_trade(self):
+        t = TestEquityCurveOpensAtTheInitialBalance()._trade(10, 0.30, 0.40, "yes", 0.0)
+        assert t.event_ticker == ""
+        assert t.same_event_ladder is False

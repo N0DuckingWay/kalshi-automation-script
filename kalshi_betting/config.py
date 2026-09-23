@@ -109,15 +109,19 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 
 # Band grid for the backtest's band x k scenario sweep, to be crossed with
 # INTERVAL_DISCOUNT_SWEEP: 6 floors x 6 ceilings = 36 bands x 13 k = 468
-# scenarios over ONE fetch. No module reads it yet — the sweep that consumes
-# it arrives with the backtester's band support. Every floor sits below every
-# ceiling, so all 36 bands are valid; every ceiling sits above both deadline-
-# gap tiers, so no grid band empties a tier (see time_series_spread_band);
-# and the default band above is a member, so a default run adds no 37th.
+# scenarios over ONE fetch. No module reads the grid yet: backtester._find_entry
+# applies ONE band per call (its spread_band, resolved through
+# time_series_spread_band), and the sweep that crosses this grid with the k
+# grid is not built yet. Every floor sits below every ceiling, so all 36
+# bands are valid; every ceiling sits above both deadline-gap tiers, so no
+# grid band empties a tier (see time_series_spread_band); and the default
+# band above is a member, so a default run adds no 37th.
 # Cost measured 2026-09-23 on the DR-73 calibration corpus (10,733 time-series
 # pairs, 10,530 with candles on both legs, start 2020-01-01, ladders on): ~1 s
-# per band (the time-series _find_entry pass, ~90-96 us per pair across
-# repeated runs — it scales with the window's pair count) and ~2-11 ms per
+# per band (the time-series _find_entry pass, ~91-97 us per pair across
+# repeated runs, before and after _find_entry gained the band alike, at no
+# band and at 0.30-0.60 and 0.40-0.50 — it scales with the window's pair
+# count; 330 entries at no band, 183 at 0.30-0.60) and ~2-11 ms per
 # simulation over its 330 entries (best of 3; it falls with the trade count,
 # from 94 trades at k = 0.40 to none at k = 1.00). A floor at or below a
 # pair's tier is inert for it.
@@ -697,9 +701,10 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
-# Eligible-market count above which backtester._prepare_entries warns the
-# operator about the RAM the grouping/pairing step is about to need, and the
-# per-record estimate the warning multiplies by.
+# Eligible-market count above which backtester._prepare_candidates (the first
+# half of _prepare_entries) warns the operator about the RAM the
+# grouping/pairing step is about to need, and the per-record estimate the
+# warning multiplies by.
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
 # phase right after it holds the whole window as one list and builds two group
@@ -739,8 +744,9 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
-# Outcome-label (subtitle) coverage below which backtester._prepare_entries
-# escalates its coverage census from INFO to WARNING (DR-66).
+# Outcome-label (subtitle) coverage below which backtester._prepare_candidates
+# (the first half of _prepare_entries) escalates its coverage census from INFO
+# to WARNING (DR-66).
 #
 # The subtitle is the outcome discriminator in BOTH backtest grouping keys —
 # the time-series key scanner.time_series_group_key() builds, and the third
@@ -978,7 +984,8 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> fl
     positional argument by tests/test_strategy.py::TestTimeSeriesKellyParity::
     test_ast_live_path_reads_no_band. This helper does not validate
     spread_min: a caller that passes one resolves it through
-    time_series_spread_band() first, which does.
+    time_series_spread_band() first, which does — as backtester._find_entry,
+    the one caller that passes it, does.
 
     Args:
         gap_days (int): Calendar days between the two legs' deadlines —
@@ -1005,10 +1012,12 @@ def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[fl
     """
     Resolve and validate a backtest time-series spread band (floor, ceiling).
 
-    The band is meant to bound the YES-ask spread pB - pA at which a
-    time-series candidate may be entered: its floor is layered on the
-    deadline-gap tier through min_price_diff_for_gap's spread_min, and its
-    ceiling is tested by time_series_spread_too_wide. It is a BACKTEST knob —
+    The band bounds the YES-ask spread pB - pA at which
+    backtester._find_entry may enter a time-series candidate: its floor is
+    layered on the deadline-gap tier through min_price_diff_for_gap's
+    spread_min (so it also sets that pass's leg-price-sum ceiling, 1 minus
+    the raised floor), and its ceiling is tested per Monday by
+    time_series_spread_too_wide. It is a BACKTEST knob —
     no module outside config, backtester, backtest and dashboard may call
     this function (pinned by tests/test_strategy.py::
     TestTimeSeriesKellyParity::test_ast_live_path_reads_no_band).
@@ -1070,7 +1079,8 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     sitting exactly on the documented bound is never dropped for float noise.
     This is the ONE place the ceiling's epsilon lives; callers test the
     result and add no tolerance of their own. Backtest-only, like
-    time_series_spread_band().
+    time_series_spread_band(); its one caller is backtester._find_entry,
+    which tests it on time-series pairs only.
 
     Args:
         spread (float): pB - pA, dollars.

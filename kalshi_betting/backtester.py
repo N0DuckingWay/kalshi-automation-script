@@ -32,7 +32,11 @@ Dependencies:
     so the live and backtest ladder rules can never disagree), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
-    time_series_profit_prob) plus BUDGET_FRACTION,
+    time_series_profit_prob), the backtest-only spread-band helpers
+    time_series_spread_band and time_series_spread_too_wide (which
+    _find_entry applies to time-series candidates, and the first of which
+    _entries_for_band also calls to validate a band up front; no live module
+    reads either), plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
@@ -166,6 +170,8 @@ from .config import (
     fee_per_pair_approx,
     min_price_diff_for_gap,
     time_series_profit_prob,
+    time_series_spread_band,
+    time_series_spread_too_wide,
 )
 from .historical import (
     fetch_all_settled_markets,
@@ -305,6 +311,20 @@ class BacktestTrade:
             deadline-gap concept, and for any trade constructed without it
             (test fixtures). Reporting only — nothing sizes, prices or settles
             on this field.
+        event_ticker (str): Event ticker of market A as traded (after
+            _find_entry's canonicalization, so for same_title it is the
+            pricier side's event), "" when the record carried none. The key a
+            report groups trades by to measure how much of a run's P&L one
+            event contributed. Reporting only.
+        same_event_ladder (bool): True for a time_series trade whose two legs
+            share one NON-EMPTY event ticker — a same-event deadline ladder
+            (DR-73), which _extract_pairs only ever proposes while the ladder
+            switch is on. False for a cross-event pair, for every same_title
+            trade (two events of different series by construction), and when
+            either leg's event ticker is missing, since an unknown event
+            cannot be shown to be one event. Reporting only — it lets a report
+            separate the ladder and cross-event populations, which price and
+            settle identically here.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -341,6 +361,13 @@ class BacktestTrade:
     # _interval_calibration DOES band k-hat on the same quantity via
     # _TimeSeriesOutcome.gap_days, so a ladder's bands are stated-gap bands.
     deadline_gap_days: int | None = None
+    # Market A's event ticker ("" when absent) and whether the pair is a
+    # same-event ladder (time_series, both legs on one non-empty event
+    # ticker). Set by _simulate_at_discount; defaulted so a trade constructed
+    # without them (test fixtures) still builds. Reporting only — nothing
+    # sizes, prices or settles on either field.
+    event_ticker: str = ""
+    same_event_ladder: bool = False
 
 
 @dataclass
@@ -459,14 +486,15 @@ class OutcomeLabelCoverage:
     and one threshold comparison per run.
 
     Holds scalars only (counts, fractions and one verdict) and no reference to
-    any market record: _prepare_entries del's the eligible-market list
-    immediately after pair extraction to lower residency across the
+    any market record: _prepare_candidates (the first half of
+    _prepare_entries) del's the eligible-market list immediately after pair
+    extraction to lower residency across the
     candlestick fetch (TS-07), and a carrier that kept examples (sample
     tickers, a per-category breakdown) would pin every one of those dicts
     alive past that statement.
 
-    The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
-    list after the _can_ever_enter prefilter, i.e. every record handed to the
+    The population is the ELIGIBLE-MARKET CORPUS — _prepare_candidates'
+    market list after the _can_ever_enter prefilter, i.e. every record handed to the
     two grouping calls. It is NOT the population the empirical k-hat is
     computed over (_interval_calibration measures over entered, binarily
     settled, non-premise-violating time-series candidates, a far smaller and
@@ -534,6 +562,72 @@ class OutcomeLabelCoverage:
     cumulative_markets: int
     snapshot_markets: int
     unknown_deadline_markets: int
+
+
+@dataclass
+class _Candidates:
+    """
+    The band- and k-independent half of a backtest: fetch -> pairs -> candles.
+
+    Returned by _prepare_candidates() and consumed by _entries_for_band(),
+    which runs the _find_entry sweep over it at one spread band. Everything up
+    to and including the candlestick fetch is independent of the band (the
+    band acts only inside _find_entry's per-Monday price tests) and of the
+    interval discount k, so one of these can feed an entry pass per band.
+
+    It also carries the three inputs the entry pass must share with pair
+    extraction — start_date, max_horizon_days and the ladder flag — so no
+    later pass can be handed a different start date than the candles were
+    fetched from, a horizon other than the one the run asked for, or a
+    different ladder-flag ARGUMENT than _extract_pairs was handed (the DR-73c
+    agreement rule: a pair the ladder rule admitted must be ordered and
+    tiered by that same rule). _entries_for_band reads them from here and
+    takes none of them as arguments.
+
+    The ladder flag is stored UNRESOLVED, which bounds that last guarantee:
+    when it is None, _extract_pairs and every later _find_entry call each
+    resolve this module's TIME_SERIES_SAME_EVENT_LADDERS at their OWN call
+    time, so they agree only if that name is not rebound between
+    _prepare_candidates and the last entry pass. Before the split both
+    resolutions sat inside one _prepare_entries call; a _Candidates object
+    now stretches that window for as long as it is kept. Production never
+    rebinds the name; a test or harness that patches it between the halves
+    re-opens the DR-73c inversion (a ladder admitted on stated deadlines,
+    then entered on close_time), and a caller that needs the guarantee
+    unconditionally passes an explicit bool instead of None.
+
+    Not frozen, deliberately: a caller that has finished every entry pass
+    may del its candles_by_ticker attribute to release the candle series
+    before a long simulation phase.
+
+    Attributes:
+        all_pairs (list): [((mA, mB, canon, group_key), pair_type), ...] — every
+            candidate pair _extract_pairs proposed, in scan order: every
+            time-series pair, then every same-title pair.
+        candles_by_ticker (dict): Ticker -> hourly candle list, from
+            _fetch_candles_parallel; every ticker of every pair in all_pairs
+            is a key.
+        label_coverage (OutcomeLabelCoverage | None): The eligible-market
+            census _log_outcome_label_coverage measured. _prepare_candidates
+            always carries it — on the feasibility short-circuit, where no
+            census is taken, it returns no _Candidates at all — so None only
+            ever appears on a hand-built instance (a test stub).
+        start_date (date): The backtest start date the markets, pairs and
+            candles were prepared for.
+        max_horizon_days (int | None): The optional bet-horizon cap,
+            forwarded to every _find_entry call. None applies no cap.
+        same_event_ladders (bool | None): The ladder flag EXACTLY as
+            _prepare_candidates received it — UNRESOLVED, None included — the
+            same argument both _extract_pairs calls were handed and every
+            entry pass hands _find_entry (see above for when None resolves
+            the same way in both).
+    """
+    all_pairs: list
+    candles_by_ticker: dict
+    label_coverage: OutcomeLabelCoverage | None
+    start_date: date
+    max_horizon_days: int | None
+    same_event_ladders: bool | None
 
 
 @dataclass
@@ -1277,11 +1371,12 @@ def _extract_pairs(
     ladder_same_day_skips = 0
     ladder_gap_cap_skips = 0
     ladder_pairs = 0
-    # Whether this CALL saw any time-series group at all. _prepare_entries
-    # calls this function twice — once per grouping — and the ladder rule
-    # applies only to string keys, so without this the same-title call would
-    # log a permanent "ladder candidates: 0" that reads as the ladder pass
-    # having found nothing when it never ran.
+    # Whether this CALL saw any time-series group at all. _prepare_candidates
+    # (the first half of _prepare_entries) calls this function twice — once
+    # per grouping — and the ladder rule applies only to string keys, so
+    # without this the same-title call would log a permanent "ladder
+    # candidates: 0" that reads as the ladder pass having found nothing when
+    # it never ran.
     saw_time_series_group = False
     for key, members in groups.items():
         if isinstance(key, str):
@@ -1712,6 +1807,7 @@ def _find_entry(
     start_date: date,
     max_horizon_days: int | None = None,
     same_event_ladders: bool | None = None,
+    spread_band: tuple[float, float] | None = None,
 ) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
@@ -1769,6 +1865,22 @@ def _find_entry(
     In both cases the traded pair of prices comes from _leg_prices_for, and
     both of them must be live [0.01, 0.99] quotes.
 
+    The BACKTEST-only spread band (spread_band, resolved through
+    config.time_series_spread_band) narrows the time-series rule and nothing
+    else. Its floor is layered on the deadline-gap tier —
+    threshold = min_price_diff_for_gap(gap_days, spread_min=floor), i.e.
+    max(tier, floor) — and that raised threshold drives BOTH the gap test and
+    the leg-price-sum ceiling (price_a + price_b <= 1 − threshold), so the sum
+    ceiling stays tied to the floor exactly as it is tied to the tier live.
+    Its ceiling refuses a Monday whose pB − pA exceeds it
+    (config.time_series_spread_too_wide, the one place the ceiling's
+    PRICE_EPSILON lives, on the keep side like the floor's) — that Monday
+    only: the scan moves on, because a LATER Monday whose spread has come
+    back inside the band can still be the entry. The default band,
+    config.BACKTEST_DEFAULT_SPREAD_BAND = (0.0, 1.0), is no band at all — a
+    floor of 0 is inert under every tier and no spread exceeds 1 — so the
+    default reproduces the live rule. same_title pairs never read the band.
+
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
 
@@ -1797,6 +1909,12 @@ def _find_entry(
             same-event pair while the switch is on, but any other caller —
             a test, a harness, a future entry point — must not get ladder
             semantics from a pair it built itself while the switch is off.
+        spread_band (tuple[float, float] | None): BACKTEST-only (floor,
+            ceiling) band on the time-series spread pB − pA, dollars. None
+            (the default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND at call
+            time — (0.0, 1.0), no band. Resolved and validated once per call,
+            before anything else, so an invalid band is refused whatever the
+            pair's data. Ignored by same_title pairs.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -1812,7 +1930,22 @@ def _find_entry(
             Returns None if no qualifying Monday was found in the scan window, or
             if either leg's close_time is missing or unparseable (no scan window
             can be derived, so the pair is simply not enterable).
+
+    Raises:
+        ValueError: From config.time_series_spread_band, when spread_band
+            does not unpack to exactly two values or does not satisfy
+            0 <= floor < ceiling <= 1 — a caller bug, not a data condition.
+        TypeError: From config.time_series_spread_band, when spread_band is
+            not iterable or an element cannot be compared with a float.
     """
+    # Resolve the backtest spread band once, BEFORE any data-dependent early
+    # return, so a caller bug surfaces on the first call rather than only on a
+    # pair that happens to have a readable close_time. config owns the default
+    # and the validation (time_series_spread_band); this module only applies
+    # it. band_lo feeds the time-series threshold below and band_hi the
+    # per-Monday ceiling; the same_title branch reads neither.
+    band_lo, band_hi = time_series_spread_band(spread_band)
+
     # Both markets must have a PARSEABLE close_time; without one we can't
     # determine the scan window. A malformed timestamp is treated exactly like
     # a missing one (the file-wide "can't parse it = unknown, not an error"
@@ -1939,8 +2072,14 @@ def _find_entry(
             return None
         # Tier the required price gap by deadline distance (15% for gaps
         # <= 15 days, 30% for 16-30 days) — the same tiering, computed off the
-        # same gap arithmetic, as scanner.find_time_series_pairs
-        threshold = min_price_diff_for_gap(gap_days)
+        # same gap arithmetic, as scanner.find_time_series_pairs — and layer
+        # the backtest band's floor on top of it: config returns
+        # max(tier, band_lo), so the default floor of 0 leaves the live tier
+        # untouched. This one threshold drives BOTH the gap test and the
+        # leg-price-sum ceiling below, which is what keeps the sum ceiling at
+        # 1 - floor when the band raises the floor (the live pairing of the
+        # two, applied to the raised floor rather than to the tier alone).
+        threshold = min_price_diff_for_gap(gap_days, spread_min=band_lo)
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold
         threshold = SAME_TITLE_MIN_PRICE_DIFF
@@ -2015,6 +2154,17 @@ def _find_entry(
         if gap < threshold - PRICE_EPSILON:
             continue
 
+        # The band's CEILING (time-series only). `continue`, never
+        # `return None`: a LATER Monday whose spread has come back inside the
+        # band can still be the entry, exactly as a Monday under the floor
+        # does not end the scan. config.time_series_spread_too_wide is the
+        # one place the ceiling's PRICE_EPSILON lives (on the keep side, so
+        # 0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling) — no
+        # tolerance is added here. The default ceiling of 1.0 can never fire,
+        # since both YES asks are banded into [0.01, 0.99] above.
+        if pair_type == "time_series" and time_series_spread_too_wide(gap, spread_max=band_hi):
+            continue
+
         # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
         # time_series — via the module's single leg mapping
         price_a, price_b = _leg_prices_for(pair_type, pA, nA, pB, nB)
@@ -2030,7 +2180,9 @@ def _find_entry(
 
         # Live orderbook-depth parity: enrich_with_orderbook_prices only keeps
         # contracts whose combined LEG price leaves the required gap
-        # (price_a + price_b <= 1 - threshold) — apply the same cut to candle entries
+        # (price_a + price_b <= 1 - threshold) — apply the same cut to candle
+        # entries. For time_series `threshold` already carries the band's
+        # floor, so under a raised floor this is 1 - max(tier, floor).
         if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
@@ -2195,7 +2347,8 @@ def _log_rss(label: str) -> None:
     Log this process's peak resident set size so far, in MiB.
 
     Diagnostics only — nothing branches on the value. Two calls bracket the
-    grouping/pairing step of _prepare_entries, the phase that follows a fetch
+    grouping/pairing step of _prepare_candidates (the first half of
+    _prepare_entries), the phase that follows a fetch
     already hardened to stream to disk and that was nonetheless the suspected
     home of a multi-GiB peak (TS-07). Without these lines that peak is
     invisible: it lives entirely between two existing INFO lines and falls
@@ -2281,7 +2434,7 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             corpus, total 0 with both fractions None (undefined, not zero),
             below_floor False and all three phrasing counts 0. Holds no
             reference to any record, so it is safe to keep past
-            _prepare_entries' `del markets`.
+            _prepare_candidates' `del markets`.
     """
     total = len(markets)
 
@@ -2380,68 +2533,57 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     )
 
 
-def _prepare_entries(
+def _prepare_candidates(
     hist_client: Any,
     live_client,
     start_date: date,
     use_cache: bool,
     max_horizon_days: int | None,
     same_event_ladders: bool | None = None,
-) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
+) -> _Candidates | None:
     """
-    Run the half of the backtest that does not depend on the interval discount.
+    Run the half of the backtest that depends on neither the band nor k.
 
     Everything here — the Monday-feasibility pre-check, the settled-market
-    fetch, the eligibility prefilter, both groupings, pair extraction, the
-    candlestick fetch and the _find_entry sweep — is driven purely by prices,
-    dates and thresholds. _find_entry applies no probability model at all, so
-    none of this changes when the time-series interval discount k changes.
-    Separating it out lets _simulate_at_discount() be re-run at many discounts
-    over one expensive, network-bound preparation pass.
+    fetch, the eligibility prefilter, the outcome-label census, both
+    groupings, pair extraction and the candlestick fetch — is driven purely by
+    which markets exist and when they traded. Neither the backtest's spread
+    band (which acts only inside _find_entry's per-Monday price tests) nor the
+    interval discount k (which only _simulate_at_discount reads) touches any
+    of it, so one call can feed an entry pass per band through
+    _entries_for_band(). This is the whole of what _prepare_entries() did
+    before its _find_entry sweep, statement for statement: same log lines in
+    the same order, the same two _log_rss brackets, and the same release of
+    the group maps and record list before the candlestick pool spawns.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
         live_client: Client passed through to fetch_all_settled_markets.
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
-        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
-            scanner.filter_markets_within_horizon on the live path, but relative
-            to each simulated checkpoint rather than real-world now: at a given
-            Monday checkpoint, a pair can only enter if the later-closing leg
-            closes within max_horizon_days of THAT checkpoint. None applies no
-            cap. Passed straight through to _find_entry() for each pair.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap. Not
+            applied here — no pair is priced here — but carried on the result
+            so every entry pass applies the cap the caller asked for. None
+            applies no cap.
         same_event_ladders (bool | None): Whether two dated cumulative rungs
             of ONE event may pair (DR-73). None (the default) resolves this
             module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
             import) at call time; patching config itself is a silent no-op —
-            see _extract_pairs' own entry. Handed
-            verbatim to BOTH _extract_pairs() and _find_entry(), which is
-            load-bearing: the two must agree, or a pair this function
-            proposes is replayed under the other rule's ordering.
+            see _extract_pairs' own entry. Handed verbatim to BOTH
+            _extract_pairs() calls and stored UNRESOLVED on the result, where
+            _entries_for_band() reads it for every _find_entry() call. That is
+            load-bearing: the two must agree, or a pair this function proposes
+            is replayed under the other rule's ordering.
 
     Returns:
-        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
-            entries and this run's outcome-label census.
-
-            Element 0 is one record per pair that produced an entry, in scan
-            order (time-series pairs first, then same-title), each shaped
-            {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
-            where "entry" is _find_entry()'s return dict (which already carries
-            the possibly-swapped mA/mB). An empty list means no pair was ever
-            tradeable. It is None — the codebase's
+        _Candidates | None: The candidate pairs (in scan order: time-series,
+            then same-title), their candle series, this run's
+            OutcomeLabelCoverage, and the start date / horizon / ladder flag
+            every entry pass must reuse. None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
-            window at all" signal distinct from "nothing entered". NOTE that
-            the sentinel now lives on element 0: a caller that forgets to
-            unpack holds a 2-tuple, which is never None, so its
-            `if raw_entries is None` guard would silently go false.
-
-            Element 1 is the OutcomeLabelCoverage the census measured over the
-            eligible-market corpus — carried out so the dashboard can render
-            the same caveat the log warns about (DR-66b) — and is None on
-            exactly the feasibility-short-circuit path, where the fetch never
-            ran and there was no corpus to census. That is distinct from a
-            censused corpus of zero records, which carries total=0.
+            window at all" signal distinct from "no pair was ever tradeable";
+            the fetch never ran on that path, so no census exists either.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2481,17 +2623,19 @@ def _prepare_entries(
             "trade can ever be entered; skipping the fetch entirely",
             start_date, feasibility_end,
         )
-        # None rather than an empty list so the caller can tell "no simulation
-        # is possible in this window" apart from "nothing was ever tradeable".
-        # run_backtest turns it into the same empty-result shape the zero-trade
-        # path already produces, so backtest.py / generate_dashboard need no
-        # changes to handle this early-exit.
+        # None rather than an empty _Candidates so the caller can tell "no
+        # simulation is possible in this window" apart from "nothing was ever
+        # tradeable". run_backtest turns it (through _prepare_entries) into
+        # the same empty-result shape the zero-trade path already produces, so
+        # backtest.py / generate_dashboard need no changes to handle this
+        # early-exit.
         #
-        # The census is None here rather than an empty OutcomeLabelCoverage:
-        # the fetch never ran, so no corpus was ever censused. That reads on
-        # the page as "not measured", which is the truth, and is distinct from
-        # a corpus that WAS censused and held zero records.
-        return None, None
+        # No _Candidates at all, so no census either: the fetch never ran, so
+        # no corpus was ever censused. _prepare_entries turns this into its
+        # (None, None) pair, which reads on the page as "not measured" — the
+        # truth, and distinct from a corpus that WAS censused and held zero
+        # records.
+        return None
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
@@ -2572,11 +2716,13 @@ def _prepare_entries(
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
-    # The ladder flag rides through unresolved (None included), so the two
-    # calls and the _find_entry sweep below all resolve the same constant at
-    # the same moment. The same-title call takes it too, for signature
-    # uniformity — 3-tuple-keyed groups have no deadline concept and the flag
-    # is inert there.
+    # The ladder flag rides through unresolved (None included): the two calls
+    # here and every _find_entry call of every later entry pass (it is carried
+    # on the returned _Candidates) receive the same argument and resolve the
+    # same module constant at their own call time — see _Candidates for why
+    # that holds only while the name is not rebound between the halves. The
+    # same-title call takes it too, for signature uniformity — 3-tuple-keyed
+    # groups have no deadline concept and the flag is inert there.
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders)
     # Release the group maps AND the record list together, before the
@@ -2589,9 +2735,10 @@ def _prepare_entries(
     # four names have to go for the records that landed in no candidate pair
     # to become collectable.
     #
-    # This lowers RESIDENCY across the candlestick fetch and the _find_entry
-    # sweep below. It does NOT lower the run's peak RSS, which is a high-water
-    # mark already reached by the time this statement runs.
+    # This lowers RESIDENCY across the candlestick fetch and every later
+    # _find_entry sweep (_entries_for_band). It does NOT lower the run's peak
+    # RSS, which is a high-water mark already reached by the time this
+    # statement runs.
     del ts_groups, same_groups, markets, eligible_markets
     _log_rss("after pair extraction")
 
@@ -2616,29 +2763,125 @@ def _prepare_entries(
 
     logging.info("Candlestick fetch complete.")
 
-    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
-    # _find_entry applies price and deadline thresholds only — it holds no
-    # probability model — so this sweep yields identical entries at every
-    # interval discount and is run exactly once, ahead of any sizing.
-
-    # Combine both pair types for the scan loop
+    # Combine both pair types in scan order — time-series first, then
+    # same-title — which is the order every entry pass walks and therefore the
+    # order of _prepare_entries' output.
     all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
-    raw_entries: list[dict] = []
 
-    for (mA_orig, mB_orig, canon, group_key), pair_type in all_pairs:
-        candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
-        candles_b = candles_by_ticker.get(mB_orig["ticker"], [])
+    # The ladder flag is stored exactly as received (None included): every
+    # entry pass hands _find_entry the same argument _extract_pairs was handed
+    # above, which resolves the same module name at call time as long as it is
+    # not rebound between the halves (DR-73c; see _Candidates).
+    return _Candidates(
+        all_pairs=all_pairs,
+        candles_by_ticker=candles_by_ticker,
+        label_coverage=label_coverage,
+        start_date=start_date,
+        max_horizon_days=max_horizon_days,
+        same_event_ladders=same_event_ladders,
+    )
+
+
+# The two pair-type labels an entry pass can be restricted to. Their order is
+# irrelevant to the result: _entries_for_band always walks all_pairs in scan
+# order and only FILTERS on this set.
+_PAIR_TYPES = ("time_series", "same_title")
+
+
+def _entries_for_band(
+    candidates: _Candidates,
+    spread_band: tuple[float, float] | None = None,
+    *,
+    pair_types: tuple[str, ...] = _PAIR_TYPES,
+) -> list[dict]:
+    """
+    Locate each candidate pair's first tradeable Monday under one spread band.
+
+    The Pass-1a sweep: one _find_entry() call per pair in candidates.all_pairs
+    whose type is in pair_types, in scan order. _find_entry applies price,
+    deadline and band thresholds only — it holds no probability model — so
+    the result is identical at every interval discount; only the band can
+    change it, and only for time-series pairs (a same-title pair never reads
+    the band). A caller sweeping many bands can therefore compute the
+    same-title entries once (pair_types=("same_title",)) and the time-series
+    entries once per band (pair_types=("time_series",)); concatenating the two
+    in that order reproduces the default call exactly, since the default
+    walks every time-series pair before every same-title one.
+
+    The start date, the bet-horizon cap and the ladder flag are read FROM
+    candidates, never taken as arguments: they must be the values pair
+    extraction and the candle fetch used, and a second copy passed here could
+    disagree with them (for the ladder flag, that is the DR-73c inversion —
+    a ladder admitted on stated deadlines and then entered on close_time).
+    The flag is carried UNRESOLVED, so this pass hands _find_entry the same
+    ARGUMENT _extract_pairs was handed; when that argument is None each of
+    them resolves this module's TIME_SERIES_SAME_EVENT_LADDERS at its own
+    call time, and the two agree only if that name is not rebound between
+    _prepare_candidates and this pass (see _Candidates).
+
+    Both arguments are validated up front, before any pair is scanned — an
+    empty or unknown pair_types here, an invalid spread_band through
+    config.time_series_spread_band — so a pass that happens to scan no pair
+    still refuses an argument that could never apply rather than returning []
+    for it.
+
+    Args:
+        candidates (_Candidates): _prepare_candidates() output.
+        spread_band (tuple[float, float] | None): BACKTEST-only (floor,
+            ceiling) band on the time-series spread pB − pA, handed verbatim
+            to every _find_entry() call. None (the default) resolves
+            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band,
+            i.e. the live rule.
+        pair_types (tuple[str, ...]): Which pair types to scan — any subset
+            of ("time_series", "same_title"). Keyword-only. Defaults to both.
+
+    Returns:
+        list[dict]: One record per pair that produced an entry, in scan order,
+            each shaped {"pair_type": str, "canon": str, "group_key": object,
+            "entry": dict} where "entry" is _find_entry()'s return dict (which
+            already carries the possibly-swapped mA/mB). Empty when no pair of
+            the requested types was ever tradeable under this band.
+
+    Raises:
+        ValueError: If pair_types is empty or names anything other than
+            "time_series" or "same_title" (including a bare string, whose
+            characters are not pair types) — either would silently scan
+            nothing and read as a band with no tradeable pair. Also, from
+            config.time_series_spread_band, if spread_band does not unpack to
+            exactly two values or does not satisfy 0 <= floor < ceiling <= 1.
+        TypeError: From config.time_series_spread_band, if spread_band is not
+            iterable or an element cannot be compared with a float.
+    """
+    if not pair_types or set(pair_types) - set(_PAIR_TYPES):
+        raise ValueError(
+            f"pair_types must be a non-empty selection from {_PAIR_TYPES}, "
+            f"got {pair_types!r}"
+        )
+    # Validation only — the resolved value is discarded and spread_band is
+    # handed to _find_entry verbatim, which resolves it again per call. config
+    # owns both the default and the rule (time_series_spread_band).
+    time_series_spread_band(spread_band)
+
+    raw_entries: list[dict] = []
+    for (mA_orig, mB_orig, canon, group_key), pair_type in candidates.all_pairs:
+        if pair_type not in pair_types:
+            continue
+        candles_a = candidates.candles_by_ticker.get(mA_orig["ticker"], [])
+        candles_b = candidates.candles_by_ticker.get(mB_orig["ticker"], [])
 
         # Find the first Monday where this pair was tradeable at the threshold
         # prices — max_horizon_days (if set) restricts entries to checkpoints
-        # close enough to the legs' close dates
+        # close enough to the legs' close dates, and spread_band narrows the
+        # time-series spread rule for this pass only
         entry = _find_entry(
-            candles_a, candles_b, mA_orig, mB_orig, pair_type, start_date,
-            max_horizon_days=max_horizon_days,
+            candles_a, candles_b, mA_orig, mB_orig, pair_type,
+            candidates.start_date,
+            max_horizon_days=candidates.max_horizon_days,
             # Same unresolved flag _extract_pairs was handed: a same-event
             # pair it proposed must be ordered and tiered by the same rule
             # that admitted it (DR-73).
-            same_event_ladders=same_event_ladders,
+            same_event_ladders=candidates.same_event_ladders,
+            spread_band=spread_band,
         )
         if entry is None:
             continue
@@ -2652,9 +2895,108 @@ def _prepare_entries(
             "group_key": group_key,
             "entry": entry,
         })
+    return raw_entries
+
+
+def _prepare_entries(
+    hist_client: Any,
+    live_client,
+    start_date: date,
+    use_cache: bool,
+    max_horizon_days: int | None,
+    same_event_ladders: bool | None = None,
+) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
+    """
+    Run the half of the backtest that does not depend on the interval discount.
+
+    Everything here — the Monday-feasibility pre-check, the settled-market
+    fetch, the eligibility prefilter, both groupings, pair extraction, the
+    candlestick fetch and the _find_entry sweep — is driven purely by prices,
+    dates and thresholds. _find_entry applies no probability model at all, so
+    none of this changes when the time-series interval discount k changes.
+    Separating it out lets _simulate_at_discount() be re-run at many discounts
+    over one expensive, network-bound preparation pass.
+
+    It is the composition of the two halves split at the spread band:
+    _prepare_candidates() (everything through the candlestick fetch) and one
+    _entries_for_band() pass at the DEFAULT band — config's
+    BACKTEST_DEFAULT_SPREAD_BAND, (0.0, 1.0), which is no band at all — so it
+    produces exactly the entries it produced before the band existed
+    (pinned against values captured from the pre-split code by
+    tests/test_backtester.py::TestPrepareEntriesGolden).
+
+    Args:
+        hist_client (Any): Signed client for the historical archive/live endpoints.
+        live_client: Client passed through to fetch_all_settled_markets.
+        start_date (date): Earliest settlement date to include.
+        use_cache (bool): Whether to reuse the disk-cached assembled market list.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
+            scanner.filter_markets_within_horizon on the live path, but relative
+            to each simulated checkpoint rather than real-world now: at a given
+            Monday checkpoint, a pair can only enter if the later-closing leg
+            closes within max_horizon_days of THAT checkpoint. None applies no
+            cap. Passed straight through to _find_entry() for each pair.
+        same_event_ladders (bool | None): Whether two dated cumulative rungs
+            of ONE event may pair (DR-73). None (the default) resolves this
+            module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
+            import) at call time; patching config itself is a silent no-op —
+            see _extract_pairs' own entry. Handed
+            verbatim to _prepare_candidates(), which gives it to BOTH
+            _extract_pairs() calls and carries it, unresolved, to every
+            _find_entry() call of the entry pass — load-bearing: the two must
+            agree, or a pair this function proposes is replayed under the
+            other rule's ordering.
+
+    Returns:
+        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
+            entries and this run's outcome-label census.
+
+            Element 0 is one record per pair that produced an entry, in scan
+            order (time-series pairs first, then same-title), each shaped
+            {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
+            where "entry" is _find_entry()'s return dict (which already carries
+            the possibly-swapped mA/mB). An empty list means no pair was ever
+            tradeable. It is None — the codebase's
+            return-None-on-validation-failure convention — when the Monday
+            feasibility pre-check fails, a "no simulation is possible in this
+            window at all" signal distinct from "nothing entered". NOTE that
+            the sentinel now lives on element 0: a caller that forgets to
+            unpack holds a 2-tuple, which is never None, so its
+            `if raw_entries is None` guard would silently go false.
+
+            Element 1 is the OutcomeLabelCoverage the census measured over the
+            eligible-market corpus — carried out so the dashboard can render
+            the same caveat the log warns about (DR-66b) — and is None on
+            exactly the feasibility-short-circuit path, where the fetch never
+            ran and there was no corpus to census. That is distinct from a
+            censused corpus of zero records, which carries total=0.
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — this is
+            treated as a real defect (a market that should never have reached
+            this stage), not degraded into "no price history".
+    """
+    # Everything through the candlestick fetch. None means the feasibility
+    # pre-check failed and nothing was fetched — so no census either.
+    candidates = _prepare_candidates(
+        hist_client, live_client, start_date, use_cache, max_horizon_days,
+        same_event_ladders=same_event_ladders,
+    )
+    if candidates is None:
+        return None, None
+
+    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
+    # _find_entry applies price and deadline thresholds only — it holds no
+    # probability model — so this sweep yields identical entries at every
+    # interval discount and is run exactly once, ahead of any sizing. At the
+    # default spread band (spread_band=None, which _find_entry resolves to
+    # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band) it is the live rule.
+    raw_entries = _entries_for_band(candidates, spread_band=None)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
-    return raw_entries, label_coverage
+    return raw_entries, candidates.label_coverage
 
 
 def _simulate_at_discount(
@@ -3036,6 +3378,18 @@ def _simulate_at_discount(
         # Slippage = realized profit vs. the win-scenario payoff (net vs. net)
         slippage = profit - expected_payoff
 
+        # Reporting-only population labels. A same-event ladder is a
+        # time-series pair whose legs share one NON-EMPTY event ticker — the
+        # only same-event pair _extract_pairs ever proposes, and only while
+        # the ladder switch is on. A missing ticker on both legs ("" == "")
+        # must not read as one event, so emptiness fails the test.
+        # Named is_ladder, not same_event_ladder: that name is scanner's
+        # imported ladder helper, which a local would shadow for this whole
+        # function.
+        event_a = mA.get("event_ticker") or ""
+        is_ladder = (c["pair_type"] == "time_series" and bool(event_a)
+                     and event_a == (mB.get("event_ticker") or ""))
+
         trades.append(BacktestTrade(
             pair_type=c["pair_type"],
             ticker_a=mA["ticker"],
@@ -3065,6 +3419,8 @@ def _simulate_at_discount(
             holding_days=c["holding_days"],
             balance_at_entry=checkpoint_cash,
             deadline_gap_days=c["gap_days"],
+            event_ticker=event_a,
+            same_event_ladder=is_ladder,
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit

@@ -769,6 +769,31 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_same_series_dicts", "event_series")
         assert _function_calls(scanner, "_same_series", "event_series")
 
+    def test_ast_backtest_band_reaches_find_entry_through_config(self):
+        # The backtest band's halves each have ONE home in config: the band is
+        # resolved and validated by time_series_spread_band, its floor is
+        # layered on the tier inside min_price_diff_for_gap (so the
+        # leg-price-sum ceiling moves with it), and its ceiling's
+        # PRICE_EPSILON lives only in time_series_spread_too_wide (TS-09). An
+        # inline `gap > band_hi + PRICE_EPSILON` in _find_entry behaves
+        # identically — every behaviour test stays green — while opening a
+        # second copy of the tolerance to drift, so the calls are pinned here.
+        assert _function_calls(backtester, "_find_entry", "time_series_spread_band")
+        assert _function_calls(backtester, "_find_entry", "time_series_spread_too_wide")
+        tree = ast.parse(inspect.getsource(backtester))
+        find_entry = next(n for n in ast.walk(tree)
+                          if isinstance(n, ast.FunctionDef) and n.name == "_find_entry")
+        tier_calls = [
+            node for node in ast.walk(find_entry)
+            if isinstance(node, ast.Call)
+            and (node.func.id if isinstance(node.func, ast.Name)
+                 else getattr(node.func, "attr", None)) == "min_price_diff_for_gap"
+        ]
+        # Non-vacuous, and every tier call carries the band's floor
+        assert tier_calls
+        for node in tier_calls:
+            assert "spread_min" in {k.arg for k in node.keywords}, node.lineno
+
     def test_ast_live_path_reads_no_band(self):
         # The time-series spread band is a BACKTEST knob. If a band is ever
         # applied live, its live constants must land in the same commit as
