@@ -769,6 +769,106 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_same_series_dicts", "event_series")
         assert _function_calls(scanner, "_same_series", "event_series")
 
+    def test_ast_live_path_reads_no_band(self):
+        # The time-series spread band is a BACKTEST knob. If a band is ever
+        # applied live, its live constants must land in the same commit as
+        # live ceiling enforcement, so a band can never go live half-wired;
+        # until then only the band's backtest-side readers may reach it. The
+        # walk is DENY-BY-DEFAULT: every module of the package, the package
+        # root included, except those readers — so a live module added later
+        # is covered without editing any list here. In every walked module:
+        #   - every min_price_diff_for_gap call passes the gap alone (one
+        #     positional argument, no keyword, no */** splat) — the call that
+        #     returns the deadline-gap tier and reads no band value;
+        #   - the helper is never aliased, shadowed by a local def or
+        #     parameter, spelled as a string (a getattr/__dict__ lookup) or
+        #     passed around uncalled, any of which could hand a later
+        #     indirect call a floor;
+        #   - no band helper or band constant is referenced, by name or by
+        #     string;
+        #   - no band-reading module other than config is imported, so the
+        #     band cannot be reached transitively through one either.
+        # A band value hardcoded inline as a literal is outside this pin's
+        # reach; the constants-live-in-config rule covers that.
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        band_readers = {"config", "backtester", "backtest", "dashboard"}
+        names = {m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)}
+        # A rename must fail here, not silently shrink the allowlist
+        assert band_readers <= names, band_readers - names
+        walked = sorted(names - band_readers)
+        # The live pipeline is in scope (the walk cannot pass by finding
+        # nothing to walk)
+        assert {"scanner", "strategy", "trader", "main"} <= set(walked), walked
+        modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}") for n in walked]
+        no_import = band_readers - {"config"}
+
+        helper = "min_price_diff_for_gap"
+        forbidden = {
+            "time_series_spread_band",
+            "time_series_spread_too_wide",
+            "BACKTEST_DEFAULT_SPREAD_BAND",
+            "SPREAD_BAND_SWEEP_FLOORS",
+            "SPREAD_BAND_SWEEP_CEILINGS",
+        }
+        tier_calls = 0
+        for module in modules:
+            mod = module.__name__
+            tree = ast.parse(inspect.getsource(module))
+            called = set()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                if name != helper:
+                    continue
+                called.add(id(fn))
+                tier_calls += 1
+                where = f"{mod}:{node.lineno}"
+                assert len(node.args) == 1, where
+                assert not isinstance(node.args[0], ast.Starred), where
+                assert not node.keywords, where
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        assert a.name.split(".")[-1] not in no_import, f"{mod} imports {a.name}"
+                    continue
+                if isinstance(node, ast.ImportFrom):
+                    assert (node.module or "").split(".")[-1] not in no_import, f"{mod} imports {node.module}"
+                    continue
+                if isinstance(node, ast.Constant):
+                    if isinstance(node.value, str):
+                        assert node.value not in forbidden | {helper}, f"{mod}:{node.lineno} spells {node.value!r}"
+                    continue
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    assert node.name not in forbidden | {helper}, f"{mod}:{node.lineno} shadows {node.name}"
+                    continue
+                if isinstance(node, ast.Name):
+                    name = node.id
+                elif isinstance(node, ast.Attribute):
+                    name = node.attr
+                elif isinstance(node, ast.arg):
+                    name = node.arg
+                elif isinstance(node, ast.alias):
+                    # `from . import backtester` names the module here, not
+                    # in ImportFrom.module
+                    name = node.name
+                    assert name not in no_import, f"{mod} imports {name}"
+                    assert not (name == helper and node.asname), mod
+                else:
+                    continue
+                assert name not in forbidden, f"{mod} references {name}"
+                if name == helper and not isinstance(node, ast.alias):
+                    assert id(node) in called, f"{mod}:{node.lineno} uncalled reference"
+        # Non-vacuous: the live finder, the pair ceiling and enrichment's
+        # fallback all call it, so a rename that hid every call from this walk
+        # must fail rather than pass with nothing checked.
+        assert tier_calls > 0
+
 
 # ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────
 

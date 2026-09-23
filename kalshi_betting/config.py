@@ -95,6 +95,35 @@ MIN_PRICE_DIFF_LONG_GAP       = 0.30
 # tiers: deadline gaps up to and including this many days use the short tier.
 SHORT_DEADLINE_GAP_DAYS       = 15
 
+# The BACKTEST's default time-series spread band (floor, ceiling) on pB - pA —
+# (0.0, 1.0) is "no band": the floor is the deadline-gap tier alone and there
+# is no ceiling, i.e. exactly the rule the live finder applies. Read ONLY by
+# time_series_spread_band(). No module outside config, backtester, backtest
+# and dashboard may reference a band helper or band constant, import one of
+# those three modules, or hand min_price_diff_for_gap more than the gap
+# (pinned by tests/test_strategy.py::TestTimeSeriesKellyParity::
+# test_ast_live_path_reads_no_band). If a band is ever applied live, its live
+# constants (TIME_SERIES_MIN/MAX_SPREAD) must land in the same commit as live
+# ceiling enforcement, so a band can never go live half-wired.
+BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
+
+# Band grid for the backtest's band x k scenario sweep, to be crossed with
+# INTERVAL_DISCOUNT_SWEEP: 6 floors x 6 ceilings = 36 bands x 13 k = 468
+# scenarios over ONE fetch. No module reads it yet — the sweep that consumes
+# it arrives with the backtester's band support. Every floor sits below every
+# ceiling, so all 36 bands are valid; every ceiling sits above both deadline-
+# gap tiers, so no grid band empties a tier (see time_series_spread_band);
+# and the default band above is a member, so a default run adds no 37th.
+# Cost measured 2026-09-23 on the DR-73 calibration corpus (10,733 time-series
+# pairs, 10,530 with candles on both legs, start 2020-01-01, ladders on): ~1 s
+# per band (the time-series _find_entry pass, ~90-96 us per pair across
+# repeated runs — it scales with the window's pair count) and ~2-11 ms per
+# simulation over its 330 entries (best of 3; it falls with the trade count,
+# from 94 trades at k = 0.40 to none at k = 1.00). A floor at or below a
+# pair's tier is inert for it.
+SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
+SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
+
 # Minimum YES ask price difference for same-title pairs. These are markets asking
 # the exact same question, so even a small divergence (5%) is anomalous and worth trading.
 SAME_TITLE_MIN_PRICE_DIFF     = 0.05
@@ -918,7 +947,7 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 
 
-def min_price_diff_for_gap(gap_days: int) -> float:
+def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> float:
     """
     Return the minimum time-series YES price gap required for a deadline gap.
 
@@ -937,20 +966,125 @@ def min_price_diff_for_gap(gap_days: int) -> float:
     gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
     does not reject over-cap gaps itself.
 
+    spread_min is a BACKTEST-only band floor, layered ON TOP of the tier: the
+    result is max(tier, spread_min), so a floor at or below the tier is inert.
+    None — what every live caller passes, by omission — returns the tier alone
+    and reads no band value at all, so the live finder, enrichment and
+    validate_pair_price get exactly the object they got before this keyword
+    existed. The only live calls are scanner's three — the finder's floor,
+    _pair_max_sum (which validate_pair_price reaches through) and
+    enrichment's ref_yes-is-None fallback — and every call in a module
+    outside config, backtester, backtest and dashboard is pinned to one
+    positional argument by tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_no_band. This helper does not validate
+    spread_min: a caller that passes one resolves it through
+    time_series_spread_band() first, which does.
+
     Args:
         gap_days (int): Calendar days between the two legs' deadlines —
             their close_times for a cross-event pair, their stated deadlines
             for a same-event ladder. Range: 0..MAX_DEADLINE_GAP_DAYS
             (caller-enforced).
+        spread_min (float | None): Backtest-only band floor on pB - pA,
+            dollars in [0, 1) — the first element of a band resolved by
+            time_series_spread_band(). None (default) means "the tier alone".
 
     Returns:
         float: The minimum required YES ask price difference (dollars, 0-1)
             by which the later leg must exceed the earlier one (later by
-            close_time, or by stated deadline for a DR-73 ladder).
+            close_time, or by stated deadline for a DR-73 ladder): the tier
+            when spread_min is None, else the larger of the tier and
+            spread_min.
     """
-    if gap_days <= SHORT_DEADLINE_GAP_DAYS:
-        return MIN_PRICE_DIFF_SHORT_GAP
-    return MIN_PRICE_DIFF_LONG_GAP
+    tier = (MIN_PRICE_DIFF_SHORT_GAP if gap_days <= SHORT_DEADLINE_GAP_DAYS
+            else MIN_PRICE_DIFF_LONG_GAP)
+    return tier if spread_min is None else max(tier, spread_min)
+
+
+def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[float, float]:
+    """
+    Resolve and validate a backtest time-series spread band (floor, ceiling).
+
+    The band is meant to bound the YES-ask spread pB - pA at which a
+    time-series candidate may be entered: its floor is layered on the
+    deadline-gap tier through min_price_diff_for_gap's spread_min, and its
+    ceiling is tested by time_series_spread_too_wide. It is a BACKTEST knob —
+    no module outside config, backtester, backtest and dashboard may call
+    this function (pinned by tests/test_strategy.py::
+    TestTimeSeriesKellyParity::test_ast_live_path_reads_no_band).
+
+    Validation is deliberately TIER-AGNOSTIC: it guarantees floor < ceiling,
+    not a non-empty EFFECTIVE band. The effective floor is max(tier, floor),
+    so a ceiling below MIN_PRICE_DIFF_LONG_GAP refuses every 16-30-day pair,
+    and one below MIN_PRICE_DIFF_SHORT_GAP refuses every pair — e.g.
+    (0.20, 0.25) empties the long tier and (0.0, 0.10) empties both; a
+    ceiling exactly ON a tier keeps only spreads sitting on that tier. No
+    SPREAD_BAND_SWEEP_* band can do this (every grid ceiling sits above both
+    tiers); a caller that accepts an operator-typed ceiling should warn when
+    it sits at or below a tier, so an emptied tier is not read as a strategy
+    result.
+
+    The default is resolved at CALL time, never bound as a default argument,
+    so a test that monkeypatches BACKTEST_DEFAULT_SPREAD_BAND still takes
+    effect — the same idiom as time_series_profit_prob's k. Both elements are
+    returned as floats, and a negative-zero floor is normalised to +0.0, so
+    bands given as (0, 1), (0.0, 1.0) and (-0.0, 1.0) resolve to the same
+    tuple, print the same ("%g-%g" gives "0-1") and label the same scenario.
+
+    Args:
+        band (tuple[float, float] | None): (floor, ceiling) override, dollars.
+            None (default) reads BACKTEST_DEFAULT_SPREAD_BAND.
+
+    Returns:
+        tuple[float, float]: The resolved (floor, ceiling), with
+            0 <= floor < ceiling <= 1.
+
+    Raises:
+        ValueError: If the band does not unpack to exactly two values, or
+            unless 0 <= floor < ceiling <= 1 (a NaN fails every comparison
+            and is refused too). This is a caller bug, not a user-input path:
+            a CLI that accepts a band validates what the operator typed
+            first, with its own parser error.
+        TypeError: If the band is not iterable, or an element cannot be
+            compared with a float.
+    """
+    lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
+    if not (0.0 <= lo < hi <= 1.0):
+        raise ValueError(
+            "time-series spread band must satisfy 0 <= floor < ceiling <= 1, "
+            f"got ({lo!r}, {hi!r})"
+        )
+    # + 0.0 turns a -0.0 floor (which passes 0.0 <= -0.0) into +0.0, so it
+    # cannot print as "-0"; the ceiling is > floor >= 0, so it is never a zero.
+    return float(lo) + 0.0, float(hi)
+
+
+def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool:
+    """
+    Return True when a time-series YES-ask spread exceeds the band's ceiling.
+
+    spread is pB - pA, the market-implied in-between mass the strategy
+    disputes. PRICE_EPSILON is absorbed on the KEEP side (TS-09): a spread is
+    refused only when it exceeds spread_max by MORE than the tolerance, so
+    0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling — a pair
+    sitting exactly on the documented bound is never dropped for float noise.
+    This is the ONE place the ceiling's epsilon lives; callers test the
+    result and add no tolerance of their own. Backtest-only, like
+    time_series_spread_band().
+
+    Args:
+        spread (float): pB - pA, dollars.
+        spread_max (float | None): The band ceiling, dollars in (0, 1] — the
+            second element of a band resolved by time_series_spread_band().
+            None means no ceiling.
+
+    Returns:
+        bool: True when spread > spread_max + PRICE_EPSILON; always False
+            when spread_max is None.
+    """
+    if spread_max is None:
+        return False
+    return spread > spread_max + PRICE_EPSILON
 
 
 def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> float:
