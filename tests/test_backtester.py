@@ -2133,10 +2133,13 @@ class TestExtractPairsSameEventLadders:
         assert self._extract([mA, mB], on=False) == []
 
     def test_the_flag_resolves_true_false_and_none(self, monkeypatch):
-        # Resolved at CALL time, the k=None idiom: None must read the constant
-        # as it stands NOW, so a monkeypatched config and a run-level override
+        # Resolved at CALL time: None must read the constant as it stands
+        # NOW, so a monkeypatched MODULE constant and a run-level override
         # both take effect. A def-time default would freeze the import-time
-        # value and silently ignore both.
+        # value and silently ignore both. The name resolved is
+        # backtester.TIME_SERIES_SAME_EVENT_LADDERS — this module's by-value
+        # binding — which is why the patch below targets `backtester` and not
+        # `config`, whose attribute this module never reads.
         mA, mB = self._two_rungs()
         monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", True)
         assert len(_extract_pairs({"ladder": [mA, mB]})) == 1
@@ -2154,6 +2157,22 @@ class TestExtractPairsSameEventLadders:
         # DR-66: a switch that produces nothing must be distinguishable from a
         # broken rule, so the count is logged at zero too.
         assert "Same-event ladder candidates among the time-series candidates: 1" \
+            in caplog.text
+        # The ZERO case is the whole DR-66 property and is pinned separately —
+        # asserting only the `1` above leaves `if ladders_on and
+        # saw_time_series_group and ladder_pairs:` alive, which silences the
+        # line on exactly the run an operator most needs it on. Two rungs of
+        # one event with IDENTICAL wording: a real time-series group (so the
+        # `saw_time_series_group` gate opens), refused by the ladder rule (so
+        # the count is 0).
+        same = "by March 1, 2026"
+        z1 = _ladder_member("Z1", same, close=datetime(2026, 3, 1, tzinfo=UTC))
+        z2 = _ladder_member("Z2", same, close=datetime(2026, 3, 20, tzinfo=UTC))
+        _assert_one_ladder_group_dicts(z1, z2)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert self._extract([z1, z2]) == []
+        assert "Same-event ladder candidates among the time-series candidates: 0" \
             in caplog.text
 
     def test_nothing_is_logged_with_the_switch_off(self, caplog):
@@ -2292,14 +2311,24 @@ class TestExtractPairsSameEventLadders:
         assert "state the same deadline" not in caplog.text
 
     def test_an_empty_shared_event_ticker_never_pairs(self, caplog):
+        # THREE rungs, not two, because the counter is incremented per
+        # CANDIDATE PAIR (n*(n-1)//2) so it means the same thing as the live
+        # finder's, which increments once per pair inside its double loop. At
+        # n=2 that arithmetic and a bare `+= 1` are indistinguishable; at n=3
+        # they are 3 against 1, and an operator comparing this funnel arrow
+        # with the live one would be reading incomparable numbers.
         mA = _ladder_member("E1", "by March 1, 2026", event="",
                             close=datetime(2026, 3, 1, tzinfo=UTC))
         mB = _ladder_member("E2", "by March 20, 2026", event="",
                             close=datetime(2026, 3, 20, tzinfo=UTC))
+        mC = _ladder_member("E3", "by April 5, 2026", event="",
+                            close=datetime(2026, 4, 5, tzinfo=UTC))
         _assert_one_ladder_group_dicts(mA, mB)
+        _assert_one_ladder_group_dicts(mB, mC)
         with caplog.at_level(logging.INFO):
-            assert self._extract([mA, mB]) == []
-        assert "the shared event ticker is empty" in caplog.text
+            assert self._extract([mA, mB, mC]) == []
+        assert ("the shared event ticker is empty (same-event sub-pass, before "
+                "price filters): 3") in caplog.text
 
     def test_a_snapshot_rung_in_one_event_never_pairs(self, caplog):
         mA = {"ticker": "S1", "event_ticker": "KXSNAP-1", "event_title": "",
@@ -2626,6 +2655,11 @@ class TestExtractPairsPerformanceSmoke:
     is already a single O(n) pass over the market list, so it was never the
     bottleneck — _extract_pairs' pairwise enumeration is the O(n^2) risk this
     whole change exists to fix, so it's the meaningful unit to time here.
+
+    Every member gets its own event_ticker, so this guards the CROSS-EVENT
+    sweep only — the DR-73 same-event sub-pass is not exercised here at all
+    (every bucket holds one member, so it does no pairwise work). Its cost is
+    bounded by the measurement recorded in _extract_pairs' docstring instead.
     """
 
     def test_50k_member_group_completes_in_seconds(self):

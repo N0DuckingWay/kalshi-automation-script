@@ -190,18 +190,35 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # BOTH PATHS IMPLEMENT THIS since DR-73c: backtester._extract_pairs forms the
 # same pairs from a per-event sub-pass and _find_entry orders and gaps them on
 # the same stated deadlines, so a ladder-enabled backtest measures the strategy
-# a ladder-enabled live run would trade. backtest.py's
+# a ladder-enabled live run would trade — with the one standing caveat the code
+# already records at backtester._simulate_at_discount's one-best dedup: the
+# backtest's one-best-per-group winner is the largest entry_monthly_ratio, not
+# the live finder's tradeable-then-largest-gap, so the two paths can replay
+# DIFFERENT rungs of the same ladder (on the 2026-09-22 snapshot the live
+# funnel narrows 87 eligible ladder candidates to 24 emitted, so that contest
+# decides 63 of them). backtest.py's
 # --same-event-ladders / --no-same-event-ladders overrides this constant for
 # ONE run, which is how the k-hat the gate above demands gets measured without
 # flipping the switch first; scanner.py binds the constant at import, so that
-# override never reaches the live finder.
+# override never reaches the live finder. The backtest's HTML dashboard does
+# NOT render the setting — it reaches kalshi_backtest.log only — so a
+# ladder-enabled run's dashboard is indistinguishable from a switch-off one and
+# must be labelled by hand (recorded, not fixed: dashboard.py is outside DR-73's
+# blast radius).
 #
-# scanner.py binds this by VALUE at import (the SCANNER_MAX_PAGES idiom), so a
-# test or harness flipping it at runtime must patch
-# scanner.TIME_SERIES_SAME_EVENT_LADDERS, not this module: patching config here
-# is a silent no-op that reads as a switch-ON run and produces a switch-OFF
-# result. (config.time_series_profit_prob resolves k at CALL time precisely to
-# avoid that trap; this constant is read too often to follow it.)
+# scanner.py, backtester.py AND backtest.py each bind this by VALUE at import
+# (the SCANNER_MAX_PAGES idiom), so a test or harness flipping it at runtime
+# must patch the constant on the MODULE it wants to affect — scanner for the
+# live finder, backtester for _extract_pairs/_find_entry, backtest for the CLI
+# echo — and never on this module: patching config here is a silent no-op that
+# reads as a switch-ON run and produces a switch-OFF result. This is NOT the
+# config.time_series_profit_prob(k=None) idiom, which works only because that
+# helper lives here and reads THIS module's global; the sentinel arguments named
+# same_event_ladders resolve their own module's binding at call time, which is
+# what makes a run-level override and a module monkeypatch take effect where a
+# def-time default would not. For a backtest the supported lever needs no
+# patching at all: run_backtest_sweep(same_event_ladders=...) or
+# backtest.py --same-event-ladders / --no-same-event-ladders.
 TIME_SERIES_SAME_EVENT_LADDERS = False
 
 # ── Time-series strategy model (2026-09 inversion) ────────────────────────────

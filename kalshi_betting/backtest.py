@@ -38,6 +38,14 @@ Notes:
     applies identically to every swept discount and a run with it on is not
     comparable to a baseline taken without it. It is the way to measure the
     ladder strategy the switch gates before flipping the switch.
+
+    That setting reaches kalshi_backtest.log ONLY — the pre-fetch echo below
+    and run_backtest_sweep's resolved line. The HTML dashboard does not render
+    it, so a ladder-enabled run's dashboard is indistinguishable from a
+    switch-off one and must be labelled by hand. Recorded rather than fixed:
+    dashboard.py is outside DR-73's blast radius, and unlike DR-66b's
+    subtitle-coverage caveat this setting is chosen by the operator on the
+    command line rather than discovered by the run.
 """
 import argparse
 import logging

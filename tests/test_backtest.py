@@ -155,8 +155,9 @@ class TestSameEventLaddersArgument:
 
     def test_default_is_no_override(self, cli, monkeypatch):
         # None is the "no override" sentinel _extract_pairs and _find_entry
-        # resolve against config.TIME_SERIES_SAME_EVENT_LADDERS at call time —
-        # the CLI must not pre-resolve it, exactly as it must not pre-resolve k.
+        # resolve against their own module's TIME_SERIES_SAME_EVENT_LADDERS at
+        # call time — the CLI must not pre-resolve it, exactly as it must not
+        # pre-resolve k.
         _run(monkeypatch)
         assert cli["sweep_kwargs"]["same_event_ladders"] is None
 
@@ -188,10 +189,17 @@ class TestSameEventLaddersArgument:
 
     def test_the_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch,
                                                              caplog):
-        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", False)
+        # Patched to the NON-shipped value on purpose: with the constant set
+        # to its own default (False) this row passes for any implementation
+        # that ignores it entirely, including `bool(args.same_event_ladders)`
+        # — and would then print "off" on a genuinely ON run the moment the
+        # switch is flipped, which is exactly what this echo exists to catch.
+        # The module attribute is the seam, not config's: backtest.py binds
+        # the constant by value at import.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", True)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert "ladders=off" in caplog.text
+        assert "ladders=on" in caplog.text
 
 
 class TestDashboardHandoff:

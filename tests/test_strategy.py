@@ -732,7 +732,16 @@ class TestTimeSeriesKellyParity:
         # it reaches deadline_profile through _deadline_profile_dict.
         assert _function_calls(scanner, "find_time_series_pairs", "stated_deadline")
         assert _function_calls(scanner, "find_time_series_pairs", "same_event_ladder")
+        # BOTH of _extract_pairs' reads are pinned, and the second is the
+        # load-bearing one: the bare stated_deadline call in that function is
+        # the CROSS-CHECK-DISARMED reading (three empty field arguments) that
+        # only splits the undated/conflict counters, so asserting it alone
+        # leaves green a tree whose ladder rule sources its actual date from
+        # somewhere other than the dict-world, cross-checking extractor —
+        # exactly the live/backtest drift this pin is named for. The
+        # _find_entry half below already asserts _stated_deadline_dict by name.
         assert _function_calls(backtester, "_extract_pairs", "stated_deadline")
+        assert _function_calls(backtester, "_extract_pairs", "_stated_deadline_dict")
         assert _function_calls(backtester, "_extract_pairs", "same_event_ladder")
         assert _function_calls(backtester, "_stated_deadline_dict", "stated_deadline")
         # _find_entry orders and gaps the pair it replays on the same helper,
