@@ -715,7 +715,7 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_time_series_pairs", "deadline_pair_refusal")
         assert _function_calls(backtester, "_extract_pairs", "deadline_pair_refusal")
 
-    def test_ast_both_finders_apply_the_same_event_ladder_rule(self):
+    def test_ast_the_live_finder_applies_the_same_event_ladder_rule(self):
         # DR-73: a same-event deadline ladder is ordered and tiered on its two
         # STATED deadlines, so the live finder must reach BOTH halves of that
         # arithmetic — stated_deadline (wording -> calendar day) and
@@ -723,6 +723,17 @@ class TestTimeSeriesKellyParity:
         # either inside the finder is how the two paths drifted apart before
         # (DR-01), and close_time cannot answer either question for a ladder
         # whose rungs settle at one instant.
+        #
+        # ONE finder, unlike its both-paths siblings above, and that is the
+        # staging rather than the rule: backtester._extract_pairs still
+        # refuses every same-event candidate, so DR-73c renames this back to
+        # test_ast_both_finders_apply_the_same_event_ladder_rule and adds
+        #     assert _function_calls(backtester, "_extract_pairs", "stated_deadline")
+        #     assert _function_calls(backtester, "_extract_pairs", "same_event_ladder")
+        # Until it lands this pin covers the LIVE finder only, and
+        # config.TIME_SERIES_SAME_EVENT_LADDERS must stay off (the two paths
+        # would otherwise measure different strategies — CLAUDE.md's DR-73
+        # gotcha records it).
         assert _function_calls(scanner, "find_time_series_pairs", "stated_deadline")
         assert _function_calls(scanner, "find_time_series_pairs", "same_event_ladder")
 

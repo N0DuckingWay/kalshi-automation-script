@@ -819,8 +819,8 @@ class CandidatePair:
             (scanner.prefix_fill_prices) instead of reusing one scalar average
             computed over depth the trade could never reach.
     """
-    market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER-closing contract
-    market_b: Any           # same_title: cheaper side by YES ask  | time_series: later-closing contract
+    market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
+    market_b: Any           # same_title: cheaper side by YES ask  | time_series: the later one, by the same ordering
     pA: float               # yes_ask_dollars of A (cost to buy YES on A) — a LEG price for time_series
     pB: float               # yes_ask_dollars of B (cost of a YES contract on B) — a LEG price for same_title
     nA: float               # no_ask_dollars of A  (cost of a NO contract on A)  — a LEG price for same_title
@@ -3090,8 +3090,9 @@ def find_time_series_pairs(
          by the two STATED deadlines for a same-event ladder — one number
          either way afterwards, through pair_gap_days()
       7. pB - pA >= min_price_diff_for_gap(gap_days) — directional: the
-         LATER-closing contract (B) must be priced higher than the earlier
-         one (A) by at least the tier (15% when the deadlines are <= 15 days
+         LATER contract (B) — later by close_time for a cross-event pair, by
+         STATED deadline for a same-event ladder — must be priced higher than
+         the earlier one (A) by at least the tier (15% when the deadlines are <= 15 days
          apart, 30% for 16-30 days). That gap is the market-implied
          probability that the event first happens between the two deadlines;
          the strategy disputes it. A pricier EARLIER contract is never a
@@ -3140,7 +3141,9 @@ def find_time_series_pairs(
     Returns:
         list: CandidatePair objects, one per normalized title+outcome group
             that produced a pair, each carrying pair_type="time_series". Empty
-            if no group has two markets on different event_tickers within the
+            if no group has two markets on different event_tickers — or, with
+            TIME_SERIES_SAME_EVENT_LADDERS on, two dated rungs of ONE event —
+            within the
             deadline-gap cap whose wording is not identical across one series
             and states two different cumulative deadlines — the two deadlines
             compared as normalized strings, not parsed calendar dates (see the
@@ -3257,6 +3260,8 @@ def find_time_series_pairs(
     # the distinction DR-72 had just split apart. Every one is silent at zero,
     # so a run with the switch off adds a single line (the disabled count).
     ladder_disabled_skips = 0
+    ladder_no_event_skips = 0
+    ladder_identical_wording_skips = 0
     ladder_snapshot_skips = 0
     ladder_no_deadline_skips = 0
     ladder_same_deadline_skips = 0
@@ -3308,6 +3313,13 @@ def find_time_series_pairs(
                     # config.TIME_SERIES_SAME_EVENT_LADDERS for the nesting
                     # evidence and for the exposure turning it on would take.
                     if not TIME_SERIES_SAME_EVENT_LADDERS:
+                        # Counts the whole same-event candidate POPULATION,
+                        # deliberately ahead of every eligibility check below:
+                        # it is the first arrow of the funnel in
+                        # config.TIME_SERIES_SAME_EVENT_LADDERS' comment, and
+                        # an operator must be able to read that number off a
+                        # switch-OFF log. It says what the switch held back,
+                        # not that every one of them would have paired.
                         ladder_disabled_skips += 1
                         continue
                     if not mA.event_ticker:
@@ -3315,6 +3327,7 @@ def find_time_series_pairs(
                         # event at all, so nothing identifies the ladder they
                         # would belong to. Fails closed, exactly as it did
                         # before this branch existed.
+                        ladder_no_event_skips += 1
                         continue
                     if _identical_wording(mA, mB):
                         # Same event AND identical wording: the deadline is
@@ -3323,7 +3336,11 @@ def find_time_series_pairs(
                         # level in. cumulative_deadline_pair below would
                         # refuse it too (identical wording states identical
                         # spans), but refusing it here keeps the ladder
-                        # counters about ladders.
+                        # counters about ladders — and it is the LARGEST
+                        # single ladder refusal on the 2026-09-22 snapshot
+                        # (502 of 3,354), so it gets its own line rather than
+                        # vanishing out of the funnel (DR-72's rule).
+                        ladder_identical_wording_skips += 1
                         continue
                     if not cumulative_deadline_pair(
                         profiles[mA.ticker], profiles[mB.ticker]
@@ -3465,8 +3482,11 @@ def find_time_series_pairs(
                 # 16-30 days — a wider gap leaves more room for the event to land
                 # between the deadlines, so more of the market's in-between mass is
                 # genuine and a bigger gap is demanded before disputing it).
-                # Directional, not abs(): mA is always the earlier-closing contract
-                # (sorted above), and the bet only exists when the LATER contract is
+                # Directional, not abs(): mA is always the EARLIER contract —
+                # by close_time for a cross-event pair (the sort above), by
+                # STATED deadline for a same-event ladder (swapped inside the
+                # branch above, because that sort cannot order one) — and the
+                # bet only exists when the LATER contract is
                 # priced higher (pB > pA) — the gap is the market-implied in-between
                 # probability we dispute. A pricier earlier contract (pA > pB) has
                 # no in-between mass to dispute, is not a candidate, and using abs()
@@ -3608,6 +3628,18 @@ def find_time_series_pairs(
             "Same-event candidates skipped because same-event deadline "
             "ladders are disabled (config.TIME_SERIES_SAME_EVENT_LADDERS): %d",
             ladder_disabled_skips,
+        )
+    if ladder_no_event_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the shared event "
+            "ticker is empty: %d",
+            ladder_no_event_skips,
+        )
+    if ladder_identical_wording_skips:
+        logging.info(
+            "Same-event ladder candidates refused because the two rungs' "
+            "wording is identical (the deadline is not in the wording): %d",
+            ladder_identical_wording_skips,
         )
     if ladder_snapshot_skips:
         logging.info(

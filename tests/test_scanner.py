@@ -2276,6 +2276,37 @@ class TestSameEventDeadlineLadders:
         # finding and would make that counter mean two things at once
         # (DR-72's whole point).
         assert "state the same deadline" not in caplog.text
+        # And COUNTED here, on its own silent-at-zero line. It is the largest
+        # single ladder refusal on the real snapshot (502 of 3,354), so a
+        # bare `continue` would drop 15% of the branch's input out of the
+        # funnel with nothing in the log to reconstruct it from.
+        assert (
+            "refused because the two rungs' wording is identical "
+            "(the deadline is not in the wording): 1"
+        ) in caplog.text
+
+    def test_an_empty_shared_event_ticker_never_pairs(self, monkeypatch, caplog):
+        # Two markets sharing an EMPTY event ticker share no event at all, so
+        # nothing identifies the ladder they would belong to — fails closed,
+        # and on its OWN line rather than being attributed to whichever check
+        # happens to follow.
+        mA = _ladder_rung("E1", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                          close=datetime(2026, 3, 1, tzinfo=UTC), event="")
+        mB = _ladder_rung("E2", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                          close=datetime(2026, 3, 20, tzinfo=UTC), event="")
+        _assert_one_ladder_group(mA, mB)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], monkeypatch) == []
+        assert (
+            "refused because the shared event ticker is empty: 1"
+        ) in caplog.text
+        # Control: the identical fixture with a real shared event ticker is
+        # admitted, so the refusal above is the empty ticker and nothing else.
+        gA = _ladder_rung("E1", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                          close=datetime(2026, 3, 1, tzinfo=UTC))
+        gB = _ladder_rung("E2", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                          close=datetime(2026, 3, 20, tzinfo=UTC))
+        assert len(self._scan([gA, gB], monkeypatch)) == 1
 
     def test_a_snapshot_rung_in_one_event_never_pairs(self, monkeypatch, caplog):
         # The wording screen is unchanged inside the branch: "Starship count
@@ -4137,6 +4168,50 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.tradeable is True
         assert enriched.pB == pair.pB
         assert enriched.pA == pytest.approx(0.30)
+
+    def test_fallback_tier_is_the_stated_gap_for_a_ladder(self, caplog):
+        # DR-73, pinned BY VALUE because the AST pin beside it cannot see
+        # this: test_ast_pair_ceiling_reads_the_pair_gap only asserts that a
+        # pair_gap_days call is present and a deadline_gap_days call absent,
+        # which a shadowing `tier = min_price_diff_for_gap(abs((close_b -
+        # close_a).days))` after the real assignment satisfies too.
+        #
+        # A ladder whose rungs close at ONE instant (the shape a settled or
+        # single-instant event produces) with a STATED gap of 19 days must be
+        # held to the 0.30 long tier here, not the 0.15 one a 0-day close gap
+        # implies. The reference side is empty, so the fallback runs; the leg
+        # fills are pA 0.30 + nB 0.35 = 0.65, inside the stated tier's 0.70
+        # ceiling, and pB - avg_yes is 0.20 — between the two tiers, so the
+        # two readings disagree about this pair and only this value test says
+        # which one is right.
+        ladder = dataclasses.replace(
+            _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35),
+            stated_gap_days=19,
+        )
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(client, [ladder], _AMPLE_BALANCE_CENTS)
+
+        assert enriched.tradeable is False
+        drops = [
+            r for r in caplog.records
+            if "no longer prices above the YES leg fill" in r.getMessage()
+        ]
+        assert len(drops) == 1
+        # The rendered tier is the assertion: a close_time-derived tier says
+        # "0.15 tier" here and keeps the pair.
+        assert "clear the 0.30 tier" in drops[0].getMessage()
+
+        # Control: the SAME book and prices with no stated gap — the pair is a
+        # cross-event one closing 0 days apart, so the 0.15 tier applies and
+        # the 0.20 gap clears it. Proves the drop above comes from the stated
+        # gap, not from the fixture's prices.
+        plain = _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35)
+        assert plain.stated_gap_days is None
+        [kept] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35), [plain], _AMPLE_BALANCE_CENTS,
+        )
+        assert kept.tradeable is True
 
     def test_reference_refresh_costs_no_extra_orderbook_fetch(self):
         # The reference comes off an array _fetch_orderbook already returned,
