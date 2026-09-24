@@ -40,7 +40,10 @@ Dependencies:
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
     same-event deadline ladder's leg order and gap (DR-73)). pair_gap_days()
     is the single reader of that gap for everything downstream of pair
-    formation. Depends on the KalshiClient produced by auth.py.
+    formation. historical.py imports event_series too, so the backtest's
+    event-title lookup budget tells a combo ticker from any other exactly as
+    the one-series rule does (DR-51). Depends on the KalshiClient produced by
+    auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -1044,6 +1047,11 @@ def event_series(event_ticker: Any) -> str:
     config.MVE_SERIES_FAMILY_PREFIX for the census and the measured
     cross-prefix co-resolution rate behind the family rule, and for why an
     allowlist was rejected.
+
+    It has a second reader outside pairing: historical._is_combo_event, which
+    decides which event-title lookups the backtest spends its capped budget on
+    (DR-51), so "combo" means the same thing there as it does to the
+    one-series rule.
 
     Args:
         event_ticker (Any): The market's event_ticker. Anything that is not a

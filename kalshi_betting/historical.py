@@ -15,12 +15,17 @@ Purpose:
 
 Dependencies:
     Imports build_client from auth.py; api_call_with_retry and fetch_json_page
-    from _http.py; and PROJECT_ROOT plus a dozen-plus tuning constants
+    from _http.py; event_series from scanner.py (the one definition of an
+    event's series identity, so the event-title fallback's combo test — DR-51 —
+    can never disagree with the one-series rule about what a combo is); and
+    PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
     SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES, ARCHIVE_TAIL_MAX_PAGES,
     ARCHIVE_TAIL_MAX_RECORDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
-    EVENT_TITLE_LISTING_MAX_BARREN_PAGES, CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
+    EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST, INCLUDE_MVE_MARKETS, PROD_URL) from
     config.py. Exports
     build_historical_client() and build_prod_live_client(), both called by
@@ -106,6 +111,7 @@ import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
@@ -122,15 +128,18 @@ from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
+    EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
+    MVE_SERIES_FAMILY_PREFIX,
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
     PROJECT_ROOT,
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
+from .scanner import event_series
 
 # Optional acceleration for the day-slice store, which serializes and re-parses
 # tens of millions of compact market dicts per full-history fetch. orjson is an
@@ -155,8 +164,12 @@ CACHE_DIR = PROJECT_ROOT / "backtest_cache"
 _CANDLES_DIR = CACHE_DIR / "candlesticks"
 # Maps event_ticker → event_title, populated lazily by _load_or_build_event_titles
 # so the backtester can construct the same (event_title + market_title) grouping
-# key the live scanner uses.
-_EVENT_TITLES_CACHE = CACHE_DIR / "event_titles.json"
+# key the live scanner uses. The "_v2" file holds GENUINE answers only; the
+# legacy file also held "" for every ticker the lookup cap skipped, grew by
+# millions of such entries per bulk window, and is migrated into the v2 file
+# once, then deleted (DR-51 — see _load_event_title_accumulator).
+_EVENT_TITLES_CACHE = CACHE_DIR / "event_titles_v2.json"
+_LEGACY_EVENT_TITLES_CACHE = CACHE_DIR / "event_titles.json"
 
 # Cached-empty candles may be genuinely empty markets, but they are also what
 # a fetch failure previously produced. Treat empty cache files as stale after
@@ -423,11 +436,13 @@ def _load_json_cache(path: Path):
     file is "no cache" — same guarded-read philosophy as _day_store_load.
 
     The whole file is read into one string and parsed at once, so it is only
-    for small caches (candlesticks, event_titles.json) — and for LEGACY
-    assembled settled-market caches (settled_markets_*.json), which
-    fetch_all_settled_markets still serves this way for compatibility. That
-    path materializes the whole corpus (TS-07 in CLAUDE.md records what it
-    cost); new assembled caches are streamed instead (SettledCorpus).
+    for small caches (candlesticks) — and for LEGACY assembled settled-market
+    caches (settled_markets_*.json), which fetch_all_settled_markets still
+    serves this way for compatibility. That path materializes the whole
+    corpus (TS-07 in CLAUDE.md records what it cost); new assembled caches are
+    streamed instead (SettledCorpus). The event-title accumulator does not
+    come through here: its reader, _read_title_file, must tell a file that
+    could not be READ from one whose content is bad, which this one cannot.
 
     Args:
         path (Path): Filesystem path to the JSON cache file.
@@ -464,7 +479,7 @@ def _save_json_cache(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic tmp+replace, same idiom as _day_store_save. The tmp name is derived
     # from the destination, so it is unique because cache paths themselves are
-    # unique (per-ticker for candlesticks; the one event_titles.json per run)
+    # unique (per-ticker for candlesticks; the one event-title accumulator per run)
     # — the same path-uniqueness invariant that keeps the parallel candlestick
     # fetch safe. Never introduce a fetch whose cache path is shared across
     # workers. (The assembled settled-market cache no longer comes through
@@ -472,6 +487,282 @@ def _save_json_cache(path: Path, data) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, default=str))
     tmp.replace(path)
+
+
+def _is_combo_event(event_ticker: str) -> bool:
+    """
+    True when an event ticker belongs to the KXMVE combo (parlay) family.
+
+    Read through scanner.event_series, the one definition of an event's series
+    identity, which collapses every KXMVE* prefix onto MVE_SERIES_FAMILY_PREFIX
+    (DR-55), so this can never disagree with the one-series rule about what a
+    combo is. It decides only which per-ticker title lookups
+    _load_or_build_event_titles spends its cap on (DR-51). It never drops or
+    filters a market, and the grouping and pairing RULES are unchanged. What
+    it does change is one of their INPUTS: a combo ticker the old sorted cap
+    happened to reach was looked up and titled, and a deferred one now keeps a
+    blank event_title unless the accumulator already holds its title. That
+    moves those markets' grouping keys and the backtest's event_title and
+    deadline-phrasing census figures, but not which pairs form — see
+    config.EVENT_TITLE_FALLBACK_MAX_LOOKUPS for the evidence.
+
+    Args:
+        event_ticker (str): An event ticker from the settled corpus.
+
+    Returns:
+        bool: True for a combo event ticker; False otherwise, including for an
+            unreadable one (event_series reads it as the series "").
+    """
+    # The one series definition, so "combo" means here what the one-series
+    # rule means by it
+    return event_series(event_ticker) == MVE_SERIES_FAMILY_PREFIX
+
+
+# Outcomes of _read_title_file. A failed READ (an OSError: a permission error,
+# an iCloud file that cannot be downloaded while offline) may succeed on the
+# next run, so nothing may be written over the file; CONTENT that is not a JSON
+# object will not heal by itself.
+_TITLE_FILE_OK = "ok"
+_TITLE_FILE_ABSENT = "absent"
+_TITLE_FILE_UNREADABLE = "unreadable"
+_TITLE_FILE_CORRUPT = "corrupt"
+
+
+def _read_title_file(path: Path) -> tuple[dict | None, str, str]:
+    """
+    Read one event-title accumulator file, telling a failed READ from bad CONTENT.
+
+    _load_json_cache folds every failure into None, which is right for a cache
+    that can simply be rebuilt but not for this one: the answer to an
+    unusable accumulator is to write a new one, and writing over a file that
+    merely could not be read THIS time destroys every title in it — and, for
+    the legacy file, writing the v2 file commits the migration marker and
+    abandons the legacy titles for good (DR-51). So the two cases are kept
+    apart. Nothing is logged here and nothing is raised; the caller logs one
+    line per case.
+
+    Args:
+        path (Path): The accumulator file to read (the v2 file or the legacy one).
+
+    Returns:
+        tuple[dict | None, str, str]: (titles, outcome, detail). outcome is
+            _TITLE_FILE_OK (titles is the parsed JSON object), _TITLE_FILE_ABSENT,
+            _TITLE_FILE_UNREADABLE (an OSError while reading) or
+            _TITLE_FILE_CORRUPT (undecodable bytes, invalid JSON, or JSON that
+            is not an object); titles is None for all but the first. detail
+            names the exception or the JSON type, for the caller's log line.
+    """
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None, _TITLE_FILE_ABSENT, ""
+    except OSError as exc:
+        return None, _TITLE_FILE_UNREADABLE, f"{type(exc).__name__}: {exc}"
+    except ValueError as exc:
+        # Undecodable bytes: UnicodeDecodeError is a ValueError, not an OSError
+        return None, _TITLE_FILE_CORRUPT, type(exc).__name__
+    try:
+        titles = json.loads(text)
+    except ValueError as exc:
+        return None, _TITLE_FILE_CORRUPT, type(exc).__name__
+    if not isinstance(titles, dict):
+        return None, _TITLE_FILE_CORRUPT, f"it holds a JSON {type(titles).__name__}"
+    return titles, _TITLE_FILE_OK, ""
+
+
+@dataclass
+class _TitleAccumulator:
+    """
+    The loaded event-title accumulator and what the caller may write back.
+
+    Attributes:
+        titles (dict[str, str]): The accumulator. The caller merges this call's
+            answers into it IN PLACE and saves this same object.
+        migrated (bool): True only when titles came from a successfully parsed
+            legacy file; the caller retires that file once the v2 file holding
+            its titles is committed.
+        rewrite (bool): True when the caller must write the v2 file even if its
+            own answers change nothing: after a migration — one that imported
+            the legacy titles or one that had to give up on a legacy file whose
+            content is not a JSON object — so the marker exists, or to replace
+            a v2 file whose content is not a JSON object.
+        persist (bool): False when a file could not be READ (an OSError). The
+            caller then writes nothing this call — neither the v2 file nor,
+            therefore, the migration marker — so a read that may succeed next
+            run can never overwrite or abandon titles it did not see.
+    """
+    titles: dict[str, str]
+    migrated: bool = False
+    rewrite: bool = False
+    persist: bool = True
+
+
+def _warn_if_legacy_lingers() -> None:
+    """
+    WARN when a legacy event_titles.json sits beside the v2 accumulator.
+
+    While event_titles_v2.json exists the legacy file is never read, so one
+    that is still there is dead weight: a migration whose delete failed, or a
+    run killed between the v2 save and that delete; a legacy file left in
+    place because its content could not be parsed; or one an older build (a
+    checkout from before DR-51, sharing this backtest_cache/) wrote back, and
+    keeps growing by millions of entries per bulk window. It is NOT deleted
+    here, because in the last case it is that build's live accumulator; it is
+    named, with its size, on every call instead, so it cannot sit unnoticed in
+    iCloud-synced storage the way the retire-once design otherwise would let it.
+    """
+    try:
+        size = _LEGACY_EVENT_TITLES_CACHE.stat().st_size
+    except OSError:
+        # Absent — the normal case — or its metadata cannot be read: nothing to name
+        return
+    logging.warning(
+        "Event-title accumulator: a legacy %s (%.1f MB) sits beside %s and is "
+        "never read while that file exists (DR-51). It is left over from a "
+        "migration whose delete failed or was interrupted, kept because it "
+        "could not be parsed, or written back by an older build (a checkout "
+        "from before DR-51), which keeps growing it. Delete it unless such a "
+        "build still uses it.",
+        _LEGACY_EVENT_TITLES_CACHE, size / 1e6, _EVENT_TITLES_CACHE.name,
+    )
+
+
+def _load_event_title_accumulator() -> _TitleAccumulator:
+    """
+    Load the cross-run event-title accumulator, migrating the legacy file once.
+
+    The accumulator lives in _EVENT_TITLES_CACHE (event_titles_v2.json). Its
+    invariant is that every entry is a GENUINE answer: a title, or "" for a
+    per-ticker lookup that failed or an event a bulk listing returned without
+    a title. The legacy _LEGACY_EVENT_TITLES_CACHE (event_titles.json) broke
+    that invariant: it also stored "" for every ticker the per-ticker
+    fallback's cap skipped — tickers nobody ever looked up — and so grew by
+    millions of entries per bulk window (3,996,906 -> 7,986,570 keys in the
+    2026-09-24 7-day run, 7,918,449 of them KXMVE tickers mapped to "").
+    A legacy "" cannot be told apart from a genuine one, so the migration keeps
+    EXACTLY the legacy file's non-empty string entries and drops every "" once
+    (DR-51). A dropped ticker is simply unknown again: it costs a lookup only if
+    a later window asks for it, and a combo ticker is looked up only when a
+    run's whole unresolved set fits under EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+
+    The v2 file's EXISTENCE is the migration marker. While it exists the
+    legacy file is never read, so the migration runs once, and a legacy file
+    that reappears later (an older build writing it again, an iCloud revert)
+    is ignored rather than re-imported with its pills — and named on every
+    call by _warn_if_legacy_lingers, never deleted.
+
+    Neither file's failure is ever raised, and the two kinds are told apart
+    (_read_title_file). A file that cannot be READ (an OSError) makes the
+    call write nothing, so it is read again next run: the v2 file is not
+    overwritten, and the migration marker is not committed over legacy titles
+    nobody saw. A file whose CONTENT is not a JSON object will not heal: a
+    damaged v2 file is replaced, as the pre-DR-51 accumulator was; a damaged
+    legacy file is left in place, none of its titles are imported, and the v2
+    file is written as the marker, so the WARNING names the recovery (repair
+    it, delete event_titles_v2.json, re-run).
+
+    Returns:
+        _TitleAccumulator: The accumulator (titles, which the caller merges into
+            IN PLACE) and what the caller may write back (migrated, rewrite,
+            persist — see the dataclass).
+    """
+    titles, outcome, detail = _read_title_file(_EVENT_TITLES_CACHE)
+    if outcome == _TITLE_FILE_OK:
+        _warn_if_legacy_lingers()
+        return _TitleAccumulator(titles)
+    if outcome == _TITLE_FILE_UNREADABLE:
+        logging.warning(
+            "Event-title accumulator %s could not be read (%s). Titles are "
+            "resolved without it this run and nothing is written back, so the "
+            "file is not overwritten; the next run reads it again.",
+            _EVENT_TITLES_CACHE, detail,
+        )
+        return _TitleAccumulator({}, persist=False)
+    if outcome == _TITLE_FILE_CORRUPT:
+        # "Corrupt JSON cache" is the wording every cache in this module uses
+        logging.warning(
+            "Corrupt JSON cache %s (the event-title accumulator: %s) — treating "
+            "it as empty and replacing it",
+            _EVENT_TITLES_CACHE, detail,
+        )
+        return _TitleAccumulator({}, rewrite=True)
+
+    # No v2 file: the first run ever, or the one-time migration. The legacy
+    # file is read whole — it can hold millions of entries (374 MB on
+    # 2026-09-24) — exactly once; every later run reads only the v2 file.
+    legacy, outcome, detail = _read_title_file(_LEGACY_EVENT_TITLES_CACHE)
+    if outcome == _TITLE_FILE_ABSENT:
+        return _TitleAccumulator({})
+    if outcome == _TITLE_FILE_UNREADABLE:
+        logging.warning(
+            "Event-title accumulator: the legacy %s could not be read (%s), so "
+            "its migration to %s is deferred. Titles are resolved without it "
+            "this run and nothing is written, so no %s marks the migration done "
+            "and the next run retries it (DR-51).",
+            _LEGACY_EVENT_TITLES_CACHE, detail, _EVENT_TITLES_CACHE.name,
+            _EVENT_TITLES_CACHE.name,
+        )
+        return _TitleAccumulator({}, persist=False)
+    if outcome == _TITLE_FILE_CORRUPT:
+        logging.warning(
+            "Event-title accumulator: the legacy %s could not be read as a JSON "
+            "object (%s), so none of its titles are imported and %s starts "
+            "empty. The legacy file is left in place for inspection; it is "
+            "never read again once %s exists (DR-51). To retry the migration "
+            "after repairing it, delete %s and re-run.",
+            _LEGACY_EVENT_TITLES_CACHE, detail, _EVENT_TITLES_CACHE.name,
+            _EVENT_TITLES_CACHE.name, _EVENT_TITLES_CACHE,
+        )
+        return _TitleAccumulator({}, rewrite=True)
+    legacy_entries = len(legacy)
+    titles = {tkr: title for tkr, title in legacy.items()
+              if isinstance(title, str) and title}
+    del legacy
+    logging.info(
+        "Event-title accumulator: migrating %s to %s — keeping its %d titled "
+        "entries and dropping the other %d, none of which holds a title. "
+        "Before DR-51 the lookup cap stored \"\" for tickers it never looked "
+        "up, and those cannot be told apart from genuine failures; a dropped "
+        "ticker is re-resolved only if a later window asks for it.",
+        _LEGACY_EVENT_TITLES_CACHE.name, _EVENT_TITLES_CACHE.name,
+        len(titles), legacy_entries - len(titles),
+    )
+    return _TitleAccumulator(titles, migrated=True, rewrite=True)
+
+
+def _retire_legacy_event_titles() -> None:
+    """
+    Delete the legacy event_titles.json once the migrated v2 file is committed.
+
+    Called only after _load_event_title_accumulator parsed the legacy file and
+    the v2 file holding every one of its titled entries was written, so the
+    only thing destroyed is the legacy file's "" entries — exactly what the
+    DR-51 migration drops. Left on disk it would be dead weight (374 MB on
+    2026-09-24, in iCloud-synced ~/Documents) that is never read again while
+    the v2 file exists. Same retire-after-commit idiom as _retire_legacy_cache.
+    A failure to delete is logged and never raised: the backtest's own result
+    does not depend on it, and _warn_if_legacy_lingers names the file on every
+    later run until it is gone.
+    """
+    try:
+        _LEGACY_EVENT_TITLES_CACHE.unlink()
+    except FileNotFoundError:
+        # A concurrent run migrated first and already removed it
+        return
+    except OSError as exc:
+        logging.warning(
+            "Could not remove the legacy event-title accumulator %s (%s). Delete "
+            "it by hand: %s now holds every titled entry it had, it is never "
+            "read again while that file exists, and every later run warns "
+            "about it until it is gone.",
+            _LEGACY_EVENT_TITLES_CACHE, exc, _EVENT_TITLES_CACHE.name,
+        )
+        return
+    logging.info(
+        "Removed the legacy event-title accumulator %s: %s now holds every "
+        "titled entry it had (DR-51).",
+        _LEGACY_EVENT_TITLES_CACHE.name, _EVENT_TITLES_CACHE.name,
+    )
 
 
 def _load_or_build_event_titles(
@@ -490,29 +781,56 @@ def _load_or_build_event_titles(
     Two-tier resolution to keep API calls bounded:
       1. Bulk pull events (settled, closed, open) and — only when
          INCLUDE_MVE_MARKETS is True — their multivariate counterparts.
-         For most backtests this covers nearly every event_ticker in a few hundred
-         paginated calls.
+         For most backtests this covers nearly every non-combo event_ticker in
+         a few hundred paginated calls.
       2. For any tickers still unresolved (very old archived events that have aged
-         out of the bulk listings), fall back to per-ticker get_event() calls —
-         run in parallel and capped at EVENT_TITLE_FALLBACK_MAX_LOOKUPS, since
-         each costs a round trip and the miss set can run to six figures at
-         current Kalshi volumes.
+         out of the bulk listings, and combo events), fall back to per-ticker
+         get_event() calls — run in parallel, paced per worker by
+         EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS, and capped at
+         EVENT_TITLE_FALLBACK_MAX_LOOKUPS, since each costs a round trip and
+         the miss set runs to millions at 2026-09 Kalshi volumes. When the
+         whole miss set fits under the cap every ticker is looked up; when it
+         does not, the cap is spent on NON-combo tickers only and every combo
+         ticker is deferred, because a combo's event title has no measured
+         effect on which pairs form while a non-combo's does (TS-11; see
+         config.EVENT_TITLE_FALLBACK_MAX_LOOKUPS for the evidence). The capped
+         non-combo slice is taken in ticker order, tickers the accumulator has
+         never answered first (then its stored pills, then tickers it already
+         titles — only the first group exists with the cache on).
 
-    Every phase logs progress. This function can legitimately run for many
-    minutes, and when it was silent an in-progress run was indistinguishable
-    from a hang (observed 2026-08-03).
+    Every phase logs progress, and one closing line accounts for every ticker
+    this CALL was asked about (DR-42): resolved by this run (listings /
+    lookups), answered from the accumulator, recorded as unresolvable, or
+    deferred. This function can legitimately run for minutes, and when it was
+    silent an in-progress run was indistinguishable from a hang (2026-08-03).
 
-    Results are persisted to _EVENT_TITLES_CACHE so subsequent runs are essentially
-    free. Tickers that cannot be resolved — lookup failed, or skipped by the cap —
-    are stored as empty strings (poison pill) so we do not retry them every run.
+    Results persist in the cross-run accumulator (_EVENT_TITLES_CACHE), which
+    stores GENUINE answers only (DR-51): a title, or "" — the poison pill — for
+    a lookup that failed or an event listed without a title, so a ticker that
+    genuinely cannot be resolved is not re-looked-up every run. A ticker the
+    cap DEFERRED is not looked up this call and nothing is stored for it: its
+    return value is whatever the accumulator already holds for it — "" unless
+    an earlier run titled it — and a later run tries it again. For non-combo
+    tickers that later run advances past this one's slice either way: with
+    the cache on because every ticker this call answered is no longer
+    unresolved, and under use_cache=False because tickers the accumulator has
+    never answered are looked up first. Storing "" for deferred tickers is
+    what grew the legacy event_titles.json by millions of entries per bulk
+    window; _load_event_title_accumulator migrates that file once.
 
-    The on-disk cache is a cross-run ACCUMULATOR and is written as a MERGE, so a
-    single run (in particular a `--no-cache` run, which resolves from scratch)
-    can never wipe titles other runs paid for. Merge rule: disk entries are
-    preserved; a fresh non-empty title wins over the disk value; a fresh "" —
-    the poison pill from a failed lookup or the fallback cap — NEVER clobbers a
-    non-empty disk title, but a fresh "" for a ticker unknown to disk IS stored
-    (poison-pill semantics preserved).
+    The accumulator is written as a MERGE, so a single run (in particular a
+    `--no-cache` run, which resolves from scratch) can never wipe titles other
+    runs paid for. Merge rule: disk entries are preserved; a fresh non-empty
+    title wins over the disk value; a fresh "" NEVER clobbers a non-empty disk
+    title, but a fresh "" for a ticker unknown to disk IS stored (poison-pill
+    semantics preserved). The merge is applied to the loaded accumulator IN
+    PLACE and this run's answers are kept in their own map: the old code held
+    two full copies of the accumulator (seed and merge) beside the parsed file,
+    which with the legacy file at 7,986,570 keys put this phase at the top of a
+    fresh fetch's peak RSS. The file is rewritten only when this call changed
+    it (or migrated or replaced it), and never when an accumulator file could
+    not be READ this call (_load_event_title_accumulator), so a read that may
+    succeed next run cannot overwrite the titles it did not see.
 
     An unresolved ticker is not an error: the caller groups those markets by
     market title alone, which is exactly what a failed lookup has always done.
@@ -521,19 +839,23 @@ def _load_or_build_event_titles(
         live_client: A KalshiClient with the events API methods available
             (e.g. the client from build_prod_live_client()).
         event_tickers (set[str]): The set of event_ticker values whose titles
-            we need. May contain hundreds or thousands of entries.
-        use_cache (bool): If True, seed resolution from the on-disk accumulator.
-            If False, start empty so this run's tickers are genuinely re-fetched.
-            The on-disk accumulator is read (for the merge) and rewritten either
-            way — a `--no-cache` run refreshes its own tickers without discarding
-            titles it did not ask about.
+            we need. May contain millions of entries. Never mutated.
+        use_cache (bool): If True, a ticker the accumulator already answers (a
+            title or a stored pill) is not resolved again. If False, every
+            requested ticker is genuinely re-resolved, within the lookup cap:
+            when the cap binds, the tickers the accumulator has never answered
+            take it first and a deferred one keeps whatever it already holds.
+            The accumulator is read (for the merge and the return) and updated
+            either way — a `--no-cache` run refreshes its own tickers without
+            discarding titles it did not ask about.
 
     Returns:
         dict[str, str]: Mapping event_ticker → event_title, restricted to
-            event_tickers, read from the MERGED view — this run's resolution
-            layered over the on-disk accumulator. Tickers that could not be
-            resolved anywhere map to "". Caller treats those markets as
-            ungrouped (effectively MVE-excluded).
+            event_tickers, read from the MERGED view — this run's answers
+            layered over the accumulator. Tickers that could not be resolved
+            anywhere, and deferred tickers the accumulator holds no title for,
+            map to "". Caller treats those markets as ungrouped (effectively
+            MVE-excluded).
 
             It used to return this run's resolution ALONE, which under
             --no-cache handed back the "" poison pill for every ticker the
@@ -547,18 +869,31 @@ def _load_or_build_event_titles(
             direction that manufactures cross-event false positives under the
             95% co-resolution prior (TS-11).
     """
+    if not event_tickers:
+        # Nothing asked, nothing to answer — and no reason to read (or migrate)
+        # an accumulator that cannot contribute to an empty result.
+        return {}
     # Always read the accumulator: even when use_cache is False and it must not
-    # seed resolution, it is needed at save time so this run's writes MERGE with
-    # (rather than replace) titles earlier runs paid round trips for. Corrupt
-    # file → {} plus a warning, via the guarded loader.
-    disk_titles: dict[str, str] = _load_json_cache(_EVENT_TITLES_CACHE) or {}
-    cached: dict[str, str] = dict(disk_titles) if use_cache else {}
-    missing = event_tickers - cached.keys()
-    if not missing:
-        # Restricted to the caller's tickers for the same reason the merged
-        # return below is: the accumulator holds every ticker every past run
-        # ever resolved, and a caller asking about 40 must not receive 800k.
-        return {tkr: cached.get(tkr, "") for tkr in event_tickers}
+    # seed resolution, it is needed for the merge and the TS-11 return. A file
+    # that cannot be used → {} plus a warning (and, if it could not even be
+    # READ, nothing is written back this call); a legacy file is migrated once.
+    accumulator = _load_event_title_accumulator()
+    disk_titles = accumulator.titles
+    accumulator_before = len(disk_titles)
+    # This call's answers ONLY — never a copy of the accumulator (DR-51). Every
+    # "this run" figure in the closing summary is read off this map (DR-42).
+    fresh: dict[str, str] = {}
+    by_listing = 0   # titles this run got from the bulk listings
+    by_lookup = 0    # titles this run got from per-ticker lookups
+
+    def _unresolved(tkr) -> bool:
+        """True while this call still has no answer for tkr."""
+        return tkr not in fresh and not (use_cache and tkr in disk_titles)
+
+    # Nothing is copied to track what is missing: `remaining` counts it, and
+    # _unresolved answers membership against the caller's set and the two maps.
+    remaining = (sum(1 for tkr in event_tickers if tkr not in disk_titles)
+                 if use_cache else len(event_tickers))
 
     # Bulk pull non-MVE events across all statuses. Each get_events call returns
     # up to 200 events; pagination continues until cursor is empty or all misses
@@ -569,9 +904,9 @@ def _load_or_build_event_titles(
     # API now sends `category: null` on some events (observed 2026-08-03), so
     # the modeled call raises pydantic ValidationError mid-listing. Same drift,
     # and same fix, as the market/order/orderbook endpoints — see module Notes.
-    total_missing = len(missing)
+    total_missing = remaining
     for status in ("settled", "closed", "open"):
-        if not missing:
+        if not remaining:
             break
         cursor = None
         pages = 0
@@ -589,9 +924,11 @@ def _load_or_build_event_titles(
             resolved_here = 0
             for ev in data.get("events") or []:
                 tkr = ev.get("event_ticker")
-                if tkr in missing:
-                    cached[tkr] = ev.get("title") or ""
-                    missing.discard(tkr)
+                if tkr in event_tickers and _unresolved(tkr):
+                    title = ev.get("title") or ""
+                    fresh[tkr] = title
+                    by_listing += bool(title)
+                    remaining -= 1
                     resolved_here += 1
             pages += 1
             # Without this the whole phase is silent for however long it runs —
@@ -599,7 +936,7 @@ def _load_or_build_event_titles(
             if pages % 100 == 0:
                 logging.info("Event titles [%s listing]: %d pages scanned, "
                              "%d/%d still unresolved",
-                             status, pages, len(missing), total_missing)
+                             status, pages, remaining, total_missing)
             # Productivity bail-out: this listing is a full scan looking for a
             # specific ticker set, so once it stops hitting wanted tickers it
             # will not start again — keep paging and it burns minutes finding
@@ -609,11 +946,11 @@ def _load_or_build_event_titles(
                 logging.info(
                     "Event titles [%s listing]: no new titles in %d consecutive "
                     "pages after %d scanned — moving on with %d/%d unresolved",
-                    status, barren, pages, len(missing), total_missing,
+                    status, barren, pages, remaining, total_missing,
                 )
                 break
             cursor = data.get("cursor")
-            if not cursor or not missing:
+            if not cursor or not remaining:
                 break
 
     # Bulk pull multivariate events — these are excluded from get_events by API
@@ -624,7 +961,7 @@ def _load_or_build_event_titles(
     # Raw-response for the same nullable-category reason as above.
     # Only worth paging when MVE markets can be in the wanted set at all —
     # with INCLUDE_MVE_MARKETS off every market fetch excluded them upstream.
-    if missing and INCLUDE_MVE_MARKETS:
+    if remaining and INCLUDE_MVE_MARKETS:
         cursor = None
         barren = 0
         for page_no in range(1, MVE_TITLE_LOOKUP_MAX_PAGES + 1):
@@ -640,14 +977,16 @@ def _load_or_build_event_titles(
             resolved_here = 0
             for ev in data.get("events") or []:
                 tkr = ev.get("event_ticker")
-                if tkr in missing:
-                    cached[tkr] = ev.get("title") or ""
-                    missing.discard(tkr)
+                if tkr in event_tickers and _unresolved(tkr):
+                    title = ev.get("title") or ""
+                    fresh[tkr] = title
+                    by_listing += bool(title)
+                    remaining -= 1
                     resolved_here += 1
             if page_no % 100 == 0:
                 logging.info("Event titles [MVE listing]: %d/%d pages scanned, "
                              "%d/%d still unresolved", page_no,
-                             MVE_TITLE_LOOKUP_MAX_PAGES, len(missing), total_missing)
+                             MVE_TITLE_LOOKUP_MAX_PAGES, remaining, total_missing)
             # Same productivity bail-out as the status listings above; the MVE
             # listing is the most unbounded of the three.
             barren = 0 if resolved_here else barren + 1
@@ -655,45 +994,91 @@ def _load_or_build_event_titles(
                 logging.info(
                     "Event titles [MVE listing]: no new titles in %d consecutive "
                     "pages after %d scanned — moving on with %d/%d unresolved",
-                    barren, page_no, len(missing), total_missing,
+                    barren, page_no, remaining, total_missing,
                 )
                 break
             cursor = data.get("cursor")
-            if not cursor or not missing:
+            if not cursor or not remaining:
                 break
 
     # Per-ticker fallback for events that aren't in the bulk listings (or fell
     # past the MVE page cap). Uses a raw signed GET because the modeled
     # get_event embeds nested Market models the pinned SDK can no longer
-    # deserialize (see module Notes). Failures are recorded as "" so we don't
-    # retry on every backtest run.
+    # deserialize (see module Notes). A failed lookup is recorded as "" (a
+    # genuine answer) so it is not retried on every backtest run.
     #
-    # This costs one HTTP round-trip per ticker, so it is BOUNDED and RUN IN
-    # PARALLEL: it was written for a handful of stragglers, but at current
-    # Kalshi volumes the bulk listings can leave hundreds of thousands
-    # unresolved (live-measured 2026-08-03), and sequentially that is hours of
-    # silent grinding. Anything past the cap is poison-pilled to "" — the same
-    # value a failed lookup produces, so the caller's behaviour is unchanged.
-    if missing:
-        to_look_up = sorted(missing)  # sorted → deterministic which ones the cap keeps
-        capped = to_look_up[EVENT_TITLE_FALLBACK_MAX_LOOKUPS:]
-        to_look_up = to_look_up[:EVENT_TITLE_FALLBACK_MAX_LOOKUPS]
-        if capped:
-            # Never drop coverage silently — say exactly how much was skipped.
-            logging.warning(
-                "Event titles: %d tickers unresolved after the bulk listings; "
-                "looking up %d individually and marking the remaining %d as "
-                "untitled (cap EVENT_TITLE_FALLBACK_MAX_LOOKUPS=%d). Those "
-                "markets group by market title alone, exactly as a failed "
-                "lookup would.",
-                len(missing), len(to_look_up), len(capped),
-                EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
-            )
-        else:
+    # This costs one HTTP round-trip per ticker, so it is BOUNDED, PACED and
+    # RUN IN PARALLEL: it was written for a handful of stragglers, but at
+    # current Kalshi volumes the bulk listings leave millions unresolved
+    # (3,987,139 on the 2026-09-24 7-day run, almost all combo tickers), and
+    # sequentially that is hours of silent grinding.
+    if remaining:
+        if remaining <= EVENT_TITLE_FALLBACK_MAX_LOOKUPS:
+            # Everything fits: look every ticker up, combos included, exactly
+            # as before DR-51. Sorted only so progress is reproducible.
+            to_look_up = sorted(tkr for tkr in event_tickers if _unresolved(tkr))
             logging.info("Event titles: looking up %d tickers individually",
                          len(to_look_up))
-        for tkr in capped:
-            cached[tkr] = ""
+        else:
+            # It does not fit: spend the cap where a title can change a pair.
+            # Deterministic order, so a re-run cannot shuffle coverage, and —
+            # since a deferred ticker is not stored — a later run takes the
+            # next slice. Combo tickers are counted, never listed: at
+            # bulk-window volume there are millions of them.
+            def _lookup_priority(tkr: str) -> tuple[int, str]:
+                """
+                Order the capped non-combo slice: tickers the accumulator has
+                never answered, then its stored pills, then tickers it already
+                titles, each group by ticker. With the cache on only the first
+                group is unresolved, so this is plain ticker order. Under
+                use_cache=False every requested ticker is re-resolved, and a
+                deferred ticker the accumulator titles keeps that title, so
+                spending the cap on the unanswered ones first is what lets
+                repeated --no-cache runs advance through the deferred tail
+                instead of re-looking-up the same head every run.
+                """
+                stored = disk_titles.get(tkr)
+                return (0 if stored is None else 1 if not stored else 2), tkr
+
+            non_combo = sorted((tkr for tkr in event_tickers
+                                if _unresolved(tkr) and not _is_combo_event(tkr)),
+                               key=_lookup_priority)
+            to_look_up = non_combo[:EVENT_TITLE_FALLBACK_MAX_LOOKUPS]
+            deferred_non_combo = len(non_combo) - len(to_look_up)
+            deferred_combo = remaining - len(non_combo)
+            if deferred_non_combo:
+                # Non-combo coverage is being lost this run — that is a warning.
+                logging.warning(
+                    "Event titles: %d tickers unresolved after the bulk listings "
+                    "(%d non-combo, %d combo), more than the lookup cap "
+                    "EVENT_TITLE_FALLBACK_MAX_LOOKUPS=%d. Looking up %d non-combo "
+                    "tickers individually and deferring the other %d non-combo "
+                    "tickers%s. A deferred ticker is not looked up this run and "
+                    "nothing is stored for it, so a later run tries it again; it "
+                    "keeps any title the accumulator already holds and is "
+                    "otherwise untitled this run, its markets grouping by market "
+                    "title alone exactly as after a failed lookup (the closing "
+                    "summary counts those).",
+                    remaining, len(non_combo), deferred_combo,
+                    EVENT_TITLE_FALLBACK_MAX_LOOKUPS, len(to_look_up),
+                    deferred_non_combo,
+                    f" and all {deferred_combo} combo tickers" if deferred_combo else "",
+                )
+            else:
+                # Only combos deferred — expected on every bulk window, and
+                # without pairing effect, so INFO: a WARNING that fires on every
+                # run trains the operator to ignore the one above.
+                logging.info(
+                    "Event titles: %d tickers unresolved after the bulk listings, "
+                    "more than the lookup cap EVENT_TITLE_FALLBACK_MAX_LOOKUPS=%d. "
+                    "Looking up all %d non-combo tickers individually and "
+                    "deferring the %d combo (%s-family) tickers, whose event "
+                    "titles have no measured effect on pairing (DR-51); they are "
+                    "not looked up this run and nothing is stored for them.",
+                    remaining, EVENT_TITLE_FALLBACK_MAX_LOOKUPS, len(to_look_up),
+                    deferred_combo, MVE_SERIES_FAMILY_PREFIX,
+                )
+            del non_combo
 
         def _lookup_one(tkr: str) -> tuple[str, str]:
             """Resolve one event title; "" on any failure (poison pill)."""
@@ -707,44 +1092,90 @@ def _load_or_build_event_titles(
                 logging.warning("Could not resolve event title for %s: HTTP %s %s",
                                 tkr, getattr(e, "status", "?"), _exception_summary(e))
                 return tkr, ""
+            finally:
+                # Pace every worker after every lookup, success or failure —
+                # the fetch_candlesticks idiom (DR-51). Unpaced, eight workers
+                # drew 268 HTTP 429s in 2m03s on the 2026-09-24 7-day run.
+                time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
 
-        done = 0
-        started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=EVENT_TITLE_FALLBACK_MAX_WORKERS) as pool:
-            for tkr, title in pool.map(_lookup_one, to_look_up):
-                cached[tkr] = title
-                done += 1
-                if done % 500 == 0:
-                    elapsed = max(time.monotonic() - started, 1e-9)
-                    remaining = (len(to_look_up) - done) / (done / elapsed)
-                    logging.info("Event titles: %d/%d individual lookups done "
-                                 "(ETA %s)", done, len(to_look_up),
-                                 _format_duration(remaining))
+        if to_look_up:
+            done = 0
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=EVENT_TITLE_FALLBACK_MAX_WORKERS) as pool:
+                for tkr, title in pool.map(_lookup_one, to_look_up):
+                    fresh[tkr] = title
+                    by_lookup += bool(title)
+                    done += 1
+                    if done % 500 == 0:
+                        elapsed = max(time.monotonic() - started, 1e-9)
+                        eta = (len(to_look_up) - done) / (done / elapsed)
+                        logging.info("Event titles: %d/%d individual lookups done "
+                                     "(ETA %s)", done, len(to_look_up),
+                                     _format_duration(eta))
+        del to_look_up
 
-    # Merge into the on-disk accumulator rather than overwriting it: disk entries
-    # are preserved, a fresh non-empty title wins over the disk value, and a
-    # fresh "" (poison pill from a failed lookup or the fallback cap) never
-    # clobbers a non-empty disk title — but a fresh "" for a ticker disk has
-    # never seen IS stored, so poison-pill semantics survive.
-    merged = dict(disk_titles)
-    for tkr, title in cached.items():
-        if title or not merged.get(tkr):
-            merged[tkr] = title
-    _save_json_cache(_EVENT_TITLES_CACHE, merged)
+    # Merge this run's answers into the accumulator IN PLACE: a fresh non-empty
+    # title wins over the disk value, and a fresh "" (a failed lookup, or an
+    # event listed without a title) never clobbers a non-empty disk title — but
+    # a fresh "" for a ticker disk has never seen IS stored, so poison-pill
+    # semantics survive. A deferred ticker is not in `fresh`, so it is never
+    # stored (DR-51). Only real changes are counted, so an unchanged
+    # accumulator is not rewritten.
+    written = 0
+    for tkr, title in fresh.items():
+        old = disk_titles.get(tkr)
+        if title:
+            if old != title:
+                disk_titles[tkr] = title
+                written += 1
+        elif old is None:
+            disk_titles[tkr] = ""
+            written += 1
+    if accumulator.persist and (written or accumulator.rewrite):
+        _save_json_cache(_EVENT_TITLES_CACHE, disk_titles)
+        if accumulator.migrated:
+            # Only now: the v2 file holding every titled legacy entry is on disk.
+            _retire_legacy_event_titles()
+    if not accumulator.persist:
+        stored_note = " (NOT written: a file could not be read, see the WARNING above)"
+    elif written or accumulator.rewrite:
+        stored_note = ""
+    else:
+        stored_note = " (unchanged, not rewritten)"
+
     # Return the MERGED view, restricted to what the caller asked about. The
     # accumulator exists precisely so a ticker resolved by an earlier run need
-    # not be re-fetched; returning `cached` threw that away at the last step and
-    # substituted the "" poison pill (TS-11).
-    result = {tkr: merged.get(tkr, "") for tkr in event_tickers}
-    # Count the substitutions so the accumulator's contribution is visible
-    # rather than inferred — this is the number that was silently lost.
-    from_accumulator = sum(
-        1 for tkr in event_tickers if not cached.get(tkr) and merged.get(tkr)
-    )
+    # not be re-fetched; returning this run's answers alone threw that away at
+    # the last step and substituted the "" poison pill (TS-11). The same pass
+    # sorts every requested ticker into exactly one outcome for the summary.
+    result: dict[str, str] = {}
+    from_accumulator = 0       # titled, but not by this run (disk hit or TS-11)
+    recorded_unresolvable = 0  # untitled, with a stored or fresh "" answer
+    deferred_untitled = 0      # untitled and never answered: deferred by the cap
+    for tkr in event_tickers:
+        title = disk_titles.get(tkr, "")
+        result[tkr] = title
+        if fresh.get(tkr):
+            continue  # titled by this run; counted by source above
+        if title:
+            from_accumulator += 1
+        elif tkr in fresh or tkr in disk_titles:
+            recorded_unresolvable += 1
+        else:
+            deferred_untitled += 1
+    # One line accounting for every ticker THIS call was asked about (DR-42):
+    # the five counts partition the request, and the accumulator's size before
+    # and after makes its growth visible run over run (DR-51).
     logging.info(
-        "Event titles resolved: %d this run, %d cached entries on disk, "
-        "%d of this run's tickers answered from the accumulator",
-        len(cached), len(merged), from_accumulator,
+        "Event titles for %d requested tickers: %d resolved by this run (%d from "
+        "the bulk listings, %d from per-ticker lookups), %d of this run's "
+        "tickers answered from the accumulator, %d untitled (%d recorded as "
+        "unresolvable, %d deferred and not stored). Accumulator: %d -> %d "
+        "entries%s.",
+        len(event_tickers), by_listing + by_lookup, by_listing, by_lookup,
+        from_accumulator, recorded_unresolvable + deferred_untitled,
+        recorded_unresolvable, deferred_untitled, accumulator_before,
+        len(disk_titles), stored_note,
     )
     return result
 

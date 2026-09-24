@@ -352,7 +352,10 @@ INCLUDE_MVE_MARKETS           = True
 # co-resolution prior (and, identically worded, as a time-series pair).
 #
 # Census of backtest_cache/event_titles.json (3,996,906 keys, 2,444 distinct
-# prefixes), measured 2026-09-16. Reproduce with:
+# prefixes), measured 2026-09-16. That file was mostly "" entries for combo
+# tickers nobody looked up; DR-51 migrates its titled entries into
+# event_titles_v2.json and deletes it, so the command below reproduces the
+# census only on a pre-DR-51 copy. Reproduce with:
 #   python3 -c "import json,collections;c=collections.Counter(k.split('-')[0] for k in json.load(open('backtest_cache/event_titles.json')));print([(k,v) for k,v in c.most_common() if k.startswith('KXMVE')])"
 #   KXMVECROSSCATEGORY            2,960,840
 #   KXMVESPORTSMULTIGAMEEXTENDED    906,157
@@ -835,9 +838,11 @@ BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 # toward (title, subtitle) — the TS-11 direction. It is legitimately near zero
 # on a HEALTHY cache (0.57% and 2.87% on the two post-fix caches above), because
 # the corpus is overwhelmingly MVE combo markets, whose titles the bulk
-# get_events listings exclude by API design and whose per-ticker fallback is
-# capped at EVENT_TITLE_FALLBACK_MAX_LOOKUPS. Warning on it would fire on every
-# run and train the operator to ignore the line.
+# get_events listings exclude by API design and whose per-ticker lookups are
+# deferred whenever a run's unresolved set exceeds
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS (DR-51 — every bulk window at 2026-09
+# volume, so expect it lower still after that change). Warning on it would
+# fire on every run and train the operator to ignore the line.
 #
 # Advisory only: the census drops, filters and alters nothing.
 BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
@@ -910,16 +915,65 @@ SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
 # 2026-08-03: 289,235 unique event_tickers for a 21-day window) — sequentially
 # that is many hours with no visible progress, which reads as a hang.
 #
-# Tickers past the cap are recorded as "" (the same poison pill used for a
-# failed lookup): the backtester then treats those markets as ungrouped, which
-# is the identical outcome a failed lookup already produced. Correctness is
-# unaffected; only MVE grouping coverage degrades, and the log says by how much.
+# How the cap is spent (DR-51, 2026-09). When every ticker still unresolved
+# after the bulk listings fits under the cap, all of them are looked up. When
+# they do not, the cap is spent on NON-combo tickers only, and every combo
+# ticker — the KXMVE family, MVE_SERIES_FAMILY_PREFIX, read through
+# scanner.event_series — is deferred. The non-combo slice is taken in ticker
+# order, tickers the accumulator has never answered first, so a later run
+# resolves the next slice: with the cache on because answered tickers are no
+# longer unresolved, and under --no-cache (which re-resolves every requested
+# ticker) because the never-answered ones outrank those it already holds.
+# A combo's event title has no measured effect on which pairs form: the
+# one-series rule refuses every combo-vs-combo same-title pair (DR-54/DR-55),
+# and on the 2026-09-08/09 day slices no combo record shared even the coarser
+# time-series grouping key with any non-combo record (CLAUDE.md, DR-67 notes).
+# A non-combo title can (TS-11), and the old single sorted list spent the whole
+# cap on the tickers sorting before "KXMVE" plus the head of the combo block:
+# on the 2026-09-24 7-day run 3,987,139 tickers reached the fallback, 5,000
+# were looked up and 3,982,139 skipped, and one non-combo event sorting after
+# "KXMVE" (KXNFLEVERYWEEKCOMPETE-27, 34 markets) was skipped with them.
+#
+# Deferring combos changes an INPUT to grouping, not a rule. A combo the old
+# cap reached was looked up and titled: that run's census logged event_title on
+# 27,934 of 7,274,215 eligible records, and 18,671 of those were among its
+# 18,705 non-combo records, so 9,263 combo records carried a title. A deferred
+# combo now stays blank unless the accumulator already holds its title, which
+# moves those markets' grouping keys and the backtest's event_title and
+# deadline-phrasing census figures (a post-DR-51 fresh backtest's outcome-label
+# census is not comparable with a pre-DR-51 one) but not which pairs form: the
+# 2026-09-08/09 measurement above was taken on day-slice records, which carry
+# no event_title at all (it is patched in at assembly), i.e. with every
+# combo's event title already blank.
+#
+# A deferred ticker is not looked up and nothing is stored for it: it is
+# untitled for that run unless the accumulator already holds its title, and a
+# later run tries it again. Storing "" for it grew
+# backtest_cache/event_titles.json from 3,996,906 to 7,986,570 keys (202 MB to
+# 374 MB) in that one run, 7,918,449 of them KXMVE tickers mapped to "", which
+# every later fetch loaded whole. Only a genuine answer is stored — a title,
+# or "" for a lookup that failed or an event listed without one. Correctness is
+# unaffected either way: an untitled market groups by market title alone,
+# exactly as after a failed lookup, and the log names how many were deferred.
 EVENT_TITLE_FALLBACK_MAX_LOOKUPS = 5_000
 
 # Worker threads for the per-ticker event-title fallback. Each lookup is an
 # independent read-only GET, so this is pure I/O overlap — the same rationale
 # (and the same retry-per-worker behaviour) as SETTLED_FETCH_MAX_WORKERS.
 EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
+
+# Pause, in seconds, that each event-title fallback worker takes after every
+# lookup (DR-51) — the same 0.15 s each fetch_candlesticks worker takes between
+# pages (its rate_limit_sleep default), against the same API with the same
+# worker count. Unpaced, the fallback's 5,000 lookups on the 2026-09-24 7-day
+# run took 2m03s (about 41 requests/s) and drew 268 HTTP 429s. Read the
+# evidence for what pacing does and does not buy: the candlestick fetch paced
+# this way ran at about 24 requests/s (37,326 single-request tickers in 25m56s
+# on 2026-09-13) and still drew 429s on 4-5% of its requests, all retried by
+# api_call_with_retry, as the 268 were. So this lowers the aggregate rate; it is
+# not a guarantee of zero 429s. What removes the storm at bulk-window volume is
+# the budget rule above: combo tickers no longer reach the fallback at all.
+EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS = 0.15
 
 # Abandon a bulk event listing after this many CONSECUTIVE pages that resolve
 # no new titles. Same "productivity bail-out" idiom as MVE_MAX_EMPTY_PAGES.

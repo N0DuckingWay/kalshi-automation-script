@@ -73,7 +73,9 @@ config.py (constants), _http.py (retry + raw-response fetch)
                     backtest.py (CLI entry)
 
     (historical.py also imports auth.py's build_client for its own client
-     builders, and _http.py directly for its raw signed GETs; backtester.py
+     builders, _http.py directly for its raw signed GETs, and scanner.py's
+     event_series so the event-title lookup budget's combo test agrees with
+     the one-series rule; backtester.py
      also imports scanner.py's time_series_group_key — the one definition of
      the time-series grouping key, title plus outcome label, shared with the
      live scanner — event_series, the one definition of an event's series
@@ -269,7 +271,15 @@ falls back to `kalshi_private_key.pem` when it's absent.
                                     .jsonl.gz exists at all, are never written any more,
                                     and are deleted once a rebuild of the same name stem
                                     has written its .jsonl.gz
-    event_titles.json             ← Cross-run event-title accumulator (merged, not overwritten)
+    event_titles_v2.json          ← Cross-run event-title accumulator (merged, not overwritten).
+                                    Stores genuine answers only — a title, or "" for a
+                                    lookup that failed — never a ticker the lookup cap
+                                    deferred. A legacy event_titles.json (which also
+                                    stored "" for every deferred ticker, millions per
+                                    bulk window) is migrated into it once, keeping only
+                                    its titled entries, and then deleted; one found
+                                    beside it later is never read, and is named in a
+                                    WARNING on every run until it is removed
     archive_days/                 ← Per-created-day archive slices (incremental/resumable)
     live_days/                    ← Per-settled-day recent-market slices (incremental/resumable)
     candlesticks/                 ← Per-ticker hourly price series

@@ -124,10 +124,24 @@ def _patch_single_event_lookups(monkeypatch,
 
 @pytest.fixture
 def isolated_cache(tmp_path, monkeypatch):
-    """Redirect _EVENT_TITLES_CACHE to a temp file so tests don't touch real cache."""
-    cache_file = tmp_path / "event_titles.json"
+    """Redirect the event-title accumulator (event_titles_v2.json) and its
+    legacy file (event_titles.json) to temp files so tests don't touch the real
+    cache, and return the accumulator's path. tests/conftest.py already applies
+    the same redirect to every test; this fixture names the path for the tests
+    that seed or read the file."""
+    cache_file = tmp_path / "event_titles_v2.json"
     monkeypatch.setattr(historical, "_EVENT_TITLES_CACHE", cache_file)
+    monkeypatch.setattr(historical, "_LEGACY_EVENT_TITLES_CACHE",
+                        tmp_path / "event_titles.json")
     return cache_file
+
+
+@pytest.fixture(autouse=True)
+def _unpaced_title_lookups(monkeypatch):
+    """Zero the per-lookup pause of the event-title fallback (DR-51) for every
+    test in this module, so lookups cost no wall time; the pacing test sets its
+    own value."""
+    monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS", 0)
 
 
 class TestEventTitlesCache:
@@ -288,7 +302,8 @@ class TestEventTitlesCache:
         # written for a handful of stragglers, but a 21-day window measured
         # 289,235 unresolved tickers live (2026-08-03) — uncapped and
         # sequential that is hours of silent grinding. Past the cap, tickers
-        # are poison-pilled to "" exactly as a failed lookup already did.
+        # are "" for this run, exactly as after a failed lookup — but since
+        # DR-51 they are DEFERRED, not stored (see TestEventTitleAccumulatorBound).
         monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
         client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
         wanted = {f"E{i:02d}" for i in range(10)}
@@ -299,7 +314,7 @@ class TestEventTitlesCache:
         with caplog.at_level(logging.WARNING):
             result = historical._load_or_build_event_titles(client, wanted)
 
-        # Every requested ticker is present — capped ones as the "" poison pill.
+        # Every requested ticker is present — deferred ones as "" this run.
         assert set(result) == wanted
         assert fallback.call_count == 3
         resolved = {t for t, v in result.items() if v}
@@ -307,9 +322,15 @@ class TestEventTitlesCache:
         assert all(result[t] == "" for t in wanted - resolved)
         # The cap is deterministic (sorted), so a re-run can't shuffle coverage.
         assert resolved == {"E00", "E01", "E02"}
-        # And it must never be silent about what it skipped.
-        assert any("marking the remaining 7 as untitled" in r.getMessage()
-                   for r in caplog.records)
+        # And it must never be silent about what it skipped — these are
+        # non-combo tickers, whose titles can change a pair, so it WARNs.
+        assert any("deferring the other 7 non-combo tickers" in r.getMessage()
+                   and r.levelno == logging.WARNING for r in caplog.records)
+        # DR-51: the deferred seven were never looked up, so nothing is stored
+        # for them — only the three genuine answers reach the accumulator.
+        assert json.loads(isolated_cache.read_text()) == {
+            t: f"Title {t}" for t in ("E00", "E01", "E02")
+        }
 
     def test_per_ticker_fallback_runs_in_parallel(self, isolated_cache, monkeypatch):
         # Each lookup is an independent read-only GET, so they must overlap
@@ -3432,6 +3453,406 @@ class TestEventTitlesReturnsMergedView:
         with caplog.at_level(logging.INFO):
             historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
         assert "1 of this run's tickers answered from the accumulator" in caplog.text
+
+
+class TestEventTitleAccumulatorBound:
+    """
+    DR-51 / DR-42: the event-title accumulator stores genuine answers only.
+
+    Before DR-51 every ticker the per-ticker fallback's cap skipped was stored
+    as "" — tickers nobody ever looked up — so one fresh 7-day run
+    (2026-09-24) grew backtest_cache/event_titles.json from 3,996,906 to
+    7,986,570 keys, 7,918,449 of them KXMVE combo tickers mapped to "", and
+    every later fetch parsed the whole file and held two full copies of it.
+    The one sorted cap also spent its 5,000 lookups on whatever sorted first,
+    so a non-combo event sorting after "KXMVE" was skipped along with millions
+    of combos. And the closing summary counted the whole seeded accumulator as
+    "this run" (DR-42). These tests pin what replaced all of it: deferred
+    tickers are not stored, a genuine failure still is, the cap goes to
+    non-combo tickers first, lookups are paced, the accumulator is merged in
+    place and rewritten only when it changed, the summary counts this call, and
+    the legacy file is migrated exactly once.
+    """
+
+    @staticmethod
+    def _combo(n: int) -> str:
+        return f"KXMVECROSSCATEGORY-SHARD1-S{n:04d}"
+
+    def test_deferred_tickers_are_not_stored_and_a_later_run_takes_the_next_slice(
+        self, isolated_cache, monkeypatch,
+    ):
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(7)}
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+
+        historical._load_or_build_event_titles(client, wanted)
+        assert set(json.loads(isolated_cache.read_text())) == {"E00", "E01", "E02"}
+
+        # The deferred four are unknown, not pilled, so the next run looks
+        # them up — the sorted cap reaching the next slice.
+        second = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), wanted,
+        )
+        assert fallback.call_count == 6
+        assert set(json.loads(isolated_cache.read_text())) == {
+            "E00", "E01", "E02", "E03", "E04", "E05",
+        }
+        assert second["E05"] == "Title E05" and second["E06"] == ""
+
+    def test_a_genuine_failure_is_still_stored_beside_deferred_tickers(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: only the never-looked-up tickers lose their pill. A lookup
+        # that was made and FAILED is a genuine answer and is stored, so it is
+        # not re-paid every run.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 2)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"E00": "Title E00"},
+            single_failures={"E01"},
+        )
+        historical._load_or_build_event_titles(client, {"E00", "E01", "E02"})
+        assert json.loads(isolated_cache.read_text()) == {
+            "E00": "Title E00", "E01": "",
+        }
+
+    def test_over_the_cap_the_lookups_go_to_non_combo_tickers(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # M5 on the 2026-09-24 run: one sorted list spent the whole cap on the
+        # tickers before "KXMVE" plus the head of the combo block, so
+        # KXNFLEVERYWEEKCOMPETE-27 (sorting after it) was skipped and its 34
+        # markets went untitled. Non-combo tickers now take the cap first, and
+        # combos — whose titles have no measured effect on pairing — are
+        # deferred whole, under every KXMVE* prefix (scanner.event_series).
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        combos = {self._combo(i) for i in range(4)} | {
+            "KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-S0001",
+        }
+        non_combo = {"AAA-26", "KXNFLEVERYWEEKCOMPETE-27", "KXPRIMARYTURNOUT-26"}
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        looked_up: list[str] = []
+
+        def fake_signed_get(_client, path, **_params):
+            tkr = path.rsplit("/", 1)[-1]
+            looked_up.append(tkr)
+            return _raw_resp({"event": {"title": f"Title {tkr}"}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=fake_signed_get))
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, combos | non_combo)
+
+        assert sorted(looked_up) == sorted(non_combo)
+        assert all(result[t] == f"Title {t}" for t in non_combo)
+        assert all(result[t] == "" for t in combos)
+        # Every non-combo fit, so nothing pairing-relevant was lost: INFO, not
+        # WARNING — a line that fires on every bulk window must not warn.
+        assert "deferring the 5 combo (KXMVE-family) tickers" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # And no combo was stored.
+        assert set(json.loads(isolated_cache.read_text())) == non_combo
+
+    def test_under_the_cap_every_ticker_is_looked_up_combos_included(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the combo deferral applies only when the miss set does not
+        # fit. Under the cap nothing changes from before DR-51.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 10)
+        wanted = {self._combo(i) for i in range(3)} | {"AAA-26", "ZZZ-26"}
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+        result = historical._load_or_build_event_titles(client, wanted)
+        assert fallback.call_count == 5
+        assert result == {t: f"Title {t}" for t in wanted}
+
+    def test_every_lookup_is_paced_success_or_failure(self, isolated_cache, monkeypatch):
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS",
+                            0.125)
+        sleeps: list[float] = []
+        monkeypatch.setattr(historical.time, "sleep", sleeps.append)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"E1": "One", "E2": "Two", "E3": "Three"},
+            single_failures={"E4"},
+        )
+        historical._load_or_build_event_titles(client, {"E1", "E2", "E3", "E4"})
+        assert sleeps == [0.125] * 4
+
+    def test_the_summary_counts_this_call_with_the_cache_on(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # DR-42: with use_cache on, the old line reported the whole seeded
+        # accumulator as "N this run" (7,986,570 on the 2026-09-24 run, which
+        # resolved at most ~7,525) and "0 answered from the accumulator" by
+        # construction. The five counts now partition the request.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 2)
+        isolated_cache.write_text(json.dumps(
+            {"D1": "Disk Title", "D2": "", "OTHER": "Unrelated"}))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"N1": "Looked Up"},
+            single_failures={"N2"},
+        )
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(
+                client, {"D1", "D2", "L1", "N1", "N2", "N3"})
+
+        assert result == {"D1": "Disk Title", "D2": "", "L1": "Listed Title",
+                          "N1": "Looked Up", "N2": "", "N3": ""}
+        assert (
+            "Event titles for 6 requested tickers: 2 resolved by this run (1 from "
+            "the bulk listings, 1 from per-ticker lookups), 1 of this run's "
+            "tickers answered from the accumulator, 3 untitled (2 recorded as "
+            "unresolvable, 1 deferred and not stored). Accumulator: 3 -> 6 "
+            "entries."
+        ) in caplog.text
+
+    def test_the_accumulator_is_merged_in_place_not_copied(
+        self, isolated_cache, monkeypatch,
+    ):
+        # The old code held the parsed file, a full seed copy and a full merge
+        # copy at once — the title phase's peak on a fresh fetch. The object
+        # loaded must be the object saved.
+        isolated_cache.write_text("{}")
+        loaded = {"D1": "Disk Title"}
+        monkeypatch.setattr(historical, "_read_title_file",
+                            lambda _path: (loaded, historical._TITLE_FILE_OK, ""))
+        saved: list = []
+        monkeypatch.setattr(historical, "_save_json_cache",
+                            lambda path, data: saved.append((path, data)))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+
+        historical._load_or_build_event_titles(client, {"D1", "L1"})
+
+        assert len(saved) == 1
+        assert saved[0][0] == isolated_cache
+        assert saved[0][1] is loaded
+        assert loaded == {"D1": "Disk Title", "L1": "Listed Title"}
+
+    def test_an_unchanged_accumulator_is_not_rewritten(self, isolated_cache, monkeypatch):
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title", "D2": ""}))
+        saves: list = []
+        monkeypatch.setattr(historical, "_save_json_cache",
+                            lambda path, data: saves.append(path))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        result = historical._load_or_build_event_titles(client, {"D1", "D2"})
+        assert result == {"D1": "Disk Title", "D2": ""}
+        assert saves == []
+
+    def test_an_empty_request_reads_nothing(self, isolated_cache, monkeypatch):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        assert historical._load_or_build_event_titles(client, set()) == {}
+        assert legacy.exists() and not isolated_cache.exists()
+
+    def test_the_legacy_file_is_migrated_once_keeping_exactly_its_titles(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({
+            "A": "Title A", "B": "", self._combo(1): "", "D": "Title D", "E": 5,
+        }))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("B", "Title B")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, {"A", "B"})
+
+        # A legacy "" is dropped, so B is unknown again and re-resolved.
+        assert result == {"A": "Title A", "B": "Title B"}
+        assert json.loads(isolated_cache.read_text()) == {
+            "A": "Title A", "D": "Title D", "B": "Title B",
+        }
+        assert not legacy.exists()
+        assert "keeping its 2 titled entries and dropping the other 3" in caplog.text
+
+        # Once the v2 file exists the legacy file is never read again, even if
+        # an older build writes one back.
+        legacy.write_text(json.dumps({"Z": "Legacy Z"}))
+        fallback = _patch_single_event_lookups(monkeypatch, single_failures={"Z"})
+        again = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), {"Z"})
+        assert again == {"Z": ""}
+        assert fallback.call_count == 1
+        assert legacy.exists()
+
+    def test_a_migration_whose_run_resolves_nothing_still_commits(
+        self, isolated_cache, monkeypatch,
+    ):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        assert historical._load_or_build_event_titles(client, {"A"}) == {"A": "Title A"}
+        assert client.get_events_without_preload_content.call_count == 0
+        assert json.loads(isolated_cache.read_text()) == {"A": "Title A"}
+        assert not legacy.exists()
+
+    def test_a_legacy_file_with_bad_content_is_left_in_place(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # Content that is not a JSON object will not heal, so the migration
+        # gives up: the v2 file is written as the marker (or every run would
+        # re-read the whole damaged file and store nothing), the legacy file is
+        # kept for inspection, and the WARNING names the way back.
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text('{"A": "Half A Titl')
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"A"})
+        with caplog.at_level(logging.WARNING):
+            assert historical._load_or_build_event_titles(client, {"A"}) == {"A": ""}
+        assert "could not be read as a JSON object" in caplog.text
+        assert "delete " + str(isolated_cache) + " and re-run" in caplog.text
+        # Nothing of it was destroyed, and the v2 file now exists as the marker.
+        assert legacy.read_text() == '{"A": "Half A Titl'
+        assert json.loads(isolated_cache.read_text()) == {"A": ""}
+
+    @staticmethod
+    def _unreadable(monkeypatch, path):
+        """Make reading `path` raise the OSError an offline iCloud file or a
+        permission error raises; every other file reads normally."""
+        real_read_text = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        return lambda: monkeypatch.setattr(Path, "read_text", real_read_text)
+
+    def test_a_legacy_file_that_cannot_be_read_defers_the_migration(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: a READ failure (an OSError) used to be folded into "not a
+        # JSON object", so the v2 marker was written with this run's answers
+        # alone and the legacy titles were abandoned for good. Now nothing is
+        # written, and the next readable run migrates.
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        restore = self._unreadable(monkeypatch, legacy)
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("N", "Title N")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, {"A", "N"})
+        assert result == {"A": "", "N": "Title N"}
+        assert not isolated_cache.exists()
+        assert json.loads(legacy.read_bytes()) == {"A": "Title A", "B": ""}
+        assert "the next run retries it" in caplog.text
+        assert "PermissionError" in caplog.text
+        assert "(NOT written: a file could not be read" in caplog.text
+
+        restore()
+        again = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[[("N", "Title N")]],
+                                          mve_pages=[]), {"A", "N"})
+        assert again == {"A": "Title A", "N": "Title N"}
+        assert json.loads(isolated_cache.read_text()) == {"A": "Title A", "N": "Title N"}
+        assert not legacy.exists()
+
+    def test_a_v2_file_that_cannot_be_read_is_not_overwritten(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # Same rule for the accumulator itself: the old code overwrote it with
+        # this run's answers alone, destroying every title it could not see.
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title"}))
+        before = isolated_cache.read_bytes()
+        self._unreadable(monkeypatch, isolated_cache)
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, {"D1", "L1"})
+        assert result == {"D1": "", "L1": "Listed Title"}
+        assert isolated_cache.read_bytes() == before
+        assert "the next run reads it again" in caplog.text
+
+    def test_a_legacy_file_beside_the_v2_file_is_named_every_call_and_kept(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: a legacy file that outlives the migration (a failed or
+        # interrupted delete, or an older build writing it back) was ignored
+        # in silence forever. It is still never read and never deleted — it
+        # may be that older build's live accumulator — but every call names it.
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title"}))
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"Z": "Legacy Z"}))
+        _patch_single_event_lookups(monkeypatch, single_failures={"Z"})
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                result = historical._load_or_build_event_titles(
+                    _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]),
+                    {"D1", "Z"})
+            assert result == {"D1": "Disk Title", "Z": ""}
+            warned = [r.getMessage() for r in caplog.records
+                      if "sits beside event_titles_v2.json" in r.getMessage()]
+            assert len(warned) == 1 and str(legacy) in warned[0]
+            assert json.loads(legacy.read_text()) == {"Z": "Legacy Z"}
+
+        # And no warning at all once it is gone.
+        legacy.unlink()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            historical._load_or_build_event_titles(
+                _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), {"D1"})
+        assert "sits beside" not in caplog.text
+
+    def test_repeated_no_cache_runs_advance_through_the_deferred_tail(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: under use_cache=False every requested ticker is
+        # re-resolved, so a plainly sorted cap looked up the same head on every
+        # --no-cache run and never reached the tail. Tickers the accumulator
+        # has never answered now take the cap first, then its stored pills
+        # (A00 sorts first but was already looked up and failed), then the
+        # tickers it already titles.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        isolated_cache.write_text(json.dumps({"A00": ""}))
+        wanted = {f"E{i:02d}" for i in range(7)} | {"A00"}
+        looked_up: list[list[str]] = []
+
+        def fake_signed_get(_client, path, **_params):
+            looked_up[-1].append(path.rsplit("/", 1)[-1])
+            return _raw_resp({"event": {"title": "Title " + path.rsplit("/", 1)[-1]}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=fake_signed_get))
+        results = []
+        for _ in range(3):
+            looked_up.append([])
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                results.append(historical._load_or_build_event_titles(
+                    _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]),
+                    wanted, use_cache=False))
+        assert [sorted(batch) for batch in looked_up] == [
+            ["E00", "E01", "E02"], ["E03", "E04", "E05"], ["A00", "E00", "E06"],
+        ]
+        assert json.loads(isolated_cache.read_text()) == {t: f"Title {t}" for t in wanted}
+        # The third run deferred E01..E05, which the accumulator titles, so
+        # they keep their titles — the WARNING must not call them untitled.
+        assert results[2] == {t: f"Title {t}" for t in wanted}
+        assert "is not looked up this run" in caplog.text
+        assert "untitled THIS run" not in caplog.text
+
+    def test_the_suite_never_reaches_the_real_accumulator(self, tmp_path):
+        # tests/conftest.py's autouse guard: a test that reaches the real
+        # function through fetch_all_settled_markets must not read, migrate or
+        # delete the operator's real backtest_cache files.
+        assert tmp_path in historical._EVENT_TITLES_CACHE.parents
+        assert tmp_path in historical._LEGACY_EVENT_TITLES_CACHE.parents
 
 
 # ─── SS-1 Commit C: the streamed assembly and the streamed assembled cache ────
