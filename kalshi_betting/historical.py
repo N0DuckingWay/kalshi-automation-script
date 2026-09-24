@@ -63,7 +63,15 @@ Notes:
     "jsonl-v1" line format written by _DayStreamWriter (which is what the
     fetch workers use, so no worker ever holds a whole UTC day — millions of
     records at 2026-08 volumes — in memory). _day_store_load reads both; see
-    the day-store section for the routing rule.
+    the day-store section for the routing rule. The live frontier (current,
+    partial) day is never persisted; it streams through a sink that keeps only
+    the caller's prefilter-passing records as each batch arrives
+    (_fetch_live_phase), so when a prefilter is given the unfiltered partial
+    day is never resident — its prefilter-passing subset still is, as a list,
+    and on the day after a Monday that can be most of the day. The two
+    sequential fallbacks apply the same prefilter per record but still hold
+    their whole filtered result; the archive tail is the one walk that applies
+    no prefilter (its record cap bounds it instead).
 
     JSON parsing dominates the fetch's CPU time at current Kalshi volumes, so
     orjson is used when installed (optional `perf` extra) and the stdlib json
@@ -1541,8 +1549,12 @@ def _fetch_archive_day(
             SETTLED_FETCH_CHUNK_RECORDS (plus a final partial batch) and the
             internal buffer is cleared each time, so the day is never held in
             memory; the return value is then the record COUNT. When None, the
-            full list is accumulated and returned — the original behavior, kept
-            for the frontier day and the sequential fallbacks.
+            full list is accumulated and returned — the original behavior,
+            retained for direct callers that want the list. No production path
+            passes None: the day workers stream into a slice file, the live
+            frontier window streams through a keep-filtering sink (see
+            _fetch_live_phase), and the sequential fallbacks are separate walks
+            that never call this function.
 
     Returns:
         list[dict] | int: Compact market dicts (created within the slice,
@@ -1727,10 +1739,11 @@ def _fetch_archive_tail(
             )
             return kept
         # Residency backstop, composing with the page cap above: whichever
-        # binds first stops the walk. This is the one fetch path with no
-        # chunked emit sink, so its whole result stays resident — the page cap
-        # alone allows ~2M records (roughly 5 GB), the same OOM shape the
-        # sharded fetch exists to avoid (TS-15).
+        # binds first stops the walk. Like the two sequential fallbacks, this
+        # walk has no chunked emit sink, so its whole result stays resident;
+        # unlike them it is not `keep`-filtered, so this cap counts every
+        # in-window record. The page cap alone allows ~2M records (roughly
+        # 5 GB), the same OOM shape the sharded fetch exists to avoid (TS-15).
         if len(kept) >= ARCHIVE_TAIL_MAX_RECORDS:
             logging.warning(
                 "Historical archive tail: reached the %d-record cap "
@@ -1750,15 +1763,17 @@ def _fetch_archive_sequential(
     start_ts: int,
     cutoff_ts: int,
     hist_kwargs: dict,
+    keep: Callable[[dict], bool] | None = None,
 ) -> list[dict]:
     """
     Original sequential archive walk — the sharding fallback path.
 
     Pages the archive from the top with the server-provided cursor chain,
-    keeping every binary market that settled within [start_ts, cutoff_ts).
-    Relies only on documented pagination behavior (never on cursor synthesis),
-    so it works even if the cursor format drifts — that is what makes it a
-    safe fallback. Slow: one serial request per 1000 records.
+    keeping every binary market that settled within [start_ts, cutoff_ts)
+    and passes `keep`. Relies only on documented pagination behavior (never
+    on cursor synthesis), so it works even if the cursor format drifts — that
+    is what makes it a safe fallback. Slow: one serial request per 1000
+    records.
 
     Completeness is bounded, not exact. The archive is ordered by created_time,
     so a market created arbitrarily early can settle in-window and no page
@@ -1766,16 +1781,34 @@ def _fetch_archive_sequential(
     ARCHIVE_MAX_BARREN_PAGES consecutive pages with no in-window settlement —
     the same rule as _fetch_archive_tail, and for the same reason.
 
+    Residency: this walk has no chunked emit sink, so its whole result is held
+    in memory. `keep` is applied per record as each page arrives, so a record
+    the caller would discard is never retained — the same records in the same
+    order as filtering the unfiltered result afterwards (fetch_all_settled_
+    markets' merge re-applies the same predicate before its first-wins dedup,
+    so dropping them here changes nothing downstream). What stays resident is
+    still the WHOLE keep-passing result, which is not bounded by this.
+
     Args:
         hist_client (Any): Authenticated KalshiClient.
         start_ts (int): Backtest window start, epoch seconds.
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
+        keep (Callable[[dict], bool] | None): Optional per-record predicate
+            (the caller's prefilter); None keeps every in-window binary
+            record, exactly as before it existed. It never affects the walk
+            itself — pages requested, the barren-page stop and the progress
+            line's "markets kept so far" count are all computed before it.
 
     Returns:
-        list[dict]: Compact market dicts settled within [start_ts, cutoff_ts).
+        list[dict]: Compact market dicts settled within [start_ts, cutoff_ts)
+            that pass `keep`, in walk order.
     """
     selected: list[dict] = []
+    # Records that passed the walk's OWN filters (result, settlement window),
+    # before `keep`: this is what the progress line has always reported, so
+    # the line stays identical whether or not a predicate is passed.
+    walk_kept = 0
     cursor = None
     page_no = 0
     barren = 0
@@ -1794,11 +1827,16 @@ def _fetch_archive_sequential(
             # Only include markets that settled within our [start_ts, cutoff_ts) window
             if settle_epoch < start_ts or settle_epoch >= cutoff_ts:
                 continue
-            selected.append(_market_to_dict(m))
+            walk_kept += 1
+            rec = _market_to_dict(m)
+            # The caller's prefilter, applied as the page arrives so a record
+            # it rejects is never retained (the merge would drop it anyway).
+            if keep is None or keep(rec):
+                selected.append(rec)
         page_no += 1
         if page_no % 100 == 0:
             logging.info("Historical archive [sequential]: %d pages scanned, "
-                         "%d markets kept so far", page_no, len(selected))
+                         "%d markets kept so far", page_no, walk_kept)
         cursor = data.get("cursor")
         # A None or empty cursor signals the last page
         if not cursor:
@@ -1917,15 +1955,19 @@ def _fetch_archive_phase(
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
         keep (Callable[[dict], bool] | None): Optional per-record predicate
-            applied while slices are read back, so records the caller will
-            discard anyway never accumulate. Slice FILES stay unfiltered.
+            applied while slices are read back, and per record by the
+            sequential fallback as its pages arrive, so records the caller
+            will discard anyway never accumulate. Slice FILES stay unfiltered.
+            The tail walk does NOT apply it (its ARCHIVE_TAIL_MAX_RECORDS cap
+            counts unfiltered records); the caller's merge filters the tail.
 
     Returns:
         tuple[list[dict], list[dict]]: (day-slice records newest-day first,
             tail records). Day-slice records are NOT yet settlement-filtered
             (the caller applies the [start_ts, cutoff_ts) window); tail
             records already are. On the sequential fallback, everything is
-            returned fully filtered in the first list and the second is empty.
+            returned settlement-filtered (and `keep`-filtered) in the first
+            list and the second is empty.
     """
     if start_ts >= cutoff_ts:
         # The archive holds only markets that settled BEFORE the cutoff, so a
@@ -2036,7 +2078,10 @@ def _fetch_archive_phase(
             "sequential walk. Any day slices already completed remain on disk "
             "and will be reused by the next run.", exc,
         )
-        return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts, hist_kwargs), []
+        # Same prefilter as the slice read-back, applied per record as each
+        # page arrives; the walk still holds its whole keep-passing result.
+        return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts,
+                                         hist_kwargs, keep), []
 
 
 # ─── Live (post-cutoff) fetching ──────────────────────────────────────────────
@@ -2065,8 +2110,14 @@ def _fetch_live_window(
             output — see _fetch_archive_day for the full contract. When given,
             batches of at most SETTLED_FETCH_CHUNK_RECORDS are handed over and
             the buffer is dropped, and the return value is the record COUNT.
-            The frontier window and the sequential fallback pass None and get
-            the accumulated list, which is the original behavior.
+            Both production callers pass one: the past-day worker streams into
+            its slice file, and the frontier window streams through a sink that
+            keeps only records passing the caller's predicate
+            (_fetch_live_phase / _extend_kept), so an unfiltered frontier
+            record is resident only while its batch is in flight. None returns
+            the accumulated list — the original behavior, retained for direct
+            callers; the sequential fallback (_fetch_live_sequential) is a
+            separate walk that never calls this function.
 
     Returns:
         list[dict] | int: Compact market dicts with a binary result and a
@@ -2134,7 +2185,11 @@ def _fetch_live_window(
     return total
 
 
-def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
+def _fetch_live_sequential(
+    live_client,
+    live_min_ts: int,
+    keep: Callable[[dict], bool] | None = None,
+) -> list[dict]:
     """
     Original single-sweep live fetch — the windowing fallback path.
 
@@ -2142,14 +2197,35 @@ def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
     behavior. Used only when _fetch_live_window detects that max_settled_ts is
     no longer honored server-side.
 
+    Residency: this walk has no chunked emit sink, so its whole result — every
+    settlement from live_min_ts to now, i.e. every past day of the window plus
+    the partial current one — is held in memory. `keep` is applied per record
+    as each page arrives, so a record the caller would discard is never
+    retained: the same records in the same order as filtering the unfiltered
+    result afterwards (fetch_all_settled_markets' merge re-applies the same
+    predicate before its first-wins dedup, so dropping them here changes
+    nothing downstream). What stays resident is still the WHOLE keep-passing
+    result, which is not bounded by this.
+
     Args:
         live_client: KalshiClient from build_prod_live_client().
         live_min_ts (int): Server-side window start (min_settled_ts).
+        keep (Callable[[dict], bool] | None): Optional per-record predicate
+            (the caller's prefilter); None keeps every binary record, exactly
+            as before it existed. It never affects the walk itself — pages
+            requested and the progress line's "markets kept so far" count are
+            computed before it.
 
     Returns:
-        list[dict]: Compact market dicts with a binary result and settlement_ts.
+        list[dict]: Compact market dicts with a binary result and settlement_ts
+            that pass `keep`, in walk order.
     """
     kept: list[dict] = []
+    # Records that passed the walk's OWN filters (binary result, settlement_ts
+    # present), before `keep`: this is what the progress line has always
+    # reported, so the line stays identical whether or not a predicate is
+    # passed.
+    walk_kept = 0
     cursor = None
     page_no = 0
     while True:
@@ -2167,11 +2243,16 @@ def _fetch_live_sequential(live_client, live_min_ts: int) -> list[dict]:
             settle = _iso_epoch(m.get("settlement_ts"))
             if settle is None or m.get("result") not in ("yes", "no"):
                 continue
-            kept.append(_market_to_dict(m))
+            walk_kept += 1
+            rec = _market_to_dict(m)
+            # The caller's prefilter, applied as the page arrives so a record
+            # it rejects is never retained (the merge would drop it anyway).
+            if keep is None or keep(rec):
+                kept.append(rec)
         page_no += 1
         if page_no % 100 == 0:
             logging.info("Live settled sweep [sequential]: %d pages scanned, "
-                         "%d markets kept so far", page_no, len(kept))
+                         "%d markets kept so far", page_no, walk_kept)
         cursor = data.get("cursor")
         if not cursor:
             return kept
@@ -2190,8 +2271,12 @@ def _fetch_and_store_live_window(
     rationale (records streamed out in chunks, freed in-thread, serialization
     off the main thread). Only past days go through here — the frontier day is
     fetched directly and deliberately never persisted, since it was captured
-    mid-day; it is therefore the one remaining place a whole (partial) day is
-    held in memory, and it is bounded by how much of today has elapsed.
+    mid-day. It is still streamed in chunks, but into an in-memory list that
+    keeps only the records passing the caller's predicate (see
+    _fetch_live_phase): with a predicate — the backtester always passes its
+    eligibility prefilter — what stays resident is the keep-passing subset of
+    the partial day plus one batch in flight; with none, every record passes
+    and the whole partial day is held, as it always was.
 
     Args:
         live_client: KalshiClient from build_prod_live_client().
@@ -2221,6 +2306,51 @@ def _fetch_and_store_live_window(
     return int(count)
 
 
+def _extend_kept(
+    dest: list[dict],
+    keep: Callable[[dict], bool] | None,
+    batch: list[dict],
+) -> None:
+    """
+    Emit-sink body: append the records of one batch that pass `keep` to `dest`.
+
+    Bound with functools.partial into the `emit` callback of the frontier
+    window's _fetch_live_window call (see _fetch_live_phase), so the caller's
+    predicate — the backtester's eligibility prefilter — runs on each batch as
+    its pages arrive instead of once over the whole accumulated partial day.
+    A rejected record is never appended to `dest`; it is resident only while
+    its batch (at most SETTLED_FETCH_CHUNK_RECORDS plus one API page) is in
+    flight. The frontier used to be accumulated unfiltered and filtered only
+    after the whole pool drained, which alone peaked a 7-day backtest at
+    ~5.5 GiB RSS (2026-09-24, 1.9M frontier records at 07:30 UTC) and grows
+    through the UTC day, for any window length (SS-1).
+
+    Order is preserved exactly — records are appended in batch order and the
+    batches arrive in fetch order from one worker thread — so `dest` ends up
+    equal, element for element, to filtering the full list afterwards: same
+    predicate, same records, same order. Only the peak changes — and only by
+    the REJECTED records: every keep-passing record is still retained in
+    `dest` until the phase returns, which on the day after a Monday can be
+    most of the partial day (see _fetch_live_phase).
+
+    Args:
+        dest (list[dict]): List to extend in place. Touched only from the one
+            worker thread running the window; the caller reads it only after
+            that window's future has completed (Future.result() is the
+            synchronization point).
+        keep (Callable[[dict], bool] | None): Per-record predicate, or None to
+            keep every record. Runs on the worker thread, so it must be
+            thread-safe; the backtester's _can_ever_enter is pure.
+        batch (list[dict]): One chunk handed over under _fetch_live_window's
+            emit contract. Not retained — the window drops it once this
+            returns.
+    """
+    if keep is None:
+        dest.extend(batch)
+    else:
+        dest.extend(m for m in batch if keep(m))
+
+
 def _fetch_live_phase(
     live_client,
     live_min_ts: int,
@@ -2240,11 +2370,31 @@ def _fetch_live_phase(
 
     As on the archive side, past-day records are streamed into the slice file
     in chunks inside the worker and read back off disk at assembly rather than
-    accumulated in memory. The frontier window is the one exception, since it
-    is never persisted — a partial day held in RAM.
+    accumulated in memory. The frontier window, which is never persisted, is
+    streamed in chunks too, through a sink (_extend_kept) that applies `keep`
+    to each batch as its pages arrive: only the keep-passing subset of the
+    partial day is ever retained, plus one batch in flight. It used to be
+    accumulated unfiltered and filtered only once the whole pool had drained —
+    the same records in the same order, at a peak that grows through the UTC
+    day (up to a full day's settlements, 9.2M records on 2026-09-22) whatever
+    the window length (SS-1). With keep=None every record passes and the whole
+    partial day is still held, exactly as before.
+
+    What that does NOT bound: the keep-passing subset is itself still held
+    whole, as a list, and how large it is depends on the weekday, not on the
+    window's length. The backtester's predicate (_can_ever_enter) admits every
+    market that was open over a Monday checkpoint on/after start_date and
+    closes at least a day later, so a frontier captured the day AFTER a Monday
+    can be mostly eligible — 7,190,452 of the 9,176,306 records settled on
+    Tuesday 2026-09-22 passed _can_ever_enter(m, 2026-09-17). Bounding that
+    requires not holding the frontier as a list at all, which this phase
+    cannot do while it returns one materialized list (the past days are
+    materialized by _assemble_day_slices too).
 
     Falls back to _fetch_live_sequential if the server stops honoring
-    max_settled_ts (detected per window by _fetch_live_window).
+    max_settled_ts (detected per window by _fetch_live_window), passing the
+    same `keep`; the partial frontier collected so far is released first,
+    since the sequential sweep refetches today anyway.
 
     Args:
         live_client: KalshiClient from build_prod_live_client().
@@ -2254,8 +2404,10 @@ def _fetch_live_phase(
             recent start_date (observed 20k+ pages discarded client-side).
         now_ts (int): Current epoch seconds; determines the frontier day.
         keep (Callable[[dict], bool] | None): Optional per-record predicate
-            applied while past-day slices are read back and to the frontier
-            window's records. Slice FILES stay unfiltered.
+            applied while past-day slices are read back (main thread), to
+            each frontier batch as its pages arrive (on the frontier's worker
+            thread, so it must be thread-safe), and per record by the
+            sequential fallback (main thread). Slice FILES stay unfiltered.
 
     Returns:
         list[dict]: Compact market dicts, frontier first then past days
@@ -2272,6 +2424,10 @@ def _fetch_live_phase(
         "include_mve": INCLUDE_MVE_MARKETS,
         "complete": True,
     }
+    # Filled ONLY by the frontier worker's sink below, and read by this thread
+    # only after frontier_future.result() has returned. Bound before the `try`
+    # so the fallback branch can always release it (see there).
+    frontier: list[dict] = []
     try:
         # As in _fetch_archive_phase: track day identities only, and re-read
         # the slices at assembly so peak memory doesn't scale with the number
@@ -2290,12 +2446,16 @@ def _fetch_live_phase(
 
         progress = _FetchProgress("Live settled sweep [windowed]")
         to_fetch.sort(reverse=True)
-        frontier: list[dict] = []
         with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
-            # The frontier day is returned in full rather than persisted — it
-            # was captured mid-day and must never be reused as a complete day.
+            # The frontier day is kept in memory rather than persisted — it was
+            # captured mid-day and must never be reused as a complete day. It
+            # streams through the emit contract like a past day, but into a
+            # sink that keeps only `keep`-passing records as each batch lands,
+            # so with a predicate the unfiltered partial day is never resident
+            # (SS-1).
             frontier_future = pool.submit(
-                _fetch_live_window, live_client, frontier_lo, None, progress
+                _fetch_live_window, live_client, frontier_lo, None, progress,
+                partial(_extend_kept, frontier, keep),
             )
             futures = {
                 pool.submit(_fetch_and_store_live_window, live_client, lo,
@@ -2312,15 +2472,25 @@ def _fetch_live_phase(
                     _log_slice_progress("Live settled-day windows",
                                         len(on_disk) - reused, len(to_fetch),
                                         lo, count, started)
-                frontier = frontier_future.result()
+                # LOAD-BEARING, not a leftover: this is the ONLY place a
+                # frontier-window failure surfaces — an ApiException that
+                # outlived its retries, a non-transient error, or `keep`
+                # raising on the worker thread. The pool's __exit__ waits for
+                # the worker whether or not this runs, so deleting it would not
+                # hang; it would silently return the batches already appended
+                # as if they were the whole frontier (a short corpus, pinned by
+                # TestFrontierStreamsThroughKeep's failure tests). The records
+                # themselves are already in `frontier`, filtered, so the
+                # returned count is deliberately discarded (never rebind it).
+                frontier_future.result()
             except BaseException:
                 # Abandon queued windows immediately rather than draining them
                 # on the way out to the sequential fallback.
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
 
-        if keep is not None:
-            frontier = [m for m in frontier if keep(m)]
+        # No post-hoc `keep` pass: the frontier sink already applied it in
+        # fetch order, so `frontier` is exactly the list that pass produced.
         return frontier + _assemble_day_slices("live_days", on_disk, expect_meta, keep)
     except _ShardedFetchUnsupported as exc:
         logging.warning(
@@ -2328,7 +2498,20 @@ def _fetch_live_phase(
             "sequential sweep. Any settled-day windows already completed remain "
             "on disk and will be reused by the next run.", exc,
         )
-        return _fetch_live_sequential(live_client, live_min_ts)
+        # The sequential sweep refetches today as well, so the frontier the
+        # windowed path collected is dead weight here. Nothing writes it any
+        # more — the pool's __exit__ joined the frontier worker (or its
+        # cancel_futures dropped it while still queued) — and a running worker
+        # finishes its whole window before that join returns, so without this
+        # the keep-passing frontier would sit beside the fallback's own copy of
+        # the same day for the whole serial walk. Cleared in place rather than
+        # rebound, so the records are released even while another reference
+        # to the list survives (the sink's partial stays reachable from
+        # frontier_future when the frontier window itself failed).
+        frontier.clear()
+        # Same prefilter as the windowed path, applied per record as each page
+        # arrives; the walk still holds its whole keep-passing result.
+        return _fetch_live_sequential(live_client, live_min_ts, keep)
 
 
 def fetch_all_settled_markets(
@@ -2503,10 +2686,13 @@ def fetch_all_settled_markets(
                 continue
             if max_settle is not None and settle >= max_settle:
                 continue
-            # Single point where the caller's prefilter is enforced, so it
-            # covers day slices, the tail, live windows, and BOTH sequential
-            # fallbacks (which don't take the `keep` fast path). Re-checking
-            # records the phases already filtered is idempotent and cheap.
+            # Single point where the caller's prefilter is GUARANTEED, so it
+            # covers every source — day slices, the live frontier, BOTH
+            # sequential fallbacks (all of which also take the `keep` fast
+            # path) and the tail (which does not). Re-checking records the
+            # phases already filtered is idempotent and cheap, and because it
+            # runs before the first-wins dedup below, a phase dropping a
+            # record early can never change which record wins a ticker.
             if prefilter is not None and not prefilter(m):
                 continue
             ticker = m.get("ticker")

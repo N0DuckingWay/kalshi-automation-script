@@ -938,9 +938,11 @@ ARCHIVE_MAX_BARREN_PAGES = 50
 ARCHIVE_TAIL_MAX_PAGES = 2000
 
 # Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
-# the page cap above. The tail is the one fetch path with no chunked `emit`
-# sink — every other phase streams its records to a day slice and drops them —
-# so its whole result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
+# the page cap above. The tail and the two sequential fallbacks are the fetch
+# walks with no chunked `emit` sink (the day workers stream into slice files;
+# the live frontier streams through a prefilter-applying in-memory sink), and
+# the tail is the one of them that applies no prefilter either, so its whole
+# unfiltered result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
 # that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,
 # which is the same OOM shape the sharded fetch was rewritten to avoid
 # (BS-15). The two caps COMPOSE: whichever binds first stops the walk, so the

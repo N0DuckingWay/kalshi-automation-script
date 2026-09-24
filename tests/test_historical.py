@@ -2,7 +2,7 @@
 import gzip
 import json
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2127,8 +2127,11 @@ class TestDayStreamWriter:
         assert [m["ticker"] for m in loaded] == [f"T{i}" for i in range(10)]
 
     def test_no_emit_returns_the_list_unchanged(self, tmp_path, monkeypatch):
-        # The frontier day and the sequential fallbacks rely on the
-        # list-returning behavior — chunking must be strictly opt-in.
+        # Direct callers rely on the list-returning behavior — chunking must be
+        # strictly opt-in. (No production path passes None since SS-1: the
+        # frontier day streams through a keep-filtering sink, see
+        # TestFrontierStreamsThroughKeep; the sequential fallbacks never call
+        # this function.)
         pages = [
             {"markets": [_mk_raw_market("F1", "2026-06-12T01:00:00Z",
                                         "2026-06-12T02:00:00Z")],
@@ -2144,6 +2147,500 @@ class TestDayStreamWriter:
         )
         assert isinstance(out, list)
         assert [m["ticker"] for m in out] == ["F1"]
+
+
+class TestExtendKept:
+    """The frontier's emit-sink body (SS-1): append only keep-passing records,
+    in batch order, and never the batch list itself."""
+
+    @staticmethod
+    def _keep(m):
+        return m["ticker"] != "B"
+
+    def test_rejected_records_are_never_appended_and_order_holds(self):
+        dest: list[dict] = []
+        historical._extend_kept(dest, self._keep, [{"ticker": "A"}, {"ticker": "B"}])
+        historical._extend_kept(dest, self._keep, [{"ticker": "C"}, {"ticker": "B"},
+                                                   {"ticker": "D"}])
+        assert [m["ticker"] for m in dest] == ["A", "C", "D"]
+
+    def test_keep_none_appends_every_record_in_order(self):
+        dest: list[dict] = [{"ticker": "X"}]
+        batch = [{"ticker": "B"}, {"ticker": "A"}]
+        historical._extend_kept(dest, None, batch)
+        assert [m["ticker"] for m in dest] == ["X", "B", "A"]
+        # The records are appended, not the batch list: the window drops its
+        # buffer after each emit, and dest must not keep that list alive.
+        assert all(m is not batch for m in dest)
+
+    def test_the_same_record_objects_are_kept(self):
+        # A filter, not a copy: downstream (title patching, first-wins dedup)
+        # sees exactly the dicts the window produced.
+        rec = {"ticker": "A"}
+        dest: list[dict] = []
+        historical._extend_kept(dest, self._keep, [rec])
+        assert dest[0] is rec
+
+
+class TestFrontierStreamsThroughKeep:
+    """SS-1: the frontier (current UTC, never-persisted) day used to be held
+    UNFILTERED in memory and filtered only after the whole pool drained — at
+    real volumes a partial day of millions of records, for any window length.
+    It now streams through _fetch_live_window's emit contract into a sink that
+    keeps only `keep`-passing records as each batch lands. Membership and
+    order must be exactly what the old post-hoc filter produced; only the peak
+    changes."""
+
+    NOW = "2026-09-24T12:00:00+00:00"
+    TODAY = "2026-09-24T00:00:00+00:00"
+
+    @staticmethod
+    def _ts(iso):
+        return int(datetime.fromisoformat(iso).timestamp())
+
+    @staticmethod
+    def _keep(m):
+        # Discriminating on purpose: rejects roughly a third of every day's
+        # records, on every page boundary pattern the fixtures produce.
+        return not m["ticker"].endswith(("0", "3", "6", "9"))
+
+    @staticmethod
+    def _frontier_markets(n=11):
+        # Settled across the frontier day before NOW, newest-first on the wire
+        # (the fake sorts by settlement DESC), never on a midnight boundary.
+        return [
+            _mk_raw_market(f"F{i:02d}", "2026-09-23T00:00:00Z",
+                           f"2026-09-24T{i + 1:02d}:00:00Z")
+            for i in range(n)
+        ]
+
+    def _oracle(self, markets, keep):
+        """The OLD frontier expression, literally: fetch the whole window as a
+        list (emit=None), then filter it afterwards."""
+        frontier = historical._fetch_live_window(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY), None,
+            historical._FetchProgress("oracle"),
+        )
+        assert isinstance(frontier, list)
+        if keep is not None:
+            frontier = [m for m in frontier if keep(m)]
+        return frontier
+
+    def test_frontier_equals_the_old_post_hoc_filter(self, tmp_path, monkeypatch):
+        # Small chunks so the frontier is emitted as SEVERAL batches — a sink
+        # that reordered or dropped a batch boundary would show up here.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        markets = self._frontier_markets()
+        expected = self._oracle(markets, self._keep)
+
+        # live_min_ts inside today => no past days, so the result IS the frontier.
+        out = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), self._keep,
+        )
+        assert out == expected
+        assert [m["ticker"] for m in out] == [m["ticker"] for m in expected]
+        # Sanity: the predicate removed something and kept something.
+        assert 0 < len(out) < len(markets)
+
+    def test_keep_none_keeps_every_frontier_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        markets = self._frontier_markets()
+        out = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), None,
+        )
+        assert out == self._oracle(markets, None)
+        assert len(out) == len(markets)
+
+    def test_whole_phase_equals_filtering_the_unfiltered_phase(self, tmp_path,
+                                                               monkeypatch):
+        # With past days on disk as well: frontier first, then past days
+        # newest-first, each filtered by the same predicate in the same order —
+        # exactly [m for m in unfiltered_phase if keep(m)].
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        past = [
+            _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
+                           f"2026-09-2{d}T{i + 1:02d}:00:00Z")
+            for d in (2, 3) for i in range(7)
+        ]
+        markets = self._frontier_markets() + past
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "all")
+        unfiltered = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW), None,
+        )
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "kept")
+        filtered = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW),
+            self._keep,
+        )
+
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        tickers = [m["ticker"] for m in unfiltered]
+        # Frontier first, then 09-23, then 09-22 — the contract the merge's
+        # first-wins dedup depends on.
+        assert tickers[:11] == [f"F{i:02d}" for i in range(10, -1, -1)]
+        assert tickers[11:18] == [f"P3{i}" for i in range(6, -1, -1)]
+        assert tickers[18:] == [f"P2{i}" for i in range(6, -1, -1)]
+        # The predicate bit on the frontier AND on the past days.
+        dropped = set(tickers) - {m["ticker"] for m in filtered}
+        assert any(t.startswith("F") for t in dropped)
+        assert any(t.startswith("P") for t in dropped)
+
+    def test_rejected_frontier_record_is_never_retained(self, tmp_path, monkeypatch):
+        # The point of SS-1. Every compact record is made weakly referenceable
+        # (a plain dict is not), and each time the window requests its next
+        # page we count how many REJECTED records are still alive. With one
+        # flush per page, a record the predicate rejected must already be
+        # garbage by the next request. The old code kept every rejected record
+        # alive in the unfiltered frontier list until the pool drained, so this
+        # count would climb page by page.
+        import weakref
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        class _Tracked(dict):
+            """A compact record that supports weak references."""
+
+        rejected_refs: list = []
+        real_to_dict = historical._market_to_dict
+
+        def tracking_to_dict(m, *args, **kwargs):
+            rec = _Tracked(real_to_dict(m, *args, **kwargs))
+            if not self._keep(rec):
+                rejected_refs.append(weakref.ref(rec))
+            return rec
+
+        monkeypatch.setattr(historical, "_market_to_dict", tracking_to_dict)
+
+        consulted: list[str] = []
+
+        def keep(m):
+            consulted.append(m["ticker"])
+            return self._keep(m)
+
+        alive_at_request: list[int] = []
+
+        class _ObservedLive(_FakeLive):
+            def get_markets_without_preload_content(self, *args, **kwargs):
+                alive_at_request.append(
+                    sum(ref() is not None for ref in rejected_refs))
+                return super().get_markets_without_preload_content(*args, **kwargs)
+
+        markets = self._frontier_markets()
+        out = historical._fetch_live_phase(
+            _ObservedLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), keep,
+        )
+
+        assert rejected_refs, "the fixture must produce rejected frontier records"
+        assert len(alive_at_request) >= 3, "the frontier must span several pages"
+        # Never a rejected record alive when the next page is requested...
+        assert alive_at_request == [0] * len(alive_at_request)
+        # ...and none survives the phase either.
+        assert all(ref() is None for ref in rejected_refs)
+        # Each frontier record was consulted exactly once, in fetch order, and
+        # nothing the predicate rejected reached the result.
+        assert consulted == [f"F{i:02d}" for i in range(10, -1, -1)]
+        assert [m["ticker"] for m in out] == [t for t in consulted
+                                              if self._keep({"ticker": t})]
+
+    # ── Failure propagation (frontier_future.result() is load-bearing) ────────
+
+    class _FailingFrontierLive(_FakeLive):
+        """A live fake whose FRONTIER window (no max_settled_ts) raises on its
+        Nth request; past-day windows (which send max_settled_ts) are served
+        normally."""
+
+        def __init__(self, markets, fail_on, exc, **kwargs):
+            super().__init__(markets, **kwargs)
+            self.fail_on = fail_on
+            self.exc = exc
+            self.frontier_calls = 0
+
+        def get_markets_without_preload_content(self, min_settled_ts=None,
+                                                max_settled_ts=None, cursor=None,
+                                                **kwargs):
+            if max_settled_ts is None:
+                self.frontier_calls += 1
+                if self.frontier_calls == self.fail_on:
+                    raise self.exc
+            return super().get_markets_without_preload_content(
+                min_settled_ts=min_settled_ts, max_settled_ts=max_settled_ts,
+                cursor=cursor, **kwargs)
+
+    def _past_days(self):
+        return [
+            _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
+                           f"2026-09-2{d}T{i + 1:02d}:00:00Z")
+            for d in (2, 3) for i in range(4)
+        ]
+
+    def test_a_frontier_fetch_failure_after_a_batch_is_raised(self, tmp_path,
+                                                              monkeypatch):
+        # The frontier's records reach `frontier` through the sink, so
+        # frontier_future.result() no longer DELIVERS them — it is only there to
+        # re-raise the window's failure. The pool's __exit__ waits for the
+        # worker either way, so without it a frontier that dies part-way would
+        # come back as the batches already appended plus every past day: a
+        # silently SHORT corpus. A non-transient error (RuntimeError: no status,
+        # not a transport class) is not retried, so it surfaces on its page.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+        consulted: list[str] = []
+
+        def keep(m):
+            consulted.append(m["ticker"])
+            return self._keep(m)
+
+        live = self._FailingFrontierLive(
+            self._frontier_markets() + self._past_days(), fail_on=4,
+            exc=RuntimeError("frontier page 4 failed"), page_size=2,
+        )
+        with pytest.raises(RuntimeError, match="frontier page 4 failed"):
+            historical._fetch_live_phase(
+                live, self._ts("2026-09-22T00:00:00+00:00"), self._ts(self.NOW),
+                keep,
+            )
+        # Batches really had been appended before the failure (pages 1-3 of
+        # the frontier, one flush each) — the state a swallowed failure would
+        # have returned as if it were the whole frontier.
+        frontier_seen = [t for t in consulted if t.startswith("F")]
+        assert frontier_seen == [f"F{i:02d}" for i in range(10, 4, -1)]
+        assert any(self._keep({"ticker": t}) for t in frontier_seen)
+
+    def test_keep_raising_on_the_frontier_worker_is_raised(self, tmp_path,
+                                                           monkeypatch):
+        # `keep` now runs on the frontier's WORKER thread, so its failure lands
+        # in frontier_future, not in this thread — the same result() call is
+        # the only thing that brings it back. Before SS-1 it raised here too,
+        # from the post-hoc filter.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        def keep(m):
+            if m["ticker"] == "F05":
+                raise ValueError("keep failed on F05")
+            return self._keep(m)
+
+        with pytest.raises(ValueError, match="keep failed on F05"):
+            historical._fetch_live_phase(
+                _FakeLive(self._frontier_markets() + self._past_days(),
+                          page_size=2),
+                self._ts("2026-09-22T00:00:00+00:00"), self._ts(self.NOW), keep,
+            )
+
+    # ── Windowed-path fallback ────────────────────────────────────────────────
+
+    def test_fallback_releases_the_partial_frontier_and_applies_keep(
+            self, tmp_path, monkeypatch):
+        # When the server stops honoring max_settled_ts, every past-day window
+        # raises _ShardedFetchUnsupported and the phase falls back to the
+        # sequential sweep — which refetches today too. By then the frontier
+        # worker has run its whole window (the pool's __exit__ joins it), so
+        # the keep-passing frontier used to sit beside the fallback's own copy
+        # of the same day for the entire serial walk. It is cleared first now,
+        # and the fallback gets the same `keep`.
+        import weakref
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        class _Tracked(dict):
+            """A compact record that supports weak references."""
+
+        kept_refs: list = []
+        real_to_dict = historical._market_to_dict
+
+        def tracking_to_dict(m, *args, **kwargs):
+            rec = _Tracked(real_to_dict(m, *args, **kwargs))
+            if self._keep(rec):
+                kept_refs.append(weakref.ref(rec))
+            return rec
+
+        monkeypatch.setattr(historical, "_market_to_dict", tracking_to_dict)
+
+        alive_at_fallback: list[int] = []
+        real_sequential = historical._fetch_live_sequential
+
+        def spy_sequential(live_client, live_min_ts, keep=None):
+            # Every tracked record made so far came from the frontier window
+            # (each past-day window raises on its first record, before
+            # building one), so this counts the frontier still resident.
+            alive_at_fallback.append(sum(r() is not None for r in kept_refs))
+            return real_sequential(live_client, live_min_ts, keep)
+
+        monkeypatch.setattr(historical, "_fetch_live_sequential", spy_sequential)
+
+        markets = self._frontier_markets() + self._past_days()
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        out = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2, ignore_max=True), live_min_ts,
+            self._ts(self.NOW), self._keep,
+        )
+
+        assert kept_refs, "the frontier must have kept records before the fallback"
+        assert alive_at_fallback == [0]
+        # The fallback result is exactly the sequential sweep, filtered.
+        unfiltered = real_sequential(_FakeLive(markets, page_size=2), live_min_ts)
+        assert out == [m for m in unfiltered if self._keep(m)]
+        assert 0 < len(out) < len(unfiltered)
+
+
+class TestSequentialFallbacksApplyKeep:
+    """The two sequential fallbacks have no emit sink and hold their whole
+    result in memory. They apply the caller's prefilter per record as each
+    page arrives, so a record the merge would discard is never retained —
+    and that must be exact: the same records in the same order as filtering
+    the unfiltered result afterwards, with byte-identical progress lines (the
+    "markets kept so far" count is taken before `keep`)."""
+
+    START = "2026-09-17T00:00:00+00:00"
+    CUTOFF = "2026-09-20T00:00:00+00:00"
+
+    @staticmethod
+    def _ts(iso):
+        return int(datetime.fromisoformat(iso).timestamp())
+
+    @staticmethod
+    def _keep(m):
+        return not m["ticker"].endswith(("0", "3", "6", "9"))
+
+    @staticmethod
+    def _stamp(base_iso, minutes):
+        base = datetime.fromisoformat(base_iso)
+        return (base + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _markets(self, prefix, base_iso, n=105, step=1):
+        # page_size=1 below, so n pages: past the 100-page progress cadence.
+        # One voided record so the walk's own result filter bites as well.
+        # `step` spaces the records in minutes (a multi-day spread is what lets
+        # an ignored max_settled_ts trip the windowed path's fallback).
+        out = [
+            _mk_raw_market(f"{prefix}{i:03d}", self._stamp(base_iso, i * step),
+                           self._stamp(base_iso, i * step + 30))
+            for i in range(n)
+        ]
+        out[7]["result"] = "void"
+        return out
+
+    @staticmethod
+    def _progress_lines(caplog, label):
+        return [r.getMessage() for r in caplog.records if label in r.getMessage()]
+
+    def test_live_sequential_applies_keep_exactly(self, caplog):
+        markets = self._markets("L", "2026-09-22T00:00:00+00:00")
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        label = "Live settled sweep [sequential]"
+
+        with caplog.at_level(logging.INFO):
+            unfiltered = historical._fetch_live_sequential(
+                _FakeLive(markets, page_size=1), live_min_ts)
+        lines_none = self._progress_lines(caplog, label)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            filtered = historical._fetch_live_sequential(
+                _FakeLive(markets, page_size=1), live_min_ts, self._keep)
+        lines_keep = self._progress_lines(caplog, label)
+
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        # The returned list IS what the walk retained: nothing rejected in it.
+        assert all(self._keep(m) for m in filtered)
+        assert 0 < len(filtered) < len(unfiltered)
+        assert lines_keep == lines_none == [
+            f"{label}: 100 pages scanned, 99 markets kept so far"
+        ]
+
+    def test_archive_sequential_applies_keep_exactly(self, monkeypatch, caplog):
+        markets = self._markets("A", "2026-09-17T06:00:00+00:00")
+        label = "Historical archive [sequential]"
+
+        def run(keep):
+            archive = _FakeArchive(markets, page_size=1)
+            monkeypatch.setattr(
+                historical, "_signed_raw_get",
+                lambda client, path, **params: _raw_resp(archive.page(**params)),
+            )
+            return historical._fetch_archive_sequential(
+                MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
+                {"limit": 1000}, keep)
+
+        with caplog.at_level(logging.INFO):
+            unfiltered = run(None)
+        lines_none = self._progress_lines(caplog, label)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            filtered = run(self._keep)
+        lines_keep = self._progress_lines(caplog, label)
+
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        assert all(self._keep(m) for m in filtered)
+        assert 0 < len(filtered) < len(unfiltered)
+        assert lines_keep == lines_none == [
+            f"{label}: 100 pages scanned, 99 markets kept so far"
+        ]
+
+    def test_archive_phase_fallback_passes_keep(self, monkeypatch):
+        # Opaque cursors defeat cursor synthesis, so the phase takes the
+        # sequential fallback; its first list must already be keep-filtered.
+        markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+
+        def run(keep):
+            archive = _FakeArchive(markets, page_size=2, opaque_cursors=True)
+            monkeypatch.setattr(
+                historical, "_signed_raw_get",
+                lambda client, path, **params: _raw_resp(archive.page(**params)),
+            )
+            return historical._fetch_archive_phase(
+                MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
+                {"limit": 1000}, keep)
+
+        unfiltered, tail_none = run(None)
+        filtered, tail_keep = run(self._keep)
+        assert tail_none == tail_keep == []
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        assert 0 < len(filtered) < len(unfiltered)
+
+    @pytest.mark.parametrize("opaque, ignore_max", [
+        (True, False), (False, True), (True, True),
+    ])
+    def test_prefilter_through_the_fallbacks_equals_postfilter(
+            self, tmp_path, monkeypatch, caplog, opaque, ignore_max):
+        # End to end: whichever fallback fires, fetch_all_settled_markets with
+        # a prefilter returns exactly the unfiltered result filtered afterwards.
+        archive_markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+        # 3-hour spacing: 09-20 06:30 through 09-21 15:30, so with max_settled_ts
+        # ignored the 09-20 window's first record lands a day past its ceiling.
+        live_markets = self._markets("L", "2026-09-20T06:00:00+00:00", n=12,
+                                     step=180)
+
+        def fetch(sub, **kwargs):
+            _install_sharded_fakes(
+                monkeypatch, tmp_path / sub,
+                _FakeArchive(archive_markets, page_size=2, opaque_cursors=opaque),
+                "2026-09-20T00:00:00Z",
+            )
+            return historical.fetch_all_settled_markets(
+                MagicMock(),
+                _FakeLive(live_markets, page_size=2, ignore_max=ignore_max),
+                start_date=date(2026, 9, 17), use_cache=False, **kwargs,
+            )
+
+        out_full = fetch("full")
+        with caplog.at_level(logging.WARNING):
+            out_pref = fetch("pref", prefilter=self._keep,
+                             prefilter_tag="testpred")
+        assert out_pref == [m for m in out_full if self._keep(m)]
+        assert 0 < len(out_pref) < len(out_full)
+        assert {m["ticker"][0] for m in out_pref} == {"A", "L"}
+        # The fixture really did take the fallback(s) it is parametrized for.
+        assert ("Archive fetch: sharded path unavailable" in caplog.text) is opaque
+        assert ("Live fetch: windowed path unavailable" in caplog.text) is ignore_max
 
 
 class TestJsonCacheDurability:
