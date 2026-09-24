@@ -5035,8 +5035,9 @@ class TestStreamedAssembledCache:
         # SS-1 review: a legacy .json of the same identity used to outlive the
         # rebuild that superseded it and come back whenever the .jsonl.gz was
         # damaged (after a WARNING claiming a cache miss) or missing (silently)
-        # — including the way iCloud has already reverted a committed rename in
-        # this repo. The stale corpus must never be served.
+        # — including the way iCloud reverted a committed rename while this repo
+        # lived in iCloud-synced ~/Documents (until 2026-09-24). The stale
+        # corpus must never be served.
         stale = [{"ticker": "STALE1"}, {"ticker": "STALE2"}]
         (tmp_path / "cache").mkdir(parents=True)
         legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"

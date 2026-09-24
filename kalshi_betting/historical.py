@@ -636,8 +636,8 @@ def _warn_if_legacy_lingers() -> None:
     checkout from before DR-51, sharing this backtest_cache/) wrote back, and
     keeps growing by millions of entries per bulk window. It is NOT deleted
     here, because in the last case it is that build's live accumulator; it is
-    named, with its size, on every call instead, so it cannot sit unnoticed in
-    iCloud-synced storage the way the retire-once design otherwise would let it.
+    named, with its size, on every call instead, so it cannot sit unnoticed on
+    disk the way the retire-once design otherwise would let it.
     """
     try:
         size = _LEGACY_EVENT_TITLES_CACHE.stat().st_size
@@ -675,7 +675,8 @@ def _load_event_title_accumulator() -> _TitleAccumulator:
 
     The v2 file's EXISTENCE is the migration marker. While it exists the
     legacy file is never read, so the migration runs once, and a legacy file
-    that reappears later (an older build writing it again, an iCloud revert)
+    that reappears later (an older build writing it again, a file-sync tool
+    restoring it)
     is ignored rather than re-imported with its pills — and named on every
     call by _warn_if_legacy_lingers, never deleted.
 
@@ -766,7 +767,7 @@ def _retire_legacy_event_titles() -> None:
     the v2 file holding every one of its titled entries was written, so the
     only thing destroyed is the legacy file's "" entries — exactly what the
     DR-51 migration drops. Left on disk it would be dead weight (374 MB on
-    2026-09-24, in iCloud-synced ~/Documents) that is never read again while
+    2026-09-24) that is never read again while
     the v2 file exists. Same retire-after-commit idiom as _retire_legacy_cache.
     A failure to delete is logged and never raised: the backtest's own result
     does not depend on it, and _warn_if_legacy_lingers names the file on every
@@ -4644,8 +4645,9 @@ def _retire_legacy_cache(legacy_path: Path, superseded_by: Path) -> None:
     settled_markets_<stem>.json in place, so an out-of-date assembly could
     never come back. The rebuild now lands in settled_markets_<stem>.jsonl.gz
     instead, and a legacy file left beside it would be served again the
-    moment that file went missing (this repo lives in iCloud-synced
-    ~/Documents, which has already reverted a committed rename) — silently,
+    moment that file went missing (until 2026-09-24 this repo lived in
+    iCloud-synced ~/Documents, where iCloud reverted a committed rename; a
+    failed delete or a hand restore can do the same) — silently,
     and typically after the very rebuild meant to replace it (the BS-02 and
     subtitle-drift remedies both end in one). Deleting it once the new file
     is committed restores the old invariant: a rebuild of an identity
