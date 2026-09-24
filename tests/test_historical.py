@@ -2494,6 +2494,233 @@ class TestFetchCandlesticks:
         assert not (tmp_path / "candles" / "T1.json").exists()
 
 
+_HOUR = 3600
+_CAP = historical.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+# The longest span one request may cover: one period short of the cap.
+_PAGE = (_CAP - 1) * historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+
+
+class _CandleEndpoint:
+    """Fake /historical/markets/{ticker}/candlesticks, cap included.
+
+    Holds one candle per hour over [first_ts, last_ts] and, like the real
+    endpoint, refuses (HTTP 400) any request that could hold more than
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST candles — counted the strict way, with
+    both ends inclusive, so a request that passes here passes whichever way the
+    real endpoint counts. `start_inclusive` / `end_inclusive` pick which of the
+    four undocumented window conventions it serves.
+    """
+
+    def __init__(self, first_ts, last_ts, *, start_inclusive=True, end_inclusive=True,
+                 fail_on_call=None, fail_status=404):
+        self.series = list(range(first_ts, last_ts + 1, _HOUR))
+        self.start_inclusive = start_inclusive
+        self.end_inclusive = end_inclusive
+        self.fail_on_call = fail_on_call or {}
+        self.fail_status = fail_status
+        self.calls: list[tuple[int, int]] = []
+
+    def served(self, start, end) -> list[int]:
+        """The candle timestamps one request for [start, end] returns, cap aside."""
+        lo = (lambda t: t >= start) if self.start_inclusive else (lambda t: t > start)
+        hi = (lambda t: t <= end) if self.end_inclusive else (lambda t: t < end)
+        return [t for t in self.series if lo(t) and hi(t)]
+
+    def __call__(self, _client, _path, **params):
+        start, end = params["start_ts"], params["end_ts"]
+        self.calls.append((start, end))
+        call_no = len(self.calls)
+        if self.fail_on_call.get(call_no, 0) > 0:
+            self.fail_on_call[call_no] -= 1
+            self.calls.pop()  # a refused attempt is retried under the same number
+            raise _FakeApiException(self.fail_status, "Injected")
+        period = params["period_interval"] * 60
+        if (end - start) // period + 1 > _CAP:
+            raise _FakeApiException(400, "Bad Request")
+        return _raw_resp({"candlesticks": [
+            {"end_period_ts": t, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}}
+            for t in self.served(start, end)
+        ]})
+
+
+class TestCandleRequestWindows:
+    """historical._candle_request_windows: one request unless the window is
+    longer than the endpoint serves, then overlapping requests within the cap."""
+
+    def test_a_window_that_fits_is_one_unchanged_request(self):
+        assert historical._candle_request_windows(1_000, 1_000 + _PAGE) == [
+            (1_000, 1_000 + _PAGE)]
+        assert historical._candle_request_windows(0, 2) == [(0, 2)]
+
+    def test_a_degenerate_window_is_passed_through(self):
+        assert historical._candle_request_windows(500, 100) == [(500, 100)]
+
+    @pytest.mark.parametrize("span", [_PAGE + 1, 2 * _PAGE, 400 * 86_400, 15_527 * _HOUR])
+    def test_a_longer_window_is_covered_by_overlapping_requests_within_the_cap(self, span):
+        open_ts = 1_700_000_000
+        windows = historical._candle_request_windows(open_ts, open_ts + span)
+        assert len(windows) >= 2
+        assert windows[0][0] == open_ts
+        assert windows[-1][1] == open_ts + span
+        for (s1, e1), (s2, _e2) in zip(windows, windows[1:], strict=False):
+            # Each request stays within the cap, and the next one starts one
+            # candle period before this one ends.
+            assert 0 < e1 - s1 <= _PAGE
+            assert s2 == e1 - _HOUR
+        assert 0 < windows[-1][1] - windows[-1][0] <= _PAGE
+
+
+class TestFetchCandlesticksPaging:
+    """The candlestick endpoint refuses a request spanning more than 5,000
+    candles (HTTP 400), and fetch_candlesticks used to send every window as ONE
+    request, so any window longer than ~208 days of hourly candles came back
+    as "no candles". A longer window is now paged and merged."""
+
+    OPEN = 1_700_000_000 - 1_700_000_000 % _HOUR
+
+    def _fetch(self, monkeypatch, tmp_path, endpoint, open_ts, close_ts, **kw):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        monkeypatch.setattr(historical, "_signed_raw_get", endpoint)
+        return historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=open_ts, close_ts=close_ts,
+            rate_limit_sleep=0.0, **kw)
+
+    def test_the_fake_endpoint_refuses_one_request_for_the_whole_window(self):
+        # The premise of every test below: one GET for this window is a 400.
+        close = self.OPEN + 400 * 86_400
+        endpoint = _CandleEndpoint(self.OPEN, close)
+        with pytest.raises(_FakeApiException):
+            endpoint(None, "", start_ts=self.OPEN, end_ts=close, period_interval=60)
+
+    @pytest.mark.parametrize("start_inclusive", [True, False])
+    @pytest.mark.parametrize("end_inclusive", [True, False])
+    def test_a_long_window_returns_exactly_what_one_uncapped_request_would(
+        self, monkeypatch, tmp_path, start_inclusive, end_inclusive,
+    ):
+        close = self.OPEN + 400 * 86_400  # 9,600 hourly candles, ~2 caps
+        endpoint = _CandleEndpoint(self.OPEN, close, start_inclusive=start_inclusive,
+                                   end_inclusive=end_inclusive)
+        out = self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                          use_cache=False)
+
+        assert len(endpoint.calls) == 2
+        # Every candle one request would have served, once each, ascending
+        assert [c["ts"] for c in out] == endpoint.served(self.OPEN, close)
+        assert out[0]["yes_ask_close"] == pytest.approx(0.55)
+        # Cached ONCE, under the whole window
+        cached = json.loads((tmp_path / "candles" / "T1.json").read_text())
+        assert (cached["open_ts"], cached["close_ts"]) == (self.OPEN, close)
+        assert cached["candles"] == out
+
+    def test_a_window_that_fits_is_still_one_request_with_the_same_parameters(
+        self, monkeypatch, tmp_path,
+    ):
+        close = self.OPEN + _PAGE
+        endpoint = _CandleEndpoint(self.OPEN, close)
+        out = self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                          use_cache=False)
+        assert endpoint.calls == [(self.OPEN, close)]
+        assert len(out) == _CAP
+
+    def test_the_longest_measured_market_span_is_fetched_whole(self, monkeypatch, tmp_path):
+        # 15,527 hours: the longest open-to-close-plus-a-day span among the
+        # DR-73 calibration corpus's 3,704 time-series legs, and one of the
+        # 115 that no single request could serve.
+        close = self.OPEN + 15_527 * _HOUR
+        endpoint = _CandleEndpoint(self.OPEN, close)
+        out = self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                          use_cache=False)
+        assert len(endpoint.calls) == 4
+        assert [c["ts"] for c in out] == endpoint.served(self.OPEN, close)
+
+    def test_a_cached_paged_window_is_served_without_any_request(self, monkeypatch, tmp_path):
+        close = self.OPEN + 400 * 86_400
+        first = self._fetch(monkeypatch, tmp_path, _CandleEndpoint(self.OPEN, close),
+                            self.OPEN, close)
+        again = _CandleEndpoint(self.OPEN, close)
+        assert self._fetch(monkeypatch, tmp_path, again, self.OPEN, close) == first
+        assert again.calls == []
+
+    def test_a_failed_later_request_returns_nothing_and_caches_nothing(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        close = self.OPEN + 400 * 86_400
+        endpoint = _CandleEndpoint(self.OPEN, close, fail_on_call={2: 1})
+        with caplog.at_level(logging.WARNING):
+            out = self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                              use_cache=False)
+
+        # All-or-nothing: the first request's candles are NOT returned or
+        # cached as if they were the whole window.
+        assert out == []
+        assert not (tmp_path / "candles" / "T1.json").exists()
+        msgs = [r.getMessage() for r in caplog.records
+                if "Candlestick fetch failed" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "T1" in msgs[0] and "HTTP 404" in msgs[0]
+        assert msgs[0].endswith("(request 2 of 2)")
+
+    def test_a_single_request_failure_keeps_its_exact_line(self, monkeypatch, tmp_path, caplog):
+        close = self.OPEN + 10 * _HOUR
+        endpoint = _CandleEndpoint(self.OPEN, close, fail_on_call={1: 1})
+        with caplog.at_level(logging.WARNING):
+            assert self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                               use_cache=False) == []
+        msgs = [r.getMessage() for r in caplog.records
+                if "Candlestick fetch failed" in r.getMessage()]
+        assert msgs == ["Candlestick fetch failed for T1: HTTP 404 Injected"]
+
+    def test_each_request_is_retried_on_a_transient_error(self, monkeypatch, tmp_path):
+        # Every request goes through _historical_get's api_call_with_retry, so
+        # a 503 on the SECOND request is backed off and retried rather than
+        # failing the whole window.
+        from kalshi_betting import _http
+        sleeps: list[float] = []
+        monkeypatch.setattr(_http.time, "sleep", sleeps.append)
+        close = self.OPEN + 400 * 86_400
+        endpoint = _CandleEndpoint(self.OPEN, close, fail_on_call={2: 1}, fail_status=503)
+        out = self._fetch(monkeypatch, tmp_path, endpoint, self.OPEN, close,
+                          use_cache=False)
+        assert [c["ts"] for c in out] == endpoint.served(self.OPEN, close)
+        assert any(s > 0 for s in sleeps)  # the retry backed off
+
+    def test_malformed_candles_are_counted_across_every_request(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        close = self.OPEN + 400 * 86_400
+        endpoint = _CandleEndpoint(self.OPEN, close)
+        bad_ts = {self.OPEN, close}  # one in the first request, one in the last
+
+        def _with_bad(client, path, **params):
+            resp = endpoint(client, path, **params)
+            payload = json.loads(resp.data)
+            for c in payload["candlesticks"]:
+                if c["end_period_ts"] in bad_ts:
+                    c["yes_ask"] = {"close": "not-a-number"}
+            return _raw_resp(payload)
+
+        with caplog.at_level(logging.WARNING):
+            out = self._fetch(monkeypatch, tmp_path, _with_bad, self.OPEN, close,
+                              use_cache=False)
+        served = endpoint.served(self.OPEN, close)
+        assert [c["ts"] for c in out] == [t for t in served if t not in bad_ts]
+        # One line for the whole window; the raw count includes the overlap's
+        # repeats, which is what the requests actually returned.
+        raw = sum(len(endpoint.served(s, e)) for s, e in endpoint.calls)
+        warnings = [r.getMessage() for r in caplog.records if "malformed" in r.getMessage()]
+        assert warnings == [f"T1: dropped 2/{raw} malformed candles"]
+
+
+class TestMergeCandlePages:
+    def test_sorts_ascending_and_keeps_the_first_copy_of_a_repeat(self):
+        a = {"ts": 2, "src": "first"}
+        b = {"ts": 2, "src": "second"}
+        merged = historical._merge_candle_pages(
+            [{"ts": 1}, a, {"ts": 3}, b, {"ts": 0}])
+        assert [c["ts"] for c in merged] == [0, 1, 2, 3]
+        assert merged[2] is a
+
+
 class TestExceptionSummary:
     """_exception_summary: one line, never the SDK's header dump (TS-02)."""
 

@@ -976,21 +976,25 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # The most candles /historical/markets/{ticker}/candlesticks serves in ONE
 # request. A request spanning more is rejected with HTTP 400 "max
 # candlesticks: 5000" — observed during the DR-73 calibration fetch and
-# recorded in .git/dr73-calib/fetch_ladder_candles.py — and
-# historical.fetch_candlesticks, which makes one unpaginated GET per ticker,
-# catches that failure and returns [] (never cached). Because
-# backtester._fetch_candles_parallel opens every ticker's request at the run's
-# --start-date (midnight UTC) and ends it one day past that market's close, a
-# market whose request — start to close plus one day — spans more than
-# CANDLESTICK_MAX_CANDLES_PER_REQUEST x CANDLESTICK_PERIOD_INTERVAL_MINUTES
-# (about 208 days at hourly candles), i.e. one closing more than about 207
-# days after --start-date, gets no candles and can never enter. Nothing
-# paginates around it: per-ticker candle windowing is a separate
-# backtest-fidelity fix. Read only by dashboard.py, which puts a red notice on
-# any page whose window could contain such a market (one closing at the end
-# of the window's last day, plus the one-day pad, spans more candles than
-# this), since the explorer (and every other strategy figure) then describes
-# a truncated population.
+# recorded in .git/dr73-calib/fetch_ladder_candles.py. The boundary is
+# consistent with that number: across the 3,704 time-series legs of the
+# 2026-09-23 calibration corpus, the longest request with a cached series
+# spanned 4,993.97 hours, while all 115 requests spanning more than 5,000
+# hours (the shortest 5,005.33) came back with no candles and left no cache
+# file, which is what a failed request leaves. historical.fetch_candlesticks —
+# the only reader — therefore sends any window longer than (this - 1) candle
+# periods as consecutive requests of at most (this - 1) periods each,
+# overlapping by one period, and merges them ascending by timestamp with the
+# overlap's repeats dropped (historical._candle_request_windows /
+# _merge_candle_pages); one period short of the cap so a request stays within
+# it whether the endpoint counts a span's two ends inclusively or not. A
+# window that fits is still ONE request, sent exactly as before. Until that
+# paging, a longer window went out as a single
+# request whose 400 fetch_candlesticks reads as "no candles" (it fail-softs
+# every fetch error to [], never cached), so every market whose window — then
+# opened at the backtest's --start-date and run to a day past its close —
+# spanned more than about 208 days of hourly candles silently had no price
+# series and could never enter a backtest trade.
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 
