@@ -1990,8 +1990,10 @@ def time_series_group_key(combined_title: str, subtitle: Any) -> str:
     spelled inside the TITLE is a separate case, not handled here.
 
     Single source of truth for BOTH paths — scanner.find_time_series_pairs and
-    backtester._group_by_normalized_title must call this (pinned by AST in
-    tests/test_strategy.py). Fail-safe on a non-string subtitle (a MagicMock's
+    backtester._group_by_normalized_title must call this, the latter through
+    backtester._ts_group_key, which backtester._index_eligible_keys also reads
+    (pinned by AST in tests/test_strategy.py; a two-link chain on the
+    backtester side). Fail-safe on a non-string subtitle (a MagicMock's
     auto-attribute, None from an old cache record): treated as absent, never
     raised on — the same rule leg_sides and strategy._depth_levels follow.
 

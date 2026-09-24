@@ -656,7 +656,17 @@ class TestTimeSeriesKellyParity:
         # reproduced the strike-blind key exactly and could never have
         # surfaced the defect on settled history.
         assert _function_calls(scanner, "find_time_series_pairs", "time_series_group_key")
-        assert _function_calls(backtester, "_group_by_normalized_title", "time_series_group_key")
+        # SS-1 moved the backtester's call into _ts_group_key, its one
+        # definition of the key, so the pin is a two-link chain — and it now
+        # also covers _index_eligible_keys, which decides from the SAME two
+        # key helpers which records are materialized for grouping at all. A
+        # key computed differently there would silently drop records the
+        # grouping needs, so both pass-1 keys are pinned beside both groupings.
+        assert _function_calls(backtester, "_ts_group_key", "time_series_group_key")
+        assert _function_calls(backtester, "_group_by_normalized_title", "_ts_group_key")
+        assert _function_calls(backtester, "_group_by_exact_title", "_st_group_key")
+        assert _function_calls(backtester, "_index_eligible_keys", "_ts_group_key")
+        assert _function_calls(backtester, "_index_eligible_keys", "_st_group_key")
 
     def test_ast_both_finders_apply_the_one_series_rule(self):
         # DR-02/DR-54: identical wording across two events of ONE series is two

@@ -1,8 +1,11 @@
 """Tests for historical.py — event-title cache and dict serialization."""
+import copy
 import gzip
 import json
 import logging
-from datetime import UTC, date, datetime
+import weakref
+import zlib
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -664,7 +667,10 @@ class TestFetchAllSettledMarkets:
                                                               caplog):
         # BS-08: a truncated assembled cache (the multi-hour fetch's final
         # write, historically interrupted by OOM kills) must read back as a
-        # miss and refetch, not raise before a single request is issued.
+        # miss and refetch, not raise before a single request is issued. This
+        # one is a LEGACY (pre-SS-1) single-document cache, which is still
+        # read through _load_json_cache; the streamed format's own corruption
+        # tests are in TestStreamedAssembledCache.
         from datetime import date
 
         cache_dir = tmp_path / "cache"
@@ -704,8 +710,13 @@ class TestFetchAllSettledMarkets:
 
         assert {m["ticker"] for m in out} == {"RECENT"}
         assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
-        # The damaged file is replaced by a well-formed one for the next run.
-        assert json.loads(corrupt.read_text()) == out
+        # A well-formed cache is written for the next run — in the streamed
+        # format (SS-1), which the next run prefers — and the damaged legacy
+        # file is gone, as the old code's rebuild overwrote it: nothing writes
+        # that format any more, and the committed rebuild retires it.
+        streamed = cache_dir / "settled_markets_2026-02-01_nomve.jsonl.gz"
+        assert _read_slice_file(streamed) == list(out)
+        assert not corrupt.exists()
 
     def test_event_titles_resolved_when_mve_excluded(self, tmp_path, monkeypatch,
                                                      isolated_cache):
@@ -745,8 +756,9 @@ class TestFetchAllSettledMarkets:
             MagicMock(), live, start_date=date(2026, 2, 1), use_cache=False,
         )
 
-        assert [m["ticker"] for m in out] == ["RECENT"]
-        assert out[0]["event_title"] == "Event EV"
+        rows = list(out)  # a streamed corpus since SS-1: iterate, never index
+        assert [m["ticker"] for m in rows] == ["RECENT"]
+        assert rows[0]["event_title"] == "Event EV"
         # No MVE ticker can be wanted when every market fetch excluded them.
         assert live.get_multivariate_events_without_preload_content.call_count == 0
 
@@ -841,7 +853,8 @@ class TestFetchAllSettledMarkets:
             )
 
         # Warn, never abort — the fetch still completes and returns normally.
-        assert out == []
+        assert list(out) == []
+        assert len(out) == 0
         assert any("archive cutoff" in r.getMessage() for r in caplog.records
                    if r.levelname == "WARNING")
 
@@ -1425,29 +1438,37 @@ class TestShardedFetch:
         # Peak memory must not scale with the number of days fetched, so no
         # phase may retain slice records: every day — including ones fetched
         # moments earlier in this same run — is re-read from its file at
-        # assembly. Verified by counting _day_store_load calls per path.
+        # assembly. Verified by counting COMPLETE reads of each path through
+        # _day_store_iter, the one reader every slice read goes through (the
+        # prescan's _day_store_load included).
         archive_markets, live_markets = self._fixture_markets()
-        real_load = historical._day_store_load
-        loads: list[str] = []
+        real_iter = historical._day_store_iter
+        reads: list[str] = []
 
-        def counting_load(path, expect_meta, keep=None):
-            result = real_load(path, expect_meta, keep)
-            if result is not None:
-                loads.append(str(path))
-            return result
+        def counting_iter(path, expect_meta, keep=None):
+            yield from real_iter(path, expect_meta, keep)
+            reads.append(str(path))  # only reached by a read that completed
 
-        monkeypatch.setattr(historical, "_day_store_load", counting_load)
+        monkeypatch.setattr(historical, "_day_store_iter", counting_iter)
         out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
                         _FakeLive(live_markets))
-        assert out  # sanity: the run actually produced records
+        assert len(out) > 0  # sanity: the run actually produced records
+        # Nothing iterated the returned corpus, so no read of the assembled
+        # cache can be in the log; every completed read is a day slice.
+        assert all("_days" in p for p in reads)
 
-        # Cold run: every successful load is an assembly read (the prescan
-        # found nothing on disk), so each written slice is read exactly once.
+        # Cold run: the prescan found nothing on disk (no completed read), so
+        # every completed read is an assembly read — and since SS-1 the
+        # assembly walks its sources TWICE (count and collect event tickers,
+        # then write the cache), each re-reading the slice from disk. Exactly
+        # two reads per written slice: never zero (retained in memory) and
+        # never more (read eagerly as well).
         written = {str(p) for p in
                    (tmp_path / "cache").glob("*_days/*.json.gz")}
         assert written, "expected day slices to have been persisted"
-        assert set(loads) == written
-        assert len(loads) == len(written)
+        assert set(reads) == written
+        assert all(reads.count(p) == 2 for p in written)
+        assert len(reads) == 2 * len(written)
 
     def test_prefilter_assembly_equals_postfilter(self, tmp_path, monkeypatch):
         # The result-neutrality proof for pushing the backtester's eligibility
@@ -1479,7 +1500,7 @@ class TestShardedFetch:
             prefilter=pred, prefilter_tag="testpred",
         )
 
-        assert out_pref == [m for m in out_full if pred(m)]
+        assert list(out_pref) == [m for m in out_full if pred(m)]
         # Sanity: the predicate actually removed something, and kept something.
         assert 0 < len(out_pref) < len(out_full)
 
@@ -1510,8 +1531,10 @@ class TestShardedFetch:
             use_cache=False, prefilter=pred, prefilter_tag="testpred",
         )
         cache_dir = tmp_path / "cache"
-        assert (cache_dir / "settled_markets_2026-06-05_testpred.json").exists()
-        assert not (cache_dir / "settled_markets_2026-06-05.json").exists()
+        assert (cache_dir / "settled_markets_2026-06-05_testpred.jsonl.gz").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05.jsonl.gz").exists()
+        # SS-1: new runs never write the legacy single-document format.
+        assert not list(cache_dir.glob("settled_markets_*.json"))
 
         # Second prefiltered run hits the tagged cache: zero API calls.
         archive.calls = 0
@@ -1519,7 +1542,7 @@ class TestShardedFetch:
             MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
             use_cache=True, prefilter=pred, prefilter_tag="testpred",
         )
-        assert out2 == out1
+        assert list(out2) == list(out1)
         assert archive.calls == 0
 
         # An unfiltered caller must NOT read the prefiltered cache.
@@ -1564,8 +1587,11 @@ class TestShardedFetch:
             use_cache=False,
         )
         cache_dir = tmp_path / "cache"
-        assert (cache_dir / "settled_markets_2026-06-05.json").exists()
-        assert not (cache_dir / "settled_markets_2026-06-05_nomve.json").exists()
+        # SS-1 changed the EXTENSION (the streamed .jsonl.gz format), not the
+        # stem this test pins: the default True case is still unmarked, and a
+        # legacy .json of that same stem is still what a hit falls back to.
+        assert (cache_dir / "settled_markets_2026-06-05.jsonl.gz").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05_nomve.jsonl.gz").exists()
 
     def test_mve_flag_separates_assembled_cache_filenames(self, tmp_path, monkeypatch):
         # DR-57: the flag changes WHAT IS FETCHED (mve_filter="exclude" on the
@@ -1590,8 +1616,8 @@ class TestShardedFetch:
 
         on_files = {p.name for p in (tmp_path / "on" / "cache").glob("settled_markets_*")}
         off_files = {p.name for p in (tmp_path / "off" / "cache").glob("settled_markets_*")}
-        assert on_files == {"settled_markets_2026-06-05_testpred.json"}
-        assert off_files == {"settled_markets_2026-06-05_testpred_nomve.json"}
+        assert on_files == {"settled_markets_2026-06-05_testpred.jsonl.gz"}
+        assert off_files == {"settled_markets_2026-06-05_testpred_nomve.jsonl.gz"}
         assert on_files.isdisjoint(off_files)
 
     def test_cache_written_under_one_mve_setting_is_not_served_to_the_other(
@@ -1629,8 +1655,8 @@ class TestShardedFetch:
         )
         assert archive.calls > 0
         cache_dir = tmp_path / "cache"
-        assert (cache_dir / "settled_markets_2026-06-05.json").exists()
-        assert (cache_dir / "settled_markets_2026-06-05_nomve.json").exists()
+        assert (cache_dir / "settled_markets_2026-06-05.jsonl.gz").exists()
+        assert (cache_dir / "settled_markets_2026-06-05_nomve.jsonl.gz").exists()
 
     def test_probe_exception_falls_back_to_sequential(self, tmp_path, monkeypatch, caplog):
         # The cursor-synthesis probe issues a real request, so it can fail for
@@ -2127,8 +2153,11 @@ class TestDayStreamWriter:
         assert [m["ticker"] for m in loaded] == [f"T{i}" for i in range(10)]
 
     def test_no_emit_returns_the_list_unchanged(self, tmp_path, monkeypatch):
-        # The frontier day and the sequential fallbacks rely on the
-        # list-returning behavior — chunking must be strictly opt-in.
+        # Direct callers rely on the list-returning behavior — chunking must be
+        # strictly opt-in. (No production path passes None since SS-1: the
+        # frontier day streams through a keep-filtering sink, see
+        # TestFrontierStreamsThroughKeep; the sequential fallbacks never call
+        # this function.)
         pages = [
             {"markets": [_mk_raw_market("F1", "2026-06-12T01:00:00Z",
                                         "2026-06-12T02:00:00Z")],
@@ -2144,6 +2173,511 @@ class TestDayStreamWriter:
         )
         assert isinstance(out, list)
         assert [m["ticker"] for m in out] == ["F1"]
+
+
+class TestExtendKept:
+    """The frontier's emit-sink body (SS-1): append only keep-passing records,
+    in batch order, and never the batch list itself."""
+
+    @staticmethod
+    def _keep(m):
+        return m["ticker"] != "B"
+
+    def test_rejected_records_are_never_appended_and_order_holds(self):
+        dest: list[dict] = []
+        historical._extend_kept(dest, self._keep, [{"ticker": "A"}, {"ticker": "B"}])
+        historical._extend_kept(dest, self._keep, [{"ticker": "C"}, {"ticker": "B"},
+                                                   {"ticker": "D"}])
+        assert [m["ticker"] for m in dest] == ["A", "C", "D"]
+
+    def test_keep_none_appends_every_record_in_order(self):
+        dest: list[dict] = [{"ticker": "X"}]
+        batch = [{"ticker": "B"}, {"ticker": "A"}]
+        historical._extend_kept(dest, None, batch)
+        assert [m["ticker"] for m in dest] == ["X", "B", "A"]
+        # The records are appended, not the batch list: the window drops its
+        # buffer after each emit, and dest must not keep that list alive.
+        assert all(m is not batch for m in dest)
+
+    def test_the_same_record_objects_are_kept(self):
+        # A filter, not a copy: downstream (title patching, first-wins dedup)
+        # sees exactly the dicts the window produced.
+        rec = {"ticker": "A"}
+        dest: list[dict] = []
+        historical._extend_kept(dest, self._keep, [rec])
+        assert dest[0] is rec
+
+
+class TestFrontierStreamsThroughKeep:
+    """SS-1: the frontier (current UTC, never-persisted) day used to be held
+    UNFILTERED in memory and filtered only after the whole pool drained — at
+    real volumes a partial day of millions of records, for any window length.
+    It now streams through _fetch_live_window's emit contract into a sink that
+    keeps only `keep`-passing records as each batch lands. Membership and
+    order must be exactly what the old post-hoc filter produced; only the peak
+    changes."""
+
+    NOW = "2026-09-24T12:00:00+00:00"
+    TODAY = "2026-09-24T00:00:00+00:00"
+
+    @staticmethod
+    def _ts(iso):
+        return int(datetime.fromisoformat(iso).timestamp())
+
+    @staticmethod
+    def _keep(m):
+        # Discriminating on purpose: rejects roughly a third of every day's
+        # records, on every page boundary pattern the fixtures produce.
+        return not m["ticker"].endswith(("0", "3", "6", "9"))
+
+    @staticmethod
+    def _frontier_markets(n=11):
+        # Settled across the frontier day before NOW, newest-first on the wire
+        # (the fake sorts by settlement DESC), never on a midnight boundary.
+        return [
+            _mk_raw_market(f"F{i:02d}", "2026-09-23T00:00:00Z",
+                           f"2026-09-24T{i + 1:02d}:00:00Z")
+            for i in range(n)
+        ]
+
+    def _oracle(self, markets, keep):
+        """The OLD frontier expression, literally: fetch the whole window as a
+        list (emit=None), then filter it afterwards."""
+        frontier = historical._fetch_live_window(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY), None,
+            historical._FetchProgress("oracle"),
+        )
+        assert isinstance(frontier, list)
+        if keep is not None:
+            frontier = [m for m in frontier if keep(m)]
+        return frontier
+
+    def test_frontier_equals_the_old_post_hoc_filter(self, tmp_path, monkeypatch):
+        # Small chunks so the frontier is emitted as SEVERAL batches — a sink
+        # that reordered or dropped a batch boundary would show up here.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        markets = self._frontier_markets()
+        expected = self._oracle(markets, self._keep)
+
+        # live_min_ts inside today => no past days, so the result IS the frontier.
+        out = list(historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), self._keep,
+        ))
+        assert out == expected
+        assert [m["ticker"] for m in out] == [m["ticker"] for m in expected]
+        # Sanity: the predicate removed something and kept something.
+        assert 0 < len(out) < len(markets)
+
+    def test_keep_none_keeps_every_frontier_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        markets = self._frontier_markets()
+        out = list(historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), None,
+        ))
+        assert out == self._oracle(markets, None)
+        assert len(out) == len(markets)
+
+    def test_whole_phase_equals_filtering_the_unfiltered_phase(self, tmp_path,
+                                                               monkeypatch):
+        # With past days on disk as well: frontier first, then past days
+        # newest-first, each filtered by the same predicate in the same order —
+        # exactly [m for m in unfiltered_phase if keep(m)].
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
+        past = [
+            _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
+                           f"2026-09-2{d}T{i + 1:02d}:00:00Z")
+            for d in (2, 3) for i in range(7)
+        ]
+        markets = self._frontier_markets() + past
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "all")
+        unfiltered = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW), None,
+        )
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "kept")
+        filtered = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW),
+            self._keep,
+        )
+
+        assert list(filtered) == [m for m in unfiltered if self._keep(m)]
+        tickers = [m["ticker"] for m in unfiltered]
+        # Frontier first, then 09-23, then 09-22 — the contract the merge's
+        # first-wins dedup depends on.
+        assert tickers[:11] == [f"F{i:02d}" for i in range(10, -1, -1)]
+        assert tickers[11:18] == [f"P3{i}" for i in range(6, -1, -1)]
+        assert tickers[18:] == [f"P2{i}" for i in range(6, -1, -1)]
+        # The predicate bit on the frontier AND on the past days.
+        dropped = set(tickers) - {m["ticker"] for m in filtered}
+        assert any(t.startswith("F") for t in dropped)
+        assert any(t.startswith("P") for t in dropped)
+
+    def test_rejected_frontier_record_is_never_retained(self, tmp_path, monkeypatch):
+        # The point of SS-1. Every compact record is made weakly referenceable
+        # (a plain dict is not), and each time the window requests its next
+        # page we count how many REJECTED records are still alive. With one
+        # flush per page, a record the predicate rejected must already be
+        # garbage by the next request. The old code kept every rejected record
+        # alive in the unfiltered frontier list until the pool drained, so this
+        # count would climb page by page.
+        import weakref
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        class _Tracked(dict):
+            """A compact record that supports weak references."""
+
+        rejected_refs: list = []
+        real_to_dict = historical._market_to_dict
+
+        def tracking_to_dict(m, *args, **kwargs):
+            rec = _Tracked(real_to_dict(m, *args, **kwargs))
+            if not self._keep(rec):
+                rejected_refs.append(weakref.ref(rec))
+            return rec
+
+        monkeypatch.setattr(historical, "_market_to_dict", tracking_to_dict)
+
+        consulted: list[str] = []
+
+        def keep(m):
+            consulted.append(m["ticker"])
+            return self._keep(m)
+
+        alive_at_request: list[int] = []
+
+        class _ObservedLive(_FakeLive):
+            def get_markets_without_preload_content(self, *args, **kwargs):
+                alive_at_request.append(
+                    sum(ref() is not None for ref in rejected_refs))
+                return super().get_markets_without_preload_content(*args, **kwargs)
+
+        markets = self._frontier_markets()
+        out = historical._fetch_live_phase(
+            _ObservedLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), keep,
+        )
+
+        assert rejected_refs, "the fixture must produce rejected frontier records"
+        assert len(alive_at_request) >= 3, "the frontier must span several pages"
+        # Never a rejected record alive when the next page is requested...
+        assert alive_at_request == [0] * len(alive_at_request)
+        # ...and none survives the phase either.
+        assert all(ref() is None for ref in rejected_refs)
+        # Each frontier record was consulted exactly once, in fetch order, and
+        # nothing the predicate rejected reached the result.
+        assert consulted == [f"F{i:02d}" for i in range(10, -1, -1)]
+        assert [m["ticker"] for m in out] == [t for t in consulted
+                                              if self._keep({"ticker": t})]
+
+    # ── Failure propagation (frontier_future.result() is load-bearing) ────────
+
+    class _FailingFrontierLive(_FakeLive):
+        """A live fake whose FRONTIER window (no max_settled_ts) raises on its
+        Nth request; past-day windows (which send max_settled_ts) are served
+        normally."""
+
+        def __init__(self, markets, fail_on, exc, **kwargs):
+            super().__init__(markets, **kwargs)
+            self.fail_on = fail_on
+            self.exc = exc
+            self.frontier_calls = 0
+
+        def get_markets_without_preload_content(self, min_settled_ts=None,
+                                                max_settled_ts=None, cursor=None,
+                                                **kwargs):
+            if max_settled_ts is None:
+                self.frontier_calls += 1
+                if self.frontier_calls == self.fail_on:
+                    raise self.exc
+            return super().get_markets_without_preload_content(
+                min_settled_ts=min_settled_ts, max_settled_ts=max_settled_ts,
+                cursor=cursor, **kwargs)
+
+    def _past_days(self):
+        return [
+            _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
+                           f"2026-09-2{d}T{i + 1:02d}:00:00Z")
+            for d in (2, 3) for i in range(4)
+        ]
+
+    def test_a_frontier_fetch_failure_after_a_batch_is_raised(self, tmp_path,
+                                                              monkeypatch):
+        # The frontier's records reach `frontier` through the sink, so
+        # frontier_future.result() no longer DELIVERS them — it is only there to
+        # re-raise the window's failure. The pool's __exit__ waits for the
+        # worker either way, so without it a frontier that dies part-way would
+        # come back as the batches already appended plus every past day: a
+        # silently SHORT corpus. A non-transient error (RuntimeError: no status,
+        # not a transport class) is not retried, so it surfaces on its page.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+        consulted: list[str] = []
+
+        def keep(m):
+            consulted.append(m["ticker"])
+            return self._keep(m)
+
+        live = self._FailingFrontierLive(
+            self._frontier_markets() + self._past_days(), fail_on=4,
+            exc=RuntimeError("frontier page 4 failed"), page_size=2,
+        )
+        with pytest.raises(RuntimeError, match="frontier page 4 failed"):
+            historical._fetch_live_phase(
+                live, self._ts("2026-09-22T00:00:00+00:00"), self._ts(self.NOW),
+                keep,
+            )
+        # Batches really had been appended before the failure (pages 1-3 of
+        # the frontier, one flush each) — the state a swallowed failure would
+        # have returned as if it were the whole frontier.
+        frontier_seen = [t for t in consulted if t.startswith("F")]
+        assert frontier_seen == [f"F{i:02d}" for i in range(10, 4, -1)]
+        assert any(self._keep({"ticker": t}) for t in frontier_seen)
+
+    def test_keep_raising_on_the_frontier_worker_is_raised(self, tmp_path,
+                                                           monkeypatch):
+        # `keep` now runs on the frontier's WORKER thread, so its failure lands
+        # in frontier_future, not in this thread — the same result() call is
+        # the only thing that brings it back. Before SS-1 it raised here too,
+        # from the post-hoc filter.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        def keep(m):
+            if m["ticker"] == "F05":
+                raise ValueError("keep failed on F05")
+            return self._keep(m)
+
+        with pytest.raises(ValueError, match="keep failed on F05"):
+            historical._fetch_live_phase(
+                _FakeLive(self._frontier_markets() + self._past_days(),
+                          page_size=2),
+                self._ts("2026-09-22T00:00:00+00:00"), self._ts(self.NOW), keep,
+            )
+
+    # ── Windowed-path fallback ────────────────────────────────────────────────
+
+    def test_fallback_releases_the_partial_frontier_and_applies_keep(
+            self, tmp_path, monkeypatch):
+        # When the server stops honoring max_settled_ts, every past-day window
+        # raises _ShardedFetchUnsupported and the phase falls back to the
+        # sequential sweep — which refetches today too. By then the frontier
+        # worker has run its whole window (the pool's __exit__ joins it), so
+        # the keep-passing frontier used to sit beside the fallback's own copy
+        # of the same day for the entire serial walk. It is released first now
+        # (since the SS-1 review its records are never resident at all — they
+        # are spooled — and the spool itself is closed, freeing its disk), and
+        # the fallback gets the same `keep`.
+        import weakref
+
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+        spools: list = []
+        real_init = historical._FrontierSpool.__init__
+
+        def recording_init(spool, directory):
+            real_init(spool, directory)
+            spools.append(spool)
+
+        monkeypatch.setattr(historical._FrontierSpool, "__init__", recording_init)
+
+        class _Tracked(dict):
+            """A compact record that supports weak references."""
+
+        kept_refs: list = []
+        real_to_dict = historical._market_to_dict
+
+        def tracking_to_dict(m, *args, **kwargs):
+            rec = _Tracked(real_to_dict(m, *args, **kwargs))
+            if self._keep(rec):
+                kept_refs.append(weakref.ref(rec))
+            return rec
+
+        monkeypatch.setattr(historical, "_market_to_dict", tracking_to_dict)
+
+        alive_at_fallback: list[int] = []
+        real_sequential = historical._fetch_live_sequential
+
+        def spy_sequential(live_client, live_min_ts, keep=None):
+            # Every tracked record made so far came from the frontier window
+            # (each past-day window raises on its first record, before
+            # building one), so this counts the frontier still resident.
+            alive_at_fallback.append(sum(r() is not None for r in kept_refs))
+            return real_sequential(live_client, live_min_ts, keep)
+
+        monkeypatch.setattr(historical, "_fetch_live_sequential", spy_sequential)
+
+        markets = self._frontier_markets() + self._past_days()
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        out = historical._fetch_live_phase(
+            _FakeLive(markets, page_size=2, ignore_max=True), live_min_ts,
+            self._ts(self.NOW), self._keep,
+        )
+
+        assert kept_refs, "the frontier must have kept records before the fallback"
+        assert alive_at_fallback == [0]
+        assert len(spools) == 1 and spools[0]._closed and len(spools[0]) > 0
+        # The fallback result is exactly the sequential sweep, filtered.
+        unfiltered = real_sequential(_FakeLive(markets, page_size=2), live_min_ts)
+        assert out == [m for m in unfiltered if self._keep(m)]
+        assert 0 < len(out) < len(unfiltered)
+
+
+class TestSequentialFallbacksApplyKeep:
+    """The two sequential fallbacks have no emit sink and hold their whole
+    result in memory. They apply the caller's prefilter per record as each
+    page arrives, so a record the merge would discard is never retained —
+    and that must be exact: the same records in the same order as filtering
+    the unfiltered result afterwards, with byte-identical progress lines (the
+    "markets kept so far" count is taken before `keep`)."""
+
+    START = "2026-09-17T00:00:00+00:00"
+    CUTOFF = "2026-09-20T00:00:00+00:00"
+
+    @staticmethod
+    def _ts(iso):
+        return int(datetime.fromisoformat(iso).timestamp())
+
+    @staticmethod
+    def _keep(m):
+        return not m["ticker"].endswith(("0", "3", "6", "9"))
+
+    @staticmethod
+    def _stamp(base_iso, minutes):
+        base = datetime.fromisoformat(base_iso)
+        return (base + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _markets(self, prefix, base_iso, n=105, step=1):
+        # page_size=1 below, so n pages: past the 100-page progress cadence.
+        # One voided record so the walk's own result filter bites as well.
+        # `step` spaces the records in minutes (a multi-day spread is what lets
+        # an ignored max_settled_ts trip the windowed path's fallback).
+        out = [
+            _mk_raw_market(f"{prefix}{i:03d}", self._stamp(base_iso, i * step),
+                           self._stamp(base_iso, i * step + 30))
+            for i in range(n)
+        ]
+        out[7]["result"] = "void"
+        return out
+
+    @staticmethod
+    def _progress_lines(caplog, label):
+        return [r.getMessage() for r in caplog.records if label in r.getMessage()]
+
+    def test_live_sequential_applies_keep_exactly(self, caplog):
+        markets = self._markets("L", "2026-09-22T00:00:00+00:00")
+        live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        label = "Live settled sweep [sequential]"
+
+        with caplog.at_level(logging.INFO):
+            unfiltered = historical._fetch_live_sequential(
+                _FakeLive(markets, page_size=1), live_min_ts)
+        lines_none = self._progress_lines(caplog, label)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            filtered = historical._fetch_live_sequential(
+                _FakeLive(markets, page_size=1), live_min_ts, self._keep)
+        lines_keep = self._progress_lines(caplog, label)
+
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        # The returned list IS what the walk retained: nothing rejected in it.
+        assert all(self._keep(m) for m in filtered)
+        assert 0 < len(filtered) < len(unfiltered)
+        assert lines_keep == lines_none == [
+            f"{label}: 100 pages scanned, 99 markets kept so far"
+        ]
+
+    def test_archive_sequential_applies_keep_exactly(self, monkeypatch, caplog):
+        markets = self._markets("A", "2026-09-17T06:00:00+00:00")
+        label = "Historical archive [sequential]"
+
+        def run(keep):
+            archive = _FakeArchive(markets, page_size=1)
+            monkeypatch.setattr(
+                historical, "_signed_raw_get",
+                lambda client, path, **params: _raw_resp(archive.page(**params)),
+            )
+            return historical._fetch_archive_sequential(
+                MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
+                {"limit": 1000}, keep)
+
+        with caplog.at_level(logging.INFO):
+            unfiltered = run(None)
+        lines_none = self._progress_lines(caplog, label)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            filtered = run(self._keep)
+        lines_keep = self._progress_lines(caplog, label)
+
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        assert all(self._keep(m) for m in filtered)
+        assert 0 < len(filtered) < len(unfiltered)
+        assert lines_keep == lines_none == [
+            f"{label}: 100 pages scanned, 99 markets kept so far"
+        ]
+
+    def test_archive_phase_fallback_passes_keep(self, monkeypatch):
+        # Opaque cursors defeat cursor synthesis, so the phase takes the
+        # sequential fallback; its first list must already be keep-filtered.
+        markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+
+        def run(keep):
+            archive = _FakeArchive(markets, page_size=2, opaque_cursors=True)
+            monkeypatch.setattr(
+                historical, "_signed_raw_get",
+                lambda client, path, **params: _raw_resp(archive.page(**params)),
+            )
+            return historical._fetch_archive_phase(
+                MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
+                {"limit": 1000}, keep)
+
+        unfiltered, tail_none = run(None)
+        filtered, tail_keep = run(self._keep)
+        assert tail_none == tail_keep == []
+        assert filtered == [m for m in unfiltered if self._keep(m)]
+        assert 0 < len(filtered) < len(unfiltered)
+
+    @pytest.mark.parametrize("opaque, ignore_max", [
+        (True, False), (False, True), (True, True),
+    ])
+    def test_prefilter_through_the_fallbacks_equals_postfilter(
+            self, tmp_path, monkeypatch, caplog, opaque, ignore_max):
+        # End to end: whichever fallback fires, fetch_all_settled_markets with
+        # a prefilter returns exactly the unfiltered result filtered afterwards.
+        archive_markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+        # 3-hour spacing: 09-20 06:30 through 09-21 15:30, so with max_settled_ts
+        # ignored the 09-20 window's first record lands a day past its ceiling.
+        live_markets = self._markets("L", "2026-09-20T06:00:00+00:00", n=12,
+                                     step=180)
+
+        def fetch(sub, **kwargs):
+            _install_sharded_fakes(
+                monkeypatch, tmp_path / sub,
+                _FakeArchive(archive_markets, page_size=2, opaque_cursors=opaque),
+                "2026-09-20T00:00:00Z",
+            )
+            return historical.fetch_all_settled_markets(
+                MagicMock(),
+                _FakeLive(live_markets, page_size=2, ignore_max=ignore_max),
+                start_date=date(2026, 9, 17), use_cache=False, **kwargs,
+            )
+
+        out_full = fetch("full")
+        with caplog.at_level(logging.WARNING):
+            out_pref = fetch("pref", prefilter=self._keep,
+                             prefilter_tag="testpred")
+        assert list(out_pref) == [m for m in out_full if self._keep(m)]
+        assert 0 < len(out_pref) < len(out_full)
+        assert {m["ticker"][0] for m in out_pref} == {"A", "L"}
+        # The fixture really did take the fallback(s) it is parametrized for.
+        assert ("Archive fetch: sharded path unavailable" in caplog.text) is opaque
+        assert ("Live fetch: windowed path unavailable" in caplog.text) is ignore_max
 
 
 class TestJsonCacheDurability:
@@ -2898,3 +3432,1122 @@ class TestEventTitlesReturnsMergedView:
         with caplog.at_level(logging.INFO):
             historical._load_or_build_event_titles(client, {"E1"}, use_cache=False)
         assert "1 of this run's tickers answered from the accumulator" in caplog.text
+
+
+# ─── SS-1 Commit C: the streamed assembly and the streamed assembled cache ────
+#
+# A 7-day backtest (--start-date 2026-09-17) could not fit on a 16 GB host:
+# 7,260,952 of its 18,061,549 fetched past-day records passed the backtester's
+# prefilter, at a measured 3,926 B/record (~28 GB), and fetch_all_settled_
+# markets assembled them into a dict, a list copy and one whole-list
+# json.dumps. The phases now return lazy views, the assembly streams them
+# twice through one generator that must reproduce the old merge EXACTLY, and
+# the corpus is handed back as a SettledCorpus streaming the new
+# settled_markets_*.jsonl.gz cache. These tests pin exactness against the old
+# merge, the all-or-nothing cache contract, the no-fallback/no-short-corpus
+# rule, and that nothing is materialized.
+
+_SS1C_META = {"kind": "archive_created_day", "cutoff_ts": 100,
+              "include_mve": True, "complete": True}
+
+
+def _write_jsonl(path, meta, records):
+    """Publish one jsonl-v1 file through the real writer; return its path."""
+    with historical._DayStreamWriter(path, meta) as writer:
+        writer.write_records(list(records))
+        writer.commit()
+    return path
+
+
+def _day_lo(iso_date):
+    d = date.fromisoformat(iso_date)
+    return int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
+
+
+class _Tracked(dict):
+    """A parsed record that supports weak references (a plain dict does not)."""
+
+
+def _track_disk_records(monkeypatch):
+    """Make every dict _slice_loads parses observable; return an alive-counter.
+
+    Only records READ FROM DISK are tracked (day slices, the live frontier's
+    spool and the assembled cache, plus the meta line of whichever slice or
+    cache file is open). The archive tail is a list built by _market_to_dict,
+    the one documented in-memory residual of these fixtures, so it is
+    deliberately not counted.
+    """
+    refs: list = []
+    real = historical._slice_loads
+
+    def tracking(raw):
+        value = real(raw)
+        if isinstance(value, dict):
+            value = _Tracked(value)
+            refs.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(historical, "_slice_loads", tracking)
+    return lambda: sum(ref() is not None for ref in refs)
+
+
+def _completed_reads(monkeypatch):
+    """Record each path whose _day_store_iter walk ran to completion."""
+    reads: list[str] = []
+    real = historical._day_store_iter
+
+    def counting(path, expect_meta, keep=None):
+        yield from real(path, expect_meta, keep)
+        reads.append(str(path))
+
+    monkeypatch.setattr(historical, "_day_store_iter", counting)
+    return reads
+
+
+def _old_assembly(day_records, tail_records, live_records, start_ts, cutoff_ts,
+                  prefilter, titles_for):
+    """fetch_all_settled_markets' assembly BEFORE SS-1, verbatim in substance.
+
+    The ticker-keyed `selected` dict and the three _merge calls, the two log
+    counts, the unique-event-ticker set, the list copy and the event_title
+    patch gated on `titles` being truthy. Works on deep copies so the caller's
+    fixtures are never patched. Returns (markets, archive_count, live_count,
+    unique_event_tickers).
+    """
+    day_records, tail_records, live_records = (
+        copy.deepcopy(list(day_records)), copy.deepcopy(list(tail_records)),
+        copy.deepcopy(list(live_records)))
+    selected: dict = {}
+
+    def _merge(records, max_settle):
+        for m in records:
+            settle = historical._iso_epoch(m.get("settlement_ts"))
+            if settle is None or settle < start_ts:
+                continue
+            if max_settle is not None and settle >= max_settle:
+                continue
+            if prefilter is not None and not prefilter(m):
+                continue
+            ticker = m.get("ticker")
+            if ticker and ticker not in selected:
+                selected[ticker] = m
+
+    _merge(day_records, cutoff_ts)
+    _merge(tail_records, cutoff_ts)
+    archive_count = len(selected)
+    _merge(live_records, None)
+    live_count = len(selected) - archive_count
+    unique = {m.get("event_ticker") for m in selected.values() if m.get("event_ticker")}
+    titles = titles_for(unique)
+    all_markets = list(selected.values())
+    if titles:
+        for m in all_markets:
+            m["event_title"] = titles.get(m.get("event_ticker") or "", "")
+    return all_markets, archive_count, live_count, unique
+
+
+def _mapped_titles(tickers):
+    """A title map shaped like the real resolver's: every requested ticker,
+    with one left unresolved ("") so the .get(..., "") default path runs."""
+    return {t: ("" if t == "EV-B" else f"Title {t}") for t in tickers}
+
+
+class TestDayStoreIter:
+    """_day_store_iter is the one reader of the slice format (day slices and
+    the assembled cache); _day_store_load is its all-or-nothing list form and
+    keeps its external contract."""
+
+    META = _SS1C_META
+
+    @staticmethod
+    def _records(n):
+        return [{"ticker": f"T{i}", "result": "yes", "n": i} for i in range(n)]
+
+    def test_load_is_the_iterator_gathered_on_both_formats(self, tmp_path):
+        records = self._records(6)
+        jsonl = _write_jsonl(tmp_path / "a.json.gz", self.META, records)
+        legacy = tmp_path / "b.json.gz"
+        historical._day_store_save(legacy, self.META, records)
+
+        def even(m):
+            return m["n"] % 2 == 0
+
+        for path in (jsonl, legacy):
+            for keep in (None, even):
+                expected = [m for m in records if keep is None or keep(m)]
+                assert historical._day_store_load(path, self.META, keep) == expected
+                assert list(historical._day_store_iter(path, self.META, keep)) == expected
+
+    def test_every_walk_yields_fresh_dicts(self, tmp_path):
+        path = _write_jsonl(tmp_path / "a.json.gz", self.META, self._records(3))
+        first = list(historical._day_store_iter(path, self.META))
+        second = list(historical._day_store_iter(path, self.META))
+        assert first == second
+        assert all(a is not b for a, b in zip(first, second, strict=True))
+
+    def test_the_meta_is_checked_before_any_record_is_yielded(self, tmp_path):
+        path = _write_jsonl(tmp_path / "a.json.gz", self.META, self._records(3))
+        walk = historical._day_store_iter(path, {**self.META, "cutoff_ts": 200})
+        with pytest.raises(historical._SliceUnreadable, match="cutoff_ts"):
+            next(walk)
+        with pytest.raises(historical._SliceUnreadable, match="does not exist"):
+            next(historical._day_store_iter(tmp_path / "absent.json.gz", self.META))
+
+    def test_damage_raises_at_the_damage_and_the_list_form_is_all_or_nothing(
+            self, tmp_path):
+        # The iterator cannot take back what it already yielded, so it raises
+        # AT the damage; the list form must still return nothing at all.
+        path = _write_jsonl(tmp_path / "a.json.gz", self.META, self._records(6))
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        with gzip.open(path, "wb") as fh:
+            fh.write(raw[: raw.index(b'"T4"') + 2])  # cut inside T4's line
+        seen = []
+        with pytest.raises(historical._SliceUnreadable, match="malformed"):
+            for m in historical._day_store_iter(path, self.META):
+                seen.append(m["ticker"])
+        assert seen == ["T0", "T1", "T2", "T3"]
+        assert historical._day_store_load(path, self.META) is None
+
+        # And a stream cut at the gzip level (an interrupted write).
+        cut = tmp_path / "cut.json.gz"
+        whole = _write_jsonl(tmp_path / "whole.json.gz", self.META, self._records(40))
+        cut.write_bytes(whole.read_bytes()[:-12])
+        with pytest.raises(historical._SliceUnreadable):
+            list(historical._day_store_iter(cut, self.META))
+        assert historical._day_store_load(cut, self.META) is None
+
+    def test_a_damaged_deflate_stream_reads_as_unreadable_not_as_a_crash(self, tmp_path):
+        # zlib.error is NOT an OSError, and the reader before SS-1 caught only
+        # (OSError, EOFError, ValueError): a damaged deflate block escaped the
+        # reuse prescan as a crash instead of reading as "refetch this day",
+        # contradicting its own all-or-nothing contract.
+        payload = (json.dumps({"meta": self.META}) + "\n"
+                   + "".join(json.dumps(m) + "\n" for m in self._records(20))).encode()
+        blob = bytearray(gzip.compress(payload))
+        blob[10] = 0x07  # first deflate block header -> the reserved block type
+        path = tmp_path / "a.json.gz"
+        path.write_bytes(bytes(blob))
+        with pytest.raises(zlib.error):  # the failure being absorbed
+            with gzip.open(path, "rb") as fh:
+                fh.readline()
+        assert historical._day_store_load(path, self.META) is None
+        with pytest.raises(historical._SliceUnreadable):
+            list(historical._day_store_iter(path, self.META))
+
+    @pytest.mark.parametrize("fmt", ["jsonl", "legacy"])
+    def test_an_exception_from_keep_propagates_on_both_formats(self, tmp_path, fmt):
+        # A predicate failure is not a damaged file. Before SS-1 a ValueError
+        # from `keep` on the JSONL path read as "slice unreadable" (so the day
+        # was silently refetched) while on the legacy path it propagated; the
+        # reader now keeps the two apart on both formats.
+        path = tmp_path / "a.json.gz"
+        if fmt == "jsonl":
+            _write_jsonl(path, self.META, self._records(4))
+        else:
+            historical._day_store_save(path, self.META, self._records(4))
+
+        def keep(m):
+            if m["n"] == 2:
+                raise ValueError("predicate bug")
+            return True
+
+        with pytest.raises(ValueError, match="predicate bug"):
+            historical._day_store_load(path, self.META, keep)
+
+    @pytest.mark.parametrize("content", [
+        '{"meta": META}\n5\n',                            # a record that is not an object
+        '{"meta": [1, 2]}\n{"ticker": "T"}\n',            # a meta block that is not an object
+        '{"meta": META, "markets": {"a": 1}}',            # legacy "markets" not a list
+        '{"meta": META, "markets": [5]}',                 # legacy record not an object
+    ])
+    def test_a_shape_the_writers_never_produce_is_unreadable(self, tmp_path, content):
+        path = tmp_path / "a.json.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write(content.replace("META", json.dumps(self.META)))
+        assert historical._day_store_load(path, self.META) is None
+
+
+class TestDaySliceStream:
+    """A phase's day slices are handed back as a lazy _DaySliceStream: nothing
+    is read until the assembly walks it, every walk re-reads the files newest
+    day first, and a slice that goes bad mid-walk is a loud, named error —
+    never a sequential-walk fallback and never a silently short corpus."""
+
+    META = _SS1C_META
+    DAYS = ("2026-06-07", "2026-06-08", "2026-06-09")
+
+    def _publish(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        by_day = {}
+        for d in self.DAYS:
+            recs = [{"ticker": f"{d}-{i}", "n": i} for i in range(4)]
+            _write_jsonl(historical._day_store_path("archive_days", _day_lo(d)),
+                         self.META, recs)
+            by_day[_day_lo(d)] = recs
+        return by_day
+
+    def test_construction_reads_nothing_and_every_walk_rereads_the_files(
+            self, tmp_path, monkeypatch):
+        by_day = self._publish(tmp_path, monkeypatch)
+        opened: list[str] = []
+        real = historical._day_store_iter
+
+        def spy(path, expect_meta, keep=None):
+            opened.append(path.name)
+            return real(path, expect_meta, keep)
+
+        monkeypatch.setattr(historical, "_day_store_iter", spy)
+        stream = historical._assemble_day_slices("archive_days", list(by_day), self.META)
+        assert isinstance(stream, historical._DaySliceStream)
+        assert opened == []  # lazy: nothing is read until it is walked
+        first, second = list(stream), list(stream)
+        assert first == second
+        assert all(a is not b for a, b in zip(first, second, strict=True))
+        newest_first = [f"{d}.json.gz" for d in reversed(self.DAYS)]
+        assert opened == newest_first * 2
+
+    def test_it_equals_the_old_eager_assembly_in_order_and_membership(
+            self, tmp_path, monkeypatch):
+        by_day = self._publish(tmp_path, monkeypatch)
+
+        def keep(m):
+            return m["n"] != 1
+
+        # The old _assemble_day_slices, literally: load each day newest-first
+        # and extend one list.
+        expected: list[dict] = []
+        for lo in sorted(by_day, reverse=True):
+            expected.extend(historical._day_store_load(
+                historical._day_store_path("archive_days", lo), self.META, keep))
+        # Day identities arrive in pool-COMPLETION order, not sorted.
+        los = [_day_lo("2026-06-08"), _day_lo("2026-06-07"), _day_lo("2026-06-09")]
+        stream = historical._assemble_day_slices("archive_days", los, self.META, keep)
+        assert list(stream) == expected
+        assert [m["ticker"][:10] for m in expected[:3]] == ["2026-06-09"] * 3
+        assert all(m["n"] != 1 for m in expected)
+
+    @pytest.mark.parametrize("damage", ["deleted", "truncated", "rewritten"])
+    def test_a_slice_that_goes_bad_mid_walk_raises_naming_the_day(
+            self, tmp_path, monkeypatch, damage):
+        by_day = self._publish(tmp_path, monkeypatch)
+        stream = historical._assemble_day_slices("archive_days", list(by_day), self.META)
+        middle = historical._day_store_path("archive_days", _day_lo("2026-06-08"))
+        if damage == "deleted":
+            middle.unlink()
+        elif damage == "truncated":
+            middle.write_bytes(middle.read_bytes()[:-12])
+        else:  # rewritten under different fetch conditions (an advanced cutoff)
+            _write_jsonl(middle, {**self.META, "cutoff_ts": 999}, [{"ticker": "X"}])
+        got: list[str] = []
+        with pytest.raises(historical.SettledCorpusError) as info:
+            for m in stream:
+                got.append(m["ticker"])
+        # The newest day was delivered, then the walk stopped LOUDLY at the
+        # damaged day — it never skipped ahead to deliver the oldest day.
+        assert got[:4] == [f"2026-06-09-{i}" for i in range(4)]
+        assert not any(t.startswith("2026-06-07") for t in got)
+        assert "2026-06-08" in str(info.value)
+        assert "Re-run" in str(info.value)
+        assert isinstance(info.value, RuntimeError)
+
+
+class TestPhasesReturnLazyViews:
+    """The phases hand back re-iterable views, never a materialized list of
+    their day slices; the live phase chains its frontier spool in front of
+    its past-day stream in the old `frontier + [...]` order."""
+
+    def test_the_archive_phase_returns_an_unread_slice_stream(self, tmp_path, monkeypatch):
+        archive_markets, _ = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        reads = _completed_reads(monkeypatch)
+        day, tail = historical._fetch_archive_phase(
+            MagicMock(), _day_lo("2026-06-05"),
+            TestShardedFetch._ts(TestShardedFetch.CUTOFF), {"limit": 1000}, None)
+        assert isinstance(day, historical._DaySliceStream)
+        assert isinstance(tail, list)
+        # Cold run: the prescan found nothing and nothing was read back.
+        assert reads == []
+        records = list(day)
+        slices = sorted((tmp_path / "cache" / "archive_days").glob("*.json.gz"))
+        assert records and sorted(reads) == sorted(str(p) for p in slices)
+
+    def test_the_live_phase_chains_its_frontier_before_a_lazy_stream(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        frontier = [_mk_raw_market(f"F{i}", "2026-09-23T00:00:00Z",
+                                   f"2026-09-24T0{i + 1}:00:00Z") for i in range(3)]
+        past = [_mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
+                               f"2026-09-2{d}T0{i + 1}:00:00Z")
+                for d in (2, 3) for i in range(3)]
+        reads = _completed_reads(monkeypatch)
+        out = historical._fetch_live_phase(
+            _FakeLive(frontier + past, page_size=2), _day_lo("2026-09-22"),
+            _day_lo("2026-09-24") + 12 * 3600, None)
+        assert isinstance(out, historical._RecordChain)
+        # The frontier is a sealed spool, not a list (SS-1 review).
+        assert isinstance(out._parts[0], historical._FrontierSpool)
+        assert reads == []  # the past days are on disk, unread
+        tickers = [m["ticker"] for m in out]
+        assert tickers == ["F2", "F1", "F0", "P32", "P31", "P30", "P22", "P21", "P20"]
+        assert [m["ticker"] for m in out] == tickers  # re-iterable, same order
+        assert len(reads) == 4  # two past days, two walks
+        out.close()
+
+
+class TestFrontierSpool:
+    """SS-1 review: the live frontier used to be returned as a list of its
+    keep-passing records, and on the day after a Monday that is most of the
+    day (7,190,452 of 9,176,306 records on Tuesday 2026-09-22). It is spooled
+    to an anonymous temporary file instead and read back per walk, like a day
+    slice: exactly the old records in the old order, none of them resident."""
+
+    NOW = TestFrontierStreamsThroughKeep.NOW
+    TODAY = TestFrontierStreamsThroughKeep.TODAY
+    _ts = staticmethod(TestFrontierStreamsThroughKeep._ts)
+    _keep = staticmethod(TestFrontierStreamsThroughKeep._keep)
+    _frontier_markets = staticmethod(TestFrontierStreamsThroughKeep._frontier_markets)
+
+    @staticmethod
+    def _sealed(directory, records):
+        spool = historical._FrontierSpool(directory)
+        spool.extend(records)
+        spool.seal()
+        return spool
+
+    def test_no_kept_frontier_record_is_resident(self, tmp_path, monkeypatch):
+        # The KEPT half of test_rejected_frontier_record_is_never_retained:
+        # a list sink kept every one of these alive until the phase's result
+        # was dropped, so this count would climb page by page and end at the
+        # kept total.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 1)
+
+        class _Tracked(dict):
+            """A compact record that supports weak references."""
+
+        kept_refs: list = []
+        real_to_dict = historical._market_to_dict
+
+        def tracking_to_dict(m, *args, **kwargs):
+            rec = _Tracked(real_to_dict(m, *args, **kwargs))
+            if self._keep(rec):
+                kept_refs.append(weakref.ref(rec))
+            return rec
+
+        monkeypatch.setattr(historical, "_market_to_dict", tracking_to_dict)
+        alive_at_request: list[int] = []
+
+        class _ObservedLive(_FakeLive):
+            def get_markets_without_preload_content(self, *args, **kwargs):
+                alive_at_request.append(sum(ref() is not None for ref in kept_refs))
+                return super().get_markets_without_preload_content(*args, **kwargs)
+
+        markets = self._frontier_markets()
+        out = historical._fetch_live_phase(
+            _ObservedLive(markets, page_size=2), self._ts(self.TODAY) + 60,
+            self._ts(self.NOW), self._keep,
+        )
+        assert kept_refs and len(alive_at_request) >= 3
+        assert alive_at_request == [0] * len(alive_at_request)
+        assert all(ref() is None for ref in kept_refs)
+        # ...and still exactly the old post-hoc filter, on every walk.
+        expected = TestFrontierStreamsThroughKeep()._oracle(markets, self._keep)
+        first, second = list(out), list(out)
+        assert first == second == expected
+        assert all(a is not b for a, b in zip(first, second, strict=True))
+        assert len(out._parts[0]) == len(expected)
+        out.close()
+
+    def test_the_spool_is_anonymous(self, tmp_path, monkeypatch):
+        # No name, so no later run can find it, reuse it as a complete day,
+        # or be left a stale one by a crash.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        out = historical._fetch_live_phase(
+            _FakeLive(self._frontier_markets(), page_size=2),
+            self._ts(self.TODAY) + 60, self._ts(self.NOW), None,
+        )
+        assert len(list(out)) == 11
+        assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+        out.close()
+
+    def test_a_fetch_closes_the_spool_on_success_and_on_failure(self, tmp_path,
+                                                                monkeypatch):
+        spools: list = []
+        real_init = historical._FrontierSpool.__init__
+
+        def recording_init(self, directory):
+            real_init(self, directory)
+            spools.append(self)
+
+        monkeypatch.setattr(historical._FrontierSpool, "__init__", recording_init)
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+            use_cache=False)
+        assert len(out) > 0 and len(spools) == 1 and spools[0]._closed
+        with pytest.raises(historical.SettledCorpusError):
+            list(spools[0])
+
+        def titles(live_client, tickers, use_cache=True):
+            historical._day_store_path("live_days", _day_lo("2026-06-10")).unlink()
+            return {}
+
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        with pytest.raises(historical.SettledCorpusError, match="2026-06-10"):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False)
+        assert len(spools) == 2 and spools[1]._closed
+
+    def test_a_failing_phase_closes_the_spool(self, tmp_path, monkeypatch):
+        spools: list = []
+        real_init = historical._FrontierSpool.__init__
+
+        def recording_init(self, directory):
+            real_init(self, directory)
+            spools.append(self)
+
+        monkeypatch.setattr(historical._FrontierSpool, "__init__", recording_init)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+
+        def keep(m):
+            raise ValueError("keep failed")
+
+        with pytest.raises(ValueError, match="keep failed"):
+            historical._fetch_live_phase(
+                _FakeLive(self._frontier_markets(), page_size=2),
+                self._ts(self.TODAY) + 60, self._ts(self.NOW), keep,
+            )
+        assert len(spools) == 1 and spools[0]._closed
+
+    def test_lifecycle_misuse_is_loud(self, tmp_path):
+        spool = historical._FrontierSpool(tmp_path)
+        spool.extend([{"ticker": "A"}])
+        with pytest.raises(historical.SettledCorpusError, match="before it was sealed"):
+            list(spool)
+        spool.seal()
+        with pytest.raises(RuntimeError, match="after it was sealed"):
+            spool.extend([{"ticker": "B"}])
+        assert list(spool) == [{"ticker": "A"}]
+        spool.close()
+        spool.close()  # idempotent
+        with pytest.raises(historical.SettledCorpusError, match="after it was closed"):
+            list(spool)
+
+    def test_a_suspended_walk_cannot_resume_after_a_newer_one(self, tmp_path):
+        # Both walks share the one file position, so the older must stop
+        # rather than read from wherever the newer one left it.
+        spool = self._sealed(tmp_path, [{"ticker": t} for t in ("A", "B", "C")])
+        older = iter(spool)
+        assert next(older) == {"ticker": "A"}
+        assert list(spool) == [{"ticker": "A"}, {"ticker": "B"}, {"ticker": "C"}]
+        with pytest.raises(historical.SettledCorpusError, match="walks must not interleave"):
+            next(older)
+        spool.close()
+
+    def test_a_short_spool_is_never_returned_quietly(self, tmp_path):
+        spool = self._sealed(tmp_path, [{"ticker": "A"}, {"ticker": "B"}])
+        spool._count += 1  # what a lost write would look like
+        with pytest.raises(historical.SettledCorpusError, match="yielded 2 records but 3"):
+            list(spool)
+        spool.close()
+
+    def test_an_empty_spool_walks_empty(self, tmp_path):
+        spool = self._sealed(tmp_path, [])
+        assert list(spool) == [] and len(spool) == 0
+        spool.close()
+
+
+class TestVanishedSliceDuringAssembly:
+    """A slice that disappears after its phase verified or wrote it raises
+    SettledCorpusError out of fetch_all_settled_markets: the old eager
+    assembly turned this into the sequential fallback, which now would hold
+    the whole range in memory and could not take back records already
+    yielded. Nothing may be published."""
+
+    @staticmethod
+    def _forbid_fallbacks(monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(historical, "_fetch_archive_sequential",
+                            lambda *a, **k: calls.append("archive") or [])
+        monkeypatch.setattr(historical, "_fetch_live_sequential",
+                            lambda *a, **k: calls.append("live") or [])
+        return calls
+
+    @staticmethod
+    def _assert_nothing_published(tmp_path):
+        cache = tmp_path / "cache"
+        assert not list(cache.glob("settled_markets_*"))
+        assert not list(cache.rglob("*.tmp"))
+
+    def test_a_live_slice_vanishing_between_the_walks(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        fallbacks = self._forbid_fallbacks(monkeypatch)
+
+        def titles(live_client, tickers, use_cache=True):
+            # Runs between walk A and walk B.
+            historical._day_store_path("live_days", _day_lo("2026-06-10")).unlink()
+            return {}
+
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        with pytest.raises(historical.SettledCorpusError, match="2026-06-10"):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=date(2026, 6, 5),
+                use_cache=False)
+        assert fallbacks == []
+        self._assert_nothing_published(tmp_path)
+
+    def test_an_archive_slice_vanishing_before_the_first_walk(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        fallbacks = self._forbid_fallbacks(monkeypatch)
+        real_phase = historical._fetch_archive_phase
+
+        def phase_then_damage(*a, **k):
+            result = real_phase(*a, **k)
+            historical._day_store_path("archive_days", _day_lo("2026-06-08")).unlink()
+            return result
+
+        monkeypatch.setattr(historical, "_fetch_archive_phase", phase_then_damage)
+        live = _FakeLive(live_markets)
+        with pytest.raises(historical.SettledCorpusError, match="2026-06-08"):
+            historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=date(2026, 6, 5), use_cache=False)
+        assert fallbacks == []
+        # Raised by walk A's archive half, before the live phase even ran.
+        assert live.calls == 0
+        self._assert_nothing_published(tmp_path)
+
+
+class _DriftingRecords:
+    """A record source yielding `first` on its first walk and `second` after."""
+
+    def __init__(self, first, second):
+        self._first, self._second = first, second
+        self.walks = 0
+
+    def __iter__(self):
+        walk = self._first if self.walks == 0 else self._second
+        self.walks += 1
+        return iter(copy.deepcopy(walk))
+
+
+class TestStreamedAssemblyParity:
+    """The streamed assembly must reproduce the old in-memory merge EXACTLY —
+    the same records, in the same order, with the same event_title patch and
+    the same logged numbers — on every source shape and on the real phases."""
+
+    START = date(2026, 6, 5)
+    CUTOFF = "2026-06-10T00:00:00Z"
+
+    @staticmethod
+    def _rec(ticker, settle, event_ticker="EV", **extra):
+        m = {"ticker": ticker, "event_ticker": event_ticker, "event_title": "",
+             "title": f"Q {ticker}", "subtitle": None, "result": "yes",
+             "open_time": "2026-06-01T00:00:00Z", "close_time": settle,
+             "settlement_ts": settle}
+        m.update(extra)
+        return m
+
+    def _sources(self):
+        r = self._rec
+        newer_day = [
+            r("A1", "2026-06-09T10:00:00Z", "EV-A"),
+            r("DUP", "2026-06-09T09:00:00Z", "EV-D", tag="archive-newer"),
+            # Rejected by the prefilter: with it, the TAIL's SHADOW must win
+            # (prefilter before dedup); without it, this one wins.
+            r("SHADOW", "2026-06-09T08:00:00Z", "EV-S", keep=False, tag="rejected"),
+            r("PRE", "2026-06-04T23:59:59Z", "EV-P"),       # settled before the window
+            r("ATCUT", "2026-06-10T00:00:00Z", "EV-C", tag="archive"),  # at the ceiling
+            r("NOSETTLE", None, "EV-N"),
+            r("", "2026-06-09T07:00:00Z", "EV-E"),          # falsy tickers never kept
+            r(None, "2026-06-09T07:00:00Z", "EV-E"),
+            r("NOEV", "2026-06-09T06:00:00Z", "", event_title="kept-own"),
+        ]
+        older_day = [
+            r("DUP", "2026-06-08T09:00:00Z", "EV-D2", tag="archive-older"),
+            r("B1", "2026-06-08T08:00:00Z", "EV-B", event_title="stale"),
+            r("B2", "2026-06-05T00:00:00Z", "EV-B"),         # exactly at start: kept
+        ]
+        tail = [
+            r("SHADOW", "2026-06-06T10:00:00Z", "EV-S", tag="tail"),
+            r("DUP", "2026-06-07T10:00:00Z", "EV-D", tag="tail"),
+            r("T1", "2026-06-06T10:00:00Z", "EV-T"),
+            # The tail is never keep-filtered by its phase, so this rejected
+            # copy reaches the merge on EVERY source shape: with the prefilter
+            # the LIVE copy must win (prefilter before dedup), without it this.
+            r("TWIN", "2026-06-07T09:00:00Z", "EV-W", keep=False, tag="tail-rejected"),
+        ]
+        frontier = [
+            r("F1", "2026-09-24T01:00:00Z", "EV-F"),
+            r("A1", "2026-09-24T00:30:00Z", "EV-A", tag="live-dup"),
+        ]
+        live_newer = [
+            r("L1", "2026-06-11T10:00:00Z", "EV-L"),
+            r("ATCUT", "2026-06-10T00:00:00Z", "EV-C", tag="live"),  # live: kept
+        ]
+        live_older = [
+            r("L1", "2026-06-10T10:00:00Z", "EV-L", tag="older-dup"),
+            r("L2", "2026-06-10T09:00:00Z", "EV-L2"),
+            r("REJ", "2026-06-10T08:00:00Z", "EV-R", keep=False),
+            r("TWIN", "2026-06-10T07:00:00Z", "EV-W", tag="live"),
+        ]
+        return newer_day, older_day, tail, frontier, live_newer, live_older
+
+    @staticmethod
+    def _keep(m):
+        return m.get("keep", True)
+
+    def _run(self, tmp_path, monkeypatch, caplog, *, mode, prefilter, titles_for):
+        newer_day, older_day, tail, frontier, live_newer, live_older = self._sources()
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        if mode == "lists":
+            day_src = newer_day + older_day
+            live_src = frontier + live_newer + live_older
+        else:
+            # The real lazy views over real files, as the phases build them.
+            meta_a = {"kind": "archive_created_day", "cutoff_ts": 1, "include_mve": True,
+                      "complete": True}
+            meta_l = {"kind": "live_settled_day", "include_mve": True, "complete": True}
+            # Live days must lie after the cutoff, or the real
+            # _prune_stale_live_days (which the assembly runs) deletes them.
+            archive_los = (_day_lo("2026-06-09"), _day_lo("2026-06-08"))
+            live_los = (_day_lo("2026-06-11"), _day_lo("2026-06-10"))
+            for store, meta, los, days in (
+                    ("archive_days", meta_a, archive_los, (newer_day, older_day)),
+                    ("live_days", meta_l, live_los, (live_newer, live_older))):
+                for lo, recs in zip(los, days, strict=True):
+                    _write_jsonl(historical._day_store_path(store, lo), meta, recs)
+            # Handed over oldest first, as pool completion order may; the
+            # stream sorts newest first itself.
+            day_src = historical._assemble_day_slices(
+                "archive_days", sorted(archive_los), meta_a, prefilter)
+            live_src = historical._RecordChain(
+                [m for m in frontier if prefilter is None or prefilter(m)],
+                historical._assemble_day_slices("live_days", sorted(live_los), meta_l,
+                                                prefilter))
+        monkeypatch.setattr(historical, "_fetch_archive_phase",
+                            lambda *a, **k: (day_src, tail))
+        monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: live_src)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: {"market_settled_ts": self.CUTOFF})
+        asked: list[set] = []
+
+        def titles(live_client, tickers, use_cache=True):
+            asked.append(set(tickers))
+            return titles_for(tickers)
+
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        kwargs = ({"prefilter": prefilter, "prefilter_tag": "t"}
+                  if prefilter is not None else {})
+        with caplog.at_level(logging.INFO):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), MagicMock(), start_date=self.START, use_cache=False,
+                **kwargs)
+        return out, asked
+
+    @pytest.mark.parametrize("mode", ["lists", "streams"])
+    @pytest.mark.parametrize("use_prefilter", [False, True])
+    @pytest.mark.parametrize("titles_kind", ["empty", "mapped"])
+    def test_the_streamed_assembly_equals_the_old_merge(
+            self, tmp_path, monkeypatch, caplog, mode, use_prefilter, titles_kind):
+        prefilter = self._keep if use_prefilter else None
+        titles_for = _mapped_titles if titles_kind == "mapped" else (lambda _t: {})
+        out, asked = self._run(tmp_path, monkeypatch, caplog, mode=mode,
+                               prefilter=prefilter, titles_for=titles_for)
+
+        newer_day, older_day, tail, frontier, live_newer, live_older = self._sources()
+        start_ts = _day_lo("2026-06-05")
+        cutoff_ts = TestShardedFetch._ts(self.CUTOFF)
+        expected, archive_count, live_count, unique = _old_assembly(
+            newer_day + older_day, tail, frontier + live_newer + live_older,
+            start_ts, cutoff_ts, prefilter, titles_for)
+
+        assert isinstance(out, historical.SettledCorpus)
+        assert list(out) == expected           # records, order and event_title
+        assert len(out) == len(expected)
+        assert asked == [unique]               # titles resolved for the same set
+
+        messages = [r.getMessage() for r in caplog.records]
+        lines = [f"Historical endpoint: {archive_count} markets from 2026-06-05",
+                 "Fetching recently settled markets (after API cutoff)...",
+                 f"Live endpoint: {live_count} recently settled markets",
+                 f"Resolving event titles for {len(unique)} unique event_tickers",
+                 f"Total settled markets from 2026-06-05: {len(expected)}"]
+        positions = [messages.index(line) for line in lines]
+        assert positions == sorted(positions)
+
+        # Not vacuous: every rule in the fixture actually decided something.
+        by_ticker = {m["ticker"]: m for m in expected}
+        assert by_ticker["DUP"]["tag"] == "archive-newer"
+        assert by_ticker["ATCUT"]["tag"] == "live"
+        assert by_ticker["A1"].get("tag") is None
+        assert by_ticker["SHADOW"]["tag"] == ("tail" if use_prefilter else "rejected")
+        assert by_ticker["TWIN"]["tag"] == ("live" if use_prefilter else "tail-rejected")
+        assert "L1" in by_ticker and by_ticker["L1"].get("tag") is None
+        assert not {"PRE", "NOSETTLE", "", None} & set(by_ticker)
+        assert ("REJ" in by_ticker) is (not use_prefilter)
+        if titles_kind == "empty":
+            assert by_ticker["NOEV"]["event_title"] == "kept-own"
+            assert by_ticker["B1"]["event_title"] == "stale"
+        else:
+            assert by_ticker["NOEV"]["event_title"] == ""
+            assert by_ticker["B1"]["event_title"] == ""
+            assert by_ticker["L2"]["event_title"] == "Title EV-L2"
+
+    @pytest.mark.parametrize("opaque, ignore_max", [
+        (False, False), (True, False), (False, True),
+    ])
+    def test_the_real_phases_assemble_exactly_as_the_old_merge(
+            self, tmp_path, monkeypatch, opaque, ignore_max):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(
+            monkeypatch, tmp_path, _FakeArchive(archive_markets, opaque_cursors=opaque),
+            TestShardedFetch.CUTOFF)
+        monkeypatch.setattr(historical, "_load_or_build_event_titles",
+                            lambda live_client, tickers, use_cache=True: _mapped_titles(tickers))
+        captured: dict = {}
+        real_archive, real_live = historical._fetch_archive_phase, historical._fetch_live_phase
+
+        def spy_archive(*a, **k):
+            captured["archive"] = real_archive(*a, **k)
+            return captured["archive"]
+
+        def spy_live(*a, **k):
+            result = real_live(*a, **k)
+            # Copied NOW, by one extra complete walk: the fetch closes the live
+            # phase's frontier spool once its own two walks are done, so the
+            # result cannot be walked again after it returns.
+            captured["live"] = list(result)
+            return result
+
+        monkeypatch.setattr(historical, "_fetch_archive_phase", spy_archive)
+        monkeypatch.setattr(historical, "_fetch_live_phase", spy_live)
+
+        def pred(m):
+            return not m["ticker"].endswith("2")
+
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets, ignore_max=ignore_max),
+            start_date=self.START, use_cache=False, prefilter=pred, prefilter_tag="t")
+        day, tail = captured["archive"]
+        expected, _, _, _ = _old_assembly(
+            day, tail, captured["live"], _day_lo("2026-06-05"),
+            TestShardedFetch._ts(TestShardedFetch.CUTOFF), pred, _mapped_titles)
+        assert list(out) == expected
+        assert {"A1", "LONGLIVED", "L1", "L3"} <= {m["ticker"] for m in expected}
+        assert all(m["event_title"] == f"Title {m['event_ticker']}" for m in expected)
+
+    @pytest.mark.parametrize("drift", ["fewer", "reordered", "event_ticker"])
+    def test_a_second_walk_that_disagrees_publishes_nothing(
+            self, tmp_path, monkeypatch, drift):
+        r = self._rec
+        first = [r("L1", "2026-06-11T10:00:00Z", "EV-1"),
+                 r("L2", "2026-06-11T09:00:00Z", "EV-2"),
+                 r("L3", "2026-06-11T08:00:00Z", "EV-3")]
+        if drift == "fewer":
+            second = first[:2]
+        elif drift == "reordered":
+            second = [first[1], first[0], first[2]]
+        else:  # same tickers, same order; one record's event_ticker changed
+            second = [first[0], r("L2", "2026-06-11T09:00:00Z", "EV-OTHER"), first[2]]
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(historical, "_fetch_archive_phase", lambda *a, **k: ([], []))
+        source = _DriftingRecords(first, second)
+        monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: source)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: {"market_settled_ts": self.CUTOFF})
+        monkeypatch.setattr(historical, "_load_or_build_event_titles",
+                            lambda *a, **k: {})
+        with pytest.raises(historical.SettledCorpusError, match="did not reproduce"):
+            historical.fetch_all_settled_markets(
+                MagicMock(), MagicMock(), start_date=self.START, use_cache=False)
+        assert source.walks == 2
+        TestVanishedSliceDuringAssembly._assert_nothing_published(tmp_path)
+
+
+class TestStreamedAssembledCache:
+    """The assembled cache is settled_markets_<...>.jsonl.gz, written through
+    the atomic streaming writer and served back as a SettledCorpus after a
+    full validation walk (all or nothing). A legacy settled_markets_<...>.json
+    is still served, whole, as a list — but only when no valid streamed cache
+    exists, and nothing writes that format any more."""
+
+    START = date(2026, 6, 5)
+
+    def _fetch(self, tmp_path, monkeypatch, use_cache=False):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=self.START,
+            use_cache=use_cache)
+        return out, archive, live_markets
+
+    def _again(self, live_markets, use_cache=True):
+        live = _FakeLive(live_markets)
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), live, start_date=self.START, use_cache=use_cache)
+        return out, live
+
+    def test_a_fetch_streams_into_the_cache_and_a_hit_streams_it_back(
+            self, tmp_path, monkeypatch, caplog):
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
+        path = tmp_path / "cache" / "settled_markets_2026-06-05.jsonl.gz"
+        assert isinstance(out, historical.SettledCorpus)
+        assert out.path == path
+        first, second = list(out), list(out)
+        assert first == second and len(out) == len(first) > 0
+        assert all(a is not b for a, b in zip(first, second, strict=True))
+        # The file IS the corpus, in jsonl-v1 framing, and its meta repeats
+        # the identity the filename encodes.
+        assert _read_slice_file(path) == first
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            meta = json.loads(fh.readline())["meta"]
+        expected_meta = historical._assembled_cache_meta(self.START, None)
+        assert {k: meta[k] for k in expected_meta} == expected_meta
+        assert not list((tmp_path / "cache").glob("settled_markets_*.json"))
+
+        archive.calls = 0
+        with caplog.at_level(logging.INFO):
+            hit, live = self._again(live_markets)
+        assert isinstance(hit, historical.SettledCorpus)
+        assert list(hit) == first and len(hit) == len(first)
+        assert archive.calls == 0 and live.calls == 0
+        assert f"Loaded {len(first)} settled markets from cache" in caplog.text
+
+    @pytest.mark.parametrize("damage", ["truncated", "mid_record", "other_kind"])
+    def test_a_damaged_cache_is_a_miss_with_a_warning_and_is_rebuilt(
+            self, tmp_path, monkeypatch, caplog, damage):
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
+        good, path = list(out), out.path
+        if damage == "truncated":
+            data = path.read_bytes()
+            path.write_bytes(data[: len(data) // 2])
+        elif damage == "mid_record":
+            with gzip.open(path, "rb") as fh:
+                raw = fh.read()
+            with gzip.open(path, "wb") as fh:
+                fh.write(raw[: raw.rindex(b"\n", 0, len(raw) - 1) + 10])
+        else:  # a valid jsonl-v1 file of another kind copied onto the name
+            _write_jsonl(path, {"kind": "live_settled_day", "include_mve": True,
+                                "complete": True}, good)
+        archive.calls = 0
+        with caplog.at_level(logging.WARNING):
+            rebuilt, _ = self._again(live_markets)
+        assert "Corrupt or mismatched settled-market cache" in caplog.text
+        assert archive.calls > 0  # rebuilt from the API + day slices, not served
+        assert list(rebuilt) == good
+        assert historical.SettledCorpus.open_validated(
+            path, historical._assembled_cache_meta(self.START, None)) is not None
+
+    def test_a_legacy_json_cache_is_still_served_whole_as_a_list(
+            self, tmp_path, monkeypatch, caplog):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
+        legacy = [{"ticker": "OLD1", "event_title": "x"}, {"ticker": "OLD2"}]
+        (tmp_path / "cache").mkdir(parents=True)
+        (tmp_path / "cache" / "settled_markets_2026-06-05.json").write_text(json.dumps(legacy))
+        with caplog.at_level(logging.INFO):
+            out, live = self._again(live_markets)
+        assert type(out) is list and out == legacy
+        assert archive.calls == 0 and live.calls == 0
+        assert "Loaded 2 settled markets from cache" in caplog.text
+        assert not list((tmp_path / "cache").glob("*.jsonl.gz"))  # a hit writes nothing
+
+    def test_the_streamed_cache_wins_over_a_legacy_one_and_a_rebuild_retires_it(
+            self, tmp_path, monkeypatch, caplog):
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
+        fresh = list(out)
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path.write_text(json.dumps([{"ticker": "STALE"}]))
+
+        hit, _ = self._again(live_markets)
+        assert isinstance(hit, historical.SettledCorpus) and list(hit) == fresh
+        # A hit changes nothing on disk.
+        assert legacy_path.read_text() == '[{"ticker": "STALE"}]'
+
+        archive.calls = 0
+        with caplog.at_level(logging.INFO):
+            refreshed, _ = self._again(live_markets, use_cache=False)
+        assert archive.calls > 0
+        assert isinstance(refreshed, historical.SettledCorpus)
+        assert list(refreshed) == fresh
+        # The committed rebuild supersedes the legacy file of the same
+        # identity, as the old code's rebuild overwrote it in place — and says
+        # so, since it can be a GB-scale file.
+        assert not legacy_path.exists()
+        assert ("Removed the superseded legacy settled-market cache "
+                "settled_markets_2026-06-05.json") in caplog.text
+
+    @pytest.mark.parametrize("loss", ["damaged", "vanished", "rename_reverted"])
+    def test_a_superseded_legacy_cache_is_never_served_again(
+            self, tmp_path, monkeypatch, caplog, loss):
+        # SS-1 review: a legacy .json of the same identity used to outlive the
+        # rebuild that superseded it and come back whenever the .jsonl.gz was
+        # damaged (after a WARNING claiming a cache miss) or missing (silently)
+        # — including the way iCloud has already reverted a committed rename in
+        # this repo. The stale corpus must never be served.
+        stale = [{"ticker": "STALE1"}, {"ticker": "STALE2"}]
+        (tmp_path / "cache").mkdir(parents=True)
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path.write_text(json.dumps(stale))
+        # The operator's rebuild (the BS-02 / subtitle-drift remedy).
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
+        fresh = list(out)
+        assert fresh and not legacy_path.exists()
+        if loss == "damaged":
+            data = out.path.read_bytes()
+            out.path.write_bytes(data[: len(data) // 2])
+        elif loss == "vanished":
+            out.path.unlink()
+        else:
+            out.path.rename(out.path.with_name(out.path.name + ".tmp"))
+
+        archive.calls = 0
+        with caplog.at_level(logging.INFO):
+            again, _ = self._again(live_markets)
+        assert archive.calls > 0  # rebuilt, not served from any cache
+        assert list(again) == fresh
+        assert "STALE" not in caplog.text
+        assert "Loaded" not in caplog.text
+
+    def test_a_damaged_streamed_cache_rebuilds_rather_than_serving_a_legacy_file(
+            self, tmp_path, monkeypatch, caplog):
+        # The other half: even if a legacy file of the same identity is
+        # present beside a DAMAGED streamed cache (its retirement failed, or
+        # it was restored by hand), the brief's rule holds — an invalid
+        # streamed cache is a WARNING and a REBUILD, never a fall-through to
+        # the older assembly the streamed one superseded.
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
+        fresh = list(out)
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path.write_text(json.dumps([{"ticker": "STALE"}]))
+        data = out.path.read_bytes()
+        out.path.write_bytes(data[: len(data) // 2])
+
+        archive.calls = 0
+        with caplog.at_level(logging.INFO):
+            rebuilt, _ = self._again(live_markets)
+        assert "Corrupt or mismatched settled-market cache" in caplog.text
+        assert archive.calls > 0
+        assert isinstance(rebuilt, historical.SettledCorpus)
+        assert list(rebuilt) == fresh
+        assert not legacy_path.exists()
+
+    def test_a_rebuild_that_publishes_nothing_retires_nothing(self, tmp_path, monkeypatch):
+        # The legacy file is deleted only AFTER the replacement is committed:
+        # a rebuild that fails leaves the operator's existing cache in place,
+        # exactly as the old atomic overwrite did.
+        (tmp_path / "cache").mkdir(parents=True)
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path.write_text(json.dumps([{"ticker": "KEEP"}]))
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+
+        def titles(live_client, tickers, use_cache=True):
+            # Between walk A and walk B: walk B cannot reproduce walk A.
+            historical._day_store_path("live_days", _day_lo("2026-06-10")).unlink()
+            return {}
+
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        with pytest.raises(historical.SettledCorpusError):
+            historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=self.START,
+                use_cache=False)
+        assert legacy_path.read_text() == '[{"ticker": "KEEP"}]'
+        assert not (tmp_path / "cache" / "settled_markets_2026-06-05.jsonl.gz").exists()
+
+    def test_retiring_the_legacy_cache(self, tmp_path, caplog):
+        streamed = tmp_path / "settled_markets_2026-06-05.jsonl.gz"
+        # Absent: the common case, silently nothing.
+        with caplog.at_level(logging.INFO):
+            historical._retire_legacy_cache(tmp_path / "absent.json", streamed)
+        assert caplog.text == ""
+        # Cannot be removed (a directory stands in for a locked file): a
+        # WARNING telling the operator to delete it, and the run goes on.
+        blocked = tmp_path / "settled_markets_2026-06-05.json"
+        blocked.mkdir()
+        with caplog.at_level(logging.WARNING):
+            historical._retire_legacy_cache(blocked, streamed)
+        assert "Could not remove the superseded legacy settled-market cache" in caplog.text
+        assert "Delete it by hand" in caplog.text
+        assert blocked.exists()
+
+    def test_a_corpus_walk_raises_when_its_file_is_replaced_or_vanishes(
+            self, tmp_path, monkeypatch):
+        out, _, _ = self._fetch(tmp_path, monkeypatch)
+        records, n = list(out), len(out)
+        assert n > 1
+        # Replaced (atomically, by the same writer) with one record fewer: a
+        # COMPLETE walk must not end as if nothing happened.
+        _write_jsonl(out.path, historical._assembled_cache_meta(self.START, None),
+                     records[:-1])
+        with pytest.raises(historical.SettledCorpusError, match=f"held {n}"):
+            list(out)
+        # An abandoned walk claims nothing and is not checked.
+        assert next(iter(out))["ticker"] == records[0]["ticker"]
+        out.path.unlink()
+        with pytest.raises(historical.SettledCorpusError, match="Re-run"):
+            list(out)
+
+
+class TestNothingIsMaterialized:
+    """The point of SS-1 Commit C. Every record parsed off disk is made weakly
+    referenceable and counted while alive: between the two assembly walks (the
+    old code held every selected record in a dict right there), at every
+    record written into the assembled cache, and at every step of a walk over
+    the returned corpus. At most the record in hand plus the open file's meta
+    line may be alive — a bound independent of how many records there are."""
+
+    def test_no_record_read_off_disk_outlives_its_turn(self, tmp_path, monkeypatch):
+        alive = _track_disk_records(monkeypatch)
+        archive_markets = [
+            _mk_raw_market(f"A{d}{i:02d}", f"2026-06-0{d}T{i:02d}:10:00Z",
+                           f"2026-06-0{d}T{i:02d}:40:00Z")
+            for d in (6, 7, 8) for i in range(12)
+        ]
+        live_markets = [
+            _mk_raw_market(f"L{d}{i:02d}", f"2026-06-{d}T00:00:00Z",
+                           f"2026-06-{d}T{i:02d}:30:00Z")
+            for d in (10, 11) for i in range(12)
+        ]
+        _install_sharded_fakes(monkeypatch, tmp_path,
+                               _FakeArchive(archive_markets, page_size=5),
+                               TestShardedFetch.CUTOFF)
+        at_titles: list[int] = []
+
+        def titles(live_client, tickers, use_cache=True):
+            at_titles.append(alive())
+            return {}
+
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        at_write: list[int] = []
+        real_write = historical._DayStreamWriter.write_record
+
+        def spy_write(self, record):
+            at_write.append(alive())
+            return real_write(self, record)
+
+        monkeypatch.setattr(historical._DayStreamWriter, "write_record", spy_write)
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets, page_size=5),
+            start_date=date(2026, 6, 5), use_cache=False)
+
+        n = len(out)
+        assert n == len(archive_markets) + len(live_markets) == 60
+        assert at_titles == [0]
+        assert len(at_write) == n and max(at_write) <= 2
+        assert alive() == 0
+        during = [alive() for _record in out]
+        assert len(during) == n and max(during) <= 2
+        assert alive() == 0

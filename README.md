@@ -131,8 +131,20 @@ backtest.py (CLI)
   ├─ backtester.run_backtest_sweep()         — run_backtest() is the plain two-tuple wrapper other callers use
   │    ├─ _prepare_candidates()                   — band- AND k-independent; runs once no matter how many
   │    │    │                                        bands or k's are simulated
-  │    │    ├─ historical.fetch_all_settled_markets() — market metadata
-  │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
+  │    │    ├─ historical.fetch_all_settled_markets() — market metadata, returned as a SettledCorpus
+  │    │    │     │                                    (streams settled_markets_*.jsonl.gz on every walk;
+  │    │    │     │                                    a legacy .json cache hit is still one list)
+  │    │    │     ├─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
+  │    │    │     └─ assembly walk A / walk B         — both stream the day slices (and the current
+  │    │    │                                          day, spooled to an anonymous temp file) lazily
+  │    │    │                                          through one merge generator: A counts and
+  │    │    │                                          collects event tickers for title resolution,
+  │    │    │                                          B patches titles and writes the cache — the
+  │    │    │                                          corpus is never held
+  │    │    ├─ _index_eligible_keys()                 — walk 1: count, prefilter, census, hash both grouping keys
+  │    │    ├─ _materialize_groupable()               — walk 2: keep only eligible markets sharing a key with
+  │    │    │                                           another (the rest form single-member groups, which both
+  │    │    │                                           groupings drop) — then group and extract pairs on those
   │    │    └─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers;
   │    │                                               each from the later of --start-date and the market's own
   │    │                                               open; a window over the 5,000-candle cap is paged)
@@ -245,13 +257,18 @@ falls back to `kalshi_private_key.pem` when it's absent.
   scheduler_state.json            ← Scheduler's claimed-slot record (auto-created)
   backtest_dashboard_<ts>.html    ← Backtest HTML dashboard (auto-created per run)
   backtest_cache/                ← Disk cache for historical data
-    settled_markets_*.json        ← Assembled market list, keyed by start date (and by
+    settled_markets_*.jsonl.gz    ← Assembled market corpus (gzipped JSON lines, streamed —
+                                    never loaded whole), keyed by start date (and by
                                     eligibility-filter tag when the backtester filters
                                     during assembly, so subsets never mix with full lists,
                                     and by a trailing `_nomve` when INCLUDE_MVE_MARKETS is
                                     False, since that flag changes which markets are
                                     fetched at all — the default True keeps the unmarked
-                                    name, so existing caches stay valid)
+                                    name). Legacy `settled_markets_*.json` files of the
+                                    same name stem are still read (whole) when no
+                                    .jsonl.gz exists at all, are never written any more,
+                                    and are deleted once a rebuild of the same name stem
+                                    has written its .jsonl.gz
     event_titles.json             ← Cross-run event-title accumulator (merged, not overwritten)
     archive_days/                 ← Per-created-day archive slices (incremental/resumable)
     live_days/                    ← Per-settled-day recent-market slices (incremental/resumable)
@@ -494,19 +511,36 @@ during the replay), not today's real date. Optional; omit for no limit.
 The settled-market fetch is sharded into one slice per UTC day and fetched with
 `SETTLED_FETCH_MAX_WORKERS` (default 8) parallel workers; each worker writes its
 own completed slice to `backtest_cache/archive_days/` / `backtest_cache/live_days/`
-and then releases it, so memory use stays flat no matter how many days the run
-spans — the final record list is streamed back off disk once every slice is
-present. An interrupted fetch resumes at day granularity, and `--no-cache`
+and then releases it, so the day slices cost no memory however many days the
+run spans. The current (partial) UTC day, which is never saved as a slice, is
+filtered as it arrives and written to a private temporary file that disappears
+with the run. The market records are never assembled in memory either: once
+every slice is present, the slices are streamed off disk twice (once to count
+the markets and collect the event tickers whose titles are resolved, once to
+write every market into the assembled `settled_markets_*.jsonl.gz` cache), and
+the backtester then streams that file on each of its own walks. What still
+grows with the run is much smaller, because it holds strings rather than whole
+records: the set of market tickers each of those two walks keeps to drop
+duplicates, and the event tickers and titles being resolved. Three record lists
+also remain: the archive tail (capped by `ARCHIVE_TAIL_MAX_RECORDS`), a
+sequential fallback's whole result if the sharded fetch ever falls back to one,
+and a legacy `settled_markets_*.json` cache, which is read whole when it is
+served. An interrupted fetch resumes at day granularity, and `--no-cache`
 reuses the day slices (they cannot go stale — see CLAUDE.md), so a refresh only
-fetches the current day plus any days not yet on disk.
+fetches the current day plus any days not yet on disk. If a day slice disappears or is damaged while it is being streamed, the
+run stops with an error naming the day rather than continuing with a short
+corpus; re-running refetches that day.
 
 **One-time cache rebuild (BS-02).** Assembled `settled_markets_*.json` files
 written before the archive stop rule was fixed can be missing *long-lived*
 markets — ones created before `--start-date` that settled inside the window.
 The archive is ordered by creation time, and the old walk stopped too early to
 reach them. Run the backtest once with `--no-cache` to rebuild those assembled
-files; the per-day slice files under `archive_days/` and `live_days/` are
-unaffected and are reused, so the rebuild re-pays only the tail walk. That tail
+files (the rebuild is written in the streamed `.jsonl.gz` format and, once it
+is written, deletes the old `.json` of the same name, just as a rebuild used to
+overwrite it); the per-day slice files under
+`archive_days/` and `live_days/` are unaffected and are reused, so the rebuild
+re-pays only the tail walk. That tail
 is *not* free: it is never slice-cached, so it is a sequential, one-page-at-a-
 time walk down created-time history that is re-paid on **every** run, rebuild or
 not. It stops after `ARCHIVE_MAX_BARREN_PAGES` (50) consecutive pages with no

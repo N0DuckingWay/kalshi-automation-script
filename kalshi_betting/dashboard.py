@@ -753,9 +753,11 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
     """
     Render the outcome-label census as a line, or as a banner when it is low.
 
-    The figure this prints is the one backtester._log_outcome_label_coverage()
-    already logged — the SAME measurement from the same single pass over the
-    same corpus, carried through BacktestSweep.label_coverage — so the page and
+    The figure this prints is the one backtester's outcome-label census
+    already logged (backtester._report_outcome_label_coverage(), which
+    _log_outcome_label_coverage() and _prepare_candidates both report through)
+    — the SAME measurement from the same single pass over the same corpus,
+    carried through BacktestSweep.label_coverage — so the page and
     the log can never report two different numbers. The below-floor verdict is
     likewise the carried one, never re-derived here: the constant is imported
     only to PRINT where the floor sits.
@@ -846,8 +848,12 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
         "different strategy. "
         "<b>Remedy:</b> delete <code>backtest_cache/archive_days/</code> and "
         "<code>backtest_cache/live_days/</code>, then re-run with "
+        # Names BOTH assembled-cache spellings (the streamed .jsonl.gz SS-1
+        # writes and any legacy .json beside it), in step with the WARNING
+        # backtester._report_outcome_label_coverage logs for the same verdict.
         "<code>--no-cache</code> (equivalently, also delete the assembled "
-        "<code>backtest_cache/settled_markets_*.json</code>); "
+        "<code>backtest_cache/settled_markets_*.jsonl.gz</code> and any legacy "
+        "<code>settled_markets_*.json</code>); "
         "<code>--no-cache</code> ALONE does not refresh the day slices, which "
         "are reused unconditionally."
         "</div>"
