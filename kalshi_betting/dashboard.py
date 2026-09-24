@@ -24,8 +24,12 @@ Dependencies:
     Imports BacktestSweep, BacktestTrade, OutcomeLabelCoverage and SweepPoint
     from backtester.py, plus its _exact_label() — the injective float formatter
     its completion lines use, reused so no two scenario-explorer labels can
-    collide — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
+    collide — and its _DAY_SECONDS, the one-day pad its candle fetch adds past
+    each market's close (the candle-cap notice's third input) — and
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST and
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES (the candle-cap notice's two inputs),
     create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
@@ -63,7 +67,7 @@ Notes:
     Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE a
     trace's data wholesale from a fixed list baked in at render time, not
     combine two independently-chosen indices into one lookup. It therefore
-    carries its own small (~80-line) inline vanilla-JS script that reads one
+    carries its own small (~100-line) inline vanilla-JS script that reads one
     `<script type="application/json">` data block and drives a `Plotly.restyle`
     call plus two plain HTML table re-renders — no new dependency, and no
     hand-rolled charting: Plotly still owns every pixel that gets drawn.
@@ -72,7 +76,18 @@ Notes:
     ladder setting (DR-73) under the Period line, or "not recorded" when the
     run passed no sweep: the ladder setting decides which pairs exist and the
     band which of them are ever entered, so, like DR-66b's strike-blind
-    notice, they qualify every section rather than only the explorer.
+    notice, they qualify every section rather than only the explorer. A red
+    header line also flags a window whose latest-closing markets need a
+    longer candlestick request than one can serve
+    (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST, counted from --start-date to
+    a day past each close): every market closing beyond that had no candles
+    and could never enter.
+
+    The scenario explorer's heatmap, fragility banner and equity curve read
+    the "time_series" population — every time-series entry simulated alone,
+    same-title excluded — never the "all" one, so a same-title result (band-
+    and k-independent) cannot dilute the band x k comparison; "all" keeps its
+    own labelled KPI row.
 """
 import html
 import json
@@ -89,6 +104,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import (
+    _DAY_SECONDS,
     BacktestSweep,
     BacktestTrade,
     OutcomeLabelCoverage,
@@ -98,6 +114,8 @@ from .backtester import (
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST,
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
     TRADING_DAYS_PER_YEAR,
@@ -1150,8 +1168,29 @@ _EQUITY_DAILY_MAX_ROWS = 400
 # The standalone populations one band x k cell can carry, in the ORDER the
 # page's data block indexes them by (it ships this tuple as "populations", and
 # the inline script resolves names through it rather than hard-coding
-# positions).
-_SCENARIO_POPULATIONS = ("all", "ladder", "cross")
+# positions — so this order is an index, not a display order).
+_SCENARIO_POPULATIONS = ("all", "ladder", "cross", "time_series")
+
+# The population the heatmap, the fragility banner and the equity curve read:
+# every time-series entry (ladders + cross-event) simulated alone, same-title
+# excluded. The band and k act on time-series pairs only, and a same-title
+# pair prices on the fixed co-resolution prior, so an "all" cell carrying
+# same-title trades would dilute the very comparison the explorer exists for
+# — and the DR-73 calibration evidence the grid is read against was
+# time-series only (its "All" row was 330 = 299 ladder + 31 cross-event
+# entries). "all" keeps its own labelled KPI row.
+_HEADLINE_POPULATION = "time_series"
+
+# Every population's label on the page, spelled once so the KPI rows, the
+# banner, the heatmap title and the curve title can never name one
+# population two ways.
+_POPULATION_LABELS = {
+    "time_series": "Time-series (ladders + cross-event; same-title excluded)",
+    "all": "All (time-series + same-title)",
+    "ladder": "Ladders (same-event)",
+    "cross": "Cross-event",
+    "same_title": "Same-title (independent of band and k)",
+}
 
 
 def _row_label(band: tuple[float, float]) -> str:
@@ -1379,16 +1418,46 @@ def _point_kpis(point: SweepPoint) -> dict:
     }
 
 
-def _all_point_extras(point: SweepPoint) -> dict:
+def _measured_half(half_return: float, half_entries: int | None) -> float | None:
     """
-    Compute the extra fields only an "all"-population point carries.
+    Return a split-half return, or None when that half had no entries.
+
+    An empty half's simulation enters nothing, so its return reads 0.0 —
+    indistinguishable from a half that traded and broke even. Rendering that
+    0.0 would put a non-measurement into the heatmap and, worse, into the
+    split-half rank correlation, where a column of tied zeros is scored as if
+    it were data. HalfSplit carries the entry counts precisely so this can be
+    told apart.
 
     Args:
-        point (SweepPoint): An "all"-population point (band sweep or not).
+        half_return (float): HalfSplit.h1_return or h2_return.
+        half_entries (int | None): The matching h1_entries / h2_entries. None
+            (not recorded — a hand-built HalfSplit) keeps the return, since
+            nothing says the half was empty.
 
     Returns:
-        dict: {h1_return, h2_return} read off point.halves (None when halves
-            was never computed — a run without the band sweep), and
+        float | None: half_return, or None when half_entries is exactly 0.
+    """
+    return None if half_entries == 0 else half_return
+
+
+def _robustness_extras(point: SweepPoint) -> dict:
+    """
+    Compute the split-half and concentration fields a checked point carries.
+
+    A band sweep runs both checks on its "all" and "time_series" points
+    (backtester._sweep_from_candidates); every other population carries
+    neither.
+
+    Args:
+        point (SweepPoint): An "all" or "time_series" point (band sweep or
+            not).
+
+    Returns:
+        dict: {h1_return, h2_return} read off point.halves — None when halves
+            was never computed (a run without the band sweep) and, for each
+            half on its own, None when that half had NO entries
+            (_measured_half), since an empty half's 0.0 is not a return — and
             {top_event, top_event_share, ex_top_return}. top_event and
             ex_top_return are read straight off point.ex_top_event — the event
             and the return of a RE-SIMULATION without its entries — never
@@ -1400,8 +1469,10 @@ def _all_point_extras(point: SweepPoint) -> dict:
             positive P&L. All three are None when ex_top_event is None (not
             a band-sweep point, or no trade on the point names an event).
     """
-    h1 = point.halves.h1_return if point.halves is not None else None
-    h2 = point.halves.h2_return if point.halves is not None else None
+    h1 = h2 = None
+    if point.halves is not None:
+        h1 = _measured_half(point.halves.h1_return, point.halves.h1_entries)
+        h2 = _measured_half(point.halves.h2_return, point.halves.h2_entries)
     top_name = top_share = ex_top_return = None
     if point.ex_top_event is not None:
         top_name, ex_top_return = point.ex_top_event
@@ -1464,8 +1535,10 @@ _SCENARIO_EXPLORER_JS = r"""
       + TD + fmtFixed(k.sharpe, 2) + ' / ' + fmtFixed(k.sortino, 2) + '</td></tr>';
   }
 
-  // The All row's split-half and concentration figures, on a sub-row of it.
-  function allExtrasRow(a) {
+  // A checked row's split-half and concentration figures, on a sub-row of it
+  // (the time-series row and the All row carry them; H1/H2 read "—" for a
+  // half that had no entries, since its 0.0 would not be a return).
+  function extrasRow(a) {
     var line = '—';
     if (a) {
       line = 'H1 return: ' + fmtPct(a.h1_return) + ' | H2 return: ' + fmtPct(a.h2_return);
@@ -1503,16 +1576,22 @@ _SCENARIO_EXPLORER_JS = r"""
   function render() {
     var bi = parseInt(bandSel.value, 10), ki = parseInt(kSel.value, 10);
     var cell = data.cells[bi][ki];
-    var all = cell[P.all];
+    var L = data.labels;
+    // The headline (time-series) population first — the one the heatmap and
+    // banner read — then its two parts, then All and Same-title, each row
+    // named by its own label so no two populations can be mistaken.
+    var ts = cell[P.time_series];
     document.getElementById('scn-kpi-body').innerHTML =
-      kpiRow('All', all) + allExtrasRow(all)
-      + kpiRow('Ladders', cell[P.ladder]) + kpiRow('Cross-event', cell[P.cross])
-      + kpiRow('Same-title (independent of band and k)', data.same_title);
+      kpiRow(esc(L.time_series), ts) + extrasRow(ts)
+      + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
+      + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
+      + kpiRow(esc(L.same_title), data.same_title);
     document.getElementById('scn-cal-body').innerHTML = calRows(data.calibration_by_band[bi]);
 
     // Every curve is already on the shared date axis (data.dates), so x is
-    // the axis itself, never a slice of it.
-    var values = (all && all.equity) ? all.equity : [];
+    // the axis itself, never a slice of it. The curve is the headline
+    // population's, like the heatmap.
+    var values = (ts && ts.equity) ? ts.equity : [];
     if (window.Plotly && document.getElementById('scn-equity')) {
       Plotly.restyle('scn-equity', {x: [values.length ? data.dates : []], y: [values]});
     }
@@ -1546,6 +1625,68 @@ def _scenario_explorer_empty_reason(sweep: BacktestSweep) -> str:
     if sweep.label_coverage is None:
         return "infeasible window (no trades and no census)"
     return "band sweep off (--no-band-sweep / band_sweep=False)"
+
+
+def _candle_cap_notice(start_date: date, today: date) -> str | None:
+    """
+    Say, in one sentence, when the window is too long for the candle fetch.
+
+    backtester._fetch_candles_parallel opens EVERY ticker's candlestick
+    request at the run's start date (midnight UTC) and ends it one day past
+    that market's close (backtester._DAY_SECONDS), and
+    historical.fetch_candlesticks makes one unpaginated GET per ticker, which
+    Kalshi refuses (HTTP 400, caught and read as "no candles") once the
+    request spans more than config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+    candles. So every market closing more than the cap LESS that one-day pad
+    after the start date silently had no price series and could never enter —
+    the trades, and every band x k cell of the scenario explorer, then
+    describe a truncated population rather than the one the window names.
+    The cap and the cutoff in days are derived from config's two constants
+    and the fetch's pad, never written down.
+
+    The test is the LONGEST request the window can produce, not the window's
+    own length: a settled market can close as late as the end of `today`
+    (the window's last, still-running UTC day), and its request then runs one
+    more day past that. Testing the bare window length instead stays silent on
+    the last two days' worth of windows whose latest-closing markets already
+    exceed the cap.
+
+    Args:
+        start_date (date): The backtest's --start-date.
+        today (date): The window's last day, today's UTC date — the same
+            "today" the page's Period line prints.
+
+    Returns:
+        str | None: The notice text (plain, un-escaped), or None when even a
+            market closing at the end of `today` gets a request within the
+            cap — i.e. when (days + 1) days to the end of today, plus the
+            fetch's one-day pad, span at most
+            CANDLESTICK_MAX_CANDLES_PER_REQUEST candles of
+            CANDLESTICK_PERIOD_INTERVAL_MINUTES each.
+    """
+    days = (today - start_date).days
+    cap_seconds = CANDLESTICK_MAX_CANDLES_PER_REQUEST * CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+    # The longest request the window can produce: from start_date midnight to
+    # a close at the END of today (a settled market closes no later than
+    # now), plus the one-day pad _fetch_candles_parallel adds past the close.
+    longest_request_seconds = (days + 1) * _DAY_SECONDS + _DAY_SECONDS
+    if longest_request_seconds <= cap_seconds:
+        return None
+    cap_days = cap_seconds / _DAY_SECONDS
+    # A market's request is refused once its CLOSE is further than the cap,
+    # less the pad, after start_date.
+    cutoff_days = (cap_seconds - _DAY_SECONDS) / _DAY_SECONDS
+    unit = ("hourly" if CANDLESTICK_PERIOD_INTERVAL_MINUTES == 60
+            else f"{CANDLESTICK_PERIOD_INTERVAL_MINUTES}-minute")
+    return (
+        f"This window spans {days:,} days, but every candlestick request opens at "
+        f"--start-date and runs to a day past the market's close, and Kalshi serves at "
+        f"most {CANDLESTICK_MAX_CANDLES_PER_REQUEST:,} {unit} candles per request (about "
+        f"{cap_days:.0f} days), so markets closing more than about {cutoff_days:.0f} days "
+        "after it had no candles and could never enter. The trades on this page, and the "
+        "scenario explorer, do not describe the full population: do not choose a band or "
+        "k from the explorer on this window."
+    )
 
 
 def _run_settings_html(sweep: BacktestSweep | None) -> str:
@@ -1584,35 +1725,60 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     )
 
 
-def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
+def _section_scenario_explorer(sweep: BacktestSweep | None, *,
+                               candle_notice: str | None = None) -> str:
     """
     Build the "Scenario Explorer" HTML section.
 
     Renders BacktestSweep.scenarios — every (spread band, k) cell of a band
-    sweep, each with standalone "all" / "ladder" / "cross" simulations — so
-    that choosing a band and k from a backtest happens with the grid's
-    fragility on screen rather than from one flattering cell. In order:
+    sweep, each with standalone "all" / "time_series" / "ladder" / "cross"
+    simulations — so that choosing a band and k from a backtest happens with
+    the grid's fragility on screen rather than from one flattering cell.
 
-      1. A fragility banner, first: how many band x k cells were computed,
-         the share with a positive total return, the split-half rank
-         correlation (Spearman) of the cells' H1 vs H2 returns, and the
-         sentence this section exists to put on the page — the best of that
-         many correlated cells overstates what a reader should expect.
-      2. A band (row) x k (column) heatmap with a native Plotly `updatemenus`
-         metric toggle: mean per trade (the default), total return, H1
-         return, H2 return and trade count. Each button is an "update" — it
-         swaps the trace's z, colour scale and hover format AND the chart
-         title together (a "restyle" button's second argument is read as
-         trace indices, so a title placed there would be silently dropped).
-         Row labels read "max(tier,<floor>)-<ceiling>" (_row_label).
+    The heatmap, the banner and the equity curve all read ONE population,
+    _HEADLINE_POPULATION — "time_series", every time-series entry (ladders +
+    cross-event) simulated alone with same-title excluded — and say so on
+    the page. The band and k act on time-series pairs only; same-title pairs
+    price on the fixed co-resolution prior, so reading the "all" cells here
+    would let a band- and k-independent result dilute the comparison, and
+    the evidence the grid is read against (the DR-73 calibration corpus) was
+    time-series only. A cell with no time-series entry has no time-series
+    point and reads "—" everywhere below; nothing falls back to "all". In
+    order:
+
+      1. A fragility banner, first. Its first line, when the run's window is
+         too long for the candlestick fetch (candle_notice), says the
+         explorer describes a truncated population. Then: how many band x k
+         cells were computed (and, when some have no time-series entry, how
+         many do), the share of time-series cells with a positive total
+         return, the split-half rank correlation (Spearman) of the
+         time-series cells' H1 vs H2 returns — over the cells whose two
+         halves BOTH had entries, since an empty half's 0.0 is not a return —
+         and the sentence this section exists to put on the page — the best
+         of that many correlated cells overstates what a reader should
+         expect, where "that many" counts the time-series cells the heatmap
+         shows a value in, never the whole grid. It says in words that every
+         figure in it, the heatmap and the curve is the time-series
+         population's, and that the KPI table below labels its own rows.
+      2. A band (row) x k (column) heatmap of the time-series population,
+         titled with it, with a native Plotly `updatemenus` metric toggle:
+         mean per trade (the default), total return, H1 return, H2 return and
+         trade count. Each button is an "update" — it swaps the trace's z,
+         colour scale and hover format AND the chart title together (a
+         "restyle" button's second argument is read as trace indices, so a
+         title placed there would be silently dropped). Row labels read
+         "max(tier,<floor>)-<ceiling>" (_row_label). A half with no entries
+         reads null (rendered "—") in the H1/H2 views.
       3. Two <select>s (band, k), preselected to the primary scenario and
          marked "(primary)", driving — through the small inline script
-         _SCENARIO_EXPLORER_JS — a KPI table with one row per population
-         (All, with a sub-row of its H1/H2 and top-event figures; Ladders;
-         Cross-event; Same-title, which is independent of band and k), the
-         selected band's own calibration table, and the "All" equity curve
-         (rendered once via _fig_html(div_id="scn-equity") and restyled in
-         place). A native updatemenus dropdown cannot express two
+         _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
+         each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
+         its H1/H2 and top-event figures; Ladders; Cross-event; All —
+         time-series + same-title, the run's actual result — with its own
+         sub-row; Same-title, which is independent of band and k), the
+         selected band's own calibration table, and the time-series equity
+         curve (rendered once via _fig_html(div_id="scn-equity") and
+         restyled in place). A native updatemenus dropdown cannot express two
          independent axes of selection, which is why this part is scripted.
 
     Every number the script reads comes from one
@@ -1637,6 +1803,11 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
             "Outcome-label coverage" text, since that caveat belongs to a
             sweep this run never produced. A sweep with no scenarios renders a
             one-line note naming the cause (_scenario_explorer_empty_reason).
+        candle_notice (str | None): Keyword-only. generate_dashboard's
+            _candle_cap_notice text for this run's window, repeated as the
+            banner's first line so the explorer carries it on its own; None
+            (default, and the value for a window within the cap) adds no
+            line.
 
     Returns:
         str: Self-contained HTML section string.
@@ -1673,30 +1844,70 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         key = id(pt)
         if key not in kpi_cache:
             kpi_cache[key] = _point_kpis(pt)
-            if pt.population == "all":
-                kpi_cache[key].update(_all_point_extras(pt))
+            if pt.population in ("all", _HEADLINE_POPULATION):
+                kpi_cache[key].update(_robustness_extras(pt))
         return kpi_cache[key]
 
-    # ── Fragility banner ─────────────────────────────────────────────────────
-    cell_all_points = [cp["all"] for row in cell_points for cp in row if cp["all"] is not None]
-    n_cells = len(cell_all_points)
-    finite_returns = [r for r in (kpis(pt)["total_return"] for pt in cell_all_points)
+    headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
+
+    # ── Fragility banner — the headline population's cells only ─────────────
+    # n_cells counts the grid (every band x k cell has an "all" point); every
+    # FIGURE below is the time-series population's, and a cell with no
+    # time-series point simply contributes no return — it never falls back
+    # to the "all" point, which is how a same-title result would reach here.
+    # The multiple-comparison count ("the best of N") is n_headline, the
+    # cells the heatmap actually shows a value in, never the grid: a band
+    # where no time-series pair enters has an "all" cell but no time-series
+    # one (the backtester skips an empty population).
+    n_cells = sum(1 for row in cell_points for cp in row if cp["all"] is not None)
+    headline_points = [cp[_HEADLINE_POPULATION] for row in cell_points for cp in row
+                       if cp[_HEADLINE_POPULATION] is not None]
+    n_headline = len(headline_points)
+    finite_returns = [r for r in (kpis(pt)["total_return"] for pt in headline_points)
                       if r is not None and math.isfinite(r)]
     positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
                       if finite_returns else None)
-    halves = [pt.halves for pt in cell_all_points if pt.halves is not None]
-    corr = _spearman([h.h1_return for h in halves], [h.h2_return for h in halves])
-    corr_txt = f"{corr:+.3f}" if corr is not None else "not enough data"
+    checked = [kpis(pt) for pt in headline_points if pt.halves is not None]
+    # A cell whose H1 or H2 had no entries carries None there
+    # (_robustness_extras), and _spearman drops any pair with a None, so the
+    # correlation is over the cells whose two halves both had entries.
+    corr = _spearman([k["h1_return"] for k in checked], [k["h2_return"] for k in checked])
+    n_empty_half = sum(1 for k in checked if k["h1_return"] is None or k["h2_return"] is None)
+    if corr is not None:
+        corr_txt = f"{corr:+.3f}"
+        if n_empty_half:
+            corr_txt += (f" (over the {len(checked) - n_empty_half} of {len(checked)} cells "
+                         "whose two halves both had entries)")
+    elif n_empty_half:
+        corr_txt = ("not measurable — the split date leaves a half without entries in "
+                    f"{n_empty_half} of the {len(checked)} cells")
+    else:
+        corr_txt = "not enough data"
     share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
+    coverage_txt = ("" if n_headline == n_cells else
+                    f"; {n_headline} of the {n_cells} cells have a time-series entry and "
+                    "the rest are blank on the heatmap")
+    best_txt = (f"The best of {n_headline} correlated cells overstates what you should expect."
+                if n_headline else
+                "No cell has a time-series entry, so nothing on this grid measures the band "
+                "or k.")
+    notice_line = (
+        f"<div style='color:#B71C1C;font-weight:700;margin-bottom:8px;'>"
+        f"{html.escape(candle_notice)}</div>"
+        if candle_notice else ""
+    )
     banner = (
         "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
         "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
         "color:#5D4037;'>"
-        f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
-        f"simulations counting the ladder and cross-event populations). {share_txt} of "
+        + notice_line
+        + f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
+        "points across the time-series, all, ladder and cross-event populations"
+        f"{coverage_txt}). Every figure in this banner, the heatmap and the "
+        f"equity curve is the <b>{html.escape(headline_label)}</b> population's; the KPI "
+        f"table below labels each row with its own population. {share_txt} of "
         "the cells with a measurable return had a positive total return. Split-half "
-        f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. The best of "
-        f"{n_cells} correlated cells overstates what you should expect."
+        f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. {best_txt}"
         "</div>"
     )
 
@@ -1704,8 +1915,8 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     def metric_matrix(field: str) -> list[list]:
         return [
             [
-                (kpis(cell_points[bi][ki]["all"])[field]
-                 if cell_points[bi][ki]["all"] is not None else None)
+                (kpis(cell_points[bi][ki][_HEADLINE_POPULATION])[field]
+                 if cell_points[bi][ki][_HEADLINE_POPULATION] is not None else None)
                 for ki in range(len(ks))
             ]
             for bi in range(len(bands))
@@ -1743,8 +1954,12 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         customdata=matrices["trades"], colorscale=default_scale, zmid=default_zmid,
         hovertemplate=default_hover,
     ))
+    # The title names the population, on every metric (each button re-sets
+    # it), so a screenshot of the heatmap alone still says whose cells these
+    # are.
+    heat_title = f"by spread band x k — {headline_label}"
     hfig.update_layout(
-        title=f"{default_label} by spread band x k",
+        title=f"{default_label} {heat_title}",
         xaxis_title="k", yaxis_title="Spread band",
         updatemenus=[{
             "type": "dropdown", "direction": "down", "active": 0, "showactive": True,
@@ -1755,7 +1970,7 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
                     "args": [
                         {"z": [matrices[field]], "colorscale": [scale],
                          "zmid": [zmid], "hovertemplate": [hover]},
-                        {"title.text": f"{label} by spread band x k"},
+                        {"title.text": f"{label} {heat_title}"},
                     ],
                 }
                 for field, label, scale, zmid, hover in heatmap_fields
@@ -1803,18 +2018,25 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 <div id="scn-cal-body"></div>
 """
 
-    # ── The "All" equity curve: rendered once for the primary cell, then
-    # restyled in place by the inline script. The axis is decided once, from
-    # the primary, and every cell's curve is placed on it by date. ───────────
+    # ── The headline population's equity curve: rendered once for the
+    # primary cell, then restyled in place by the inline script. The axis is
+    # decided once, from the primary (every scenario of one run spans the same
+    # calendar), and every cell's curve is placed on it by date. Only the
+    # headline population ships a curve per cell: the curves are the page's
+    # dominant term, and a second population's would roughly double it. ─────
     axis = _equity_axis(sweep.primary.equity_df)
     axis_dates = [d.date().isoformat() for d in axis]
-    primary_values = _curve_on_axis(sweep.primary.equity_df, axis)
+    primary_cell = cell_points[primary_band_idx][primary_k_idx] if bands and ks else {}
+    primary_headline = primary_cell.get(_HEADLINE_POPULATION)
+    primary_values = (_curve_on_axis(primary_headline.equity_df, axis)
+                      if primary_headline is not None else [])
     efig = go.Figure()
     efig.add_trace(go.Scatter(
-        x=axis_dates if primary_values else [], y=primary_values, name="All",
+        x=axis_dates if primary_values else [], y=primary_values,
+        name=headline_label,
         line={"color": _COLORS["strategy"], "width": 2},
     ))
-    efig.update_layout(title="Equity curve — selected band x k (population: All)",
+    efig.update_layout(title=f"Equity curve — selected band x k — {headline_label}",
                        yaxis_title="Portfolio Value ($)", xaxis_title="Date")
 
     # ── The data block every select, table and chart above reads from ────────
@@ -1822,7 +2044,7 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         if pt is None:
             return None
         d = dict(kpis(pt))
-        if population == "all":
+        if population == _HEADLINE_POPULATION:
             d["equity"] = _curve_on_axis(pt.equity_df, axis)
         return d
 
@@ -1841,6 +2063,9 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         "bands": [[lo, hi] for lo, hi in bands],
         "ks": list(ks),
         "populations": list(_SCENARIO_POPULATIONS),
+        # Every row's label, spelled once (_POPULATION_LABELS); the script
+        # escapes each before it reaches innerHTML.
+        "labels": dict(_POPULATION_LABELS),
         "primary_band_idx": primary_band_idx,
         "primary_k_idx": primary_k_idx,
         "dates": axis_dates,
@@ -2246,6 +2471,15 @@ def generate_dashboard(
     band and the ladder setting — with no coverage line and no strike-blind
     notice, since that path has no census to report.
 
+    One header notice needs no sweep at all: when a market closing at the end
+    of today (UTC) would need a longer candlestick request — start_date to a
+    day past its close — than one request serves (_candle_cap_notice —
+    config.CANDLESTICK_MAX_CANDLES_PER_REQUEST at
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES), a red line under the Period line
+    says that markets closing beyond the cap, less that one-day pad, after
+    start_date had no candles and could never enter, and the scenario
+    explorer repeats it as its fragility banner's first line.
+
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
             run_backtest() (or run_backtest_sweep()'s primary point). May be
@@ -2286,6 +2520,10 @@ def generate_dashboard(
     """
     ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
+    # The window's last day, read ONCE so the Period line and the candle-cap
+    # notice below can never disagree about how long the window is. UTC, like
+    # every other "today" the backtest reads (TS-13).
+    today = datetime.now(UTC).date()
 
     # A label-less corpus taints EVERY section, not just the interval-discount
     # one: it changes which pairs were formed, so the trades, the returns and
@@ -2311,6 +2549,20 @@ def generate_dashboard(
     # when there is no sweep.
     run_settings = _run_settings_html(sweep)
 
+    # A window whose latest-closing markets need a longer candlestick request
+    # than one can serve silently drops every such market (it gets no
+    # candles and can never enter), so — like the strike-blind notice — it
+    # qualifies every strategy figure and belongs in the header; the same
+    # text is handed to the scenario explorer as its banner's first line,
+    # since that section is where a band and k get chosen. Decided from
+    # start_date and today alone, so it renders with or without a sweep.
+    candle_notice = _candle_cap_notice(start_date, today)
+    candle_note = (
+        '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+        f"{html.escape(candle_notice)}</p>"
+        if candle_notice else ""
+    )
+
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
         _section_decomposition(trades),
@@ -2321,7 +2573,7 @@ def generate_dashboard(
         # and .calibrations_by_band, none of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
         # header's run-settings line) drift onto different bands or settings.
-        _section_scenario_explorer(sweep),
+        _section_scenario_explorer(sweep, candle_notice=candle_notice),
         _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
@@ -2345,12 +2597,13 @@ def generate_dashboard(
 <body>
 <h1>Kalshi Arbitrage Backtest</h1>
 <p style="color:#616161; font-size:14px;">
-  Period: {start_date} → {datetime.now(UTC).date()} &nbsp;|&nbsp;
+  Period: {start_date} → {today} &nbsp;|&nbsp;
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>
 {run_settings}
 {header_note}
+{candle_note}
 {''.join(sections)}
 </body>
 </html>"""

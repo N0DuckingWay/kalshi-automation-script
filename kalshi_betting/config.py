@@ -121,19 +121,27 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 # member).
 # Cost measured 2026-09-23 on the DR-73 calibration corpus (10,733 time-series
 # pairs, 10,530 with candles on both legs, start 2020-01-01, ladders on): ~1 s
-# per band (the time-series _find_entry pass, ~91-97 us per pair across
+# for ONE full time-series _find_entry pass (~91-97 us per pair across
 # repeated runs, before and after _find_entry gained the band alike, at no
 # band and at 0.30-0.60 and 0.40-0.50 — it scales with the window's pair
 # count; 330 entries at no band, 183 at 0.30-0.60) and ~2-11 ms per
 # simulation over its 330 entries (best of 3; it falls with the trade count,
-# from 94 trades at k = 0.40 to none at k = 1.00). The whole band sweep over
-# that corpus (also 2026-09-23, the production _sweep_from_candidates: 468 "all"
-# scenarios, 468 ladder and 468 cross-event points, each "all" point's two
-# halves, and an ex-top re-simulation on each of the 423 "all" points with a
-# traded event — the other 45 entered no trade — 2,763 simulations in all)
-# took 49.9 and 50.1 s in two runs and kept 1,404 equity frames of ~138 KB
-# each (2,460 daily rows), ~194 MB in all. A floor at or below a pair's tier
-# is inert for it.
+# from 94 trades at k = 0.40 to none at k = 1.00). A band sweep pays the full
+# pass ONCE, at the no-band band, and every other band rescans only the pairs
+# that entered there (every band's entries are a subset of the no-band
+# band's — see backtester._sweep_from_candidates): on that corpus 330 of the
+# 10,733 pairs, 0.056-0.073 s per band against 1.02-1.06 s for the full pass.
+# The whole band sweep over that corpus (the production _sweep_from_candidates,
+# measured 2026-09-23 with the pre-pass and the time-series population in
+# place: 468 "all", 468 time-series, 468 ladder and 468 cross-event points,
+# each "all" and time-series point's two halves, and an ex-top re-simulation
+# on each of the 423 "all" and 423 time-series points with a traded event —
+# the other 45 of each entered no trade — 4,590 simulations in all) took 26.4
+# and 26.6 s in two runs, 3.2-3.3 s of it the entry passes (before the
+# pre-pass and the time-series population, the 2,763-simulation sweep of the
+# same corpus took 52.2 s, 37.7 s of it the entry passes), and kept 1,872 equity
+# frames of ~138 KB each (2,460 daily rows), ~258 MB in all. A floor at or
+# below a pair's tier is inert for it.
 SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
 SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
 
@@ -964,6 +972,26 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 # 60 (hourly) is the finest granularity actually available — period_interval=1
 # (minute) returns HTTP 400.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
+
+# The most candles /historical/markets/{ticker}/candlesticks serves in ONE
+# request. A request spanning more is rejected with HTTP 400 "max
+# candlesticks: 5000" — observed during the DR-73 calibration fetch and
+# recorded in .git/dr73-calib/fetch_ladder_candles.py — and
+# historical.fetch_candlesticks, which makes one unpaginated GET per ticker,
+# catches that failure and returns [] (never cached). Because
+# backtester._fetch_candles_parallel opens every ticker's request at the run's
+# --start-date (midnight UTC) and ends it one day past that market's close, a
+# market whose request — start to close plus one day — spans more than
+# CANDLESTICK_MAX_CANDLES_PER_REQUEST x CANDLESTICK_PERIOD_INTERVAL_MINUTES
+# (about 208 days at hourly candles), i.e. one closing more than about 207
+# days after --start-date, gets no candles and can never enter. Nothing
+# paginates around it: per-ticker candle windowing is a separate
+# backtest-fidelity fix. Read only by dashboard.py, which puts a red notice on
+# any page whose window could contain such a market (one closing at the end
+# of the window's last day, plus the one-day pad, spans more candles than
+# this), since the explorer (and every other strategy figure) then describes
+# a truncated population.
+CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 
 def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> float:

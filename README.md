@@ -139,14 +139,16 @@ backtest.py (CLI)
   │    └─ _sweep_from_candidates()
   │         ├─ _entries_for_band()            — k-independent; one time-series _find_entry() pass per band:
   │         │                                    every band of SPREAD_BAND_SWEEP_FLOORS x CEILINGS (plus the
-  │         │                                    primary if it is off-grid) by default, or the primary band
-  │         │                                    alone with --no-band-sweep; plus one same-title pass
+  │         │                                    primary if it is off-grid) by default — only the no-band pass
+  │         │                                    scans every pair, the rest rescan the pairs that entered
+  │         │                                    there — or the primary band alone with --no-band-sweep;
+  │         │                                    plus one same-title pass
   │         ├─ _interval_calibration()        — empirical k_hat per band, from that band's k-independent entries
   │         └─ _simulate_at_discount()  — once per (band, k[, population]): Kelly gate, dedup, P&L from
   │                                        outcomes, _build_equity_curve() — the scenario explorer's
-  │                                        band x k x {all, ladder, cross} grid, plus one same-title
-  │                                        simulation, come from repeating this call, never from slicing
-  │                                        a joint run
+  │                                        band x k x {all, time_series, ladder, cross} grid, plus
+  │                                        one same-title simulation, come from repeating this call,
+  │                                        never from slicing a joint run
   └─ dashboard.generate_dashboard()          — write HTML report: k-selector section plus the scenario-
                                                 explorer section (band x k heatmap, per-population KPIs)
 ```
@@ -424,31 +426,51 @@ or below a deadline-gap tier logs a WARNING that it empties that tier. The
 band sweep is **on by default**, so a default run also re-simulates every
 band of `config.SPREAD_BAND_SWEEP_FLOORS` x `SPREAD_BAND_SWEEP_CEILINGS` (36
 bands) crossed with every swept `k` (13 values) — 468 scenarios, plus a
-standalone same-event-ladder and cross-event simulation per non-empty cell,
-a split-half out-of-sample check, and, for every cell that traded at least
-one event, a re-simulation excluding the single most concentrated event —
-computed over the *same* fetch, pair extraction and candlestick set as the
-primary scenario (only the entry-detection pass and the simulation are
-repeated per band). An "All" cell is every entry at its band, same-title
-included (it is the run's actual result); "Ladders" and "Cross-event" split
-only its time-series entries, and "Same-title" is simulated once,
-independent of band and `k`. `--no-band-sweep` skips that grid: the primary
-scenario still runs, but the dashboard's "Scenario Explorer" section has no
-scenarios to show. The explorer's fragility banner reports how many band x
-`k` cells were computed, what share of them had a positive return, and the
-split-half rank correlation of their returns — the point being that the best
-of many correlated cells overstates what you should expect, so read any cell
-with that banner on screen rather than from one flattering cell.
+standalone time-series (ladders and cross-event together), same-event-ladder
+and cross-event simulation per non-empty cell, a split-half out-of-sample
+check, and, for every cell that traded at least one event, a re-simulation
+excluding the single most concentrated event — computed over the *same*
+fetch, pair extraction and candlestick set as the primary scenario (only the
+entry-detection pass and the simulation are repeated per band, and only the
+no-band band's entry pass scans every pair: every other band rescans just
+the pairs that entered there, which cannot change its entries because a band
+only ever tightens the entry tests). An "All" cell is every entry at its
+band, same-title included (it is the run's actual result); a "Time-series"
+cell is every time-series entry, same-title excluded — and it is the one the
+explorer's heatmap, banner and equity curve show, because the band and `k`
+act on time-series pairs only and a same-title result would dilute the
+comparison. "Ladders" and "Cross-event" split the time-series entries
+further, and "Same-title" is simulated once, independent of band and `k`;
+every population is labelled on the page. `--no-band-sweep` skips that
+grid: the primary scenario still runs, but the dashboard's "Scenario
+Explorer" section has no scenarios to show. The explorer's fragility banner
+reports how many band x `k` cells were computed, what share of the
+time-series cells had a positive return, and the split-half rank correlation
+of their returns — the point being that the best of many correlated cells
+overstates what you should expect, so read any cell with that banner on
+screen rather than from one flattering cell (the banner's "best of N"
+counts the cells that have a time-series entry, not the whole grid). A
+split-half half with no entries reads "—" rather than a 0% return and is
+left out of that correlation. One split date serves every cell — the median
+entry date of the primary band's time-series entries (the lower of the two
+middle dates on an even count) — so a half is empty
+either when at least half of those entries share the first entry date (the
+backtest log warns when that happens) or, at any other band or on the "All"
+population, when all of that cell's own entries fall on one side of it.
 
 Two caveats. **On a long window the explorer describes a truncated
 population.** Every ticker's candle window opens at the run's global
-`--start-date`, and Kalshi rejects a candlestick request spanning more than
-5,000 hourly candles (~208 days) with HTTP 400. That failure is caught, so
-on a longer window every ticker closing more than ~208 days after the start
-gets no candles (counted in the log's `N of M tickers returned no candles`
-line) and can never enter. The default `--start-date 2024-01-01` is far past
+`--start-date` and runs to a day past the market's close, and Kalshi
+rejects a candlestick request spanning more than 5,000 hourly candles (~208
+days) with HTTP 400. That failure is caught, so on a longer window every
+ticker closing more than ~207 days after the start gets no candles (counted
+in the log's `N of M tickers returned no candles` line) and can never
+enter. The default `--start-date 2024-01-01` is far past
 that limit. Per-ticker candle windowing is a separate fix that has not
-landed. **Picking a scenario changes nothing the live bot does:** live
+landed; until it does, the dashboard puts a red notice in its header, and
+as the first line of the explorer's banner, on any window long enough to
+contain such a market (207 days or more at hourly candles). **Picking a
+scenario changes nothing the live bot does:** live
 trading has no band setting at all, and `k` and the ladder switch stay
 whatever `config.py` says. Applying a chosen band and `k` live is a separate
 change that must add live enforcement first. This is entirely a backtest

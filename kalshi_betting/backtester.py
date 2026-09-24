@@ -109,9 +109,10 @@ Notes:
     (unioned with the caller's own, so the primary is always an exact grid
     member), returned as a BacktestSweep. With band_sweep it crosses every
     band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
-    that k grid and adds standalone ladder / cross-event / same-title
-    populations, a split-half check and an excluding-top-event check — the
-    backtest-only scenario explorer; no live module reads a band.
+    that k grid and adds standalone time-series (ladders + cross-event),
+    ladder, cross-event and same-title populations, a split-half check and an
+    excluding-top-event check — the backtest-only scenario explorer; no live
+    module reads a band.
     run_backtest() is untouched by it — same signature, same two-tuple — so
     every existing caller keeps working.
 
@@ -243,10 +244,14 @@ _CALIBRATION_POOLED_LABEL = "POOLED"
 # SweepPoint.population), and the run labels its split-half and
 # excluding-top-event simulations carry on their completion lines only — the
 # points those runs return are reduced to a return and a trade count and never
-# kept. _simulate_at_discount refuses anything else, so a typo cannot
-# mislabel a scenario.
-_SCENARIO_POPULATIONS = ("all", "ladder", "cross", "same_title")
-_SIMULATION_LABELS = _SCENARIO_POPULATIONS + ("all/H1", "all/H2", "all/ex-top")
+# kept. Those two checks run on the two populations that carry them, "all" and
+# "time_series", hence one label set per population. _simulate_at_discount
+# refuses anything else, so a typo cannot mislabel a scenario.
+_SCENARIO_POPULATIONS = ("all", "time_series", "ladder", "cross", "same_title")
+_CHECKED_POPULATIONS = ("all", "time_series")
+_SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
+    f"{population}/{run}" for population in _CHECKED_POPULATIONS
+    for run in ("H1", "H2", "ex-top"))
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
@@ -414,19 +419,44 @@ class HalfSplit:
     module has no `from __future__ import annotations`), so a later
     declaration would raise NameError at import on CI's Python 3.11.
 
+    A half with NO entries is not a measurement: its simulation enters
+    nothing, so its h*_return reads 0.0 — indistinguishable from a half that
+    entered and broke even. The entry counts are carried so a reader can tell
+    the two apart (the dashboard renders such a half's return as "—" and
+    leaves the cell out of its split-half correlation). Two things empty a
+    half. At the primary band, for the time-series entries the split date is
+    computed from: H1 is empty whenever AT LEAST half of them share the
+    earliest entry date (one of two is enough), since the split date is their
+    median_low and H1 is strictly before it — _sweep_from_candidates warns
+    when that happens. And everywhere else — every other band's cells, and
+    any "all" point that also carries same-title entries — the split date is
+    that ONE primary-band date, not the point's own median, so either half is
+    empty whenever all of the point's own entries fall on one side of it; no
+    WARNING names those, but the dashboard blanks every empty half alike.
+
     Attributes:
         h1_return (float): Total return of the entries entering STRICTLY
             BEFORE split_date, simulated alone: (final portfolio value −
-            initial balance) / initial balance. 0.0 when that half is empty.
+            initial balance) / initial balance. 0.0 when that half is empty
+            — read h1_entries before trusting it.
         h2_return (float): The same for the entries entering ON or after
             split_date.
         h1_trades (int): Trades the first half's simulation entered.
         h2_trades (int): Trades the second half's simulation entered.
+        h1_entries (int | None): Entries the first half's simulation was
+            handed — 0 means that half is EMPTY and h1_return is not a
+            measurement. None means not recorded (a hand-built instance);
+            every sweep records it. Appended after the four original fields,
+            with a default, so a positional four-field construction still
+            builds.
+        h2_entries (int | None): The same for the second half.
     """
     h1_return: float
     h2_return: float
     h1_trades: int
     h2_trades: int
+    h1_entries: int | None = None
+    h2_entries: int | None = None
 
 
 @dataclass
@@ -466,20 +496,24 @@ class SweepPoint:
             same_title_point); a band sweep stamps every scenario with its
             tuple, the default band's (0.0, 1.0) included.
         population (str): Which entries were simulated: "all" (every entry at
-            this band — the run's actual result), "ladder" (only the
-            time-series entries whose two legs share one non-empty event
-            ticker), "cross" (every other time-series entry) or "same_title".
-            Each population is its OWN standalone simulation from the initial
-            balance, never a slice of an "all" run, so its return, drawdown
-            and Sharpe are defined. On every point a BacktestSweep holds it is
-            one of those four; _simulate_at_discount also accepts the
-            completion-line labels "all/H1", "all/H2" and "all/ex-top" for the
+            this band, same-title included — the run's actual result),
+            "time_series" (every time-series entry at this band — ladders and
+            cross-event together, same-title excluded: the population the
+            dashboard's heatmap and fragility banner read, since the band and
+            k act on time-series pairs alone), "ladder" (only the time-series
+            entries whose two legs share one non-empty event ticker), "cross"
+            (every other time-series entry) or "same_title". Each population
+            is its OWN standalone simulation from the initial balance, never a
+            slice of an "all" run, so its return, drawdown and Sharpe are
+            defined. On every point a BacktestSweep holds it is one of those
+            five; _simulate_at_discount also accepts the completion-line
+            labels "<all|time_series>/H1", "/H2" and "/ex-top" for the
             split-half and excluding-top-event runs, whose transient points
             are reduced to the numbers below and never kept.
         halves (HalfSplit | None): The split-half check — each half of this
             point's entries, split at BacktestSweep.split_date, simulated
-            alone from the initial balance. Set only on the "all" points of a
-            band sweep; None everywhere else.
+            alone from the initial balance. Set only on the "all" and
+            "time_series" points of a band sweep; None everywhere else.
         ex_top_event (tuple[str, float] | None): The concentration check:
             (event ticker, total return) — the event whose trades made the
             largest summed profit on this point (by BacktestTrade.event_ticker,
@@ -489,9 +523,9 @@ class SweepPoint:
             re-simulation, never a subtraction of that event's P&L from this
             point's return: the survivors are re-sized against the cash the
             removed trades no longer consume, and a subtraction is not bounded
-            below by −100%. Set only on the "all" points of a band sweep, and
-            None there too when no trade names an event (there is no event to
-            drop).
+            below by −100%. Set only on the "all" and "time_series" points of
+            a band sweep, and None there too when no trade names an event
+            (there is no event to drop).
     """
     k: float
     trades: list[BacktestTrade]
@@ -785,11 +819,12 @@ class BacktestSweep:
             always pass it.
         scenarios (list[SweepPoint]): Every simulated (band, k) cell of a
             band sweep, band by band in ascending band order and ascending k
-            within a band: the "all" point, then a "ladder" and a "cross"
-            point for each of those populations that is non-empty at that
-            band. Every "all" point carries halves, and ex_top_event whenever
-            one of its trades names an event. Every object in points is in
-            here (the primary band's "all" points).
+            within a band: the "all" point, then a "time_series", a "ladder"
+            and a "cross" point for each of those populations that is
+            non-empty at that band. Every "all" and "time_series" point
+            carries halves, and ex_top_event whenever one of its trades names
+            an event. Every object in points is in here (the primary band's
+            "all" points).
             [] when the band sweep is off OR the window was infeasible —
             label_coverage (None only on an infeasible window) tells the two
             apart.
@@ -810,10 +845,12 @@ class BacktestSweep:
             None means not recorded (a hand-built sweep).
         split_date (date | None): The date the split-half check (SweepPoint.
             halves) splits entries at — the median_low of the primary band's
-            entry dates, or the window's midpoint when that band has none. One
-            date for every scenario, so every cell's halves cover the same two
-            stretches of history. None when the band sweep is off or the
-            window was infeasible.
+            TIME-SERIES entry dates (same-title entries are left out, so they
+            cannot move the split the time-series checks are read at), or the
+            window's midpoint when that band has none. One date for every
+            scenario and both checked populations, so every cell's halves
+            cover the same two stretches of history. None when the band sweep
+            is off or the window was infeasible.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -3028,12 +3065,14 @@ def _entries_for_band(
     spread_band: tuple[float, float] | None = None,
     *,
     pair_types: tuple[str, ...] = _PAIR_TYPES,
+    _pairs: list | None = None,
 ) -> list[dict]:
     """
     Locate each candidate pair's first tradeable Monday under one spread band.
 
     The Pass-1a sweep: one _find_entry() call per pair in candidates.all_pairs
-    whose type is in pair_types, in scan order. _find_entry applies price,
+    (or in _pairs, when given) whose type is in pair_types, in scan order.
+    _find_entry applies price,
     deadline and band thresholds only — it holds no probability model — so
     the result is identical at every interval discount; only the band can
     change it, and only for time-series pairs (a same-title pair never reads
@@ -3069,6 +3108,16 @@ def _entries_for_band(
             i.e. the live rule.
         pair_types (tuple[str, ...]): Which pair types to scan — any subset
             of ("time_series", "same_title"). Keyword-only. Defaults to both.
+        _pairs (list | None): PRIVATE, keyword-only. The
+            [((mA, mB, canon, group_key), pair_type), ...] items to scan in
+            place of candidates.all_pairs — in practice a subsequence of it,
+            in its order, so the result keeps the full scan's order. None (the
+            default, and what every caller but _sweep_from_candidates passes)
+            scans candidates.all_pairs. It only ever NARROWS which pairs are
+            looked at; the caller owns the proof that no pair it leaves out
+            could have produced an entry at this band (see
+            _sweep_from_candidates' no-band pre-pass). candidates.all_pairs
+            itself is never mutated.
 
     Returns:
         list[dict]: One record per pair that produced an entry, in scan order,
@@ -3098,7 +3147,8 @@ def _entries_for_band(
     time_series_spread_band(spread_band)
 
     raw_entries: list[dict] = []
-    for (mA_orig, mB_orig, canon, group_key), pair_type in candidates.all_pairs:
+    scan = candidates.all_pairs if _pairs is None else _pairs
+    for (mA_orig, mB_orig, canon, group_key), pair_type in scan:
         if pair_type not in pair_types:
             continue
         candles_a = candidates.candles_by_ticker.get(mA_orig["ticker"], [])
@@ -3292,9 +3342,11 @@ def _simulate_at_discount(
             renders on the completion line as the resolved default band
             (config.time_series_spread_band(None)) and is stamped as None.
         population (str): Which entries these are, for the completion line
-            and the stamp: one of "all" (default), "ladder", "cross",
-            "same_title", or the run labels "all/H1", "all/H2", "all/ex-top"
-            a band sweep gives its split-half and excluding-top-event runs.
+            and the stamp: one of "all" (default), "time_series", "ladder",
+            "cross", "same_title", or the run labels "all/H1", "all/H2",
+            "all/ex-top", "time_series/H1", "time_series/H2" and
+            "time_series/ex-top" a band sweep gives its split-half and
+            excluding-top-event runs.
 
     Returns:
         SweepPoint: The trades (in entry-date order, empty if none entered) and
@@ -4153,8 +4205,15 @@ def _split_date(entries: list[dict], start_date: date) -> date:
     [start_date, today UTC] — a date that splits nothing, since there is
     nothing to split, but one that keeps BacktestSweep.split_date a date.
 
+    median_low is always one of the dates, so H2 (on or after it) is never
+    empty when there is an entry — but H1 (strictly before it) IS empty
+    whenever at least half of the entries share the earliest entry date (one
+    of two is enough); _sweep_from_candidates warns when that happens at the
+    primary band.
+
     Args:
-        entries (list[dict]): The primary band's prepared entries.
+        entries (list[dict]): The entries to split — _sweep_from_candidates
+            hands it the primary band's TIME-SERIES entries only.
         start_date (date): The backtest's start date.
 
     Returns:
@@ -4170,15 +4229,33 @@ def _split_date(entries: list[dict], start_date: date) -> date:
     return start_date + timedelta(days=max((today - start_date).days, 0) // 2)
 
 
+def _split_halves(entries: list[dict], split_date: date) -> tuple[list[dict], list[dict]]:
+    """
+    Split entries at a band sweep's one split date, keeping their order.
+
+    Args:
+        entries (list[dict]): Prepared entry records (each with
+            ["entry"]["entry_date"]).
+        split_date (date): BacktestSweep.split_date.
+
+    Returns:
+        tuple[list[dict], list[dict]]: (every entry strictly before
+            split_date, every entry on or after it) — either may be empty.
+    """
+    return ([rec for rec in entries if rec["entry"]["entry_date"] < split_date],
+            [rec for rec in entries if rec["entry"]["entry_date"] >= split_date])
+
+
 def _half_split(
     halves: tuple[list[dict], list[dict]],
     start_date: date,
     initial_balance: float,
     k: float,
     band: tuple[float, float],
+    population: str = "all",
 ) -> HalfSplit:
     """
-    Simulate each half of one scenario's entries alone and keep two numbers each.
+    Simulate each half of one scenario's entries alone and keep three numbers each.
 
     Args:
         halves (tuple[list[dict], list[dict]]): The scenario's entries split
@@ -4189,21 +4266,28 @@ def _half_split(
         k (float): The scenario's resolved interval discount.
         band (tuple[float, float]): The scenario's resolved band (a label for
             the completion lines; the entries already reflect it).
+        population (str): The checked population the halves belong to —
+            "all" (default) or "time_series" — which names the two runs
+            "<population>/H1" and "<population>/H2" on their completion lines,
+            so the two populations' split-half runs never share a prefix.
 
     Returns:
-        HalfSplit: Each half's total return and trade count. The halves'
-            equity curves are dropped.
+        HalfSplit: Each half's total return, trade count and entry count. The
+            halves' equity curves are dropped; an entry count of 0 marks a
+            half whose 0.0 return is not a measurement.
     """
     first, second = halves
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
-                               spread_band=band, population="all/H1")
+                               spread_band=band, population=f"{population}/H1")
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
-                               spread_band=band, population="all/H2")
+                               spread_band=band, population=f"{population}/H2")
     return HalfSplit(
         h1_return=_total_return(h1, initial_balance),
         h2_return=_total_return(h2, initial_balance),
         h1_trades=len(h1.trades),
         h2_trades=len(h2.trades),
+        h1_entries=len(first),
+        h2_entries=len(second),
     )
 
 
@@ -4213,6 +4297,7 @@ def _ex_top_event(
     start_date: date,
     initial_balance: float,
     band: tuple[float, float],
+    population: str = "all",
 ) -> tuple[str, float] | None:
     """
     Measure how much of one scenario's result a single event carried.
@@ -4232,11 +4317,14 @@ def _ex_top_event(
     re-simulation +14.3%.
 
     Args:
-        point (SweepPoint): The scenario's "all" point.
+        point (SweepPoint): The scenario's "all" or "time_series" point.
         entries (list[dict]): The entries that point was simulated from.
         start_date (date): The backtest's start date.
         initial_balance (float): The balance the re-simulation starts from.
         band (tuple[float, float]): The scenario's resolved band (a label).
+        population (str): The point's population — "all" (default) or
+            "time_series" — naming the re-simulation "<population>/ex-top" on
+            its completion line.
 
     Returns:
         tuple[str, float] | None: (event ticker, total return without it).
@@ -4258,7 +4346,7 @@ def _ex_top_event(
     rest = [rec for rec in entries
             if (rec["entry"]["mA"].get("event_ticker") or "") != top]
     without = _simulate_at_discount(rest, start_date, initial_balance, k=point.k,
-                                    spread_band=band, population="all/ex-top")
+                                    spread_band=band, population=f"{population}/ex-top")
     return top, _total_return(without, initial_balance)
 
 
@@ -4283,11 +4371,16 @@ def _sweep_from_candidates(
     entries at that band, announced as "Spread band i/N: <floor>-<ceiling>"
     with " (primary)" on the primary band. Each band's entries are its
     time-series entries followed by the shared same-title ones, which is
-    exactly the default _entries_for_band() call's scan order. Then the
-    candles and the pair list are released (candidates.candles_by_ticker and
-    candidates.all_pairs are deleted) before any simulation runs: nothing
-    after Phase 1 reads either, and the simulations are where a band sweep
-    spends its time.
+    exactly the default _entries_for_band() call's scan order. On a band
+    sweep the no-band band (0.0, 1.0) is scanned FIRST, over every
+    time-series pair, and every other band rescans only the pairs that
+    produced an entry there — each band's accepted Mondays are a subset of
+    the no-band band's (see the comment at the pre-pass), so this changes no
+    band's entries and turns every other band's full scan into a rescan of
+    the few pairs that can enter at all. Then the candles and the pair list
+    are released (candidates.candles_by_ticker and candidates.all_pairs are
+    deleted) before any simulation runs: nothing after Phase 1 reads either,
+    and the simulations are where a band sweep spends its time.
 
     Phase 2 — simulations. The primary band's calibration is measured and
     logged exactly as a single-band run always logged it, and the primary
@@ -4296,12 +4389,17 @@ def _sweep_from_candidates(
     never disagree with the point it contains). Every band then gets its own
     calibration (labelled with its own floor) and one "all" simulation per k
     on the SAME k grid, so a band x k table is rectangular. On a band sweep
-    each (band, k) also gets: a standalone "ladder" and "cross" simulation
-    for each population that is non-empty at that band (standalone, never
-    sliced out of the "all" run, so return, drawdown and Sharpe are defined
-    for each); the split-half check (SweepPoint.halves); and the
-    excluding-top-event check (SweepPoint.ex_top_event). The same-title
-    entries are then simulated alone once (same_title_point).
+    each (band, k) also gets a standalone "time_series" (ladders and
+    cross-event together, same-title excluded), "ladder" and "cross"
+    simulation for each of those populations that is non-empty at that band
+    (standalone, never sliced out of the "all" run, so return, drawdown and
+    Sharpe are defined for each), and both the "all" and the "time_series"
+    point get the split-half check (SweepPoint.halves, split at ONE date,
+    the median_low of the primary band's time-series entry dates — a WARNING
+    names it when it leaves a half of those entries empty, since the check
+    is then not measurable) and the excluding-top-event check
+    (SweepPoint.ex_top_event). The same-title entries are then simulated
+    alone once (same_title_point).
 
     The primary point is reused, never re-simulated: it is the same object in
     points and scenarios. With band_sweep False this is exactly the pre-band
@@ -4372,14 +4470,67 @@ def _sweep_from_candidates(
     if band_sweep:
         logging.info("Same-title candidate entries (band-independent, computed once): %d",
                      len(st_entries))
+    # ── The no-band pre-pass (band sweep only) ──────────────────────────────
+    # Every band's accepted Mondays are a SUBSET of the no-band band's, pair by
+    # pair, because a band only ever tightens _find_entry's per-Monday tests:
+    #   * the floor only rises — threshold = min_price_diff_for_gap(gap,
+    #     spread_min=floor) = max(tier, floor) >= tier, the no-band threshold
+    #     (floor 0.0 is inert under every tier);
+    #   * the leg-price-sum ceiling, 1 - threshold, therefore only falls;
+    #   * the spread ceiling only drops (1.0, the no-band ceiling, never fires:
+    #     both YES asks are banded into [0.01, 0.99]);
+    #   * everything else — the leg order, the deadline gap and its cap, the
+    #     horizon, the candle lookups, the live-quote checks and the fee check
+    #     — never reads the band.
+    # Float arithmetic keeps each comparison monotone in the threshold, so no
+    # float edge can admit at a band what no band refused. A pair that
+    # produced NO entry at (0.0, 1.0) therefore produces none at any band, and
+    # rescanning only the pairs that did enter there gives every band exactly
+    # the entries a full scan gives it — in the same order, since the subset
+    # keeps all_pairs' order (pinned against a full scan per band by
+    # TestBandSweepPhaseOneSubset). A single-band run keeps its one full scan.
+    no_band = time_series_spread_band((0.0, 1.0))
+    no_band_entries: list[dict] | None = None
+    rescan: list | None = None
+    if band_sweep:
+        n_ts_pairs = sum(1 for _, pair_type in candidates.all_pairs
+                         if pair_type == "time_series")
+        logging.info("No-band pre-pass: scanning all %d time-series pairs at %s",
+                     n_ts_pairs, _band_label(no_band))
+        no_band_entries = _entries_for_band(candidates, no_band, pair_types=("time_series",))
+        # Matched on the legs' TICKERS, not on object identity: whatever
+        # _find_entry hands back (the legs it was given, possibly swapped),
+        # the two tickers name the pair, and a ticker pair can only ever
+        # OVER-include a pair here (a duplicate is rescanned, never lost).
+        entered = {frozenset((rec["entry"]["mA"]["ticker"], rec["entry"]["mB"]["ticker"]))
+                   for rec in no_band_entries}
+        # A new list — candidates.all_pairs itself is never mutated.
+        rescan = [item for item in candidates.all_pairs
+                  if item[1] == "time_series"
+                  and frozenset((item[0][0]["ticker"], item[0][1]["ticker"])) in entered]
+        logging.info(
+            "No-band pre-pass: %d of %d time-series pairs produced an entry; every "
+            "other band rescans only those", len(rescan), n_ts_pairs)
+
     entries_by_band: dict[tuple[float, float], list[dict]] = {}
     for i, band in enumerate(bands, start=1):
         # Announced BEFORE the pass, so a slow band is attributable while it runs
         logging.info("Spread band %d/%d: %s%s", i, len(bands), _band_label(band),
                      " (primary)" if band == primary_band else "")
-        # The time-series _find_entry pass at this band — the only per-band
-        # cost of Phase 1. ts + st is the default call's scan order.
-        ts_entries = _entries_for_band(candidates, band, pair_types=("time_series",))
+        if no_band_entries is not None and band == no_band:
+            # This band's full scan IS the pre-pass — never run it twice.
+            ts_entries = no_band_entries
+        elif rescan is None:
+            # A single-band run: the one full time-series _find_entry pass,
+            # exactly as before the pre-pass existed.
+            ts_entries = _entries_for_band(candidates, band, pair_types=("time_series",))
+        else:
+            # The time-series _find_entry pass at this band — the only
+            # per-band cost of Phase 1 — narrowed to the pairs the pre-pass
+            # proved can enter at all. ts + st is the default call's scan
+            # order.
+            ts_entries = _entries_for_band(candidates, band, pair_types=("time_series",),
+                                           _pairs=rescan)
         entries_by_band[band] = ts_entries + st_entries
         if band_sweep:
             logging.info(
@@ -4394,8 +4545,10 @@ def _sweep_from_candidates(
     # holds no pair tuple through the simulations: the entry dicts carry the
     # market records they need (mA/mB) and never a candle. Only the scalar
     # fields — label_coverage, start_date, same_event_ladders — are read after
-    # this point.
+    # this point. The pre-pass's rescan list is a list of pair tuples too, so
+    # it goes with them (its entries already live on in entries_by_band).
     del candidates.candles_by_ticker, candidates.all_pairs
+    del rescan, no_band_entries
 
     # ── Phase 2: simulations ───────────────────────────────────────────────
     primary_entries = entries_by_band[primary_band]
@@ -4446,10 +4599,30 @@ def _sweep_from_candidates(
         )
 
     # One split date for every scenario, from the PRIMARY band's entries, so
-    # every cell's halves cover the same two stretches of history.
-    split_date = _split_date(primary_entries, start_date) if band_sweep else None
-    if split_date is not None:
+    # every cell's halves cover the same two stretches of history — its
+    # TIME-SERIES entries only: the dashboard's banner and heatmap read the
+    # time-series population's halves, and a same-title entry (which neither
+    # the band nor k ever moves) must not be able to move where they split.
+    split_date = None
+    if band_sweep:
+        primary_ts = [rec for rec in primary_entries if rec["pair_type"] == "time_series"]
+        split_date = _split_date(primary_ts, start_date)
         logging.info("Split-half check: entries before %s vs on or after it", split_date)
+        # median_low is one of the dates, so H1 (strictly before it) is empty
+        # whenever at least half of the entries share the earliest date — and
+        # an empty half's 0.0 return is not a measurement. Said here, once,
+        # for the band every other band is compared against (another band's,
+        # or an "all" point's, halves can also come out empty at this one
+        # date, unwarned); the dashboard blanks each such half and leaves it
+        # out of its correlation.
+        n_h1, n_h2 = (len(half) for half in _split_halves(primary_ts, split_date))
+        empty = " and ".join(name for name, n in (("H1", n_h1), ("H2", n_h2)) if n == 0)
+        if empty:
+            logging.warning(
+                "Split-half check: split date %s leaves %s empty; the split-half check "
+                "is not measurable for this window (primary band %s: %d time-series "
+                "entries before it, %d on or after it)",
+                split_date, empty, _band_label(primary_band), n_h1, n_h2)
 
     points: list[SweepPoint] = []
     scenarios: list[SweepPoint] = []
@@ -4465,19 +4638,27 @@ def _sweep_from_candidates(
             # Standalone populations, split once per band (they are
             # k-independent subsets) on _is_ladder_pair — the same rule that
             # labels each trade's same_event_ladder, so a trade and the
-            # population it was simulated in always agree. A population with
-            # no entry at this band is skipped rather than simulated as an
-            # empty scenario.
+            # population it was simulated in always agree. "time_series" is
+            # ladders + cross-event together, same-title excluded: the
+            # population the band and k actually act on, and the one the
+            # dashboard's heatmap and fragility banner read, so a same-title
+            # result (band- and k-independent) can never dilute them. A
+            # population with no entry at this band is skipped rather than
+            # simulated as an empty scenario.
             ladder_flags = [_is_ladder_pair(rec["pair_type"], rec["entry"]["mA"],
                                             rec["entry"]["mB"]) for rec in entries]
+            ts_only = [rec for rec in entries if rec["pair_type"] == "time_series"]
             populations = [
+                ("time_series", ts_only),
                 ("ladder", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
                             if is_ladder]),
                 ("cross", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
                            if rec["pair_type"] == "time_series" and not is_ladder]),
             ]
-            halves = ([rec for rec in entries if rec["entry"]["entry_date"] < split_date],
-                      [rec for rec in entries if rec["entry"]["entry_date"] >= split_date])
+
+            # Both checked populations' halves, at the ONE split date.
+            halves_by_population = {"all": _split_halves(entries, split_date),
+                                    "time_series": _split_halves(ts_only, split_date)}
             if len(bands) > 1:
                 logging.info("Simulating spread band %d/%d: %s%s (%d entries)",
                              bi, len(bands), _band_label(band),
@@ -4506,16 +4687,28 @@ def _sweep_from_candidates(
 
             scenarios.append(point)
             # The two robustness checks, set on the "all" point itself (the
-            # primary included — same object everywhere it is held).
-            point.halves = _half_split(halves, start_date, initial_balance, point_k, band)
+            # primary included — same object everywhere it is held) and, below,
+            # on the "time_series" point: the dashboard reads the latter's,
+            # and keeps the former's for its own "All" row.
+            point.halves = _half_split(halves_by_population["all"], start_date,
+                                       initial_balance, point_k, band, population="all")
             point.ex_top_event = _ex_top_event(point, entries, start_date,
-                                               initial_balance, band)
+                                               initial_balance, band, population="all")
             for label, subset in populations:
-                if subset:
-                    scenarios.append(_simulate_at_discount(
-                        subset, start_date, initial_balance, k=point_k,
-                        spread_band=band, population=label,
-                    ))
+                if not subset:
+                    continue
+                pop_point = _simulate_at_discount(
+                    subset, start_date, initial_balance, k=point_k,
+                    spread_band=band, population=label,
+                )
+                if label in _CHECKED_POPULATIONS:
+                    pop_point.halves = _half_split(
+                        halves_by_population[label], start_date, initial_balance,
+                        point_k, band, population=label)
+                    pop_point.ex_top_event = _ex_top_event(
+                        pop_point, subset, start_date, initial_balance, band,
+                        population=label)
+                scenarios.append(pop_point)
 
     same_title_point = None
     if band_sweep and st_entries:
@@ -4561,9 +4754,10 @@ def run_backtest_sweep(
     per discount on config.INTERVAL_DISCOUNT_SWEEP so a report can offer a k
     selector without a re-run. With band_sweep it additionally crosses every
     band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
-    that k grid and simulates the ladder / cross-event / same-title
-    populations, a split-half check and an excluding-top-event check per cell
-    — the backtest-only scenario explorer. run_backtest() is unchanged and
+    that k grid and simulates the time-series (ladders + cross-event),
+    ladder, cross-event and same-title populations, a split-half check and an
+    excluding-top-event check per cell (on the "all" and "time_series"
+    points) — the backtest-only scenario explorer. run_backtest() is unchanged and
     remains the two-tuple entry point for every existing caller; this is what
     backtest.py calls when it needs the sweep payload.
 
