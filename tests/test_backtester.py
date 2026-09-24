@@ -2748,8 +2748,9 @@ class TestFetchCandlesParallel:
         assert result == expected
 
     def test_window_bounds_match_sequential_formula(self, monkeypatch):
-        # open_ts is hoisted out of the loop now (it only depends on
-        # start_date); close_ts is still per-ticker close + one day.
+        # With no open_time (the shape of a cache record written before
+        # _market_to_dict carried it) every request opens at start_date
+        # midnight, as it always did; close_ts is per-ticker close + one day.
         seen = {}
 
         def _record(_c, ticker, open_ts, close_ts, use_cache):
@@ -2770,6 +2771,138 @@ class TestFetchCandlesParallel:
             assert open_ts == expected_open
             assert close_ts == int(datetime.fromisoformat(close_time).timestamp()) + 86400
             assert use_cache is False
+
+    @staticmethod
+    def _requested_open(monkeypatch, market, start=date(2026, 1, 1)):
+        """The open_ts _fetch_candles_parallel hands fetch_candlesticks for one market."""
+        seen = {}
+
+        def _record(_c, ticker, open_ts, close_ts, use_cache):
+            seen[ticker] = open_ts
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _record)
+        _fetch_candles_parallel(MagicMock(), {"M": {"ticker": "M", **market}}, start, False)
+        return seen["M"]
+
+    def test_a_market_opened_after_the_window_starts_at_its_own_open_hour(self, monkeypatch):
+        # A market has no candles before it opens, so its request starts at
+        # its own open_time — floored to the hour, so the candle covering the
+        # opening hour is inside the request however the endpoint reads a
+        # mid-hour start_ts.
+        opened = self._requested_open(monkeypatch, {
+            "open_time": "2026-03-10T14:30:00Z", "close_time": "2026-04-01T00:00:00Z"})
+        assert opened == int(datetime(2026, 3, 10, 14, 0, tzinfo=UTC).timestamp())
+
+    def test_an_on_the_hour_open_is_kept_as_is(self, monkeypatch):
+        opened = self._requested_open(monkeypatch, {
+            "open_time": "2026-03-10T14:00:00+00:00", "close_time": "2026-04-01T00:00:00Z"})
+        assert opened == int(datetime(2026, 3, 10, 14, 0, tzinfo=UTC).timestamp())
+
+    def test_a_market_opened_before_the_window_starts_at_the_window(self, monkeypatch):
+        opened = self._requested_open(monkeypatch, {
+            "open_time": "2025-06-01T12:00:00Z", "close_time": "2026-02-01T00:00:00Z"})
+        assert opened == int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+
+    @pytest.mark.parametrize("open_time", [None, "", "not-a-timestamp"])
+    def test_an_unreadable_open_time_keeps_the_window_start(self, monkeypatch, open_time):
+        # Every cache record written before _market_to_dict carried open_time
+        # reads it back as None: those requests are exactly what they were.
+        opened = self._requested_open(monkeypatch, {
+            "open_time": open_time, "close_time": "2026-02-01T00:00:00Z"})
+        assert opened == int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+
+    def test_an_open_time_past_the_request_end_keeps_the_window_start(self, monkeypatch):
+        # A data defect: the market "opens" after its own request ends (close
+        # plus a day). The only safe request is the one always sent.
+        opened = self._requested_open(monkeypatch, {
+            "open_time": "2026-02-05T00:00:00Z", "close_time": "2026-02-01T00:00:00Z"})
+        assert opened == int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+
+    def test_a_long_window_gets_every_market_its_candles_end_to_end(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        # The whole fix through the REAL historical.fetch_candlesticks, against
+        # a fake endpoint that refuses any request that could hold more than
+        # 5,000 hourly candles, as Kalshi does. On the CLI's default
+        # --start-date 2024-01-01 the old code sent ONE request per ticker from
+        # that date, which this endpoint refuses for RECENT and LONGLIVED —
+        # both came back with no candles and could never enter.
+        import json
+
+        from kalshi_betting import historical
+
+        cap = historical.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+        hour = 3600
+
+        def ts(text):
+            return int(datetime.fromisoformat(text).timestamp())
+
+        needed = {
+            # Opened long after the window began; its own life is 3 weeks.
+            "RECENT": {"open_time": "2026-03-10T14:30:00+00:00",
+                       "close_time": "2026-04-01T00:00:00+00:00"},
+            # Open for two years: no single request can hold its own life.
+            "LONGLIVED": {"open_time": "2024-06-01T00:00:00+00:00",
+                          "close_time": "2026-06-01T00:00:00+00:00"},
+            # Opened before the window: requested from the window's start.
+            "OLD": {"open_time": "2023-06-01T00:00:00+00:00",
+                    "close_time": "2024-03-01T00:00:00+00:00"},
+        }
+        # One candle per hour from the first full hour of trading to the close
+        series = {
+            t: range(ts(m["open_time"]) - ts(m["open_time"]) % hour + hour,
+                     ts(m["close_time"]) + 1, hour)
+            for t, m in needed.items()
+        }
+        calls: dict[str, list[tuple[int, int]]] = {t: [] for t in needed}
+
+        class _Refused(Exception):
+            status = 400
+            reason = "max candlesticks: 5000"
+
+        def endpoint(_client, path, **params):
+            ticker = path.split("/")[-2]
+            start, end = params["start_ts"], params["end_ts"]
+            calls[ticker].append((start, end))
+            if (end - start) // hour + 1 > cap:
+                raise _Refused()
+            body = {"candlesticks": [
+                {"end_period_ts": t, "yes_ask": {"close": "0.40"},
+                 "yes_bid": {"close": "0.38"}}
+                for t in series[ticker] if start <= t <= end]}
+            return SimpleNamespace(status=200, data=json.dumps(body).encode())
+
+        window_open = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+        # The premise: one request from the window's start is refused
+        for ticker in ("RECENT", "LONGLIVED"):
+            with pytest.raises(_Refused):
+                endpoint(None, f"/x/{ticker}/candlesticks", start_ts=window_open,
+                         end_ts=ts(needed[ticker]["close_time"]) + 86_400)
+            calls[ticker].clear()
+
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        monkeypatch.setattr(historical, "_signed_raw_get", endpoint)
+        monkeypatch.setattr(historical.time, "sleep", lambda _s: None)
+        with caplog.at_level(logging.WARNING):
+            result = _fetch_candles_parallel(
+                MagicMock(), {t: {"ticker": t, **m} for t, m in needed.items()},
+                date(2024, 1, 1), False)
+
+        # Every candle from the later of the window's start and the market's
+        # open through its close — nothing lost at either end or in between.
+        for ticker in needed:
+            expected = [t for t in series[ticker] if t >= window_open]
+            assert [c["ts"] for c in result[ticker]] == expected, ticker
+        # First candle: the one covering the 14:00 opening hour, ending 15:00
+        assert len(result["RECENT"]) == (ts("2026-04-01T00:00:00+00:00")
+                                         - ts("2026-03-10T15:00:00+00:00")) // hour + 1
+        assert len(calls["RECENT"]) == 1   # its own three weeks: one request
+        assert len(calls["OLD"]) == 1
+        assert calls["OLD"][0][0] == window_open
+        assert len(calls["LONGLIVED"]) >= 2  # paged, every request within the cap
+        assert all((e - s) // hour + 1 <= cap for s, e in calls["LONGLIVED"])
+        assert not any("returned no candles" in r.getMessage() for r in caplog.records)
 
     def test_missing_close_time_skips_the_api(self, monkeypatch):
         # No close window to request, so the old loop short-circuited to [] —

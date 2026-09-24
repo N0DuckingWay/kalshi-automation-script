@@ -24,12 +24,8 @@ Dependencies:
     Imports BacktestSweep, BacktestTrade, OutcomeLabelCoverage and SweepPoint
     from backtester.py, plus its _exact_label() — the injective float formatter
     its completion lines use, reused so no two scenario-explorer labels can
-    collide — and its _DAY_SECONDS, the one-day pad its candle fetch adds past
-    each market's close (the candle-cap notice's third input) — and
-    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
+    collide — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
-    CANDLESTICK_MAX_CANDLES_PER_REQUEST and
-    CANDLESTICK_PERIOD_INTERVAL_MINUTES (the candle-cap notice's two inputs),
     create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
@@ -76,12 +72,7 @@ Notes:
     ladder setting (DR-73) under the Period line, or "not recorded" when the
     run passed no sweep: the ladder setting decides which pairs exist and the
     band which of them are ever entered, so, like DR-66b's strike-blind
-    notice, they qualify every section rather than only the explorer. A red
-    header line also flags a window whose latest-closing markets need a
-    longer candlestick request than one can serve
-    (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST, counted from --start-date to
-    a day past each close): every market closing beyond that had no candles
-    and could never enter.
+    notice, they qualify every section rather than only the explorer.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -104,7 +95,6 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import (
-    _DAY_SECONDS,
     BacktestSweep,
     BacktestTrade,
     OutcomeLabelCoverage,
@@ -114,8 +104,6 @@ from .backtester import (
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
-    CANDLESTICK_MAX_CANDLES_PER_REQUEST,
-    CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
     TRADING_DAYS_PER_YEAR,
@@ -1627,68 +1615,6 @@ def _scenario_explorer_empty_reason(sweep: BacktestSweep) -> str:
     return "band sweep off (--no-band-sweep / band_sweep=False)"
 
 
-def _candle_cap_notice(start_date: date, today: date) -> str | None:
-    """
-    Say, in one sentence, when the window is too long for the candle fetch.
-
-    backtester._fetch_candles_parallel opens EVERY ticker's candlestick
-    request at the run's start date (midnight UTC) and ends it one day past
-    that market's close (backtester._DAY_SECONDS), and
-    historical.fetch_candlesticks makes one unpaginated GET per ticker, which
-    Kalshi refuses (HTTP 400, caught and read as "no candles") once the
-    request spans more than config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
-    candles. So every market closing more than the cap LESS that one-day pad
-    after the start date silently had no price series and could never enter —
-    the trades, and every band x k cell of the scenario explorer, then
-    describe a truncated population rather than the one the window names.
-    The cap and the cutoff in days are derived from config's two constants
-    and the fetch's pad, never written down.
-
-    The test is the LONGEST request the window can produce, not the window's
-    own length: a settled market can close as late as the end of `today`
-    (the window's last, still-running UTC day), and its request then runs one
-    more day past that. Testing the bare window length instead stays silent on
-    the last two days' worth of windows whose latest-closing markets already
-    exceed the cap.
-
-    Args:
-        start_date (date): The backtest's --start-date.
-        today (date): The window's last day, today's UTC date — the same
-            "today" the page's Period line prints.
-
-    Returns:
-        str | None: The notice text (plain, un-escaped), or None when even a
-            market closing at the end of `today` gets a request within the
-            cap — i.e. when (days + 1) days to the end of today, plus the
-            fetch's one-day pad, span at most
-            CANDLESTICK_MAX_CANDLES_PER_REQUEST candles of
-            CANDLESTICK_PERIOD_INTERVAL_MINUTES each.
-    """
-    days = (today - start_date).days
-    cap_seconds = CANDLESTICK_MAX_CANDLES_PER_REQUEST * CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
-    # The longest request the window can produce: from start_date midnight to
-    # a close at the END of today (a settled market closes no later than
-    # now), plus the one-day pad _fetch_candles_parallel adds past the close.
-    longest_request_seconds = (days + 1) * _DAY_SECONDS + _DAY_SECONDS
-    if longest_request_seconds <= cap_seconds:
-        return None
-    cap_days = cap_seconds / _DAY_SECONDS
-    # A market's request is refused once its CLOSE is further than the cap,
-    # less the pad, after start_date.
-    cutoff_days = (cap_seconds - _DAY_SECONDS) / _DAY_SECONDS
-    unit = ("hourly" if CANDLESTICK_PERIOD_INTERVAL_MINUTES == 60
-            else f"{CANDLESTICK_PERIOD_INTERVAL_MINUTES}-minute")
-    return (
-        f"This window spans {days:,} days, but every candlestick request opens at "
-        f"--start-date and runs to a day past the market's close, and Kalshi serves at "
-        f"most {CANDLESTICK_MAX_CANDLES_PER_REQUEST:,} {unit} candles per request (about "
-        f"{cap_days:.0f} days), so markets closing more than about {cutoff_days:.0f} days "
-        "after it had no candles and could never enter. The trades on this page, and the "
-        "scenario explorer, do not describe the full population: do not choose a band or "
-        "k from the explorer on this window."
-    )
-
-
 def _run_settings_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line naming the run's primary spread band and ladder setting.
@@ -1725,8 +1651,7 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     )
 
 
-def _section_scenario_explorer(sweep: BacktestSweep | None, *,
-                               candle_notice: str | None = None) -> str:
+def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     """
     Build the "Scenario Explorer" HTML section.
 
@@ -1746,12 +1671,10 @@ def _section_scenario_explorer(sweep: BacktestSweep | None, *,
     point and reads "—" everywhere below; nothing falls back to "all". In
     order:
 
-      1. A fragility banner, first. Its first line, when the run's window is
-         too long for the candlestick fetch (candle_notice), says the
-         explorer describes a truncated population. Then: how many band x k
-         cells were computed (and, when some have no time-series entry, how
-         many do), the share of time-series cells with a positive total
-         return, the split-half rank correlation (Spearman) of the
+      1. A fragility banner, first: how many band x k cells were computed
+         (and, when some have no time-series entry, how many do), the share
+         of time-series cells with a positive total return, the split-half
+         rank correlation (Spearman) of the
          time-series cells' H1 vs H2 returns — over the cells whose two
          halves BOTH had entries, since an empty half's 0.0 is not a return —
          and the sentence this section exists to put on the page — the best
@@ -1803,11 +1726,6 @@ def _section_scenario_explorer(sweep: BacktestSweep | None, *,
             "Outcome-label coverage" text, since that caveat belongs to a
             sweep this run never produced. A sweep with no scenarios renders a
             one-line note naming the cause (_scenario_explorer_empty_reason).
-        candle_notice (str | None): Keyword-only. generate_dashboard's
-            _candle_cap_notice text for this run's window, repeated as the
-            banner's first line so the explorer carries it on its own; None
-            (default, and the value for a window within the cap) adds no
-            line.
 
     Returns:
         str: Self-contained HTML section string.
@@ -1891,16 +1809,10 @@ def _section_scenario_explorer(sweep: BacktestSweep | None, *,
                 if n_headline else
                 "No cell has a time-series entry, so nothing on this grid measures the band "
                 "or k.")
-    notice_line = (
-        f"<div style='color:#B71C1C;font-weight:700;margin-bottom:8px;'>"
-        f"{html.escape(candle_notice)}</div>"
-        if candle_notice else ""
-    )
     banner = (
         "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
         "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
         "color:#5D4037;'>"
-        + notice_line
         + f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
         "points across the time-series, all, ladder and cross-event populations"
         f"{coverage_txt}). Every figure in this banner, the heatmap and the "
@@ -2471,15 +2383,6 @@ def generate_dashboard(
     band and the ladder setting — with no coverage line and no strike-blind
     notice, since that path has no census to report.
 
-    One header notice needs no sweep at all: when a market closing at the end
-    of today (UTC) would need a longer candlestick request — start_date to a
-    day past its close — than one request serves (_candle_cap_notice —
-    config.CANDLESTICK_MAX_CANDLES_PER_REQUEST at
-    CANDLESTICK_PERIOD_INTERVAL_MINUTES), a red line under the Period line
-    says that markets closing beyond the cap, less that one-day pad, after
-    start_date had no candles and could never enter, and the scenario
-    explorer repeats it as its fragility banner's first line.
-
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
             run_backtest() (or run_backtest_sweep()'s primary point). May be
@@ -2520,9 +2423,8 @@ def generate_dashboard(
     """
     ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
     out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
-    # The window's last day, read ONCE so the Period line and the candle-cap
-    # notice below can never disagree about how long the window is. UTC, like
-    # every other "today" the backtest reads (TS-13).
+    # The window's last day for the Period line. UTC, like every other
+    # "today" the backtest reads (TS-13).
     today = datetime.now(UTC).date()
 
     # A label-less corpus taints EVERY section, not just the interval-discount
@@ -2549,20 +2451,6 @@ def generate_dashboard(
     # when there is no sweep.
     run_settings = _run_settings_html(sweep)
 
-    # A window whose latest-closing markets need a longer candlestick request
-    # than one can serve silently drops every such market (it gets no
-    # candles and can never enter), so — like the strike-blind notice — it
-    # qualifies every strategy figure and belongs in the header; the same
-    # text is handed to the scenario explorer as its banner's first line,
-    # since that section is where a band and k get chosen. Decided from
-    # start_date and today alone, so it renders with or without a sweep.
-    candle_notice = _candle_cap_notice(start_date, today)
-    candle_note = (
-        '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
-        f"{html.escape(candle_notice)}</p>"
-        if candle_notice else ""
-    )
-
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
         _section_decomposition(trades),
@@ -2573,7 +2461,7 @@ def generate_dashboard(
         # and .calibrations_by_band, none of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
         # header's run-settings line) drift onto different bands or settings.
-        _section_scenario_explorer(sweep, candle_notice=candle_notice),
+        _section_scenario_explorer(sweep),
         _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
@@ -2603,7 +2491,6 @@ def generate_dashboard(
 </p>
 {run_settings}
 {header_note}
-{candle_note}
 {''.join(sections)}
 </body>
 </html>"""

@@ -38,7 +38,9 @@ Dependencies:
     and resolves a band up front in _entries_for_band, run_backtest_sweep,
     _sweep_from_candidates and _simulate_at_discount's completion line; no
     live module reads either), plus BUDGET_FRACTION,
-    CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
+    CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
+    grid _candle_window_open floors a market's open onto),
+    LARGE_GROUP_WARN_THRESHOLD,
     INTERVAL_DISCOUNT_SWEEP and the band grid SPREAD_BAND_SWEEP_FLOORS /
     SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates),
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
@@ -172,6 +174,7 @@ from .config import (
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS,
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     INTERVAL_DISCOUNT_SWEEP,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
@@ -2399,6 +2402,60 @@ def _find_entry(
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────
 
+def _candle_window_open(market: dict, window_open_ts: int, close_ts: int) -> int:
+    """
+    Pick where one market's candlestick request starts.
+
+    The later of the backtest window's start and the market's own open_time,
+    the latter floored onto the candle grid (CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    so the top of the hour at hourly candles). Opening every request at the
+    window's start instead asked for months of candles a market that opened
+    later never had, which cost a request per 5,000 empty candles — and before
+    historical.fetch_candlesticks paged a long window, it cost the whole
+    series (HTTP 400, read as "no candles").
+
+    Result-neutral by construction and by measurement. A market has no candles
+    before it opens: across the DR-73 calibration corpus's 573 cached series
+    whose request opened before the market did, not one candle ends at or
+    before the start of the hour its market opened in. And the open is FLOORED
+    because the endpoint's reading of a start_ts that falls mid-period is
+    undocumented: a request that starts on the boundary gets the candle
+    covering the opening hour under either reading. (58 of 1,093 cached
+    series requested from an unfloored off-the-hour open_time start later than
+    that hour — possibly no quote in the first hour, possibly the endpoint;
+    flooring removes the doubt at the cost of one candle period.) The rest of
+    the backtester already treats open_time as when the market opened:
+    _can_ever_enter drops a market whose open_time leaves no entry checkpoint.
+
+    A missing or unparseable open_time — every cache record written before
+    historical._market_to_dict carried the field reads back None — keeps the
+    window's start, as does an open_time that does not precede the request's
+    end (a data defect; the old request is the only safe one to send), so this
+    only ever moves a request's start LATER, and only for a market that
+    demonstrably opened after the window began.
+
+    Args:
+        market (dict): The market dict (historical._market_to_dict shape);
+            only "open_time" is read.
+        window_open_ts (int): Unix timestamp of the backtest window's start
+            (start_date midnight UTC), where every request used to open.
+        close_ts (int): Unix timestamp the market's request ends at.
+
+    Returns:
+        int: Unix timestamp the market's candlestick request should start at:
+            window_open_ts, or a later candle-period boundary.
+    """
+    open_dt = _parse_iso_datetime(market.get("open_time"))
+    if open_dt is None:
+        return window_open_ts
+    period_seconds = CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+    market_open_ts = int(open_dt.timestamp())
+    market_open_ts -= market_open_ts % period_seconds
+    if market_open_ts >= close_ts:
+        return window_open_ts
+    return max(window_open_ts, market_open_ts)
+
+
 def _fetch_candles_parallel(
     hist_client: Any,
     needed_tickers: dict[str, dict],
@@ -2408,8 +2465,11 @@ def _fetch_candles_parallel(
     """
     Fetch the hourly candlestick series for every needed ticker, in parallel.
 
-    One HTTP fetch per ticker, spread across CANDLESTICK_FETCH_MAX_WORKERS
-    threads. Parallelism is result-neutral here for three reasons: the returned
+    One fetch per ticker (one HTTP request, or more for a window longer than
+    one request serves — historical.fetch_candlesticks pages it), spread
+    across CANDLESTICK_FETCH_MAX_WORKERS threads. Each ticker's request runs
+    from _candle_window_open — the later of start_date and the market's own
+    open_time, floored to a candle boundary — to one day past its close. Parallelism is result-neutral here for three reasons: the returned
     mapping is only ever read by key (never iterated), so completion order
     cannot matter; each ticker's disk cache path is derived from its ticker, so
     two workers can never write the same file (historical._save_json_cache is an
@@ -2440,8 +2500,9 @@ def _fetch_candles_parallel(
             threads (the same pattern historical.py's fetch pools use).
         needed_tickers (dict[str, dict]): Ticker -> market dict, for exactly
             the markets appearing in at least one candidate pair.
-        start_date (date): Start of the backtest window; the fetch window's
-            lower bound, identical for every ticker.
+        start_date (date): Start of the backtest window; the earliest any
+            ticker's request starts (a market that opened later starts at its
+            own open — _candle_window_open).
         use_cache (bool): Passed through to fetch_candlesticks — whether the
             per-ticker disk cache may be reused.
 
@@ -2456,14 +2517,14 @@ def _fetch_candles_parallel(
     """
     candles_by_ticker: dict[str, list[dict]] = {}
 
-    # open_ts: start of the backtest window. Depends only on start_date, so it
-    # is identical for every ticker and computed once.
-    open_ts = int(datetime(start_date.year, start_date.month, start_date.day,
-                           tzinfo=UTC).timestamp())
+    # Start of the backtest window: the earliest any request opens. Depends
+    # only on start_date, so it is computed once.
+    window_open_ts = int(datetime(start_date.year, start_date.month, start_date.day,
+                                  tzinfo=UTC).timestamp())
 
     # Split the work first: no-close_time markets resolve without any HTTP, so
     # they never occupy a worker slot.
-    work: list[tuple[str, int]] = []
+    work: list[tuple[str, int, int]] = []
     for ticker, m in needed_tickers.items():
         close_time = m.get("close_time")
         if not close_time:
@@ -2484,7 +2545,10 @@ def _fetch_candles_parallel(
             continue
         # close_ts: one day past market close to include the final candle
         close_ts = int(close_dt.timestamp()) + _DAY_SECONDS
-        work.append((ticker, close_ts))
+        # Open at the market's own open when it opened after the window began:
+        # it has no candles before then, so asking for them only costs requests.
+        open_ts = _candle_window_open(m, window_open_ts, close_ts)
+        work.append((ticker, open_ts, close_ts))
 
     if work:
         with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
@@ -2493,7 +2557,7 @@ def _fetch_candles_parallel(
             futures = {
                 pool.submit(fetch_candlesticks, hist_client, ticker,
                             open_ts, close_ts, use_cache): ticker
-                for ticker, close_ts in work
+                for ticker, open_ts, close_ts in work
             }
             done = 0
             try:
@@ -4960,9 +5024,10 @@ def _build_equity_curve(
     (DR-61), and NOT because the prices are missing. A true daily mark-to-market
     off each leg's candles would need a per-day quote for every open position on
     every calendar day of the window, and those quotes are already fetched:
-    _fetch_candles_parallel requests each leg's WHOLE hourly series (start_date
-    midnight UTC through one day past that market's close) and disk-caches it
-    per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
+    _fetch_candles_parallel requests each leg's WHOLE hourly series (from the
+    later of start_date midnight UTC and the market's own open, through one day
+    past its close — everything a position in it could need a quote for) and
+    disk-caches it per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
     entry-checkpoint prices only, so candles_by_ticker lives on the _Candidates
     object only until the last entry pass (it dies with _prepare_entries on
     run_backtest's path, and _sweep_from_candidates deletes it before its first
