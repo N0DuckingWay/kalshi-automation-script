@@ -48,7 +48,9 @@ Dependencies:
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS from
     config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py. Also
-    depends on pandas (external) for the equity-curve DataFrame. Does NOT
+    depends on pandas (external) for the equity-curve DataFrame and numpy
+    (external, a declared dependency pandas already pulls in) for counting
+    the grouping-key hashes behind the groupable subset. Does NOT
     import strategy.py — Kelly sizing and portfolio selection are
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
@@ -133,6 +135,28 @@ Notes:
     53k-member group). Neither optimization changes results: both only skip
     work that provably cannot produce an entry.
 
+    Only the GROUPABLE eligible records are then grouped (SS-1), and this
+    module builds no list of every eligible record of its own: the corpus is
+    walked twice. The first walk (_index_eligible_keys) hashes each eligible
+    record's time-series and same-title grouping keys — through
+    _ts_group_key/_st_group_key, the very helpers the two grouping functions
+    group on — and the second (_materialize_groupable) keeps only the records
+    whose key hash is shared with another eligible record. Both groupings
+    drop every single-member group, so a record sharing neither key can never
+    appear in any pair; on a measured 7-day window only 184,255 of 7,260,952
+    eligible records share one. The subset holds every member of every group
+    of two or more, in order, so the groups and pairs are exactly those of
+    the whole eligible list; a hash collision can only keep an extra record,
+    which the exact grouping then drops. The corpus itself is whatever
+    historical.fetch_all_settled_markets returns — today still ONE list, and
+    since the prefilter runs during its assembly that list IS the eligible
+    set, resident through both walks until _prepare_candidates releases it;
+    the two walks are written so a corpus that streams can replace it. The
+    corpus must re-iterate identically, and a second walk that disagrees with
+    the first on anything the subset was chosen from (the eligible count, or
+    an eligible record's ticker or grouping fields) raises rather than
+    misaligning the subset.
+
     Time-series pairs buy YES on the earlier-closing contract (market A) and
     NO on the later one (market B) — scanner.leg_sides is the only source of
     truth for the sides, and _settlement_receipt pays by side. Their
@@ -160,12 +184,15 @@ import logging
 import resource
 import statistics
 import sys
+from array import array
 from collections import defaultdict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .config import (
@@ -623,22 +650,28 @@ class OutcomeLabelCoverage:
     """
     The outcome-label census over one backtest window's eligible markets.
 
-    Produced by _log_outcome_label_coverage() as it emits its log line, so the
-    page and the log can never report two different numbers or disagree about
-    where the warning floor sits — there is exactly ONE measurement, one pass
-    and one threshold comparison per run.
+    Produced by _report_outcome_label_coverage() as it emits its log line —
+    reached through _log_outcome_label_coverage() for a whole iterable, or
+    directly by _prepare_candidates, which counts during its first walk over
+    the corpus (SS-1) — so the page and the log can never report two
+    different numbers or disagree about where the warning floor sits: there is
+    exactly ONE measurement, one pass and one threshold comparison per run.
 
     Holds scalars only (counts, fractions and one verdict) and no reference to
     any market record: _prepare_candidates (the first half of
-    _prepare_entries) del's the eligible-market list immediately after pair
-    extraction to lower residency across the
-    candlestick fetch (TS-07), and a carrier that kept examples (sample
-    tickers, a per-category breakdown) would pin every one of those dicts
-    alive past that statement.
+    _prepare_entries) releases the corpus right after its second pass and
+    the groupable subset immediately after pair extraction, to lower
+    residency across grouping and the candlestick fetch (TS-07, SS-1), and a
+    carrier that kept examples (sample tickers, a per-category breakdown)
+    would pin those dicts alive past both statements.
 
-    The population is the ELIGIBLE-MARKET CORPUS — _prepare_candidates'
-    market list after the _can_ever_enter prefilter, i.e. every record handed to the
-    two grouping calls. It is NOT the population the empirical k-hat is
+    The population is the ELIGIBLE-MARKET CORPUS — every record of
+    _prepare_candidates' corpus that passes the _can_ever_enter prefilter,
+    counted during its first pass. Since SS-1 that is a SUPERSET of what the
+    two grouping calls receive (only the eligible records that share a
+    grouping key are materialized for them), but it is the same population
+    this census has always covered: every eligible record, whether or not it
+    can group. It is NOT the population the empirical k-hat is
     computed over (_interval_calibration measures over entered, binarily
     settled, non-premise-violating time-series candidates, a far smaller and
     differently-selected subset). Any rendering of these numbers must be
@@ -756,7 +789,8 @@ class _Candidates:
             _fetch_candles_parallel; every ticker of every pair in all_pairs
             is a key.
         label_coverage (OutcomeLabelCoverage | None): The eligible-market
-            census _log_outcome_label_coverage measured. _prepare_candidates
+            census _prepare_candidates counted in its first walk and reported
+            through _report_outcome_label_coverage. _prepare_candidates
             always carries it — on the feasibility short-circuit, where no
             census is taken, it returns no _Candidates at all — so None only
             ever appears on a hand-built instance (a test stub).
@@ -1268,12 +1302,74 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
     )
 
 
-def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
+def _ts_group_key(m: dict) -> str:
+    """
+    The time-series grouping key of one market dict — the single definition in
+    this module.
+
+    Read by BOTH _group_by_normalized_title, which groups on it, and
+    _index_eligible_keys, which decides from it (and _st_group_key) which
+    eligible records are worth materializing at all (SS-1). One definition is
+    what makes that decision exact: a key the index computed differently from
+    the grouping would drop a record the grouping needs.
+
+    The key itself is scanner.time_series_group_key — the same helper the live
+    finder calls, pinned by AST in tests/test_strategy.py — over _pair_key
+    (event_title + market title, so an option label shared across unrelated
+    events does not collide) and the subtitle, which keeps two different
+    OUTCOMES (two strikes of one daily family) out of one group (DR-01).
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+            A cached `subtitle` of None reads as absent, exactly as `or ""`
+            reads it everywhere else.
+
+    Returns:
+        str: The normalized key. An empty string means the market is not
+            grouped for time-series detection at all (its title normalizes
+            away).
+    """
+    # The live finder's own key helper, never a local copy: the backtester
+    # once keyed on its own normalize_title call and so reproduced DR-01
+    # instead of detecting it.
+    return time_series_group_key(_pair_key(m), m.get("subtitle") or "")
+
+
+def _st_group_key(m: dict) -> tuple[str, str, str] | None:
+    """
+    The same-title grouping key of one market dict — the single definition in
+    this module.
+
+    Read by BOTH _group_by_exact_title and _index_eligible_keys, for the same
+    reason _ts_group_key is shared: the groupable-subset decision (SS-1) is
+    only exact if it is taken on the very key the grouping uses.
+
+    Args:
+        m (dict): A market dict in the compact historical._market_to_dict form.
+            Every field reads through `or ""`, so a cached None, a blank string
+            and an absent key are all the same "no value".
+
+    Returns:
+        tuple[str, str, str] | None: (event_title, title, subtitle), or None
+            when title and subtitle are both empty — such a market carries no
+            wording to match on and is not grouped for same-title detection.
+    """
+    event_title = m.get("event_title") or ""
+    title = m.get("title") or ""
+    subtitle = m.get("subtitle") or ""
+    if not (title or subtitle):
+        return None
+    return (event_title, title, subtitle)
+
+
+def _group_by_exact_title(markets: Iterable[dict]) -> dict[tuple, list[dict]]:
     """
     Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
 
     Three-element key: the event_title component prevents cross-event option-label
     collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
+    The key is _st_group_key's, shared with _index_eligible_keys so the
+    groupable-subset decision in _prepare_candidates is taken on this exact key.
 
     Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54):
     two events of one recurring fixture still land in one group, and
@@ -1282,8 +1378,8 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     filters inside its inner loop.
 
     Args:
-        markets (list[dict]): Market dicts in the compact historical._market_to_dict
-            form.
+        markets (Iterable[dict]): Market dicts in the compact
+            historical._market_to_dict form, walked once.
 
     Returns:
         dict[tuple, list[dict]]: Mapping of (event_title, title, subtitle) ->
@@ -1292,25 +1388,25 @@ def _group_by_exact_title(markets: list[dict]) -> dict[tuple, list[dict]]:
     """
     groups: dict = defaultdict(list)
     for m in markets:
-        event_title = m.get("event_title") or ""
-        title    = m.get("title") or ""
-        subtitle = m.get("subtitle") or ""
-        if title or subtitle:
-            groups[(event_title, title, subtitle)].append(m)
+        key = _st_group_key(m)
+        if key is not None:
+            groups[key].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
-def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
+def _group_by_normalized_title(markets: Iterable[dict]) -> dict[str, list[dict]]:
     """
     Group markets by date-stripped combined key (event_title + title) plus the
     outcome label (subtitle), for time-series pair detection.
 
     Mirrors the live scanner exactly by calling the same helper,
-    scanner.time_series_group_key — pinned by AST in tests/test_strategy.py.
+    scanner.time_series_group_key, through this module's one definition of the
+    key, _ts_group_key — the two-link chain is pinned by AST in
+    tests/test_strategy.py.
 
     Args:
-        markets (list[dict]): Market dicts in the compact historical._market_to_dict
-            form.
+        markets (Iterable[dict]): Market dicts in the compact
+            historical._market_to_dict form, walked once.
 
     Returns:
         dict[str, list[dict]]: Mapping of normalized (event_title + title +
@@ -1330,7 +1426,7 @@ def _group_by_normalized_title(markets: list[dict]) -> dict[str, list[dict]]:
         # unrelated events does not collide) and the subtitle keeps two
         # different OUTCOMES — two strikes of one daily family — out of one
         # group. This mirror reproduced DR-01 and so could never detect it.
-        norm = time_series_group_key(_pair_key(m), m.get("subtitle") or "")
+        norm = _ts_group_key(m)
         if norm:
             groups[norm].append(m)
     return {k: v for k, v in groups.items() if len(v) >= 2}
@@ -2630,59 +2726,83 @@ def _log_rss(label: str) -> None:
     logging.info("Peak RSS %s: %.0f MiB", label, mib)
 
 
-def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
+@dataclass
+class _OutcomeLabelTally:
     """
-    Census how many eligible markets carry an outcome label and how their
-    deadline wording classifies, and warn when few carry a label.
+    The running counters of one outcome-label census, fed one record at a time.
 
-    Both backtest grouping keys are built from fields a stale cache may simply
-    not have. `subtitle` is the outcome discriminator in the time-series key
-    (scanner.time_series_group_key) and the third component of the same-title
-    key (event_title, title, subtitle); `event_title` is the first component of
-    the latter. A record whose subtitle is blank keys by title alone — the
-    pre-DR-01 strike-blind grouping the live scanner was fixed to stop using —
-    and a blank event_title collapses the same-title key toward (title,
-    subtitle), the direction that manufactures cross-event false positives
-    under the 0.95 co-resolution prior (TS-11).
+    The COUNTING half of the census. _report_outcome_label_coverage is the
+    logging half, and _log_outcome_label_coverage composes the two over any
+    iterable. They are separable because _prepare_candidates must count inside
+    its first pass over the corpus — the census may not cost a pass of its own,
+    and since SS-1 _prepare_candidates walks the corpus rather than building
+    an eligible list of its own to hand over —
+    while the census's log lines must still appear where they always have:
+    after the "Peak RSS before grouping" line and the RAM-budget warning, which
+    can only be written once both of _prepare_candidates' passes are done.
 
-    The defect this closes is the SILENCE, not the grouping (DR-66). A backtest
-    over a cache written before the 2026-08-14 yes_sub_title ingest fix reports
-    potential-pair counts, trade counts, a return figure and an empirical k-hat
-    recommendation for the real-money constant
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT, all describing a strategy the shipped
-    code does not implement — and neither the backtest log nor the dashboard
-    said so, making such a run indistinguishable in its own output from a run
-    on a good cache. The live scanner's own "Distinct normalized title+outcome
-    keys" counter cannot cover this: it lives in find_time_series_pairs, which
-    the backtester never calls, and it moves the OTHER way here — it detects
-    the one-leg-labelled case, where keys SPLIT, whereas a wholesale-blank
-    cache makes keys MERGE.
+    Holds counts only, never a record, so a tally kept across the two passes
+    pins nothing alive (TS-07).
 
-    Only subtitle coverage escalates to WARNING. event_title coverage shares
-    the INFO line but is never warned on, because it is legitimately near zero
-    on a healthy cache; the reasoning and the measured coverages behind both
-    decisions live in config.py beside BACKTEST_OUTCOME_LABEL_WARN_FRACTION, so
-    that no figure from another run is baked into a string emitted on every run
-    (TS-07).
+    Attributes:
+        total (int): Records added.
+        with_subtitle (int): Records carrying a non-blank `subtitle`.
+        with_event_title (int): Records carrying a non-blank `event_title`.
+        phrasing (defaultdict[str, int]): Records per deadline-phrasing
+            verdict (DEADLINE_CUMULATIVE / DEADLINE_SNAPSHOT /
+            DEADLINE_UNKNOWN), from scanner.deadline_profile.
+    """
+    total: int = 0
+    with_subtitle: int = 0
+    with_event_title: int = 0
+    phrasing: defaultdict = field(default_factory=lambda: defaultdict(int))
 
-    Advisory only: this reads the list and logs. No market, group, pair or
-    entry is dropped, filtered or altered, and no count the run reports moves.
+    def add(self, m: dict) -> None:
+        """
+        Count one record.
 
-    It also RETURNS what it just measured, so the same figure can reach the
-    dashboard (DR-66b): a run over a label-less cache used to log the warning
-    and then render a bare "Pooled empirical k̂" card with no caveat anywhere on
-    the page, while backtest.py's own closing line points the operator at that
-    page. Measuring and reporting in one function is a deliberate departure
-    from the check_shard_coverage / _log_shard_coverage pure-plus-loud split:
-    the single pass is the memory-sensitive part and must not be duplicated,
-    and the threshold must be evaluated exactly once so the log line and the
-    page cannot disagree about where the floor sits.
+        Blank/None/absent all read as "no label", the same falsiness the two
+        grouping keys apply with `or ""`.
+
+        Args:
+            m (dict): An eligible market record in the compact
+                historical._market_to_dict form. Read only; no reference to it
+                is kept.
+
+        Returns:
+            None
+        """
+        self.total += 1
+        if m.get("subtitle"):
+            self.with_subtitle += 1
+        if m.get("event_title"):
+            self.with_event_title += 1
+        # Folded into whatever pass feeds this tally rather than given its own.
+        # The census's own cost is this classifier, not the walk (about 12 us
+        # vs 0.3 us per record after DR-70, measured on 200,000 records of the
+        # 2026-09-08 day slice, 2026-09-22), so a walk of its own would add
+        # little; what bounds the census on a multi-million-record corpus is
+        # the classifier's cost. Since SS-1 the pass that feeds it in a
+        # backtest is _index_eligible_keys, which also computes both grouping
+        # keys per eligible record — and on a combo-heavy corpus the
+        # time-series key dominates that pass (~135 us/record, normalize_title
+        # on long combo titles, measured on the 2026-09-17 7-day window), so
+        # there the census is the smaller share.
+        self.phrasing[_deadline_profile_dict(m)[0]] += 1
+
+
+def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCoverage:
+    """
+    Log a finished outcome-label census and return exactly what it logged.
+
+    The LOGGING half of the census: see _log_outcome_label_coverage for what
+    the census measures and why it exists, and _OutcomeLabelTally for why the
+    counting and the logging are separable. Every line this emits, in order,
+    and the dataclass it returns are byte-for-byte what the census emitted and
+    returned before SS-1 split it in two.
 
     Args:
-        markets (list[dict]): The eligible market records, in the compact
-            historical._market_to_dict form, exactly as handed to the two
-            grouping calls below. Counted in ONE pass with no second list
-            materialized, since this can be millions of records.
+        tally (_OutcomeLabelTally): The completed counts.
 
     Returns:
         OutcomeLabelCoverage: Scalars only (counts, fractions and one
@@ -2691,12 +2811,16 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             corpus, total 0 with both fractions None (undefined, not zero),
             below_floor False and all three phrasing counts 0. Holds no
             reference to any record, so it is safe to keep past
-            _prepare_candidates' `del markets`.
+            _prepare_candidates' release of the corpus and the groupable
+            subset.
     """
-    total = len(markets)
+    total = tally.total
+    with_subtitle = tally.with_subtitle
+    with_event_title = tally.with_event_title
+    phrasing = tally.phrasing
 
-    # An empty list has no coverage to report: the fraction is undefined, not
-    # zero, so warning here would manufacture a drift alarm out of a corpus
+    # An empty corpus has no coverage to report: the fraction is undefined,
+    # not zero, so warning here would manufacture a drift alarm out of a corpus
     # that simply has no records — a cause the surrounding "Total settled
     # markets" and "Eligibility prefilter" lines already name. The census still
     # emits one line, so its ABSENCE always means this helper did not run.
@@ -2713,23 +2837,6 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             below_floor=False,
             cumulative_markets=0, snapshot_markets=0, unknown_deadline_markets=0,
         )
-
-    # One pass, five counters. Blank/None/absent all read as "no label", the
-    # same falsiness the two grouping helpers apply with `or ""`.
-    with_subtitle = 0
-    with_event_title = 0
-    phrasing: dict = defaultdict(int)
-    for m in markets:
-        if m.get("subtitle"):
-            with_subtitle += 1
-        if m.get("event_title"):
-            with_event_title += 1
-        # Folded into this pass rather than given its own. The classifier, not
-        # the walk, dominates this pass (about 12 us vs 0.3 us per record after
-        # DR-70, measured on 200,000 records of the 2026-09-08 day slice,
-        # 2026-09-22), so a second walk would add little; what bounds the
-        # census on a multi-million-record corpus is the classifier's own cost.
-        phrasing[_deadline_profile_dict(m)[0]] += 1
 
     subtitle_fraction = with_subtitle / total
     logging.info(
@@ -2790,6 +2897,343 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     )
 
 
+def _log_outcome_label_coverage(markets: Iterable[dict]) -> OutcomeLabelCoverage:
+    """
+    Census how many eligible markets carry an outcome label and how their
+    deadline wording classifies, and warn when few carry a label.
+
+    Both backtest grouping keys are built from fields a stale cache may simply
+    not have. `subtitle` is the outcome discriminator in the time-series key
+    (scanner.time_series_group_key) and the third component of the same-title
+    key (event_title, title, subtitle); `event_title` is the first component of
+    the latter. A record whose subtitle is blank keys by title alone — the
+    pre-DR-01 strike-blind grouping the live scanner was fixed to stop using —
+    and a blank event_title collapses the same-title key toward (title,
+    subtitle), the direction that manufactures cross-event false positives
+    under the 0.95 co-resolution prior (TS-11).
+
+    The defect this closes is the SILENCE, not the grouping (DR-66). A backtest
+    over a cache written before the 2026-08-14 yes_sub_title ingest fix reports
+    potential-pair counts, trade counts, a return figure and an empirical k-hat
+    recommendation for the real-money constant
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT, all describing a strategy the shipped
+    code does not implement — and neither the backtest log nor the dashboard
+    said so, making such a run indistinguishable in its own output from a run
+    on a good cache. The live scanner's own "Distinct normalized title+outcome
+    keys" counter cannot cover this: it lives in find_time_series_pairs, which
+    the backtester never calls, and it moves the OTHER way here — it detects
+    the one-leg-labelled case, where keys SPLIT, whereas a wholesale-blank
+    cache makes keys MERGE.
+
+    Only subtitle coverage escalates to WARNING. event_title coverage shares
+    the INFO line but is never warned on, because it is legitimately near zero
+    on a healthy cache; the reasoning and the measured coverages behind both
+    decisions live in config.py beside BACKTEST_OUTCOME_LABEL_WARN_FRACTION, so
+    that no figure from another run is baked into a string emitted on every run
+    (TS-07).
+
+    Advisory only: this reads the records and logs. No market, group, pair or
+    entry is dropped, filtered or altered, and no count the run reports moves.
+
+    It also RETURNS what it just measured, so the same figure can reach the
+    dashboard (DR-66b): a run over a label-less cache used to log the warning
+    and then render a bare "Pooled empirical k̂" card with no caveat anywhere on
+    the page, while backtest.py's own closing line points the operator at that
+    page. Measuring and reporting in one call is a deliberate departure from
+    the check_shard_coverage / _log_shard_coverage pure-plus-loud split: the
+    single pass is the memory-sensitive part and must not be duplicated, and
+    the threshold must be evaluated exactly once so the log line and the page
+    cannot disagree about where the floor sits.
+
+    This function is the one-shot composition of the census's two halves —
+    _OutcomeLabelTally counts, _report_outcome_label_coverage logs and returns
+    — for a caller holding a whole iterable. _prepare_candidates uses the two
+    halves directly instead (SS-1): it feeds the tally inside its FIRST pass
+    over the corpus, so the census never costs a pass of its own, and reports
+    at the position this census has always logged from. Both routes run the
+    same counting and the same reporting code, so they cannot disagree.
+
+    Args:
+        markets (Iterable[dict]): The eligible market records, in the compact
+            historical._market_to_dict form. Walked EXACTLY ONCE, counting
+            `total` as it goes rather than asking for a length, so a one-shot
+            iterator serves as well as a list and no second list is ever
+            materialized, since this can be millions of records.
+
+    Returns:
+        OutcomeLabelCoverage: Scalars only (counts, fractions and one
+            verdict) — the numbers this census just logged, with below_floor
+            carrying the very comparison the WARNING branches on. On an empty
+            corpus, total 0 with both fractions None (undefined, not zero),
+            below_floor False and all three phrasing counts 0. Holds no
+            reference to any record (see _report_outcome_label_coverage).
+    """
+    tally = _OutcomeLabelTally()
+    for m in markets:
+        tally.add(m)
+    return _report_outcome_label_coverage(tally)
+
+
+@dataclass(frozen=True)
+class _EligibleKeyIndex:
+    """
+    What _prepare_candidates' first pass over the corpus learned, compactly.
+
+    One entry per ELIGIBLE record (a record passing _can_ever_enter), in the
+    order the corpus yielded them — the positional contract the second pass,
+    _materialize_groupable, reads back. Holds no record, only fixed-width
+    numbers per eligible record, which is the whole point on a corpus of
+    millions (SS-1). While the first pass builds it, it holds about 27 bytes
+    per eligible record (three int64 arrays and two flag bytes; 187 MiB for
+    7,260,952 eligible records, measured on synthetic keys on 2026-09-24),
+    and computing `keep` from those buffers adds a transient of about
+    74 bytes per record (np.unique inside _shared_key_mask; 515 MiB at that
+    count). Once built it keeps only `keep` (1 byte) and `identities`
+    (8 bytes) per eligible record.
+
+    Attributes:
+        total (int): Every record the first pass walked, eligible or not — the
+            figure "Total settled markets to analyze" reports.
+        eligible (int): Records that passed _can_ever_enter.
+        groupable (int): Eligible records whose time-series key OR same-title
+            key hash is shared with another eligible record — how many the
+            second pass will materialize.
+        keep (bytes): One byte per eligible record, 1 when that record is
+            groupable, else 0.
+        identities (array): _corpus_identity() of each eligible record, int64
+            — one hash over its ticker and every field either grouping key
+            reads — which the second pass compares position by position, so a
+            corpus that does not re-iterate identically in anything the keep
+            flags were chosen from is refused rather than silently misaligned.
+    """
+    total: int
+    eligible: int
+    groupable: int
+    keep: bytes
+    identities: array
+
+
+def _shared_key_mask(hashes: array, valid: bytearray) -> np.ndarray:
+    """
+    Flag every key hash that occurs at least twice among the VALID keys.
+
+    A record can only ever land in a group of two or more — and both grouping
+    functions drop every single-member group — if some OTHER eligible record
+    carries the same key. So "this record's key is shared" is exactly "this
+    record can appear in a group", and a record whose time-series key and
+    same-title key are both unshared can never appear in any pair of either
+    type.
+
+    Hashes stand in for the keys to keep this compact (8 bytes per record
+    instead of a multi-hundred-byte string; np.unique's sort, inverse and
+    counts add a transient of about 74 bytes per position while this runs —
+    see _EligibleKeyIndex for the measurement), which is safe in one direction
+    only, and that is the direction that matters: equal keys ALWAYS hash equal,
+    so a genuinely shared key is always flagged, and a 64-bit collision
+    between two DIFFERENT keys can only flag extra records as shared. Those are
+    then kept and grouped on their real keys, where the exact grouping drops
+    them as the single-member groups they are — so a collision costs a few
+    bytes of residency, never a changed result. hash() is salted per process
+    (PYTHONHASHSEED), which is harmless: both passes and the grouping run in
+    one process.
+
+    Args:
+        hashes (array): int64 ('q') key hashes, one per eligible record.
+            Positions whose key is invalid hold a placeholder that is never
+            read.
+        valid (bytearray): One byte per position: 1 when that record has a
+            key of this kind at all (a non-empty time-series key; a same-title
+            key that is not None), else 0.
+
+    Returns:
+        np.ndarray: Boolean, one per position — True exactly when the position
+            is valid and its hash occurs at least twice among valid positions.
+    """
+    h = np.frombuffer(hashes, dtype=np.int64)
+    ok = np.frombuffer(valid, dtype=np.bool_)
+    shared = np.zeros(len(h), dtype=np.bool_)
+    if ok.any():
+        # counts[inverse] is, for each valid position, how many valid
+        # positions carry the same hash.
+        _unique, inverse, counts = np.unique(
+            h[ok], return_inverse=True, return_counts=True,
+        )
+        shared[ok] = counts[inverse] >= 2
+    return shared
+
+
+def _corpus_identity(m: dict) -> int:
+    """
+    One hash over a record's ticker and every field either grouping key reads.
+
+    _materialize_groupable applies the first pass's keep flags BY POSITION, so
+    it must be able to tell when the second walk is not the corpus the flags
+    were chosen for. A ticker alone cannot: a corpus that repeats the same
+    tickers in the same order but changes a grouping field between walks (a
+    cache file re-read after another run replaced it with different event
+    titles, say) would have the flags applied to records whose keys are not
+    the ones the first pass hashed — dropping a record whose NEW key is shared
+    — with nothing raised. So the identity covers exactly what the flags
+    depend on: the ticker (position) plus event_title, title and subtitle,
+    which are every field _ts_group_key (through _pair_key, whose last
+    fallback is the ticker) and _st_group_key read. Eligibility, the only
+    other input, is re-applied by the second pass itself, and a change in it
+    shifts the eligible sequence, which this comparison or the count check
+    catches. No other field is compared: none can change which records are
+    grouped.
+
+    Raw values, not the `or ""`-normalized ones: a field that changes from
+    None to "" did not iterate identically either, and refusing it costs
+    nothing on a corpus that genuinely re-iterates. Being a 64-bit hash, a
+    change could in principle slip through on a collision; the guard is
+    against a corpus that drifts, not an adversarial one.
+
+    Args:
+        m (dict): A market record in the compact historical._market_to_dict
+            form.
+
+    Returns:
+        int: hash((ticker, event_title, title, subtitle)) of the raw values.
+    """
+    return hash((m.get("ticker"), m.get("event_title"), m.get("title"), m.get("subtitle")))
+
+
+def _index_eligible_keys(
+    markets: Iterable[dict], start_date: date, census: _OutcomeLabelTally,
+) -> _EligibleKeyIndex:
+    """
+    First pass over the corpus: count it, prefilter it, census it, and hash
+    every eligible record's two grouping keys.
+
+    The keys are the same _ts_group_key / _st_group_key the two grouping
+    functions group on, computed once per eligible record here — the SAME
+    per-record cost the time-series grouping used to pay over the whole
+    eligible list (the normalize_title inside the time-series key dominates
+    it), so this pass adds a walk, not a second keying. Only hashes and flags
+    are kept, never a record — about 27 bytes per eligible record while the
+    pass runs, plus the transient of computing the keep flags (see
+    _EligibleKeyIndex for both measurements).
+
+    Args:
+        markets (Iterable[dict]): The settled-market corpus, in the compact
+            historical._market_to_dict form. Walked once here and once more by
+            _materialize_groupable, so it must re-iterate IDENTICALLY — a list,
+            or any re-iterable that yields the same records in the same order
+            on every walk (fresh dict objects each walk are fine).
+        start_date (date): The backtest start date _can_ever_enter tests
+            against.
+        census (_OutcomeLabelTally): Fed every eligible record, in order, so
+            the outcome-label census costs no pass of its own.
+
+    Returns:
+        _EligibleKeyIndex: The counts, the per-eligible-record keep flags and
+            identity hashes (_corpus_identity). Holds no record.
+    """
+    total = 0
+    identities = array("q")
+    ts_hashes = array("q")
+    ts_valid = bytearray()
+    st_hashes = array("q")
+    st_valid = bytearray()
+    for m in markets:
+        total += 1
+        if not _can_ever_enter(m, start_date):
+            continue
+        census.add(m)
+        identities.append(_corpus_identity(m))
+        ts_key = _ts_group_key(m)
+        # An empty time-series key is never grouped, so it is never "shared"
+        # either; its placeholder hash is masked out by the validity flag.
+        ts_hashes.append(hash(ts_key) if ts_key else 0)
+        ts_valid.append(1 if ts_key else 0)
+        st_key = _st_group_key(m)
+        st_hashes.append(0 if st_key is None else hash(st_key))
+        st_valid.append(0 if st_key is None else 1)
+    keep = _shared_key_mask(ts_hashes, ts_valid) | _shared_key_mask(st_hashes, st_valid)
+    return _EligibleKeyIndex(
+        total=total,
+        eligible=len(identities),
+        groupable=int(keep.sum()),
+        keep=keep.tobytes(),
+        identities=identities,
+    )
+
+
+def _materialize_groupable(
+    markets: Iterable[dict], start_date: date, index: _EligibleKeyIndex,
+) -> list[dict]:
+    """
+    Second pass over the corpus: keep exactly the eligible records the first
+    pass flagged as groupable, in corpus order.
+
+    The keep decision is read by POSITION among eligible records from the first
+    pass's index — the expensive keys are never recomputed for the millions of
+    records that are dropped. Because every member of every group of two or
+    more is kept, and kept in its original relative order, the two grouping
+    functions return the same keys, the same members in the same order and the
+    same insertion order over this subset as they would over the whole
+    eligible list, and so _extract_pairs returns the same pairs.
+
+    Position is only meaningful if the corpus re-iterates identically, so this
+    fails LOUDLY rather than misalign: each eligible record's _corpus_identity
+    — its ticker and every field either grouping key reads — must match the
+    one the first pass recorded at that position, and the eligible count must
+    match in full. That covers everything the keep flags were chosen from;
+    a field no key reads is not compared, because it cannot change which
+    records are grouped.
+
+    Args:
+        markets (Iterable[dict]): The same corpus _index_eligible_keys walked.
+        start_date (date): The same start date, re-applied through
+            _can_ever_enter so the eligible positions line up.
+        index (_EligibleKeyIndex): The first pass's result.
+
+    Returns:
+        list[dict]: The groupable records — every eligible record whose
+            time-series or same-title key is shared with another eligible
+            record — in corpus order.
+
+    Raises:
+        RuntimeError: When the corpus did not iterate identically twice — an
+            eligible record's ticker or grouping fields (event_title, title,
+            subtitle) differ from the first pass's at the same position, or the
+            two passes found different eligible counts. Continuing would group
+            a subset chosen for a different corpus.
+    """
+    groupable: list[dict] = []
+    keep = index.keep
+    identities = index.identities
+    expected = index.eligible
+    position = 0
+    for m in markets:
+        if not _can_ever_enter(m, start_date):
+            continue
+        if position < expected:
+            if _corpus_identity(m) != identities[position]:
+                raise RuntimeError(
+                    f"The settled-market corpus did not iterate identically "
+                    f"twice: eligible record {position} is {m.get('ticker')!r} "
+                    f"on the second pass, but the first pass recorded a "
+                    f"different ticker or different grouping fields "
+                    f"(event_title, title, subtitle) at that position. The "
+                    f"groupable subset is chosen by position, so it cannot be "
+                    f"applied to this corpus; refusing to continue rather than "
+                    f"group the wrong records"
+                )
+            if keep[position]:
+                groupable.append(m)
+        position += 1
+    if position != expected:
+        raise RuntimeError(
+            f"The settled-market corpus did not iterate identically twice: the "
+            f"first pass found {expected} eligible markets and the second "
+            f"{position}. The groupable subset is chosen by position, so it "
+            f"cannot be applied to this corpus; refusing to continue rather "
+            f"than group the wrong records"
+        )
+    return groupable
+
+
 def _prepare_candidates(
     hist_client: Any,
     live_client,
@@ -2809,9 +3253,31 @@ def _prepare_candidates(
     interval discount k (which only _simulate_at_discount reads) touches any
     of it, so one call can feed an entry pass per band through
     _entries_for_band(). This is the whole of what _prepare_entries() did
-    before its _find_entry sweep, statement for statement: same log lines in
-    the same order, the same two _log_rss brackets, and the same release of
-    the group maps and record list before the candlestick pool spawns.
+    before its _find_entry sweep: same log lines in the same order, the same
+    two _log_rss brackets, and the same release of the group maps and records
+    before the candlestick pool spawns.
+
+    Since SS-1 it builds no eligible list of its own and groups only the
+    groupable subset. The fetched corpus is walked TWICE and treated as any
+    re-iterable of market dicts: the first pass (_index_eligible_keys) counts
+    it, prefilters it, feeds the census and hashes each eligible record's two
+    grouping keys; the second (_materialize_groupable) keeps only the eligible
+    records whose time-series or same-title key is shared with another
+    eligible record — every other record would form a single-member group,
+    which both grouping functions drop. Every member of every group of two or
+    more is kept, in order, so the group maps, the pairs, the census and every
+    number the run reports are exactly what grouping the whole eligible list
+    produced. One INFO line ("Groupable subset: ...") is new, and the
+    RAM-budget warning now counts the groupable records it describes rather
+    than every eligible one.
+
+    What this does NOT remove is the corpus itself. fetch_all_settled_markets
+    still returns one list, and because the prefilter is applied during its
+    assembly that list IS the eligible set: it stays resident through both
+    walks, and the "Peak RSS before grouping" line counts it, until it is
+    released right after the second pass. The two walks are written for any
+    corpus that re-iterates identically, so a streaming corpus can replace the
+    list without touching this function.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -2848,6 +3314,11 @@ def _prepare_candidates(
             was not properly excluded by the eligibility prefilter — this is
             treated as a real defect (a market that should never have reached
             this stage), not degraded into "no price history".
+        RuntimeError: Propagates out of _materialize_groupable when the
+            corpus did not iterate identically on its two walks (a different
+            eligible count, or a different ticker at some eligible position):
+            the groupable subset is chosen by position, so continuing would
+            group records chosen for a different corpus.
     """
 
     # Feasibility pre-check, BEFORE any network call: a trade can only ever be
@@ -2897,7 +3368,7 @@ def _prepare_candidates(
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
     # ineligible markets are dropped during assembly rather than materialized
-    # and cached first — result-neutral, since the very next statement would
+    # and cached first — result-neutral, since both passes below would
     # discard exactly those records anyway, but it keeps peak memory and the
     # assembled cache proportional to what the backtest can actually use.
     # SETTLED_PREFILTER_CACHE_TAG keys that cache to _can_ever_enter's current
@@ -2907,72 +3378,130 @@ def _prepare_candidates(
         prefilter=lambda m: _can_ever_enter(m, start_date),
         prefilter_tag=SETTLED_PREFILTER_CACHE_TAG,
     )
-    logging.info("Total settled markets to analyze: %d", len(markets))
-
-    # Necessary-condition prefilter: drop markets whose [open_time, close_time
-    # - 1 day] window contains no Monday checkpoint on/after start_date, since
-    # _find_entry() can then never enter them as either leg of either pair
-    # type. This is what makes grouping/pairing tractable at current Kalshi
-    # volumes (hourly/intraday ladders are the overwhelming majority of
-    # settled markets and almost never span a scannable Monday).
+    # Two walks over the corpus, and no eligible list of this function's own
+    # (SS-1). The corpus is treated as any RE-ITERABLE of market dicts: it is
+    # walked here and once more by _materialize_groupable, and nothing else in
+    # this function iterates it. (Today the fetch still returns ONE list, and
+    # since the prefilter ran during its assembly that list is the eligible
+    # set — resident until the `del markets` below. What SS-1 removes here is
+    # the second, filtered copy and the grouping over every eligible record;
+    # a corpus that streams is what would remove the list itself.)
+    #
+    # Pass 1 counts every record (the "Total settled markets" figure), applies
+    # the eligibility prefilter below, feeds each eligible record to the
+    # outcome-label census, and hashes that record's two grouping keys — about
+    # 27 bytes per eligible record, never the record itself (plus a transient
+    # while the keep flags are computed; _EligibleKeyIndex has both measured).
+    # A 7-day window (--start-date 2026-09-17) measured 7,260,952 eligible
+    # records of which only 184,255 (2.5%) share either key with another
+    # eligible record; both grouping functions drop every single-member group,
+    # so the rest can never appear in any pair of either type, yet holding
+    # them all at the 3,926 B/record measured on that window is ~28 GB — past
+    # a 16 GB host. Pass 2 then keeps exactly the records whose key is shared.
+    #
+    # Necessary-condition prefilter, applied in BOTH passes: drop markets
+    # whose [open_time, close_time - 1 day] window contains no Monday
+    # checkpoint on/after start_date, since _find_entry() can then never enter
+    # them as either leg of either pair type. This is what makes
+    # grouping/pairing tractable at current Kalshi volumes (hourly/intraday
+    # ladders are the overwhelming majority of settled markets and almost
+    # never span a scannable Monday).
     #
     # Retained even though the same predicate was passed into the fetch above:
-    # it is idempotent, it costs one pass, and it keeps this guarantee local to
-    # the code that depends on it (a cached unfiltered list, a caller that
-    # skips the prefilter argument, or a future fetch path would otherwise
-    # reach the O(n^2) pairing unfiltered).
-    eligible_markets = [m for m in markets if _can_ever_enter(m, start_date)]
+    # it is idempotent, it costs nothing extra (both passes walk the corpus
+    # anyway), and it keeps this guarantee local to the code that depends on
+    # it (a cached unfiltered list, a caller that skips the prefilter argument,
+    # or a future fetch path would otherwise reach the O(n^2) pairing
+    # unfiltered).
+    census = _OutcomeLabelTally()
+    key_index = _index_eligible_keys(markets, start_date, census)
+    logging.info("Total settled markets to analyze: %d", key_index.total)
     logging.info(
         "Eligibility prefilter: skipping %d/%d markets that cannot appear in any tradeable pair",
-        len(markets) - len(eligible_markets), len(markets),
+        key_index.total - key_index.eligible, key_index.total,
     )
-    markets = eligible_markets
+
+    # Pass 2: materialize the groupable subset, in corpus order. Raises if the
+    # corpus did not iterate identically twice, which would misalign the
+    # positional keep flags.
+    groupable = _materialize_groupable(markets, start_date, key_index)
+    eligible_count = key_index.eligible
+    logging.info(
+        "Groupable subset: materializing %d of %d eligible markets — the rest "
+        "share no grouping key with any other eligible market, so both "
+        "groupings would drop them as single-member groups",
+        len(groupable), eligible_count,
+    )
+    # Nothing below reads the corpus or the first pass's index: `groupable`
+    # holds every record grouping needs, and the census has its counts. For a
+    # corpus held as a list (what fetch_all_settled_markets returns today, or
+    # a test stub) this is what lets every eligible record that shares no key
+    # be collected BEFORE the group maps are built, rather than after pair
+    # extraction.
+    del markets, key_index
 
     # Logged BEFORE the RAM-budget warning below so the two read in causal
     # order: this line is what the fetch — or, on a cache hit, the cache load —
-    # has ALREADY cost, and the warning that follows names the record list's
-    # share of it and what grouping is about to add on top.
+    # and the two passes have ALREADY cost, the groupable subset included, and
+    # the warning that follows names that subset's share of it and what
+    # grouping is about to add on top.
     _log_rss("before grouping")
 
     # Everything from here to the end of pair extraction is held live at once:
-    # the whole record list, two group maps over it, and two candidate-pair
-    # lists referencing those same dicts. The records are ALREADY resident when
-    # this fires — fetch_all_settled_markets either assembled them from the
-    # streamed day slices or, on a cache hit, rebuilt every one of them with
-    # json.loads() over the assembled file — so this is a budget line covering
-    # money already spent plus money about to be spent, not a forecast issued
-    # ahead of the whole cost. It deliberately carries only THIS run's numbers;
-    # the historical measurements live in config.py beside
+    # the groupable subset, two group maps over it, and two candidate-pair
+    # lists referencing those same dicts. The subset is ALREADY resident when
+    # this fires — the second pass has just materialized it — so this is a
+    # budget line covering money already spent plus money about to be spent,
+    # not a forecast issued ahead of the whole cost. It is keyed on the
+    # GROUPABLE count, not the eligible one, because the subset is what stays
+    # resident from here on: the corpus was released just above.
+    #
+    # Known residual, recorded rather than implied away: while the corpus is
+    # a list (always, today — see the note at the fetch), every eligible
+    # record WAS resident up to that release, and the peak RSS line above
+    # includes all of them, yet this warning does not count them. So a run
+    # whose eligible count is far above the threshold but whose groupable
+    # count is not (the 7-day window above: 7,260,952 eligible, 184,255
+    # groupable) gets no warning for the list that set its peak; its eligible
+    # count is still on the "Eligibility prefilter" and "Groupable subset"
+    # lines, and the cost on the RSS line. It deliberately carries only THIS
+    # run's numbers; the historical measurements live in config.py beside
     # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them
     # current, rather than in a string emitted on every run (TS-07). Advisory
     # only: nothing is capped or dropped.
-    if len(markets) > BACKTEST_MARKETS_RAM_WARN:
+    if len(groupable) > BACKTEST_MARKETS_RAM_WARN:
         logging.warning(
-            "%d eligible markets: their records alone are roughly %.1f GB and "
-            "are already resident — the peak RSS line above covers them; "
-            "grouping and pair extraction add the group maps and the pair "
-            "lists on top of them",
-            len(markets), len(markets) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
+            "%d groupable markets (of %d eligible) are materialized for "
+            "grouping: their records alone are roughly %.1f GB and are already "
+            "resident — the peak RSS line above covers them; grouping and pair "
+            "extraction add the group maps and the pair lists on top of them",
+            len(groupable), eligible_count,
+            len(groupable) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
         )
 
-    # Census the two fields the grouping keys below are built from, while the
-    # record list is still alive (it is del'd a few lines down). A cache
-    # predating the 2026-08-14 yes_sub_title ingest fix carries subtitle=None on
-    # nearly every record, which makes the time-series key collapse to the
+    # Report the census of the two fields the grouping keys below are built
+    # from. It was COUNTED over every eligible record during pass 1 and is
+    # only logged here, at the position it has always logged from. A cache
+    # predating the 2026-08-14 yes_sub_title ingest fix carries subtitle=None
+    # on nearly every record, which makes the time-series key collapse to the
     # pre-DR-01 strike-blind title-only form — silently, with the run's pair
-    # counts, trades, return and empirical k-hat all still reported as if it had
-    # grouped correctly (DR-66). Advisory: it logs and changes nothing.
+    # counts, trades, return and empirical k-hat all still reported as if it
+    # had grouped correctly (DR-66). Advisory: it logs and changes nothing.
     #
     # The measurement is carried out of this function (DR-66b) so the dashboard
     # can render the same caveat beside the k-hat card it recommends a
     # real-money constant from. It is scalars only (counts, fractions and one
     # verdict) with no reference to any record here, so holding it costs
-    # nothing and the `del markets` below is unaffected.
-    label_coverage = _log_outcome_label_coverage(markets)
+    # nothing and the release of the subset below is unaffected.
+    label_coverage = _report_outcome_label_coverage(census)
 
-    # Group settled markets into potential pairs using the same logic as the live scanner
-    ts_groups    = _group_by_normalized_title(markets)
-    same_groups  = _group_by_exact_title(markets)
+    # Group the groupable subset into potential pairs using the same logic as
+    # the live scanner. Every member of every group of two or more is in the
+    # subset, in its original relative order, so these maps — keys, members,
+    # member order and insertion order — are exactly the maps the whole
+    # eligible list would have produced.
+    ts_groups    = _group_by_normalized_title(groupable)
+    same_groups  = _group_by_exact_title(groupable)
     # The ladder flag rides through unresolved (None included): the two calls
     # here and every _find_entry call of every later entry pass (it is carried
     # on the returned _Candidates) receive the same argument and resolve the
@@ -2982,21 +3511,20 @@ def _prepare_candidates(
     # groups have no deadline concept and the flag is inert there.
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders)
-    # Release the group maps AND the record list together, before the
+    # Release the group maps AND the groupable subset together, before the
     # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
-    # at function exit, which is where they were all freed before. Nothing
-    # below reads any of them — the pair lists carry the market dicts they
-    # need. Dropping the group maps alone frees no record dicts at all:
-    # `markets` still references every one of them, and after the prefilter
-    # above `eligible_markets` is the SAME list object as `markets`, so all
-    # four names have to go for the records that landed in no candidate pair
-    # to become collectable.
+    # at function exit. Nothing below reads any of them — the pair lists carry
+    # the market dicts they need. Dropping the group maps alone frees no record
+    # dicts at all: `groupable` still references every one of them, so all
+    # three names have to go for the groupable records that landed in no
+    # candidate pair to become collectable. (The corpus itself was released
+    # right after the second pass, above.)
     #
     # This lowers RESIDENCY across the candlestick fetch and every later
     # _find_entry sweep (_entries_for_band). It does NOT lower the run's peak
     # RSS, which is a high-water mark already reached by the time this
     # statement runs.
-    del ts_groups, same_groups, markets, eligible_markets
+    del ts_groups, same_groups, groupable
     _log_rss("after pair extraction")
 
     logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))

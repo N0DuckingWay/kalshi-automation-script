@@ -722,14 +722,34 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
-# Eligible-market count above which backtester._prepare_candidates (the first
+# GROUPABLE-market count above which backtester._prepare_candidates (the first
 # half of _prepare_entries) warns the operator about the RAM the
-# grouping/pairing step is about to need, and the per-record estimate the
-# warning multiplies by.
+# grouping/pairing step holds, and the per-record estimate the warning
+# multiplies by. Groupable = the eligible markets (those passing
+# _can_ever_enter) whose time-series or same-title grouping key is shared with
+# another eligible market: since SS-1 they are the only records
+# _prepare_candidates builds a list of for grouping, because every other
+# eligible record would form a single-member group, which both groupings drop.
+# The warning used to count every ELIGIBLE record, which matched what was then
+# held for grouping; since SS-1 the subset is what stays resident from the
+# warning onward, so the eligible count would over-state it. A 7-day window
+# (--start-date 2026-09-17) measured 7,260,952 eligible records of which
+# 184,255 share a key — the gap between those two numbers is what the eligible
+# count would over-state now.
+#
+# Known residual: the corpus fetch_all_settled_markets returns is still ONE
+# list, and since the prefilter is applied during its assembly it IS the
+# eligible set — resident, and counted by the "Peak RSS before grouping"
+# line, until _prepare_candidates releases it right after its second walk,
+# just before this warning. The warning does not count those records, so a
+# run whose eligible count is far above this threshold but whose groupable
+# count is not gets no warning for the list that set its peak (its eligible
+# count is still on the "Eligibility prefilter" and "Groupable subset" lines).
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
-# phase right after it holds the whole window as one list and builds two group
-# maps and two candidate-pair lists over it. This comment is the ONLY place
+# phase right after it held the whole window as one list and built two group
+# maps and two candidate-pair lists over it (the two TS-07 measurements below
+# predate SS-1 and describe that shape). This comment is the ONLY place
 # (with the matching CLAUDE.md note) that records historical measurements: the
 # warning itself prints only the running process's own numbers, so it can never
 # quote a figure from some other run. Two runs on a 16 GB host, both over the
@@ -761,7 +781,12 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # ~3.0 KB per record (the sample averages 1,290 JSON bytes/record against the
 # file-wide 1,310, so it is representative), while subtracting that 1.43 GB
 # decoded string from the 3,816 MiB pre-grouping peak above leaves no more than
-# ~2.4 KB per record actually resident. 2,700 sits between the two.
+# ~2.4 KB per record actually resident. 2,700 sits between the two. A third
+# measurement, on the eligible records of the 2026-09-17 7-day window (99.75%
+# MVE combos), found 3,926 B/record under tracemalloc over 60,000 samples, so
+# on a combo-heavy corpus this estimate UNDERSTATES the footprint. It is left
+# at 2,700 deliberately: it only scales an advisory warning, and moving it
+# would change what that line reports on every other corpus.
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 

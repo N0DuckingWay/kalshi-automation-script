@@ -2,10 +2,13 @@
 import gc
 import inspect
 import logging
+import random
 import re
 import statistics
 import time
 import weakref
+from array import array
+from collections import defaultdict
 from dataclasses import astuple
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -3072,12 +3075,13 @@ class TestLogRss:
 
 
 class TestPrepareEntriesMemoryInstrumentation:
-    """TS-07: the grouping/pairing step holds the whole record list, two group
-    maps and two pair lists live at once. It is bracketed by RSS lines, the
-    first of which precedes a RAM-budget warning carrying only this run's own
-    numbers, and the maps and the record list are released together before the
-    candlestick pool runs. The measured figures behind all of this live in
-    config.py beside BACKTEST_RECORD_BYTES_ESTIMATE, not here.
+    """TS-07: the grouping/pairing step holds the groupable subset (SS-1: the
+    eligible records that share a grouping key), two group maps and two pair
+    lists live at once. It is bracketed by RSS lines, the first of which
+    precedes a RAM-budget warning carrying only this run's own numbers, and
+    the maps and the subset are released together before the candlestick
+    pool runs. The measured figures behind all of this live in config.py
+    beside BACKTEST_RECORD_BYTES_ESTIMATE, not here.
     """
 
     @staticmethod
@@ -3113,8 +3117,11 @@ class TestPrepareEntriesMemoryInstrumentation:
 
     @staticmethod
     def _ram_warnings(caplog):
+        # SS-1 reworded the warning: it now counts the GROUPABLE records it
+        # says are resident, beside the eligible count they were chosen from.
         return [r.getMessage() for r in caplog.records
-                if "eligible markets: their records alone are" in r.getMessage()]
+                if "are materialized for grouping: their records alone are"
+                in r.getMessage()]
 
     def test_rss_lines_bracket_the_grouping_step(self, monkeypatch, caplog):
         with caplog.at_level("INFO"):
@@ -3132,7 +3139,7 @@ class TestPrepareEntriesMemoryInstrumentation:
             self._run(monkeypatch)
         warnings = self._ram_warnings(caplog)
         assert len(warnings) == 1
-        assert warnings[0].startswith("2 eligible markets")
+        assert warnings[0].startswith("2 groupable markets (of 2 eligible)")
 
     def test_ram_warning_is_silent_at_the_threshold(self, monkeypatch, caplog):
         # Strictly greater-than: a run exactly at the threshold is not warned.
@@ -3168,55 +3175,75 @@ class TestPrepareEntriesMemoryInstrumentation:
         rss_at = next(i for i, m in enumerate(messages)
                       if m.startswith("Peak RSS before grouping"))
         warn_at = next(i for i, m in enumerate(messages)
-                       if "eligible markets: their records alone are" in m)
+                       if "are materialized for grouping: their records alone are" in m)
         assert rss_at < warn_at
 
     def test_ram_warning_quotes_only_this_runs_numbers(self, monkeypatch, caplog):
         # A line emitted on every run must not carry another run's
         # measurements: those live in config.py's comment, where a reader is
         # prompted to keep them current. The only numbers here are this run's
-        # own market count and the footprint derived from it.
+        # own groupable and eligible counts and the footprint derived from the
+        # first.
         monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
         with caplog.at_level("WARNING"):
             self._run(monkeypatch)
         message = self._ram_warnings(caplog)[0]
         expected_gb = 2 * backtester.BACKTEST_RECORD_BYTES_ESTIMATE / 1e9
-        assert message.startswith("2 eligible markets")
+        assert message.startswith("2 groupable markets (of 2 eligible)")
         assert f"{expected_gb:.1f} GB" in message
         # Every numeric token in the line is derived from this run.
         numbers = re.findall(r"\d+(?:\.\d+)?", message)
-        assert numbers == ["2", f"{expected_gb:.1f}"]
+        assert numbers == ["2", "2", f"{expected_gb:.1f}"]
 
     def test_unpaired_records_are_released_before_the_candlestick_fetch(
-        self, monkeypatch,
+        self, monkeypatch, caplog,
     ):
         """TS-07: deleting the group maps alone frees no record dicts, because
-        `markets` still references every one of them. Deleting the list too is
-        what lets a market that landed in no candidate pair be collected
-        before the candlestick pool and the _find_entry sweep run.
+        a list of records still references every one of them. Two such lists
+        exist since SS-1, released by two different statements, and each is
+        guarded by its own records here:
+
+        - EC shares no grouping key with anything, so it is never copied into
+          the groupable subset; only the CORPUS list holds it, and it goes with
+          `del markets` right after the second walk.
+        - ED and EE share both keys (identical wording on two events of ONE
+          series), so they ARE materialized into the groupable subset, yet the
+          one-series rule (DR-02) keeps them out of every candidate pair; only
+          the post-extraction `del ts_groups, same_groups, groupable` frees
+          them.
 
         Residency, not peak: the process high-water mark is already set by
         this point. The probe is a weakref taken inside the patched fetch, so
-        the test itself never holds the record alive.
+        the test itself never holds a record alive.
         """
         candles = {
             "EA": [_candle(_MONDAY_TS, 0.30, 0.70)],
             "EB": [_candle(_MONDAY_TS, 0.60, 0.40)],
         }
         # A third eligible market with a title that groups with nothing else,
-        # so it survives the prefilter but appears in no candidate pair.
+        # so it survives the prefilter but is never groupable.
         lonely = {"ticker": "EC", "event_ticker": "EVC", "event_title": "EVC",
                   "title": "Unrelated question by March 1, 2026", "subtitle": "",
                   "result": "no",
                   "open_time": "2026-01-01T00:00:00+00:00",
                   "close_time": "2026-03-01T00:00:00+00:00",
                   "settlement_ts": "2026-03-01T12:00:00+00:00"}
+        # Two eligible, groupable markets that no finder may pair: one series
+        # (EVD), identical wording, two fixtures.
+        fixture = {"event_title": "EVD", "title": "Recurring fixture question",
+                   "subtitle": "", "result": "yes",
+                   "open_time": "2026-01-01T00:00:00+00:00",
+                   "close_time": "2026-03-01T00:00:00+00:00",
+                   "settlement_ts": "2026-03-01T12:00:00+00:00"}
+        fixtures = [{**fixture, "ticker": "ED", "event_ticker": "EVD-1"},
+                    {**fixture, "ticker": "EE", "event_ticker": "EVD-2"}]
         probes: dict[str, weakref.ref] = {}
 
         def _fetch(*_a, **_k):
             # Built and weak-referenced HERE so the only strong references are
             # the ones the backtester itself keeps.
-            records = [_WeakrefDict(m) for m in self._markets() + [lonely]]
+            records = [_WeakrefDict(m)
+                       for m in self._markets() + [lonely] + fixtures]
             for rec in records:
                 probes[rec["ticker"]] = weakref.ref(rec)
             return records
@@ -3233,12 +3260,21 @@ class TestPrepareEntriesMemoryInstrumentation:
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles.get(ticker, []))
         monkeypatch.setattr(backtester, "_fetch_candles_parallel", _spy)
-        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
-                     start_date=date(2026, 1, 1), initial_balance=10_000.0)
+        with caplog.at_level("INFO"):
+            trades, _ = run_backtest(
+                hist_client=MagicMock(), live_client=MagicMock(),
+                start_date=date(2026, 1, 1), initial_balance=10_000.0)
 
-        # The unpaired record is gone; the two that a candidate pair holds are
-        # still alive, because the pair lists legitimately reference them.
-        assert observed == {"EA": True, "EB": True, "EC": False}
+        # Not vacuous: ED and EE really were materialized into the subset (EA,
+        # EB, ED, EE of 5 eligible), and really formed no pair.
+        assert ("Groupable subset: materializing 4 of 5 eligible markets"
+                in caplog.text)
+        assert "Potential pairs: 1 time-series, 0 same-title" in caplog.text
+        assert [(t.ticker_a, t.ticker_b) for t in trades] == [("EA", "EB")]
+        # The unpaired records are gone; the two that a candidate pair holds
+        # are still alive, because the pair lists legitimately reference them.
+        assert observed == {"EA": True, "EB": True,
+                            "EC": False, "ED": False, "EE": False}
 
 
 class TestOutcomeLabelCoverageCensus:
@@ -3411,11 +3447,28 @@ class TestOutcomeLabelCoverageCensus:
     def test_census_changes_no_backtest_result(self, monkeypatch):
         """Advisory only. Running with the census replaced by a no-op must
         produce the same trades and the same equity curve — if it does not, the
-        census is filtering or consuming something it only meant to read."""
+        census is filtering or consuming something it only meant to read.
+
+        SS-1 moved the seam: _prepare_candidates no longer hands a list to
+        _log_outcome_label_coverage, it feeds an _OutcomeLabelTally inside its
+        first pass and reports through _report_outcome_label_coverage. Both
+        halves are replaced here, and the spy proves the run really went
+        through them — patching the old name alone would now be a no-op and
+        this comparison vacuous."""
         with_census_trades, with_census_equity = self._run(monkeypatch)
-        monkeypatch.setattr(backtester, "_log_outcome_label_coverage",
-                            lambda _markets: None)
+        used: list[str] = []
+
+        class _NoCensusTally:
+            def add(self, _m):
+                used.append("add")
+
+        def _no_report(_tally):
+            used.append("report")
+
+        monkeypatch.setattr(backtester, "_OutcomeLabelTally", _NoCensusTally)
+        monkeypatch.setattr(backtester, "_report_outcome_label_coverage", _no_report)
         without_trades, without_equity = self._run(monkeypatch)
+        assert used == ["add", "add", "report"]
 
         assert [astuple(t) for t in with_census_trades] == \
                [astuple(t) for t in without_trades]
@@ -3425,7 +3478,9 @@ class TestOutcomeLabelCoverageCensus:
 
     def test_census_is_logged_inside_the_grouping_window(self, monkeypatch, caplog):
         # After the RSS/RAM-budget lines and before the pair counts, i.e. while
-        # `markets` is still alive — it is del'd right after pair extraction.
+        # the groupable subset is still alive — it is del'd right after pair
+        # extraction (the corpus itself was released after the second walk,
+        # before the RSS line; SS-1).
         with caplog.at_level("INFO"):
             self._run(monkeypatch)
         messages = [r.getMessage() for r in caplog.records]
@@ -3448,8 +3503,9 @@ class TestOutcomeLabelCoverageCensus:
 
 class TestOutcomeLabelCoverageIsCarried:
     """DR-66b: the census must also cross out of _prepare_entries, because that
-    is the only scope the eligible-market list exists in and its lifetime must
-    not be extended (TS-07).
+    is the only scope the market records it censused are held in (the corpus,
+    and since SS-1 the groupable subset), and their lifetime must not be
+    extended (TS-07).
 
     The carrier is a RETURN VALUE rather than an optional sink precisely
     because a sink can be forgotten — which would reproduce, in the mechanism
@@ -3560,9 +3616,10 @@ class TestOutcomeLabelCoverageIsCarried:
             backtester.OutcomeLabelCoverage(**kwargs)
 
     def test_the_carrier_holds_no_market_reference(self):
-        # _prepare_entries del's the record list right after pair extraction to
-        # lower residency across the candlestick fetch. A carrier holding
-        # examples would pin every record alive past that statement.
+        # _prepare_candidates del's the corpus right after its second walk and
+        # the groupable subset right after pair extraction, to lower residency
+        # across grouping and the candlestick fetch (TS-07, SS-1). A carrier
+        # holding examples would pin those records alive past both statements.
         coverage = backtester._log_outcome_label_coverage(
             [{"subtitle": "Y", "event_title": "E"}])
         for value in astuple(coverage):
@@ -5738,6 +5795,498 @@ class TestPrepareCandidates:
         for (mA, mB, _canon, _key), _pt in c.all_pairs:
             assert mA["ticker"] in c.candles_by_ticker
             assert mB["ticker"] in c.candles_by_ticker
+
+
+# ─── SS-1: key every eligible record, materialize only the groupable subset ──
+
+_SS1_START = date(2026, 1, 1)
+
+
+def _ss1_record(ticker, event_ticker, title, *, subtitle="", event_title="",
+                close="2026-02-20", eligible=True):
+    """A cached-shape market record; `eligible=False` spans no Monday."""
+    if eligible:
+        open_t, close_t = "2026-01-01T00:00:00+00:00", f"{close}T00:00:00+00:00"
+    else:
+        # Opens and closes inside one Tuesday: no Monday 09:00 UTC checkpoint
+        # fits, so _can_ever_enter proves it can never enter any pair.
+        open_t, close_t = "2026-01-13T00:00:00+00:00", "2026-01-13T02:00:00+00:00"
+    return {"ticker": ticker, "event_ticker": event_ticker,
+            "event_title": event_title, "title": title, "subtitle": subtitle,
+            "result": "yes", "open_time": open_t, "close_time": close_t,
+            "settlement_ts": close_t}
+
+
+def _ss1_corpus(seed: int) -> list[dict]:
+    """Hand-placed anchors for every case the subset must get right, plus a
+    seeded random fill whose small title/subtitle/event pools make keys
+    collide (shared) about as often as they stay unique (singletons)."""
+    anchors = [
+        # A cross-event time-series pair: shared time-series key, distinct
+        # same-title keys ...
+        _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026",
+                    event_title="RAIN", close="2026-03-01"),
+        _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026",
+                    event_title="RAIN", close="2026-03-20"),
+        # ... and an INELIGIBLE member of the same family, which both passes
+        # must skip without shifting any position.
+        _ss1_record("RX", "RAINX-1", "Rain falls by March 9, 2026",
+                    event_title="RAIN", eligible=False),
+        # A same-title pair on two series (shares BOTH keys).
+        _ss1_record("SA", "SERA-1", "Q", event_title="EVS"),
+        _ss1_record("SB", "SERB-1", "Q", event_title="EVS"),
+        # A same-event deadline ladder, later rung listed first (DR-73).
+        _ss1_record("L2", "KXSTAR-14",
+                    "Will SpaceX launch another Starship by March 20, 2026?",
+                    close="2026-03-20"),
+        _ss1_record("L1", "KXSTAR-14",
+                    "Will SpaceX launch another Starship by March 1, 2026?",
+                    close="2026-03-20"),
+        # Kept ONLY through the same-title key: the title normalizes away, so
+        # the time-series key is empty.
+        _ss1_record("DA", "DATEA-1", "March 1, 2026"),
+        _ss1_record("DB", "DATEB-1", "March 1, 2026"),
+        # Singletons of each kind, plus a record with no wording at all.
+        _ss1_record("DZ", "DATEZ-1", "April 2, 2026"),
+        _ss1_record("NW", "NOWORD-1", ""),
+        _ss1_record("LONE", "LONE-1", "A question nobody else asks by May 1, 2026"),
+        # A strike family: the subtitle is the outcome discriminator (DR-01).
+        _ss1_record("K1", "KXBTC-1", "Bitcoin price by March 1, 2026?",
+                    subtitle="$80,000 or above", close="2026-03-01"),
+        _ss1_record("K2", "KXBTC-2", "Bitcoin price by March 9, 2026?",
+                    subtitle="$80,000 or above", close="2026-03-09"),
+        _ss1_record("K3", "KXBTC-2", "Bitcoin price by March 9, 2026?",
+                    subtitle="$90,000 or above", close="2026-03-09"),
+        # A pre-fix cache record: subtitle null, event title never resolved.
+        {**_ss1_record("U1", "UNL-1", "Unlabelled question"),
+         "subtitle": None, "event_title": None},
+    ]
+    rng = random.Random(seed)
+    titles = ["Rain falls by March 1, 2026", "Rain falls by March 20, 2026", "Q",
+              "Snow falls by February 1, 2026", "Snow falls by February 10, 2026",
+              "Bitcoin price on Sep 15, 2026?", "Will X happen by March 5, 2026?",
+              "March 1, 2026"]
+    fill = []
+    for i in range(300):
+        title = (f"Unique question {seed}-{i}" if rng.random() < 0.4
+                 else rng.choice(titles))
+        close = (date(2026, 2, 1) + timedelta(days=rng.randint(0, 50))).isoformat()
+        rec = _ss1_record(
+            f"R{seed}-{i}",
+            f"{rng.choice('ABCDE')}SER-{rng.randint(1, 4)}",
+            title,
+            subtitle=rng.choice(["", "Yes", "$80,000 or above"]),
+            event_title=rng.choice(["", "RAIN", "EVS", "SNOW"]),
+            close=close,
+            eligible=rng.random() > 0.1,
+        )
+        if rng.random() < 0.1:
+            rec["subtitle"] = None
+        fill.append(rec)
+    return anchors + fill
+
+
+def _old_group_by_exact_title(markets):
+    """The pre-SS-1 _group_by_exact_title, verbatim — an oracle that does not
+    route through the _st_group_key it is checking."""
+    groups = defaultdict(list)
+    for m in markets:
+        event_title = m.get("event_title") or ""
+        title = m.get("title") or ""
+        subtitle = m.get("subtitle") or ""
+        if title or subtitle:
+            groups[(event_title, title, subtitle)].append(m)
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _old_group_by_normalized_title(markets):
+    """The pre-SS-1 _group_by_normalized_title, verbatim (see above)."""
+    groups = defaultdict(list)
+    for m in markets:
+        norm = scanner.time_series_group_key(
+            backtester._pair_key(m), m.get("subtitle") or "")
+        if norm:
+            groups[norm].append(m)
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _group_shape(groups):
+    """Keys, insertion order, and member IDENTITY and order, in one value."""
+    return [(k, [id(m) for m in v]) for k, v in groups.items()]
+
+
+def _pair_shape(all_pairs, by=id):
+    """A candidate-pair list reduced to comparable fields; `by` picks member
+    identity (id) or, for fresh-dict corpora, the ticker."""
+    return [(by(mA), by(mB), canon, key, pair_type)
+            for (mA, mB, canon, key), pair_type in all_pairs]
+
+
+def _by_ticker(m):
+    return m["ticker"]
+
+
+class _FreshCorpus:
+    """A re-iterable corpus that is NOT a list and has no len(): every walk
+    yields FRESH dict objects built from the template (as a corpus streamed off
+    disk would), and it counts its walks."""
+
+    def __init__(self, template, factory=dict):
+        self._template = template
+        self._factory = factory
+        self.walks = 0
+        self.yielded: list[list] = []
+
+    def __iter__(self):
+        self.walks += 1
+        this_walk: list = []
+        self.yielded.append(this_walk)
+        for m in self._template:
+            fresh = self._factory(m)
+            if self._factory is _WeakrefDict:
+                this_walk.append(weakref.ref(fresh))
+            yield fresh
+
+
+class _DriftingCorpus:
+    """Yields `first` on its first walk and `second` on every later one."""
+
+    def __init__(self, first, second):
+        self._walks = [first, second]
+        self.walks = 0
+
+    def __iter__(self):
+        walk = self._walks[min(self.walks, 1)]
+        self.walks += 1
+        return iter(walk)
+
+
+class TestGroupableSubset:
+    """SS-1: a 7-day window measured 7,260,952 eligible records of which only
+    184,255 share either grouping key with another eligible record. Both
+    grouping functions drop every single-member group, so _prepare_candidates
+    keys every eligible record in a first pass (hashes only) and materializes
+    only the records whose key is shared in a second. That must be EXACT: the
+    same groups, pairs, census and log numbers as grouping the whole eligible
+    list, which the old code did.
+    """
+
+    @staticmethod
+    def _eligible(markets):
+        return [m for m in markets if _can_ever_enter(m, _SS1_START)]
+
+    @staticmethod
+    def _subset(markets):
+        index = backtester._index_eligible_keys(
+            markets, _SS1_START, backtester._OutcomeLabelTally())
+        return backtester._materialize_groupable(markets, _SS1_START, index)
+
+    @staticmethod
+    def _patch(monkeypatch, corpus):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: corpus)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *a, **k: [])
+
+    @staticmethod
+    def _prepare(ladders=True):
+        return backtester._prepare_candidates(
+            MagicMock(), MagicMock(), _SS1_START, True, None,
+            same_event_ladders=ladders)
+
+    @staticmethod
+    def _reference_pairs(eligible, ladders):
+        ts_pairs = _extract_pairs(_old_group_by_normalized_title(eligible),
+                                  same_event_ladders=ladders)
+        same_pairs = _extract_pairs(_old_group_by_exact_title(eligible),
+                                    same_event_ladders=ladders)
+        return ([(p, "time_series") for p in ts_pairs]
+                + [(p, "same_title") for p in same_pairs])
+
+    # ── (1) exactness ────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_groups_over_the_subset_equal_groups_over_the_eligible_list(self, seed):
+        markets = _ss1_corpus(seed)
+        eligible = self._eligible(markets)
+        subset = self._subset(markets)
+
+        old_ts = _old_group_by_normalized_title(eligible)
+        old_st = _old_group_by_exact_title(eligible)
+        # Keys, insertion order, and member identity and order — all equal.
+        assert _group_shape(_group_by_normalized_title(subset)) == _group_shape(old_ts)
+        assert _group_shape(_group_by_exact_title(subset)) == _group_shape(old_st)
+
+        # And the subset is EXACTLY the records some group of two or more
+        # holds, in corpus order (no hash collision is plausible at this size;
+        # the collision case has its own test below).
+        grouped = {id(m) for g in (old_ts, old_st) for v in g.values() for m in v}
+        assert [id(m) for m in subset] == [id(m) for m in eligible if id(m) in grouped]
+
+        # Not vacuous: the fixture really exercises every case.
+        assert len(eligible) < len(markets)          # prefiltered records
+        assert len(subset) < len(eligible)           # singletons dropped
+        by_ticker = {m["ticker"]: m for m in markets}
+        assert backtester._ts_group_key(by_ticker["DA"]) == ""
+        assert by_ticker["DA"] in subset             # kept via same-title only
+        for lone in ("DZ", "NW", "LONE", "RX"):
+            assert all(m is not by_ticker[lone] for m in subset)
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_prepare_candidates_equals_grouping_the_whole_eligible_list(
+        self, monkeypatch, seed, ladders,
+    ):
+        markets = _ss1_corpus(seed)
+        eligible = self._eligible(markets)
+        self._patch(monkeypatch, markets)
+        c = self._prepare(ladders)
+
+        expected = self._reference_pairs(eligible, ladders)
+        assert _pair_shape(c.all_pairs) == _pair_shape(expected)
+        assert c.label_coverage == backtester._log_outcome_label_coverage(eligible)
+        # Not vacuous: both pair types present, and the ladder with ladders on.
+        types = {pt for _, pt in c.all_pairs}
+        assert types == {"time_series", "same_title"}
+        ladder = {"L1", "L2"}
+        assert any({mA["ticker"], mB["ticker"]} == ladder
+                   for (mA, mB, _c, _k), _pt in c.all_pairs) is ladders
+
+    def test_log_numbers_and_order_are_unchanged_plus_one_line(
+        self, monkeypatch, caplog,
+    ):
+        markets = _ss1_corpus(0)
+        eligible = self._eligible(markets)
+        subset = self._subset(markets)
+        self._patch(monkeypatch, markets)
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("INFO"):
+            self._prepare()
+        messages = [r.getMessage() for r in caplog.records]
+
+        def at(prefix):
+            hits = [i for i, m in enumerate(messages) if m.startswith(prefix)]
+            assert len(hits) == 1, prefix
+            return hits[0]
+
+        total = f"Total settled markets to analyze: {len(markets)}"
+        prefilter = (f"Eligibility prefilter: skipping "
+                     f"{len(markets) - len(eligible)}/{len(markets)} markets")
+        groupable = (f"Groupable subset: materializing {len(subset)} of "
+                     f"{len(eligible)} eligible markets")
+        ram = f"{len(subset)} groupable markets (of {len(eligible)} eligible)"
+        order = [at(total), at(prefilter), at(groupable),
+                 at("Peak RSS before grouping"), at(ram),
+                 at(f"Outcome-label coverage over {len(eligible)} eligible markets"),
+                 at(f"Deadline phrasing over {len(eligible)} eligible markets"),
+                 at("Peak RSS after pair extraction"), at("Potential pairs:")]
+        assert order == sorted(order)
+
+    def test_a_hash_collision_can_only_keep_extra_records(self, monkeypatch, caplog):
+        """Every key hashes to ONE value here, so every eligible record with a
+        key of either kind reads as "shared" and is materialized. The exact
+        grouping then drops the true singletons, so the pairs and census are
+        unchanged — the whole safety argument for keying on hash()."""
+        markets = _ss1_corpus(1)
+        eligible = self._eligible(markets)
+        expected = self._reference_pairs(eligible, True)
+        self._patch(monkeypatch, markets)
+        monkeypatch.setattr(backtester, "hash", lambda _value: 7, raising=False)
+        with caplog.at_level("INFO"):
+            c = self._prepare()
+        assert _pair_shape(c.all_pairs) == _pair_shape(expected)
+        assert c.label_coverage == backtester._log_outcome_label_coverage(eligible)
+        # Every eligible record has a key of some kind here, so all are kept.
+        assert all(backtester._ts_group_key(m) or backtester._st_group_key(m)
+                   for m in eligible)
+        assert (f"Groupable subset: materializing {len(eligible)} of "
+                f"{len(eligible)} eligible markets") in caplog.text
+
+    def test_the_shared_mask_never_counts_an_invalid_placeholder(self):
+        # Position 1 has NO key; its placeholder hash happens to equal the
+        # valid key at position 0. That must not make position 0 "shared".
+        hashes = array("q", [0, 0, 5, 5, 9])
+        valid = bytearray([1, 0, 1, 1, 1])
+        assert backtester._shared_key_mask(hashes, valid).tolist() == [
+            False, False, True, True, False]
+        assert backtester._shared_key_mask(array("q"), bytearray()).tolist() == []
+
+    # ── (2) the census over a one-shot iterator ──────────────────────────
+
+    @pytest.mark.parametrize("corpus", [
+        _ss1_corpus(0),
+        TestOutcomeLabelCoverageCensus._unlabelled(10),
+        [],
+    ])
+    def test_the_census_over_a_one_shot_iterator_equals_the_census_over_the_list(
+        self, caplog, corpus,
+    ):
+        with caplog.at_level("INFO"):
+            from_list = backtester._log_outcome_label_coverage(corpus)
+        list_lines = [(r.levelname, r.getMessage()) for r in caplog.records]
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            from_iter = backtester._log_outcome_label_coverage(m for m in corpus)
+        assert from_iter == from_list
+        assert [(r.levelname, r.getMessage()) for r in caplog.records] == list_lines
+
+    # ── (3) a non-list re-iterable of fresh dicts ────────────────────────
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    def test_a_fresh_dict_reiterable_reproduces_the_golden_capture(
+        self, monkeypatch, ladders,
+    ):
+        golden = TestPrepareEntriesGolden()
+        corpus = _FreshCorpus(golden._markets())
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: corpus)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: golden._CANDLES[ticker])
+        c = self._prepare(ladders)
+        rows = TestPrepareEntriesGolden._rows(backtester._entries_for_band(c))
+        assert rows == golden._GOLDEN[ladders]
+        assert c.label_coverage.total == golden._GOLDEN_CENSUS_TOTAL
+        # Exactly two walks: the census rides the first, never a third.
+        assert corpus.walks == 2
+
+    def test_a_fresh_dict_reiterable_matches_the_list_on_the_synthetic_corpus(
+        self, monkeypatch,
+    ):
+        template = _ss1_corpus(2)
+        self._patch(monkeypatch, template)
+        from_list = self._prepare()
+        corpus = _FreshCorpus(template)
+        self._patch(monkeypatch, corpus)
+        from_fresh = self._prepare()
+        assert (_pair_shape(from_fresh.all_pairs, by=_by_ticker)
+                == _pair_shape(from_list.all_pairs, by=_by_ticker))
+        # Value-equal records, not merely equal tickers.
+        assert [p for p, _ in from_fresh.all_pairs] == [p for p, _ in from_list.all_pairs]
+        assert from_fresh.label_coverage == from_list.label_coverage
+        assert corpus.walks == 2
+
+    # ── (4) a corpus that does not re-iterate identically ────────────────
+
+    @pytest.mark.parametrize("drift", ["fewer", "more", "reordered",
+                                       "title", "subtitle", "event_title"])
+    def test_a_second_walk_that_disagrees_raises(self, monkeypatch, drift):
+        first = _ss1_corpus(0)
+        if drift == "fewer":
+            second = [m for m in first if m["ticker"] != "SB"]
+        elif drift == "more":
+            second = first + [_ss1_record("EXTRA", "EXTRA-1", "Q", event_title="EVS")]
+        elif drift == "reordered":
+            # Same eligible count, two eligible records swapped.
+            second = list(first)
+            i = next(k for k, m in enumerate(second) if m["ticker"] == "SA")
+            j = next(k for k, m in enumerate(second) if m["ticker"] == "RB")
+            second[i], second[j] = second[j], second[i]
+        else:
+            # Same tickers in the same order, but one eligible record's
+            # grouping field changed between the walks: the keep flags were
+            # chosen on keys this record no longer has. One row per field
+            # either key reads, so dropping any one of them from the identity
+            # is caught.
+            second = [dict(m) for m in first]
+            i = next(k for k, m in enumerate(second) if m["ticker"] == "LONE")
+            second[i][drift] = "changed between walks"
+        self._patch(monkeypatch, _DriftingCorpus(first, second))
+        with pytest.raises(RuntimeError, match="did not iterate identically twice"):
+            self._prepare()
+
+    def test_a_key_field_drift_that_would_silently_drop_a_record_raises(self):
+        """B-ADV-1's shape: walk 2 repeats walk 1's tickers in order, but C's
+        subtitle now matches A and B's, so C belongs in their group. The keep
+        flags were chosen on walk 1, where C's key was unique, so applying
+        them to walk 2 would drop C from a group of the corpus actually being
+        grouped — with nothing raised, if only tickers were compared."""
+        def rec(ticker, subtitle):
+            return _ss1_record(ticker, f"{ticker}SER-1", "Will X happen by March 5, 2026?",
+                               subtitle=subtitle, close="2026-03-05")
+
+        first = [rec("A", "s1"), rec("B", "s1"), rec("C", "s2")]
+        second = [rec("A", "s1"), rec("B", "s1"), rec("C", "s1")]
+        # The premise: grouped as a list, walk 2 genuinely holds all three.
+        assert [m["ticker"] for g in _old_group_by_normalized_title(second).values()
+                for m in g] == ["A", "B", "C"]
+        corpus = _DriftingCorpus(first, second)
+        index = backtester._index_eligible_keys(
+            corpus, _SS1_START, backtester._OutcomeLabelTally())
+        assert index.keep == bytes([1, 1, 0])
+        with pytest.raises(RuntimeError, match="eligible record 2 is 'C'"):
+            backtester._materialize_groupable(corpus, _SS1_START, index)
+
+    def test_the_count_mismatch_names_both_counts(self):
+        first = [_ss1_record("A", "EA-1", "Q"), _ss1_record("B", "EB-1", "Q")]
+        corpus = _DriftingCorpus(first, first[:1])
+        index = backtester._index_eligible_keys(
+            corpus, _SS1_START, backtester._OutcomeLabelTally())
+        with pytest.raises(RuntimeError, match="found 2 eligible markets and the second 1"):
+            backtester._materialize_groupable(corpus, _SS1_START, index)
+
+    def test_drift_among_ineligible_records_is_not_a_misalignment(self, monkeypatch):
+        # Positions are counted among ELIGIBLE records only, so a second walk
+        # that differs solely in records the prefilter drops is the same
+        # corpus as far as the subset is concerned — and must not raise.
+        first = _ss1_corpus(0)
+        second = [m for m in first if m["ticker"] != "RX"]      # RX is ineligible
+        assert not _can_ever_enter(next(m for m in first if m["ticker"] == "RX"),
+                                   _SS1_START)
+        self._patch(monkeypatch, _DriftingCorpus(first, second))
+        c = self._prepare()
+        expected = self._reference_pairs(self._eligible(first), True)
+        assert _pair_shape(c.all_pairs) == _pair_shape(expected)
+
+    # ── (5) singletons are never materialized ─────────────────────────────
+
+    def test_singletons_are_never_materialized(self, monkeypatch):
+        """Instrumented: every walk yields fresh weak-referenceable dicts, so
+        at the moment grouping starts the ONLY live records are the ones the
+        backtester chose to hold. Those must be exactly the groupable ones —
+        not one singleton, and nothing left over from the first walk."""
+        template = _ss1_corpus(0)
+        eligible = self._eligible(template)
+        old_ts = _old_group_by_normalized_title(eligible)
+        old_st = _old_group_by_exact_title(eligible)
+        grouped = {m["ticker"] for g in (old_ts, old_st) for v in g.values() for m in v}
+        expected = [m["ticker"] for m in eligible if m["ticker"] in grouped]
+        assert 0 < len(expected) < len(eligible)
+
+        corpus = _FreshCorpus(template, factory=_WeakrefDict)
+        self._patch(monkeypatch, corpus)
+        real_group = backtester._group_by_normalized_title
+        seen: dict = {}
+
+        def _spy(markets):
+            gc.collect()
+            seen["input"] = [m["ticker"] for m in markets]
+            seen["walk1_alive"] = sum(r() is not None for r in corpus.yielded[0])
+            seen["walk2_alive"] = sorted(
+                r()["ticker"] for r in corpus.yielded[1] if r() is not None)
+            return real_group(markets)
+
+        monkeypatch.setattr(backtester, "_group_by_normalized_title", _spy)
+        self._prepare()
+        assert seen["input"] == expected
+        assert seen["walk1_alive"] == 0
+        assert seen["walk2_alive"] == sorted(expected)
+
+    def test_the_ram_warning_counts_the_groupable_records(self, monkeypatch, caplog):
+        # Three eligible markets, two of which share a key: the warning is
+        # keyed on the 2 it says are resident, not the 3 eligible ones.
+        markets = TestPrepareEntriesMemoryInstrumentation._markets() + [
+            _ss1_record("EC", "EVC", "Unrelated question by March 1, 2026",
+                        close="2026-03-01")]
+        self._patch(monkeypatch, markets)
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 2)
+        with caplog.at_level("WARNING"):
+            self._prepare()
+        assert "groupable markets" not in caplog.text
+        caplog.clear()
+        monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)
+        with caplog.at_level("WARNING"):
+            self._prepare()
+        assert "2 groupable markets (of 3 eligible) are materialized" in caplog.text
 
 
 class TestEntriesForBand:

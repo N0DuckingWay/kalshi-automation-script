@@ -133,6 +133,10 @@ backtest.py (CLI)
   │    │    │                                        bands or k's are simulated
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata
   │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
+  │    │    ├─ _index_eligible_keys()                 — walk 1: count, prefilter, census, hash both grouping keys
+  │    │    ├─ _materialize_groupable()               — walk 2: keep only eligible markets sharing a key with
+  │    │    │                                           another (the rest form single-member groups, which both
+  │    │    │                                           groupings drop) — then group and extract pairs on those
   │    │    └─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers;
   │    │                                               each from the later of --start-date and the market's own
   │    │                                               open; a window over the 5,000-candle cap is paged)

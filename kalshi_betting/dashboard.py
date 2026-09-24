@@ -753,9 +753,11 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
     """
     Render the outcome-label census as a line, or as a banner when it is low.
 
-    The figure this prints is the one backtester._log_outcome_label_coverage()
-    already logged — the SAME measurement from the same single pass over the
-    same corpus, carried through BacktestSweep.label_coverage — so the page and
+    The figure this prints is the one backtester's outcome-label census
+    already logged (backtester._report_outcome_label_coverage(), which
+    _log_outcome_label_coverage() and _prepare_candidates both report through)
+    — the SAME measurement from the same single pass over the same corpus,
+    carried through BacktestSweep.label_coverage — so the page and
     the log can never report two different numbers. The below-floor verdict is
     likewise the carried one, never re-derived here: the constant is imported
     only to PRINT where the floor sits.
