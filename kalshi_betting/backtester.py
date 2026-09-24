@@ -2872,15 +2872,12 @@ def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCov
     below_floor = subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION
 
     if below_floor:
-        # Known residual (SS-1 Commit C): the remedy's "equivalently" clause
-        # names only the LEGACY settled_markets_*.json. Since that commit the
-        # assembled cache is settled_markets_*.jsonl.gz, so deleting the .json
-        # alone leaves the streamed cache to be served; the primary remedy
-        # (--no-cache after deleting the day slices) is unaffected. The text is
-        # kept byte-identical because SS-1 must not change any log line or
-        # dashboard section (dashboard._label_coverage_html renders the same
-        # sentence and tests/test_dashboard.py::TestGoldenSections pins it);
-        # correcting both is a follow-up that re-captures that golden.
+        # The "equivalently" clause names BOTH assembled-cache spellings: since
+        # SS-1 the assembled cache is the streamed settled_markets_*.jsonl.gz,
+        # and a legacy settled_markets_*.json may still sit beside it, so
+        # naming the .json alone left the streamed cache to be served again.
+        # dashboard._label_coverage_html renders the same remedy and must be
+        # kept in step with this sentence.
         logging.warning(
             "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
             "eligible markets carry no subtitle, so the time-series key falls "
@@ -2891,7 +2888,8 @@ def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCov
             "describing a different strategy from the shipped one. Remedy: "
             "delete backtest_cache/archive_days/ and backtest_cache/live_days/, "
             "then re-run with --no-cache (equivalently, also delete the "
-            "assembled backtest_cache/settled_markets_*.json); --no-cache ALONE "
+            "assembled backtest_cache/settled_markets_*.jsonl.gz and any legacy "
+            "settled_markets_*.json); --no-cache ALONE "
             "does not refresh the day slices, which are reused unconditionally",
             subtitle_fraction * 100.0,
             BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0,

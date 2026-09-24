@@ -11,11 +11,14 @@
     "performance": "17b036b0107039f4328d20e6f6e453d7954d93a7236da58064a3ae13d5fb326f",
     "decomposition": "3a75fdf0e419f57de04f286da655cce57ce6c25ffbbfd112caf7dca14cf1ee3e",
     "calibration": "7e2d02440a833ab4fca31793a9fc919d67b929abff444b402f3ef21a3a19087e",
-    "interval_discount_below_floor": "72b3b4ee302ada23f96c93e27425a04466c9565711f1f31a1c7b3ba2ad26fdea",
+    "interval_discount_below_floor": "8061c1efbf892ec498d55fda7106ce6a9721ac68105baeaa081336ac767a66a5",
     "interval_discount_healthy": "622412bdcfd7e99975bedf9989cf5bea8c5552084a5a863f46a06e63cb6e8e74",
     "diagnostics": "ed1a9cd0269d2399126119d48c5a0ac3386a43410234e10c010e94f4d9188749",
     "risk": "3d0918a770193ebc5f26595eb6d8a9b31dfb73bda1ea4924bb481d926de9bc82",
     "benchmark": "485956ef88e29a06aac5fdcf7175ec1b1c922b3dffa7edac9756663a97ccdf33",
     "benchmark_offline": "728d581c7f3f43b1efac62619eff6644dc64eb1ffb9e63f1bd06c157e22a94bf"
+  },
+  "amended": {
+    "interval_discount_below_floor": "Re-captured (same renderer, same rendering_env) after main @ fe0a758 for one intended change: the below-floor banner's remedy now names the streamed settled_markets_*.jsonl.gz as well as any legacy settled_markets_*.json (SS-1 follow-up). The normalised render differs from fe0a758's only in that clause. Previous digest: 72b3b4ee302ada23f96c93e27425a04466c9565711f1f31a1c7b3ba2ad26fdea. Every other digest is still fe0a758's."
   }
 }

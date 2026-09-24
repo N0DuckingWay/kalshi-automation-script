@@ -848,12 +848,12 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
         "different strategy. "
         "<b>Remedy:</b> delete <code>backtest_cache/archive_days/</code> and "
         "<code>backtest_cache/live_days/</code>, then re-run with "
-        # Names only the LEGACY assembled cache; since SS-1's Commit C the
-        # streamed settled_markets_*.jsonl.gz must go too for this clause to
-        # hold. Left byte-identical on purpose — see the matching note beside
-        # backtester._report_outcome_label_coverage's WARNING.
+        # Names BOTH assembled-cache spellings (the streamed .jsonl.gz SS-1
+        # writes and any legacy .json beside it), in step with the WARNING
+        # backtester._report_outcome_label_coverage logs for the same verdict.
         "<code>--no-cache</code> (equivalently, also delete the assembled "
-        "<code>backtest_cache/settled_markets_*.json</code>); "
+        "<code>backtest_cache/settled_markets_*.jsonl.gz</code> and any legacy "
+        "<code>settled_markets_*.json</code>); "
         "<code>--no-cache</code> ALONE does not refresh the day slices, which "
         "are reused unconditionally."
         "</div>"
