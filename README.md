@@ -18,7 +18,7 @@ The earlier contract resolving YES while the later resolves NO is impossible for
 
 **Same-title pairs:** Two contracts on different event tickers but with the *identical* title and subtitle (i.e. asking exactly the same question). If their prices diverge by 5% or more, the bot buys NO on the expensive one and YES on the cheap one. Both contracts should co-resolve, so the trade is priced on a 95% co-resolution assumption — high, but **not risk-free**: the 5% that does not co-resolve is a total loss on one leg. The subtitle here is the outcome label that distinguishes markets sharing one question title (e.g. two candidate names under "Who will the next Pope be?"); the API stopped sending a `subtitle` field in 2026-08, so ingest now sources it from `yes_sub_title` — without that discriminator, two *different* outcomes would be paired as if they were the same contract.
 
-**Time-series pairs** must also sit on **different event tickers**, with one exception: a same-event cumulative deadline **ladder**, where Kalshi lists one question's several deadlines as separate markets inside a single event ("Will SpaceX launch another Starship before Sep 23, 2026?" and "… by Oct 16, 2026?" are both `KXSPACEXSTARSHIP-14`). Two such rungs are the time-series premise itself, and the time-series finder will pair them when `TIME_SERIES_SAME_EVENT_LADDERS` in `config.py` is turned on — ordering the legs and choosing the price tier by the two **stated** deadlines rather than by the exchange close times, which a settled event gives every rung alike. It ships **off**: read the constant's comment first, which records both why ladders nest (the impossible earlier-YES/later-NO settlement never occurred in 1,821 archive ladder pairs, against 13% of cross-event ones) and what turning it on would deploy (98% of a $10,000 balance into six trades, at a market-implied expected value of −31% — which is the later leg's own bid-ask spread plus taker fees, not the strategy's disbelief in the market). **Both paths implement ladders**: the backtester forms the same pairs from a per-event sub-pass and orders and gaps them on the same stated deadlines, so a ladder-enabled backtest measures the strategy a ladder-enabled live run would trade — with one standing caveat, that the two paths keep one pair per group by different rules (the live finder ranks tradeable-first then largest price gap, the backtest by largest entry-time monthly ratio), so they can replay different rungs of the same ladder. The setting reaches the backtest log only; the HTML dashboard does not render it, so a ladder-enabled run's dashboard must be labelled by hand. `backtest.py --same-event-ladders` / `--no-same-event-ladders` overrides the switch for one backtest run, which is how the calibration that gates the flip gets measured without flipping it — the live finder binds the constant at import, so a backtest override can never reach it. Everything below is unchanged by that switch.
+**Time-series pairs** must also sit on **different event tickers**, with one exception: a same-event cumulative deadline **ladder**, where Kalshi lists one question's several deadlines as separate markets inside a single event ("Will SpaceX launch another Starship before Sep 23, 2026?" and "… by Oct 16, 2026?" are both `KXSPACEXSTARSHIP-14`). Two such rungs are the time-series premise itself, and the time-series finder will pair them when `TIME_SERIES_SAME_EVENT_LADDERS` in `config.py` is turned on — ordering the legs and choosing the price tier by the two **stated** deadlines rather than by the exchange close times, which a settled event gives every rung alike. It ships **off**: read the constant's comment first, which records both why ladders nest (the impossible earlier-YES/later-NO settlement never occurred in 1,821 archive ladder pairs, against 13% of cross-event ones) and what turning it on would deploy (98% of a $10,000 balance into six trades, at a market-implied expected value of −31% — which is the later leg's own bid-ask spread plus taker fees, not the strategy's disbelief in the market). **Both paths implement ladders**: the backtester forms the same pairs from a per-event sub-pass and orders and gaps them on the same stated deadlines, so a ladder-enabled backtest measures the strategy a ladder-enabled live run would trade — with one standing caveat, that the two paths keep one pair per group by different rules (the live finder ranks tradeable-first then largest price gap, the backtest by largest entry-time monthly ratio), so they can replay different rungs of the same ladder. The setting reaches the backtest log *and* the dashboard's own page header (`Primary spread band: … | same-event ladders: on / off / not recorded`, printed above every section), so a ladder-enabled run's dashboard is no longer indistinguishable from a switch-off one. `backtest.py --same-event-ladders` / `--no-same-event-ladders` overrides the switch for one backtest run, which is how the calibration that gates the flip gets measured without flipping it — the live finder binds the constant at import, so a backtest override can never reach it. Everything below is unchanged by that switch.
 
 The two event tickers must also belong to **different event series** (a same-event ladder's two rungs share one event and therefore one series; the series rule bites on a time-series pair only when the wording is identical across that series, which a dated ladder's is not). A Kalshi event ticker is a series prefix followed by an instance stamp, so two events of one series are two instances of one recurring fixture — two ball games, two 15-minute price windows, two multi-leg combos of different games. Multi-leg combos are the one exception to "the prefix is the series": Kalshi lists them under several prefixes that all begin `KXMVE` (`KXMVECROSSCATEGORY`, `KXMVESPORTSMULTIGAMEEXTENDED`, `KXMVECROSSCATEGORY0`, `KXMVENBASINGLEGAME`), and the whole family is treated as **one** series, so two combos under two *different* `KXMVE*` prefixes are still refused — a combo ticket's wording names its legs but never its date, so identical wording across any two combo tickets is two different tickets. Reading the literal prefix missed exactly those cross-prefix pairs: in one day's settled history they co-resolved only 68% of the time (an unconditional rate over every record in each cross-prefix wording class, with no price or liquidity filter — the measured reason the family rule exists, not a co-resolution estimate for pairs that would actually be traded). Identical wording across two events of one series is the same question asked about two *different* events, and the co-resolution assumption simply does not hold: one such pair of consecutive baseball game days was quoted 0.97 and 0.01 at the same moment. The time-series finder applies the same rule (when the wording is identical across one series, the deadline is not in the wording and there is no cumulative-deadline pair either), so the trade cannot reappear relabelled. A second, independent rule decides whether a time-series pair is a *deadline* pair at all: both legs' wording must state a cumulative "by \<date\>" deadline, and the two deadlines must differ. It reads the outcome label first, then the market title, then the event title, so a multi-choice market whose sub-contract is labelled "$80,000 by June 30" qualifies on that label alone — the rule turns on wording, never on a market's type. It is applied in the live scanner and the backtester through one shared helper for the same reason the series rule is: gating one path only would leave the other replaying the defect. Different series is a *necessary* condition, not a sufficient one: the same prop listed for two different games in two *different* leagues shares its wording too (`KXBRASILEIROB1HTOTAL-…` vs `KXUCL1HTOTAL-…`, both "Over 0.5 1H goals scored", settled no and yes on 2026-09-10), and there the event title in the grouping key is the only thing left to separate them.
 
@@ -129,15 +129,31 @@ backtest.py (CLI)
   ├─ historical.build_historical_client()    — prod API client for archives
   ├─ historical.build_prod_live_client()     — prod API client for recent data
   ├─ backtester.run_backtest_sweep()         — run_backtest() is the plain two-tuple wrapper other callers use
-  │    ├─ _prepare_entries()                      — k-independent; runs once no matter how many k's are simulated
+  │    ├─ _prepare_candidates()                   — band- AND k-independent; runs once no matter how many
+  │    │    │                                        bands or k's are simulated
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata
   │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
-  │    │    ├─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers)
-  │    │    └─ _find_entry()                          — first tradeable Monday per pair
-  │    ├─ _interval_calibration()                 — empirical k_hat, once, from the k-independent entries
-  │    └─ _simulate_at_discount()  — once per swept k: Kelly gate, dedup, P&L from outcomes, _build_equity_curve()
-  └─ dashboard.generate_dashboard()          — write HTML report, incl. the k-selector section
+  │    │    └─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers;
+  │    │                                               every window opens at --start-date: see the 5,000-candle
+  │    │                                               caveat under Run Commands → Backtest)
+  │    └─ _sweep_from_candidates()
+  │         ├─ _entries_for_band()            — k-independent; one time-series _find_entry() pass per band:
+  │         │                                    every band of SPREAD_BAND_SWEEP_FLOORS x CEILINGS (plus the
+  │         │                                    primary if it is off-grid) by default — only the no-band pass
+  │         │                                    scans every pair, the rest rescan the pairs that entered
+  │         │                                    there — or the primary band alone with --no-band-sweep;
+  │         │                                    plus one same-title pass
+  │         ├─ _interval_calibration()        — empirical k_hat per band, from that band's k-independent entries
+  │         └─ _simulate_at_discount()  — once per (band, k[, population]): Kelly gate, dedup, P&L from
+  │                                        outcomes, _build_equity_curve() — the scenario explorer's
+  │                                        band x k x {all, time_series, ladder, cross} grid, plus
+  │                                        one same-title simulation, come from repeating this call,
+  │                                        never from slicing a joint run
+  └─ dashboard.generate_dashboard()          — write HTML report: k-selector section plus the scenario-
+                                                explorer section (band x k heatmap, per-population KPIs)
 ```
+
+`run_backtest()` composes `_prepare_candidates()` with a single `_entries_for_band()` pass at the default (no-op) band (the two together are `_prepare_entries()`) and one `_simulate_at_discount()` call, so every pre-existing caller of the plain two-tuple entry point is unaffected by the band sweep above.
 
 ---
 
@@ -146,7 +162,7 @@ backtest.py (CLI)
 | Module | Description |
 |--------|-------------|
 | `__init__.py` | Package initializer. No exports; marks the directory as the `kalshi_betting` package. |
-| `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths), the two fee helper functions, and `max_affordable_pairs()` — the single budget-to-contracts definition shared by the scanner's depth bound and the sizer. |
+| `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths), the two fee helper functions, `max_affordable_pairs()` — the single budget-to-contracts definition shared by the scanner's depth bound and the sizer — and the backtest-only time-series spread-band helpers `time_series_spread_band()` / `time_series_spread_too_wide()` plus the `SPREAD_BAND_SWEEP_FLOORS` / `SPREAD_BAND_SWEEP_CEILINGS` grid the scenario explorer sweeps; nothing on the live path reads a band value. |
 | `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
 | `_http.py` | Shared HTTP helpers used across the package (auth, scanner, historical, trader, and v2_probe): `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission and the collateral transfer call it directly). |
 | `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles and appends each market's outcome label (subtitle) to group time-series pairs, detects same-title pairs via exact match, refuses a same-title pair between two events of one series, a time-series pair whose wording is identical across one series (two instances of one recurring fixture — a genuine two-deadline family of one series spells its deadline in the wording and can still pair, if both legs are worded as cumulative deadlines; `event_series()` reads the prefix before the first hyphen, except that every `KXMVE*` combo prefix collapses onto one family so two combos listed under two different combo series are still refused), a time-series pair between two markets of ONE event unless `TIME_SERIES_SAME_EVENT_LADDERS` is on and they are two dated rungs of that event's deadline ladder (`stated_deadline()` / `same_event_ladder()`, which order the legs and measure the gap on the STATED deadlines; `pair_gap_days()` is the one place anything downstream reads that gap), and a time-series pair whose legs are not both worded as cumulative "by \<date\>" deadlines at two different dates (compared as normalized text, not parsed calendar dates — see the note above; `deadline_phrasing()` — a snapshot family such as "Solana price on Sep 14/18, 2026?" still groups but no longer pairs; `deadline_pair_refusal()` names WHY a refused pair was refused — snapshot wording, no stated deadline, or the same deadline stated twice — feeding three separate, honestly-labelled skip counts instead of one folded one, DR-72), and enriches tradeable pairs with live order book depth to compute real fill prices — averaged over the contracts the balance could actually buy, not the whole book, with the qualifying levels kept on the pair (`depth_levels`) for the sizer to re-price against via `prefix_fill_prices()`. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades, and to the V2 order-price grid arithmetic (`tick_size_for_price()`, `ceil_to_tick()`, `v2_limit_price()`, `v2_effective_cap()`) — it lives here, not in `trader.py`, so the sizer can test a candidate size against the very limit the trader will submit without importing it. |
@@ -156,9 +172,9 @@ backtest.py (CLI)
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
 | `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester (candlesticks are fetched in parallel across tickers and cached per ticker, so workers never share a cache file and a repeat run re-reads them from disk). |
-| `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs (including, behind `TIME_SERIES_SAME_EVENT_LADDERS`, two dated rungs of one event's deadline ladder — formed by a separate, deliberately unwindowed per-event sub-pass and ordered and gapped on their stated deadlines through the same `scanner.stated_deadline()` / `same_event_ladder()` the live finder uses), scans weekly Monday snapshots for the first tradeable entry, applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its day-0 charges as a real daily return and a real drawdown. The curve is a portfolio value, not a cash balance: an open position is carried at its cost basis for its whole holding period, so committing capital does not move the curve and the drawdown/Sharpe/Sortino figures derived from it measure realized loss rather than peak deployment. |
-| `dashboard.py` | Generates a self-contained HTML performance report from backtest results, including equity curve, Sharpe/Sortino/drawdown KPIs, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, trade diagnostics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. |
-| `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount`, `--no-sweep` and `--same-event-ladders` / `--no-same-event-ladders`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
+| `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs (including, behind `TIME_SERIES_SAME_EVENT_LADDERS`, two dated rungs of one event's deadline ladder — formed by a separate, deliberately unwindowed per-event sub-pass and ordered and gapped on their stated deadlines through the same `scanner.stated_deadline()` / `same_event_ladder()` the live finder uses), scans weekly Monday snapshots for the first tradeable entry — at a BACKTEST-only time-series spread band (`_entries_for_band()`, `_find_entry()`) that live trading never reads — applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its day-0 charges as a real daily return and a real drawdown. The curve is a portfolio value, not a cash balance: an open position is carried at its cost basis for its whole holding period, so committing capital does not move the curve and the drawdown/Sharpe/Sortino figures derived from it measure realized loss rather than peak deployment. The work is split at the band and the interval discount `k`: `_prepare_candidates()` (fetch through candlesticks) depends on neither, `_entries_for_band()` depends only on the band, and `_simulate_at_discount()` — the Kelly gate, dedup, P&L, equity curve — depends on `k`; `_sweep_from_candidates()` composes all three into the band x `k` x population scenario grid (`SweepPoint`, `HalfSplit`, `BacktestSweep`) the dashboard's scenario explorer renders. |
+| `dashboard.py` | Generates a self-contained HTML performance report from backtest results — eight sections: equity curve / Sharpe/Sortino/drawdown KPIs, returns decomposition, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, a scenario-explorer section (a fragility banner, a spread-band x `k` heatmap and a per-population KPI table over the band sweep, with its own band/`k` `<select>`s), trade diagnostics, risk metrics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. The page header names the run's primary spread band and same-event-ladder setting. |
+| `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount`, `--no-sweep`, `--same-event-ladders` / `--no-same-event-ladders`, and the backtest-only `--spread-min` / `--spread-max` / `--no-band-sweep`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
 | `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. A 2xx order body that is not a JSON object, in either step that reads one (DR-58), and — in the NO-buy step only — an object whose fill counts are unreadable (DR-60), are a clean FAIL that still reads the position, re-reads it once when that first read is `None` or `0`, and reports lookup-failed, position-open and genuinely-flat as three distinct outcomes, never a traceback out of the fill readers. Two of the unfillable-ask step's branches are recorded residuals — its unreadable-fill-counts branch and its `not killed` branch both FAIL without re-reading the account. The NO-buy step classifies readable fill counts into three outcomes, not two — a complete fill, a true kill, and a fill-or-kill invariant violation — so a partial fill FAILs naming the counts and re-reading the account rather than being reported as a clean kill with the account "still flat" (DR-20); the unfillable-ask step always read a partial that way. Both steps judge on `fill_count` AND `remaining_count`, which is deliberately stricter than the live `trader._v2_fill_status`, whose contract is `fill_count` alone. `--dest-shard` equal to the source shard is refused with a NEUTRAL at the top of the transfer step, before any transfer I/O, so it can no longer POST a net-zero self-transfer and then report a false in-flight FAIL (DR-22). Never imported by the pipeline. |
 
 ### Order API version
@@ -363,9 +379,11 @@ python3 -m kalshi_betting.backtest --start-date 2023-01-01 --balance 50000
 python3 -m kalshi_betting.backtest --no-cache   # rebuild the assembled market list
 python3 -m kalshi_betting.backtest --max-horizon-days 14
 python3 -m kalshi_betting.backtest --interval-discount 0.60   # override k for this run only
-python3 -m kalshi_betting.backtest --no-sweep   # skip the k-grid re-simulation (single-point dashboard selector)
+python3 -m kalshi_betting.backtest --no-sweep   # skip the k-grid re-simulation (single-point dashboard selector; one k column in the scenario explorer)
 python3 -m kalshi_betting.backtest --same-event-ladders     # force same-event deadline ladders ON for this run
 python3 -m kalshi_betting.backtest --no-same-event-ladders  # force them OFF for this run
+python3 -m kalshi_betting.backtest --spread-min 0.30 --spread-max 0.60   # primary scenario's time-series spread band (backtest only)
+python3 -m kalshi_betting.backtest --no-band-sweep           # skip the spread-band grid; the dashboard's scenario explorer has nothing to show
 ```
 
 `--start-date` should predate the Kalshi archive cutoff. Markets that settled
@@ -376,7 +394,9 @@ it produces no trades regardless of how many pairs it finds.
 discount `k` for this backtest run only — it never reaches live trading, which
 always reads `config.TIME_SERIES_INTERVAL_PROB_DISCOUNT`. Omit it (the
 default) to run at the configured value. `--no-sweep` skips the extra
-re-simulation across `config.INTERVAL_DISCOUNT_SWEEP`; the empirical-`k`
+re-simulation across `config.INTERVAL_DISCOUNT_SWEEP`; with the band sweep on
+(the default), each band is simulated at the primary `k` only, so the scenario
+explorer's heatmap has a single `k` column. The empirical-`k`
 calibration measurement and its log/dashboard report are unaffected by either
 flag — see the sizing bullet under [Strategy change (2026-09)](#strategy-change-2026-09)
 and CLAUDE.md for the full mechanism.
@@ -389,8 +409,79 @@ identically to every swept `k` and a run with it on is **not comparable** to a
 baseline taken without it. It never reaches the live finder, which binds that
 constant at import.
 
-**Feasibility pre-check (BS-11).** Before any network call, `_prepare_entries()`
-— the preparation step shared by `run_backtest()` and `run_backtest_sweep()` —
+**`--spread-min` / `--spread-max` / `--no-band-sweep` — the scenario explorer
+(backtest only; live trading reads no band value at all).** By default the
+time-series finder's own directional price filter is the only gate on a
+pair's YES-price gap (`pB − pA`): a floor tiered on the deadline gap, and no
+ceiling. `--spread-min X` / `--spread-max Y` (each in `[0, 1]`) layer a
+BACKTEST-only spread *band* on top of that for the **primary** scenario —
+the floor is `max(deadline-gap tier, X)` and the ceiling is `Y`. The raised
+floor also tightens the leg-price-sum ceiling to `1 − max(tier, X)`, exactly
+as the live tier sets `1 − tier`, so a band is stricter than a YES-gap floor
+alone. Either flag may be given alone, and omitting both runs the configured
+default band (`config.BACKTEST_DEFAULT_SPREAD_BAND`, `(0.0, 1.0)` — no band,
+i.e. exactly the live rule). The resolved floor must be strictly below the
+ceiling (a violation is rejected before anything is logged), and a ceiling at
+or below a deadline-gap tier logs a WARNING that it empties that tier. The
+band sweep is **on by default**, so a default run also re-simulates every
+band of `config.SPREAD_BAND_SWEEP_FLOORS` x `SPREAD_BAND_SWEEP_CEILINGS` (36
+bands) crossed with every swept `k` (13 values) — 468 scenarios, plus a
+standalone time-series (ladders and cross-event together), same-event-ladder
+and cross-event simulation per non-empty cell, a split-half out-of-sample
+check, and, for every cell that traded at least one event, a re-simulation
+excluding the single most concentrated event — computed over the *same*
+fetch, pair extraction and candlestick set as the primary scenario (only the
+entry-detection pass and the simulation are repeated per band, and only the
+no-band band's entry pass scans every pair: every other band rescans just
+the pairs that entered there, which cannot change its entries because a band
+only ever tightens the entry tests). An "All" cell is every entry at its
+band, same-title included (it is the run's actual result); a "Time-series"
+cell is every time-series entry, same-title excluded — and it is the one the
+explorer's heatmap, banner and equity curve show, because the band and `k`
+act on time-series pairs only and a same-title result would dilute the
+comparison. "Ladders" and "Cross-event" split the time-series entries
+further, and "Same-title" is simulated once, independent of band and `k`;
+every population is labelled on the page. `--no-band-sweep` skips that
+grid: the primary scenario still runs, but the dashboard's "Scenario
+Explorer" section has no scenarios to show. The explorer's fragility banner
+reports how many band x `k` cells were computed, what share of the
+time-series cells had a positive return, and the split-half rank correlation
+of their returns — the point being that the best of many correlated cells
+overstates what you should expect, so read any cell with that banner on
+screen rather than from one flattering cell (the banner's "best of N"
+counts the cells that have a time-series entry, not the whole grid). A
+split-half half with no entries reads "—" rather than a 0% return and is
+left out of that correlation. One split date serves every cell — the median
+entry date of the primary band's time-series entries (the lower of the two
+middle dates on an even count) — so a half is empty
+either when at least half of those entries share the first entry date (the
+backtest log warns when that happens) or, at any other band or on the "All"
+population, when all of that cell's own entries fall on one side of it.
+
+Two caveats. **On a long window the explorer describes a truncated
+population.** Every ticker's candle window opens at the run's global
+`--start-date` and runs to a day past the market's close, and Kalshi
+rejects a candlestick request spanning more than 5,000 hourly candles (~208
+days) with HTTP 400. That failure is caught, so on a longer window every
+ticker closing more than ~207 days after the start gets no candles (counted
+in the log's `N of M tickers returned no candles` line) and can never
+enter. The default `--start-date 2024-01-01` is far past
+that limit. Per-ticker candle windowing is a separate fix that has not
+landed; until it does, the dashboard puts a red notice in its header, and
+as the first line of the explorer's banner, on any window long enough to
+contain such a market (207 days or more at hourly candles). **Picking a
+scenario changes nothing the live bot does:** live
+trading has no band setting at all, and `k` and the ladder switch stay
+whatever `config.py` says. Applying a chosen band and `k` live is a separate
+change that must add live enforcement first. This is entirely a backtest
+reporting feature: `min_price_diff_for_gap()` gains the `spread_min` keyword
+the band's floor is layered through, but no live caller (`scanner.py`,
+`strategy.py`, `trader.py`, `main.py`) ever passes it or reads a band
+constant — see `CLAUDE.md`'s `test_ast_live_path_reads_no_band`.
+
+**Feasibility pre-check (BS-11).** Before any network call, `_prepare_candidates()`
+— the band- and `k`-independent preparation step `run_backtest()` and
+`run_backtest_sweep()` both build on —
 checks whether the `[--start-date, today]` window contains at least one
 Monday-09:00-UTC entry checkpoint (the only time the replay ever enters a
 trade). If not, it logs a warning and the run returns the same empty result the

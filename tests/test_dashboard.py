@@ -11,11 +11,19 @@ so these tests stay fully offline. Both sites are Kalshi-controlled
 (BacktestTrade.title_a is a market question straight from the API). The
 interval-discount section is tested the same way: _section_interval_discount()
 is driven from a hand-built BacktestSweep, never through generate_dashboard().
+
+The scenario explorer (PB5) is pinned by VALUE on a non-square band x k grid
+whose primary sits off index 0 on both axes, and the seven sections that
+predate it are pinned against digests captured on main by
+tests/dashboard_golden.py (TestGoldenSections). Tests that do render a whole
+page stub dashboard.yf.download and redirect dashboard.PROJECT_ROOT.
 """
 import dataclasses
+import json
 import math
 import re
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -24,6 +32,7 @@ from kalshi_betting import backtester, config, dashboard
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
+    HalfSplit,
     IntervalCalibration,
     IntervalCalibrationBucket,
     OutcomeLabelCoverage,
@@ -42,7 +51,10 @@ from kalshi_betting.dashboard import (
     _section_diagnostics,
     _section_interval_discount,
     _section_risk,
+    _section_scenario_explorer,
 )
+
+from . import dashboard_golden
 
 _XSS_TITLE = "<script>alert(1)</script>Will BTC exceed $80k by December 2026 or later?"
 
@@ -1044,3 +1056,929 @@ class TestDeadlinePhrasingIsRendered:
         html = dashboard._deadline_phrasing_html(mismatched)
         assert "could not have produced a time-series trade" not in html
         assert "counts do not sum to the corpus" in html
+
+
+# ═══ PB5: the "Scenario Explorer" section (band x k x population sweep) ══════
+
+def _scn_trade(profit: float = 5.0, event_ticker: str = "") -> BacktestTrade:
+    """make_trade's time-series trade with a settable profit and event ticker
+    (BacktestTrade.event_ticker drives the explorer's concentration figures)."""
+    return dataclasses.replace(make_trade(profit=profit), event_ticker=event_ticker)
+
+
+def _scn_point(band, k, population="all", trades=None, values=None,
+               halves=None, ex_top=None) -> SweepPoint:
+    """One scenario SweepPoint."""
+    return SweepPoint(
+        k=k, trades=trades if trades is not None else [_scn_trade()],
+        equity_df=make_equity(values if values is not None else [1000.0, 1010.0]),
+        spread_band=band, population=population, halves=halves, ex_top_event=ex_top,
+    )
+
+
+def _scn_calibration(label: str = "0-7d", n: int = 6) -> IntervalCalibration:
+    return IntervalCalibration(
+        pooled=IntervalCalibrationBucket(label="POOLED", tier=0.0, n=10,
+                                         realised_rate=0.12, mean_implied=0.20,
+                                         empirical_k=0.60),
+        buckets=[IntervalCalibrationBucket(label=label, tier=0.15, n=n,
+                                           realised_rate=0.10, mean_implied=0.18,
+                                           empirical_k=None)],
+        excluded_premise_violations=0,
+    )
+
+
+def _scn_coverage() -> OutcomeLabelCoverage:
+    return OutcomeLabelCoverage(
+        total=10, with_subtitle=10, with_event_title=10,
+        subtitle_fraction=1.0, event_title_fraction=1.0, below_floor=False,
+        cumulative_markets=1, snapshot_markets=1, unknown_deadline_markets=8,
+    )
+
+
+def _fail_on_constant(token):  # pragma: no cover - only runs on a failure
+    pytest.fail(f"JSON payload contained a non-finite constant token: {token}")
+
+
+def _scn_data(section_html: str) -> dict:
+    """The scn-data payload, cut at the FIRST "</script>" after the block's
+    opening tag — exactly where a browser's HTML parser ends the block — and
+    parsed strictly (a NaN/Infinity token fails the test)."""
+    start = section_html.index('id="scn-data">') + len('id="scn-data">')
+    end = section_html.index("</script>", start)
+    return json.loads(section_html[start:end], parse_constant=_fail_on_constant)
+
+
+def _first_figure(section_html: str) -> tuple[list, dict]:
+    """(data, layout) of the first Plotly.newPlot call in a fragment — the
+    explorer's heatmap — with plotly's typed arrays decoded to lists."""
+    decoder = json.JSONDecoder()
+    i = section_html.index("Plotly.newPlot(") + len("Plotly.newPlot(")
+    args = []
+    while len(args) < 3:
+        while section_html[i] in " \n\t,":
+            i += 1
+        value, i = decoder.raw_decode(section_html, i)
+        args.append(value)
+    return (dashboard_golden._decode_typed_arrays(args[1]),
+            dashboard_golden._decode_typed_arrays(args[2]))
+
+
+def _options(section_html: str, select_id: str) -> list[tuple[str, bool, str]]:
+    """(value, selected, text) of every <option> of one <select>."""
+    body = re.search(rf"<select id='{select_id}'>(.*?)</select>", section_html).group(1)
+    return [(v, bool(sel), txt) for v, sel, txt in
+            re.findall(r'<option value="(\d+)"( selected)?>(.*?)</option>', body)]
+
+
+class _Grid:
+    """A NON-square 3-band x 2-k grid whose primary sits at index 1 on BOTH
+    axes, so a transposed payload, a primary hard-coded to index 0, or a
+    population read off the wrong point all show up as wrong numbers.
+
+    Cell c = band_index * 2 + k_index. Its "all" point has c + 1 trades, its
+    "ladder" point 10 + c and its "cross" point 20 + c — except that cell 5
+    has no ladder and cell 0 no cross. The "all" returns are NaN / 0 / +1% /
+    +2% / +3% / -1% (the NaN from a NaN final value), and the H1 / H2 halves
+    have DIFFERENT rank orders, so the split-half correlation is a specific
+    non-trivial number rather than +/-1.
+
+    PB7: each cell also carries a "time_series" point — the population the
+    heatmap, banner and curve read — whose figures MIRROR its "all" point, as
+    on the DR-73 calibration corpus, which has no same-title pair (there
+    time_series == all). The tests below therefore read the same numbers they
+    always did; TestScenarioExplorerHeadlinePopulation proves, on a fixture
+    where the two differ, that the headline reads "time_series".
+    """
+
+    BANDS = [(0.0, 1.0), (0.3, 0.6), (0.35, 0.8)]
+    KS = [0.65, 0.75]
+    H1 = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+    H2 = [0.03, -0.01, 0.05, 0.00, 0.02, 0.02]
+    FINALS = [float("nan"), 1000.0, 1010.0, 1020.0, 1030.0, 990.0]
+    PRIMARY_TRADES = [(10.0, "EVT-A"), (30.0, "EVT-C"), (-5.0, "EVT-B"), (0.0, "")]
+    PRIMARY_VALUES = [1000.0, 1040.0, 980.0, 1020.0]
+
+    @classmethod
+    def all_trades(cls, c: int) -> list[BacktestTrade]:
+        if c == 3:
+            return [_scn_trade(p, e) for p, e in cls.PRIMARY_TRADES]
+        return [_scn_trade(5.0, "EVT-A") for _ in range(c + 1)]
+
+    @classmethod
+    def sweep(cls, *, top_event: str = "EVT-C") -> BacktestSweep:
+        scenarios, primary = [], None
+        for bi, band in enumerate(cls.BANDS):
+            for ki, k in enumerate(cls.KS):
+                c = bi * 2 + ki
+                trades = cls.all_trades(c)
+                values = (cls.PRIMARY_VALUES if c == 3
+                          else [1000.0, 1000.0 + 5 * c, cls.FINALS[c]])
+                ex_top = (top_event, -0.015) if c == 3 else ("EVT-A", 0.01)
+                if c == 3 and top_event != "EVT-C":
+                    trades = [dataclasses.replace(t, event_ticker=top_event)
+                              if t.event_ticker == "EVT-C" else t for t in trades]
+                pt = _scn_point(band, k, "all", trades, values,
+                                HalfSplit(cls.H1[c], cls.H2[c], 1, 1), ex_top)
+                scenarios.append(pt)
+                scenarios.append(dataclasses.replace(pt, population="time_series"))
+                if c == 3:
+                    primary = pt
+                if c != 5:
+                    scenarios.append(_scn_point(
+                        band, k, "ladder", [_scn_trade(1.0)] * (10 + c),
+                        [1000.0, 1000.0 + c, 1000.0 + 2 * c]))
+                if c != 0:
+                    scenarios.append(_scn_point(
+                        band, k, "cross", [_scn_trade(-1.0)] * (20 + c),
+                        [1000.0, 999.0 - c]))
+        same_title = _scn_point(None, cls.KS[1], "same_title",
+                                [_scn_trade(2.0)] * 7, [1000.0, 1002.0])
+        return BacktestSweep(
+            primary=primary, points=[primary], calibration=_scn_calibration(),
+            label_coverage=_scn_coverage(), scenarios=scenarios,
+            same_title_point=same_title,
+            calibrations_by_band={cls.BANDS[0]: _scn_calibration(),
+                                  cls.BANDS[1]: _scn_calibration("8-15d", 9),
+                                  cls.BANDS[2]: None},
+            same_event_ladders=True, split_date=date(2026, 1, 6),
+        )
+
+    @classmethod
+    def section(cls, **kwargs) -> str:
+        return _section_scenario_explorer(cls.sweep(**kwargs))
+
+
+class TestScenarioExplorerPayload:
+    """The data block the inline script reads: its indexing, its per-population
+    rows and its values, all pinned by value on a non-square grid."""
+
+    def test_the_grid_is_band_major_and_not_transposed(self):
+        data = _scn_data(_Grid.section())
+        assert data["bands"] == [[0.0, 1.0], [0.3, 0.6], [0.35, 0.8]]
+        assert data["ks"] == [0.65, 0.75]
+        assert data["populations"] == ["all", "ladder", "cross", "time_series"]
+        pop = {name: i for i, name in enumerate(data["populations"])}
+        assert len(data["cells"]) == 3
+        assert all(len(row) == 2 for row in data["cells"])
+        for bi in range(3):
+            for ki in range(2):
+                c = bi * 2 + ki
+                cell = data["cells"][bi][ki]
+                assert cell[pop["all"]]["trades"] == c + 1
+                # Each population row is its OWN point's figures, never the
+                # All point's — 10 + c and 20 + c trades, not c + 1.
+                if c == 5:
+                    assert cell[pop["ladder"]] is None
+                else:
+                    assert cell[pop["ladder"]]["trades"] == 10 + c
+                if c == 0:
+                    assert cell[pop["cross"]] is None
+                else:
+                    assert cell[pop["cross"]]["trades"] == 20 + c
+
+    def test_the_primary_cell_kpis_by_value(self):
+        sweep = _Grid.sweep()
+        data = _scn_data(_section_scenario_explorer(sweep))
+        all_row = data["cells"][1][1][0]
+        trades = _Grid.all_trades(3)
+        assert all_row["trades"] == 4
+        # profit > 0 strictly: the zero-profit trade is not a win.
+        assert all_row["win_rate"] == pytest.approx(0.5)
+        # Mean per trade = mean of profit / (total_cost + fees), fee-inclusive.
+        expected_mean = sum(t.profit / (t.total_cost + t.fees) for t in trades) / 4
+        assert all_row["mean_per_trade"] == pytest.approx(expected_mean)
+        assert all_row["total_return"] == pytest.approx(0.02)
+        assert all_row["final_balance"] == pytest.approx(1020.0)
+        assert all_row["max_drawdown"] == pytest.approx((980.0 - 1040.0) / 1040.0)
+        eq = sweep.primary.equity_df
+        assert all_row["sharpe"] == pytest.approx(dashboard._sharpe(eq["daily_return"]))
+        assert all_row["sortino"] == pytest.approx(dashboard._sortino(eq["daily_return"]))
+        assert all_row["sortino"] != pytest.approx(all_row["sharpe"])
+        assert (all_row["h1_return"], all_row["h2_return"]) == (0.04, 0.00)
+        assert all_row["top_event"] == "EVT-C"
+        # 30 / (10 + 30): the share is over POSITIVE event P&L only; a net-P&L
+        # denominator would read 30 / 35.
+        assert all_row["top_event_share"] == pytest.approx(0.75)
+        assert all_row["ex_top_return"] == pytest.approx(-0.015)
+
+    def test_population_rows_are_their_own_simulations(self):
+        data = _scn_data(_Grid.section())
+        ladder, cross = data["cells"][1][1][1], data["cells"][1][1][2]
+        assert ladder["total_return"] == pytest.approx(0.006)   # 1000 -> 1006
+        assert ladder["final_balance"] == pytest.approx(1006.0)
+        assert cross["total_return"] == pytest.approx(-0.004)   # 1000 -> 996
+        assert "h1_return" not in ladder and "equity" not in ladder
+        same_title = data["same_title"]
+        assert same_title["trades"] == 7
+        assert same_title["total_return"] == pytest.approx(0.002)
+
+    def test_calibration_is_the_selected_bands_own(self):
+        data = _scn_data(_Grid.section())
+        labels = [[row["label"] for row in cal] if cal else None
+                  for cal in data["calibration_by_band"]]
+        assert labels == [["0-7d", "POOLED"], ["8-15d", "POOLED"], None]
+        assert data["calibration_by_band"][1][0]["n"] == 9
+        # The POOLED row's tier of 0.0 means "no tier" and ships as null.
+        assert data["calibration_by_band"][0][1]["tier"] is None
+
+    def test_json_is_strict_and_carries_no_non_finite_value(self):
+        section = _Grid.section()
+        data = _scn_data(section)
+        assert data["cells"][0][0][0]["total_return"] is None
+        # PB7: the per-cell curve is the headline (time-series) population's
+        assert data["cells"][0][0][3]["equity"][2] is None
+        assert "NaN" not in section and "Infinity" not in section
+
+    def test_a_script_closing_ticker_cannot_end_the_data_block(self):
+        hostile = "EVT-</script><b>x"
+        section = _Grid.section(top_event=hostile)
+        assert hostile not in section
+        assert "EVT-<\\/script>" in section
+        assert _scn_data(section)["cells"][1][1][0]["top_event"] == hostile
+
+    def test_every_curve_is_on_the_shared_axis(self):
+        sweep = _Grid.sweep()
+        data = _scn_data(_section_scenario_explorer(sweep))
+        assert data["dates"] == [d.isoformat() for d in sweep.primary.equity_df["date"]]
+        for row in data["cells"]:
+            for cell in row:
+                # PB7: the per-cell curve is the headline (time-series)
+                # population's; the "all" entry no longer ships one
+                assert len(cell[3]["equity"]) == len(data["dates"])
+                assert "equity" not in cell[0]
+
+
+class TestScenarioExplorerControls:
+    """The selects, the heatmap's metric toggle and the fragility banner."""
+
+    def test_selects_are_labelled_and_preselect_only_the_primary(self):
+        section = _Grid.section()
+        assert _options(section, "scn-band-select") == [
+            ("0", False, "max(tier,0)-1"),
+            ("1", True, "max(tier,0.3)-0.6 (primary)"),
+            ("2", False, "max(tier,0.35)-0.8"),
+        ]
+        assert _options(section, "scn-k-select") == [
+            ("0", False, "k = 0.65"),
+            ("1", True, "k = 0.75 (primary)"),
+        ]
+        data = _scn_data(section)
+        assert (data["primary_band_idx"], data["primary_k_idx"]) == (1, 1)
+
+    def test_labels_stay_distinct_for_off_grid_values(self):
+        # An off-grid --interval-discount within a rounding of a grid member,
+        # and an off-grid band floor, must not share a label with the member:
+        # the heatmap's axes are categorical and would merge them.
+        bands = [(0.3, 0.6), (0.3000001, 0.6)]
+        ks = [0.65, 0.651, 0.70]
+        scenarios = [_scn_point(b, k) for b in bands for k in ks]
+        sweep = BacktestSweep(primary=scenarios[1], points=[scenarios[1]],
+                              calibration=None, label_coverage=_scn_coverage(),
+                              scenarios=scenarios)
+        heat, _ = _first_figure(_section_scenario_explorer(sweep))
+        assert heat[0]["x"] == ["k = 0.65", "k = 0.651", "k = 0.70"]
+        assert heat[0]["y"] == ["max(tier,0.3)-0.6", "max(tier,0.3000001)-0.6"]
+
+    def test_heatmap_buttons_update_z_and_title_together(self):
+        heat, layout = _first_figure(_Grid.section())
+        # PB7: the title names the population the cells are
+        pop = "Time-series (ladders + cross-event; same-title excluded)"
+        assert layout["title"]["text"] == (
+            f"Mean per trade (equal stake) by spread band x k — {pop}")
+        buttons = layout["updatemenus"][0]["buttons"]
+        assert [b["label"] for b in buttons] == [
+            "Mean per trade (equal stake)", "Total return", "H1 return",
+            "H2 return", "Trade count"]
+        for b in buttons:
+            # "restyle" would read the second argument as trace indices and
+            # drop the title silently; "update" relayouts it.
+            assert b["method"] == "update"
+            assert b["args"][1] == {
+                "title.text": f"{b['label']} by spread band x k — {pop}"}
+        z = {b["label"]: b["args"][0]["z"][0] for b in buttons}
+        assert z["Trade count"] == [[1, 2], [3, 4], [5, 6]]
+        assert z["Total return"][0][0] is None
+        assert z["Total return"][1] == pytest.approx([0.01, 0.02])
+        assert z["H1 return"] == [[0.01, 0.02], [0.03, 0.04], [0.05, 0.06]]
+        assert z["H2 return"] == [[0.03, -0.01], [0.05, 0.0], [0.02, 0.02]]
+        assert heat[0]["z"] == z["Mean per trade (equal stake)"]
+        # A count is never negative: its own colour scale, auto-ranged.
+        count = buttons[4]["args"][0]
+        assert count["zmid"] == [None]
+        assert count["colorscale"] != buttons[0]["args"][0]["colorscale"]
+        assert buttons[0]["args"][0]["zmid"] == [0]
+        assert heat[0]["colorscale"] == buttons[0]["args"][0]["colorscale"][0]
+
+    def test_banner_is_first_and_carries_this_runs_figures(self):
+        from scipy.stats import spearmanr
+        section = _Grid.section()
+        expected_rho = spearmanr(_Grid.H1, _Grid.H2).statistic
+        # The halves were chosen so the figure is specific (neither +/-1 nor 0).
+        assert f"{expected_rho:+.3f}" == "-0.116"
+        banner_at = section.index("band x k cells computed")
+        assert banner_at < section.index("Plotly.newPlot(")
+        assert "<b>6 band x k cells computed</b>" in section
+        # 6 all + 6 time-series + 5 ladder + 5 cross points (the stored
+        # scenario points, not every simulation the sweep ran).
+        assert "(22 scenario points" in section
+        # Every cell has a time-series entry, so no "N of M" clause
+        assert "cells have a time-series entry" not in section
+        # Finite returns 0, +1%, +2%, +3%, -1% (the NaN cell excluded): 3 of 5.
+        assert "60.0% of the cells with a measurable return" in section
+        assert "H1 vs H2: -0.116." in section
+        assert "The best of 6 correlated cells overstates what you should expect." in section
+
+    def test_equity_div_id_is_the_fixed_token(self):
+        assert 'id="scn-equity"' in _Grid.section()
+
+
+def _nth_figure(section_html: str, n: int) -> tuple[list, dict]:
+    """(data, layout) of the n-th (0-based) Plotly.newPlot call in a fragment:
+    0 is the explorer's heatmap, 1 its equity curve."""
+    decoder = json.JSONDecoder()
+    i = -1
+    for _ in range(n + 1):
+        i = section_html.index("Plotly.newPlot(", i + 1)
+    i += len("Plotly.newPlot(")
+    args = []
+    while len(args) < 3:
+        while section_html[i] in " \n\t,":
+            i += 1
+        value, i = decoder.raw_decode(section_html, i)
+        args.append(value)
+    return (dashboard_golden._decode_typed_arrays(args[1]),
+            dashboard_golden._decode_typed_arrays(args[2]))
+
+
+_TS_LABEL = "Time-series (ladders + cross-event; same-title excluded)"
+
+
+class TestScenarioExplorerHeadlinePopulation:
+    """PB7: the heatmap, the fragility banner and the equity curve read the
+    "time_series" population — every time-series entry simulated alone,
+    same-title excluded — never the "all" one, and say so. The fixture makes
+    the two DISAGREE on everything: every "all" cell is +50% (a same-title
+    windfall, band- and k-independent), every time-series cell loses, and the
+    last cell has no time-series point at all."""
+
+    BANDS = [(0.0, 1.0), (0.3, 0.6)]
+    KS = [0.65, 0.75]
+    TS_FINALS = [900.0, 880.0, 860.0]           # cells 0..2; cell 3 has none
+    TS_H1 = [-0.10, -0.30, -0.20]
+    TS_H2 = [-0.05, -0.02, -0.40]
+
+    @classmethod
+    def sweep(cls) -> BacktestSweep:
+        scenarios, primary = [], None
+        for bi, band in enumerate(cls.BANDS):
+            for ki, k in enumerate(cls.KS):
+                c = bi * 2 + ki
+                # Every curve spans one calendar, as every scenario of one run
+                # does (the page decides its date axis from the primary)
+                all_pt = _scn_point(band, k, "all", [_scn_trade(50.0, "EVT-ST")] * 3,
+                                    [1000.0, 1250.0, 1500.0],
+                                    HalfSplit(0.9, 0.8, 1, 1, 1, 1), ("EVT-ST", 0.4))
+                scenarios.append(all_pt)
+                if c == 0:
+                    primary = all_pt
+                if c < 3:
+                    scenarios.append(_scn_point(
+                        band, k, "time_series", [_scn_trade(-5.0, "EVT-TS")],
+                        [1000.0, 950.0, cls.TS_FINALS[c]],
+                        HalfSplit(cls.TS_H1[c], cls.TS_H2[c], 1, 1, 2, 2),
+                        ("EVT-TS", -0.05)))
+        return BacktestSweep(
+            primary=primary, points=[primary], calibration=None,
+            label_coverage=_scn_coverage(), scenarios=scenarios,
+            same_title_point=_scn_point(None, 0.75, "same_title",
+                                        [_scn_trade(50.0)] * 3, [1000.0, 1500.0]),
+            calibrations_by_band=dict.fromkeys(cls.BANDS),
+            same_event_ladders=True, split_date=date(2026, 1, 6))
+
+    def test_the_heatmap_reads_time_series_and_never_falls_back(self):
+        heat, layout = _first_figure(_section_scenario_explorer(self.sweep()))
+        buttons = {b["label"]: b["args"][0]["z"][0]
+                   for b in layout["updatemenus"][0]["buttons"]}
+        expected = [(f - 1000.0) / 1000.0 for f in self.TS_FINALS]
+        assert buttons["Total return"][0] == pytest.approx(expected[:2])
+        assert buttons["Total return"][1][0] == pytest.approx(expected[2])
+        # Cell 3 has no time-series point: null, never the "all" cell's +50%
+        assert buttons["Total return"][1][1] is None
+        assert buttons["Trade count"] == [[1, 1], [1, None]]
+        assert buttons["H1 return"] == [[-0.10, -0.30], [-0.20, None]]
+        # The title names the population on every metric
+        assert layout["title"]["text"].endswith(f"— {_TS_LABEL}")
+        assert all(_TS_LABEL in b["args"][1]["title.text"]
+                   for b in layout["updatemenus"][0]["buttons"])
+
+    def test_same_title_dilution_cannot_reach_the_banner(self):
+        from scipy.stats import spearmanr
+        section = _section_scenario_explorer(self.sweep())
+        # Every time-series cell lost; every "all" cell won
+        assert "0.0% of the cells with a measurable return" in section
+        rho = spearmanr(self.TS_H1, self.TS_H2).statistic
+        assert f"H1 vs H2: {rho:+.3f}." in section
+        # The "all" halves are constant (0.9 / 0.8): read, they would make
+        # the correlation undefined instead
+        assert "not enough data" not in section
+        # The grid still counts every cell, and the banner names its population
+        assert "<b>4 band x k cells computed</b>" in section
+        assert (f"Every figure in this banner, the heatmap and the equity curve is the "
+                f"<b>{_TS_LABEL}</b> population's; the KPI table below labels each row "
+                "with its own population.") in section
+        # ... but its multiple-comparison count is the cells the heatmap
+        # shows a value in (cell 3 has no time-series point), never the grid
+        assert "; 3 of the 4 cells have a time-series entry and the rest are blank" in section
+        assert "The best of 3 correlated cells overstates what you should expect." in section
+        assert "The best of 4 correlated cells" not in section
+
+    def test_a_grid_with_no_time_series_cell_says_so(self):
+        # Every cell carries an "all" point only (a same-title-only run): the
+        # banner must not claim a "best of 0" and must not read the "all"
+        # cells in their place.
+        scenarios = [_scn_point(band, k, "all", [_scn_trade(50.0, "EVT-ST")],
+                                [1000.0, 1500.0], HalfSplit(0.4, 0.5, 1, 1, 1, 1))
+                     for band in self.BANDS for k in self.KS]
+        sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=scenarios)
+        section = _section_scenario_explorer(sweep)
+        assert "<b>4 band x k cells computed</b>" in section
+        assert "; 0 of the 4 cells have a time-series entry" in section
+        assert ("No cell has a time-series entry, so nothing on this grid measures the "
+                "band or k.") in section
+        assert "The best of" not in section
+        assert "— of the cells with a measurable return" in section
+
+    def test_the_curve_and_payload_follow_the_headline(self):
+        section = _section_scenario_explorer(self.sweep())
+        curve, layout = _nth_figure(section, 1)
+        # The primary cell's TIME-SERIES curve, not its "all" curve
+        assert curve[0]["y"] == [1000.0, 950.0, 900.0]
+        assert _TS_LABEL in layout["title"]["text"]
+        data = _scn_data(section)
+        pop = {name: i for i, name in enumerate(data["populations"])}
+        cell = data["cells"][0][0]
+        assert cell[pop["time_series"]]["equity"] == [1000.0, 950.0, 900.0]
+        assert "equity" not in cell[pop["all"]]
+        # ... and both checked populations carry their own extras
+        assert cell[pop["time_series"]]["top_event"] == "EVT-TS"
+        assert cell[pop["all"]]["top_event"] == "EVT-ST"
+        assert data["cells"][1][1][pop["time_series"]] is None
+
+    def test_every_population_is_labelled(self):
+        data = _scn_data(_section_scenario_explorer(self.sweep()))
+        assert data["labels"] == {
+            "time_series": _TS_LABEL,
+            "all": "All (time-series + same-title)",
+            "ladder": "Ladders (same-event)",
+            "cross": "Cross-event",
+            "same_title": "Same-title (independent of band and k)",
+        }
+        # The script builds every KPI row from those labels, the headline
+        # population first, and no longer spells a bare 'All'
+        js = dashboard._SCENARIO_EXPLORER_JS
+        assert js.index("L.time_series") < js.index("L.ladder") < js.index("L.all")
+        assert "kpiRow('All'" not in js
+
+    def test_the_script_reads_the_headline_population(self):
+        # The KPI table's headline row, its sub-row and the restyled curve
+        # exist only in the inline script, which no test executes; on a
+        # corpus with no same-title pair "all" equals "time_series" cell for
+        # cell, so a script reading "all" would look right there. Pin the
+        # reads themselves.
+        js = dashboard._SCENARIO_EXPLORER_JS
+        assert "var ts = cell[P.time_series];" in js
+        assert "kpiRow(esc(L.time_series), ts) + extrasRow(ts)" in js
+        assert "var values = (ts && ts.equity) ? ts.equity : [];" in js
+        assert "kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])" in js
+        # ... and the population is resolved through the payload's names, so
+        # the index the script reads is the time-series point's
+        data = _scn_data(_section_scenario_explorer(self.sweep()))
+        ts_idx = data["populations"].index("time_series")
+        cell = data["cells"][0][0]
+        assert cell[ts_idx]["equity"] == [1000.0, 950.0, 900.0]
+        assert cell[ts_idx]["final_balance"] == pytest.approx(900.0)
+
+
+class TestSplitHalfDegeneracy:
+    """PB7: a half with no entries has a 0.0 return that is NOT a measurement.
+    The page renders it as null ("—") and leaves the cell out of the
+    split-half correlation."""
+
+    @staticmethod
+    def _sweep(halves: list[HalfSplit]) -> BacktestSweep:
+        scenarios = []
+        for i, h in enumerate(halves):
+            band = (0.0, 0.5 + 0.1 * i)
+            for population in ("all", "time_series"):
+                scenarios.append(_scn_point(band, 0.75, population, halves=h))
+        return BacktestSweep(primary=scenarios[0], points=[scenarios[0]], calibration=None,
+                             label_coverage=_scn_coverage(), scenarios=scenarios)
+
+    def test_an_empty_half_is_null_and_left_out_of_the_correlation(self):
+        from scipy.stats import spearmanr
+        h1 = [0.01, 0.02, 0.03, 0.04]
+        h2 = [0.03, 0.01, 0.04, 0.02]
+        halves = [HalfSplit(a, b, 1, 1, 3, 3) for a, b in zip(h1, h2, strict=True)]
+        # A fifth cell whose H1 had no entries: its 0.0 would move the rank
+        # correlation if it were counted
+        halves.append(HalfSplit(0.0, 0.10, 0, 2, 0, 3))
+        section = _section_scenario_explorer(self._sweep(halves))
+        measured = spearmanr(h1, h2).statistic
+        with_zero = spearmanr(h1 + [0.0], h2 + [0.10]).statistic
+        assert f"{measured:+.3f}" != f"{with_zero:+.3f}"
+        assert f"H1 vs H2: {measured:+.3f} (over the 4 of 5 cells whose two halves both " \
+               "had entries)." in section
+        _, layout = _first_figure(section)
+        z = {b["label"]: b["args"][0]["z"][0] for b in layout["updatemenus"][0]["buttons"]}
+        assert [row[0] for row in z["H1 return"]] == [*h1, None]
+        # ... while H2 of that cell, which had entries, is still a measurement
+        assert [row[0] for row in z["H2 return"]] == [*h2, 0.10]
+        data = _scn_data(section)
+        pop = {name: i for i, name in enumerate(data["populations"])}
+        assert data["cells"][4][0][pop["time_series"]]["h1_return"] is None
+        assert data["cells"][4][0][pop["all"]]["h1_return"] is None
+
+    def test_every_half_empty_says_not_measurable(self):
+        halves = [HalfSplit(0.0, r, 0, 1, 0, 2) for r in (0.1, 0.2, 0.3)]
+        section = _section_scenario_explorer(self._sweep(halves))
+        assert ("H1 vs H2: not measurable — the split date leaves a half without "
+                "entries in 3 of the 3 cells.") in section
+
+    def test_unrecorded_entry_counts_keep_the_return(self):
+        # A hand-built four-field HalfSplit records no entry counts; nothing
+        # says a half was empty, so its return is kept
+        assert dashboard._measured_half(0.0, None) == 0.0
+        assert dashboard._measured_half(0.0, 0) is None
+        assert dashboard._measured_half(-0.2, 3) == -0.2
+
+    def test_the_golden_fixture_s_empty_h1_reaches_the_page_as_null(self, monkeypatch):
+        # The backtester's golden fixture: four of the primary band's five
+        # entries (three of its four time-series ones) enter on the first
+        # Monday, so the median_low split date IS that Monday and every
+        # cell's H1 is empty. Run through the real sweep and rendered.
+        from . import test_backtester as tb
+        golden = tb.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        sweep = backtester.run_backtest_sweep(
+            hist_client=tb.MagicMock(), live_client=tb.MagicMock(),
+            start_date=golden._START, initial_balance=10_000.0,
+            same_event_ladders=True, sweep=False, band_sweep=True)
+        assert sweep.split_date == date(2026, 1, 5)
+        assert all(p.halves.h1_entries == 0 for p in sweep.scenarios
+                   if p.population in ("all", "time_series"))
+        section = _section_scenario_explorer(sweep)
+        data = _scn_data(section)
+        pop = {name: i for i, name in enumerate(data["populations"])}
+        for row in data["cells"]:
+            for cell in row:
+                for name in ("all", "time_series"):
+                    assert cell[pop[name]]["h1_return"] is None
+                    assert cell[pop[name]]["h2_return"] is not None
+        assert "H1 vs H2: not measurable — the split date leaves a half without entries" \
+            in section
+
+
+class TestCandleCapNotice:
+    """PB7: a window whose latest-closing markets need a longer candlestick
+    request (--start-date to a day past the close) than one request serves
+    silently drops every such market. The page says so in the header AND as
+    the explorer banner's first line."""
+
+    CAP_DAYS = (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+                * config.CANDLESTICK_PERIOD_INTERVAL_MINUTES / (24 * 60))
+
+    def test_the_threshold_is_the_longest_request_the_window_can_produce(self):
+        # _fetch_candles_parallel requests start_date midnight to one day
+        # past each close, and a settled market can close as late as the end
+        # of today, so the longest request spans (days + 2) days: the notice
+        # fires from the first window where THAT exceeds the cap — 207 days at
+        # hourly candles — not from the first whose bare length does (209).
+        today = date(2026, 9, 23)
+        per_day = 24 * 60 / config.CANDLESTICK_PERIOD_INTERVAL_MINUTES
+        longest_ok = int(config.CANDLESTICK_MAX_CANDLES_PER_REQUEST // per_day) - 2
+        assert longest_ok == 206
+        assert (longest_ok + 2) * per_day <= config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+        assert (longest_ok + 3) * per_day > config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+        assert dashboard._candle_cap_notice(today - timedelta(days=longest_ok), today) is None
+        notice = dashboard._candle_cap_notice(today - timedelta(days=longest_ok + 1), today)
+        assert notice is not None
+        assert f"spans {longest_ok + 1:,} days" in notice
+
+    def test_a_market_the_notice_misses_would_have_been_served(self):
+        # Cross-check against the fetch's own window arithmetic: on the
+        # longest silent window, a market closing at the last second of today
+        # still gets a request within the cap; one day longer, it does not.
+        from datetime import UTC, datetime
+        today = date(2026, 9, 23)
+        cap_seconds = (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
+                       * config.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60)
+        for days, fires in ((206, False), (207, True)):
+            start = today - timedelta(days=days)
+            open_ts = datetime(start.year, start.month, start.day, tzinfo=UTC).timestamp()
+            last_close = datetime(today.year, today.month, today.day, 23, 59, 59,
+                                  tzinfo=UTC).timestamp()
+            request = last_close + backtester._DAY_SECONDS - open_ts
+            assert (request > cap_seconds) is fires
+            assert (dashboard._candle_cap_notice(start, today) is not None) is fires
+
+    def test_the_text_derives_its_numbers_from_config(self):
+        today = date(2026, 9, 23)
+        notice = dashboard._candle_cap_notice(date(2024, 1, 1), today)
+        assert f"spans {(today - date(2024, 1, 1)).days:,} days" in notice
+        assert f"at most {config.CANDLESTICK_MAX_CANDLES_PER_REQUEST:,} hourly candles" in notice
+        assert f"hourly candles per request (about {self.CAP_DAYS:.0f} days)" in notice
+        # The close cutoff is the cap less the fetch's one-day pad past close
+        assert "runs to a day past the market's close" in notice
+        assert f"markets closing more than about {self.CAP_DAYS - 1:.0f} days after it" \
+            in notice
+        assert f"{self.CAP_DAYS:.0f}" == "208" and f"{self.CAP_DAYS - 1:.0f}" == "207"
+        assert "do not choose a band or k from the explorer on this window" in notice
+
+    @staticmethod
+    def _page(monkeypatch, tmp_path, start: date, **kwargs) -> str:
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        out_path = dashboard.generate_dashboard(
+            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]), start, 1000.0, **kwargs)
+        return out_path.read_text(encoding="utf-8")
+
+    def test_a_long_window_shows_it_in_the_header_and_the_banner(self, monkeypatch, tmp_path):
+        from datetime import UTC, datetime
+        start = datetime.now(UTC).date() - timedelta(days=400)
+        page = self._page(monkeypatch, tmp_path, start, sweep=_Grid.sweep())
+        notice = "This window spans 400 days"
+        assert page.count(notice) == 2
+        header_at = page.index(notice)
+        banner_at = page.index(notice, header_at + 1)
+        # The header copy sits under the Period line, above every section ...
+        assert page.index("Period:") < header_at < page.index("Portfolio Performance")
+        # ... and the banner copy is the banner's first line
+        assert page.index("Scenario Explorer") < banner_at < page.index(
+            "band x k cells computed")
+
+    def test_a_short_window_shows_neither(self, monkeypatch, tmp_path):
+        from datetime import UTC, datetime
+        start = datetime.now(UTC).date() - timedelta(days=30)
+        page = self._page(monkeypatch, tmp_path, start, sweep=_Grid.sweep())
+        assert "This window spans" not in page
+        assert "band x k cells computed" in page
+
+    def test_the_header_needs_no_sweep(self, monkeypatch, tmp_path):
+        from datetime import UTC, datetime
+        start = datetime.now(UTC).date() - timedelta(days=400)
+        page = self._page(monkeypatch, tmp_path, start)
+        assert page.count("This window spans 400 days") == 1
+        # ... and still carries none of the census's words
+        assert "strike-blind" not in page and "Outcome-label coverage" not in page
+
+
+class TestSpearman:
+    """dashboard._spearman against scipy, with ties, and its None cases."""
+
+    @pytest.mark.parametrize("xs, ys", [
+        ([1, 2, 3, 4, 5], [5, 6, 7, 8, 7]),
+        ([0.1, 0.1, 0.3, -0.2, 0.5, 0.5], [2.0, 1.0, 1.0, 4.0, -3.0, 0.0]),
+        (_Grid.H1, _Grid.H2),
+    ])
+    def test_matches_scipy_with_ties(self, xs, ys):
+        from scipy.stats import spearmanr
+        assert dashboard._spearman(xs, ys) == pytest.approx(spearmanr(xs, ys).statistic)
+
+    @pytest.mark.parametrize("xs, ys", [
+        ([1.0], [2.0]),                         # fewer than two pairs
+        ([1.0, 2.0], [1.0]),                    # lengths disagree
+        ([1.0, 1.0, 1.0], [1.0, 2.0, 3.0]),     # constant sample
+        ([1.0, float("nan"), None], [1.0, 2.0, 3.0]),  # one finite pair left
+    ])
+    def test_undefined_cases_are_none(self, xs, ys):
+        assert dashboard._spearman(xs, ys) is None
+
+    def test_non_finite_pairs_are_dropped_not_ranked(self):
+        from scipy.stats import spearmanr
+        xs = [1.0, 2.0, float("nan"), 4.0, 5.0]
+        ys = [2.0, 1.0, 9.0, 4.0, 3.0]
+        kept = ([1.0, 2.0, 4.0, 5.0], [2.0, 1.0, 4.0, 3.0])
+        assert dashboard._spearman(xs, ys) == pytest.approx(spearmanr(*kept).statistic)
+
+
+class TestEquityAxis:
+    """One date axis per page, decided from the primary; every curve placed on
+    it by date, in cents."""
+
+    @staticmethod
+    def _curve(n: int, start: date = date(2019, 12, 31)) -> pd.DataFrame:
+        return make_equity([10000.0 + i * 1.2345678901 for i in range(n)], start=start)
+
+    def test_short_curves_keep_every_date(self):
+        eq = self._curve(400)
+        assert list(dashboard._equity_axis(eq).date) == list(eq["date"])
+
+    def test_long_curves_keep_the_opening_and_real_week_ends(self):
+        eq = self._curve(2459)
+        axis = dashboard._equity_axis(eq)
+        assert len(axis) == 353
+        # The DR-03 opening row survives, and the last point is the curve's
+        # real last date — never the future Sunday that closes its week.
+        assert axis[0].date() == eq["date"].iloc[0]
+        assert axis[-1].date() == eq["date"].iloc[-1]
+        assert set(axis.date) <= set(eq["date"])
+        assert all(d.weekday() == 6 for d in axis.date[1:-1])
+
+    def test_a_longer_cell_is_placed_by_date_on_the_primarys_axis(self):
+        # A band sweep that crosses 00:00 UTC hands later cells one more row.
+        primary = self._curve(400)
+        later = self._curve(401)
+        axis = dashboard._equity_axis(primary)
+        values = dashboard._curve_on_axis(later, axis)
+        assert len(values) == 400
+        assert values == [round(v, 2) for v in later["portfolio_value"].iloc[:400]]
+
+    def test_values_are_cents_and_non_finite_is_none(self):
+        eq = make_equity([1000.123456, float("nan"), 1001.5])
+        values = dashboard._curve_on_axis(eq, dashboard._equity_axis(eq))
+        assert values == [1000.12, None, 1001.5]
+
+    def test_missing_curves_and_dates_are_empty_or_none(self):
+        axis = dashboard._equity_axis(self._curve(5))
+        assert dashboard._curve_on_axis(None, axis) == []
+        shorter = self._curve(3)
+        assert dashboard._curve_on_axis(shorter, axis)[3:] == [None, None]
+        assert len(dashboard._equity_axis(None)) == 0
+
+
+class TestScenarioExplorerEmptyStates:
+    """The section's own placeholders: no sweep, and the two empty-scenario
+    causes, each named in the operator's own terms."""
+
+    def test_no_sweep(self):
+        out = _section_scenario_explorer(None)
+        assert "Scenario Explorer" in out
+        assert "No sweep for this run." in out
+        for absent in ("strike-blind", "Outcome-label coverage", "Primary spread band"):
+            assert absent not in out
+
+    def test_infeasible_window(self):
+        pt = _scn_point((0.0, 1.0), 0.75, trades=[], values=[1000.0])
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=None, scenarios=[])
+        assert ("No scenarios were computed: infeasible window (no trades and no "
+                "census).") in _section_scenario_explorer(sweep)
+
+    def test_band_sweep_off(self):
+        pt = _scn_point((0.0, 1.0), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=[])
+        out = _section_scenario_explorer(sweep)
+        assert ("No scenarios were computed: band sweep off (--no-band-sweep / "
+                "band_sweep=False).") in out
+        assert "infeasible window" not in out
+
+
+class TestRunSettingsHeader:
+    """The page header names the primary spread band and the ladder setting,
+    under the Period line and above every section — both decide which pairs
+    exist, so they qualify the whole page."""
+
+    @staticmethod
+    def _page(monkeypatch, tmp_path, **kwargs) -> str:
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        out_path = dashboard.generate_dashboard(
+            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]),
+            date(2026, 1, 5), 1000.0, **kwargs)
+        return out_path.read_text(encoding="utf-8")
+
+    def test_no_sweep_says_not_recorded(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        assert ("Primary spread band: not recorded | same-event ladders: not recorded"
+                in page)
+        assert "strike-blind" not in page
+        assert "Outcome-label coverage" not in page
+
+    @pytest.mark.parametrize("ladders, word", [(True, "on"), (False, "off"),
+                                               (None, "not recorded")])
+    def test_each_ladder_state(self, monkeypatch, tmp_path, ladders, word):
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=[],
+                              same_event_ladders=ladders)
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+        line = f"Primary spread band: max(tier,0.3)-0.6 | same-event ladders: {word}</p>"
+        assert line in page
+        assert page.index("Period:") < page.index(line) < page.index("Portfolio Performance")
+
+
+class TestFigHtmlDivId:
+    """_fig_html's div_id keyword: opt-in, backward compatible."""
+
+    def test_default_lets_plotly_generate_the_id(self):
+        import plotly.graph_objects as go
+        out = dashboard._fig_html(go.Figure())
+        assert re.search(r'<div id="[0-9a-f-]{36}"', out)
+
+    def test_explicit_div_id_is_passed_through(self):
+        import plotly.graph_objects as go
+        assert 'id="my-fixed-id"' in dashboard._fig_html(go.Figure(), div_id="my-fixed-id")
+
+
+class TestScenarioExplorerPageSize:
+    """A full page for the real grid (36 bands x 13 ks) over a V3-length window
+    (2,459 days), with realistic float values, every population point, a
+    calibration per band and a top event per cell, stays within 5 MB."""
+
+    def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path):
+        import numpy as np
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+
+        bands = [(lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
+                 for hi in config.SPREAD_BAND_SWEEP_CEILINGS]
+        ks = list(config.INTERVAL_DISCOUNT_SWEEP)
+        assert len(bands) * len(ks) == 468
+
+        # A seeded random walk: full-precision dollar values, as a real curve
+        # carries, not short round numbers that would understate the payload.
+        rng = np.random.default_rng(7)
+        walk = 10_000.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, 2459))
+        shared_equity = make_equity(list(walk), start=date(2019, 12, 31))
+        trades = [_scn_trade(profit=float(p), event_ticker=f"KXEVENT-26SEP{i:02d}-ABCDEF")
+                  for i, p in enumerate(rng.normal(0.0, 20.0, 88))]
+
+        scenarios = []
+        for band in bands:
+            for k in ks:
+                # PB7: the "all" AND the "time_series" point each carry both
+                # checks, and the time-series one carries the per-cell curve
+                for population in ("all", "time_series"):
+                    scenarios.append(SweepPoint(
+                        k=k, trades=trades, equity_df=shared_equity, spread_band=band,
+                        population=population,
+                        halves=HalfSplit(float(rng.normal()), float(rng.normal()), 40, 48,
+                                         120, 130),
+                        ex_top_event=("KXEVENT-26SEP03-ABCDEF", float(rng.normal()))))
+                for population in ("ladder", "cross"):
+                    scenarios.append(SweepPoint(
+                        k=k, trades=trades[:40], equity_df=shared_equity,
+                        spread_band=band, population=population))
+        sweep = BacktestSweep(
+            primary=scenarios[0], points=[scenarios[0]], calibration=None,
+            label_coverage=_scn_coverage(), scenarios=scenarios,
+            same_title_point=SweepPoint(k=ks[0], trades=trades[:10],
+                                        equity_df=shared_equity, population="same_title"),
+            calibrations_by_band={b: _scn_calibration() for b in bands},
+            same_event_ladders=True, split_date=date(2023, 5, 1),
+        )
+
+        out_path = dashboard.generate_dashboard(
+            trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
+        size = out_path.stat().st_size
+        assert size <= 5_000_000, f"page was {size} bytes"
+
+
+class TestGoldenSections:
+    """The seven sections that predate the scenario explorer render exactly as
+    they did on main @ fe0a758. The digests were captured there, by running
+    tests/dashboard_golden.py as a script against that tree (the recipe is in
+    its module docstring); the same module replays them here, so the fixture,
+    renderer and normaliser can never drift apart. A same-tree golden would be
+    tautological.
+    """
+
+    _PATH = Path(__file__).parent / "fixtures" / "dashboard_golden_main.json"
+
+    def _check(self) -> None:
+        golden = json.loads(self._PATH.read_text(encoding="utf-8"))
+        got = dashboard_golden.section_digests(dashboard_golden.render_sections())
+        assert set(got) == set(golden["hashes"])
+        diverged = sorted(name for name, digest in got.items()
+                          if digest != golden["hashes"][name])
+        env = dashboard_golden.rendering_environment()
+        if diverged and env != golden["rendering_env"]:
+            pytest.skip(
+                f"sections {diverged} diverge from the golden, but it was captured "
+                f"under {golden['rendering_env']} and this is {env}; re-capture it "
+                "(tests/dashboard_golden.py's docstring) to compare in this environment")
+        assert not diverged, (
+            f"sections {diverged} diverged from main @ {golden['source_sha'][:7]}")
+
+    def test_sections_match_main(self):
+        self._check()
+
+    def test_sections_match_main_under_the_stdlib_json_engine(self, monkeypatch):
+        # CI installs no orjson, so plotly serialises through the stdlib json
+        # module there; the golden must not depend on which one ran.
+        import plotly.io as pio
+        monkeypatch.setattr(pio.json.config, "default_engine", "json")
+        self._check()
+
+    def test_the_normaliser_still_sees_content(self):
+        risk = dashboard_golden.render_sections()["risk"]
+        once = dashboard_golden.normalize(risk)
+        assert once == dashboard_golden.normalize(risk)
+        assert "UUID" in once and '"template":' not in once
+        assert dashboard_golden.normalize(risk.replace("Kelly", "Kellx")) != once

@@ -210,6 +210,156 @@ class TestMinPriceDiffForGap:
         assert MIN_PRICE_DIFF_LONG_GAP == 0.30
 
 
+def _pre_band_tier(gap_days: int) -> float:
+    """min_price_diff_for_gap exactly as it stood before the band keyword
+    existed — the oracle the neutrality tests compare against. Written out
+    here rather than derived from the helper under test, so a change to the
+    helper cannot also change what it is checked against."""
+    if gap_days <= SHORT_DEADLINE_GAP_DAYS:
+        return MIN_PRICE_DIFF_SHORT_GAP
+    return MIN_PRICE_DIFF_LONG_GAP
+
+
+class TestTimeSeriesSpreadBand:
+    """The backtest's time-series spread band (floor, ceiling) on pB - pA.
+
+    The floor rides on min_price_diff_for_gap's backtest-only spread_min
+    keyword (max of tier and floor), the ceiling on time_series_spread_too_wide,
+    and time_series_spread_band resolves and validates the pair. The live path
+    passes none of it — every assertion that the no-band call is unchanged is
+    what keeps live trading byte-identical while the explorer is built.
+    """
+
+    def test_no_band_is_the_pre_band_tier_in_value_and_type(self):
+        # Every gap the live path can hand in (and some it cannot: negatives
+        # and far past MAX_DEADLINE_GAP_DAYS), by omission AND by an explicit
+        # None — the same value, the same type, the very same constant object.
+        for g in range(-5, 400):
+            expected = _pre_band_tier(g)
+            for got in (min_price_diff_for_gap(g), min_price_diff_for_gap(g, spread_min=None)):
+                assert type(got) is type(expected)
+                assert got == expected
+                assert got is expected
+
+    def test_default_band_is_no_band(self):
+        # (0.0, 1.0): a zero floor never beats a tier, and no spread a price in
+        # [0, 1] can produce sits above a 1.0 ceiling — so a backtest run on the
+        # default band applies exactly the live rule.
+        assert config.BACKTEST_DEFAULT_SPREAD_BAND == (0.0, 1.0)
+        lo, hi = config.time_series_spread_band()
+        assert (lo, hi) == (0.0, 1.0)
+        for g in range(-5, 400):
+            got = min_price_diff_for_gap(g, spread_min=lo)
+            assert type(got) is float
+            assert got == _pre_band_tier(g)
+        for spread in (0.0, 0.15, 0.60, 0.9999, 1.0):
+            assert not config.time_series_spread_too_wide(spread, hi)
+
+    def test_floor_is_the_larger_of_tier_and_band_floor(self):
+        # Short tier (0.15): a 0.30 floor raises it, a 0.10 floor is inert, and
+        # a floor equal to the tier leaves it where it was
+        assert min_price_diff_for_gap(7, spread_min=0.30) == 0.30
+        assert min_price_diff_for_gap(7, spread_min=0.10) == MIN_PRICE_DIFF_SHORT_GAP
+        assert min_price_diff_for_gap(7, spread_min=MIN_PRICE_DIFF_SHORT_GAP) == MIN_PRICE_DIFF_SHORT_GAP
+        # Long tier (0.30): a 0.20 floor is inert, a 0.40 floor raises it
+        assert min_price_diff_for_gap(20, spread_min=0.20) == MIN_PRICE_DIFF_LONG_GAP
+        assert min_price_diff_for_gap(20, spread_min=0.40) == 0.40
+        # Across both tiers' boundaries and the whole sweep's floor grid
+        for g in (0, SHORT_DEADLINE_GAP_DAYS, SHORT_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS):
+            for floor in config.SPREAD_BAND_SWEEP_FLOORS:
+                assert min_price_diff_for_gap(g, spread_min=floor) == max(_pre_band_tier(g), floor)
+
+    def test_ceiling_boundary_absorbs_float_noise_on_the_keep_side(self):
+        too_wide = config.time_series_spread_too_wide
+        # Exactly on the ceiling, and well inside it: kept
+        assert not too_wide(0.60, 0.60)
+        assert not too_wide(0.30, 0.60)
+        # A spread sitting on the documented bound that float arithmetic nudges
+        # one ULP above it (TS-09) — the case is only meaningful if the nudge
+        # is real, so assert that first
+        spread = 0.90 - 0.30
+        assert spread > 0.60
+        assert not too_wide(spread, 0.60)
+        # Two millionths above: past PRICE_EPSILON (1e-6), a genuine refusal
+        assert too_wide(0.600002, 0.60)
+        assert too_wide(0.61, 0.60)
+
+    def test_no_ceiling_is_never_too_wide(self):
+        for spread in (0.0, 0.60, 1.0, 5.0):
+            assert config.time_series_spread_too_wide(spread, None) is False
+
+    def test_default_is_resolved_at_call_time(self, monkeypatch):
+        # The default is looked up inside the body, not bound at def time, so
+        # a patched constant governs an override-free call...
+        monkeypatch.setattr(config, "BACKTEST_DEFAULT_SPREAD_BAND", (0.30, 0.60))
+        assert config.time_series_spread_band() == (0.30, 0.60)
+        assert config.time_series_spread_band(None) == (0.30, 0.60)
+        # ...an explicit band still wins over it...
+        assert config.time_series_spread_band((0.20, 0.90)) == (0.20, 0.90)
+        # ...and the tier helper never reads it: the live path sees no band
+        # even when the backtest's default is not "no band"
+        assert min_price_diff_for_gap(7) is MIN_PRICE_DIFF_SHORT_GAP
+        assert min_price_diff_for_gap(20) is MIN_PRICE_DIFF_LONG_GAP
+        # A patched default is validated like an override
+        monkeypatch.setattr(config, "BACKTEST_DEFAULT_SPREAD_BAND", (0.60, 0.30))
+        with pytest.raises(ValueError):
+            config.time_series_spread_band()
+
+    def test_band_is_returned_as_a_float_tuple(self):
+        # (0, 1), (0.0, 1.0) and (-0.0, 1.0) must label the same scenario —
+        # a -0.0 floor passes 0.0 <= -0.0 and compares equal to 0.0, so only
+        # its sign and its printed form could tell it apart
+        for band in ((0, 1), [0, 1], (0.0, 1.0), (-0.0, 1.0)):
+            resolved = config.time_series_spread_band(band)
+            assert resolved == (0.0, 1.0)
+            assert type(resolved) is tuple
+            assert all(type(x) is float for x in resolved)
+            assert math.copysign(1.0, resolved[0]) == 1.0
+            # the form a log line's %g-%g would print
+            assert f"{resolved[0]:g}-{resolved[1]:g}" == "0-1"
+
+    def test_validation_is_tier_agnostic(self):
+        # A band whose ceiling sits below a tier validates — the helper checks
+        # floor < ceiling only, never the EFFECTIVE band max(tier, floor)..ceiling
+        # — so a caller accepting an operator-typed ceiling must warn itself.
+        # (0.20, 0.25) empties the long tier; (0.0, 0.10) empties both.
+        assert config.time_series_spread_band((0.20, 0.25)) == (0.20, 0.25)
+        assert min_price_diff_for_gap(20, spread_min=0.20) > 0.25 + config.PRICE_EPSILON
+        assert min_price_diff_for_gap(7, spread_min=0.20) < 0.25
+        assert config.time_series_spread_band((0.0, 0.10)) == (0.0, 0.10)
+        for g in (0, SHORT_DEADLINE_GAP_DAYS, SHORT_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS):
+            assert min_price_diff_for_gap(g, spread_min=0.0) > 0.10 + config.PRICE_EPSILON
+
+    @pytest.mark.parametrize("band", [
+        (-0.01, 0.60),        # floor below zero
+        (0.30, 1.01),         # ceiling above one
+        (0.60, 0.60),         # floor == ceiling: an empty band
+        (0.60, 0.30),         # floor above ceiling
+        (math.nan, 0.60),     # NaN fails every comparison
+        (0.30, math.nan),
+        (0.10, 0.20, 0.30),   # not a pair
+        (0.30,),
+    ])
+    def test_invalid_band_raises(self, band):
+        with pytest.raises(ValueError):
+            config.time_series_spread_band(band)
+
+    def test_sweep_grid_is_36_valid_bands_including_the_default(self):
+        floors, ceilings = config.SPREAD_BAND_SWEEP_FLOORS, config.SPREAD_BAND_SWEEP_CEILINGS
+        assert len(floors) == 6 and len(ceilings) == 6
+        # Every combination validates (no floor reaches the lowest ceiling)...
+        bands = {config.time_series_spread_band((f, c)) for f in floors for c in ceilings}
+        assert len(bands) == 36
+        # ...and the default band is a member, so a default run's sweep adds
+        # no 37th band: 36 bands x 13 k = 468 scenarios
+        assert config.time_series_spread_band() in bands
+        assert len(bands) * len(config.INTERVAL_DISCOUNT_SWEEP) == 468
+        # No grid band empties a tier: every ceiling clears both tiers even
+        # after the largest floor raises them
+        assert min(ceilings) > max(floors)
+        assert min(ceilings) > max(MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP)
+
+
 class TestMaxAffordablePairs:
     """max_affordable_pairs is the single budget -> contracts definition shared
     by the scanner's depth cap and strategy.compute_trade's sizing. The upper-

@@ -95,6 +95,56 @@ MIN_PRICE_DIFF_LONG_GAP       = 0.30
 # tiers: deadline gaps up to and including this many days use the short tier.
 SHORT_DEADLINE_GAP_DAYS       = 15
 
+# The BACKTEST's default time-series spread band (floor, ceiling) on pB - pA —
+# (0.0, 1.0) is "no band": the floor is the deadline-gap tier alone and there
+# is no ceiling, i.e. exactly the rule the live finder applies. Read ONLY by
+# time_series_spread_band(). No module outside config, backtester, backtest
+# and dashboard may reference a band helper or band constant, import one of
+# those three modules, or hand min_price_diff_for_gap more than the gap
+# (pinned by tests/test_strategy.py::TestTimeSeriesKellyParity::
+# test_ast_live_path_reads_no_band). If a band is ever applied live, its live
+# constants (TIME_SERIES_MIN/MAX_SPREAD) must land in the same commit as live
+# ceiling enforcement, so a band can never go live half-wired.
+BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
+
+# Band grid for the backtest's band x k scenario sweep, crossed with
+# INTERVAL_DISCOUNT_SWEEP: 6 floors x 6 ceilings = 36 bands x 13 k = 468
+# scenarios over ONE fetch. Read only by backtester._sweep_from_candidates
+# (reached through run_backtest_sweep(band_sweep=True)), which runs one
+# _find_entry pass per band — _find_entry applies ONE band per call, its
+# spread_band resolved through time_series_spread_band — and then simulates
+# every band at every k of the same k grid. Every floor sits below every
+# ceiling, so all 36 bands are valid; every ceiling sits above both
+# deadline-gap tiers, so no grid band empties a tier (see
+# time_series_spread_band); and the default band above is a member, so a
+# default run adds no 37th (an off-grid primary band does, as its own exact
+# member).
+# Cost measured 2026-09-23 on the DR-73 calibration corpus (10,733 time-series
+# pairs, 10,530 with candles on both legs, start 2020-01-01, ladders on): ~1 s
+# for ONE full time-series _find_entry pass (~91-97 us per pair across
+# repeated runs, before and after _find_entry gained the band alike, at no
+# band and at 0.30-0.60 and 0.40-0.50 — it scales with the window's pair
+# count; 330 entries at no band, 183 at 0.30-0.60) and ~2-11 ms per
+# simulation over its 330 entries (best of 3; it falls with the trade count,
+# from 94 trades at k = 0.40 to none at k = 1.00). A band sweep pays the full
+# pass ONCE, at the no-band band, and every other band rescans only the pairs
+# that entered there (every band's entries are a subset of the no-band
+# band's — see backtester._sweep_from_candidates): on that corpus 330 of the
+# 10,733 pairs, 0.056-0.073 s per band against 1.02-1.06 s for the full pass.
+# The whole band sweep over that corpus (the production _sweep_from_candidates,
+# measured 2026-09-23 with the pre-pass and the time-series population in
+# place: 468 "all", 468 time-series, 468 ladder and 468 cross-event points,
+# each "all" and time-series point's two halves, and an ex-top re-simulation
+# on each of the 423 "all" and 423 time-series points with a traded event —
+# the other 45 of each entered no trade — 4,590 simulations in all) took 26.4
+# and 26.6 s in two runs, 3.2-3.3 s of it the entry passes (before the
+# pre-pass and the time-series population, the 2,763-simulation sweep of the
+# same corpus took 52.2 s, 37.7 s of it the entry passes), and kept 1,872 equity
+# frames of ~138 KB each (2,460 daily rows), ~258 MB in all. A floor at or
+# below a pair's tier is inert for it.
+SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
+SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
+
 # Minimum YES ask price difference for same-title pairs. These are markets asking
 # the exact same question, so even a small divergence (5%) is anomalous and worth trading.
 SAME_TITLE_MIN_PRICE_DIFF     = 0.05
@@ -200,11 +250,12 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # --same-event-ladders / --no-same-event-ladders overrides this constant for
 # ONE run, which is how the k-hat the gate above demands gets measured without
 # flipping the switch first; scanner.py binds the constant at import, so that
-# override never reaches the live finder. The backtest's HTML dashboard does
-# NOT render the setting — it reaches kalshi_backtest.log only — so a
-# ladder-enabled run's dashboard is indistinguishable from a switch-off one and
-# must be labelled by hand (recorded, not fixed: dashboard.py is outside DR-73's
-# blast radius).
+# override never reaches the live finder. The backtest's HTML dashboard also
+# renders the resolved setting, not just kalshi_backtest.log:
+# dashboard._run_settings_html prints "same-event ladders: on / off / not
+# recorded" in the page header (BacktestSweep.same_event_ladders), alongside
+# the primary spread band, so a ladder-enabled run's dashboard is no longer
+# indistinguishable from a switch-off one.
 #
 # scanner.py, backtester.py AND backtest.py each bind this by VALUE at import
 # (the SCANNER_MAX_PAGES idiom), so a test or harness flipping it at runtime
@@ -245,11 +296,14 @@ TIME_SERIES_SAME_EVENT_LADDERS = False
 TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 
 # Grid of k values backtester.run_backtest_sweep() re-simulates so the dashboard
-# can offer a k selector without a re-run. Spans "size very aggressively" (0.40)
+# can offer a k selector without a re-run and, on a band sweep, as the scenario
+# explorer's k axis. Spans "size very aggressively" (0.40)
 # through "take the market at face value" (1.00, where Kelly is <= 0 for every
 # pair and nothing trades — the boundary is informative, so it stays in). Each
-# point costs one extra sizing+selection pass over already-fetched candidates;
-# the market fetch and candlestick fetch happen once regardless.
+# point costs one extra sizing+selection pass over already-fetched candidates —
+# on a band sweep, one per point per band, plus that band's population,
+# split-half and ex-top runs (see SPREAD_BAND_SWEEP_FLOORS for the measured
+# total); the market fetch and candlestick fetch happen once regardless.
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
                            0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
 
@@ -668,9 +722,10 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
-# Eligible-market count above which backtester._prepare_entries warns the
-# operator about the RAM the grouping/pairing step is about to need, and the
-# per-record estimate the warning multiplies by.
+# Eligible-market count above which backtester._prepare_candidates (the first
+# half of _prepare_entries) warns the operator about the RAM the
+# grouping/pairing step is about to need, and the per-record estimate the
+# warning multiplies by.
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
 # phase right after it holds the whole window as one list and builds two group
@@ -710,8 +765,9 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 BACKTEST_MARKETS_RAM_WARN      = 500_000
 BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 
-# Outcome-label (subtitle) coverage below which backtester._prepare_entries
-# escalates its coverage census from INFO to WARNING (DR-66).
+# Outcome-label (subtitle) coverage below which backtester._prepare_candidates
+# (the first half of _prepare_entries) escalates its coverage census from INFO
+# to WARNING (DR-66).
 #
 # The subtitle is the outcome discriminator in BOTH backtest grouping keys —
 # the time-series key scanner.time_series_group_key() builds, and the third
@@ -917,8 +973,28 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 # (minute) returns HTTP 400.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 
+# The most candles /historical/markets/{ticker}/candlesticks serves in ONE
+# request. A request spanning more is rejected with HTTP 400 "max
+# candlesticks: 5000" — observed during the DR-73 calibration fetch and
+# recorded in .git/dr73-calib/fetch_ladder_candles.py — and
+# historical.fetch_candlesticks, which makes one unpaginated GET per ticker,
+# catches that failure and returns [] (never cached). Because
+# backtester._fetch_candles_parallel opens every ticker's request at the run's
+# --start-date (midnight UTC) and ends it one day past that market's close, a
+# market whose request — start to close plus one day — spans more than
+# CANDLESTICK_MAX_CANDLES_PER_REQUEST x CANDLESTICK_PERIOD_INTERVAL_MINUTES
+# (about 208 days at hourly candles), i.e. one closing more than about 207
+# days after --start-date, gets no candles and can never enter. Nothing
+# paginates around it: per-ticker candle windowing is a separate
+# backtest-fidelity fix. Read only by dashboard.py, which puts a red notice on
+# any page whose window could contain such a market (one closing at the end
+# of the window's last day, plus the one-day pad, spans more candles than
+# this), since the explorer (and every other strategy figure) then describes
+# a truncated population.
+CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
-def min_price_diff_for_gap(gap_days: int) -> float:
+
+def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> float:
     """
     Return the minimum time-series YES price gap required for a deadline gap.
 
@@ -937,20 +1013,131 @@ def min_price_diff_for_gap(gap_days: int) -> float:
     gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
     does not reject over-cap gaps itself.
 
+    spread_min is a BACKTEST-only band floor, layered ON TOP of the tier: the
+    result is max(tier, spread_min), so a floor at or below the tier is inert.
+    None — what every live caller passes, by omission — returns the tier alone
+    and reads no band value at all, so the live finder, enrichment and
+    validate_pair_price get exactly the object they got before this keyword
+    existed. The only live calls are scanner's three — the finder's floor,
+    _pair_max_sum (which validate_pair_price reaches through) and
+    enrichment's ref_yes-is-None fallback — and every call in a module
+    outside config, backtester, backtest and dashboard is pinned to one
+    positional argument by tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_no_band. This helper does not validate
+    spread_min: a caller that passes one resolves it through
+    time_series_spread_band() first, which does — as backtester._find_entry,
+    the one caller that passes it, does.
+
     Args:
         gap_days (int): Calendar days between the two legs' deadlines —
             their close_times for a cross-event pair, their stated deadlines
             for a same-event ladder. Range: 0..MAX_DEADLINE_GAP_DAYS
             (caller-enforced).
+        spread_min (float | None): Backtest-only band floor on pB - pA,
+            dollars in [0, 1) — the first element of a band resolved by
+            time_series_spread_band(). None (default) means "the tier alone".
 
     Returns:
         float: The minimum required YES ask price difference (dollars, 0-1)
             by which the later leg must exceed the earlier one (later by
-            close_time, or by stated deadline for a DR-73 ladder).
+            close_time, or by stated deadline for a DR-73 ladder): the tier
+            when spread_min is None, else the larger of the tier and
+            spread_min.
     """
-    if gap_days <= SHORT_DEADLINE_GAP_DAYS:
-        return MIN_PRICE_DIFF_SHORT_GAP
-    return MIN_PRICE_DIFF_LONG_GAP
+    tier = (MIN_PRICE_DIFF_SHORT_GAP if gap_days <= SHORT_DEADLINE_GAP_DAYS
+            else MIN_PRICE_DIFF_LONG_GAP)
+    return tier if spread_min is None else max(tier, spread_min)
+
+
+def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[float, float]:
+    """
+    Resolve and validate a backtest time-series spread band (floor, ceiling).
+
+    The band bounds the YES-ask spread pB - pA at which
+    backtester._find_entry may enter a time-series candidate: its floor is
+    layered on the deadline-gap tier through min_price_diff_for_gap's
+    spread_min (so it also sets that pass's leg-price-sum ceiling, 1 minus
+    the raised floor), and its ceiling is tested per Monday by
+    time_series_spread_too_wide. It is a BACKTEST knob —
+    no module outside config, backtester, backtest and dashboard may call
+    this function (pinned by tests/test_strategy.py::
+    TestTimeSeriesKellyParity::test_ast_live_path_reads_no_band).
+
+    Validation is deliberately TIER-AGNOSTIC: it guarantees floor < ceiling,
+    not a non-empty EFFECTIVE band. The effective floor is max(tier, floor),
+    so a ceiling below MIN_PRICE_DIFF_LONG_GAP refuses every 16-30-day pair,
+    and one below MIN_PRICE_DIFF_SHORT_GAP refuses every pair — e.g.
+    (0.20, 0.25) empties the long tier and (0.0, 0.10) empties both; a
+    ceiling exactly ON a tier keeps only spreads sitting on that tier. No
+    SPREAD_BAND_SWEEP_* band can do this (every grid ceiling sits above both
+    tiers); a caller that accepts an operator-typed ceiling should warn when
+    it sits at or below a tier, so an emptied tier is not read as a strategy
+    result.
+
+    The default is resolved at CALL time, never bound as a default argument,
+    so a test that monkeypatches BACKTEST_DEFAULT_SPREAD_BAND still takes
+    effect — the same idiom as time_series_profit_prob's k. Both elements are
+    returned as floats, and a negative-zero floor is normalised to +0.0, so
+    bands given as (0, 1), (0.0, 1.0) and (-0.0, 1.0) resolve to the same
+    tuple, print the same ("%g-%g" gives "0-1") and label the same scenario.
+
+    Args:
+        band (tuple[float, float] | None): (floor, ceiling) override, dollars.
+            None (default) reads BACKTEST_DEFAULT_SPREAD_BAND.
+
+    Returns:
+        tuple[float, float]: The resolved (floor, ceiling), with
+            0 <= floor < ceiling <= 1.
+
+    Raises:
+        ValueError: If the band does not unpack to exactly two values, or
+            unless 0 <= floor < ceiling <= 1 (a NaN fails every comparison
+            and is refused too). This is a caller bug, not a user-input path:
+            a CLI that accepts a band validates what the operator typed
+            first, with its own parser error.
+        TypeError: If the band is not iterable, or an element cannot be
+            compared with a float.
+    """
+    lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
+    if not (0.0 <= lo < hi <= 1.0):
+        raise ValueError(
+            "time-series spread band must satisfy 0 <= floor < ceiling <= 1, "
+            f"got ({lo!r}, {hi!r})"
+        )
+    # + 0.0 turns a -0.0 floor (which passes 0.0 <= -0.0) into +0.0, so it
+    # cannot print as "-0"; the ceiling is > floor >= 0, so it is never a zero.
+    return float(lo) + 0.0, float(hi)
+
+
+def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool:
+    """
+    Return True when a time-series YES-ask spread exceeds the band's ceiling.
+
+    spread is pB - pA, the market-implied in-between mass the strategy
+    disputes. PRICE_EPSILON is absorbed on the KEEP side (TS-09): a spread is
+    refused only when it exceeds spread_max by MORE than the tolerance, so
+    0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling — a pair
+    sitting exactly on the documented bound is never dropped for float noise.
+    This is the ONE place the ceiling's epsilon lives; callers test the
+    result and add no tolerance of their own. Backtest-only, like
+    time_series_spread_band(). It has two callers: backtester._find_entry,
+    which tests it on time-series pairs only, and backtest.main, which tests
+    a spread sitting exactly on each deadline-gap tier so it can warn when
+    an operator-typed ceiling empties that tier.
+
+    Args:
+        spread (float): pB - pA, dollars.
+        spread_max (float | None): The band ceiling, dollars in (0, 1] — the
+            second element of a band resolved by time_series_spread_band().
+            None means no ceiling.
+
+    Returns:
+        bool: True when spread > spread_max + PRICE_EPSILON; always False
+            when spread_max is None.
+    """
+    if spread_max is None:
+        return False
+    return spread > spread_max + PRICE_EPSILON
 
 
 def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> float:

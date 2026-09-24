@@ -32,9 +32,15 @@ Dependencies:
     so the live and backtest ladder rules can never disagree), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
-    time_series_profit_prob) plus BUDGET_FRACTION,
+    time_series_profit_prob), the backtest-only spread-band helpers
+    time_series_spread_band and time_series_spread_too_wide (which
+    _find_entry applies to time-series candidates; the first also validates
+    and resolves a band up front in _entries_for_band, run_backtest_sweep,
+    _sweep_from_candidates and _simulate_at_discount's completion line; no
+    live module reads either), plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, LARGE_GROUP_WARN_THRESHOLD,
-    INTERVAL_DISCOUNT_SWEEP,
+    INTERVAL_DISCOUNT_SWEEP and the band grid SPREAD_BAND_SWEEP_FLOORS /
+    SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates),
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS from
@@ -44,10 +50,12 @@ Dependencies:
     import strategy.py — Kelly sizing and portfolio selection are
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
-    parity. Exports BacktestTrade, SweepPoint, IntervalCalibrationBucket,
-    IntervalCalibration and BacktestSweep (BacktestTrade is consumed by
-    dashboard.py) plus run_backtest() and run_backtest_sweep() (called by
-    backtest.py).
+    parity. Exports BacktestTrade, HalfSplit, SweepPoint,
+    IntervalCalibrationBucket, IntervalCalibration, OutcomeLabelCoverage and
+    BacktestSweep (BacktestTrade, BacktestSweep, OutcomeLabelCoverage and
+    SweepPoint are consumed by dashboard.py, which also imports the private
+    label helper _exact_label) plus run_backtest() and run_backtest_sweep()
+    (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -71,33 +79,44 @@ Notes:
     one-active-position-per-ticker rule: get_held_tickers() reads positions with
     count_filter="position", so a settled ticker leaves the blocked set live too.
 
-    run_backtest() itself is a thin wrapper: the work is split at the
-    interval-discount boundary into _prepare_entries() (the k-independent
-    prologue — fetch, prefilter, grouping, pair extraction, candlesticks and
-    the _find_entry sweep, which contains no probability model at all) and
-    _simulate_at_discount() (everything that reads k — the Kelly gate, the
-    dedups, Pass 2 and the equity curve), which returns a SweepPoint stamped
-    with the resolved discount. That split exists so one preparation pass can
-    feed many discounts; run_backtest() calls the tail once with k=None, which
+    The work is split at two boundaries. _prepare_candidates() is the half
+    that depends on neither the backtest's time-series spread band nor the
+    interval discount k — fetch, prefilter, census, grouping, pair extraction
+    and candlesticks — returned as a _Candidates. _entries_for_band() is the
+    _find_entry sweep at ONE spread band (the band acts only there; it holds
+    no probability model, so its entries are k-independent).
+    _simulate_at_discount() is everything that reads k — the Kelly gate, the
+    dedups, Pass 2 and the equity curve — and returns a SweepPoint stamped
+    with the resolved discount, band and population. run_backtest() is a thin
+    wrapper over _prepare_entries() (_prepare_candidates() plus one
+    _entries_for_band() pass at the default band, which is no band at all)
+    and one _simulate_at_discount() call with k=None, which
     config.time_series_profit_prob resolves to the live sizer's constant.
 
-    _interval_calibration() measures the EMPIRICAL discount from the same
-    k-independent prologue output — the realised in-between rate divided by
-    the mean market-implied gap, pooled and per deadline-gap band — and
-    _log_interval_calibration() reports it. Because it reads _prepare_entries()
-    rather than _simulate_at_discount(), it is never filtered by the Kelly
-    gate, which is what stops the estimate confirming whatever k produced it.
-    It is a RECOMMENDATION ONLY: nothing here writes config.py, and live
-    sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+    _interval_calibration() measures the EMPIRICAL discount from one band's
+    k-independent entries — the realised in-between rate divided by the mean
+    market-implied gap, pooled and per deadline-gap band — and
+    _log_interval_calibration() reports it. Because it reads the prepared
+    entries rather than _simulate_at_discount(), it is never filtered by the
+    Kelly gate, which is what stops the estimate confirming whatever k
+    produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py,
+    and live sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     run_backtest_sweep() is the entry point that exposes all of that:
-    one preparation pass, one calibration, and one _simulate_at_discount()
-    per discount on config.INTERVAL_DISCOUNT_SWEEP (unioned with the
-    caller's own, so the primary is always an exact grid member), returned
-    as a BacktestSweep. run_backtest() is untouched by it — same signature,
-    same two-tuple — so every existing caller keeps working.
+    _prepare_candidates() once, then _sweep_from_candidates() — one
+    _find_entry pass per band, one calibration per band, and one
+    _simulate_at_discount() per discount on config.INTERVAL_DISCOUNT_SWEEP
+    (unioned with the caller's own, so the primary is always an exact grid
+    member), returned as a BacktestSweep. With band_sweep it crosses every
+    band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
+    that k grid and adds standalone time-series (ladders + cross-event),
+    ladder, cross-event and same-title populations, a split-half check and an
+    excluding-top-event check — the backtest-only scenario explorer; no live
+    module reads a band.
+    run_backtest() is untouched by it — same signature, same two-tuple — so
+    every existing caller keeps working.
 
-    Before grouping, _prepare_entries() filters markets through _can_ever_enter(),
+    Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
     have an hourly candle at-or-before that Monday (i.e. opened by then). A
@@ -137,10 +156,11 @@ Notes:
 """
 import logging
 import resource
+import statistics
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -160,12 +180,16 @@ from .config import (
     SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG,
     SHORT_DEADLINE_GAP_DAYS,
+    SPREAD_BAND_SWEEP_CEILINGS,
+    SPREAD_BAND_SWEEP_FLOORS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
     time_series_profit_prob,
+    time_series_spread_band,
+    time_series_spread_too_wide,
 )
 from .historical import (
     fetch_all_settled_markets,
@@ -215,6 +239,19 @@ _CALIBRATION_GAP_BANDS: tuple[tuple[int, int], ...] = (
 # Label of the calibration's all-bands row. Not a gap band, so it carries no
 # single price tier (see IntervalCalibrationBucket.tier).
 _CALIBRATION_POOLED_LABEL = "POOLED"
+
+# The populations a band sweep simulates as standalone scenarios (see
+# SweepPoint.population), and the run labels its split-half and
+# excluding-top-event simulations carry on their completion lines only — the
+# points those runs return are reduced to a return and a trade count and never
+# kept. Those two checks run on the two populations that carry them, "all" and
+# "time_series", hence one label set per population. _simulate_at_discount
+# refuses anything else, so a typo cannot mislabel a scenario.
+_SCENARIO_POPULATIONS = ("all", "time_series", "ladder", "cross", "same_title")
+_CHECKED_POPULATIONS = ("all", "time_series")
+_SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
+    f"{population}/{run}" for population in _CHECKED_POPULATIONS
+    for run in ("H1", "H2", "ex-top"))
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
@@ -305,6 +342,20 @@ class BacktestTrade:
             deadline-gap concept, and for any trade constructed without it
             (test fixtures). Reporting only — nothing sizes, prices or settles
             on this field.
+        event_ticker (str): Event ticker of market A as traded (after
+            _find_entry's canonicalization, so for same_title it is the
+            pricier side's event), "" when the record carried none. The key a
+            report groups trades by to measure how much of a run's P&L one
+            event contributed. Reporting only.
+        same_event_ladder (bool): True for a time_series trade whose two legs
+            share one NON-EMPTY event ticker — a same-event deadline ladder
+            (DR-73), which _extract_pairs only ever proposes while the ladder
+            switch is on. False for a cross-event pair, for every same_title
+            trade (two events of different series by construction), and when
+            either leg's event ticker is missing, since an unknown event
+            cannot be shown to be one event. Reporting only — it lets a report
+            separate the ladder and cross-event populations, which price and
+            settle identically here.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -341,6 +392,71 @@ class BacktestTrade:
     # _interval_calibration DOES band k-hat on the same quantity via
     # _TimeSeriesOutcome.gap_days, so a ladder's bands are stated-gap bands.
     deadline_gap_days: int | None = None
+    # Market A's event ticker ("" when absent) and whether the pair is a
+    # same-event ladder (time_series, both legs on one non-empty event
+    # ticker). Set by _simulate_at_discount; defaulted so a trade constructed
+    # without them (test fixtures) still builds. Reporting only — nothing
+    # sizes, prices or settles on either field.
+    event_ticker: str = ""
+    same_event_ladder: bool = False
+
+
+@dataclass(frozen=True)
+class HalfSplit:
+    """
+    A split-half out-of-sample check on one band-sweep scenario.
+
+    The scenario's entries are split at BacktestSweep.split_date and each half
+    is simulated ALONE from the run's initial balance, at the scenario's own
+    band and k — so a band x k cell that only looks good because of one
+    stretch of history shows it as two very different numbers. Only the two
+    final-balance returns and trade counts are kept; neither half's equity
+    curve is (a band sweep would otherwise hold two extra frames per
+    scenario).
+
+    Declared BEFORE SweepPoint on purpose: SweepPoint annotates a field with
+    this class, and the annotation is evaluated when the class body runs (this
+    module has no `from __future__ import annotations`), so a later
+    declaration would raise NameError at import on CI's Python 3.11.
+
+    A half with NO entries is not a measurement: its simulation enters
+    nothing, so its h*_return reads 0.0 — indistinguishable from a half that
+    entered and broke even. The entry counts are carried so a reader can tell
+    the two apart (the dashboard renders such a half's return as "—" and
+    leaves the cell out of its split-half correlation). Two things empty a
+    half. At the primary band, for the time-series entries the split date is
+    computed from: H1 is empty whenever AT LEAST half of them share the
+    earliest entry date (one of two is enough), since the split date is their
+    median_low and H1 is strictly before it — _sweep_from_candidates warns
+    when that happens. And everywhere else — every other band's cells, and
+    any "all" point that also carries same-title entries — the split date is
+    that ONE primary-band date, not the point's own median, so either half is
+    empty whenever all of the point's own entries fall on one side of it; no
+    WARNING names those, but the dashboard blanks every empty half alike.
+
+    Attributes:
+        h1_return (float): Total return of the entries entering STRICTLY
+            BEFORE split_date, simulated alone: (final portfolio value −
+            initial balance) / initial balance. 0.0 when that half is empty
+            — read h1_entries before trusting it.
+        h2_return (float): The same for the entries entering ON or after
+            split_date.
+        h1_trades (int): Trades the first half's simulation entered.
+        h2_trades (int): Trades the second half's simulation entered.
+        h1_entries (int | None): Entries the first half's simulation was
+            handed — 0 means that half is EMPTY and h1_return is not a
+            measurement. None means not recorded (a hand-built instance);
+            every sweep records it. Appended after the four original fields,
+            with a default, so a positional four-field construction still
+            builds.
+        h2_entries (int | None): The same for the second half.
+    """
+    h1_return: float
+    h2_return: float
+    h1_trades: int
+    h2_trades: int
+    h1_entries: int | None = None
+    h2_entries: int | None = None
 
 
 @dataclass
@@ -353,7 +469,9 @@ class SweepPoint:
     imports FROM this module, so importing its _max_drawdown()/_sharpe()
     helpers back here would be a circular import and a layering violation.
     Every such metric is computable from equity_df by the dashboard, using the
-    helpers it already owns.
+    helpers it already owns. The two exceptions below — halves and
+    ex_top_event — are returns of simulations whose equity curves are NOT
+    kept, so there is nothing for the dashboard to derive them from.
 
     Attributes:
         k (float): The RESOLVED interval discount this point was simulated at
@@ -370,10 +488,52 @@ class SweepPoint:
             is empty. portfolio_value is cash plus open positions carried at
             cost, so it moves only on realized costs and P&L, never on
             deployment (see _build_equity_curve).
+        spread_band (tuple[float, float] | None): The RESOLVED time-series
+            spread band (floor, ceiling) this point's entries were detected
+            under — the same tuple that was handed to _entries_for_band, so a
+            reader never has to re-derive it. None when the simulation was
+            given no band (run_backtest(), and the band-independent
+            same_title_point); a band sweep stamps every scenario with its
+            tuple, the default band's (0.0, 1.0) included.
+        population (str): Which entries were simulated: "all" (every entry at
+            this band, same-title included — the run's actual result),
+            "time_series" (every time-series entry at this band — ladders and
+            cross-event together, same-title excluded: the population the
+            dashboard's heatmap and fragility banner read, since the band and
+            k act on time-series pairs alone), "ladder" (only the time-series
+            entries whose two legs share one non-empty event ticker), "cross"
+            (every other time-series entry) or "same_title". Each population
+            is its OWN standalone simulation from the initial balance, never a
+            slice of an "all" run, so its return, drawdown and Sharpe are
+            defined. On every point a BacktestSweep holds it is one of those
+            five; _simulate_at_discount also accepts the completion-line
+            labels "<all|time_series>/H1", "/H2" and "/ex-top" for the
+            split-half and excluding-top-event runs, whose transient points
+            are reduced to the numbers below and never kept.
+        halves (HalfSplit | None): The split-half check — each half of this
+            point's entries, split at BacktestSweep.split_date, simulated
+            alone from the initial balance. Set only on the "all" and
+            "time_series" points of a band sweep; None everywhere else.
+        ex_top_event (tuple[str, float] | None): The concentration check:
+            (event ticker, total return) — the event whose trades made the
+            largest summed profit on this point (by BacktestTrade.event_ticker,
+            ignoring trades with no event ticker, ties to the alphabetically
+            first) and the return of ONE re-simulation of this point's entries
+            without those whose market-A event ticker is that event. A
+            re-simulation, never a subtraction of that event's P&L from this
+            point's return: the survivors are re-sized against the cash the
+            removed trades no longer consume, and a subtraction is not bounded
+            below by −100%. Set only on the "all" and "time_series" points of
+            a band sweep, and None there too when no trade names an event
+            (there is no event to drop).
     """
     k: float
     trades: list[BacktestTrade]
     equity_df: pd.DataFrame
+    spread_band: tuple[float, float] | None = None
+    population: str = "all"
+    halves: HalfSplit | None = None
+    ex_top_event: tuple[str, float] | None = None
 
 
 @dataclass
@@ -388,11 +548,14 @@ class IntervalCalibrationBucket:
     Attributes:
         label (str): Row label — "<lo>-<hi>d" for a gap band, or
             _CALIBRATION_POOLED_LABEL ("POOLED") for the all-bands row.
-        tier (float): The minimum YES-gap tier config.min_price_diff_for_gap
-            returns for this band (0.15 or 0.30). The pooled row spans every
-            band and therefore has no single tier: it carries 0.0, which the
-            report renders as "-". Read `tier <= 0` as "not a single band",
-            never as a real threshold.
+        tier (float): The minimum YES-gap floor config.min_price_diff_for_gap
+            returns for this band — its deadline-gap tier (0.15 or 0.30), or
+            the backtest spread band's floor where that is higher, since the
+            report labels each band with the floor its entries were actually
+            detected under (_interval_calibration's spread_min). The pooled
+            row spans every band and therefore has no single tier: it carries
+            0.0, which the report renders as "-". Read `tier <= 0` as "not a
+            single band", never as a real threshold.
         n (int): Candidates in the bucket. Can be 0 on the pooled row when
             every time-series candidate was a premise violation (empty gap
             bands are omitted from IntervalCalibration.buckets entirely).
@@ -421,10 +584,14 @@ class IntervalCalibration:
     """
     The empirical interval-discount report for one backtest window.
 
-    Produced by _interval_calibration() from _prepare_entries()' output, so it
-    is INDEPENDENT of the interval discount k: it is computed once and is
-    valid for every point of a sweep, which is why it hangs off BacktestSweep
-    rather than off any single SweepPoint.
+    Produced by _interval_calibration() from one spread band's prepared
+    entries (_prepare_entries()' output, or one band's _entries_for_band()
+    output inside a sweep), so it is INDEPENDENT of the interval discount k:
+    it is computed once per band and is valid for every k at that band,
+    which is why it hangs off BacktestSweep (the primary band's as
+    `calibration`, every band's in `calibrations_by_band`) rather than off
+    any single SweepPoint. It is NOT band-independent: a band changes which
+    pairs enter, and when.
 
     Attributes:
         pooled (IntervalCalibrationBucket): The all-bands row, labelled
@@ -459,14 +626,15 @@ class OutcomeLabelCoverage:
     and one threshold comparison per run.
 
     Holds scalars only (counts, fractions and one verdict) and no reference to
-    any market record: _prepare_entries del's the eligible-market list
-    immediately after pair extraction to lower residency across the
+    any market record: _prepare_candidates (the first half of
+    _prepare_entries) del's the eligible-market list immediately after pair
+    extraction to lower residency across the
     candlestick fetch (TS-07), and a carrier that kept examples (sample
     tickers, a per-category breakdown) would pin every one of those dicts
     alive past that statement.
 
-    The population is the ELIGIBLE-MARKET CORPUS — _prepare_entries' market
-    list after the _can_ever_enter prefilter, i.e. every record handed to the
+    The population is the ELIGIBLE-MARKET CORPUS — _prepare_candidates'
+    market list after the _can_ever_enter prefilter, i.e. every record handed to the
     two grouping calls. It is NOT the population the empirical k-hat is
     computed over (_interval_calibration measures over entered, binarily
     settled, non-premise-violating time-series candidates, a far smaller and
@@ -537,29 +705,107 @@ class OutcomeLabelCoverage:
 
 
 @dataclass
-class BacktestSweep:
+class _Candidates:
     """
-    Everything one backtest run produces across every interval discount.
+    The band- and k-independent half of a backtest: fetch -> pairs -> candles.
 
-    Returned by run_backtest_sweep(). One preparation pass (the expensive,
-    network-bound half) feeds every point here, so the whole aggregate costs
-    one fetch plus one sizing/selection pass per swept discount.
+    Returned by _prepare_candidates() and consumed by _entries_for_band(),
+    which runs the _find_entry sweep over it at one spread band —
+    once, inside _prepare_entries(), or once per band, inside
+    _sweep_from_candidates(). Everything up
+    to and including the candlestick fetch is independent of the band (the
+    band acts only inside _find_entry's per-Monday price tests) and of the
+    interval discount k, so one of these can feed an entry pass per band.
+
+    It also carries the three inputs the entry pass must share with pair
+    extraction — start_date, max_horizon_days and the ladder flag — so no
+    later pass can be handed a different start date than the candles were
+    fetched from, a horizon other than the one the run asked for, or a
+    different ladder-flag ARGUMENT than _extract_pairs was handed (the DR-73c
+    agreement rule: a pair the ladder rule admitted must be ordered and
+    tiered by that same rule). _entries_for_band reads them from here and
+    takes none of them as arguments.
+
+    The ladder flag is stored UNRESOLVED, which bounds that last guarantee:
+    when it is None, _extract_pairs and every later _find_entry call each
+    resolve this module's TIME_SERIES_SAME_EVENT_LADDERS at their OWN call
+    time, so they agree only if that name is not rebound between
+    _prepare_candidates and the last entry pass. Before the split both
+    resolutions sat inside one _prepare_entries call; a _Candidates object
+    now stretches that window for as long as it is kept. Production never
+    rebinds the name; a test or harness that patches it between the halves
+    re-opens the DR-73c inversion (a ladder admitted on stated deadlines,
+    then entered on close_time), and a caller that needs the guarantee
+    unconditionally passes an explicit bool instead of None.
+
+    Not frozen, deliberately: a caller that has finished every entry pass
+    may del its candles_by_ticker and all_pairs attributes to release the
+    candle series and the pair list (and every market record only it still
+    references) before a long simulation phase — _sweep_from_candidates()
+    does exactly that, which is why one _Candidates feeds one sweep (and why
+    such an instance can no longer be repr()'d).
 
     Attributes:
-        primary (SweepPoint): The point at the effective discount — the run's
-            actual result, and the one a caller that wants a single answer
-            should read. It is the SAME object as the matching entry of
-            points, never a copy. There is deliberately no separate primary_k
-            field: primary.k already carries the resolved discount, and a
-            second copy could disagree with it.
-        points (list[SweepPoint]): One point per swept discount, ascending by
-            k, always including primary. A single-element list when sweeping
-            is off or the run was infeasible.
+        all_pairs (list): [((mA, mB, canon, group_key), pair_type), ...] — every
+            candidate pair _extract_pairs proposed, in scan order: every
+            time-series pair, then every same-title pair.
+        candles_by_ticker (dict): Ticker -> hourly candle list, from
+            _fetch_candles_parallel; every ticker of every pair in all_pairs
+            is a key.
+        label_coverage (OutcomeLabelCoverage | None): The eligible-market
+            census _log_outcome_label_coverage measured. _prepare_candidates
+            always carries it — on the feasibility short-circuit, where no
+            census is taken, it returns no _Candidates at all — so None only
+            ever appears on a hand-built instance (a test stub).
+        start_date (date): The backtest start date the markets, pairs and
+            candles were prepared for.
+        max_horizon_days (int | None): The optional bet-horizon cap,
+            forwarded to every _find_entry call. None applies no cap.
+        same_event_ladders (bool | None): The ladder flag EXACTLY as
+            _prepare_candidates received it — UNRESOLVED, None included — the
+            same argument both _extract_pairs calls were handed and every
+            entry pass hands _find_entry (see above for when None resolves
+            the same way in both).
+    """
+    all_pairs: list
+    candles_by_ticker: dict
+    label_coverage: OutcomeLabelCoverage | None
+    start_date: date
+    max_horizon_days: int | None
+    same_event_ladders: bool | None
+
+
+@dataclass
+class BacktestSweep:
+    """
+    Everything one backtest run produces across every interval discount — and,
+    when the spread-band sweep is on, across every band of the grid.
+
+    Returned by run_backtest_sweep(). One preparation pass (the expensive,
+    network-bound half, _prepare_candidates) feeds every point here, so the
+    whole aggregate costs one fetch, one _find_entry pass per band, and one
+    sizing/selection pass per simulated scenario.
+
+    Attributes:
+        primary (SweepPoint): The point at the effective discount and the
+            primary spread band — the run's actual result, and the one a
+            caller that wants a single answer should read. It is the SAME
+            object as the matching entry of points (and of scenarios, on a
+            band sweep), never a copy. There is deliberately no separate
+            primary_k field: primary.k already carries the resolved discount,
+            and a second copy could disagree with it.
+        points (list[SweepPoint]): The primary band's k sweep, population
+            "all": one point per swept discount, ascending by k, always
+            including primary. A single-element list when sweeping is off or
+            the run was infeasible. Unchanged by the band sweep — every object
+            here is also in scenarios, never simulated twice.
         calibration (IntervalCalibration | None): The empirical-discount
-            measurement over this window, or None when there was no
-            time-series candidate to measure. It hangs off the sweep rather
-            than off any point because it is k-independent — one measurement
-            valid for all of them (see _interval_calibration).
+            measurement over the PRIMARY band's entries, or None when there
+            was no time-series candidate to measure. It hangs off the sweep
+            rather than off any point because it is k-independent — one
+            measurement valid for every k at that band (see
+            _interval_calibration). The same object as
+            calibrations_by_band[primary.spread_band] on a feasible run.
         label_coverage (OutcomeLabelCoverage | None): The outcome-label census
             over this run's eligible-market corpus, or None when no census was
             taken (the Monday-feasibility short-circuit skips the fetch
@@ -568,13 +814,54 @@ class BacktestSweep:
             measurement over one corpus, k-independent, valid at every point.
             DEFAULTED so no existing construction breaks — but a caller that
             omits it renders "not measured" on the dashboard rather than the
-            caveat, so the two production constructions in run_backtest_sweep()
-            must always pass it.
+            caveat, so the two production constructions — the infeasible
+            branch of run_backtest_sweep() and _sweep_from_candidates() — must
+            always pass it.
+        scenarios (list[SweepPoint]): Every simulated (band, k) cell of a
+            band sweep, band by band in ascending band order and ascending k
+            within a band: the "all" point, then a "time_series", a "ladder"
+            and a "cross" point for each of those populations that is
+            non-empty at that band. Every "all" and "time_series" point
+            carries halves, and ex_top_event whenever one of its trades names
+            an event. Every object in points is in here (the primary band's
+            "all" points).
+            [] when the band sweep is off OR the window was infeasible —
+            label_coverage (None only on an infeasible window) tells the two
+            apart.
+        same_title_point (SweepPoint | None): The same-title entries simulated
+            alone, ONCE: a same-title pair prices on the fixed co-resolution
+            prior and never reads the band, so this one point is valid at
+            every band and every k (its k and spread_band stamps are nominal:
+            the primary k, and None). None when the band sweep is off, the
+            window was infeasible, or no same-title pair produced an entry.
+        calibrations_by_band (dict): Band -> that band's own
+            IntervalCalibration (or None), keyed by the RESOLVED band tuple,
+            each labelling its tiers with the floor that band actually
+            applied. Always holds the primary band on a feasible run; every
+            grid band on a band sweep; {} on an infeasible window.
+        same_event_ladders (bool | None): The RESOLVED ladder setting the
+            run's pairs were extracted and entered under (DR-73) — the flag
+            decides which pairs exist, so a report must say which it was.
+            None means not recorded (a hand-built sweep).
+        split_date (date | None): The date the split-half check (SweepPoint.
+            halves) splits entries at — the median_low of the primary band's
+            TIME-SERIES entry dates (same-title entries are left out, so they
+            cannot move the split the time-series checks are read at), or the
+            window's midpoint when that band has none. One date for every
+            scenario and both checked populations, so every cell's halves
+            cover the same two stretches of history. None when the band sweep
+            is off or the window was infeasible.
     """
     primary: SweepPoint
     points: list[SweepPoint]
     calibration: IntervalCalibration | None
     label_coverage: OutcomeLabelCoverage | None = None
+    scenarios: list[SweepPoint] = field(default_factory=list)
+    same_title_point: SweepPoint | None = None
+    calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = field(
+        default_factory=dict)
+    same_event_ladders: bool | None = None
+    split_date: date | None = None
 
 
 @dataclass
@@ -1277,11 +1564,12 @@ def _extract_pairs(
     ladder_same_day_skips = 0
     ladder_gap_cap_skips = 0
     ladder_pairs = 0
-    # Whether this CALL saw any time-series group at all. _prepare_entries
-    # calls this function twice — once per grouping — and the ladder rule
-    # applies only to string keys, so without this the same-title call would
-    # log a permanent "ladder candidates: 0" that reads as the ladder pass
-    # having found nothing when it never ran.
+    # Whether this CALL saw any time-series group at all. _prepare_candidates
+    # (the first half of _prepare_entries) calls this function twice — once
+    # per grouping — and the ladder rule applies only to string keys, so
+    # without this the same-title call would log a permanent "ladder
+    # candidates: 0" that reads as the ladder pass having found nothing when
+    # it never ran.
     saw_time_series_group = False
     for key, members in groups.items():
         if isinstance(key, str):
@@ -1712,6 +2000,7 @@ def _find_entry(
     start_date: date,
     max_horizon_days: int | None = None,
     same_event_ladders: bool | None = None,
+    spread_band: tuple[float, float] | None = None,
 ) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
@@ -1769,6 +2058,22 @@ def _find_entry(
     In both cases the traded pair of prices comes from _leg_prices_for, and
     both of them must be live [0.01, 0.99] quotes.
 
+    The BACKTEST-only spread band (spread_band, resolved through
+    config.time_series_spread_band) narrows the time-series rule and nothing
+    else. Its floor is layered on the deadline-gap tier —
+    threshold = min_price_diff_for_gap(gap_days, spread_min=floor), i.e.
+    max(tier, floor) — and that raised threshold drives BOTH the gap test and
+    the leg-price-sum ceiling (price_a + price_b <= 1 − threshold), so the sum
+    ceiling stays tied to the floor exactly as it is tied to the tier live.
+    Its ceiling refuses a Monday whose pB − pA exceeds it
+    (config.time_series_spread_too_wide, the one place the ceiling's
+    PRICE_EPSILON lives, on the keep side like the floor's) — that Monday
+    only: the scan moves on, because a LATER Monday whose spread has come
+    back inside the band can still be the entry. The default band,
+    config.BACKTEST_DEFAULT_SPREAD_BAND = (0.0, 1.0), is no band at all — a
+    floor of 0 is inert under every tier and no spread exceeds 1 — so the
+    default reproduces the live rule. same_title pairs never read the band.
+
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
 
@@ -1797,6 +2102,12 @@ def _find_entry(
             same-event pair while the switch is on, but any other caller —
             a test, a harness, a future entry point — must not get ladder
             semantics from a pair it built itself while the switch is off.
+        spread_band (tuple[float, float] | None): BACKTEST-only (floor,
+            ceiling) band on the time-series spread pB − pA, dollars. None
+            (the default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND at call
+            time — (0.0, 1.0), no band. Resolved and validated once per call,
+            before anything else, so an invalid band is refused whatever the
+            pair's data. Ignored by same_title pairs.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -1812,7 +2123,22 @@ def _find_entry(
             Returns None if no qualifying Monday was found in the scan window, or
             if either leg's close_time is missing or unparseable (no scan window
             can be derived, so the pair is simply not enterable).
+
+    Raises:
+        ValueError: From config.time_series_spread_band, when spread_band
+            does not unpack to exactly two values or does not satisfy
+            0 <= floor < ceiling <= 1 — a caller bug, not a data condition.
+        TypeError: From config.time_series_spread_band, when spread_band is
+            not iterable or an element cannot be compared with a float.
     """
+    # Resolve the backtest spread band once, BEFORE any data-dependent early
+    # return, so a caller bug surfaces on the first call rather than only on a
+    # pair that happens to have a readable close_time. config owns the default
+    # and the validation (time_series_spread_band); this module only applies
+    # it. band_lo feeds the time-series threshold below and band_hi the
+    # per-Monday ceiling; the same_title branch reads neither.
+    band_lo, band_hi = time_series_spread_band(spread_band)
+
     # Both markets must have a PARSEABLE close_time; without one we can't
     # determine the scan window. A malformed timestamp is treated exactly like
     # a missing one (the file-wide "can't parse it = unknown, not an error"
@@ -1939,8 +2265,14 @@ def _find_entry(
             return None
         # Tier the required price gap by deadline distance (15% for gaps
         # <= 15 days, 30% for 16-30 days) — the same tiering, computed off the
-        # same gap arithmetic, as scanner.find_time_series_pairs
-        threshold = min_price_diff_for_gap(gap_days)
+        # same gap arithmetic, as scanner.find_time_series_pairs — and layer
+        # the backtest band's floor on top of it: config returns
+        # max(tier, band_lo), so the default floor of 0 leaves the live tier
+        # untouched. This one threshold drives BOTH the gap test and the
+        # leg-price-sum ceiling below, which is what keeps the sum ceiling at
+        # 1 - floor when the band raises the floor (the live pairing of the
+        # two, applied to the raised floor rather than to the tier alone).
+        threshold = min_price_diff_for_gap(gap_days, spread_min=band_lo)
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold
         threshold = SAME_TITLE_MIN_PRICE_DIFF
@@ -2015,6 +2347,17 @@ def _find_entry(
         if gap < threshold - PRICE_EPSILON:
             continue
 
+        # The band's CEILING (time-series only). `continue`, never
+        # `return None`: a LATER Monday whose spread has come back inside the
+        # band can still be the entry, exactly as a Monday under the floor
+        # does not end the scan. config.time_series_spread_too_wide is the
+        # one place the ceiling's PRICE_EPSILON lives (on the keep side, so
+        # 0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling) — no
+        # tolerance is added here. The default ceiling of 1.0 can never fire,
+        # since both YES asks are banded into [0.01, 0.99] above.
+        if pair_type == "time_series" and time_series_spread_too_wide(gap, spread_max=band_hi):
+            continue
+
         # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
         # time_series — via the module's single leg mapping
         price_a, price_b = _leg_prices_for(pair_type, pA, nA, pB, nB)
@@ -2030,7 +2373,9 @@ def _find_entry(
 
         # Live orderbook-depth parity: enrich_with_orderbook_prices only keeps
         # contracts whose combined LEG price leaves the required gap
-        # (price_a + price_b <= 1 - threshold) — apply the same cut to candle entries
+        # (price_a + price_b <= 1 - threshold) — apply the same cut to candle
+        # entries. For time_series `threshold` already carries the band's
+        # floor, so under a raised floor this is 1 - max(tier, floor).
         if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
@@ -2195,7 +2540,8 @@ def _log_rss(label: str) -> None:
     Log this process's peak resident set size so far, in MiB.
 
     Diagnostics only — nothing branches on the value. Two calls bracket the
-    grouping/pairing step of _prepare_entries, the phase that follows a fetch
+    grouping/pairing step of _prepare_candidates (the first half of
+    _prepare_entries), the phase that follows a fetch
     already hardened to stream to disk and that was nonetheless the suspected
     home of a multi-GiB peak (TS-07). Without these lines that peak is
     invisible: it lives entirely between two existing INFO lines and falls
@@ -2281,7 +2627,7 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
             corpus, total 0 with both fractions None (undefined, not zero),
             below_floor False and all three phrasing counts 0. Holds no
             reference to any record, so it is safe to keep past
-            _prepare_entries' `del markets`.
+            _prepare_candidates' `del markets`.
     """
     total = len(markets)
 
@@ -2380,68 +2726,57 @@ def _log_outcome_label_coverage(markets: list[dict]) -> OutcomeLabelCoverage:
     )
 
 
-def _prepare_entries(
+def _prepare_candidates(
     hist_client: Any,
     live_client,
     start_date: date,
     use_cache: bool,
     max_horizon_days: int | None,
     same_event_ladders: bool | None = None,
-) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
+) -> _Candidates | None:
     """
-    Run the half of the backtest that does not depend on the interval discount.
+    Run the half of the backtest that depends on neither the band nor k.
 
     Everything here — the Monday-feasibility pre-check, the settled-market
-    fetch, the eligibility prefilter, both groupings, pair extraction, the
-    candlestick fetch and the _find_entry sweep — is driven purely by prices,
-    dates and thresholds. _find_entry applies no probability model at all, so
-    none of this changes when the time-series interval discount k changes.
-    Separating it out lets _simulate_at_discount() be re-run at many discounts
-    over one expensive, network-bound preparation pass.
+    fetch, the eligibility prefilter, the outcome-label census, both
+    groupings, pair extraction and the candlestick fetch — is driven purely by
+    which markets exist and when they traded. Neither the backtest's spread
+    band (which acts only inside _find_entry's per-Monday price tests) nor the
+    interval discount k (which only _simulate_at_discount reads) touches any
+    of it, so one call can feed an entry pass per band through
+    _entries_for_band(). This is the whole of what _prepare_entries() did
+    before its _find_entry sweep, statement for statement: same log lines in
+    the same order, the same two _log_rss brackets, and the same release of
+    the group maps and record list before the candlestick pool spawns.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
         live_client: Client passed through to fetch_all_settled_markets.
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
-        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
-            scanner.filter_markets_within_horizon on the live path, but relative
-            to each simulated checkpoint rather than real-world now: at a given
-            Monday checkpoint, a pair can only enter if the later-closing leg
-            closes within max_horizon_days of THAT checkpoint. None applies no
-            cap. Passed straight through to _find_entry() for each pair.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap. Not
+            applied here — no pair is priced here — but carried on the result
+            so every entry pass applies the cap the caller asked for. None
+            applies no cap.
         same_event_ladders (bool | None): Whether two dated cumulative rungs
             of ONE event may pair (DR-73). None (the default) resolves this
             module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
             import) at call time; patching config itself is a silent no-op —
-            see _extract_pairs' own entry. Handed
-            verbatim to BOTH _extract_pairs() and _find_entry(), which is
-            load-bearing: the two must agree, or a pair this function
-            proposes is replayed under the other rule's ordering.
+            see _extract_pairs' own entry. Handed verbatim to BOTH
+            _extract_pairs() calls and stored UNRESOLVED on the result, where
+            _entries_for_band() reads it for every _find_entry() call. That is
+            load-bearing: the two must agree, or a pair this function proposes
+            is replayed under the other rule's ordering.
 
     Returns:
-        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
-            entries and this run's outcome-label census.
-
-            Element 0 is one record per pair that produced an entry, in scan
-            order (time-series pairs first, then same-title), each shaped
-            {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
-            where "entry" is _find_entry()'s return dict (which already carries
-            the possibly-swapped mA/mB). An empty list means no pair was ever
-            tradeable. It is None — the codebase's
+        _Candidates | None: The candidate pairs (in scan order: time-series,
+            then same-title), their candle series, this run's
+            OutcomeLabelCoverage, and the start date / horizon / ladder flag
+            every entry pass must reuse. None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
-            window at all" signal distinct from "nothing entered". NOTE that
-            the sentinel now lives on element 0: a caller that forgets to
-            unpack holds a 2-tuple, which is never None, so its
-            `if raw_entries is None` guard would silently go false.
-
-            Element 1 is the OutcomeLabelCoverage the census measured over the
-            eligible-market corpus — carried out so the dashboard can render
-            the same caveat the log warns about (DR-66b) — and is None on
-            exactly the feasibility-short-circuit path, where the fetch never
-            ran and there was no corpus to census. That is distinct from a
-            censused corpus of zero records, which carries total=0.
+            window at all" signal distinct from "no pair was ever tradeable";
+            the fetch never ran on that path, so no census exists either.
 
     Raises:
         KeyError: Propagates out of the candlestick-fetch pool
@@ -2481,17 +2816,19 @@ def _prepare_entries(
             "trade can ever be entered; skipping the fetch entirely",
             start_date, feasibility_end,
         )
-        # None rather than an empty list so the caller can tell "no simulation
-        # is possible in this window" apart from "nothing was ever tradeable".
-        # run_backtest turns it into the same empty-result shape the zero-trade
-        # path already produces, so backtest.py / generate_dashboard need no
-        # changes to handle this early-exit.
+        # None rather than an empty _Candidates so the caller can tell "no
+        # simulation is possible in this window" apart from "nothing was ever
+        # tradeable". run_backtest (through _prepare_entries) and
+        # run_backtest_sweep each turn it into the same empty-result shape the
+        # zero-trade path already produces, so backtest.py / generate_dashboard
+        # need no changes to handle this early-exit.
         #
-        # The census is None here rather than an empty OutcomeLabelCoverage:
-        # the fetch never ran, so no corpus was ever censused. That reads on
-        # the page as "not measured", which is the truth, and is distinct from
-        # a corpus that WAS censused and held zero records.
-        return None, None
+        # No _Candidates at all, so no census either: the fetch never ran, so
+        # no corpus was ever censused. _prepare_entries turns this into its
+        # (None, None) pair and run_backtest_sweep into label_coverage=None,
+        # which reads on the page as "not measured" — the truth, and distinct
+        # from a corpus that WAS censused and held zero records.
+        return None
 
     # Fetch all settled markets from start_date onward (uses disk cache if
     # available). The eligibility predicate below is handed to the fetch so
@@ -2572,11 +2909,13 @@ def _prepare_entries(
     # Group settled markets into potential pairs using the same logic as the live scanner
     ts_groups    = _group_by_normalized_title(markets)
     same_groups  = _group_by_exact_title(markets)
-    # The ladder flag rides through unresolved (None included), so the two
-    # calls and the _find_entry sweep below all resolve the same constant at
-    # the same moment. The same-title call takes it too, for signature
-    # uniformity — 3-tuple-keyed groups have no deadline concept and the flag
-    # is inert there.
+    # The ladder flag rides through unresolved (None included): the two calls
+    # here and every _find_entry call of every later entry pass (it is carried
+    # on the returned _Candidates) receive the same argument and resolve the
+    # same module constant at their own call time — see _Candidates for why
+    # that holds only while the name is not rebound between the halves. The
+    # same-title call takes it too, for signature uniformity — 3-tuple-keyed
+    # groups have no deadline concept and the flag is inert there.
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders)
     # Release the group maps AND the record list together, before the
@@ -2589,9 +2928,10 @@ def _prepare_entries(
     # four names have to go for the records that landed in no candidate pair
     # to become collectable.
     #
-    # This lowers RESIDENCY across the candlestick fetch and the _find_entry
-    # sweep below. It does NOT lower the run's peak RSS, which is a high-water
-    # mark already reached by the time this statement runs.
+    # This lowers RESIDENCY across the candlestick fetch and every later
+    # _find_entry sweep (_entries_for_band). It does NOT lower the run's peak
+    # RSS, which is a high-water mark already reached by the time this
+    # statement runs.
     del ts_groups, same_groups, markets, eligible_markets
     _log_rss("after pair extraction")
 
@@ -2616,29 +2956,217 @@ def _prepare_entries(
 
     logging.info("Candlestick fetch complete.")
 
-    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
-    # _find_entry applies price and deadline thresholds only — it holds no
-    # probability model — so this sweep yields identical entries at every
-    # interval discount and is run exactly once, ahead of any sizing.
-
-    # Combine both pair types for the scan loop
+    # Combine both pair types in scan order — time-series first, then
+    # same-title — which is the order every entry pass walks and therefore the
+    # order of _prepare_entries' output.
     all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
-    raw_entries: list[dict] = []
 
-    for (mA_orig, mB_orig, canon, group_key), pair_type in all_pairs:
-        candles_a = candles_by_ticker.get(mA_orig["ticker"], [])
-        candles_b = candles_by_ticker.get(mB_orig["ticker"], [])
+    # The ladder flag is stored exactly as received (None included): every
+    # entry pass hands _find_entry the same argument _extract_pairs was handed
+    # above, which resolves the same module name at call time as long as it is
+    # not rebound between the halves (DR-73c; see _Candidates).
+    return _Candidates(
+        all_pairs=all_pairs,
+        candles_by_ticker=candles_by_ticker,
+        label_coverage=label_coverage,
+        start_date=start_date,
+        max_horizon_days=max_horizon_days,
+        same_event_ladders=same_event_ladders,
+    )
+
+
+# The two pair-type labels an entry pass can be restricted to. Their order is
+# irrelevant to the result: _entries_for_band always walks all_pairs in scan
+# order and only FILTERS on this set.
+_PAIR_TYPES = ("time_series", "same_title")
+
+
+def _exact_label(value: float, spec: str) -> str:
+    """
+    Format a float with a short spec, falling back to repr when that is lossy.
+
+    The completion lines of one sweep must have unique prefixes (TS-21), and
+    a prefix names the k and the band — so two DIFFERENT values must never
+    print alike. A fixed spec alone cannot promise that: "%g" prints both 0.3
+    and 0.3000001 as "0.3", and "%.3f" prints both 0.75 and 0.7500001 as
+    "0.750", so an off-grid override within a rounding of a grid member (or
+    one carrying float noise, 0.1 + 0.2) would repeat that member's prefix at
+    every point it shares. The short form is kept whenever it reads back as
+    exactly the value — every grid member does, so the familiar "0.3-0.6" and
+    "k=0.750" are unchanged — and repr, the shortest string that round-trips,
+    is used otherwise. The mapping is therefore injective: two strings are
+    equal only if the floats they came from are.
+
+    Args:
+        value (float): The number to render.
+        spec (str): The preferred format spec, e.g. "g" or ".3f".
+
+    Returns:
+        str: format(value, spec) when float() of it equals value, else
+            repr(value).
+    """
+    short = format(value, spec)
+    return short if float(short) == value else repr(value)
+
+
+def _band_label(band: tuple[float, float]) -> str:
+    """
+    Render a resolved spread band as the "floor-ceiling" text every log line uses.
+
+    One definition, so the Phase-1 announcement of a band sweep and the
+    completion line of every simulation at that band spell it identically —
+    a reader can match them by text. Each bound is formatted with :g, which
+    drops trailing zeros, so the default band reads "0-1" and the plan's
+    30-60% band "0.3-0.6" — unless :g would lose precision, when the bound is
+    printed exactly (_exact_label), so a primary band of (0.3000001, 0.6) is
+    never announced or labelled as the grid band "0.3-0.6".
+
+    Args:
+        band (tuple[float, float]): A (floor, ceiling) already resolved by
+            config.time_series_spread_band.
+
+    Returns:
+        str: "<floor>-<ceiling>" — distinct for every distinct band.
+    """
+    lo, hi = band
+    return f"{_exact_label(lo, 'g')}-{_exact_label(hi, 'g')}"
+
+
+def _is_ladder_pair(pair_type: str, mA: dict, mB: dict) -> bool:
+    """
+    Report whether a pair is a same-event deadline ladder (DR-73).
+
+    A same-event ladder is a time-series pair whose two legs share one
+    NON-EMPTY event ticker — the only same-event pair _extract_pairs ever
+    proposes, and only while the ladder switch is on. A missing ticker on
+    both legs ("" == "") must not read as one event: an unknown event cannot
+    be shown to be one event, so emptiness fails the test. The single
+    definition behind both BacktestTrade.same_event_ladder and a band sweep's
+    "ladder"/"cross" populations, so a trade's label and the population it was
+    simulated in can never disagree. Reporting only — nothing prices, sizes or
+    settles on it.
+
+    Args:
+        pair_type (str): "time_series" or "same_title".
+        mA (dict): Market A's record (after _find_entry's canonicalization).
+        mB (dict): Market B's record.
+
+    Returns:
+        bool: True for a time-series pair whose legs share one non-empty
+            event ticker; False otherwise, including every same-title pair.
+    """
+    event_a = mA.get("event_ticker") or ""
+    return (pair_type == "time_series" and bool(event_a)
+            and event_a == (mB.get("event_ticker") or ""))
+
+
+def _entries_for_band(
+    candidates: _Candidates,
+    spread_band: tuple[float, float] | None = None,
+    *,
+    pair_types: tuple[str, ...] = _PAIR_TYPES,
+    _pairs: list | None = None,
+) -> list[dict]:
+    """
+    Locate each candidate pair's first tradeable Monday under one spread band.
+
+    The Pass-1a sweep: one _find_entry() call per pair in candidates.all_pairs
+    (or in _pairs, when given) whose type is in pair_types, in scan order.
+    _find_entry applies price,
+    deadline and band thresholds only — it holds no probability model — so
+    the result is identical at every interval discount; only the band can
+    change it, and only for time-series pairs (a same-title pair never reads
+    the band). A caller sweeping many bands can therefore compute the
+    same-title entries once (pair_types=("same_title",)) and the time-series
+    entries once per band (pair_types=("time_series",)); concatenating the two
+    in that order reproduces the default call exactly, since the default
+    walks every time-series pair before every same-title one.
+
+    The start date, the bet-horizon cap and the ladder flag are read FROM
+    candidates, never taken as arguments: they must be the values pair
+    extraction and the candle fetch used, and a second copy passed here could
+    disagree with them (for the ladder flag, that is the DR-73c inversion —
+    a ladder admitted on stated deadlines and then entered on close_time).
+    The flag is carried UNRESOLVED, so this pass hands _find_entry the same
+    ARGUMENT _extract_pairs was handed; when that argument is None each of
+    them resolves this module's TIME_SERIES_SAME_EVENT_LADDERS at its own
+    call time, and the two agree only if that name is not rebound between
+    _prepare_candidates and this pass (see _Candidates).
+
+    Both arguments are validated up front, before any pair is scanned — an
+    empty or unknown pair_types here, an invalid spread_band through
+    config.time_series_spread_band — so a pass that happens to scan no pair
+    still refuses an argument that could never apply rather than returning []
+    for it.
+
+    Args:
+        candidates (_Candidates): _prepare_candidates() output.
+        spread_band (tuple[float, float] | None): BACKTEST-only (floor,
+            ceiling) band on the time-series spread pB − pA, handed verbatim
+            to every _find_entry() call. None (the default) resolves
+            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band,
+            i.e. the live rule.
+        pair_types (tuple[str, ...]): Which pair types to scan — any subset
+            of ("time_series", "same_title"). Keyword-only. Defaults to both.
+        _pairs (list | None): PRIVATE, keyword-only. The
+            [((mA, mB, canon, group_key), pair_type), ...] items to scan in
+            place of candidates.all_pairs — in practice a subsequence of it,
+            in its order, so the result keeps the full scan's order. None (the
+            default, and what every caller but _sweep_from_candidates passes)
+            scans candidates.all_pairs. It only ever NARROWS which pairs are
+            looked at; the caller owns the proof that no pair it leaves out
+            could have produced an entry at this band (see
+            _sweep_from_candidates' no-band pre-pass). candidates.all_pairs
+            itself is never mutated.
+
+    Returns:
+        list[dict]: One record per pair that produced an entry, in scan order,
+            each shaped {"pair_type": str, "canon": str, "group_key": object,
+            "entry": dict} where "entry" is _find_entry()'s return dict (which
+            already carries the possibly-swapped mA/mB). Empty when no pair of
+            the requested types was ever tradeable under this band.
+
+    Raises:
+        ValueError: If pair_types is empty or names anything other than
+            "time_series" or "same_title" (including a bare string, whose
+            characters are not pair types) — either would silently scan
+            nothing and read as a band with no tradeable pair. Also, from
+            config.time_series_spread_band, if spread_band does not unpack to
+            exactly two values or does not satisfy 0 <= floor < ceiling <= 1.
+        TypeError: From config.time_series_spread_band, if spread_band is not
+            iterable or an element cannot be compared with a float.
+    """
+    if not pair_types or set(pair_types) - set(_PAIR_TYPES):
+        raise ValueError(
+            f"pair_types must be a non-empty selection from {_PAIR_TYPES}, "
+            f"got {pair_types!r}"
+        )
+    # Validation only — the resolved value is discarded and spread_band is
+    # handed to _find_entry verbatim, which resolves it again per call. config
+    # owns both the default and the rule (time_series_spread_band).
+    time_series_spread_band(spread_band)
+
+    raw_entries: list[dict] = []
+    scan = candidates.all_pairs if _pairs is None else _pairs
+    for (mA_orig, mB_orig, canon, group_key), pair_type in scan:
+        if pair_type not in pair_types:
+            continue
+        candles_a = candidates.candles_by_ticker.get(mA_orig["ticker"], [])
+        candles_b = candidates.candles_by_ticker.get(mB_orig["ticker"], [])
 
         # Find the first Monday where this pair was tradeable at the threshold
         # prices — max_horizon_days (if set) restricts entries to checkpoints
-        # close enough to the legs' close dates
+        # close enough to the legs' close dates, and spread_band narrows the
+        # time-series spread rule for this pass only
         entry = _find_entry(
-            candles_a, candles_b, mA_orig, mB_orig, pair_type, start_date,
-            max_horizon_days=max_horizon_days,
+            candles_a, candles_b, mA_orig, mB_orig, pair_type,
+            candidates.start_date,
+            max_horizon_days=candidates.max_horizon_days,
             # Same unresolved flag _extract_pairs was handed: a same-event
             # pair it proposed must be ordered and tiered by the same rule
             # that admitted it (DR-73).
-            same_event_ladders=same_event_ladders,
+            same_event_ladders=candidates.same_event_ladders,
+            spread_band=spread_band,
         )
         if entry is None:
             continue
@@ -2652,9 +3180,112 @@ def _prepare_entries(
             "group_key": group_key,
             "entry": entry,
         })
+    return raw_entries
+
+
+def _prepare_entries(
+    hist_client: Any,
+    live_client,
+    start_date: date,
+    use_cache: bool,
+    max_horizon_days: int | None,
+    same_event_ladders: bool | None = None,
+) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
+    """
+    Run the half of the backtest that does not depend on the interval discount.
+
+    Everything here — the Monday-feasibility pre-check, the settled-market
+    fetch, the eligibility prefilter, both groupings, pair extraction, the
+    candlestick fetch and the _find_entry sweep — is driven purely by prices,
+    dates and thresholds. _find_entry applies no probability model at all, so
+    none of this changes when the time-series interval discount k changes.
+    Separating it out lets _simulate_at_discount() be re-run at many discounts
+    over one expensive, network-bound preparation pass. run_backtest() is its
+    one production caller: run_backtest_sweep() composes _prepare_candidates()
+    with _sweep_from_candidates(), which runs the _entries_for_band() passes
+    itself, because a band sweep needs one entry pass per band where this
+    runs exactly one.
+
+    It is the composition of the two halves split at the spread band:
+    _prepare_candidates() (everything through the candlestick fetch) and one
+    _entries_for_band() pass at the DEFAULT band — config's
+    BACKTEST_DEFAULT_SPREAD_BAND, (0.0, 1.0), which is no band at all — so it
+    produces exactly the entries it produced before the band existed
+    (pinned against values captured from the pre-split code by
+    tests/test_backtester.py::TestPrepareEntriesGolden).
+
+    Args:
+        hist_client (Any): Signed client for the historical archive/live endpoints.
+        live_client: Client passed through to fetch_all_settled_markets.
+        start_date (date): Earliest settlement date to include.
+        use_cache (bool): Whether to reuse the disk-cached assembled market list.
+        max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
+            scanner.filter_markets_within_horizon on the live path, but relative
+            to each simulated checkpoint rather than real-world now: at a given
+            Monday checkpoint, a pair can only enter if the later-closing leg
+            closes within max_horizon_days of THAT checkpoint. None applies no
+            cap. Passed straight through to _find_entry() for each pair.
+        same_event_ladders (bool | None): Whether two dated cumulative rungs
+            of ONE event may pair (DR-73). None (the default) resolves this
+            module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
+            import) at call time; patching config itself is a silent no-op —
+            see _extract_pairs' own entry. Handed
+            verbatim to _prepare_candidates(), which gives it to BOTH
+            _extract_pairs() calls and carries it, unresolved, to every
+            _find_entry() call of the entry pass — load-bearing: the two must
+            agree, or a pair this function proposes is replayed under the
+            other rule's ordering.
+
+    Returns:
+        tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
+            entries and this run's outcome-label census.
+
+            Element 0 is one record per pair that produced an entry, in scan
+            order (time-series pairs first, then same-title), each shaped
+            {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
+            where "entry" is _find_entry()'s return dict (which already carries
+            the possibly-swapped mA/mB). An empty list means no pair was ever
+            tradeable. It is None — the codebase's
+            return-None-on-validation-failure convention — when the Monday
+            feasibility pre-check fails, a "no simulation is possible in this
+            window at all" signal distinct from "nothing entered". NOTE that
+            the sentinel now lives on element 0: a caller that forgets to
+            unpack holds a 2-tuple, which is never None, so its
+            `if raw_entries is None` guard would silently go false.
+
+            Element 1 is the OutcomeLabelCoverage the census measured over the
+            eligible-market corpus — carried out so the dashboard can render
+            the same caveat the log warns about (DR-66b) — and is None on
+            exactly the feasibility-short-circuit path, where the fetch never
+            ran and there was no corpus to census. That is distinct from a
+            censused corpus of zero records, which carries total=0.
+
+    Raises:
+        KeyError: Propagates out of the candlestick-fetch pool
+            (_fetch_candles_parallel) if a ticker needed by a candidate pair
+            was not properly excluded by the eligibility prefilter — this is
+            treated as a real defect (a market that should never have reached
+            this stage), not degraded into "no price history".
+    """
+    # Everything through the candlestick fetch. None means the feasibility
+    # pre-check failed and nothing was fetched — so no census either.
+    candidates = _prepare_candidates(
+        hist_client, live_client, start_date, use_cache, max_horizon_days,
+        same_event_ladders=same_event_ladders,
+    )
+    if candidates is None:
+        return None, None
+
+    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
+    # _find_entry applies price and deadline thresholds only — it holds no
+    # probability model — so this sweep yields identical entries at every
+    # interval discount and is run exactly once, ahead of any sizing. At the
+    # default spread band (spread_band=None, which _find_entry resolves to
+    # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band) it is the live rule.
+    raw_entries = _entries_for_band(candidates, spread_band=None)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
-    return raw_entries, label_coverage
+    return raw_entries, candidates.label_coverage
 
 
 def _simulate_at_discount(
@@ -2662,6 +3293,8 @@ def _simulate_at_discount(
     start_date: date,
     initial_balance: float,
     k: float | None = None,
+    spread_band: tuple[float, float] | None = None,
+    population: str = "all",
 ) -> SweepPoint:
     """
     Size, select and settle prepared entries at one interval discount.
@@ -2684,9 +3317,17 @@ def _simulate_at_discount(
     runs after the Kelly gate, so a different k can change which candidate wins
     its group. Both are intended; do not reorder or hoist them.
 
+    spread_band and population change NOTHING about the simulation: the band
+    has already acted by the time entries reach here (inside _find_entry,
+    through _entries_for_band), and the population is whichever subset of
+    entries the caller chose to hand over. Both only name the run on its
+    completion line — so each of a band sweep's thousands of simulations is
+    distinguishable in the log (TS-21) — and stamp the returned point.
+
     Args:
-        raw_entries (list[dict]): _prepare_entries() output — one record per
-            pair that produced an entry.
+        raw_entries (list[dict]): Prepared entries — _prepare_entries()
+            output, or (inside a sweep) one band's _entries_for_band() output
+            or a subset of it — one record per pair that produced an entry.
         start_date (date): First trading date of the window; the equity curve
             _build_equity_curve returns opens one row earlier than this.
         initial_balance (float): Simulated starting cash balance in dollars.
@@ -2696,12 +3337,39 @@ def _simulate_at_discount(
             call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
             the live sizer reads — so the default path prices exactly as it
             always has.
+        spread_band (tuple[float, float] | None): The spread band the entries
+            were detected under — a label, never applied here. None (default)
+            renders on the completion line as the resolved default band
+            (config.time_series_spread_band(None)) and is stamped as None.
+        population (str): Which entries these are, for the completion line
+            and the stamp: one of "all" (default), "time_series", "ladder",
+            "cross", "same_title", or the run labels "all/H1", "all/H2",
+            "all/ex-top", "time_series/H1", "time_series/H2" and
+            "time_series/ex-top" a band sweep gives its split-half and
+            excluding-top-event runs.
 
     Returns:
         SweepPoint: The trades (in entry-date order, empty if none entered) and
             the daily equity curve produced at this discount, stamped with the
-            RESOLVED k — never None.
+            RESOLVED k — never None — the resolved spread_band (None when None
+            was passed) and the population.
+
+    Raises:
+        ValueError: If population is not one of the labels above (a typo would
+            otherwise mislabel a scenario silently), or, from
+            config.time_series_spread_band, if spread_band is not a valid
+            band. Both are caller bugs, checked before any entry is scored.
+        TypeError: From config.time_series_spread_band, for a band that is not
+            a pair of numbers.
     """
+    if population not in _SIMULATION_LABELS:
+        raise ValueError(
+            f"population must be one of {_SIMULATION_LABELS}, got {population!r}"
+        )
+    # The band this run is LABELLED with. config.time_series_spread_band owns
+    # the default and the validation; resolving here (once, before the loop)
+    # also means a bad band fails before any work rather than after it.
+    band_lo, band_hi = time_series_spread_band(spread_band)
     # The discount actually in force, recorded on the result so no caller has
     # to re-derive it from the None sentinel.
     effective_k = TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k
@@ -2721,8 +3389,9 @@ def _simulate_at_discount(
 
     for rec in raw_entries:
         # Group identity and the _find_entry result, exactly as recorded by
-        # _prepare_entries — mA/mB inside the entry may have been swapped
-        # there to canonicalize which leg is A.
+        # _entries_for_band (inside _prepare_entries, or once per band in a
+        # sweep) — mA/mB inside the entry may have been swapped there to
+        # canonicalize which leg is A.
         pair_type = rec["pair_type"]
         canon     = rec["canon"]
         group_key = rec["group_key"]
@@ -3036,6 +3705,15 @@ def _simulate_at_discount(
         # Slippage = realized profit vs. the win-scenario payoff (net vs. net)
         slippage = profit - expected_payoff
 
+        # Reporting-only population labels: market A's event ticker, and
+        # whether the pair is a same-event ladder — through _is_ladder_pair,
+        # the one definition a band sweep's "ladder"/"cross" populations also
+        # split on. Named is_ladder, not same_event_ladder: that name is
+        # scanner's imported ladder helper, which a local would shadow for
+        # this whole function.
+        event_a = mA.get("event_ticker") or ""
+        is_ladder = _is_ladder_pair(c["pair_type"], mA, mB)
+
         trades.append(BacktestTrade(
             pair_type=c["pair_type"],
             ticker_a=mA["ticker"],
@@ -3065,6 +3743,8 @@ def _simulate_at_discount(
             holding_days=c["holding_days"],
             balance_at_entry=checkpoint_cash,
             deadline_gap_days=c["gap_days"],
+            event_ticker=event_a,
+            same_event_ladder=is_ladder,
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
@@ -3078,20 +3758,32 @@ def _simulate_at_discount(
         active_until.append((c["exit_date"], mA["ticker"]))
         active_until.append((c["exit_date"], mB["ticker"]))
 
-    # Named with the RESOLVED discount. A default run emits this line 13 times
-    # — once per swept k — with nothing distinguishing them, so a reader could
-    # not tell which simulation a trade count belonged to, and the primary's
-    # copy appears BEFORE the sweep is even announced (TS-21). effective_k, not
-    # the k argument, so the None sentinel is never printed.
+    # Named with the RESOLVED discount, the resolved band and the population.
+    # A default run emits this line once per swept k, and a band sweep once
+    # per (band, k, population) plus its split-half and ex-top runs, so
+    # without all three a reader could not tell which simulation a trade
+    # count belonged to (TS-21); every prefix up to the ':' is unique within
+    # one sweep — k and band are printed through _exact_label, so an off-grid
+    # value that rounds onto a grid member still prints distinctly.
+    # effective_k and the resolved band, never the arguments, so the None
+    # sentinels are never printed.
     logging.info(
-        "Backtest complete at k=%.3f: %d trades, %d profitable",
-        effective_k,
+        "Backtest complete at k=%s, band %s, %s: %d trades, %d profitable",
+        _exact_label(effective_k, ".3f"),
+        _band_label((band_lo, band_hi)),
+        population,
         len(trades),
         sum(1 for t in trades if t.profit > 0),
     )
 
     equity_df = _build_equity_curve(trades, start_date, initial_balance)
-    return SweepPoint(k=effective_k, trades=trades, equity_df=equity_df)
+    return SweepPoint(
+        k=effective_k, trades=trades, equity_df=equity_df,
+        # The resolved tuple when a band was given, so (0, 1) and (0.0, 1.0)
+        # stamp the same scenario; None stays None ("given no band").
+        spread_band=None if spread_band is None else (band_lo, band_hi),
+        population=population,
+    )
 
 
 # ─── Interval-discount calibration ────────────────────────────────────────────
@@ -3142,7 +3834,10 @@ def _calibration_bucket(
     )
 
 
-def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None:
+def _interval_calibration(
+    raw_entries: list[dict],
+    spread_min: float | None = None,
+) -> IntervalCalibration | None:
     """
     Measure the empirical interval discount k over the prepared entries.
 
@@ -3157,14 +3852,16 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
     pooled and per deadline-gap band, so an operator can compare the hand-set
     constant against what the history did.
 
-    The population is deliberately k-INDEPENDENT: it reads _prepare_entries()'
-    output directly, NOT _simulate_at_discount()'s surviving candidates, so it
-    is NOT filtered by the Kelly gate. Filtering by Kelly would make the
-    estimate circular — the in-between rate would be measured only among the
-    pairs the CURRENT k already liked, so a wrong k would confirm itself.
-    Being k-independent also means one computation is valid for every point of
-    a sweep, which is why BacktestSweep holds one of these rather than each
-    SweepPoint holding its own.
+    The population is deliberately k-INDEPENDENT: it reads the prepared
+    entries directly (_prepare_entries()' output, or one spread band's
+    _entries_for_band() output inside a sweep), NOT _simulate_at_discount()'s
+    surviving candidates, so it is NOT filtered by the Kelly gate. Filtering
+    by Kelly would make the estimate circular — the in-between rate would be
+    measured only among the pairs the CURRENT k already liked, so a wrong k
+    would confirm itself. Being k-independent also means one computation is
+    valid for every k at one band, which is why BacktestSweep holds one of
+    these per band rather than each SweepPoint holding its own. It is not
+    band-independent: a band decides which pairs enter at all.
 
     Two properties of the population to keep in mind when reading the number:
 
@@ -3190,10 +3887,18 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
         compare TIME_SERIES_INTERVAL_PROB_DISCOUNT against.
 
     Args:
-        raw_entries (list[dict]): _prepare_entries() output — one record per
-            pair that produced an entry. Same-title records are ignored: they
+        raw_entries (list[dict]): Prepared entries (_prepare_entries() output,
+            or one band's _entries_for_band() output) — one record per pair
+            that produced an entry. Same-title records are ignored: they
             price on the fixed co-resolution prior and have no in-between cell
             or deadline gap at all.
+        spread_min (float | None): The backtest spread band's FLOOR the
+            entries were detected under, handed to
+            config.min_price_diff_for_gap so each gap band's `tier` is the
+            floor its entries actually cleared — max(tier, spread_min). None
+            (default) labels the deadline-gap tiers alone, which is also what
+            the default band's floor of 0.0 labels. Labelling only: it filters
+            nothing, since the band already acted inside _find_entry.
 
     Returns:
         IntervalCalibration | None: The report, or None when there is nothing
@@ -3260,8 +3965,10 @@ def _interval_calibration(raw_entries: list[dict]) -> IntervalCalibration | None
             # Never hardcode the 0.15/0.30 tiers: read them from the same
             # helper _find_entry and the live scanner select with. A band
             # never straddles the tier boundary (see _CALIBRATION_GAP_BANDS),
-            # so its upper edge names the whole band's tier.
-            min_price_diff_for_gap(hi),
+            # so its upper edge names the whole band's tier. spread_min is the
+            # same band floor _find_entry layered on that tier, so the label
+            # is the floor these entries were actually detected under.
+            min_price_diff_for_gap(hi, spread_min=spread_min),
             band,
         ))
 
@@ -3461,6 +4168,570 @@ def run_backtest(
     return point.trades, point.equity_df
 
 
+def _total_return(point: SweepPoint, initial_balance: float) -> float:
+    """
+    Return a simulated point's total return off its equity curve's last row.
+
+    The same (final − initial) / initial the dashboard's performance card
+    computes from equity_df, so a split-half or excluding-top-event figure is
+    on exactly the footing of the scenario's own return beside it.
+
+    Args:
+        point (SweepPoint): A simulation's result.
+        initial_balance (float): The balance that simulation started from, in
+            dollars.
+
+    Returns:
+        float: The fractional total return — 0.0 for a point with no trades,
+            and 0.0 when initial_balance is 0 (nothing can be sized from it),
+            the same guard the dashboard's per-k table applies to its opening
+            balance, so a zero-balance band sweep cannot raise
+            ZeroDivisionError after its fetch.
+    """
+    if not initial_balance:
+        return 0.0
+    final_value = float(point.equity_df["portfolio_value"].iloc[-1])
+    return (final_value - initial_balance) / initial_balance
+
+
+def _split_date(entries: list[dict], start_date: date) -> date:
+    """
+    Choose the date a band sweep's split-half check splits entries at.
+
+    statistics.median_low of the entry dates, never statistics.median: median
+    AVERAGES the two middle values of an even-length list, which raises
+    TypeError on dates, while median_low returns one of them. The fallback,
+    for a band with no entry at all, is the midpoint of the backtest window
+    [start_date, today UTC] — a date that splits nothing, since there is
+    nothing to split, but one that keeps BacktestSweep.split_date a date.
+
+    median_low is always one of the dates, so H2 (on or after it) is never
+    empty when there is an entry — but H1 (strictly before it) IS empty
+    whenever at least half of the entries share the earliest entry date (one
+    of two is enough); _sweep_from_candidates warns when that happens at the
+    primary band.
+
+    Args:
+        entries (list[dict]): The entries to split — _sweep_from_candidates
+            hands it the primary band's TIME-SERIES entries only.
+        start_date (date): The backtest's start date.
+
+    Returns:
+        date: The split date. H1 is every entry strictly before it, H2 every
+            entry on or after it.
+    """
+    dates = [rec["entry"]["entry_date"] for rec in entries]
+    if dates:
+        return statistics.median_low(dates)
+    # UTC for the same reason _build_equity_curve and the feasibility check
+    # use it (TS-13): the window the backtest simulates ends on today's UTC date.
+    today = datetime.now(UTC).date()
+    return start_date + timedelta(days=max((today - start_date).days, 0) // 2)
+
+
+def _split_halves(entries: list[dict], split_date: date) -> tuple[list[dict], list[dict]]:
+    """
+    Split entries at a band sweep's one split date, keeping their order.
+
+    Args:
+        entries (list[dict]): Prepared entry records (each with
+            ["entry"]["entry_date"]).
+        split_date (date): BacktestSweep.split_date.
+
+    Returns:
+        tuple[list[dict], list[dict]]: (every entry strictly before
+            split_date, every entry on or after it) — either may be empty.
+    """
+    return ([rec for rec in entries if rec["entry"]["entry_date"] < split_date],
+            [rec for rec in entries if rec["entry"]["entry_date"] >= split_date])
+
+
+def _half_split(
+    halves: tuple[list[dict], list[dict]],
+    start_date: date,
+    initial_balance: float,
+    k: float,
+    band: tuple[float, float],
+    population: str = "all",
+) -> HalfSplit:
+    """
+    Simulate each half of one scenario's entries alone and keep three numbers each.
+
+    Args:
+        halves (tuple[list[dict], list[dict]]): The scenario's entries split
+            at BacktestSweep.split_date — (before it, on or after it).
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance EACH half starts from, in dollars
+            — the halves are two independent runs, never one run's two parts.
+        k (float): The scenario's resolved interval discount.
+        band (tuple[float, float]): The scenario's resolved band (a label for
+            the completion lines; the entries already reflect it).
+        population (str): The checked population the halves belong to —
+            "all" (default) or "time_series" — which names the two runs
+            "<population>/H1" and "<population>/H2" on their completion lines,
+            so the two populations' split-half runs never share a prefix.
+
+    Returns:
+        HalfSplit: Each half's total return, trade count and entry count. The
+            halves' equity curves are dropped; an entry count of 0 marks a
+            half whose 0.0 return is not a measurement.
+    """
+    first, second = halves
+    h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
+                               spread_band=band, population=f"{population}/H1")
+    h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
+                               spread_band=band, population=f"{population}/H2")
+    return HalfSplit(
+        h1_return=_total_return(h1, initial_balance),
+        h2_return=_total_return(h2, initial_balance),
+        h1_trades=len(h1.trades),
+        h2_trades=len(h2.trades),
+        h1_entries=len(first),
+        h2_entries=len(second),
+    )
+
+
+def _ex_top_event(
+    point: SweepPoint,
+    entries: list[dict],
+    start_date: date,
+    initial_balance: float,
+    band: tuple[float, float],
+    population: str = "all",
+) -> tuple[str, float] | None:
+    """
+    Measure how much of one scenario's result a single event carried.
+
+    Finds the event whose trades made the largest summed profit on the point
+    (by BacktestTrade.event_ticker — market A's event as traded — ignoring
+    trades with no event ticker, since an unknown event cannot be shown to be
+    one event; ties go to the alphabetically first ticker so the choice is
+    deterministic), then RE-SIMULATES the point's entries without every entry
+    whose market-A event ticker is that event, from the same initial balance
+    at the same k and band. A re-simulation rather than a subtraction of that
+    event's P&L: the remaining trades are re-sized against the cash the
+    removed ones no longer tie up, and a subtraction is not even bounded below
+    by −100%. Measured 2026-09-23 on the DR-73 calibration corpus's same-event
+    ladders alone (no band, k = 0.65, $10,000 from 2020-01-01, 71 trades,
+    +157.3%): without its top event the subtraction reads +2.5% and the
+    re-simulation +14.3%.
+
+    Args:
+        point (SweepPoint): The scenario's "all" or "time_series" point.
+        entries (list[dict]): The entries that point was simulated from.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance the re-simulation starts from.
+        band (tuple[float, float]): The scenario's resolved band (a label).
+        population (str): The point's population — "all" (default) or
+            "time_series" — naming the re-simulation "<population>/ex-top" on
+            its completion line.
+
+    Returns:
+        tuple[str, float] | None: (event ticker, total return without it).
+            None when no trade on the point names an event — there is no
+            event to drop, so no re-simulation runs.
+    """
+    pnl_by_event: dict[str, float] = defaultdict(float)
+    for t in point.trades:
+        if t.event_ticker:
+            pnl_by_event[t.event_ticker] += t.profit
+    if not pnl_by_event:
+        return None
+    # Largest summed profit first; the ticker breaks exact ties.
+    top = min(pnl_by_event, key=lambda ev: (-pnl_by_event[ev], ev))
+    # The same market-A event ticker BacktestTrade.event_ticker records —
+    # entry["mA"] is _find_entry's canonicalized leg, which is the mA
+    # _simulate_at_discount reads — so the trades removed are exactly the
+    # ones counted above (plus any same-event entry the point did not trade).
+    rest = [rec for rec in entries
+            if (rec["entry"]["mA"].get("event_ticker") or "") != top]
+    without = _simulate_at_discount(rest, start_date, initial_balance, k=point.k,
+                                    spread_band=band, population=f"{population}/ex-top")
+    return top, _total_return(without, initial_balance)
+
+
+def _sweep_from_candidates(
+    candidates: _Candidates,
+    initial_balance: float,
+    *,
+    interval_discount: float | None,
+    sweep: bool,
+    spread_band: tuple[float, float] | None,
+    band_sweep: bool,
+) -> BacktestSweep:
+    """
+    Run every entry pass and every simulation of one backtest over one fetch.
+
+    The second half of run_backtest_sweep(): everything after
+    _prepare_candidates(). It runs in two phases so the candle series are
+    held no longer than today's single-band run holds them.
+
+    Phase 1 — entries. The same-title entries are computed ONCE (a same-title
+    pair never reads the band), then, for every band, the time-series
+    entries at that band, announced as "Spread band i/N: <floor>-<ceiling>"
+    with " (primary)" on the primary band. Each band's entries are its
+    time-series entries followed by the shared same-title ones, which is
+    exactly the default _entries_for_band() call's scan order. On a band
+    sweep the no-band band (0.0, 1.0) is scanned FIRST, over every
+    time-series pair, and every other band rescans only the pairs that
+    produced an entry there — each band's accepted Mondays are a subset of
+    the no-band band's (see the comment at the pre-pass), so this changes no
+    band's entries and turns every other band's full scan into a rescan of
+    the few pairs that can enter at all. Then the candles and the pair list
+    are released (candidates.candles_by_ticker and candidates.all_pairs are
+    deleted) before any simulation runs: nothing after Phase 1 reads either,
+    and the simulations are where a band sweep spends its time.
+
+    Phase 2 — simulations. The primary band's calibration is measured and
+    logged exactly as a single-band run always logged it, and the primary
+    (band, k) point is simulated first, so its resolved k can be read back
+    off the point and unioned into the k grid (one resolution — the grid can
+    never disagree with the point it contains). Every band then gets its own
+    calibration (labelled with its own floor) and one "all" simulation per k
+    on the SAME k grid, so a band x k table is rectangular. On a band sweep
+    each (band, k) also gets a standalone "time_series" (ladders and
+    cross-event together, same-title excluded), "ladder" and "cross"
+    simulation for each of those populations that is non-empty at that band
+    (standalone, never sliced out of the "all" run, so return, drawdown and
+    Sharpe are defined for each), and both the "all" and the "time_series"
+    point get the split-half check (SweepPoint.halves, split at ONE date,
+    the median_low of the primary band's time-series entry dates — a WARNING
+    names it when it leaves a half of those entries empty, since the check
+    is then not measurable) and the excluding-top-event check
+    (SweepPoint.ex_top_event). The same-title entries are then simulated
+    alone once (same_title_point).
+
+    The primary point is reused, never re-simulated: it is the same object in
+    points and scenarios. With band_sweep False this is exactly the pre-band
+    single-band sweep — one calibration, one simulation per k, scenarios [],
+    no same_title_point and no split_date — and it logs what that sweep
+    logged, plus the "Spread band 1/1" announcement (run_backtest_sweep adds
+    the band-source line), with the band and population on each completion
+    line.
+
+    Args:
+        candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
+            candles_by_ticker and all_pairs attributes are deleted after
+            Phase 1, so one _Candidates feeds one sweep.
+        initial_balance (float): Simulated starting cash balance in dollars;
+            every scenario, half and re-simulation starts from it.
+        interval_discount (float | None): The primary k, in [0, 1]. None means
+            no override, which config.time_series_profit_prob resolves to
+            TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+        sweep (bool): When True, every band is simulated at every k of
+            config.INTERVAL_DISCOUNT_SWEEP unioned with the primary k; when
+            False, at the primary k alone.
+        spread_band (tuple[float, float] | None): The primary band.
+            run_backtest_sweep() has already resolved and validated it before
+            the fetch; it is resolved again here only so a direct caller (a
+            harness handing in its own _Candidates) gets the same default and
+            validation — a no-op on an already-resolved tuple.
+        band_sweep (bool): When True, sweep every band of
+            config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS
+            (unioned with the primary band) and compute the population,
+            split-half and concentration scenarios; when False, the primary
+            band alone and none of those.
+
+    Returns:
+        BacktestSweep: primary, points (the primary band's k sweep),
+            calibration (the primary band's), label_coverage (carried from
+            candidates), scenarios, same_title_point, calibrations_by_band,
+            same_event_ladders (resolved) and split_date — see BacktestSweep.
+
+    Raises:
+        ValueError: From config.time_series_spread_band, if spread_band is not
+            a valid band.
+        AttributeError: If candidates has already fed a sweep (its
+            all_pairs and candles_by_ticker were deleted) — loud rather than
+            a silent sweep with no pairs and therefore no entries.
+    """
+    start_date = candidates.start_date
+    primary_band = time_series_spread_band(spread_band)
+    # The ladder setting this sweep's pairs were extracted under, resolved the
+    # way _extract_pairs and _find_entry resolve the unresolved flag carried on
+    # candidates (see _Candidates for when those can disagree), for the report.
+    ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS if candidates.same_event_ladders is None
+                   else candidates.same_event_ladders)
+    if band_sweep:
+        # Each grid band through config.time_series_spread_band, so it is
+        # validated and normalised exactly like the primary and a grid band
+        # equal to the primary is the SAME tuple — the union adds no duplicate.
+        grid_bands = {time_series_spread_band((lo, hi))
+                      for lo in SPREAD_BAND_SWEEP_FLOORS
+                      for hi in SPREAD_BAND_SWEEP_CEILINGS}
+        bands = sorted(grid_bands | {primary_band})
+    else:
+        bands = [primary_band]
+
+    # ── Phase 1: every band's entries, then release the candles ─────────────
+    # Same-title entries once: _find_entry never reads the band for them
+    # (pinned by TestFindEntrySpreadBand::test_same_title_is_untouched_at_any_band).
+    st_entries = _entries_for_band(candidates, primary_band, pair_types=("same_title",))
+    if band_sweep:
+        logging.info("Same-title candidate entries (band-independent, computed once): %d",
+                     len(st_entries))
+    # ── The no-band pre-pass (band sweep only) ──────────────────────────────
+    # Every band's accepted Mondays are a SUBSET of the no-band band's, pair by
+    # pair, because a band only ever tightens _find_entry's per-Monday tests:
+    #   * the floor only rises — threshold = min_price_diff_for_gap(gap,
+    #     spread_min=floor) = max(tier, floor) >= tier, the no-band threshold
+    #     (floor 0.0 is inert under every tier);
+    #   * the leg-price-sum ceiling, 1 - threshold, therefore only falls;
+    #   * the spread ceiling only drops (1.0, the no-band ceiling, never fires:
+    #     both YES asks are banded into [0.01, 0.99]);
+    #   * everything else — the leg order, the deadline gap and its cap, the
+    #     horizon, the candle lookups, the live-quote checks and the fee check
+    #     — never reads the band.
+    # Float arithmetic keeps each comparison monotone in the threshold, so no
+    # float edge can admit at a band what no band refused. A pair that
+    # produced NO entry at (0.0, 1.0) therefore produces none at any band, and
+    # rescanning only the pairs that did enter there gives every band exactly
+    # the entries a full scan gives it — in the same order, since the subset
+    # keeps all_pairs' order (pinned against a full scan per band by
+    # TestBandSweepPhaseOneSubset). A single-band run keeps its one full scan.
+    no_band = time_series_spread_band((0.0, 1.0))
+    no_band_entries: list[dict] | None = None
+    rescan: list | None = None
+    if band_sweep:
+        n_ts_pairs = sum(1 for _, pair_type in candidates.all_pairs
+                         if pair_type == "time_series")
+        logging.info("No-band pre-pass: scanning all %d time-series pairs at %s",
+                     n_ts_pairs, _band_label(no_band))
+        no_band_entries = _entries_for_band(candidates, no_band, pair_types=("time_series",))
+        # Matched on the legs' TICKERS, not on object identity: whatever
+        # _find_entry hands back (the legs it was given, possibly swapped),
+        # the two tickers name the pair, and a ticker pair can only ever
+        # OVER-include a pair here (a duplicate is rescanned, never lost).
+        entered = {frozenset((rec["entry"]["mA"]["ticker"], rec["entry"]["mB"]["ticker"]))
+                   for rec in no_band_entries}
+        # A new list — candidates.all_pairs itself is never mutated.
+        rescan = [item for item in candidates.all_pairs
+                  if item[1] == "time_series"
+                  and frozenset((item[0][0]["ticker"], item[0][1]["ticker"])) in entered]
+        logging.info(
+            "No-band pre-pass: %d of %d time-series pairs produced an entry; every "
+            "other band rescans only those", len(rescan), n_ts_pairs)
+
+    entries_by_band: dict[tuple[float, float], list[dict]] = {}
+    for i, band in enumerate(bands, start=1):
+        # Announced BEFORE the pass, so a slow band is attributable while it runs
+        logging.info("Spread band %d/%d: %s%s", i, len(bands), _band_label(band),
+                     " (primary)" if band == primary_band else "")
+        if no_band_entries is not None and band == no_band:
+            # This band's full scan IS the pre-pass — never run it twice.
+            ts_entries = no_band_entries
+        elif rescan is None:
+            # A single-band run: the one full time-series _find_entry pass,
+            # exactly as before the pre-pass existed.
+            ts_entries = _entries_for_band(candidates, band, pair_types=("time_series",))
+        else:
+            # The time-series _find_entry pass at this band — the only
+            # per-band cost of Phase 1 — narrowed to the pairs the pre-pass
+            # proved can enter at all. ts + st is the default call's scan
+            # order.
+            ts_entries = _entries_for_band(candidates, band, pair_types=("time_series",),
+                                           _pairs=rescan)
+        entries_by_band[band] = ts_entries + st_entries
+        if band_sweep:
+            logging.info(
+                "Prepared %d candidate entries for sizing (%d time-series, %d same-title)",
+                len(entries_by_band[band]), len(ts_entries), len(st_entries))
+        else:
+            # A single-band run keeps the pre-band wording byte-for-byte.
+            logging.info("Prepared %d candidate entries for sizing", len(entries_by_band[band]))
+    # Nothing below reads a candle or the pair list. Releasing both here keeps
+    # the peak at a single-band run's entry-pass peak and, like the old
+    # single-band path (whose pair list died with _prepare_entries' locals),
+    # holds no pair tuple through the simulations: the entry dicts carry the
+    # market records they need (mA/mB) and never a candle. Only the scalar
+    # fields — label_coverage, start_date, same_event_ladders — are read after
+    # this point. The pre-pass's rescan list is a list of pair tuples too, so
+    # it goes with them (its entries already live on in entries_by_band).
+    del candidates.candles_by_ticker, candidates.all_pairs
+    del rescan, no_band_entries
+
+    # ── Phase 2: simulations ───────────────────────────────────────────────
+    primary_entries = entries_by_band[primary_band]
+    # Measured from the k-independent entries of the primary band, so it is
+    # valid for every k there and is never filtered by any point's Kelly gate.
+    # Its floor labels the tiers it applied (a no-op at the default floor 0.0).
+    calibration = _interval_calibration(primary_entries, spread_min=primary_band[0])
+    # Reported here rather than inside the measurement, mirroring the
+    # check_shard_coverage / _log_shard_coverage split. Sub-counts inside the
+    # report stay silent at zero, but calibration is None is itself reported
+    # with one explanatory line rather than nothing at all (DR-72). Only the
+    # primary band's is logged: 36 tables would bury it.
+    _log_interval_calibration(calibration)
+
+    # The run's actual result. interval_discount is handed over verbatim —
+    # including the None sentinel — so a no-override run prices identically to
+    # run_backtest(). Announced before it runs, like every swept point below —
+    # its slot used to be unnumbered, so "Sweeping 2/13" was the FIRST counter
+    # a reader saw and slot 1 appeared to be missing (TS-21).
+    logging.info("Simulating the primary interval discount: k = %s",
+                 "config default" if interval_discount is None
+                 else f"{interval_discount:.2f}")
+    primary = _simulate_at_discount(
+        primary_entries, start_date, initial_balance, k=interval_discount,
+        spread_band=primary_band, population="all",
+    )
+    # Read the RESOLVED discount back off the point rather than re-deriving it
+    # from the sentinel: one resolution, so the grid membership below cannot
+    # disagree with the point it is supposed to contain.
+    effective_k = primary.k
+
+    # Union rather than "nearest point": the primary must be an exact member,
+    # so an override that is not on the standard grid still gets its own
+    # entry. sorted() gives the ascending order BacktestSweep.points promises.
+    # The SAME grid for every band, so the band x k table is rectangular.
+    grid = sorted(set(INTERVAL_DISCOUNT_SWEEP) | {effective_k}) if sweep else [effective_k]
+    if band_sweep:
+        logging.info(
+            "Re-simulating prepared entries at %d interval discount(s) across %d "
+            "spread band(s) (primary k = %.3f, primary band %s)",
+            len(grid), len(bands), effective_k, _band_label(primary_band),
+        )
+    elif len(grid) > 1:
+        # A single-band run keeps the pre-band wording byte-for-byte.
+        logging.info(
+            "Re-simulating %d prepared entries at %d interval discounts (primary k = %.3f)",
+            len(primary_entries), len(grid), effective_k,
+        )
+
+    # One split date for every scenario, from the PRIMARY band's entries, so
+    # every cell's halves cover the same two stretches of history — its
+    # TIME-SERIES entries only: the dashboard's banner and heatmap read the
+    # time-series population's halves, and a same-title entry (which neither
+    # the band nor k ever moves) must not be able to move where they split.
+    split_date = None
+    if band_sweep:
+        primary_ts = [rec for rec in primary_entries if rec["pair_type"] == "time_series"]
+        split_date = _split_date(primary_ts, start_date)
+        logging.info("Split-half check: entries before %s vs on or after it", split_date)
+        # median_low is one of the dates, so H1 (strictly before it) is empty
+        # whenever at least half of the entries share the earliest date — and
+        # an empty half's 0.0 return is not a measurement. Said here, once,
+        # for the band every other band is compared against (another band's,
+        # or an "all" point's, halves can also come out empty at this one
+        # date, unwarned); the dashboard blanks each such half and leaves it
+        # out of its correlation.
+        n_h1, n_h2 = (len(half) for half in _split_halves(primary_ts, split_date))
+        empty = " and ".join(name for name, n in (("H1", n_h1), ("H2", n_h2)) if n == 0)
+        if empty:
+            logging.warning(
+                "Split-half check: split date %s leaves %s empty; the split-half check "
+                "is not measurable for this window (primary band %s: %d time-series "
+                "entries before it, %d on or after it)",
+                split_date, empty, _band_label(primary_band), n_h1, n_h2)
+
+    points: list[SweepPoint] = []
+    scenarios: list[SweepPoint] = []
+    calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = {}
+    for bi, band in enumerate(bands, start=1):
+        entries = entries_by_band[band]
+        # The primary's is the object already measured and logged above.
+        calibrations_by_band[band] = (
+            calibration if band == primary_band
+            else _interval_calibration(entries, spread_min=band[0])
+        )
+        if band_sweep:
+            # Standalone populations, split once per band (they are
+            # k-independent subsets) on _is_ladder_pair — the same rule that
+            # labels each trade's same_event_ladder, so a trade and the
+            # population it was simulated in always agree. "time_series" is
+            # ladders + cross-event together, same-title excluded: the
+            # population the band and k actually act on, and the one the
+            # dashboard's heatmap and fragility banner read, so a same-title
+            # result (band- and k-independent) can never dilute them. A
+            # population with no entry at this band is skipped rather than
+            # simulated as an empty scenario.
+            ladder_flags = [_is_ladder_pair(rec["pair_type"], rec["entry"]["mA"],
+                                            rec["entry"]["mB"]) for rec in entries]
+            ts_only = [rec for rec in entries if rec["pair_type"] == "time_series"]
+            populations = [
+                ("time_series", ts_only),
+                ("ladder", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
+                            if is_ladder]),
+                ("cross", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
+                           if rec["pair_type"] == "time_series" and not is_ladder]),
+            ]
+
+            # Both checked populations' halves, at the ONE split date.
+            halves_by_population = {"all": _split_halves(entries, split_date),
+                                    "time_series": _split_halves(ts_only, split_date)}
+            if len(bands) > 1:
+                logging.info("Simulating spread band %d/%d: %s%s (%d entries)",
+                             bi, len(bands), _band_label(band),
+                             " (primary)" if band == primary_band else "", len(entries))
+
+        for ki, point_k in enumerate(grid, start=1):
+            if band == primary_band and point_k == effective_k:
+                # Already simulated; reuse the object so BacktestSweep.primary
+                # and its entries in points and scenarios are one point.
+                point = primary
+            else:
+                # Each non-primary "all" point announces itself here. Its own
+                # completion line — and, on a band sweep, those of its
+                # split-half, ex-top and population runs, which follow it
+                # unannounced — name the k, band and population, so every
+                # completion line is self-describing (TS-21).
+                logging.info("Sweeping interval discount %d/%d: k = %.2f", ki, len(grid), point_k)
+                point = _simulate_at_discount(
+                    entries, start_date, initial_balance, k=point_k,
+                    spread_band=band, population="all",
+                )
+            if band == primary_band:
+                points.append(point)
+            if not band_sweep:
+                continue
+
+            scenarios.append(point)
+            # The two robustness checks, set on the "all" point itself (the
+            # primary included — same object everywhere it is held) and, below,
+            # on the "time_series" point: the dashboard reads the latter's,
+            # and keeps the former's for its own "All" row.
+            point.halves = _half_split(halves_by_population["all"], start_date,
+                                       initial_balance, point_k, band, population="all")
+            point.ex_top_event = _ex_top_event(point, entries, start_date,
+                                               initial_balance, band, population="all")
+            for label, subset in populations:
+                if not subset:
+                    continue
+                pop_point = _simulate_at_discount(
+                    subset, start_date, initial_balance, k=point_k,
+                    spread_band=band, population=label,
+                )
+                if label in _CHECKED_POPULATIONS:
+                    pop_point.halves = _half_split(
+                        halves_by_population[label], start_date, initial_balance,
+                        point_k, band, population=label)
+                    pop_point.ex_top_event = _ex_top_event(
+                        pop_point, subset, start_date, initial_balance, band,
+                        population=label)
+                scenarios.append(pop_point)
+
+    same_title_point = None
+    if band_sweep and st_entries:
+        # Once, not per (band, k): same-title entries never read the band and
+        # price on the fixed co-resolution prior, never on k. Its k is the
+        # primary's and its band None — both nominal.
+        logging.info("Simulating the same-title population once (band- and k-independent)")
+        same_title_point = _simulate_at_discount(
+            st_entries, start_date, initial_balance, k=effective_k,
+            spread_band=None, population="same_title",
+        )
+
+    return BacktestSweep(
+        primary=primary, points=points, calibration=calibration,
+        label_coverage=candidates.label_coverage,
+        scenarios=scenarios,
+        same_title_point=same_title_point,
+        calibrations_by_band=calibrations_by_band,
+        same_event_ladders=ladders,
+        split_date=split_date,
+    )
+
+
 def run_backtest_sweep(
     hist_client: Any,
     live_client,
@@ -3471,39 +4742,51 @@ def run_backtest_sweep(
     interval_discount: float | None = None,
     sweep: bool = True,
     same_event_ladders: bool | None = None,
+    spread_band: tuple[float, float] | None = None,
+    band_sweep: bool = False,
 ) -> BacktestSweep:
     """
-    Replay both pair strategies at one interval discount, or at a grid of them.
+    Replay both pair strategies at one interval discount, or at a grid of them —
+    and, optionally, across a grid of time-series spread bands.
 
     The richer sibling of run_backtest(): same simulation, but it also returns
     the empirical-discount calibration and, by default, one full re-simulation
     per discount on config.INTERVAL_DISCOUNT_SWEEP so a report can offer a k
-    selector without a re-run. run_backtest() is unchanged and remains the
-    two-tuple entry point for every existing caller; this is what backtest.py
-    calls when it needs the sweep payload.
+    selector without a re-run. With band_sweep it additionally crosses every
+    band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
+    that k grid and simulates the time-series (ladders + cross-event),
+    ladder, cross-event and same-title populations, a split-half check and an
+    excluding-top-event check per cell (on the "all" and "time_series"
+    points) — the backtest-only scenario explorer. run_backtest() is unchanged and
+    remains the two-tuple entry point for every existing caller; this is what
+    backtest.py calls when it needs the sweep payload.
 
-    The expensive half runs ONCE: _prepare_entries() (fetch, prefilter,
-    grouping, pair extraction, candlesticks, the _find_entry sweep) holds no
-    probability model, so its output is identical at every discount.
-    _interval_calibration() is computed once from that same output for the
-    same reason. Only _simulate_at_discount() — Kelly gate, dedups, Pass 2,
-    equity curve — is repeated per k, and it must be a full re-simulation
-    rather than a re-score: the Kelly gate precedes the one-pair-per-group
-    dedup, so a different k changes which candidate wins its group, and every
-    surviving candidate then competes for the same simulated cash.
+    It is the composition _prepare_candidates() + _sweep_from_candidates().
+    The expensive half runs ONCE: _prepare_candidates() (fetch, prefilter,
+    grouping, pair extraction, candlesticks) depends on neither the band nor
+    k. Only the _find_entry pass is repeated per band (the band acts there and
+    nowhere else), and only _simulate_at_discount() — Kelly gate, dedups,
+    Pass 2, equity curve — per simulated scenario; it must be a full
+    re-simulation rather than a re-score: the Kelly gate precedes the
+    one-pair-per-group dedup, so a different k changes which candidate wins
+    its group, and every surviving candidate then competes for the same
+    simulated cash. _interval_calibration() is computed once per band.
 
-    The primary point is simulated with the caller's interval_discount passed
-    through verbatim, sentinel included, so with no override it prices exactly
-    as run_backtest() does (k=None is resolved inside
-    config.time_series_profit_prob at call time). Its resolved k is then read
-    back off the point and unioned into the sweep grid, so the primary is
-    always an EXACT grid member — an --interval-discount 0.62 run gets a grid
-    entry at exactly 0.62 rather than the nearest standard point — and it is
-    the same object in points, never a re-simulated copy.
+    The primary point is simulated at the primary band with the caller's
+    interval_discount passed through verbatim, sentinel included, so with no
+    override (and the default band) it prices exactly as run_backtest() does
+    (k=None is resolved inside config.time_series_profit_prob at call time).
+    Its resolved k is then read back off the point and unioned into the sweep
+    grid, so the primary is always an EXACT grid member — an
+    --interval-discount 0.62 run gets a grid entry at exactly 0.62 rather than
+    the nearest standard point — and it is the same object in points (and
+    scenarios), never a re-simulated copy. The primary band is likewise
+    unioned into the band grid.
 
     This function never writes config.py. The calibration it reports is a
-    recommendation for a human to act on, and live sizing keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here.
+    recommendation for a human to act on, live sizing keeps reading
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here,
+    and no live module reads a spread band at all.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -3512,15 +4795,17 @@ def run_backtest_sweep(
         initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap, passed
-            straight through to _prepare_entries(). None applies no cap.
+            straight through to _prepare_candidates(), which carries it to
+            every entry pass. None applies no cap.
         interval_discount (float | None): Interval discount for the primary
             point, in [0, 1]. None (default) means "no override", which
             resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
             live sizing reads.
         sweep (bool): When True (default), also simulate every discount in
             config.INTERVAL_DISCOUNT_SWEEP. When False, points holds the
-            primary alone — the escape hatch for a full-history run where the
-            extra passes are not worth their time.
+            primary alone (and a band sweep simulates each band at the
+            primary k only) — the escape hatch for a full-history run where
+            the extra passes are not worth their time.
         same_event_ladders (bool | None): Whether two dated cumulative rungs
             of ONE event may pair for this run (DR-73). None (the default)
             resolves this module's TIME_SERIES_SAME_EVENT_LADDERS (bound from
@@ -3528,127 +4813,121 @@ def run_backtest_sweep(
             Passing it here is the SUPPORTED way to flip ladders for one
             backtest and needs no monkeypatching at all; patching
             config.TIME_SERIES_SAME_EVENT_LADDERS would be a silent no-op.
-            Passed straight through to
-            _prepare_entries(), so it is k-INDEPENDENT like everything else
+            Passed straight through to _prepare_candidates(), which hands it
+            to pair extraction and carries it, unresolved, to every entry
+            pass, so it is band- and k-INDEPENDENT like everything else
             there: it changes which pairs exist, not how any of them is
-            priced, and therefore applies identically to every swept point.
+            priced, and therefore applies identically to every scenario.
             Like --interval-discount, it never reaches live sizing: nothing
-            here writes config.py.
+            here writes config.py. Its resolved value is recorded on
+            BacktestSweep.same_event_ladders.
+        spread_band (tuple[float, float] | None): The primary scenario's
+            BACKTEST-only time-series spread band (floor, ceiling) on pB − pA.
+            None (default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND —
+            (0.0, 1.0), no band, the live rule. Resolved and validated at the
+            TOP of this function, before anything is logged or fetched, so a
+            bad band fails in milliseconds rather than after the fetch.
+        band_sweep (bool): When True, also sweep every band of the config
+            grid and compute BacktestSweep.scenarios, same_title_point,
+            split_date and every band's calibration. False (default) keeps
+            this the single-band k sweep it always was.
 
     Returns:
-        BacktestSweep: primary (the effective-discount result), points
-            (ascending by k, always containing primary), calibration (None
-            when no time-series candidate was measurable) and label_coverage
-            (the run's outcome-label census, None when the feasibility
-            short-circuit skipped the fetch).
+        BacktestSweep: primary (the effective-discount, primary-band result),
+            points (the primary band's k sweep, ascending, always containing
+            primary), calibration (the primary band's; None when no
+            time-series candidate was measurable), label_coverage (the run's
+            outcome-label census, None when the feasibility short-circuit
+            skipped the fetch), and the band-sweep payload — scenarios,
+            same_title_point, calibrations_by_band, split_date — plus the
+            resolved same_event_ladders (see BacktestSweep).
 
     Raises:
+        ValueError: From config.time_series_spread_band, before any fetch, if
+            spread_band is not a valid band (0 <= floor < ceiling <= 1).
+        TypeError: From config.time_series_spread_band, before any fetch, if
+            spread_band is not a pair of numbers.
         KeyError: Propagates out of the candlestick-fetch pool
             (_fetch_candles_parallel) if a ticker needed by a candidate pair
             was not properly excluded by the eligibility prefilter — a real
             defect rather than a ticker with no price history.
 
     Note:
-        When _prepare_entries()'s Monday feasibility pre-check fails, no
-        simulation is possible at any discount: the result is a sweep holding
-        one empty point (built by the same _simulate_at_discount() call every
-        other point comes from, over an empty entry list, so its shape and its
-        resolved k cannot drift from a real one), calibration=None and
-        label_coverage=None. Callers therefore need no special case for that
-        path.
+        When _prepare_candidates()'s Monday feasibility pre-check fails, no
+        simulation is possible at any discount or band: the result is a sweep
+        holding one empty point (built by the same _simulate_at_discount()
+        call every other point comes from, over an empty entry list, so its
+        shape, its resolved k and its band stamp cannot drift from a real
+        one), calibration=None, label_coverage=None, scenarios=[],
+        calibrations_by_band={} and the resolved same_event_ladders. Callers
+        therefore need no special case for that path.
     """
+    # Resolved and validated FIRST — before anything is logged or fetched: an
+    # invalid band is a caller bug, and it must surface in milliseconds, not
+    # after a multi-hour fetch. config owns the default and the rule.
+    primary_band = time_series_spread_band(spread_band)
+
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
-    # The k-independent half — one fetch, one pairing, one entry sweep, reused
-    # by every point below. None means the feasibility pre-check failed.
-    # label_coverage is the run's outcome-label census, k-independent like the
-    # calibration below and carried on the sweep for the same reason.
     # Logged with its SOURCE, not just its value: a run that reads the config
     # and one that was handed the same value on the command line are different
     # facts about what produced the numbers below, and DR-73's switch is the
     # one input here that changes which PAIRS exist rather than how they are
-    # priced. Resolved for the log only — _prepare_entries takes the sentinel
-    # verbatim and resolves it itself, so there is exactly one resolution that
-    # the run actually depends on.
+    # priced. Resolved for the log (and the infeasible return) only —
+    # _prepare_candidates takes the sentinel verbatim and resolves it itself,
+    # so there is exactly one resolution that the run actually depends on.
+    ladders = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
+               else same_event_ladders)
     logging.info(
         "Same-event deadline ladders (DR-73): %s (%s)",
-        "on" if (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
-                 else same_event_ladders) else "off",
+        "on" if ladders else "off",
         "config.TIME_SERIES_SAME_EVENT_LADDERS" if same_event_ladders is None
         else "run-level override",
     )
-    raw_entries, label_coverage = _prepare_entries(
+    # The same idiom for the band: the resolved value and where it came from,
+    # so a report can never be read as the default band when it was not.
+    logging.info(
+        "Time-series spread band (backtest only): %s (%s); band sweep %s",
+        _band_label(primary_band),
+        "config.BACKTEST_DEFAULT_SPREAD_BAND" if spread_band is None
+        else "run-level override",
+        "on" if band_sweep else "off",
+    )
+
+    # The band- and k-independent half — one fetch, one pairing, one candle
+    # fetch, reused by every band and every point below. None means the
+    # feasibility pre-check failed. The ladder flag rides through unresolved
+    # and is carried on the result to every entry pass (DR-73c).
+    candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders,
     )
-    if raw_entries is None:
-        # Nothing can be simulated at any discount. Build the empty point
-        # through the normal path (an empty entry list yields no trades and a
-        # flat curve) so it resolves the discount sentinel and shapes its
-        # equity curve exactly as every other point does.
+    if candidates is None:
+        # Nothing can be simulated at any discount or band. Build the empty
+        # point through the normal path (an empty entry list yields no trades
+        # and a flat curve) so it resolves the discount sentinel, stamps the
+        # band and shapes its equity curve exactly as every other point does.
         empty = _simulate_at_discount(
-            [], start_date, initial_balance, k=interval_discount
+            [], start_date, initial_balance, k=interval_discount,
+            spread_band=primary_band,
         )
         # label_coverage is None on this path by construction — the fetch was
         # skipped, so nothing was censused. The dashboard renders that as "not
-        # measured" rather than as healthy coverage.
+        # measured" rather than as healthy coverage, and it is what tells an
+        # empty scenarios list here apart from a band sweep that was off.
         return BacktestSweep(primary=empty, points=[empty], calibration=None,
-                             label_coverage=None)
+                             label_coverage=None, scenarios=[],
+                             calibrations_by_band={},
+                             same_event_ladders=bool(ladders))
 
-    # Measured from the k-independent entries, so it is valid for every point
-    # below and is never filtered by any point's Kelly gate.
-    calibration = _interval_calibration(raw_entries)
-    # Reported here rather than inside the measurement, mirroring the
-    # check_shard_coverage / _log_shard_coverage split. Sub-counts inside the
-    # report stay silent at zero, but calibration is None is itself now
-    # reported with one explanatory line rather than nothing at all (DR-72).
-    _log_interval_calibration(calibration)
-
-    # The run's actual result. interval_discount is handed over verbatim —
-    # including the None sentinel — so a no-override run prices identically to
-    # run_backtest().
-    # Announced before it runs, like every swept point below — its slot used to
-    # be unnumbered, so "Sweeping 2/13" was the FIRST counter a reader saw and
-    # slot 1 appeared to be missing (TS-21). The index is filled in after the
-    # grid is known, below; this line names the run's own discount.
-    logging.info("Simulating the primary interval discount: k = %s",
-                 "config default" if interval_discount is None
-                 else f"{interval_discount:.2f}")
-    primary = _simulate_at_discount(
-        raw_entries, start_date, initial_balance, k=interval_discount
+    # Every entry pass and every simulation. It deletes the candle series and
+    # the pair list itself once the last entry pass is done (before any
+    # simulation), so holding `candidates` here pins neither.
+    return _sweep_from_candidates(
+        candidates, initial_balance,
+        interval_discount=interval_discount, sweep=sweep,
+        spread_band=primary_band, band_sweep=band_sweep,
     )
-    # Read the RESOLVED discount back off the point rather than re-deriving it
-    # from the sentinel: one resolution, so the grid membership below cannot
-    # disagree with the point it is supposed to contain.
-    effective_k = primary.k
-
-    # Union rather than "nearest point": the primary must be an exact member,
-    # so an override that is not on the standard grid still gets its own
-    # entry. sorted() gives the ascending order BacktestSweep.points promises.
-    grid = sorted(set(INTERVAL_DISCOUNT_SWEEP) | {effective_k}) if sweep else [effective_k]
-
-    if len(grid) > 1:
-        logging.info(
-            "Re-simulating %d prepared entries at %d interval discounts (primary k = %.3f)",
-            len(raw_entries), len(grid), effective_k,
-        )
-
-    points: list[SweepPoint] = []
-    for i, point_k in enumerate(grid, start=1):
-        if point_k == effective_k:
-            # Already simulated; reuse the object so BacktestSweep.primary and
-            # its entry in points are the same point, not two equal ones.
-            points.append(primary)
-            continue
-        # Each point announces itself here and _simulate_at_discount then names
-        # the same k on its completion line, so the two bracket one simulation.
-        logging.info("Sweeping interval discount %d/%d: k = %.2f", i, len(grid), point_k)
-        points.append(_simulate_at_discount(
-            raw_entries, start_date, initial_balance, k=point_k
-        ))
-
-    return BacktestSweep(primary=primary, points=points, calibration=calibration,
-                         label_coverage=label_coverage)
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────
@@ -3684,8 +4963,10 @@ def _build_equity_curve(
     _fetch_candles_parallel requests each leg's WHOLE hourly series (start_date
     midnight UTC through one day past that market's close) and disk-caches it
     per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
-    entry-checkpoint prices only, so candles_by_ticker is a local that dies with
-    _prepare_entries, and mark-to-market means threading a per-day series
+    entry-checkpoint prices only, so candles_by_ticker lives on the _Candidates
+    object only until the last entry pass (it dies with _prepare_entries on
+    run_backtest's path, and _sweep_from_candidates deletes it before its first
+    simulation), and mark-to-market means threading a per-day series
     through raw_entries and _simulate_at_discount into this function and
     deciding what to carry on a day a leg has no candle at all. Cost-basis carry
     is the minimal change that makes the derived metrics mean what their labels
