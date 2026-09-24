@@ -5,18 +5,26 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Generates a self-contained interactive HTML performance dashboard from the
-    results of a backtest run. Assembles seven sections — portfolio performance
+    results of a backtest run. Assembles eight sections — portfolio performance
     (equity curve, Sharpe, drawdown), returns decomposition (by month, category,
     entry price), calibration analysis (Brier score, reliability diagram),
     interval-discount (k) calibration (empirical k-hat plus a native Plotly
-    dropdown that switches the equity curve between the swept k values), trade-
-    level diagnostics (distribution, slippage, best/worst trades), risk metrics
-    (Kelly sizing scatter, capital deployment), and benchmark comparison (S&P 500
-    via yfinance) — into a single HTML file with embedded Plotly charts. The file
+    dropdown that switches the equity curve between the swept k values), a
+    scenario explorer (a fragility banner, a spread-band x k heatmap and a
+    per-population KPI table over BacktestSweep.scenarios, with two <select>s
+    and a short inline script driving a Plotly.restyle'd equity curve — a
+    native updatemenus dropdown cannot express two independent axes of
+    selection), trade-level diagnostics
+    (distribution, slippage, best/worst trades), risk metrics (Kelly sizing
+    scatter, capital deployment), and benchmark comparison (S&P 500 via
+    yfinance) — into a single HTML file with embedded Plotly charts. The file
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
 Dependencies:
-    Imports BacktestSweep and BacktestTrade from backtester.py, and PROJECT_ROOT,
+    Imports BacktestSweep, BacktestTrade, OutcomeLabelCoverage and SweepPoint
+    from backtester.py, plus its _exact_label() — the injective float formatter
+    its completion lines use, reused so no two scenario-explorer labels can
+    collide — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
@@ -42,12 +50,33 @@ Notes:
     The interval-discount section's k selector is a NATIVE Plotly `updatemenus`
     dropdown over one trace per swept k — no extra dependency and no hand-rolled
     JavaScript, so it works inside the same self-contained page every other
-    chart renders into. Its scope is deliberately that one section: the other
-    six always reflect the run's primary k (the CLI's --interval-discount, or
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed).
+    chart renders into. Its scope is deliberately that one section: the
+    scenario-explorer section (below) carries its own independent band/k
+    selectors, and the remaining six sections always reflect the run's primary
+    k (the CLI's --interval-discount, or config.TIME_SERIES_INTERVAL_PROB_DISCOUNT
+    when it was not passed).
+
+    The scenario-explorer section's band x k grid is too large, and its two
+    axes of selection too independent, for the same native-dropdown idiom: a
+    Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE a
+    trace's data wholesale from a fixed list baked in at render time, not
+    combine two independently-chosen indices into one lookup. It therefore
+    carries its own small (~80-line) inline vanilla-JS script that reads one
+    `<script type="application/json">` data block and drives a `Plotly.restyle`
+    call plus two plain HTML table re-renders — no new dependency, and no
+    hand-rolled charting: Plotly still owns every pixel that gets drawn.
+
+    The page header names the run's primary spread band and its same-event
+    ladder setting (DR-73) under the Period line, or "not recorded" when the
+    run passed no sweep: both decide which pairs exist, so, like DR-66b's
+    strike-blind notice, they qualify every section rather than only the
+    explorer.
 """
 import html
+import json
 import logging
+import math
+from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -57,7 +86,13 @@ import plotly.graph_objects as go
 import yfinance as yf
 from plotly.subplots import make_subplots
 
-from .backtester import BacktestSweep, BacktestTrade, OutcomeLabelCoverage
+from .backtester import (
+    BacktestSweep,
+    BacktestTrade,
+    OutcomeLabelCoverage,
+    SweepPoint,
+    _exact_label,
+)
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
@@ -357,7 +392,7 @@ def _kpi(label: str, value: str, color: str = "#212121") -> str:
     return _KPI_TEMPLATE.format(label=label, value=value, color=color)
 
 
-def _fig_html(fig: go.Figure, height: int = 400) -> str:
+def _fig_html(fig: go.Figure, height: int = 400, div_id: str | None = None) -> str:
     """
     Apply a standard layout to a Plotly figure and return it as an inline HTML string.
 
@@ -368,6 +403,13 @@ def _fig_html(fig: go.Figure, height: int = 400) -> str:
     Args:
         fig (go.Figure): Plotly figure to render.
         height (int): Desired figure height in pixels. Defaults to 400.
+        div_id (str | None): Optional fixed id for the figure's wrapping <div>,
+            passed straight through to Plotly's own to_html(). None (default)
+            lets Plotly generate its usual random UUID id — the same behaviour
+            every pre-existing caller of this helper still gets. A caller that
+            needs to drive the figure from separate client-side JS (the
+            scenario-explorer section's Plotly.restyle calls) passes a fixed
+            id here instead of scraping a random one out of the rendered HTML.
 
     Returns:
         str: HTML string fragment (no <html>/<body> wrapper, no Plotly.js script tag).
@@ -380,7 +422,10 @@ def _fig_html(fig: go.Figure, height: int = 400) -> str:
         font={"family": "sans-serif", "size": 12},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
     )
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    kwargs = {"full_html": False, "include_plotlyjs": False}
+    if div_id is not None:
+        kwargs["div_id"] = div_id
+    return fig.to_html(**kwargs)
 
 
 # ─── Section 1: Portfolio Performance ────────────────────────────────────────
@@ -1092,7 +1137,742 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     )
 
 
-# ─── Section 5: Trade-Level Diagnostics ──────────────────────────────────────
+# ─── Section 5: Scenario Explorer ────────────────────────────────────────────
+
+# Above this many rows, a scenario's equity curve is embedded at one point per
+# calendar week instead of one per day (see _equity_axis). A band sweep embeds
+# one curve per band x k cell, so on a multi-year window the curves, not the
+# metrics, are what decides the page size.
+_EQUITY_DAILY_MAX_ROWS = 400
+
+# The standalone populations one band x k cell can carry, in the ORDER the
+# page's data block indexes them by (it ships this tuple as "populations", and
+# the inline script resolves names through it rather than hard-coding
+# positions).
+_SCENARIO_POPULATIONS = ("all", "ladder", "cross")
+
+
+def _row_label(band: tuple[float, float]) -> str:
+    """
+    Render a resolved spread band as a heatmap row / band <select> label.
+
+    Spells the floor as "max(tier,<floor>)" rather than the bare floor,
+    because the band's floor only ever applies ON TOP OF the deadline-gap tier
+    (config.min_price_diff_for_gap(gap_days, spread_min=...)): a floor at or
+    below both tiers (0.15, 0.30) is inert for every pair, and a bare
+    "0.2-0.6" would hide that. Each bound goes through
+    backtester._exact_label — the same injective formatter the completion
+    lines use — so two DIFFERENT bands can never share a label. That matters
+    here more than in a log: the heatmap's y axis is categorical, and Plotly
+    merges equal category labels into one row.
+
+    Args:
+        band (tuple[float, float]): A (floor, ceiling) already resolved by
+            config.time_series_spread_band.
+
+    Returns:
+        str: "max(tier,<floor>)-<ceiling>", e.g. "max(tier,0.3)-0.6".
+    """
+    lo, hi = band
+    return f"max(tier,{_exact_label(lo, 'g')})-{_exact_label(hi, 'g')}"
+
+
+def _k_label(k: float) -> str:
+    """
+    Render an interval discount as a heatmap column / k <select> label.
+
+    Two decimals for every grid member ("k = 0.65"), but through
+    backtester._exact_label, so an off-grid primary within a rounding of a
+    grid member (--interval-discount 0.651 beside the grid's 0.65) prints
+    exactly ("k = 0.651") instead of repeating the member's label. The
+    heatmap's x axis is categorical: two equal labels would merge two columns,
+    shift every later column under the wrong label and drop the last one.
+
+    Args:
+        k (float): A resolved interval discount.
+
+    Returns:
+        str: "k = <k>", distinct for every distinct k.
+    """
+    return f"k = {_exact_label(k, '.2f')}"
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float | None:
+    """
+    Spearman rank correlation of two paired samples, ties at average rank.
+
+    Computed as the Pearson correlation of the two samples' average ranks,
+    which is Spearman's definition with ties — the same value
+    scipy.stats.spearmanr returns (tests/test_dashboard.py checks it against
+    scipy directly). Done by hand only so a constant sample yields None here
+    rather than scipy's NaN plus a ConstantInputWarning.
+
+    Args:
+        xs (list[float]): First sample.
+        ys (list[float]): Second sample, paired positionally with xs.
+
+    Returns:
+        float | None: The correlation in [-1, 1], or None when the lengths
+            disagree, fewer than two pairs have BOTH values finite (pairs with
+            a non-finite member are dropped, never ranked), either sample is
+            constant over those pairs (its ranks have zero variance, so the
+            ratio is undefined), or the result is itself non-finite.
+    """
+    if len(xs) != len(ys):
+        return None
+    pairs = [(x, y) for x, y in zip(xs, ys, strict=True)
+             if x is not None and y is not None and math.isfinite(x) and math.isfinite(y)]
+    if len(pairs) < 2:
+        return None
+    rx = pd.Series([x for x, _ in pairs]).rank()
+    ry = pd.Series([y for _, y in pairs]).rank()
+    if rx.std() == 0 or ry.std() == 0:
+        return None
+    corr = rx.corr(ry)
+    return float(corr) if corr is not None and math.isfinite(corr) else None
+
+
+def _json_safe(obj):
+    """
+    Recursively replace non-finite floats with None so a payload can be
+    serialised with json.dumps(..., allow_nan=False).
+
+    A browser's JSON.parse() has no representation for NaN/Infinity — Python's
+    json module emits the bare (invalid-JSON) tokens NaN/Infinity/-Infinity
+    for them unless allow_nan=False, which then RAISES instead of silently
+    emitting unparseable output. This walks the payload first so the raise
+    never fires on a legitimately non-finite metric (a NaN in an equity curve,
+    a zero-variance Sharpe denominator, ...) — those render as JS `null`, which
+    every reader in the inline script renders as an em dash.
+
+    Args:
+        obj: Any JSON-serialisable structure (nested dicts/lists/tuples of
+            str/int/float/bool/None).
+
+    Returns:
+        The same structure with every non-finite float replaced by None.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _equity_axis(eq: pd.DataFrame | None) -> pd.DatetimeIndex:
+    """
+    Decide, ONCE, the date axis every scenario's curve is embedded on.
+
+    Called on the primary scenario's curve. Every scenario of one run spans
+    the same calendar (backtester._build_equity_curve always runs from
+    start_date - 1 to "today"), so one axis serves them all and the page ships
+    one shared date array — but "today" is read per simulation, so a band
+    sweep that crosses 00:00 UTC hands later scenarios one more row than the
+    primary. Deciding the axis here, and placing every curve on it by DATE
+    (_curve_on_axis), is what keeps such a cell from being drawn against the
+    wrong dates — including across the downsampling threshold, where a
+    per-curve decision would put a weekly curve on a daily axis.
+
+    At or below _EQUITY_DAILY_MAX_ROWS rows the axis is every date. Above it,
+    it is the LAST OBSERVED date of each calendar week, plus the curve's
+    opening row (the untouched initial balance DR-03 anchors every curve on),
+    so no point is dated past the curve's real end — a 2,459-row curve
+    becomes 353 points, about a seventh.
+
+    Args:
+        eq (pd.DataFrame | None): The primary scenario's equity curve, columns
+            [date, portfolio_value, daily_return], or None / empty.
+
+    Returns:
+        pd.DatetimeIndex: The axis, ascending; empty when eq is None or empty.
+    """
+    if eq is None or eq.empty:
+        return pd.DatetimeIndex([])
+    idx = pd.DatetimeIndex(pd.to_datetime(eq["date"])).unique().sort_values()
+    if len(idx) <= _EQUITY_DAILY_MAX_ROWS:
+        return idx
+    positions = pd.Series(np.arange(len(idx)), index=idx)
+    week_ends = positions.groupby(idx.to_period("W")).max().to_numpy()
+    keep = np.union1d([0], week_ends)
+    return idx[keep]
+
+
+def _curve_on_axis(eq: pd.DataFrame | None, axis: pd.DatetimeIndex) -> list[float | None]:
+    """
+    Place one scenario's equity curve on the shared axis, by date, in cents.
+
+    Values are rounded to cents: a portfolio value is a dollar amount, the
+    curve is display-only, and a full-precision float (~19 characters) instead
+    of a cents one (~8) roughly doubles the page's dominant term on a long
+    band sweep. A date the curve does not have — or a non-finite value — is
+    None (a gap in the line, JS null), never a neighbour's value shifted into
+    its slot.
+
+    Args:
+        eq (pd.DataFrame | None): One scenario's equity curve, or None / empty.
+        axis (pd.DatetimeIndex): The shared axis from _equity_axis.
+
+    Returns:
+        list[float | None]: One value per axis date; [] when eq is None or
+            empty or the axis is empty.
+    """
+    if eq is None or eq.empty or len(axis) == 0:
+        return []
+    s = pd.Series(eq["portfolio_value"].to_numpy(dtype=float),
+                  index=pd.DatetimeIndex(pd.to_datetime(eq["date"])))
+    s = s[~s.index.duplicated(keep="last")]
+    return [round(float(v), 2) if math.isfinite(v) else None
+            for v in s.reindex(axis).to_numpy(dtype=float)]
+
+
+def _point_kpis(point: SweepPoint) -> dict:
+    """
+    Compute one standalone SweepPoint's KPI-table row.
+
+    Every field is derived from the point's OWN trades and OWN equity curve,
+    never sliced out of a joint run: a band sweep's "ladder" and "cross"
+    points and the same-title point are each their own simulation from the
+    initial balance, and only a simulation that ran alone has a return, a
+    drawdown or a Sharpe of its own — slicing the joint "all" run's trades by
+    population would give a P&L sum with no curve behind it.
+
+    Args:
+        point (SweepPoint): One simulated scenario, band sweep or not.
+
+    Returns:
+        dict: {trades, win_rate, mean_per_trade, total_return, final_balance,
+            max_drawdown, sharpe, sortino}. win_rate counts trades with
+            profit STRICTLY above zero. mean_per_trade is the mean of
+            BacktestTrade.profit_ratio, which the backtester defines as
+            profit / (total_cost + fees) — the return on each trade's own
+            fee-inclusive stake, equal-weighted across trades. Sharpe and
+            Sortino are annualised on the calendar-day base (365), like every
+            other figure computed on a strategy curve. Every value is None
+            where the underlying quantity is undefined (no trades, or an
+            empty/absent equity curve) rather than a misleading 0.0.
+    """
+    trades = point.trades
+    n = len(trades)
+    win_rate = (sum(1 for t in trades if t.profit > 0) / n) if n else None
+    mean_per_trade = float(np.mean([t.profit_ratio for t in trades])) if n else None
+    eq = point.equity_df
+    if eq is None or eq.empty:
+        total_return = final_balance = max_dd = sharpe = sortino = None
+    else:
+        # Same base as _section_interval_discount's _srow: the curve's OWN
+        # opening row, always the untouched initial balance (DR-03), so this
+        # figure never disagrees with the run's own performance card.
+        opening = float(eq["portfolio_value"].iloc[0])
+        final_balance = float(eq["portfolio_value"].iloc[-1])
+        total_return = (final_balance - opening) / opening if opening else None
+        max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
+        sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else None
+        sortino = _sortino(eq["daily_return"]) if "daily_return" in eq else None
+    return {
+        "trades": n, "win_rate": win_rate, "mean_per_trade": mean_per_trade,
+        "total_return": total_return, "final_balance": final_balance,
+        "max_drawdown": max_dd, "sharpe": sharpe, "sortino": sortino,
+    }
+
+
+def _all_point_extras(point: SweepPoint) -> dict:
+    """
+    Compute the extra fields only an "all"-population point carries.
+
+    Args:
+        point (SweepPoint): An "all"-population point (band sweep or not).
+
+    Returns:
+        dict: {h1_return, h2_return} read off point.halves (None when halves
+            was never computed — a run without the band sweep), and
+            {top_event, top_event_share, ex_top_return}. top_event and
+            ex_top_return are read straight off point.ex_top_event — the event
+            and the return of a RE-SIMULATION without its entries — never
+            re-derived. top_event_share is that event's summed profit divided
+            by the sum of every event's POSITIVE summed profit: that
+            denominator stays positive, and the share stays in (0, 1], even
+            when the run as a whole lost money (a raw net-P&L denominator
+            would be negative or near zero there). None when no event has
+            positive P&L. All three are None when ex_top_event is None (not
+            a band-sweep point, or no trade on the point names an event).
+    """
+    h1 = point.halves.h1_return if point.halves is not None else None
+    h2 = point.halves.h2_return if point.halves is not None else None
+    top_name = top_share = ex_top_return = None
+    if point.ex_top_event is not None:
+        top_name, ex_top_return = point.ex_top_event
+        # Same grouping _ex_top_event itself uses (BacktestTrade.event_ticker,
+        # market A's event as traded), recomputed here only for the SHARE this
+        # carrier does not keep.
+        pnl_by_event: dict[str, float] = defaultdict(float)
+        for t in point.trades:
+            if t.event_ticker:
+                pnl_by_event[t.event_ticker] += t.profit
+        positive_sum = sum(v for v in pnl_by_event.values() if v > 0)
+        top_pnl = pnl_by_event.get(top_name, 0.0)
+        top_share = (top_pnl / positive_sum) if positive_sum > 0 else None
+    return {
+        "h1_return": h1, "h2_return": h2,
+        "top_event": top_name, "top_event_share": top_share,
+        "ex_top_return": ex_top_return,
+    }
+
+
+# The inline script the scenario explorer drives its selects with. A raw
+# string, so the — escapes reach the browser as JS escapes. It reads ONE
+# JSON block (id="scn-data") and writes only through textContent-escaped HTML
+# and Plotly.restyle — it draws nothing itself.
+_SCENARIO_EXPLORER_JS = r"""
+<script>
+(function() {
+  var data = JSON.parse(document.getElementById('scn-data').textContent);
+  var bandSel = document.getElementById('scn-band-select');
+  var kSel = document.getElementById('scn-k-select');
+  // Population name -> its index in every cell's array.
+  var P = {};
+  data.populations.forEach(function(name, i) { P[name] = i; });
+
+  function isNum(x) { return typeof x === 'number' && isFinite(x); }
+  function fmtPct(x) { return isNum(x) ? (x * 100).toFixed(1) + '%' : '—'; }
+  function fmtFixed(x, d) { return isNum(x) ? x.toFixed(d) : '—'; }
+  function fmtInt(x) { return isNum(x) ? String(x) : '—'; }
+  function fmtMoney(x) {
+    return isNum(x)
+      ? '$' + x.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+      : '—';
+  }
+  // Every data-sourced STRING goes through this before innerHTML: the top
+  // event's ticker is Kalshi-controlled (BacktestTrade.event_ticker), and
+  // escaping the backtester's own bucket labels too costs nothing.
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+  var TD = '<td style="padding:6px 16px;">';
+
+  function kpiRow(label, k) {
+    k = k || {};
+    return '<tr style="border-bottom:1px solid #E0E0E0">' + TD + label + '</td>'
+      + TD + fmtInt(k.trades) + '</td>' + TD + fmtPct(k.win_rate) + '</td>'
+      + TD + fmtPct(k.mean_per_trade) + '</td>' + TD + fmtPct(k.total_return) + '</td>'
+      + TD + fmtMoney(k.final_balance) + '</td>' + TD + fmtPct(k.max_drawdown) + '</td>'
+      + TD + fmtFixed(k.sharpe, 2) + ' / ' + fmtFixed(k.sortino, 2) + '</td></tr>';
+  }
+
+  // The All row's split-half and concentration figures, on a sub-row of it.
+  function allExtrasRow(a) {
+    var line = '—';
+    if (a) {
+      line = 'H1 return: ' + fmtPct(a.h1_return) + ' | H2 return: ' + fmtPct(a.h2_return);
+      if (a.top_event) {
+        line += ' | Top event: ' + esc(a.top_event) + ' (' + fmtPct(a.top_event_share)
+          + ' of positive event P&amp;L) | return re-simulated without it: '
+          + fmtPct(a.ex_top_return);
+      }
+    }
+    return '<tr style="border-bottom:1px solid #E0E0E0;font-size:13px;color:#616161;">'
+      + TD + '</td><td colspan="7" style="padding:4px 16px 8px;">' + line + '</td></tr>';
+  }
+
+  function calRows(rows) {
+    if (!rows || !rows.length) {
+      return '<p style="font-family:sans-serif;font-size:14px;color:#616161;">'
+        + 'No time-series candidate was measurable at this band.</p>';
+    }
+    var th = '<th style="padding:8px 16px;">';
+    var t = '<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;'
+      + 'margin:16px 0; width:auto;"><tr style="background:#E3F2FD; font-weight:bold;">'
+      + th + 'Gap bucket</th>' + th + 'Tier</th>' + th + 'n</th>'
+      + th + 'Realised in-between rate</th>' + th + 'Mean implied gap</th>'
+      + th + 'k&#770;</th></tr>';
+    rows.forEach(function(r) {
+      t += '<tr style="border-bottom:1px solid #E0E0E0">'
+        + TD + esc(r.label) + '</td>' + TD + fmtFixed(r.tier, 2) + '</td>'
+        + TD + fmtInt(r.n) + '</td>' + TD + fmtFixed(r.realised_rate, 4) + '</td>'
+        + TD + fmtFixed(r.mean_implied, 4) + '</td>' + TD + fmtFixed(r.empirical_k, 3) + '</td>'
+        + '</tr>';
+    });
+    return t + '</table>';
+  }
+
+  function render() {
+    var bi = parseInt(bandSel.value, 10), ki = parseInt(kSel.value, 10);
+    var cell = data.cells[bi][ki];
+    var all = cell[P.all];
+    document.getElementById('scn-kpi-body').innerHTML =
+      kpiRow('All', all) + allExtrasRow(all)
+      + kpiRow('Ladders', cell[P.ladder]) + kpiRow('Cross-event', cell[P.cross])
+      + kpiRow('Same-title (independent of band and k)', data.same_title);
+    document.getElementById('scn-cal-body').innerHTML = calRows(data.calibration_by_band[bi]);
+
+    // Every curve is already on the shared date axis (data.dates), so x is
+    // the axis itself, never a slice of it.
+    var values = (all && all.equity) ? all.equity : [];
+    if (window.Plotly && document.getElementById('scn-equity')) {
+      Plotly.restyle('scn-equity', {x: [values.length ? data.dates : []], y: [values]});
+    }
+  }
+
+  bandSel.addEventListener('change', render);
+  kSel.addEventListener('change', render);
+  render();
+})();
+</script>
+"""
+
+
+def _scenario_explorer_empty_reason(sweep: BacktestSweep) -> str:
+    """
+    Name why a non-None sweep still has no scenarios to show.
+
+    Args:
+        sweep (BacktestSweep): A sweep whose .scenarios is empty.
+
+    Returns:
+        str: One of two causes, told apart by label_coverage. It is None only
+            on the Monday-feasibility short-circuit (run_backtest_sweep()'s
+            infeasible-window branch, which censuses nothing) or on a
+            hand-built sweep that never had one; every FEASIBLE run carries a
+            real census, even over an empty corpus (OutcomeLabelCoverage with
+            total=0), so a present census means the window was fine and the
+            band sweep was simply not requested. The band-sweep cause names
+            both the operator's CLI switch and the keyword it sets.
+    """
+    if sweep.label_coverage is None:
+        return "infeasible window (no trades and no census)"
+    return "band sweep off (--no-band-sweep / band_sweep=False)"
+
+
+def _run_settings_html(sweep: BacktestSweep | None) -> str:
+    """
+    Render the page-header line naming the run's primary spread band and ladder setting.
+
+    Both settings decide WHICH PAIRS EXIST — the band filters every
+    time-series entry and the same-event ladder switch (DR-73) admits or
+    refuses a whole pair population — so, like DR-66b's strike-blind notice,
+    they taint every section of the page, not only the scenario explorer, and
+    belong in the header a reader sees before any figure. "not recorded" is
+    printed rather than a guess whenever the sweep does not carry the value
+    (no sweep at all — the four-positional generate_dashboard call — or a
+    hand-built sweep).
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+
+    Returns:
+        str: One <p> line: "Primary spread band: <label> | same-event
+            ladders: on / off / not recorded".
+    """
+    band = ladders = "not recorded"
+    if sweep is not None:
+        if sweep.primary.spread_band is not None:
+            band = _row_label(sweep.primary.spread_band)
+        if sweep.same_event_ladders is True:
+            ladders = "on"
+        elif sweep.same_event_ladders is False:
+            ladders = "off"
+    return (
+        '<p style="color:#616161; font-size:14px;">'
+        f"Primary spread band: {html.escape(band)} | same-event ladders: {ladders}</p>"
+    )
+
+
+def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
+    """
+    Build the "Scenario Explorer" HTML section.
+
+    Renders BacktestSweep.scenarios — every (spread band, k) cell of a band
+    sweep, each with standalone "all" / "ladder" / "cross" simulations — so
+    that choosing a band and k from a backtest happens with the grid's
+    fragility on screen rather than from one flattering cell. In order:
+
+      1. A fragility banner, first: how many band x k cells were computed,
+         the share with a positive total return, the split-half rank
+         correlation (Spearman) of the cells' H1 vs H2 returns, and the
+         sentence this section exists to put on the page — the best of that
+         many correlated cells overstates what a reader should expect.
+      2. A band (row) x k (column) heatmap with a native Plotly `updatemenus`
+         metric toggle: mean per trade (the default), total return, H1
+         return, H2 return and trade count. Each button is an "update" — it
+         swaps the trace's z, colour scale and hover format AND the chart
+         title together (a "restyle" button's second argument is read as
+         trace indices, so a title placed there would be silently dropped).
+         Row labels read "max(tier,<floor>)-<ceiling>" (_row_label).
+      3. Two <select>s (band, k), preselected to the primary scenario and
+         marked "(primary)", driving — through the small inline script
+         _SCENARIO_EXPLORER_JS — a KPI table with one row per population
+         (All, with a sub-row of its H1/H2 and top-event figures; Ladders;
+         Cross-event; Same-title, which is independent of band and k), the
+         selected band's own calibration table, and the "All" equity curve
+         (rendered once via _fig_html(div_id="scn-equity") and restyled in
+         place). A native updatemenus dropdown cannot express two
+         independent axes of selection, which is why this part is scripted.
+
+    Every number the script reads comes from one
+    `<script type="application/json" id="scn-data">` block: cells are
+    addressed by integer index into the ordered band / k / population arrays
+    it also carries, and its only strings are values that are themselves
+    names (the date axis, a calibration bucket's label, a cell's top event
+    ticker); every value is passed through _json_safe() and the
+    payload serialised with json.dumps(..., allow_nan=False), so a non-finite
+    metric reaches the browser as null (rendered as an em dash) rather than as
+    an invalid NaN token; and every "</" is escaped, because the payload
+    carries each cell's top event ticker (Kalshi-controlled) and an unescaped
+    "</script>" inside a JSON string would end the block early. The run's
+    primary band and ladder setting are not repeated here — they are on the
+    page header (_run_settings_html), since they shape every section.
+
+    Args:
+        sweep (BacktestSweep | None): The sweep payload from
+            backtester.run_backtest_sweep(). None renders "No sweep for this
+            run." — the same shape _section_interval_discount's None branch
+            takes, and deliberately free of any "strike-blind" /
+            "Outcome-label coverage" text, since that caveat belongs to a
+            sweep this run never produced. A sweep with no scenarios renders a
+            one-line note naming the cause (_scenario_explorer_empty_reason).
+
+    Returns:
+        str: Self-contained HTML section string.
+    """
+    title = _SECTION_STYLE.format(title="Scenario Explorer")
+
+    if sweep is None:
+        return title + "<p>No sweep for this run.</p>"
+    if not sweep.scenarios:
+        return (title + "<p>No scenarios were computed: "
+                f"{_scenario_explorer_empty_reason(sweep)}.</p>")
+
+    # ── Index the (band, k) grid and bucket every scenario into it ──────────
+    all_points = [pt for pt in sweep.scenarios if pt.population == "all"]
+    bands = sorted({pt.spread_band for pt in all_points if pt.spread_band is not None})
+    ks = sorted({pt.k for pt in all_points})
+    band_idx = {b: i for i, b in enumerate(bands)}
+    k_idx = {k: i for i, k in enumerate(ks)}
+
+    cell_points: list[list[dict]] = [
+        [dict.fromkeys(_SCENARIO_POPULATIONS) for _ in ks] for _ in bands
+    ]
+    for pt in sweep.scenarios:
+        if (pt.spread_band not in band_idx or pt.k not in k_idx
+                or pt.population not in _SCENARIO_POPULATIONS):
+            continue
+        cell_points[band_idx[pt.spread_band]][k_idx[pt.k]][pt.population] = pt
+
+    # Cached per point, so every metric is computed exactly once however many
+    # places (heatmap, banner, data block) read it.
+    kpi_cache: dict[int, dict] = {}
+
+    def kpis(pt: SweepPoint) -> dict:
+        key = id(pt)
+        if key not in kpi_cache:
+            kpi_cache[key] = _point_kpis(pt)
+            if pt.population == "all":
+                kpi_cache[key].update(_all_point_extras(pt))
+        return kpi_cache[key]
+
+    # ── Fragility banner ─────────────────────────────────────────────────────
+    cell_all_points = [cp["all"] for row in cell_points for cp in row if cp["all"] is not None]
+    n_cells = len(cell_all_points)
+    finite_returns = [r for r in (kpis(pt)["total_return"] for pt in cell_all_points)
+                      if r is not None and math.isfinite(r)]
+    positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
+                      if finite_returns else None)
+    halves = [pt.halves for pt in cell_all_points if pt.halves is not None]
+    corr = _spearman([h.h1_return for h in halves], [h.h2_return for h in halves])
+    corr_txt = f"{corr:+.3f}" if corr is not None else "not enough data"
+    share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
+    banner = (
+        "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
+        "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
+        "color:#5D4037;'>"
+        f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
+        f"simulations counting the ladder and cross-event populations). {share_txt} of "
+        "the cells with a measurable return had a positive total return. Split-half "
+        f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. The best of "
+        f"{n_cells} correlated cells overstates what you should expect."
+        "</div>"
+    )
+
+    # ── Heatmap: band rows x k columns, one "update" button per metric ──────
+    def metric_matrix(field: str) -> list[list]:
+        return [
+            [
+                (kpis(cell_points[bi][ki]["all"])[field]
+                 if cell_points[bi][ki]["all"] is not None else None)
+                for ki in range(len(ks))
+            ]
+            for bi in range(len(bands))
+        ]
+
+    band_labels = [_row_label(b) for b in bands]
+    k_labels = [_k_label(k) for k in ks]
+    # Colour scales are read back off a trace plotly.py has already coerced,
+    # never passed to the browser by name: plotly.py and plotly.js define
+    # "RdBu" in OPPOSITE directions, so a named scale in a button would flip
+    # the colours the first time a metric is switched.
+    diverging = go.Heatmap(colorscale="RdBu").colorscale
+    sequential = go.Heatmap(colorscale="Blues").colorscale
+    pct_hover = ("band=%{y}<br>%{x}<br>value=%{z:.2%}<br>trades=%{customdata}"
+                 "<extra></extra>")
+    count_hover = "band=%{y}<br>%{x}<br>trades=%{z}<extra></extra>"
+    # (field, label, colour scale, zmid, hover). zmid None lets the scale
+    # auto-range: a trade count is never negative, so centring it on zero
+    # would spend half the colour scale on values that cannot occur.
+    heatmap_fields = [
+        ("mean_per_trade", "Mean per trade (equal stake)", diverging, 0, pct_hover),
+        ("total_return", "Total return", diverging, 0, pct_hover),
+        ("h1_return", "H1 return", diverging, 0, pct_hover),
+        ("h2_return", "H2 return", diverging, 0, pct_hover),
+        ("trades", "Trade count", sequential, None, count_hover),
+    ]
+    # _json_safe here too: the button args are free-form JSON that no Plotly
+    # validator touches, so a NaN cell must already be None when it gets there.
+    matrices = {field: _json_safe(metric_matrix(field)) for field, *_ in heatmap_fields}
+
+    _, default_label, default_scale, default_zmid, default_hover = heatmap_fields[0]
+    hfig = go.Figure()
+    hfig.add_trace(go.Heatmap(
+        z=matrices["mean_per_trade"], x=k_labels, y=band_labels,
+        customdata=matrices["trades"], colorscale=default_scale, zmid=default_zmid,
+        hovertemplate=default_hover,
+    ))
+    hfig.update_layout(
+        title=f"{default_label} by spread band x k",
+        xaxis_title="k", yaxis_title="Spread band",
+        updatemenus=[{
+            "type": "dropdown", "direction": "down", "active": 0, "showactive": True,
+            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
+            "buttons": [
+                {
+                    "label": label, "method": "update",
+                    "args": [
+                        {"z": [matrices[field]], "colorscale": [scale],
+                         "zmid": [zmid], "hovertemplate": [hover]},
+                        {"title.text": f"{label} by spread band x k"},
+                    ],
+                }
+                for field, label, scale, zmid, hover in heatmap_fields
+            ],
+        }],
+    )
+
+    # ── The <select>s, preselected to (and marking) the primary scenario ─────
+    primary_band_idx = band_idx.get(sweep.primary.spread_band, 0)
+    primary_k_idx = k_idx.get(sweep.primary.k, 0)
+
+    def options(labels: list[str], primary: int) -> str:
+        return "".join(
+            f'<option value="{i}"{" selected" if i == primary else ""}>'
+            f'{html.escape(lbl)}{" (primary)" if i == primary else ""}</option>'
+            for i, lbl in enumerate(labels)
+        )
+
+    selects = (
+        "<div style='font-family:sans-serif;font-size:14px;margin:16px 0;'>"
+        "<label>Spread band: <select id='scn-band-select'>"
+        + options(band_labels, primary_band_idx) + "</select></label>"
+        "&nbsp;&nbsp;"
+        "<label>k: <select id='scn-k-select'>"
+        + options(k_labels, primary_k_idx) + "</select></label>"
+        "</div>"
+    )
+
+    # ── KPI table skeleton (filled by the inline script) ─────────────────────
+    kpi_table = """
+<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;
+              margin:16px 0; width:auto;">
+<tr style="background:#E8F5E9; font-weight:bold;">
+  <th style="padding:8px 16px;">Population</th>
+  <th style="padding:8px 16px;">Trades</th>
+  <th style="padding:8px 16px;">Win Rate</th>
+  <th style="padding:8px 16px;">Mean/Trade</th>
+  <th style="padding:8px 16px;">Total Return</th>
+  <th style="padding:8px 16px;">Final Balance</th>
+  <th style="padding:8px 16px;">Max Drawdown</th>
+  <th style="padding:8px 16px;">Sharpe / Sortino (365-day base)</th>
+</tr>
+<tbody id="scn-kpi-body"></tbody>
+</table>
+<div id="scn-cal-body"></div>
+"""
+
+    # ── The "All" equity curve: rendered once for the primary cell, then
+    # restyled in place by the inline script. The axis is decided once, from
+    # the primary, and every cell's curve is placed on it by date. ───────────
+    axis = _equity_axis(sweep.primary.equity_df)
+    axis_dates = [d.date().isoformat() for d in axis]
+    primary_values = _curve_on_axis(sweep.primary.equity_df, axis)
+    efig = go.Figure()
+    efig.add_trace(go.Scatter(
+        x=axis_dates if primary_values else [], y=primary_values, name="All",
+        line={"color": _COLORS["strategy"], "width": 2},
+    ))
+    efig.update_layout(title="Equity curve — selected band x k (population: All)",
+                       yaxis_title="Portfolio Value ($)", xaxis_title="Date")
+
+    # ── The data block every select, table and chart above reads from ────────
+    def cell_entry(pt: SweepPoint | None, population: str) -> dict | None:
+        if pt is None:
+            return None
+        d = dict(kpis(pt))
+        if population == "all":
+            d["equity"] = _curve_on_axis(pt.equity_df, axis)
+        return d
+
+    def cal_json(band: tuple[float, float]) -> list[dict] | None:
+        cal = sweep.calibrations_by_band.get(band)
+        if cal is None:
+            return None
+        return [
+            {"label": b.label, "tier": (None if b.tier <= 0 else b.tier), "n": b.n,
+             "realised_rate": b.realised_rate, "mean_implied": b.mean_implied,
+             "empirical_k": b.empirical_k}
+            for b in [*cal.buckets, cal.pooled]
+        ]
+
+    payload = {
+        "bands": [[lo, hi] for lo, hi in bands],
+        "ks": list(ks),
+        "populations": list(_SCENARIO_POPULATIONS),
+        "primary_band_idx": primary_band_idx,
+        "primary_k_idx": primary_k_idx,
+        "dates": axis_dates,
+        # cells[band index][k index][population index]
+        "cells": [
+            [
+                [cell_entry(cell_points[bi][ki][pop], pop) for pop in _SCENARIO_POPULATIONS]
+                for ki in range(len(ks))
+            ]
+            for bi in range(len(bands))
+        ],
+        "same_title": (kpis(sweep.same_title_point)
+                       if sweep.same_title_point is not None else None),
+        "calibration_by_band": [cal_json(b) for b in bands],
+    }
+    # _json_safe() has already replaced every non-finite float, so
+    # allow_nan=False never fires in practice — it is the backstop that makes
+    # a missed one raise here instead of shipping unparseable JSON. "</" is
+    # escaped so a Kalshi-controlled top-event ticker can never close this
+    # <script> block early.
+    json_text = json.dumps(_json_safe(payload), allow_nan=False).replace("</", "<\\/")
+    data_block = f'<script type="application/json" id="scn-data">{json_text}</script>'
+
+    return (
+        title
+        + banner
+        + _fig_html(hfig, height=450)
+        + selects
+        + kpi_table
+        + _fig_html(efig, height=400, div_id="scn-equity")
+        + data_block
+        + _SCENARIO_EXPLORER_JS
+    )
+
+
+# ─── Section 6: Trade-Level Diagnostics ──────────────────────────────────────
 
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     """
@@ -1197,7 +1977,7 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     )
 
 
-# ─── Section 6: Risk Metrics ──────────────────────────────────────────────────
+# ─── Section 7: Risk Metrics ──────────────────────────────────────────────────
 
 def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
                   initial_balance: float, k: float | None = None) -> str:
@@ -1294,7 +2074,7 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     )
 
 
-# ─── Section 7: Benchmark Comparison ─────────────────────────────────────────
+# ─── Section 8: Benchmark Comparison ─────────────────────────────────────────
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
                         initial_balance: float) -> str:
@@ -1444,7 +2224,7 @@ def generate_dashboard(
     interval_discount: float | None = None,
 ) -> Path:
     """
-    Assemble all seven dashboard sections into a single self-contained HTML file.
+    Assemble all eight dashboard sections into a single self-contained HTML file.
 
     Calls each _section_*() builder in order, concatenates the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag, then
@@ -1455,10 +2235,12 @@ def generate_dashboard(
     name (TS-18).
 
     The two sweep-related parameters are keyword-only WITH defaults, so the
-    existing four-argument positional call still works verbatim: omit both and
-    the page renders exactly as before, with the interval-discount section
-    showing the same kind of short placeholder every other builder emits for
-    empty input.
+    existing four-argument positional call still works verbatim. Omit both and
+    the interval-discount and scenario-explorer sections each show the same
+    kind of short placeholder every other builder emits for empty input, and
+    the header's run-settings line reads "not recorded" for both the spread
+    band and the ladder setting — with no coverage line and no strike-blind
+    notice, since that path has no census to report.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
@@ -1470,18 +2252,22 @@ def generate_dashboard(
         initial_balance (float): Starting portfolio value in dollars, used for
             return calculations and benchmark normalization.
         sweep (BacktestSweep | None): The full sweep payload from
-            backtester.run_backtest_sweep(), rendered by the interval-discount
-            section. Passed whole rather than unpacked — it already carries the
-            calibration, every swept point, the primary k and the run's
-            outcome-label census, and splitting it would create copies that
-            could disagree. None (default) renders that section's placeholder —
-            and therefore no coverage line either, which is honest: that path
-            shows no k̂ card to caveat.
+            backtester.run_backtest_sweep(), rendered by BOTH the
+            interval-discount section and the scenario-explorer section.
+            Passed whole rather than unpacked — it already carries the
+            calibration, every swept point, the primary k, the band x k x
+            population scenarios and the run's outcome-label census, and
+            splitting it would create copies that could disagree. It also
+            feeds the header's run-settings line (_run_settings_html). None
+            (default) renders both sections' placeholders — and therefore no
+            coverage line either, which is honest: that path shows no k̂ card
+            to caveat — and the run-settings line says "not recorded" rather
+            than guessing.
 
             When its label_coverage is below
             config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION, a one-line notice is
             also emitted under the Period line, because a strike-blind corpus
-            changes which pairs exist and so taints all seven sections, not
+            changes which pairs exist and so taints all eight sections, not
             just the one that renders the census (DR-66b).
         interval_discount (float | None): The interval discount `trades` were
             SIZED at, threaded into the Risk section's Kelly scatter. Separate
@@ -1515,12 +2301,22 @@ def generate_dashboard(
             "</p>"
         )
 
+    # The primary spread band and the ladder setting decide which pairs
+    # exist, so they are named in the header above every section, not only
+    # inside the scenario explorer; "not recorded" when there is no sweep.
+    run_settings = _run_settings_html(sweep)
+
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
         _section_decomposition(trades),
         _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k)
         _section_interval_discount(sweep),
+        # Also takes the sweep whole — it reads .scenarios, .same_title_point
+        # and .calibrations_by_band, none of which _section_interval_discount
+        # renders, and passing pieces could let the two sections (and the
+        # header's run-settings line) drift onto different bands or settings.
+        _section_scenario_explorer(sweep),
         _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
@@ -1548,6 +2344,7 @@ def generate_dashboard(
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>
+{run_settings}
 {header_note}
 {''.join(sections)}
 </body>
