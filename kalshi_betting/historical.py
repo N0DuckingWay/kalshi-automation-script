@@ -20,7 +20,8 @@ Dependencies:
     ARCHIVE_TAIL_MAX_RECORDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-    INCLUDE_MVE_MARKETS, PROD_URL) from config.py. Exports
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST, INCLUDE_MVE_MARKETS, PROD_URL) from
+    config.py. Exports
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
@@ -34,6 +35,10 @@ Notes:
     CANDLESTICK_PERIOD_INTERVAL_MINUTES (hourly) — daily candles only cover
     markets whose lifespan crosses a UTC midnight boundary, which silently
     excludes most Kalshi markets (see config.py for the full explanation).
+    The candlestick endpoint serves at most
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST candles per request and refuses a
+    longer one with HTTP 400, so fetch_candlesticks pages any longer window
+    into consecutive requests and merges them in timestamp order.
 
     The pinned SDK (kalshi-python-sync==3.2.0) ships no historical_api module,
     and 2026-07 API drift broke its Market response model anyway (legacy
@@ -86,6 +91,7 @@ from .config import (
     ARCHIVE_MAX_BARREN_PAGES,
     ARCHIVE_TAIL_MAX_PAGES,
     ARCHIVE_TAIL_MAX_RECORDS,
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
@@ -2598,6 +2604,87 @@ def _candle_close(side: dict) -> float | None:
     return None
 
 
+def _candle_request_windows(open_ts: int, close_ts: int) -> list[tuple[int, int]]:
+    """
+    Split one candlestick window into requests the endpoint will serve.
+
+    /historical/markets/{ticker}/candlesticks refuses a request spanning more
+    than config.CANDLESTICK_MAX_CANDLES_PER_REQUEST candles with HTTP 400
+    ("max candlesticks: 5000"). A window no longer than
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST - 1 candle periods is returned
+    unchanged as ONE request — exactly what fetch_candlesticks always sent —
+    and anything longer is cut into consecutive requests of at most that many
+    periods, the first starting at open_ts and the last ending at close_ts.
+    One period short of the cap because a request whose span is N periods can
+    hold N + 1 period ends when the endpoint counts both ends inclusively, so
+    N = cap - 1 stays within the cap whichever way it counts.
+
+    Consecutive requests OVERLAP by one candle period (request k + 1 starts
+    one period before request k ends). Whether the endpoint treats a window's
+    two ends as inclusive or exclusive is not documented, and with that
+    overlap every timestamp strictly inside the overall window lies strictly
+    inside at least one request — so, under any of the four conventions, the
+    requests together return exactly the candles one uncapped request for the
+    whole window would, plus repeats of the few candles two requests share.
+    fetch_candlesticks drops those repeats (_merge_candle_pages).
+
+    Args:
+        open_ts (int): Unix timestamp the window starts at.
+        close_ts (int): Unix timestamp the window ends at.
+
+    Returns:
+        list[tuple[int, int]]: (start_ts, end_ts) per request, in time order.
+            A single element — (open_ts, close_ts) itself — whenever the window
+            fits one request, including a degenerate window with
+            close_ts <= open_ts, which is passed through unchanged for the
+            endpoint to judge, as it always was.
+    """
+    period_seconds = CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+    page_seconds = (CANDLESTICK_MAX_CANDLES_PER_REQUEST - 1) * period_seconds
+    if close_ts - open_ts <= page_seconds:
+        return [(open_ts, close_ts)]
+    # Each request advances by one period less than it spans, which is the
+    # one-period overlap described above (positive, since the cap is 5000).
+    step_seconds = page_seconds - period_seconds
+    windows = []
+    start = open_ts
+    while start + page_seconds < close_ts:
+        windows.append((start, start + page_seconds))
+        start += step_seconds
+    windows.append((start, close_ts))
+    return windows
+
+
+def _merge_candle_pages(candles: list[dict]) -> list[dict]:
+    """
+    Order the candles of several requests by timestamp and drop repeats.
+
+    The requests _candle_request_windows builds overlap by one candle period,
+    so a candle in an overlap can come back from both; the first copy in
+    timestamp order is kept (the sort is stable, so that is the earlier
+    request's). Sorting is what makes the result safe for
+    backtester._candle_at_or_before, which assumes an ascending series and
+    stops at the first candle past its target.
+
+    Only called when a window took more than one request: a single response
+    is returned exactly as the endpoint ordered it, as it always was.
+
+    Args:
+        candles (list[dict]): Parsed candles (each with an int "ts") from every
+            request of one window, concatenated in request order.
+
+    Returns:
+        list[dict]: The same candle dicts, ascending by "ts", with at most one
+            candle per "ts".
+    """
+    merged: list[dict] = []
+    for candle in sorted(candles, key=lambda c: c["ts"]):
+        if merged and merged[-1]["ts"] == candle["ts"]:
+            continue
+        merged.append(candle)
+    return merged
+
+
 def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
@@ -2618,9 +2705,25 @@ def fetch_candlesticks(
     cross a UTC midnight boundary — daily candles return zero bars for them
     (see config.py CANDLESTICK_PERIOD_INTERVAL_MINUTES for the full explanation).
 
+    The endpoint serves at most CANDLESTICK_MAX_CANDLES_PER_REQUEST candles
+    per request and refuses a longer one with HTTP 400, which used to reach
+    the except branch below and come back as "no candles" — so every market
+    whose window was longer than about 208 days of hourly candles silently
+    had no price series. A window that fits one request is still fetched in
+    exactly one GET with exactly the same parameters; a longer one is fetched
+    as consecutive requests overlapping by one candle period
+    (_candle_request_windows), each through the same retried read-only GET,
+    and merged ascending by timestamp with the overlap's repeats dropped
+    (_merge_candle_pages). The window is
+    all-or-nothing: if ANY of its requests fails, the whole ticker returns []
+    and nothing is cached, exactly like a single failed request — a partial
+    series cached as complete would silently drop the missing span on every
+    later run.
+
     Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json,
     tagged with the [open_ts, close_ts] window and period_interval that were
-    actually fetched. A cache hit requires the cached window to COVER the
+    actually fetched — the whole window as one entry, however many requests it
+    took. A cache hit requires the cached window to COVER the
     requested window AND the cached period_interval to match the current
     CANDLESTICK_PERIOD_INTERVAL_MINUTES — open_ts varies between backtest runs
     with different --start-date values, so a cache built for a later start_date
@@ -2641,15 +2744,17 @@ def fetch_candlesticks(
             (typically the market's close_time + one day buffer).
         use_cache (bool): If True (default), load from disk cache if available
             and save after fetching. If False, always fetch from the API.
-        rate_limit_sleep (float): Seconds to sleep after each API call to stay
-            within the Kalshi rate limit. Defaults to 0.15 seconds.
+        rate_limit_sleep (float): Seconds to sleep after each API call (each
+            request of a paged window included) to stay within the Kalshi rate
+            limit. Defaults to 0.15 seconds.
 
     Returns:
         list[dict]: List of candlestick dicts with keys:
             - "ts" (int): Unix timestamp of the candle's end period.
             - "yes_ask_close" (float): YES ask price at close. Range: [0.01, 0.99].
             - "no_ask_close" (float): Approximated NO ask price at close (1 − yes_bid_close).
-              Clamped to [0.01, 0.99]. Returns an empty list on API failure.
+              Clamped to [0.01, 0.99]. Returns an empty list on API failure,
+              including a failure of any one request of a paged window.
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CANDLES_DIR / f"{ticker}.json"
@@ -2679,51 +2784,69 @@ def fetch_candlesticks(
                 if age < _EMPTY_CANDLE_TTL_SECONDS:
                     return candles
 
+    # One request unless the window is longer than the endpoint serves in one
+    # (CANDLESTICK_MAX_CANDLES_PER_REQUEST), in which case it is paged.
+    windows = _candle_request_windows(open_ts, close_ts)
+    # 1-based number of the request in flight, read only by the failure line
+    # below; reset to 0 once every request has returned, so a failure after
+    # that (the cache write) is not blamed on the last request.
+    request_no = 0
     try:
-        # Raw signed GET — the pinned SDK has no historical_api module and its
-        # candlestick models predate the current wire format anyway.
-        data = _historical_get(
-            hist_client,
-            f"{_API_PREFIX}/historical/markets/{ticker}/candlesticks",
-            start_ts=open_ts,
-            end_ts=close_ts,
-            period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-        )
         candles = []
-        raw_candlesticks = data.get("candlesticks") or []
+        raw_count = 0
         dropped = 0
-        for c in raw_candlesticks:
-            try:
-                ya = c.get("yes_ask") or {}
-                yb = c.get("yes_bid") or {}
-                # Dollar-string extraction with explicit presence checks —
-                # see _candle_close for why truthiness fallthrough is wrong
-                yes_ask = _candle_close(ya)
-                yes_bid = _candle_close(yb)
-                if yes_ask is None or yes_bid is None:
-                    # Counts as a DROP, not a silent skip: _candle_close
-                    # signals an unparseable/absent close by returning None
-                    # rather than raising, so without this the candle would
-                    # bypass the counter below and a thinned series would be
-                    # cached with no visible signal at all (BS-23).
+        for request_open, request_close in windows:
+            request_no += 1
+            # Raw signed GET — the pinned SDK has no historical_api module and
+            # its candlestick models predate the current wire format anyway.
+            # Read-only, so _historical_get's api_call_with_retry backoff
+            # applies per request.
+            data = _historical_get(
+                hist_client,
+                f"{_API_PREFIX}/historical/markets/{ticker}/candlesticks",
+                start_ts=request_open,
+                end_ts=request_close,
+                period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+            )
+            raw_candlesticks = data.get("candlesticks") or []
+            raw_count += len(raw_candlesticks)
+            for c in raw_candlesticks:
+                try:
+                    ya = c.get("yes_ask") or {}
+                    yb = c.get("yes_bid") or {}
+                    # Dollar-string extraction with explicit presence checks —
+                    # see _candle_close for why truthiness fallthrough is wrong
+                    yes_ask = _candle_close(ya)
+                    yes_bid = _candle_close(yb)
+                    if yes_ask is None or yes_bid is None:
+                        # Counts as a DROP, not a silent skip: _candle_close
+                        # signals an unparseable/absent close by returning None
+                        # rather than raising, so without this the candle would
+                        # bypass the counter below and a thinned series would be
+                        # cached with no visible signal at all (BS-23).
+                        dropped += 1
+                        continue
+                    # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
+                    no_ask  = 1.0 - yes_bid
+                    candles.append({
+                        "ts": c["end_period_ts"],
+                        "yes_ask_close": yes_ask,
+                        "no_ask_close": max(0.01, min(0.99, no_ask)),
+                    })
+                except (ValueError, TypeError, AttributeError, KeyError):
                     dropped += 1
-                    continue
-                # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                no_ask  = 1.0 - yes_bid
-                candles.append({
-                    "ts": c["end_period_ts"],
-                    "yes_ask_close": yes_ask,
-                    "no_ask_close": max(0.01, min(0.99, no_ask)),
-                })
-            except (ValueError, TypeError, AttributeError, KeyError):
-                dropped += 1
+            # Rate limit: sleep briefly after each call to avoid 429 responses
+            time.sleep(rate_limit_sleep)
+        request_no = 0
+        if len(windows) > 1:
+            # Paged: put the requests' candles in timestamp order and drop the
+            # repeats the one-period overlaps return twice.
+            candles = _merge_candle_pages(candles)
         if dropped:
             # The drop happens before the cache write, so a thinned series is
             # otherwise cached as if it were complete with no visible signal.
             logging.warning("%s: dropped %d/%d malformed candles",
-                            ticker, dropped, len(raw_candlesticks))
-        # Rate limit: sleep briefly after each call to avoid 429 responses
-        time.sleep(rate_limit_sleep)
+                            ticker, dropped, raw_count)
         # Only successful fetches are cached (tagged with the window and
         # granularity just fetched); failures fall through the except branch
         # and return [] without persisting so the next run retries. Saved
@@ -2742,11 +2865,17 @@ def fetch_candlesticks(
         # and are deliberately never cached, so this warning is re-paid on
         # every run for every such ticker. The per-run count is summarized
         # once by backtester._fetch_candles_parallel, which sees every ticker.
+        # A paged window names the request that failed; a single-request one
+        # keeps the exact line it always logged.
+        where = (f" (request {request_no} of {len(windows)})"
+                 if len(windows) > 1 and request_no else "")
         logging.warning(
-            "Candlestick fetch failed for %s: HTTP %s %s",
-            ticker, getattr(e, "status", "?"), _exception_summary(e),
+            "Candlestick fetch failed for %s: HTTP %s %s%s",
+            ticker, getattr(e, "status", "?"), _exception_summary(e), where,
         )
         time.sleep(rate_limit_sleep)
         # Deliberately DO NOT cache — a poisoned empty file would silence this
-        # ticker on every subsequent run until manually deleted.
+        # ticker on every subsequent run until manually deleted. That holds for
+        # a paged window too: the requests that DID succeed are discarded
+        # rather than cached as if they were the whole window.
         return []
