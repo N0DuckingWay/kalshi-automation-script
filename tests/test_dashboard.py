@@ -1640,99 +1640,27 @@ class TestSplitHalfDegeneracy:
             in section
 
 
-class TestCandleCapNotice:
-    """PB7: a window whose latest-closing markets need a longer candlestick
-    request (--start-date to a day past the close) than one request serves
-    silently drops every such market. The page says so in the header AND as
-    the explorer banner's first line."""
+class TestNoCandleCapNotice:
+    """PB7 put a red notice on any window long enough to need a candlestick
+    request over Kalshi's 5,000-candle cap, because every market needing one
+    silently had no candles and could never enter. historical.fetch_candlesticks
+    now pages such a window, so the page must not claim a truncated
+    population on a long window — in the header or in the explorer's banner."""
 
-    CAP_DAYS = (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
-                * config.CANDLESTICK_PERIOD_INTERVAL_MINUTES / (24 * 60))
-
-    def test_the_threshold_is_the_longest_request_the_window_can_produce(self):
-        # _fetch_candles_parallel requests start_date midnight to one day
-        # past each close, and a settled market can close as late as the end
-        # of today, so the longest request spans (days + 2) days: the notice
-        # fires from the first window where THAT exceeds the cap — 207 days at
-        # hourly candles — not from the first whose bare length does (209).
-        today = date(2026, 9, 23)
-        per_day = 24 * 60 / config.CANDLESTICK_PERIOD_INTERVAL_MINUTES
-        longest_ok = int(config.CANDLESTICK_MAX_CANDLES_PER_REQUEST // per_day) - 2
-        assert longest_ok == 206
-        assert (longest_ok + 2) * per_day <= config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
-        assert (longest_ok + 3) * per_day > config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
-        assert dashboard._candle_cap_notice(today - timedelta(days=longest_ok), today) is None
-        notice = dashboard._candle_cap_notice(today - timedelta(days=longest_ok + 1), today)
-        assert notice is not None
-        assert f"spans {longest_ok + 1:,} days" in notice
-
-    def test_a_market_the_notice_misses_would_have_been_served(self):
-        # Cross-check against the fetch's own window arithmetic: on the
-        # longest silent window, a market closing at the last second of today
-        # still gets a request within the cap; one day longer, it does not.
+    def test_a_long_window_carries_no_candle_cap_notice(self, monkeypatch, tmp_path):
         from datetime import UTC, datetime
-        today = date(2026, 9, 23)
-        cap_seconds = (config.CANDLESTICK_MAX_CANDLES_PER_REQUEST
-                       * config.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60)
-        for days, fires in ((206, False), (207, True)):
-            start = today - timedelta(days=days)
-            open_ts = datetime(start.year, start.month, start.day, tzinfo=UTC).timestamp()
-            last_close = datetime(today.year, today.month, today.day, 23, 59, 59,
-                                  tzinfo=UTC).timestamp()
-            request = last_close + backtester._DAY_SECONDS - open_ts
-            assert (request > cap_seconds) is fires
-            assert (dashboard._candle_cap_notice(start, today) is not None) is fires
-
-    def test_the_text_derives_its_numbers_from_config(self):
-        today = date(2026, 9, 23)
-        notice = dashboard._candle_cap_notice(date(2024, 1, 1), today)
-        assert f"spans {(today - date(2024, 1, 1)).days:,} days" in notice
-        assert f"at most {config.CANDLESTICK_MAX_CANDLES_PER_REQUEST:,} hourly candles" in notice
-        assert f"hourly candles per request (about {self.CAP_DAYS:.0f} days)" in notice
-        # The close cutoff is the cap less the fetch's one-day pad past close
-        assert "runs to a day past the market's close" in notice
-        assert f"markets closing more than about {self.CAP_DAYS - 1:.0f} days after it" \
-            in notice
-        assert f"{self.CAP_DAYS:.0f}" == "208" and f"{self.CAP_DAYS - 1:.0f}" == "207"
-        assert "do not choose a band or k from the explorer on this window" in notice
-
-    @staticmethod
-    def _page(monkeypatch, tmp_path, start: date, **kwargs) -> str:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        out_path = dashboard.generate_dashboard(
-            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]), start, 1000.0, **kwargs)
-        return out_path.read_text(encoding="utf-8")
-
-    def test_a_long_window_shows_it_in_the_header_and_the_banner(self, monkeypatch, tmp_path):
-        from datetime import UTC, datetime
-        start = datetime.now(UTC).date() - timedelta(days=400)
-        page = self._page(monkeypatch, tmp_path, start, sweep=_Grid.sweep())
-        notice = "This window spans 400 days"
-        assert page.count(notice) == 2
-        header_at = page.index(notice)
-        banner_at = page.index(notice, header_at + 1)
-        # The header copy sits under the Period line, above every section ...
-        assert page.index("Period:") < header_at < page.index("Portfolio Performance")
-        # ... and the banner copy is the banner's first line
-        assert page.index("Scenario Explorer") < banner_at < page.index(
-            "band x k cells computed")
-
-    def test_a_short_window_shows_neither(self, monkeypatch, tmp_path):
-        from datetime import UTC, datetime
-        start = datetime.now(UTC).date() - timedelta(days=30)
-        page = self._page(monkeypatch, tmp_path, start, sweep=_Grid.sweep())
+        start = datetime.now(UTC).date() - timedelta(days=1_000)
+        page = dashboard.generate_dashboard(
+            [make_trade()], make_equity([1000.0, 1010.0, 1005.0]), start, 1000.0,
+            sweep=_Grid.sweep()).read_text(encoding="utf-8")
         assert "This window spans" not in page
+        assert "candles per request" not in page
+        assert "could never enter" not in page
+        # The explorer's banner still opens on its own first line
         assert "band x k cells computed" in page
-
-    def test_the_header_needs_no_sweep(self, monkeypatch, tmp_path):
-        from datetime import UTC, datetime
-        start = datetime.now(UTC).date() - timedelta(days=400)
-        page = self._page(monkeypatch, tmp_path, start)
-        assert page.count("This window spans 400 days") == 1
-        # ... and still carries none of the census's words
-        assert "strike-blind" not in page and "Outcome-label coverage" not in page
 
 
 class TestSpearman:

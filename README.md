@@ -134,8 +134,7 @@ backtest.py (CLI)
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata
   │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
   │    │    └─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers;
-  │    │                                               every window opens at --start-date: see the 5,000-candle
-  │    │                                               caveat under Run Commands → Backtest)
+  │    │                                               a window over the endpoint's 5,000-candle cap is paged)
   │    └─ _sweep_from_candidates()
   │         ├─ _entries_for_band()            — k-independent; one time-series _find_entry() pass per band:
   │         │                                    every band of SPREAD_BAND_SWEEP_FLOORS x CEILINGS (plus the
@@ -458,18 +457,13 @@ either when at least half of those entries share the first entry date (the
 backtest log warns when that happens) or, at any other band or on the "All"
 population, when all of that cell's own entries fall on one side of it.
 
-Two caveats. **On a long window the explorer describes a truncated
-population.** Every ticker's candle window opens at the run's global
-`--start-date` and runs to a day past the market's close, and Kalshi
-rejects a candlestick request spanning more than 5,000 hourly candles (~208
-days) with HTTP 400. That failure is caught, so on a longer window every
-ticker closing more than ~207 days after the start gets no candles (counted
-in the log's `N of M tickers returned no candles` line) and can never
-enter. The default `--start-date 2024-01-01` is far past
-that limit. Per-ticker candle windowing is a separate fix that has not
-landed; until it does, the dashboard puts a red notice in its header, and
-as the first line of the explorer's banner, on any window long enough to
-contain such a market (207 days or more at hourly candles). **Picking a
+Kalshi serves at most 5,000 hourly candles (~208 days) per candlestick
+request and rejects a longer one with HTTP 400, so a ticker's price series is
+fetched in as many requests as its window needs and merged; a long window no
+longer loses the markets that close late in it. (Until 2026-09-23 it did:
+each window was one request opened at `--start-date`, so on the default
+`--start-date 2024-01-01` every ticker closing more than ~207 days after the
+start got no candles and could never enter.) One caveat: **Picking a
 scenario changes nothing the live bot does:** live
 trading has no band setting at all, and `k` and the ladder switch stay
 whatever `config.py` says. Applying a chosen band and `k` live is a separate
