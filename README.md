@@ -601,6 +601,38 @@ counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (2000) pages total, which
 logs a WARNING when hit (markets created deeper than that may be missed; raise
 the constant if a run needs them).
 
+**Prefilter tag bump (P5): delete the old assembled caches by hand.** The
+backtester's eligibility prefilter now drops a market that opened at or after
+every Monday-09:00-UTC checkpoint it could be entered at — those dated from
+`--start-date` to the day before its close. It used to compare the opening
+DATE, so it kept markets opened later on a checkpoint Monday, which that
+Monday's checkpoint can never enter: 30% of the 2026-09-17 window's cache, 59%
+of the 2026-07-13 one. For the same settled records, trades and returns are
+unchanged and only the eligible-market counts shrink; a re-assembled corpus can
+still differ from an old one, as any two assemblies made at different times do
+(see the prefilter gotcha in `CLAUDE.md`). Because the predicate names the
+assembled cache, its tag moved from `monday-eligibility-v1` to
+`monday-checkpoint-v2`, so every
+`backtest_cache/settled_markets_*_monday-eligibility-v1.*` file is never read
+again and is not deleted by any rebuild (a rebuild only replaces a legacy file
+of its own name). None of them held a usable result: the three that start
+before the archive cutoff (2026-05-01, 05-28, 07-13) were assembled on
+2026-08-03, before the subtitle fix, so they group strike-blind; the one for
+2026-08-29 is empty and more than a day old, which the cache lookup already
+treats as a miss; and the other four start after the cutoff, so they are
+0-trade by construction. Take any before/after baseline you want from them with
+a checkout from before this change, then delete them. The next run of each
+start date re-assembles its corpus from the day slices, which are unaffected.
+For a window that starts after the cutoff that is one extra assembly, plus any
+live day not on disk (the 7-day 2026-09-17 window: 2,382 s fresh against
+1,040 s from its cache). For one that starts before it, it is close to a full fetch: on
+2026-09-24 none of the archive day slices such a window needs was valid under
+the current cutoff, and 35 of its 61 past live days were not on disk. That is
+the rebuild the strike-blind caches needed anyway. It is not a complete fix
+for them, though: the live slices for 2026-07-25..08-02, 08-29 and 08-30 were
+also written before the subtitle fix and are reused unless you delete them
+(see the subtitle-drift gotcha in `CLAUDE.md`).
+
 Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
 parallel workers, one independent request per ticker. Cache files are keyed per
 ticker, so workers never contend for a path and any ticker already on disk is

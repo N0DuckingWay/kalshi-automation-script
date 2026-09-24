@@ -435,7 +435,8 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         "no_ask_dollars": m.get("no_ask_dollars"),
         "yes_bid_dollars": m.get("yes_bid_dollars"),
         # Feeds backtester._can_ever_enter()'s eligibility prefilter — needed
-        # to prove a market's tradeable window contains no Monday checkpoint
+        # to prove no Monday checkpoint of a market's tradeable window falls
+        # after its opening instant
         "open_time": m.get("open_time"),
         "close_time": m.get("close_time"),
         "settlement_ts": m.get("settlement_ts"),
@@ -3191,7 +3192,10 @@ class _FrontierSpool:
     Monday can be mostly eligible — 7,190,452 of the 9,176,306 records
     settled on Tuesday 2026-09-22 passed _can_ever_enter(m, 2026-09-17),
     ~28 GB at the 3,926 B/record measured on eligible records of that window,
-    on a 16 GB host. So the frontier worker's sink (_extend_kept) streams
+    on a 16 GB host (measured under the date-granular predicate P5 replaced,
+    which also admitted markets opened later on the Monday itself; the
+    checkpoint-instant one admits a subset, so the bound only improves). So
+    the frontier worker's sink (_extend_kept) streams
     each kept batch into this spool instead, and every walk reads it back one
     record at a time, exactly like a day slice.
 
@@ -3432,8 +3436,10 @@ def _fetch_live_phase(
     Monday checkpoint on/after start_date and closes at least a day later, so
     a frontier captured the day AFTER a Monday can be mostly eligible —
     7,190,452 of the 9,176,306 records settled on Tuesday 2026-09-22 passed
-    _can_ever_enter(m, 2026-09-17). Spooled, it holds one batch in flight
-    whatever the weekday, and with keep=None as well. The caller must close()
+    _can_ever_enter(m, 2026-09-17) (under the date-granular predicate P5
+    replaced; the checkpoint-instant one admits a subset). Spooled, it holds
+    one batch in flight whatever the weekday, and with keep=None as well.
+    The caller must close()
     the returned chain once it is done walking it (fetch_all_settled_markets
     does so in a `finally`), which releases the spool; it also vanishes with
     the process.

@@ -737,8 +737,12 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # held for grouping; since SS-1 the subset is what stays resident from the
 # warning onward, so the eligible count would over-state it. A 7-day window
 # (--start-date 2026-09-17) measured 7,260,952 eligible records of which
-# 184,255 share a key — the gap between those two numbers is what the eligible
-# count would over-state now.
+# 184,255 share a key — the gap between those two numbers is what counting
+# eligible records over-stated on that run. Both were measured under the pre-P5
+# prefilter (SETTLED_PREFILTER_CACHE_TAG "monday-eligibility-v1"), which also
+# admitted markets opened after that window's only checkpoint; the current
+# prefilter admits a subset, so both numbers and the gap between them are
+# smaller now (not re-measured).
 #
 # Known residual, narrowed by SS-1's Commit C: fetch_all_settled_markets now
 # returns a historical.SettledCorpus that streams the assembled
@@ -911,7 +915,25 @@ TRADER_MAX_WORKERS = 8
 # (backtester._log_corpus_prefilter) — which catches a TIGHTENED predicate. A
 # LOOSENED one is still invisible, since the records the old predicate dropped
 # are simply absent from the cache.
-SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
+#
+# History: "monday-eligibility-v1" read open_time as a DATE, so it kept every
+# market that opened later on the checkpoint Monday itself — 2,192,241 of the
+# 7,274,215 records of the 2026-09-17 window's assembled cache (30.1%, the
+# 2026-09-24 review's M8) and 336,750 of the 570,506 of the 2026-07-13 one
+# (59.0%, streamed for P5). "monday-checkpoint-v2" (P5) compares open_time with
+# the 09:00 UTC checkpoint INSTANT (backtester._can_ever_enter). v2 admits a
+# subset of what v1 admitted (for every real UTC offset) and drops only
+# markets that can never be entered, so the entries a backtest finds over the
+# same settled records are unchanged. The bump ORPHANS every assembled cache
+# written under v1: the name stem changed, so none of them is ever read
+# again, and a rebuild retires only a legacy file of its OWN stem, so none is
+# ever deleted either — remove
+# backtest_cache/settled_markets_*_monday-eligibility-v1.* by hand. The day
+# slices are not keyed by this tag and are unaffected. Every eligible-record
+# count quoted in this repo from before P5 — 7,274,215 and 7,260,952 for the
+# 2026-09-17 window (and its 184,255 groupable), the frontier's 7,190,452 of
+# 9,176,306, 570,506 for 2026-07-13 — was measured under v1.
+SETTLED_PREFILTER_CACHE_TAG = "monday-checkpoint-v2"
 
 # How young an EMPTY assembled settled-market cache must be to still be served
 # (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it

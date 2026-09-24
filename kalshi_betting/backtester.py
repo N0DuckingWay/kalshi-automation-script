@@ -129,10 +129,13 @@ Notes:
     Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
-    have an hourly candle at-or-before that Monday (i.e. opened by then). A
-    market whose [open_time, close_time - 1 day] window contains no such
-    Monday can never appear in any entered pair, as either leg, in either pair
-    type — dropping it up front avoids materializing it into any group at all.
+    have an hourly candle at-or-before that checkpoint — which, since a
+    market has no candle ending before its opening hour, means it OPENED
+    strictly before the checkpoint instant (a date test until P5, which kept
+    markets opened later that same Monday). A market with no such checkpoint
+    on or before its close_time's date minus one day can never appear in any
+    entered pair, as either leg, in either pair type — dropping it up front
+    avoids materializing it into any group at all.
     This matters because normalized-title groups can have 10,000+ members at
     current Kalshi volumes (hourly/intraday crypto ladders collapsing into one
     group) — without the prefilter, and without the close-time-windowed
@@ -1153,15 +1156,58 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
     Necessary-condition prefilter: could this market possibly appear in any
     entered pair, as either leg, of either pair type?
 
-    _find_entry() only opens a trade at a Monday-09:00-UTC checkpoint inside
-    [start_date, min(close_a, close_b) - 1 day], and requires an hourly candle
-    at-or-before that Monday for BOTH legs — which requires each market to
-    have opened on or before it. So a market whose own
-    [open_time, close_time - 1 day] window contains no Monday on/after
-    start_date can never satisfy that condition for any partner market,
-    regardless of pair_type. Dropping such a market before grouping/pairing
-    is therefore provably safe — it would have contributed entry=None to
-    every possible pair anyway (see CLAUDE.md for the full invariant).
+    _find_entry() only opens a trade at a Monday checkpoint — 09:00 UTC,
+    _checkpoint_datetime — whose DATE lies in
+    [start_date, min(close_a, close_b) - 1 day], and only when
+    _candle_at_or_before finds a candle at or before that checkpoint for
+    BOTH legs. A candle's "ts" is its period END (historical.fetch_candlesticks
+    stores end_period_ts there), and a market has no candle ending at or
+    before the start of the hour it opened in — the measurement recorded in
+    _candle_window_open's docstring, re-measured for this predicate (M8 of the
+    2026-09-24 review, P5): 0 of 952,519 cached hourly candles across 3,542
+    series of the DR-73 calibration corpus end at or before their market's
+    opening hour, including the 573 series whose request opened before the
+    market did, so the endpoint had the chance to serve one. The checkpoint
+    sits on the hour grid, so a market can have a candle at or before it only
+    if it OPENED strictly before it: one that opened at 08:30 can (its first
+    candle ends at 09:00 — 1,233 of the 1,310 series in that corpus whose
+    market opened off the hour have a first candle ending at the next top of
+    the hour), one that opened at 09:00:00 or later that Monday cannot (2,168
+    of the 2,232 that opened ON the hour have a first candle ending one hour
+    after the open, and none earlier). So a market is kept iff some Monday
+    on/after start_date and on or before close_time's date minus one day has
+    its checkpoint INSTANT strictly after open_time. The upper bound is read
+    as a DATE, exactly as _find_entry builds scan_end; only the lower bound
+    is an instant. The one-year lookback and the max_horizon_days cap
+    _find_entry also applies are not tested here: the first depends on the
+    partner's close and the second is not part of the corpus's identity
+    (config.SETTLED_PREFILTER_CACHE_TAG names the corpus, not the run).
+
+    Until P5 the lower bound was open_time's DATE too, which kept every market
+    that opened later on the checkpoint Monday itself — on the 2026-09-17
+    7-day window 2,192,241 of the 7,274,215 records it admitted (30.1%, the
+    review's streamed open_time histogram) opened between 09:00 and 24:00 UTC
+    on that window's only Monday and could never be entered. The instant test
+    drops exactly those, and a market the date test already dropped stays
+    dropped: the date test read open_time's date in its OWN offset, and for
+    any real offset (-12:00 to +14:00) the first Monday the instant test can
+    reach is never earlier than the date test's — a UTC date that trails the
+    local one means a UTC time of 10:00 or later, past that Monday's
+    checkpoint (pinned over a grid in -05:00, +05:30 and +14:00 by
+    TestCanEverEnterMatchesTheScan). So the change only shrinks the corpus.
+    Changing this predicate requires a config.SETTLED_PREFILTER_CACHE_TAG
+    bump, which P5 made.
+
+    An open_time with no UTC offset (only reachable from a hand-edited cache —
+    every Kalshi timestamp carries one) cannot be placed against a UTC
+    checkpoint, so it keeps the date test: looser, never tighter. So does an
+    aware one whose UTC instant falls outside datetime's range (a year-1 time
+    east of UTC, a year-9999 one west of it), where astimezone(UTC) raises
+    OverflowError. The rest of the arithmetic is done on date DIFFERENCES, so
+    no parseable timestamp can make this predicate raise: it is the fetch's
+    assembly prefilter (on the live frontier's worker thread, too) and runs in
+    both of _prepare_candidates' passes, where an exception would end the run
+    instead of keeping one absurd, hand-edited record.
 
     Args:
         m (dict): Market dict as produced by historical._market_to_dict().
@@ -1174,26 +1220,53 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
             since then we can't prove ineligibility (also keeps older cache
             files, written before open_time was added, working correctly —
             just without the speedup). False only when we can prove no
-            Monday checkpoint falls in the market's eligible window.
+            Monday checkpoint of the scan both falls in the market's window
+            and follows its opening. Never raises, whatever the timestamps.
     """
-    open_d = _parse_iso_date(m.get("open_time"))
+    open_dt = _parse_iso_datetime(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
-    if open_d is None or close_d is None:
+    if open_dt is None or close_d is None:
         # Can't prove ineligibility — keep it rather than risk dropping a
         # market that could actually enter a pair.
         return True
 
-    lower = max(open_d, start_date)
-    upper = close_d - timedelta(days=1)  # mirrors _find_entry's scan_end
-    if lower > upper:
-        return False
+    # Naive (no offset): no instant to compare, so the date alone, in the
+    # string's own wall clock (the pre-P5 rule).
+    open_utc = None
+    open_d = open_dt.date()
+    if open_dt.utcoffset() is not None:
+        try:
+            open_utc = open_dt.astimezone(UTC)
+        except OverflowError:
+            # The UTC instant falls outside datetime's range (a year-1 time
+            # east of UTC, a year-9999 one west of it — only a hand-edited
+            # cache). It cannot be placed against a checkpoint either, so it
+            # takes the naive branch's date test: exactly the pre-P5 answer,
+            # never an exception out of an assembly worker.
+            pass
+        else:
+            open_d = open_utc.date()
 
-    # Advance to the first Monday on/after `lower` — identical convention to
-    # _monday_timestamps' own advance-to-Monday step, so the two stay in sync.
-    d = lower
-    while d.weekday() != 0:
-        d += timedelta(days=1)
-    return d <= upper
+    # Every step below is a DIFFERENCE of dates, never a date plus a
+    # timedelta, so no date near either end of datetime's range can raise
+    # OverflowError (the pre-P5 predicate could: its close-minus-a-day on a
+    # year-1 close, its advance-to-Monday loop past 9999-12-31).
+    # The scan starts at the later of the opening date and start_date ...
+    first = max(open_d, start_date)
+    # ... may reach any checkpoint dated up to close_time's date minus one
+    # day, exactly as _find_entry builds scan_end ...
+    room = (close_d - first).days - 1
+    # ... and its first Monday is the same advance-to-Monday step
+    # _monday_timestamps takes, so the two walk the same Mondays.
+    ahead = (7 - first.weekday()) % 7
+    # A Monday strictly after the opening date has its checkpoint strictly
+    # after the opening instant. Only the opening date itself can put the
+    # checkpoint at or before it: then the first checkpoint the market can
+    # reach is the NEXT Monday's.
+    if (open_utc is not None and ahead == 0 and first == open_d
+            and open_utc >= _checkpoint_datetime(first)):
+        ahead = 7
+    return ahead <= room
 
 
 # ─── Pair grouping (metadata only, no prices) ─────────────────────────────────
@@ -2283,12 +2356,31 @@ def _extract_pairs(
 
 # ─── Entry point detection from candlestick data ──────────────────────────────
 
+def _checkpoint_datetime(d: date) -> datetime:
+    """
+    The entry checkpoint instant on one date: 09:00 UTC.
+
+    The ONE place the checkpoint's time of day is written. _monday_timestamps
+    builds every checkpoint _find_entry scans from it, and _can_ever_enter
+    compares a market's opening instant against it, so the prefilter and the
+    scan cannot disagree about when a Monday's checkpoint falls (M8, P5).
+
+    Args:
+        d (date): The checkpoint's date (a Monday, for every caller).
+
+    Returns:
+        datetime: 09:00 on d, tz-aware in UTC.
+    """
+    return datetime(d.year, d.month, d.day, 9, 0, tzinfo=UTC)
+
+
 def _monday_timestamps(start_date: date, end_date: date) -> list[int]:
     """
     Generate a list of Unix timestamps for every Monday in the given date range.
 
-    Each timestamp corresponds to 09:00 UTC on the Monday. The backtest scans
-    these weekly checkpoints to simulate the bot's Monday morning trading schedule.
+    Each timestamp corresponds to 09:00 UTC on the Monday (_checkpoint_datetime,
+    shared with the _can_ever_enter prefilter). The backtest scans these weekly
+    checkpoints to simulate the bot's Monday morning trading schedule.
 
     Args:
         start_date (date): First date of the scan range (inclusive). The function
@@ -2305,7 +2397,7 @@ def _monday_timestamps(start_date: date, end_date: date) -> list[int]:
         d += timedelta(days=1)
     ts_list = []
     while d <= end_date:
-        ts_list.append(int(datetime(d.year, d.month, d.day, 9, 0, tzinfo=UTC).timestamp()))
+        ts_list.append(int(_checkpoint_datetime(d).timestamp()))
         d += timedelta(weeks=1)
     return ts_list
 
@@ -3779,9 +3871,13 @@ def _prepare_candidates(
     # a 16 GB host. Pass 2 then keeps exactly the records whose key is shared.
     #
     # Necessary-condition prefilter, applied in BOTH passes: drop markets
-    # whose [open_time, close_time - 1 day] window contains no Monday
-    # checkpoint on/after start_date, since _find_entry() can then never enter
-    # them as either leg of either pair type. This is what makes
+    # with no Monday 09:00 UTC checkpoint on/after start_date that is strictly
+    # after their opening instant and dated on or before their close date
+    # minus one day, since _find_entry() can then never enter them as either
+    # leg of either pair type (see _can_ever_enter; the date-granular test it
+    # replaced in P5 also kept markets opened later on the Monday itself —
+    # 2,192,241 of the 7,274,215 records of the 7-day window's cache, and the
+    # counts quoted in this function were measured under it). This is what makes
     # grouping/pairing tractable at current Kalshi volumes (hourly/intraday
     # ladders are the overwhelming majority of settled markets and almost
     # never span a scannable Monday).
