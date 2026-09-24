@@ -134,7 +134,8 @@ backtest.py (CLI)
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata
   │    │    │     └─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
   │    │    └─ historical.fetch_candlesticks()        — hourly price series per ticker (parallel across tickers;
-  │    │                                               a window over the endpoint's 5,000-candle cap is paged)
+  │    │                                               each from the later of --start-date and the market's own
+  │    │                                               open; a window over the 5,000-candle cap is paged)
   │    └─ _sweep_from_candidates()
   │         ├─ _entries_for_band()            — k-independent; one time-series _find_entry() pass per band:
   │         │                                    every band of SPREAD_BAND_SWEEP_FLOORS x CEILINGS (plus the
@@ -458,7 +459,8 @@ backtest log warns when that happens) or, at any other band or on the "All"
 population, when all of that cell's own entries fall on one side of it.
 
 Kalshi serves at most 5,000 hourly candles (~208 days) per candlestick
-request and rejects a longer one with HTTP 400, so a ticker's price series is
+request and rejects a longer one with HTTP 400, so a ticker's price series —
+requested from the later of `--start-date` and the market's own open — is
 fetched in as many requests as its window needs and merged; a long window no
 longer loses the markets that close late in it. (Until 2026-09-23 it did:
 each window was one request opened at `--start-date`, so on the default
