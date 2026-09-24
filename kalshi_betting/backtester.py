@@ -52,8 +52,9 @@ Dependencies:
     to either sizing formula must be made in both places to keep live/backtest
     parity. Exports BacktestTrade, HalfSplit, SweepPoint,
     IntervalCalibrationBucket, IntervalCalibration, OutcomeLabelCoverage and
-    BacktestSweep (BacktestTrade, BacktestSweep and OutcomeLabelCoverage are
-    consumed by dashboard.py) plus run_backtest() and run_backtest_sweep()
+    BacktestSweep (BacktestTrade, BacktestSweep, OutcomeLabelCoverage and
+    SweepPoint are consumed by dashboard.py, which also imports the private
+    label helper _exact_label) plus run_backtest() and run_backtest_sweep()
     (called by backtest.py).
 
 Notes:

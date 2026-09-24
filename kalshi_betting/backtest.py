@@ -48,13 +48,16 @@ Notes:
     comparable to a baseline taken without it. It is the way to measure the
     ladder strategy the switch gates before flipping the switch.
 
-    That setting reaches kalshi_backtest.log ONLY — the pre-fetch echo below
-    and run_backtest_sweep's resolved line. The HTML dashboard does not render
-    it, so a ladder-enabled run's dashboard is indistinguishable from a
-    switch-off one and must be labelled by hand. Recorded rather than fixed:
-    dashboard.py is outside DR-73's blast radius, and unlike DR-66b's
-    subtitle-coverage caveat this setting is chosen by the operator on the
-    command line rather than discovered by the run.
+    That setting reaches kalshi_backtest.log (the pre-fetch echo below and
+    run_backtest_sweep's resolved line) AND the HTML dashboard's own page
+    header: dashboard._run_settings_html(sweep) prints "same-event ladders:
+    on / off / not recorded" (BacktestSweep.same_event_ladders) beside the
+    primary spread band, under the "Period:" line, above every section — so a
+    ladder-enabled run's dashboard is no longer indistinguishable from a
+    switch-off one and needs no hand labelling. Unlike DR-66b's
+    subtitle-coverage caveat, this setting is chosen by the operator on the
+    command line rather than discovered by the run, which is why it is named
+    rather than banner-flagged.
 
     --spread-min/--spread-max set the PRIMARY scenario's backtest-only
     time-series spread band (floor, ceiling) on pB - pA. Once
@@ -392,9 +395,10 @@ def main() -> None:
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
     # don't duplicate that line here, just point the user at the file.
     #
-    # sweep carries the calibration and every swept point for the k selector;
-    # interval_discount is the resolved k these trades were sized at, which the
-    # Risk section's Kelly scatter must price on
+    # sweep carries the calibration and every swept point for the k selector,
+    # the scenario explorer's band x k payload and the header's run-settings
+    # line; interval_discount is the resolved k these trades were sized at,
+    # which the Risk section's Kelly scatter must price on
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k)
     logging.info("Open the HTML file in a browser to view the interactive charts.")

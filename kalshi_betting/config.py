@@ -242,11 +242,12 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # --same-event-ladders / --no-same-event-ladders overrides this constant for
 # ONE run, which is how the k-hat the gate above demands gets measured without
 # flipping the switch first; scanner.py binds the constant at import, so that
-# override never reaches the live finder. The backtest's HTML dashboard does
-# NOT render the setting — it reaches kalshi_backtest.log only — so a
-# ladder-enabled run's dashboard is indistinguishable from a switch-off one and
-# must be labelled by hand (recorded, not fixed: dashboard.py is outside DR-73's
-# blast radius).
+# override never reaches the live finder. The backtest's HTML dashboard also
+# renders the resolved setting, not just kalshi_backtest.log:
+# dashboard._run_settings_html prints "same-event ladders: on / off / not
+# recorded" in the page header (BacktestSweep.same_event_ladders), alongside
+# the primary spread band, so a ladder-enabled run's dashboard is no longer
+# indistinguishable from a switch-off one.
 #
 # scanner.py, backtester.py AND backtest.py each bind this by VALUE at import
 # (the SCANNER_MAX_PAGES idiom), so a test or harness flipping it at runtime
@@ -287,11 +288,14 @@ TIME_SERIES_SAME_EVENT_LADDERS = False
 TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 
 # Grid of k values backtester.run_backtest_sweep() re-simulates so the dashboard
-# can offer a k selector without a re-run. Spans "size very aggressively" (0.40)
+# can offer a k selector without a re-run and, on a band sweep, as the scenario
+# explorer's k axis. Spans "size very aggressively" (0.40)
 # through "take the market at face value" (1.00, where Kelly is <= 0 for every
 # pair and nothing trades — the boundary is informative, so it stays in). Each
-# point costs one extra sizing+selection pass over already-fetched candidates;
-# the market fetch and candlestick fetch happen once regardless.
+# point costs one extra sizing+selection pass over already-fetched candidates —
+# on a band sweep, one per point per band, plus that band's population,
+# split-half and ex-top runs (see SPREAD_BAND_SWEEP_FLOORS for the measured
+# total); the market fetch and candlestick fetch happen once regardless.
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
                            0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
 

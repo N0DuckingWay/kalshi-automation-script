@@ -53,8 +53,10 @@ Notes:
     chart renders into. Its scope is deliberately that one section: the
     scenario-explorer section (below) carries its own independent band/k
     selectors, and the remaining six sections always reflect the run's primary
-    k (the CLI's --interval-discount, or config.TIME_SERIES_INTERVAL_PROB_DISCOUNT
-    when it was not passed).
+    scenario: its primary k (the CLI's --interval-discount, or
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed) AND its
+    primary spread band (--spread-min/--spread-max, or
+    config.BACKTEST_DEFAULT_SPREAD_BAND when neither was passed).
 
     The scenario-explorer section's band x k grid is too large, and its two
     axes of selection too independent, for the same native-dropdown idiom: a
@@ -68,9 +70,9 @@ Notes:
 
     The page header names the run's primary spread band and its same-event
     ladder setting (DR-73) under the Period line, or "not recorded" when the
-    run passed no sweep: both decide which pairs exist, so, like DR-66b's
-    strike-blind notice, they qualify every section rather than only the
-    explorer.
+    run passed no sweep: the ladder setting decides which pairs exist and the
+    band which of them are ever entered, so, like DR-66b's strike-blind
+    notice, they qualify every section rather than only the explorer.
 """
 import html
 import json
@@ -1550,9 +1552,11 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line naming the run's primary spread band and ladder setting.
 
-    Both settings decide WHICH PAIRS EXIST — the band filters every
-    time-series entry and the same-event ladder switch (DR-73) admits or
-    refuses a whole pair population — so, like DR-66b's strike-blind notice,
+    Both settings shape the population every section reports on — the
+    same-event ladder switch (DR-73) decides which pairs exist, admitting or
+    refusing a whole pair population, and the band decides which of them are
+    ever entered (it acts inside backtester._find_entry, after pair
+    extraction) — so, like DR-66b's strike-blind notice,
     they taint every section of the page, not only the scenario explorer, and
     belong in the header a reader sees before any figure. "not recorded" is
     printed rather than a guess whenever the sweep does not carry the value
@@ -2301,9 +2305,10 @@ def generate_dashboard(
             "</p>"
         )
 
-    # The primary spread band and the ladder setting decide which pairs
-    # exist, so they are named in the header above every section, not only
-    # inside the scenario explorer; "not recorded" when there is no sweep.
+    # The ladder setting decides which pairs exist and the primary spread band
+    # which of them are ever entered, so both are named in the header above
+    # every section, not only inside the scenario explorer; "not recorded"
+    # when there is no sweep.
     run_settings = _run_settings_html(sweep)
 
     sections = [
