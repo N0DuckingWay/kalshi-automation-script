@@ -226,6 +226,8 @@ pip install -e ".[dev,perf]"
 
 Dependencies are declared in `pyproject.toml`: `kalshi-python-sync` (pinned to `3.2.0` — do not bump, see `CLAUDE.md`), `schedule`, `tabulate`, `cryptography`, `python-dateutil`, `openpyxl`, `plotly`, `pandas`, `numpy`, `scipy`, `yfinance`. The `[dev]` extra adds `pytest` and `ruff`. The `[perf]` extra adds `orjson`, which speeds up the backtest's settled-market fetch — that fetch parses tens of millions of JSON records and is CPU-bound on JSON decoding. It is entirely optional: without it the code falls back to the stdlib `json` module, and because `orjson` emits plain JSON the on-disk cache format is identical either way, so installing or removing it never invalidates a cache.
 
+The package to install is named explicitly (`[tool.setuptools.packages.find]` includes only `kalshi_betting*`). Otherwise the `backtest_cache/` directory a backtest leaves at the repo root is auto-discovered as a second package, and `pip install -e` refuses to build.
+
 ### Credentials
 
 Create `secrets.json` in the project root with the following structure:
