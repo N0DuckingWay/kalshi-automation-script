@@ -1088,8 +1088,10 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     sitting exactly on the documented bound is never dropped for float noise.
     This is the ONE place the ceiling's epsilon lives; callers test the
     result and add no tolerance of their own. Backtest-only, like
-    time_series_spread_band(); its one caller is backtester._find_entry,
-    which tests it on time-series pairs only.
+    time_series_spread_band(). It has two callers: backtester._find_entry,
+    which tests it on time-series pairs only, and backtest.main, which tests
+    a spread sitting exactly on each deadline-gap tier so it can warn when
+    an operator-typed ceiling empties that tier.
 
     Args:
         spread (float): pB - pA, dollars.
