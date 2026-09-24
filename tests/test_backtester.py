@@ -3129,7 +3129,7 @@ class TestPrepareEntriesMemoryInstrumentation:
         labels = [r.args[0] for r in caplog.records
                   if r.getMessage().startswith("Peak RSS")]
         # In order, and exactly the two that bracket grouping/pairing — the
-        # window between the existing "Total settled markets" and "Potential
+        # window between the existing "Markets to analyze" and "Potential
         # pairs" lines, where the peak lives and is otherwise invisible.
         assert labels == ["before grouping", "after pair extraction"]
 
@@ -6137,7 +6137,7 @@ class TestGroupableSubset:
             assert len(hits) == 1, prefix
             return hits[0]
 
-        total = f"Total settled markets to analyze: {len(markets)}"
+        total = f"Markets to analyze: {len(markets)}"
         prefilter = (f"Eligibility prefilter: skipping "
                      f"{len(markets) - len(eligible)}/{len(markets)} markets")
         groupable = (f"Groupable subset: materializing {len(subset)} of "
@@ -6463,6 +6463,154 @@ class TestPrepareCandidatesOverASettledCorpus:
         # matches, so pass 2's own identity check stops the run there.
         with pytest.raises(RuntimeError, match="did not iterate identically"):
             TestGroupableSubset._prepare()
+
+
+class TestPrefilterLinesSayItRanDuringAssembly:
+    """M9 of the 2026-09-24 7-day-run review: _prepare_candidates re-applies
+    the eligibility prefilter to a corpus the fetch already prefiltered, so
+    "Eligibility prefilter: skipping 0/7274215" was printed beside "Total
+    settled markets to analyze: 7274215" although the assembly had kept
+    those 7,274,215 of about 24.6M settled records (the review's estimate).
+    A corpus that carries provenance (it came from the fetch) is now
+    reported as ELIGIBLE markets, with the assembly's own rejections when it
+    recorded them, and its re-check is named as one; a re-check that rejects
+    anything is a WARNING, since only a predicate changed without a tag bump
+    (or an altered cache) can do that."""
+
+    TAG = backtester.SETTLED_PREFILTER_CACHE_TAG
+    COUNTS = historical.AssemblyCounts(settled=40, rejected=25, duplicates=3)
+
+    @staticmethod
+    def _prov(**fields):
+        base = {"from_cache": False, "assembled_at": datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
+                "archive_cutoff": datetime(2026, 7, 25, tzinfo=UTC), "post_cutoff": True}
+        base.update(fields)
+        return historical.CorpusProvenance(**base)
+
+    @staticmethod
+    def _lines(caplog):
+        return [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_a_fresh_prefiltered_corpus_quotes_what_the_assembly_rejected(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(12, 12, self._prov(assembly_counts=self.COUNTS))
+        assert self._lines(caplog) == [
+            ("INFO", f"Markets to analyze: 12 eligible — the eligibility prefilter "
+                     f"({self.TAG}) ran during assembly and rejected 25 of the 40 "
+                     f"records settled in the window (3 more were duplicate or blank "
+                     f"tickers; counted by this run)"),
+            ("INFO", "Eligibility prefilter re-check: 0 of 12 markets rejected — "
+                     "none expected, since it already ran during assembly"),
+        ]
+        assert "skipping 0/" not in caplog.text
+
+    def test_a_cache_hit_says_the_counts_are_as_of_its_assembly(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(
+                12, 12, self._prov(from_cache=True, assembly_counts=self.COUNTS))
+        assert "(3 more were duplicate or blank tickers; counted at this cache's " \
+            "assembly)" in caplog.text
+
+    @pytest.mark.parametrize("legacy, noun", [(False, "cache"), (True, "legacy cache")])
+    def test_a_corpus_without_counts_says_it_records_none(self, caplog, legacy, noun):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(
+                7, 7, self._prov(from_cache=True, legacy=legacy,
+                                 archive_cutoff=None, post_cutoff=None))
+        assert self._lines(caplog)[0] == (
+            "INFO", f"Markets to analyze: 7 eligible — the eligibility prefilter "
+                    f"({self.TAG}) ran during assembly, but this {noun} records no "
+                    f"count of the records it rejected")
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    @pytest.mark.parametrize("counts", [None, COUNTS])
+    def test_a_re_check_that_rejects_anything_is_a_warning(self, caplog, counts):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(12, 9, self._prov(assembly_counts=counts))
+        lines = self._lines(caplog)
+        warned = [m for level, m in lines if level == "WARNING"]
+        assert len(warned) == 1
+        assert warned[0].startswith(
+            f"Eligibility prefilter re-check: 3 of 12 markets rejected, although "
+            f"the prefilter ({self.TAG}) already ran during this corpus's assembly")
+        assert "config.SETTLED_PREFILTER_CACHE_TAG" in warned[0]
+        # The INFO line above that WARNING must not call all 12 eligible when
+        # the WARNING says 3 of them are not: it names both counts.
+        assert lines[0][0] == "INFO"
+        assert lines[0][1].startswith(
+            f"Markets to analyze: 12 assembled as eligible, 9 still eligible "
+            f"after the re-check below — the eligibility prefilter ({self.TAG}) "
+            f"ran during assembly")
+        assert "12 eligible" not in lines[0][1]
+
+    def test_a_plain_list_keeps_the_old_skip_line(self, caplog):
+        # No provenance, so no assembly is known to have filtered it: the
+        # re-check IS its prefilter, and says so in the words it always used.
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(10, 6, None)
+        assert self._lines(caplog) == [
+            ("INFO", "Markets to analyze: 10 (no assembly record — whether a "
+                     "prefilter ran while this corpus was assembled is unknown)"),
+            ("INFO", "Eligibility prefilter: skipping 4/10 markets that cannot "
+                     "appear in any tradeable pair"),
+        ]
+
+    def test_prepare_candidates_reports_a_fetched_corpus_through_it(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # End to end over a real streamed corpus that WAS prefiltered, as the
+        # fetch returns it: the corpus is its eligible markets, the assembly's
+        # counts are quoted, the re-check rejects nothing, nothing warns.
+        eligible = TestGroupableSubset._eligible(_ss1_corpus(0))
+        written = TestPrepareCandidatesOverASettledCorpus._corpus(tmp_path, eligible)
+        counts = historical.AssemblyCounts(
+            settled=len(eligible) + 30, rejected=30, duplicates=0)
+        corpus = historical.SettledCorpus(
+            written.path, historical._assembled_cache_meta(_SS1_START, "t"),
+            len(written), provenance=self._prov(assembly_counts=counts))
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            TestGroupableSubset._prepare()
+        messages = [r.getMessage() for r in caplog.records]
+        assert (f"Markets to analyze: {len(eligible)} eligible — the eligibility "
+                f"prefilter ({self.TAG}) ran during assembly and rejected 30 of "
+                f"the {len(eligible) + 30} records settled in the window") in caplog.text
+        assert (f"Eligibility prefilter re-check: 0 of {len(eligible)} markets "
+                f"rejected") in caplog.text
+        # (the stubbed candle fetch returns nothing, which warns on its own)
+        assert not [r for r in caplog.records if r.levelname == "WARNING"
+                    and "prefilter" in r.getMessage()]
+        # Still before the groupable line, as the old pair of lines was.
+        first = next(i for i, m in enumerate(messages) if m.startswith("Markets to analyze"))
+        group = next(i for i, m in enumerate(messages) if m.startswith("Groupable subset"))
+        assert first < group
+
+    def test_prepare_candidates_warns_on_a_fetched_corpus_it_can_still_filter(
+        self, monkeypatch, caplog,
+    ):
+        # A corpus claiming to come from the fetch that still holds records
+        # the predicate rejects: the stale-tag case. Dropped AND warned about.
+        template = _ss1_corpus(0)
+        legacy = historical.LegacySettledCorpus(
+            template, self._prov(from_cache=True, legacy=True,
+                                 archive_cutoff=None, post_cutoff=None))
+        TestGroupableSubset._patch(monkeypatch, legacy)
+        with caplog.at_level(logging.INFO):
+            prepared = TestGroupableSubset._prepare()
+        rejected = len(template) - len(TestGroupableSubset._eligible(template))
+        assert rejected > 0
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+                  and r.getMessage().startswith("Eligibility prefilter re-check")]
+        assert len(warned) == 1 and warned[0].startswith(
+            f"Eligibility prefilter re-check: {rejected} of {len(template)} markets rejected")
+        # ...and the line above it names both counts, never all of them eligible.
+        assert (f"Markets to analyze: {len(template)} assembled as eligible, "
+                f"{len(template) - rejected} still eligible after the re-check "
+                f"below — the eligibility prefilter ({self.TAG}) ran during "
+                f"assembly, but this legacy cache records no count") in caplog.text
+        # ...and the dropped records are dropped exactly as before.
+        TestGroupableSubset._patch(monkeypatch, template)
+        assert prepared.all_pairs == TestGroupableSubset._prepare().all_pairs
 
 
 class TestEntriesForBand:

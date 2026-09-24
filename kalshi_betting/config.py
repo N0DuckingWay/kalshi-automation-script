@@ -754,7 +754,7 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # this warning. The warning does not count those records, so such a run whose
 # eligible count is far above this threshold but whose groupable count is not
 # gets no warning for the list that set its peak (its eligible count is still
-# on the "Eligibility prefilter" and "Groupable subset" lines).
+# on the "Markets to analyze" and "Groupable subset" lines).
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
 # phase right after it held the whole window as one list and built two group
@@ -904,7 +904,13 @@ TRADER_MAX_WORKERS = 8
 #
 # MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
 # stale prefiltered cache is silently reused and the backtest sees a market set
-# the current predicate would not have produced.
+# the current predicate would not have produced. Since M9 (P3) half of that is
+# no longer silent: _prepare_candidates re-applies the predicate to every
+# fetched corpus, and a re-check that rejects anything on a corpus assembled
+# under this tag is a WARNING naming this constant
+# (backtester._log_corpus_prefilter) — which catches a TIGHTENED predicate. A
+# LOOSENED one is still invisible, since the records the old predicate dropped
+# are simply absent from the cache.
 SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
 
 # How young an EMPTY assembled settled-market cache must be to still be served

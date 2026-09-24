@@ -136,14 +136,21 @@ backtest.py (CLI)
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata, returned as a SettledCorpus
   │    │    │     │                                    (streams settled_markets_*.jsonl.gz on every walk;
   │    │    │     │                                    a legacy .json cache hit is still one list)
-  │    │    │     ├─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
-  │    │    │     └─ assembly walk A / walk B         — both stream the day slices (and the current
-  │    │    │                                          day, spooled to an anonymous temp file) lazily
-  │    │    │                                          through one merge generator: A counts and
+  │    │    │     ├─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly;
+  │    │    │     │                                    the log reports the window's settled records
+  │    │    │     │                                    beside the eligible ones it kept
+  │    │    │     └─ assembly walk A / walk B         — both stream the day slices (unfiltered) and
+  │    │    │                                          the current day (spooled to an anonymous temp
+  │    │    │                                          file, prefiltered as it arrived) lazily
+  │    │    │                                          through one merge generator: A counts — the
+  │    │    │                                          kept markets, and the settled records the
+  │    │    │                                          prefilter or the dedup removed — and
   │    │    │                                          collects event tickers for title resolution,
-  │    │    │                                          B patches titles and writes the cache — the
-  │    │    │                                          corpus is never held
-  │    │    ├─ _index_eligible_keys()                 — walk 1: count, prefilter, census, hash both grouping keys
+  │    │    │                                          B patches titles and writes the cache, the
+  │    │    │                                          counts in its meta — the corpus is never held
+  │    │    ├─ _index_eligible_keys()                 — walk 1: count, re-check the prefilter (a no-op on a
+  │    │    │                                           fetched corpus, which says so), census, hash both
+  │    │    │                                           grouping keys
   │    │    ├─ _materialize_groupable()               — walk 2: keep only eligible markets sharing a key with
   │    │    │                                           another (the rest form single-member groups, which both
   │    │    │                                           groupings drop) — then group and extract pairs on those
@@ -556,7 +563,14 @@ with the run. The market records are never assembled in memory either: once
 every slice is present, the slices are streamed off disk twice (once to count
 the markets and collect the event tickers whose titles are resolved, once to
 write every market into the assembled `settled_markets_*.jsonl.gz` cache), and
-the backtester then streams that file on each of its own walks. What still
+the backtester then streams that file on each of its own walks. The first walk
+also counts every record that settled in the window and how many of them the
+backtester's eligibility prefilter rejected, so the log reads "N eligible
+markets of M records settled ..." instead of calling the survivors settled
+markets; those counts are stored in the assembled cache, repeated when a later
+run is served from it, and quoted on the backtester's own "Markets to analyze"
+line, whose prefilter re-check then reports the zero it finds as expected
+rather than as "skipping 0". What still
 grows with the run is much smaller, because it holds strings rather than whole
 records: the set of market tickers each of those two walks keeps to drop
 duplicates, and the event tickers and titles being resolved. Three record lists

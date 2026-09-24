@@ -2899,8 +2899,8 @@ def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCov
 
     # An empty corpus has no coverage to report: the fraction is undefined,
     # not zero, so warning here would manufacture a drift alarm out of a corpus
-    # that simply has no records — a cause the surrounding "Total settled
-    # markets" and "Eligibility prefilter" lines already name. The census still
+    # that simply has no records — a cause the surrounding "Markets to
+    # analyze" and "Eligibility prefilter" lines already name. The census still
     # emits one line, so its ABSENCE always means this helper did not run.
     if not total:
         logging.info("Outcome-label coverage: no eligible markets to census")
@@ -3078,7 +3078,7 @@ class _EligibleKeyIndex:
 
     Attributes:
         total (int): Every record the first pass walked, eligible or not — the
-            figure "Total settled markets to analyze" reports.
+            figure "Markets to analyze" reports.
         eligible (int): Records that passed _can_ever_enter.
         groupable (int): Eligible records whose time-series key OR same-title
             key hash is shared with another eligible record — how many the
@@ -3319,6 +3319,108 @@ def _materialize_groupable(
     return groupable
 
 
+def _log_corpus_prefilter(total: int, eligible: int,
+                          provenance: CorpusProvenance | None) -> None:
+    """
+    Log what the corpus holds and what the eligibility prefilter did to it.
+
+    M9 of the 2026-09-24 7-day-run review. _prepare_candidates hands
+    _can_ever_enter to the fetch as its prefilter, so the corpus that comes
+    back is already the eligible set, and the first pass's own re-check of
+    the same predicate rejects nothing. The old lines ignored that: they
+    called the corpus "Total settled markets to analyze" and logged
+    "Eligibility prefilter: skipping 0/N" on every production run — the
+    7-day window printed "skipping 0/7274215" although the assembly had
+    kept those 7,274,215 of about 24.6M settled records (the review's
+    estimate; the prefilter accounts for up to the ~17.3M gap) — so a
+    prefilter that worked and one that rejected nothing logged the same line.
+    The corpus's provenance now decides the wording:
+
+      * provenance present (a SettledCorpus or a LegacySettledCorpus, i.e.
+        the corpus came from fetch_all_settled_markets under
+        SETTLED_PREFILTER_CACHE_TAG): the corpus is N ELIGIBLE markets, and
+        the line says the prefilter ran during assembly — quoting its
+        rejections of the records settled in the window when the corpus
+        recorded them (CorpusProvenance.assembly_counts), and saying it
+        recorded none otherwise (every legacy cache, and every streamed one
+        written before those counts existed). The re-check is then named as
+        one, and anything it rejects is a WARNING: it can only mean
+        _can_ever_enter changed without a tag bump — the stale-cache case
+        config.SETTLED_PREFILTER_CACHE_TAG exists to prevent — or the cache
+        file was altered.
+      * no provenance (a plain list: a test stub or a hand-built corpus): how
+        it was assembled is unknown, so the re-check IS its prefilter, and
+        the second line keeps its old wording, "Eligibility prefilter:
+        skipping X/N ...".
+
+    Both lines are logged on every run, healthy or not (DR-66): the first
+    always at INFO, the re-check at INFO when it rejects nothing and at
+    WARNING otherwise. A zero-trade run's first question — did the prefilter
+    leave anything? — is answered by the first line on its own, which on
+    that WARNING path names both counts ("N assembled as eligible, E still
+    eligible after the re-check below") rather than call all N eligible on
+    the line above a WARNING that says some of them are not.
+
+    Args:
+        total (int): Every record the first pass walked.
+        eligible (int): Those that passed _can_ever_enter in that pass.
+        provenance (CorpusProvenance | None): The corpus's provenance, read by
+            type before the corpus is released; None for a plain list.
+    """
+    rejected_here = total - eligible
+    if provenance is None:
+        logging.info(
+            "Markets to analyze: %d (no assembly record — whether a prefilter "
+            "ran while this corpus was assembled is unknown)", total,
+        )
+        logging.info(
+            "Eligibility prefilter: skipping %d/%d markets that cannot appear "
+            "in any tradeable pair", rejected_here, total,
+        )
+        return
+    counts = provenance.assembly_counts
+    when = "at this cache's assembly" if provenance.from_cache else "by this run"
+    # The corpus is N eligible markets only while the re-check agrees. When
+    # it rejects anything (the WARNING below), name both counts: the line
+    # above that WARNING must not call all N eligible.
+    if rejected_here == 0:
+        size, size_args = "%d eligible", (total,)
+    else:
+        size = "%d assembled as eligible, %d still eligible after the re-check below"
+        size_args = (total, eligible)
+    if counts is not None:
+        logging.info(
+            "Markets to analyze: " + size + " — the eligibility prefilter (%s) "
+            "ran during assembly and rejected %d of the %d records settled in "
+            "the window (%d more were duplicate or blank tickers; counted %s)",
+            *size_args, SETTLED_PREFILTER_CACHE_TAG, counts.rejected,
+            counts.settled, counts.duplicates, when,
+        )
+    else:
+        logging.info(
+            "Markets to analyze: " + size + " — the eligibility prefilter (%s) "
+            "ran during assembly, but this %s records no count of the records "
+            "it rejected",
+            *size_args, SETTLED_PREFILTER_CACHE_TAG,
+            "legacy cache" if provenance.legacy else "cache",
+        )
+    if rejected_here == 0:
+        logging.info(
+            "Eligibility prefilter re-check: 0 of %d markets rejected — none "
+            "expected, since it already ran during assembly", total,
+        )
+    else:
+        logging.warning(
+            "Eligibility prefilter re-check: %d of %d markets rejected, although "
+            "the prefilter (%s) already ran during this corpus's assembly and "
+            "should have left none — backtester._can_ever_enter has changed "
+            "without a config.SETTLED_PREFILTER_CACHE_TAG bump, or the cache "
+            "file was altered. They are dropped here; bump the tag so the cache "
+            "is rebuilt under the current predicate",
+            rejected_here, total, SETTLED_PREFILTER_CACHE_TAG,
+        )
+
+
 def _prepare_candidates(
     hist_client: Any,
     live_client,
@@ -3491,7 +3593,7 @@ def _prepare_candidates(
     # which since the prefilter ran during its assembly is the eligible set,
     # resident until the `del markets` below.
     #
-    # Pass 1 counts every record (the "Total settled markets" figure), applies
+    # Pass 1 counts every record (the "Markets to analyze" figure), re-applies
     # the eligibility prefilter below, feeds each eligible record to the
     # outcome-label census, and hashes that record's two grouping keys — about
     # 27 bytes per eligible record, never the record itself (plus a transient
@@ -3516,14 +3618,16 @@ def _prepare_candidates(
     # anyway), and it keeps this guarantee local to the code that depends on
     # it (a cached unfiltered list, a caller that skips the prefilter argument,
     # or a future fetch path would otherwise reach the O(n^2) pairing
-    # unfiltered).
+    # unfiltered). On a fetched corpus it rejects nothing, and its line says so
+    # rather than reporting "skipping 0" as if nothing had been filtered: the
+    # rejections happened during assembly, and the first line quotes them
+    # (M9, _log_corpus_prefilter).
     census = _OutcomeLabelTally()
     key_index = _index_eligible_keys(markets, start_date, census)
-    logging.info("Total settled markets to analyze: %d", key_index.total)
-    logging.info(
-        "Eligibility prefilter: skipping %d/%d markets that cannot appear in any tradeable pair",
-        key_index.total - key_index.eligible, key_index.total,
-    )
+    # What the corpus is (eligible markets, when the fetch prefiltered it) and
+    # what the prefilter rejected — during assembly, as the corpus recorded
+    # it, and in the re-check just run (M9)
+    _log_corpus_prefilter(key_index.total, key_index.eligible, corpus_provenance)
 
     # Pass 2: materialize the groupable subset, in corpus order. Raises if the
     # corpus did not iterate identically twice, which would misalign the
@@ -3568,7 +3672,7 @@ def _prepare_candidates(
     # So such a run whose eligible count is far above the threshold but whose
     # groupable count is not (the 7-day window above: 7,260,952 eligible,
     # 184,255 groupable) gets no warning for the list that set its peak; its
-    # eligible count is still on the "Eligibility prefilter" and "Groupable
+    # eligible count is still on the "Markets to analyze" and "Groupable
     # subset" lines, and the cost on the RSS line. It deliberately carries only THIS
     # run's numbers; the historical measurements live in config.py beside
     # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them

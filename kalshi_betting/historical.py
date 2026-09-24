@@ -35,9 +35,11 @@ Dependencies:
     disk-backed, re-iterable corpus fetch_all_settled_markets returns — and
     LegacySettledCorpus, the list a legacy settled_markets_*.json hit
     returns; each carries a CorpusProvenance (when, and under which archive
-    cutoff, the corpus was assembled; backtester.py carries it to the
-    dashboard header); and SettledCorpusError, which walking a SettledCorpus
-    raises when its file cannot be read.
+    cutoff, the corpus was assembled, and — as AssemblyCounts — how many
+    records settled in its window and how many of them the prefilter
+    rejected; backtester.py carries it to the dashboard header and reports
+    the counts on its own prefilter line); and SettledCorpusError, which
+    walking a SettledCorpus raises when its file cannot be read.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -84,7 +86,12 @@ Notes:
     day after a Monday can be most of the day — is ever resident. The two
     sequential fallbacks apply the same prefilter per record but still hold
     their whole filtered result; the archive tail is the one walk that
-    applies no prefilter (its record cap bounds it instead).
+    applies no prefilter (its record cap bounds it instead). Those three
+    fetch-time filters are the only places the prefilter runs before the
+    assembly: the day slices are handed back UNFILTERED (M9 of the 2026-09-24
+    review), so the assembly's first walk sees every one of their records and
+    can count what the prefilter rejects, and the fetch-time filters add the
+    records they dropped to the same count (_AssemblyTally, AssemblyCounts).
 
     Since SS-1 the ASSEMBLED corpus is never held in memory either. The phases
     return lazy views (_DaySliceStream re-reads the day slices on every walk;
@@ -130,6 +137,7 @@ import zlib
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
@@ -2160,11 +2168,13 @@ class _DaySliceStream:
                 (copied).
             keep (Callable[[dict], bool] | None): Optional predicate applied per
                 record as slices are read, so records the caller would discard
-                anyway are never yielded (for "jsonl-v1" slices they are never
-                even retained past their own parse). Purely a memory
-                optimization — the assembly re-applies the same predicate. The
-                slice FILES are never filtered; they stay complete for other
-                start dates.
+                anyway are never yielded. The phases no longer pass one (M9):
+                it saved no memory — a walk holds one record at a time either
+                way, and the assembly discards a rejected record as soon as it
+                has tested it — while hiding every record it dropped from the
+                assembly's count of what the prefilter rejected. The slice
+                FILES are never filtered; they stay complete for other start
+                dates.
         """
         self._store = store
         # Newest day first: the order the old in-memory assembly produced, and
@@ -2288,8 +2298,9 @@ def _assemble_day_slices(
             have a valid slice on disk (reused or just written).
         expect_meta (dict): Reuse-gating keys the slices must still match.
         keep (Callable[[dict], bool] | None): Optional predicate applied per
-            record as slices are read (see _DaySliceStream). The slice FILES
-            are never filtered; they stay complete for other start dates.
+            record as slices are read (see _DaySliceStream for why the phases
+            pass none). The slice FILES are never filtered; they stay complete
+            for other start dates.
 
     Returns:
         _DaySliceStream: Compact market dicts, newest day first, re-read from
@@ -2576,6 +2587,8 @@ def _fetch_archive_sequential(
     cutoff_ts: int,
     hist_kwargs: dict,
     keep: Callable[[dict], bool] | None = None,
+    *,
+    tally: "_AssemblyTally | None" = None,
 ) -> list[dict]:
     """
     Original sequential archive walk — the sharding fallback path.
@@ -2611,6 +2624,12 @@ def _fetch_archive_sequential(
             record, exactly as before it existed. It never affects the walk
             itself — pages requested, the barren-page stop and the progress
             line's "markets kept so far" count are all computed before it.
+        tally (_AssemblyTally | None): When given, the in-window records
+            `keep` rejected are added to it once the walk completes
+            (_AssemblyTally.note_rejected) — every record this walk tests is
+            already inside [start_ts, cutoff_ts), so each is one the
+            assembly's count of settled records must include, and the
+            assembly never sees it (M9). Nothing is added if the walk raises.
 
     Returns:
         list[dict]: Compact market dicts settled within [start_ts, cutoff_ts)
@@ -2673,6 +2692,11 @@ def _fetch_archive_sequential(
                 barren,
             )
             break
+    if tally is not None:
+        # walk_kept counts in-window binary records BEFORE `keep`, so the gap
+        # is exactly what the prefilter dropped here — records the assembly
+        # will never see and so could not count itself (M9).
+        tally.note_rejected(walk_kept - len(selected))
     return selected
 
 
@@ -2733,6 +2757,8 @@ def _fetch_archive_phase(
     cutoff_ts: int,
     hist_kwargs: dict,
     keep: Callable[[dict], bool] | None = None,
+    *,
+    tally: "_AssemblyTally | None" = None,
 ) -> tuple[Iterable[dict], list[dict]]:
     """
     Fetch the archive's contribution: created-day slices plus the below-start tail.
@@ -2770,24 +2796,31 @@ def _fetch_archive_phase(
         start_ts (int): Backtest window start, epoch seconds (UTC midnight).
         cutoff_ts (int): Archive/live boundary from /historical/cutoff.
         hist_kwargs (dict): Base query params (limit, optional mve_filter).
-        keep (Callable[[dict], bool] | None): Optional per-record predicate
-            applied while slices are read back, and per record by the
-            sequential fallback as its pages arrive, so records the caller
-            will discard anyway never accumulate. Slice FILES stay unfiltered.
-            The tail walk does NOT apply it (its ARCHIVE_TAIL_MAX_RECORDS cap
-            counts unfiltered records); the caller's merge filters the tail.
+        keep (Callable[[dict], bool] | None): Optional per-record predicate,
+            applied only by the sequential fallback, per record as its pages
+            arrive, so the list it holds never accumulates records the caller
+            will discard. The day-slice stream is returned UNFILTERED (M9):
+            filtering it at read-back saved no memory and hid its rejections
+            from the assembly's count; the caller's assembly applies the same
+            predicate to every record and counts. Slice FILES stay
+            unfiltered either way. The tail walk does not apply it either
+            (its ARCHIVE_TAIL_MAX_RECORDS cap counts unfiltered records).
+        tally (_AssemblyTally | None): Handed to the sequential fallback,
+            which adds the in-window records `keep` dropped (the only records
+            of this phase the assembly never sees). The sharded path adds
+            nothing: everything it returns reaches the assembly unfiltered.
 
     Returns:
         tuple[Iterable[dict], list[dict]]: (day-slice records newest-day
             first, tail records). On the sharded path the first element is a
             _DaySliceStream — re-iterable, read lazily off disk on every walk,
-            never a list; the tail is a list (its record cap bounds it). Day-
-            slice records are NOT yet settlement-filtered (the caller applies
-            the [start_ts, cutoff_ts) window); tail records already are. On
-            the sequential fallback, everything is returned
-            settlement-filtered (and `keep`-filtered) in the first element, a
-            list, and the second is empty; when the window starts at or after
-            the cutoff, both are empty lists.
+            never a list, and not `keep`-filtered; the tail is a list (its
+            record cap bounds it). Day-slice records are NOT yet
+            settlement-filtered (the caller applies the [start_ts, cutoff_ts)
+            window); tail records already are. On the sequential fallback,
+            everything is returned settlement-filtered (and `keep`-filtered)
+            in the first element, a list, and the second is empty; when the
+            window starts at or after the cutoff, both are empty lists.
     """
     if start_ts >= cutoff_ts:
         # The archive holds only markets that settled BEFORE the cutoff, so a
@@ -2893,18 +2926,20 @@ def _fetch_archive_phase(
                                    tail_progress)
 
         # A lazy stream, not a list: nothing is read here, and every later
-        # walk re-reads the slices one record at a time (SS-1).
-        return _assemble_day_slices("archive_days", on_disk, expect_meta, keep), tail
+        # walk re-reads the slices one record at a time (SS-1). Unfiltered
+        # (M9): the assembly applies `keep` itself and counts what it rejects.
+        return _assemble_day_slices("archive_days", on_disk, expect_meta), tail
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Archive fetch: sharded path unavailable (%s) — falling back to the "
             "sequential walk. Any day slices already completed remain on disk "
             "and will be reused by the next run.", exc,
         )
-        # Same prefilter as the slice read-back, applied per record as each
-        # page arrives; the walk still holds its whole keep-passing result.
+        # The caller's prefilter, applied per record as each page arrives;
+        # the walk still holds its whole keep-passing result, and adds what it
+        # dropped to the tally, since the assembly never sees those records.
         return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts,
-                                         hist_kwargs, keep), []
+                                         hist_kwargs, keep, tally=tally), []
 
 
 # ─── Live (post-cutoff) fetching ──────────────────────────────────────────────
@@ -3013,6 +3048,8 @@ def _fetch_live_sequential(
     live_client,
     live_min_ts: int,
     keep: Callable[[dict], bool] | None = None,
+    *,
+    tally: "_AssemblyTally | None" = None,
 ) -> list[dict]:
     """
     Original single-sweep live fetch — the windowing fallback path.
@@ -3039,6 +3076,13 @@ def _fetch_live_sequential(
             as before it existed. It never affects the walk itself — pages
             requested and the progress line's "markets kept so far" count are
             computed before it.
+        tally (_AssemblyTally | None): When given, the records `keep`
+            rejected are added to it once the walk completes
+            (_AssemblyTally.note_rejected): the assembly never sees them, so
+            it could not count them itself (M9). Every one settled at or after
+            live_min_ts — the server-side bound this walk requests, which is
+            never below the backtest window's start — so each is a record
+            settled in the window. Nothing is added if the walk raises.
 
     Returns:
         list[dict]: Compact market dicts with a binary result and settlement_ts
@@ -3079,6 +3123,10 @@ def _fetch_live_sequential(
                          "%d markets kept so far", page_no, walk_kept)
         cursor = data.get("cursor")
         if not cursor:
+            if tally is not None:
+                # walk_kept counts binary settled records BEFORE `keep`, so the
+                # gap is exactly what the prefilter dropped here (M9).
+                tally.note_rejected(walk_kept - len(kept))
             return kept
 
 
@@ -3348,6 +3396,8 @@ def _fetch_live_phase(
     live_min_ts: int,
     now_ts: int,
     keep: Callable[[dict], bool] | None = None,
+    *,
+    tally: "_AssemblyTally | None" = None,
 ) -> Iterable[dict]:
     """
     Fetch the live endpoint's contribution: per-settled-day windows in parallel.
@@ -3365,11 +3415,13 @@ def _fetch_live_phase(
     returned as a lazy _DaySliceStream that re-reads them off disk on every
     walk of the assembly (SS-1; a slice that cannot be read during a walk
     raises SettledCorpusError there and never reaches the sequential fallback
-    below). The frontier window, which is never persisted as a slice, is
-    streamed in chunks too, through a sink (_extend_kept) that applies `keep`
-    to each batch as its pages arrive and writes the survivors into a
-    _FrontierSpool — a private, anonymous temporary file that no later run can
-    find, read back one record at a time on every walk like a day slice. It
+    below), UNFILTERED — the assembly applies `keep` to them itself and
+    counts what it rejects (M9). The frontier window, which is never
+    persisted as a slice, is streamed in chunks too, through a sink
+    (_extend_kept) that applies `keep` to each batch as its pages arrive and
+    writes the survivors into a _FrontierSpool — a private, anonymous
+    temporary file that no later run can find, read back one record at a
+    time on every walk like a day slice. It
     used to be accumulated unfiltered and filtered only once the whole pool
     had drained — the same records in the same order, at a peak that grows
     through the UTC day (up to a full day's settlements, 9.2M records on
@@ -3400,10 +3452,25 @@ def _fetch_live_phase(
             recent start_date (observed 20k+ pages discarded client-side).
         now_ts (int): Current epoch seconds; determines the frontier day.
         keep (Callable[[dict], bool] | None): Optional per-record predicate
-            applied while past-day slices are read back (main thread), to
-            each frontier batch as its pages arrive (on the frontier's worker
+            applied only where records would otherwise be held: to each
+            frontier batch as its pages arrive (on the frontier's worker
             thread, so it must be thread-safe), and per record by the
-            sequential fallback (main thread). Slice FILES stay unfiltered.
+            sequential fallback (main thread). The past-day stream is NOT
+            filtered (M9): the caller's assembly applies the same predicate
+            to every record it reads and counts the rejections, which a
+            read-back filter would hide. Slice FILES stay unfiltered.
+        tally (_AssemblyTally | None): Receives the records `keep` dropped
+            before the assembly could see them — the frontier's (what its
+            window emitted minus what the spool kept, added only once the
+            windowed path has succeeded, so a frontier discarded by the
+            fallback is never counted) or, on the fallback, the sequential
+            walk's own. Every such record settled at or after its window's
+            server-side min_settled_ts: live_min_ts on the fallback, and on
+            the windowed path at worst live_min_ts rounded down to its UTC
+            midnight — never below the backtest window's start, itself a UTC
+            midnight no later than live_min_ts — so each is a record settled
+            in the window. That rests on the server honoring min_settled_ts,
+            the same bound every live window already relies on.
 
     Returns:
         Iterable[dict]: Compact market dicts, frontier first then past days
@@ -3487,9 +3554,10 @@ def _fetch_live_phase(
                 # batches already spooled as if they were the whole frontier
                 # (a short corpus, pinned by TestFrontierStreamsThroughKeep's
                 # failure tests). The records themselves are already in the
-                # spool, filtered, so the returned count is deliberately
-                # discarded (never rebind it).
-                frontier_future.result()
+                # spool, filtered; the returned count is how many the window
+                # EMITTED before `keep`, so the gap to the spool's length is
+                # exactly what the prefilter dropped (M9, counted below).
+                frontier_emitted = frontier_future.result()
             except BaseException:
                 # Abandon queued windows immediately rather than draining them
                 # on the way out to the sequential fallback.
@@ -3501,10 +3569,17 @@ def _fetch_live_phase(
         # here. No post-hoc `keep` pass: the sink already applied it in fetch
         # order, so the spool holds exactly the list that pass produced.
         frontier.seal()
+        if tally is not None:
+            # Only now, on success: a frontier the fallback below discards
+            # must not have its rejections counted beside the sequential
+            # walk's, which refetches the same day.
+            tally.note_rejected(frontier_emitted - len(frontier))
         # Chained rather than concatenated (SS-1): the frontier and the past
         # days stay on disk, walked in the same order `frontier + [...]` had.
+        # The past days are unfiltered (M9): the assembly applies `keep` to
+        # them and counts what it rejects.
         return _RecordChain(
-            frontier, _assemble_day_slices("live_days", on_disk, expect_meta, keep),
+            frontier, _assemble_day_slices("live_days", on_disk, expect_meta),
         )
     except _ShardedFetchUnsupported as exc:
         logging.warning(
@@ -3522,9 +3597,10 @@ def _fetch_live_phase(
         # sink's partial keeps it reachable from frontier_future when the
         # frontier window itself failed.
         frontier.close()
-        # Same prefilter as the windowed path, applied per record as each page
-        # arrives; the walk still holds its whole keep-passing result.
-        return _fetch_live_sequential(live_client, live_min_ts, keep)
+        # Same prefilter as the windowed path's frontier, applied per record as
+        # each page arrives; the walk still holds its whole keep-passing
+        # result, and adds what it dropped to the tally.
+        return _fetch_live_sequential(live_client, live_min_ts, keep, tally=tally)
     except BaseException:
         # Any other failure (a frontier or past-day window error, a spool that
         # could not be written or sealed): release the spool, then propagate.
@@ -3556,11 +3632,12 @@ def _assembled_cache_meta(start_date: date, prefilter_tag: str | None) -> dict:
             prefilter was applied.
 
     Returns:
-        dict: The expected meta block (without the two informational keys the
-            writer also records — assembled_at and archive_cutoff_ts, see
-            CorpusProvenance — which describe WHEN and UNDER WHICH CUTOFF a
-            corpus was assembled, not WHICH request it answers, so they are
-            never compared and a file written before either existed is still
+        dict: The expected meta block (without the three informational keys
+            the writer also records — assembled_at, archive_cutoff_ts and
+            assembly_counts, see CorpusProvenance — which describe WHEN and
+            UNDER WHICH CUTOFF a corpus was assembled and what its prefilter
+            rejected, not WHICH request it answers, so they are never
+            compared and a file written before any of them existed is still
             served).
     """
     return {
@@ -3570,6 +3647,193 @@ def _assembled_cache_meta(start_date: date, prefilter_tag: str | None) -> dict:
         "include_mve": INCLUDE_MVE_MARKETS,
         "format": _SLICE_FORMAT_JSONL,
     }
+
+
+@dataclass(frozen=True)
+class AssemblyCounts:
+    """
+    What an assembly did with the records settled in its window: how many, how many the prefilter rejected.
+
+    M9 of the 2026-09-24 7-day-run review. The fetch's count lines counted
+    only the records that SURVIVED the prefilter while calling them "settled
+    markets", and the backtester re-applied that same prefilter to the
+    already-prefiltered corpus, so its "Eligibility prefilter: skipping" line
+    read 0 on every production path. No line anywhere reported how many of
+    that 7-day window's ~24.6M settled records the prefilter dropped (the
+    review's estimate: 22,175,942 in the seven past-day slices plus the
+    ~2.39M the frontier walked, against 7,274,215 assembled — a gap of about
+    17.3M, an upper bound on the prefilter's share, since boundary duplicates
+    fall in it too), and a prefilter that rejected nothing would have logged
+    exactly the same lines as one that worked. This carries the missing
+    numbers: fetch_all_settled_markets counts them during the assembly's
+    FIRST walk (no extra walk — see _AssemblyTally), logs them per endpoint
+    and in total, and stamps the
+    total into the assembled cache's meta block so a later HIT can report it
+    too; CorpusProvenance carries it to the backtester, whose prefilter line
+    says the filter ran during assembly and quotes it.
+
+    RECORDS, not markets. The day slices, the tail and the live windows
+    deliberately overlap at their boundaries, so one market can arrive twice.
+    Among records the prefilter passes, a repeat is caught by the ticker
+    dedup and counted in `duplicates`; a repeat the prefilter rejects is
+    counted in `rejected` once per arrival, since telling it apart would mean
+    holding every rejected ticker — up to about 17M strings on that window,
+    the residency SS-1 removed.
+
+    Attributes:
+        settled (int): Records whose settlement lies in the window (below the
+            archive cutoff for the archive's sources), before the prefilter
+            and before the ticker dedup.
+        rejected (int): Of those, the ones the caller's prefilter rejected — at
+            the assembly, or earlier by a fetch-time filter (the live
+            frontier's sink, a sequential fallback) that had to drop them
+            before they could be held. 0 when no prefilter was given.
+        duplicates (int): Of those the prefilter passed, the ones not kept
+            because their ticker was already kept or is blank.
+    """
+    settled: int
+    rejected: int
+    duplicates: int
+
+    @property
+    def kept(self) -> int:
+        """
+        Returns:
+            int: The records kept — the assembled corpus's own count (for an
+                assembly with a prefilter, its eligible markets).
+        """
+        return self.settled - self.rejected - self.duplicates
+
+
+@dataclass
+class _AssemblyTally:
+    """
+    The mutable counter behind AssemblyCounts, filled during the assembly's first walk.
+
+    Two kinds of site add to it, and between them every in-window record is
+    counted exactly once per arrival. The fetch-time filters — the live
+    frontier's sink and the two sequential fallbacks, which must drop
+    rejected records before they are held — add the records they dropped
+    (note_rejected), since the assembly never sees those. Every other record
+    reaches the assembly's first walk — the day slices and the tail
+    unfiltered (the day-slice streams are no longer filtered at read-back,
+    and the tail never was), the fetch-time filters' survivors after their
+    filter — and that walk, _count_assembled, counts it there
+    (_assembled_records' `tally`). The second walk passes none, so nothing
+    is counted twice.
+
+    Attributes:
+        settled (int): See AssemblyCounts.
+        rejected (int): See AssemblyCounts.
+        duplicates (int): See AssemblyCounts.
+    """
+    settled: int = 0
+    rejected: int = 0
+    duplicates: int = 0
+
+    def note_rejected(self, count: int) -> None:
+        """
+        Record `count` in-window records a fetch-time filter rejected.
+
+        Each is a record settled in the window that the prefilter rejected
+        and that the assembly will never see, so it adds to both counts.
+
+        Args:
+            count (int): How many records the filter dropped (>= 0).
+        """
+        self.settled += count
+        self.rejected += count
+
+    def counts(self) -> AssemblyCounts:
+        """
+        Returns:
+            AssemblyCounts: A frozen copy of the counts so far.
+        """
+        return AssemblyCounts(self.settled, self.rejected, self.duplicates)
+
+
+def _total_counts(*parts: AssemblyCounts) -> AssemblyCounts:
+    """
+    Sum per-endpoint assembly counts into the whole assembly's.
+
+    Args:
+        *parts (AssemblyCounts): The archive's and the live endpoint's counts.
+
+    Returns:
+        AssemblyCounts: Their field-by-field sum.
+    """
+    return AssemblyCounts(
+        sum(c.settled for c in parts),
+        sum(c.rejected for c in parts),
+        sum(c.duplicates for c in parts),
+    )
+
+
+def _describe_counts(counts: AssemblyCounts, prefilter_tag: str | None) -> str:
+    """
+    The parenthetical every count line carries: what became of the records not kept.
+
+    One definition, so the per-endpoint lines, the assembly total and a cache
+    hit's line can never word the same numbers two ways.
+
+    Args:
+        counts (AssemblyCounts): The counts being reported.
+        prefilter_tag (str | None): The prefilter's tag, or None when none
+            was applied (its clause is then left out: it rejected nothing).
+
+    Returns:
+        str: "<R> rejected by the prefilter <tag>, <D> duplicate or blank
+            tickers", or just the duplicate clause with no prefilter.
+    """
+    parts = []
+    if prefilter_tag is not None:
+        parts.append(f"{counts.rejected} rejected by the prefilter {prefilter_tag}")
+    parts.append(f"{counts.duplicates} duplicate or blank tickers")
+    return ", ".join(parts)
+
+
+def _kept_noun(prefilter_tag: str | None) -> str:
+    """
+    What the kept records ARE, for a count line: eligible markets, or settled markets.
+
+    With a prefilter the corpus is the settled markets that passed it — the
+    "eligible markets" of the backtester's lines and the dashboard's census —
+    and calling them "settled markets" is the M9 misstatement. Without one,
+    every kept record is a settled market.
+
+    Args:
+        prefilter_tag (str | None): The prefilter's tag, or None.
+
+    Returns:
+        str: "eligible markets" or "settled markets".
+    """
+    return "eligible markets" if prefilter_tag is not None else "settled markets"
+
+
+def _parse_assembly_counts(raw: Any) -> AssemblyCounts | None:
+    """
+    Read an assembled cache's assembly_counts meta value, fail-safe by type.
+
+    Args:
+        raw (Any): The meta block's "assembly_counts" value — a dict of three
+            non-negative ints as the writer records it, or anything else an
+            older, damaged or hand-edited block might hold.
+
+    Returns:
+        AssemblyCounts | None: The counts, or None when the value is absent,
+            not a dict, holds a non-int (a bool is refused: it is an int
+            subclass), a negative, or counts that do not add up (more rejected
+            and duplicate records than settled ones).
+    """
+    if not isinstance(raw, dict):
+        return None
+    values = [raw.get(key) for key in ("settled", "rejected", "duplicates")]
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in values):
+        return None
+    settled, rejected, duplicates = values
+    if rejected + duplicates > settled:
+        return None
+    return AssemblyCounts(settled, rejected, duplicates)
 
 
 @dataclass(frozen=True)
@@ -3629,12 +3893,21 @@ class CorpusProvenance:
             (assembled_at is then its file time, and nothing recorded a
             cutoff); False for the streamed .jsonl.gz. Defaulted, so every
             construction that predates it still builds a streamed provenance.
+        assembly_counts (AssemblyCounts | None): How many records settled in
+            the window and what became of the ones not kept — above all, how
+            many the prefilter rejected (M9). Recorded as of assembly, like
+            assembled_at. None for every legacy cache and every streamed one
+            written before these counts existed (including the 2026-09-17
+            cache on disk), for a block whose value is unreadable, and for a
+            hit whose counts disagree with the records its validating walk
+            counted (SettledCorpus.open_validated). Defaulted, like legacy.
     """
     from_cache: bool
     assembled_at: datetime | None
     archive_cutoff: datetime | None
     post_cutoff: bool | None
     legacy: bool = False
+    assembly_counts: AssemblyCounts | None = None
 
 
 def _window_start_ts(start_date: date) -> int:
@@ -3736,6 +4009,8 @@ def _corpus_provenance(meta: dict, *, from_cache: bool) -> CorpusProvenance:
     return CorpusProvenance(
         from_cache=from_cache, assembled_at=assembled_at,
         archive_cutoff=archive_cutoff, post_cutoff=post_cutoff,
+        # Informational like the two keys above: by TYPE, None when absent
+        assembly_counts=_parse_assembly_counts(meta.get("assembly_counts")),
     )
 
 
@@ -3880,6 +4155,50 @@ def _warn_post_cutoff(start_date: date, archive_cutoff: datetime, *,
     )
 
 
+def _log_cache_load(count: int, counts: AssemblyCounts | None, start_date: date,
+                    prefilter_tag: str | None) -> None:
+    """
+    Log a cache hit's record count, naming what the records are and what their assembly rejected.
+
+    The line used to read "Loaded N settled markets from cache" whatever the
+    corpus held; with a prefilter those N are the ELIGIBLE markets, the
+    settled markets that passed it, and nothing said how many did not (M9 of
+    the 2026-09-24 review — run3 of the 7-day window logged "Loaded 7274215
+    settled markets from cache" for a corpus assembled from about 24.6M
+    settled records, the review's estimate). The noun now says which, and
+    when the cache recorded its assembly counts they follow, as of assembly.
+    A cache that records none — every legacy file, and every streamed one
+    written before the counts existed — says so rather than letting the
+    silence read as "nothing was rejected". Without a prefilter the line
+    still begins "Loaded N settled markets from cache", as it always did.
+
+    Args:
+        count (int): The corpus's record count (its validated len()).
+        counts (AssemblyCounts | None): The counts the cache recorded at
+            assembly, or None.
+        start_date (date): The window's first day.
+        prefilter_tag (str | None): The prefilter tag the cache was assembled
+            under (part of its identity), or None.
+    """
+    noun = _kept_noun(prefilter_tag)
+    if counts is not None:
+        logging.info(
+            "Loaded %d %s from cache — as assembled, of %d records settled "
+            "since %s (%s)",
+            count, noun, counts.settled, start_date,
+            _describe_counts(counts, prefilter_tag),
+        )
+    elif prefilter_tag is not None:
+        logging.info(
+            "Loaded %d %s from cache — the prefilter %s ran during its "
+            "assembly, but this cache records no count of the records it "
+            "rejected",
+            count, noun, prefilter_tag,
+        )
+    else:
+        logging.info("Loaded %d %s from cache", count, noun)
+
+
 def _announce_cache_hit(path: Path, start_date: date, provenance: CorpusProvenance,
                         now: datetime) -> None:
     """
@@ -3950,6 +4269,7 @@ def _assembled_records(
     start_ts: int,
     prefilter: Callable[[dict], bool] | None,
     seen: set,
+    tally: _AssemblyTally | None = None,
 ) -> Iterator[dict]:
     """
     Yield the assembled corpus: settlement window, prefilter, first-wins ticker dedup.
@@ -3975,15 +4295,21 @@ def _assembled_records(
         start_ts (int): Inclusive settlement floor, epoch seconds.
         prefilter (Callable[[dict], bool] | None): The caller's predicate.
             Applied here, before the dedup, as the single point where it is
-            GUARANTEED for every source — day slices, the live frontier, both
-            sequential fallbacks (all of which also take the `keep` fast path)
-            and the tail (which does not). Re-checking records a phase already
-            filtered is idempotent, and because it runs before the dedup, a
-            phase dropping a record early can never change which record wins
-            a ticker.
+            GUARANTEED for every source. The day slices and the tail reach it
+            unfiltered; the live frontier and both sequential fallbacks were
+            already filtered where they were fetched, because their records
+            would otherwise be held — re-checking those is idempotent. And
+            because it runs before the dedup, a phase dropping a record early
+            can never change which record wins a ticker.
         seen (set): Tickers already yielded. Pass a FRESH set per walk; a walk
             split across calls (the assembly's first walk, archive then live)
             passes the same one to every call.
+        tally (_AssemblyTally | None): When given — by the assembly's FIRST
+            walk only, so nothing is counted twice — every in-window record
+            is counted in `settled`, and each one not yielded in `rejected`
+            (the prefilter refused it) or `duplicates` (its ticker was already
+            yielded, or is blank) (M9). Records outside the window are not
+            counted at all. Counting changes nothing that is yielded.
 
     Yields:
         dict: Each record of the assembled corpus, in first-wins order. They
@@ -3991,17 +4317,33 @@ def _assembled_records(
     """
     for records, max_settle in sources:
         for m in records:
+            # The prefilter is tested BEFORE the window: both are pure
+            # filters, so the order changes nothing that is yielded, and a
+            # walk that counts nothing skips the settlement parse for every
+            # record the prefilter rejects — most of them on the review's
+            # 7-day window — exactly as the day-slice read-back filter used
+            # to (M9 moved that filter here). A counting walk must still read
+            # a rejected record's settlement, to know whether it lies in the
+            # window at all.
+            passed = prefilter is None or prefilter(m)
+            if not passed and tally is None:
+                continue
             settle = _iso_epoch(m.get("settlement_ts"))
             if settle is None or settle < start_ts:
                 continue
             if max_settle is not None and settle >= max_settle:
                 continue
-            if prefilter is not None and not prefilter(m):
-                continue
+            if tally is not None:
+                tally.settled += 1
+                if not passed:
+                    tally.rejected += 1
+                    continue
             ticker = m.get("ticker")
             if ticker and ticker not in seen:
                 seen.add(ticker)
                 yield m
+            elif tally is not None:
+                tally.duplicates += 1
 
 
 def _assembly_identity(digest: int, m: dict) -> int:
@@ -4037,6 +4379,7 @@ def _count_assembled(
     seen: set,
     event_tickers: set[str],
     identity: int,
+    tally: _AssemblyTally | None = None,
 ) -> tuple[int, int]:
     """
     The assembly's first walk over some sources: count, collect event tickers, fold identity.
@@ -4045,7 +4388,13 @@ def _count_assembled(
     that no record outlives the walk: a loop variable left bound in the caller
     would keep the last record alive through the whole title resolution that
     follows. Nothing else is retained — only tickers (in `seen`) and event
-    tickers.
+    tickers. This is also the one walk that fills the assembly's counts (M9)
+    — never a second walk. Counting is not free: the day slices now reach
+    this walk unfiltered, so each record the prefilter rejects pays the
+    settlement parse that decides whether it lies in the window, on top of at
+    most two integer increments per record; each record the prefilter passes
+    saves the read-back filter's prefilter call. See the prefilter gotcha in
+    CLAUDE.md for what that nets to on real records.
 
     Args:
         sources (Iterable[tuple[Iterable[dict], int | None]]): As for
@@ -4057,12 +4406,15 @@ def _count_assembled(
             truthy event_ticker — the set titles are resolved for, exactly the
             old `{m.get("event_ticker") for m in selected.values() if ...}`.
         identity (int): The walk's running _assembly_identity so far.
+        tally (_AssemblyTally | None): The endpoint's counts, extended in
+            place with every in-window record of these sources (see
+            _assembled_records). None counts nothing.
 
     Returns:
         tuple[int, int]: (records yielded by these sources, updated identity).
     """
     count = 0
-    for m in _assembled_records(sources, start_ts, prefilter, seen):
+    for m in _assembled_records(sources, start_ts, prefilter, seen, tally):
         count += 1
         identity = _assembly_identity(identity, m)
         event_ticker = m.get("event_ticker")
@@ -4134,7 +4486,9 @@ class SettledCorpus:
         Returns:
             SettledCorpus | None: A corpus over the file with its validated
                 count and its provenance (from_cache=True, read from the meta
-                block this same walk validated — never from a second read), or
+                block this same walk validated — never from a second read;
+                its assembly_counts are dropped, with a WARNING, when they do
+                not keep exactly the records the walk counted), or
                 None when the file is absent (silently) or unreadable,
                 truncated, damaged or written for a different request (with a
                 WARNING naming the reason). Whether a valid EMPTY corpus is
@@ -4156,8 +4510,20 @@ class SettledCorpus:
                 "miss: %s", exc,
             )
             return None
-        return cls(path, expect_meta, count,
-                   provenance=_corpus_provenance(meta, from_cache=True))
+        provenance = _corpus_provenance(meta, from_cache=True)
+        counts = provenance.assembly_counts
+        if counts is not None and counts.kept != count:
+            # The counts describe some OTHER assembly (a hand-edited block, a
+            # file rewritten under a stale meta line): quoting them beside
+            # this corpus would report numbers that do not add up to it.
+            # Dropped, not fatal — they are informational, never identity.
+            logging.warning(
+                "Settled-market cache %s records assembly counts that keep %d "
+                "records, but it holds %d — ignoring those counts",
+                path.name, counts.kept, count,
+            )
+            provenance = dc_replace(provenance, assembly_counts=None)
+        return cls(path, expect_meta, count, provenance=provenance)
 
     @property
     def path(self) -> Path:
@@ -4353,10 +4719,19 @@ def fetch_all_settled_markets(
     frontier, then live day slices newest-first, unbounded above),
     settlement >= start_ts, the prefilter, and first-wins ticker dedup. It is
     walked TWICE. Walk A counts the records the "Historical endpoint" and
-    "Live endpoint" lines report (the same numbers as before) and collects
-    the unique event_tickers for title resolution; walk B patches event_title
-    exactly as before and writes every record straight into the assembled
-    cache, which the returned SettledCorpus then streams. Walk B must
+    "Live endpoint" lines report (the same kept numbers as before) and
+    collects the unique event_tickers for title resolution; it also counts,
+    per endpoint, every record settled in the window and what the prefilter
+    and the dedup removed from them (M9 of the 2026-09-24 review), which
+    those lines and the closing "Assembled N ... of M records settled" line
+    now report beside the kept number. For that the day slices reach walk A
+    UNFILTERED — they used to be prefiltered as they were read back, which
+    saved no memory and hid every rejection from any count — while the
+    three filters that must drop records before they are held (the live
+    frontier's sink and the two sequential fallbacks) report their own
+    rejections into the same counts. Walk B counts nothing: it patches
+    event_title exactly as before and writes every record straight into the
+    assembled cache, which the returned SettledCorpus then streams. Walk B must
     reproduce walk A (same count, same order-sensitive identity over ticker
     and event_ticker) or nothing is published and SettledCorpusError is
     raised. A day slice that cannot be read during either walk raises
@@ -4394,10 +4769,14 @@ def fetch_all_settled_markets(
 
     A hit is ANNOUNCED, never silent, and still makes ZERO network calls
     (DR-13 and M2/M3 of the 2026-09-24 review). The streamed cache's meta
-    block records, besides its identity, two informational keys the identity
-    check never compares: assembled_at (the corpus holds no market settled
-    after it) and, since P2, archive_cutoff_ts (the cutoff it was assembled
-    under). A hit logs the assembly time and its age, that the window
+    block records, besides its identity, three informational keys the
+    identity check never compares: assembled_at (the corpus holds no market
+    settled after it), since P2 archive_cutoff_ts (the cutoff it was
+    assembled under), and since M9 assembly_counts (how many records settled
+    in the window and how many of them the prefilter rejected). A hit's
+    count line names its records "eligible markets" when a prefilter ran and
+    quotes those counts as of assembly (_log_cache_load). A hit also logs
+    the assembly time and its age, that the window
     nominally runs to today, the cutoff at assembly, and what --no-cache
     costs to extend the corpus (_announce_cache_hit); a legacy .json hit logs
     its file time instead, says it records no cutoff, and is returned as a
@@ -4428,7 +4807,10 @@ def fetch_all_settled_markets(
             keeping peak memory and cache size proportional to the markets
             actually usable rather than to everything Kalshi ever settled. The
             per-day slice FILES are never filtered — they are shared across
-            start dates and must stay complete.
+            start dates and must stay complete. How many in-window records it
+            rejected is counted during the assembly's first walk and logged
+            beside the kept count (M9); it must be pure and thread-safe,
+            since the live frontier applies it on a worker thread.
         prefilter_tag (str | None): Short name for prefilter's semantics; becomes
             part of the assembled cache's filename so a cache built under one
             predicate is never served to a caller expecting another. Required
@@ -4461,8 +4843,9 @@ def fetch_all_settled_markets(
             entirely). Consumers must only iterate it (as many times as they
             like) and take its len(); nothing indexes it. Both kinds also
             carry .provenance (CorpusProvenance: from_cache, assembled_at,
-            archive_cutoff, post_cutoff, legacy), which the backtester carries
-            to the dashboard header.
+            archive_cutoff, post_cutoff, legacy, assembly_counts), which the
+            backtester carries to the dashboard header and quotes on its
+            prefilter line.
     """
     if (prefilter is None) != (prefilter_tag is None):
         raise ValueError(
@@ -4508,7 +4891,10 @@ def fetch_all_settled_markets(
             corpus = SettledCorpus.open_validated(cache_path, cache_meta)
             if corpus is not None and _serve_assembled_cache(
                     cache_path, len(corpus), corpus.provenance.assembled_at, now):
-                logging.info("Loaded %d settled markets from cache", len(corpus))
+                # What the corpus is, and what its prefilter rejected as of
+                # assembly (M9) — the counts come from its own meta block
+                _log_cache_load(len(corpus), corpus.provenance.assembly_counts,
+                                start_date, prefilter_tag)
                 # Coverage line, and the post-cutoff WARNING as of assembly
                 _announce_cache_hit(cache_path, start_date, corpus.provenance, now)
                 return corpus
@@ -4531,7 +4917,8 @@ def fetch_all_settled_markets(
             if cached is not None:
                 written_at = _file_time(legacy_cache_path)
                 if _serve_assembled_cache(legacy_cache_path, len(cached), written_at, now):
-                    logging.info("Loaded %d settled markets from cache", len(cached))
+                    # A legacy file records no assembly counts (M9)
+                    _log_cache_load(len(cached), None, start_date, prefilter_tag)
                     provenance = CorpusProvenance(
                         from_cache=True, assembled_at=written_at,
                         archive_cutoff=None, post_cutoff=None, legacy=True,
@@ -4581,9 +4968,16 @@ def fetch_all_settled_markets(
 
     # ── Historical endpoint ───────────────────────────────────────────────────
     logging.info("Fetching historical settled markets (settled before API cutoff)...")
-    # Sharded parallel fetch with day-level disk reuse; sequential on fallback
+    # What the prefilter and the dedup did to each endpoint's in-window
+    # records (M9): filled by walk A below and by the fetch-time filters inside
+    # the phases (the only filters whose rejections walk A never sees).
+    archive_tally = _AssemblyTally()
+    live_tally = _AssemblyTally()
+    # Sharded parallel fetch with day-level disk reuse; sequential on fallback.
+    # Its day slices come back unfiltered; only a sequential fallback applies
+    # the prefilter itself, and it reports what it dropped into archive_tally.
     day_records, tail_records = _fetch_archive_phase(
-        hist_client, start_ts, cutoff_ts, hist_kwargs, prefilter
+        hist_client, start_ts, cutoff_ts, hist_kwargs, prefilter, tally=archive_tally,
     )
 
     # Assembly: settlement-window filter, prefilter and first-wins ticker
@@ -4594,14 +4988,24 @@ def fetch_all_settled_markets(
     archive_sources = ((day_records, cutoff_ts), (tail_records, cutoff_ts))
 
     # Walk A, archive half: count what the old `len(selected)` reported and
-    # collect the event_tickers titles are resolved for. One `seen` set spans
+    # collect the event_tickers titles are resolved for, and count every
+    # in-window record into the archive's tally (M9). One `seen` set spans
     # both halves of this walk (the dedup is global); only tickers are held.
     seen_a: set = set()
     event_tickers: set[str] = set()
     archive_count, identity_a = _count_assembled(
         archive_sources, start_ts, prefilter, seen_a, event_tickers, 0,
+        tally=archive_tally,
     )
-    logging.info("Historical endpoint: %d markets from %s", archive_count, start_date)
+    archive_counts = archive_tally.counts()
+    # The kept count first, as before, then what the window held (M9): the
+    # settled records, and what the prefilter and the dedup removed from them
+    logging.info(
+        "Historical endpoint: %d %s of %d records settled in the window before "
+        "the archive cutoff (%s)",
+        archive_count, _kept_noun(prefilter_tag), archive_counts.settled,
+        _describe_counts(archive_counts, prefilter_tag),
+    )
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
     # Prune any live_days/ slices left over from a PRIOR cutoff before the
@@ -4615,16 +5019,28 @@ def fetch_all_settled_markets(
     # lower bound is max(cutoff_ts, start_ts) rather than bare cutoff_ts.
     logging.info("Fetching recently settled markets (after API cutoff)...")
     live_min_ts = max(cutoff_ts, start_ts)
-    # Windowed parallel fetch with settled-day disk reuse; sequential on fallback
-    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()), prefilter)
+    # Windowed parallel fetch with settled-day disk reuse; sequential on
+    # fallback. Past days come back unfiltered; the frontier (and a fallback)
+    # apply the prefilter as pages arrive and report what they dropped.
+    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()),
+                                     prefilter, tally=live_tally)
     try:
         live_sources = ((live_records, None),)
         # Walk A, live half: same `seen` set, so a live record whose ticker the
         # archive already supplied is dropped exactly as the old merge dropped it.
         live_count, identity_a = _count_assembled(
             live_sources, start_ts, prefilter, seen_a, event_tickers, identity_a,
+            tally=live_tally,
         )
-        logging.info("Live endpoint: %d recently settled markets", live_count)
+        live_counts = live_tally.counts()
+        logging.info(
+            "Live endpoint: %d %s of %d recently settled records in the window (%s)",
+            live_count, _kept_noun(prefilter_tag), live_counts.settled,
+            _describe_counts(live_counts, prefilter_tag),
+        )
+        # The whole assembly's counts, stamped into the cache below so a
+        # later hit can report them without a fetch
+        assembly_counts = _total_counts(archive_counts, live_counts)
         # Walk A is done; its ticker set is the one piece of it worth releasing
         # before titles are resolved (walk B builds its own).
         del seen_a
@@ -4669,6 +5085,13 @@ def fetch_all_settled_markets(
             **cache_meta,
             "assembled_at": datetime.now(UTC).isoformat(),
             "archive_cutoff_ts": cutoff_ts,
+            # Informational too (M9): how many records settled in the window
+            # and what the prefilter and the dedup removed, as of assembly
+            "assembly_counts": {
+                "settled": assembly_counts.settled,
+                "rejected": assembly_counts.rejected,
+                "duplicates": assembly_counts.duplicates,
+            },
         }
         with _DayStreamWriter(cache_path, assembled_meta) as writer:
             for m in _assembled_records(archive_sources + live_sources, start_ts,
@@ -4697,7 +5120,14 @@ def fetch_all_settled_markets(
                       "may be writing or pruning backtest_cache/ concurrently). "
                       "Nothing was cached; re-run the backtest."
                 )
-            logging.info("Total settled markets from %s: %d", start_date, written)
+            # Named for what it counts (M9): the kept records are the eligible
+            # markets when a prefilter ran, beside the settled records they
+            # were assembled from — no longer "Total settled markets".
+            logging.info(
+                "Assembled %d %s of %d records settled since %s (%s)",
+                written, _kept_noun(prefilter_tag), assembly_counts.settled,
+                start_date, _describe_counts(assembly_counts, prefilter_tag),
+            )
             writer.commit()
         # A committed rebuild of this identity supersedes any legacy .json of
         # the same stem, exactly as the old code's rebuild overwrote it; left

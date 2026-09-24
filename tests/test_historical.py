@@ -4,6 +4,7 @@ import gzip
 import json
 import logging
 import os
+import threading
 import weakref
 import zlib
 from datetime import UTC, date, datetime, timedelta
@@ -1525,6 +1526,7 @@ class TestShardedFetch:
         assert list(out_pref) == [m for m in out_full if pred(m)]
         # Sanity: the predicate actually removed something, and kept something.
         assert 0 < len(out_pref) < len(out_full)
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
 
         # The day-slice FILES must stay complete — they are shared across start
         # dates and other callers, so filtering them would corrupt the cache.
@@ -2303,11 +2305,15 @@ class TestFrontierStreamsThroughKeep:
         assert out == self._oracle(markets, None)
         assert len(out) == len(markets)
 
-    def test_whole_phase_equals_filtering_the_unfiltered_phase(self, tmp_path,
-                                                               monkeypatch):
+    def test_whole_phase_filters_only_the_frontier_and_counts_its_rejections(
+            self, tmp_path, monkeypatch):
         # With past days on disk as well: frontier first, then past days
-        # newest-first, each filtered by the same predicate in the same order —
-        # exactly [m for m in unfiltered_phase if keep(m)].
+        # newest-first. Only the frontier is filtered by the phase (its records
+        # would otherwise be spooled); the past days come back UNFILTERED since
+        # M9, because the assembly applies the same predicate to them and
+        # counts what it rejects — so filtering the phase's output still
+        # equals filtering the unfiltered phase, and the tally holds exactly
+        # the frontier's rejections, the only ones the assembly never sees.
         monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
         past = [
             _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
@@ -2322,22 +2328,32 @@ class TestFrontierStreamsThroughKeep:
             _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW), None,
         )
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "kept")
+        tally = historical._AssemblyTally()
         filtered = historical._fetch_live_phase(
             _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW),
-            self._keep,
+            self._keep, tally=tally,
         )
 
-        assert list(filtered) == [m for m in unfiltered if self._keep(m)]
-        tickers = [m["ticker"] for m in unfiltered]
+        everything, got = list(unfiltered), list(filtered)
+        # What the assembly can keep is unchanged: it re-applies `keep`.
+        assert [m for m in got if self._keep(m)] == [
+            m for m in everything if self._keep(m)]
+        tickers = [m["ticker"] for m in everything]
         # Frontier first, then 09-23, then 09-22 — the contract the merge's
         # first-wins dedup depends on.
         assert tickers[:11] == [f"F{i:02d}" for i in range(10, -1, -1)]
         assert tickers[11:18] == [f"P3{i}" for i in range(6, -1, -1)]
         assert tickers[18:] == [f"P2{i}" for i in range(6, -1, -1)]
-        # The predicate bit on the frontier AND on the past days.
-        dropped = set(tickers) - {m["ticker"] for m in filtered}
-        assert any(t.startswith("F") for t in dropped)
-        assert any(t.startswith("P") for t in dropped)
+        # The frontier is filtered where it is fetched; the past days are not.
+        frontier_kept = [m for m in everything[:11] if self._keep(m)]
+        assert got == frontier_kept + everything[11:]
+        # The predicate bit on the frontier, and the past days still carry
+        # records it rejects — they reach the assembly, which counts them.
+        rejected_at_fetch = 11 - len(frontier_kept)
+        assert rejected_at_fetch > 0
+        assert any(not self._keep(m) for m in got[len(frontier_kept):])
+        assert tally == historical._AssemblyTally(
+            settled=rejected_at_fetch, rejected=rejected_at_fetch, duplicates=0)
 
     def test_rejected_frontier_record_is_never_retained(self, tmp_path, monkeypatch):
         # The point of SS-1. Every compact record is made weakly referenceable
@@ -2526,22 +2542,25 @@ class TestFrontierStreamsThroughKeep:
         alive_at_fallback: list[int] = []
         real_sequential = historical._fetch_live_sequential
 
-        def spy_sequential(live_client, live_min_ts, keep=None):
+        def spy_sequential(live_client, live_min_ts, keep=None, **kwargs):
             # Every tracked record made so far came from the frontier window
             # (each past-day window raises on its first record, before
             # building one), so this counts the frontier still resident.
             alive_at_fallback.append(sum(r() is not None for r in kept_refs))
-            return real_sequential(live_client, live_min_ts, keep)
+            return real_sequential(live_client, live_min_ts, keep, **kwargs)
 
         monkeypatch.setattr(historical, "_fetch_live_sequential", spy_sequential)
 
         markets = self._frontier_markets() + self._past_days()
         live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        tally = historical._AssemblyTally()
         out = historical._fetch_live_phase(
             _FakeLive(markets, page_size=2, ignore_max=True), live_min_ts,
-            self._ts(self.NOW), self._keep,
+            self._ts(self.NOW), self._keep, tally=tally,
         )
 
+        # The frontier's first page is F10 and F09, and `keep` rejects F09, so
+        # a spooled frontier record means the frontier had rejected one too.
         assert kept_refs, "the frontier must have kept records before the fallback"
         assert alive_at_fallback == [0]
         assert len(spools) == 1 and spools[0]._closed and len(spools[0]) > 0
@@ -2549,6 +2568,12 @@ class TestFrontierStreamsThroughKeep:
         unfiltered = real_sequential(_FakeLive(markets, page_size=2), live_min_ts)
         assert out == [m for m in unfiltered if self._keep(m)]
         assert 0 < len(out) < len(unfiltered)
+        # M9: only the sequential walk's rejections are counted — the
+        # discarded frontier had rejected some of the same day's records too,
+        # and counting them as well would report them twice.
+        rejected = len(unfiltered) - len(out)
+        assert tally == historical._AssemblyTally(
+            settled=rejected, rejected=rejected, duplicates=0)
 
 
 class TestSequentialFallbacksApplyKeep:
@@ -2602,12 +2627,18 @@ class TestSequentialFallbacksApplyKeep:
                 _FakeLive(markets, page_size=1), live_min_ts)
         lines_none = self._progress_lines(caplog, label)
         caplog.clear()
+        tally = historical._AssemblyTally()
         with caplog.at_level(logging.INFO):
             filtered = historical._fetch_live_sequential(
-                _FakeLive(markets, page_size=1), live_min_ts, self._keep)
+                _FakeLive(markets, page_size=1), live_min_ts, self._keep, tally=tally)
         lines_keep = self._progress_lines(caplog, label)
 
         assert filtered == [m for m in unfiltered if self._keep(m)]
+        # M9: the assembly never sees what this walk dropped, so the walk
+        # reports it — every one a record settled in the window
+        dropped = len(unfiltered) - len(filtered)
+        assert tally == historical._AssemblyTally(
+            settled=dropped, rejected=dropped, duplicates=0)
         # The returned list IS what the walk retained: nothing rejected in it.
         assert all(self._keep(m) for m in filtered)
         assert 0 < len(filtered) < len(unfiltered)
@@ -2619,7 +2650,7 @@ class TestSequentialFallbacksApplyKeep:
         markets = self._markets("A", "2026-09-17T06:00:00+00:00")
         label = "Historical archive [sequential]"
 
-        def run(keep):
+        def run(keep, tally=None):
             archive = _FakeArchive(markets, page_size=1)
             monkeypatch.setattr(
                 historical, "_signed_raw_get",
@@ -2627,17 +2658,22 @@ class TestSequentialFallbacksApplyKeep:
             )
             return historical._fetch_archive_sequential(
                 MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
-                {"limit": 1000}, keep)
+                {"limit": 1000}, keep, tally=tally)
 
         with caplog.at_level(logging.INFO):
             unfiltered = run(None)
         lines_none = self._progress_lines(caplog, label)
         caplog.clear()
+        tally = historical._AssemblyTally()
         with caplog.at_level(logging.INFO):
-            filtered = run(self._keep)
+            filtered = run(self._keep, tally)
         lines_keep = self._progress_lines(caplog, label)
 
         assert filtered == [m for m in unfiltered if self._keep(m)]
+        # M9: the in-window records `keep` dropped, which the assembly never sees
+        dropped = len(unfiltered) - len(filtered)
+        assert tally == historical._AssemblyTally(
+            settled=dropped, rejected=dropped, duplicates=0)
         assert all(self._keep(m) for m in filtered)
         assert 0 < len(filtered) < len(unfiltered)
         assert lines_keep == lines_none == [
@@ -2696,10 +2732,98 @@ class TestSequentialFallbacksApplyKeep:
                              prefilter_tag="testpred")
         assert list(out_pref) == [m for m in out_full if self._keep(m)]
         assert 0 < len(out_pref) < len(out_full)
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
         assert {m["ticker"][0] for m in out_pref} == {"A", "L"}
         # The fixture really did take the fallback(s) it is parametrized for.
         assert ("Archive fetch: sharded path unavailable" in caplog.text) is opaque
         assert ("Live fetch: windowed path unavailable" in caplog.text) is ignore_max
+
+    @pytest.mark.parametrize("opaque, ignore_max", [
+        (False, False), (True, False), (False, True), (True, True),
+    ])
+    def test_a_frontier_that_rejects_records_is_counted_once_on_every_path(
+            self, tmp_path, monkeypatch, caplog, opaque, ignore_max):
+        # M9 end to end with a NON-EMPTY frontier. Every other end-to-end
+        # count test runs at the real "now", whose frontier day holds no
+        # fixture record, so the frontier's own rejections (its window's
+        # emitted count minus the spool's length) were pinned only at phase
+        # level. "Now" is pinned to 2026-09-21 12:00 UTC here: the 09-20
+        # records are a past day (walk A counts their rejections), the 09-21
+        # ones the frontier (its sink drops L006, L009 and L010 before the
+        # assembly sees them). With max_settled_ts ignored, the past day trips
+        # the live fallback AFTER the frontier has spooled — the ordering is
+        # forced below — so a frontier whose rejections were counted anyway
+        # would show 14 settled records instead of 11.
+        archive_markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+        live_markets = self._markets("L", "2026-09-20T06:00:00+00:00", n=12,
+                                     step=180)
+        now_ts = self._ts("2026-09-21T12:00:00+00:00")
+        real_phase = historical._fetch_live_phase
+        monkeypatch.setattr(
+            historical, "_fetch_live_phase",
+            lambda client, lo, _now, keep=None, **kw: real_phase(
+                client, lo, now_ts, keep, **kw),
+        )
+        real_extend = historical._extend_kept
+        real_store = historical._fetch_and_store_live_window
+
+        def fetch(sub, **kwargs):
+            sink_dropped: list[int] = []
+            frontier_done = threading.Event()
+
+            def spy_extend(dest, keep, batch):
+                # The frontier's sink: record what it drops, then let the
+                # past-day windows run, so the fallback (when it fires) always
+                # discards a frontier that has already spooled its batch.
+                real_extend(dest, keep, batch)
+                sink_dropped.append(0 if keep is None
+                                    else sum(1 for m in batch if not keep(m)))
+                frontier_done.set()
+
+            def past_day_after_the_frontier(*args, **kw):
+                assert frontier_done.wait(timeout=30), "the frontier never emitted"
+                return real_store(*args, **kw)
+
+            monkeypatch.setattr(historical, "_extend_kept", spy_extend)
+            monkeypatch.setattr(historical, "_fetch_and_store_live_window",
+                                past_day_after_the_frontier)
+            _install_sharded_fakes(
+                monkeypatch, tmp_path / sub,
+                _FakeArchive(archive_markets, page_size=2, opaque_cursors=opaque),
+                "2026-09-20T00:00:00Z",
+            )
+            out = historical.fetch_all_settled_markets(
+                MagicMock(),
+                _FakeLive(live_markets, page_size=2, ignore_max=ignore_max),
+                start_date=date(2026, 9, 17), use_cache=False, **kwargs,
+            )
+            return out, sink_dropped
+
+        with caplog.at_level(logging.INFO):
+            out_full, dropped_full = fetch("full")
+        full_text = caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            out_pref, dropped_pref = fetch("pref", prefilter=self._keep,
+                                           prefilter_tag="testpred")
+        pref_text = caplog.text
+
+        # The frontier really held records, and the prefilter really dropped
+        # three of them in its sink (L007, voided, never reaches it).
+        assert dropped_full == [0] and dropped_pref == [3]
+        assert list(out_pref) == [m for m in out_full if self._keep(m)]
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
+        # Exact, per endpoint: 11 binary live records, 5 of them rejected —
+        # L000/L003 by walk A (past day, or the fallback's own walk) and
+        # L006/L009/L010 in the frontier's sink (or, on the fallback, the
+        # sequential walk that refetched the day). Counted once either way.
+        assert ("Live endpoint: 11 settled markets of 11 recently settled records "
+                "in the window (0 duplicate or blank tickers)") in full_text
+        assert ("Live endpoint: 6 eligible markets of 11 recently settled records "
+                "in the window (5 rejected by the prefilter testpred, 0 duplicate "
+                "or blank tickers)") in pref_text
+        assert ("Live fetch: windowed path unavailable" in pref_text) is ignore_max
+        assert ("Archive fetch: sharded path unavailable" in pref_text) is opaque
 
 
 class TestJsonCacheDurability:
@@ -3968,6 +4092,61 @@ def _old_assembly(day_records, tail_records, live_records, start_ts, cutoff_ts,
     return all_markets, archive_count, live_count, unique
 
 
+def _assert_counts_cover_the_prefilter(out_full, out_pref):
+    """M9's end-to-end invariant, for one fixture assembled twice.
+
+    `out_full` was assembled with no prefilter and `out_pref` with one, from
+    the same records. The records settled in the window are the same records
+    either way, so the two assemblies must report the same `settled` count —
+    whichever path fetched them and wherever the prefilter dropped them: a
+    rejection hidden from the count (the old read-back filter) makes it
+    smaller, and one counted twice (a discarded frontier beside the fallback
+    that refetches its day) makes it larger. Every market the prefilter cost
+    is rejected at least once, and each count keeps exactly its corpus.
+    """
+    full = out_full.provenance.assembly_counts
+    pref = out_pref.provenance.assembly_counts
+    assert full.settled == pref.settled
+    assert (full.rejected, full.kept) == (0, len(out_full))
+    assert pref.kept == len(out_pref)
+    assert pref.rejected >= len(out_full) - len(out_pref) > 0
+
+
+def _old_assembly_counts(endpoints, start_ts, prefilter):
+    """The old merge's walk, counting instead of keeping (M9's oracle).
+
+    `endpoints` is one [(records, max_settle)] source list per endpoint, in
+    merge order; the ticker dedup spans all of them, as the old merge's one
+    `selected` dict did. Every record whose settlement lies in
+    [start_ts, max_settle) is SETTLED; of those, the ones the prefilter
+    refuses are REJECTED, and the ones that pass but whose ticker is blank or
+    already kept are DUPLICATES. Returns one historical.AssemblyCounts per
+    endpoint.
+    """
+    seen: set = set()
+    out = []
+    for sources in endpoints:
+        settled = rejected = duplicates = 0
+        for records, max_settle in sources:
+            for m in records:
+                settle = historical._iso_epoch(m.get("settlement_ts"))
+                if settle is None or settle < start_ts:
+                    continue
+                if max_settle is not None and settle >= max_settle:
+                    continue
+                settled += 1
+                if prefilter is not None and not prefilter(m):
+                    rejected += 1
+                    continue
+                ticker = m.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                else:
+                    duplicates += 1
+        out.append(historical.AssemblyCounts(settled, rejected, duplicates))
+    return out
+
+
 def _mapped_titles(tickers):
     """A title map shaped like the real resolver's: every requested ticker,
     with one left unresolved ("") so the .get(..., "") default path runs."""
@@ -4548,13 +4727,16 @@ class TestStreamedAssemblyParity:
                 for lo, recs in zip(los, days, strict=True):
                     _write_jsonl(historical._day_store_path(store, lo), meta, recs)
             # Handed over oldest first, as pool completion order may; the
-            # stream sorts newest first itself.
+            # stream sorts newest first itself. UNFILTERED, as the phases hand
+            # their day slices over since M9; only the frontier is filtered
+            # where it is fetched (this fixture's frontier has nothing the
+            # prefilter rejects, so no fetch-time count is lost by stubbing
+            # the phase here).
             day_src = historical._assemble_day_slices(
-                "archive_days", sorted(archive_los), meta_a, prefilter)
+                "archive_days", sorted(archive_los), meta_a)
             live_src = historical._RecordChain(
                 [m for m in frontier if prefilter is None or prefilter(m)],
-                historical._assemble_day_slices("live_days", sorted(live_los), meta_l,
-                                                prefilter))
+                historical._assemble_day_slices("live_days", sorted(live_los), meta_l))
         monkeypatch.setattr(historical, "_fetch_archive_phase",
                             lambda *a, **k: (day_src, tail))
         monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: live_src)
@@ -4597,14 +4779,48 @@ class TestStreamedAssemblyParity:
         assert len(out) == len(expected)
         assert asked == [unique]               # titles resolved for the same set
 
+        # M9: every count line reports the settled records beside the kept
+        # ones, split into what the prefilter and the dedup removed.
+        archive_counts, live_counts = _old_assembly_counts(
+            [[(newer_day + older_day, cutoff_ts), (tail, cutoff_ts)],
+             [(frontier + live_newer + live_older, None)]], start_ts, prefilter)
+        total = historical._total_counts(archive_counts, live_counts)
+        # Not vacuous: the fixture's numbers, worked by hand. The settled
+        # counts do not depend on the prefilter; the kept ones match the
+        # old merge's.
+        if use_prefilter:
+            assert (archive_counts, live_counts) == (
+                historical.AssemblyCounts(13, 2, 4), historical.AssemblyCounts(8, 1, 2))
+        else:
+            assert (archive_counts, live_counts) == (
+                historical.AssemblyCounts(13, 0, 5), historical.AssemblyCounts(8, 0, 3))
+        assert (archive_counts.kept, live_counts.kept, total.kept) == (
+            archive_count, live_count, len(expected))
+
+        def said(counts):
+            dup = f"{counts.duplicates} duplicate or blank tickers"
+            return (f"{counts.rejected} rejected by the prefilter t, {dup}"
+                    if use_prefilter else dup)
+
+        noun = "eligible markets" if use_prefilter else "settled markets"
         messages = [r.getMessage() for r in caplog.records]
-        lines = [f"Historical endpoint: {archive_count} markets from 2026-06-05",
+        lines = [f"Historical endpoint: {archive_count} {noun} of "
+                 f"{archive_counts.settled} records settled in the window before "
+                 f"the archive cutoff ({said(archive_counts)})",
                  "Fetching recently settled markets (after API cutoff)...",
-                 f"Live endpoint: {live_count} recently settled markets",
+                 f"Live endpoint: {live_count} {noun} of {live_counts.settled} "
+                 f"recently settled records in the window ({said(live_counts)})",
                  f"Resolving event titles for {len(unique)} unique event_tickers",
-                 f"Total settled markets from 2026-06-05: {len(expected)}"]
+                 f"Assembled {len(expected)} {noun} of {total.settled} records "
+                 f"settled since 2026-06-05 ({said(total)})"]
         positions = [messages.index(line) for line in lines]
         assert positions == sorted(positions)
+        # ...and the total rides the corpus out, and into the cache's meta.
+        assert out.provenance.assembly_counts == total
+        with gzip.open(out.path, "rt", encoding="utf-8") as fh:
+            assert json.loads(fh.readline())["meta"]["assembly_counts"] == {
+                "settled": total.settled, "rejected": total.rejected,
+                "duplicates": total.duplicates}
 
         # Not vacuous: every rule in the fixture actually decided something.
         by_ticker = {m["ticker"]: m for m in expected}
@@ -4993,9 +5209,16 @@ class TestCorpusProvenance:
         assert meta["archive_cutoff_ts"] == int(self.CUTOFF_DT.timestamp())
         assert before <= datetime.fromisoformat(meta["assembled_at"]) <= after
         prov = out.provenance
+        # M9: the assembly's counts ride along too — with no prefilter nothing
+        # is rejected, and the counts keep exactly the corpus's records
+        counts = prov.assembly_counts
+        assert counts is not None and counts.rejected == 0
+        assert counts.kept == len(out) and counts.settled >= len(out)
+        assert meta["assembly_counts"] == {
+            "settled": counts.settled, "rejected": 0, "duplicates": counts.duplicates}
         assert prov == historical.CorpusProvenance(
             from_cache=False, assembled_at=datetime.fromisoformat(meta["assembled_at"]),
-            archive_cutoff=self.CUTOFF_DT, post_cutoff=False)
+            archive_cutoff=self.CUTOFF_DT, post_cutoff=False, assembly_counts=counts)
 
     def test_the_stamp_is_informational_not_identity(self, tmp_path, monkeypatch):
         # A file whose informational keys differ from anything this run would
@@ -5026,9 +5249,15 @@ class TestCorpusProvenance:
         # The same meta block, read back: identical facts, flagged as cached.
         assert hit.provenance == historical.CorpusProvenance(
             from_cache=True, assembled_at=fresh.assembled_at,
-            archive_cutoff=fresh.archive_cutoff, post_cutoff=False)
+            archive_cutoff=fresh.archive_cutoff, post_cutoff=False,
+            assembly_counts=fresh.assembly_counts)
         text = caplog.text
         assert f"Loaded {len(out)} settled markets from cache" in text
+        # ...with the assembly's counts, as of assembly (M9)
+        counts = fresh.assembly_counts
+        assert (f"Loaded {len(out)} settled markets from cache — as assembled, of "
+                f"{counts.settled} records settled since {self.PRE} "
+                f"({counts.duplicates} duplicate or blank tickers)") in text
         assert (f"Assembled cache {out.path.name} was assembled at "
                 f"{fresh.assembled_at:%Y-%m-%d %H:%M UTC}") in text
         assert "holds no market settled after that moment" in text
@@ -5247,6 +5476,159 @@ class TestCorpusProvenance:
     ])
     def test_the_assembly_stamp_is_read_as_a_utc_instant(self, raw, expected):
         assert historical._parse_assembled_at(raw) == expected
+
+
+class TestAssemblyCounts:
+    """M9 of the 2026-09-24 7-day-run review: the fetch's count lines counted
+    only prefilter SURVIVORS while calling them settled markets, and nothing
+    reported what the prefilter dropped. The assembly's first walk now counts
+    every record settled in the window and what the prefilter and the dedup
+    removed; the total is stamped into the assembled cache (informational,
+    never identity), read back on a hit, and quoted on the hit's count line —
+    which names its records "eligible markets" when a prefilter ran."""
+
+    START = date(2026, 6, 5)
+
+    @staticmethod
+    def _pred(m):
+        return not m["ticker"].endswith("1")
+
+    def _fetch(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        return historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=self.START,
+            use_cache=False, prefilter=self._pred, prefilter_tag="t")
+
+    def _hit(self):
+        return historical.fetch_all_settled_markets(
+            _NoNetwork(), _NoNetwork(), start_date=self.START, use_cache=True,
+            prefilter=self._pred, prefilter_tag="t")
+
+    @staticmethod
+    def _rewrite_meta(path, **changes):
+        records = list(historical._day_store_iter(
+            path, historical._assembled_cache_meta(TestAssemblyCounts.START, "t")))
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            meta = json.loads(fh.readline())["meta"]
+        meta.update(changes)
+        meta = {k: v for k, v in meta.items() if v is not None}
+        _write_jsonl(path, meta, records)
+        return records
+
+    def test_a_prefiltered_fresh_fetch_logs_settled_beside_eligible(
+            self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            out = self._fetch(tmp_path, monkeypatch)
+        counts = out.provenance.assembly_counts
+        assert counts.kept == len(out) and counts.rejected > 0
+        messages = [r.getMessage() for r in caplog.records]
+        total = [m for m in messages if m.startswith("Assembled ")]
+        assert total == [
+            f"Assembled {len(out)} eligible markets of {counts.settled} records "
+            f"settled since {self.START} ({counts.rejected} rejected by the "
+            f"prefilter t, {counts.duplicates} duplicate or blank tickers)"]
+        # The endpoint lines name eligible markets too, and sum to the total.
+        hist = [m for m in messages if m.startswith("Historical endpoint: ")]
+        live = [m for m in messages if m.startswith("Live endpoint: ")]
+        assert len(hist) == len(live) == 1
+        assert " eligible markets of " in hist[0] and " eligible markets of " in live[0]
+        assert "rejected by the prefilter t" in hist[0] + live[0]
+        # The misstatements M9 names are gone: no line counts the survivors
+        # as "settled markets" any more.
+        assert not [m for m in messages if m.startswith("Total settled markets")
+                    or (m.startswith("Live endpoint: ")
+                        and "recently settled markets" in m)]
+
+    def test_a_prefiltered_hit_names_eligible_markets_and_quotes_the_counts(
+            self, tmp_path, monkeypatch, caplog):
+        out = self._fetch(tmp_path, monkeypatch)
+        fresh = out.provenance.assembly_counts
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == list(out)
+        assert hit.provenance.assembly_counts == fresh
+        assert (f"Loaded {len(out)} eligible markets from cache — as assembled, of "
+                f"{fresh.settled} records settled since {self.START} "
+                f"({fresh.rejected} rejected by the prefilter t, "
+                f"{fresh.duplicates} duplicate or blank tickers)") in caplog.text
+        assert "settled markets from cache" not in caplog.text
+
+    def test_a_cache_written_before_the_counts_says_it_records_none(
+            self, tmp_path, monkeypatch, caplog):
+        # The real 2026-09-17 cache on disk has no assembly_counts: served,
+        # with the line saying the counts are missing rather than implying
+        # that nothing was rejected.
+        out = self._fetch(tmp_path, monkeypatch)
+        records = self._rewrite_meta(out.path, assembly_counts=None)
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == records
+        assert hit.provenance.assembly_counts is None
+        assert (f"Loaded {len(records)} eligible markets from cache — the "
+                "prefilter t ran during its assembly, but this cache records no "
+                "count of the records it rejected") in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_counts_that_do_not_keep_the_corpus_are_dropped_loudly(
+            self, tmp_path, monkeypatch, caplog):
+        # A block whose counts keep a different number of records than the
+        # file holds describes some other assembly: served, counts dropped.
+        out = self._fetch(tmp_path, monkeypatch)
+        records = self._rewrite_meta(
+            out.path, assembly_counts={"settled": len(out) + 50, "rejected": 10,
+                                       "duplicates": 0})
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == records
+        assert hit.provenance.assembly_counts is None
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warned == [
+            f"Settled-market cache {out.path.name} records assembly counts that "
+            f"keep {len(out) + 40} records, but it holds {len(records)} — "
+            f"ignoring those counts"]
+        assert "records no count of the records it rejected" in caplog.text
+
+    def test_a_legacy_hit_under_a_prefilter_says_it_records_no_counts(
+            self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        (tmp_path / "cache").mkdir(parents=True)
+        (tmp_path / "cache" / f"settled_markets_{self.START}_t.json").write_text(
+            json.dumps([{"ticker": "OLD1"}]))
+        _forbid_network(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            out = self._hit()
+        assert out == [{"ticker": "OLD1"}]
+        assert out.provenance.assembly_counts is None
+        assert ("Loaded 1 eligible markets from cache — the prefilter t ran "
+                "during its assembly, but this cache records no count of the "
+                "records it rejected") in caplog.text
+
+    @pytest.mark.parametrize("raw", [
+        None, "12", [13, 2, 4], {"settled": 13, "rejected": 2},
+        {"settled": 13, "rejected": 2, "duplicates": True},
+        {"settled": 13, "rejected": -1, "duplicates": 4},
+        {"settled": 13, "rejected": 2.0, "duplicates": 4},
+        {"settled": 13, "rejected": "2", "duplicates": 4},
+        {"settled": 5, "rejected": 2, "duplicates": 4},
+    ])
+    def test_unreadable_counts_read_as_none(self, raw):
+        assert historical._parse_assembly_counts(raw) is None
+
+    def test_readable_counts_parse(self):
+        counts = historical._parse_assembly_counts(
+            {"settled": 13, "rejected": 2, "duplicates": 4, "extra": "ignored"})
+        assert counts == historical.AssemblyCounts(13, 2, 4)
+        assert counts.kept == 7
+        assert historical._parse_assembly_counts(
+            {"settled": 0, "rejected": 0, "duplicates": 0}).kept == 0
 
 
 class TestNothingIsMaterialized:
