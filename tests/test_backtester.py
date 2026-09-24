@@ -21,7 +21,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester, scanner
+from kalshi_betting import backtester, historical, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -6287,6 +6287,76 @@ class TestGroupableSubset:
         with caplog.at_level("WARNING"):
             self._prepare()
         assert "2 groupable markets (of 3 eligible) are materialized" in caplog.text
+
+
+class TestPrepareCandidatesOverASettledCorpus:
+    """SS-1 Commit C: fetch_all_settled_markets now hands _prepare_candidates a
+    disk-backed historical.SettledCorpus — the assembled .jsonl.gz cache,
+    streamed afresh on every walk — instead of one list. _prepare_candidates'
+    two passes must produce exactly what they produce over the list, and walk
+    the file exactly twice (the census rides the first pass)."""
+
+    @staticmethod
+    def _corpus(tmp_path, records):
+        path = tmp_path / "settled_markets_test.jsonl.gz"
+        meta = historical._assembled_cache_meta(_SS1_START, "t")
+        with historical._DayStreamWriter(path, meta) as writer:
+            for m in records:
+                writer.write_record(m)
+            count = writer.commit()
+        return historical.SettledCorpus(path, meta, count)
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_the_streamed_corpus_prepares_exactly_what_the_list_does(
+        self, tmp_path, monkeypatch, seed, ladders,
+    ):
+        template = _ss1_corpus(seed)
+        TestGroupableSubset._patch(monkeypatch, template)
+        from_list = TestGroupableSubset._prepare(ladders)
+
+        corpus = self._corpus(tmp_path, template)
+        assert len(corpus) == len(template)
+        walks: list[int] = []
+        real_iter = historical._day_store_iter
+
+        def counting(*args, **kwargs):
+            walks.append(1)
+            return real_iter(*args, **kwargs)
+
+        monkeypatch.setattr(historical, "_day_store_iter", counting)
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        from_corpus = TestGroupableSubset._prepare(ladders)
+
+        assert (_pair_shape(from_corpus.all_pairs, by=_by_ticker)
+                == _pair_shape(from_list.all_pairs, by=_by_ticker))
+        # Value-equal records (a JSON round trip changes nothing here), not
+        # merely equal tickers.
+        assert [p for p, _ in from_corpus.all_pairs] == [p for p, _ in from_list.all_pairs]
+        assert from_corpus.label_coverage == from_list.label_coverage
+        assert len(walks) == 2
+
+    def test_a_cache_replaced_between_the_two_passes_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        # Pass 2 re-opens the file; if another run replaced it in between
+        # with a different corpus, the run must stop, not group records the
+        # first pass never keyed.
+        template = _ss1_corpus(0)
+        corpus = self._corpus(tmp_path, template)
+        real_index = backtester._index_eligible_keys
+
+        def index_then_replace(markets, start_date, census):
+            index = real_index(markets, start_date, census)
+            self._corpus(tmp_path, [m for m in template if m["ticker"] != "SB"])
+            return index
+
+        monkeypatch.setattr(backtester, "_index_eligible_keys", index_then_replace)
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        # The first eligible position after the removed record no longer
+        # matches, so pass 2's own identity check stops the run there.
+        with pytest.raises(RuntimeError, match="did not iterate identically"):
+            TestGroupableSubset._prepare()
 
 
 class TestEntriesForBand:

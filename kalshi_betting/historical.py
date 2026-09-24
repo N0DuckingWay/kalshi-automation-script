@@ -10,7 +10,8 @@ Purpose:
     regular /markets?status=settled endpoint (which covers more recent settlements);
     and (2) hourly candlestick price series for individual markets used to find
     the week when each pair first became tradeable. All data is cached to JSON
-    files on disk so re-runs do not re-fetch from the API.
+    (or gzipped JSON-lines) files on disk so re-runs do not re-fetch from the
+    API.
 
 Dependencies:
     Imports build_client from auth.py; api_call_with_retry and fetch_json_page
@@ -25,7 +26,9 @@ Dependencies:
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
-    all called by backtester.py.
+    all called by backtester.py. Also exports SettledCorpus — the
+    disk-backed, re-iterable corpus fetch_all_settled_markets returns — and
+    SettledCorpusError, which walking one raises when its file cannot be read.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -62,16 +65,30 @@ Notes:
     gzipped JSON document written by _day_store_save, and the streamed
     "jsonl-v1" line format written by _DayStreamWriter (which is what the
     fetch workers use, so no worker ever holds a whole UTC day — millions of
-    records at 2026-08 volumes — in memory). _day_store_load reads both; see
-    the day-store section for the routing rule. The live frontier (current,
-    partial) day is never persisted; it streams through a sink that keeps only
-    the caller's prefilter-passing records as each batch arrives
-    (_fetch_live_phase), so when a prefilter is given the unfiltered partial
-    day is never resident — its prefilter-passing subset still is, as a list,
-    and on the day after a Monday that can be most of the day. The two
+    records at 2026-08 volumes — in memory). _day_store_iter reads both (and
+    _day_store_load is its all-or-nothing list form); see the day-store
+    section for the routing rule. The live frontier (current, partial) day is
+    never persisted as a slice; it streams through a sink that keeps only the
+    caller's prefilter-passing records as each batch arrives and spools them
+    to an anonymous temporary file (_fetch_live_phase, _FrontierSpool), so
+    neither the partial day nor its prefilter-passing subset — which on the
+    day after a Monday can be most of the day — is ever resident. The two
     sequential fallbacks apply the same prefilter per record but still hold
-    their whole filtered result; the archive tail is the one walk that applies
-    no prefilter (its record cap bounds it instead).
+    their whole filtered result; the archive tail is the one walk that
+    applies no prefilter (its record cap bounds it instead).
+
+    Since SS-1 the ASSEMBLED corpus is never held in memory either. The phases
+    return lazy views (_DaySliceStream re-reads the day slices on every walk;
+    the live phase chains its frontier spool in front of one), the assembly
+    walks them twice through one generator that reproduces the old merge
+    exactly (_assembled_records), and the second walk streams straight into
+    the assembled cache settled_markets_*.jsonl.gz, which is returned as a
+    SettledCorpus that streams the file again on every walk. Legacy
+    settled_markets_*.json caches are still served, whole, as lists — only
+    while no streamed cache of the same identity exists, and the first
+    rebuild of that identity deletes them (_retire_legacy_cache). A file
+    that cannot be read once a walk is under way raises SettledCorpusError —
+    never a sequential-walk fallback, never a short corpus.
 
     JSON parsing dominates the fetch's CPU time at current Kalshi volumes, so
     orjson is used when installed (optional `perf` extra) and the stdlib json
@@ -83,9 +100,11 @@ import base64
 import gzip
 import json
 import logging
+import tempfile
 import threading
 import time
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from functools import partial
@@ -341,8 +360,9 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
             slices can't go stale by construction — a full refresh requires
             deleting backtest_cache/archive_days/ and backtest_cache/live_days/
             AND re-running with --no-cache, because a default run loads the
-            assembled backtest_cache/settled_markets_*.json first and returns
-            before the day slices are consulted at all.
+            assembled backtest_cache/settled_markets_* cache (the .jsonl.gz,
+            or a legacy .json) first and returns before the day slices are
+            consulted at all.
             Note: price_level_structure/price_ranges are new, raw pass-through
             groundwork fields (2026-08) for a future tick-aware order cap —
             nothing in the backtester reads them yet. Cache records written
@@ -367,7 +387,7 @@ def _market_to_dict(m: dict, event_title: str = "") -> dict:
         # written before this fix keep subtitle=None — that reproduces the
         # pre-fix (weakened) grouping. Refreshing needs BOTH deleting
         # backtest_cache/{archive_days,live_days}/ and a --no-cache run (which
-        # bypasses the assembled settled_markets_*.json that would otherwise
+        # bypasses the assembled settled_markets_* cache that would otherwise
         # short-circuit the fetch before any slice is read).
         "subtitle": m.get("subtitle") or m.get("yes_sub_title"),
         "result": m.get("result"),
@@ -401,6 +421,13 @@ def _load_json_cache(path: Path):
     written by multi-hour fetches that have historically been interrupted by
     OOM kills and SIGKILLs, and the only safe interpretation of a half-written
     file is "no cache" — same guarded-read philosophy as _day_store_load.
+
+    The whole file is read into one string and parsed at once, so it is only
+    for small caches (candlesticks, event_titles.json) — and for LEGACY
+    assembled settled-market caches (settled_markets_*.json), which
+    fetch_all_settled_markets still serves this way for compatibility. That
+    path materializes the whole corpus (TS-07 in CLAUDE.md records what it
+    cost); new assembled caches are streamed instead (SettledCorpus).
 
     Args:
         path (Path): Filesystem path to the JSON cache file.
@@ -437,10 +464,11 @@ def _save_json_cache(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic tmp+replace, same idiom as _day_store_save. The tmp name is derived
     # from the destination, so it is unique because cache paths themselves are
-    # unique (per-ticker for candlesticks, per-start-date for assembled settled
-    # markets) — the same path-uniqueness invariant that keeps the parallel
-    # candlestick fetch safe. Never introduce a fetch whose cache path is shared
-    # across workers.
+    # unique (per-ticker for candlesticks; the one event_titles.json per run)
+    # — the same path-uniqueness invariant that keeps the parallel candlestick
+    # fetch safe. Never introduce a fetch whose cache path is shared across
+    # workers. (The assembled settled-market cache no longer comes through
+    # here: since SS-1 it is streamed by _DayStreamWriter, same idiom.)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, default=str))
     tmp.replace(path)
@@ -1033,7 +1061,53 @@ def _format_duration(seconds: float) -> str:
 #
 # The tag lives inside the meta block, which is otherwise pass-through, so an
 # expect_meta identity check is unaffected by its presence.
+#
+# Since SS-1 the assembled settled-market cache (settled_markets_*.jsonl.gz,
+# see fetch_all_settled_markets) is written in the same "jsonl-v1" framing by
+# the same writer and read by the same reader, _day_store_iter; only its meta
+# block differs.
 _SLICE_FORMAT_JSONL = "jsonl-v1"
+
+# What reading a gzipped slice can raise when the FILE is at fault, as opposed
+# to the caller's `keep` predicate: OSError covers a missing file, a bad gzip
+# header and a CRC/length mismatch (gzip.BadGzipFile); EOFError a stream cut
+# before its end-of-stream marker (an interrupted write); zlib.error a damaged
+# deflate stream, which is NOT an OSError subclass. JSON decoding errors are
+# ValueError and are caught separately, around the parse alone.
+_SLICE_READ_ERRORS = (OSError, EOFError, zlib.error)
+
+
+class _SliceUnreadable(Exception):
+    """
+    Raised by _day_store_iter when a slice-format file cannot be trusted.
+
+    Covers every way the file itself can be at fault: absent, not gzip, cut
+    short, damaged, not valid JSON, not the expected shape, or written under
+    different fetch conditions (a meta mismatch). Never raised for an
+    exception out of the caller's `keep` predicate, which propagates as-is.
+    Each caller maps it to its own contract: _day_store_load to None (the day
+    is refetched), SettledCorpus.open_validated to a cache miss, and a lazy
+    walk that is already under way to SettledCorpusError.
+    """
+
+
+class SettledCorpusError(RuntimeError):
+    """
+    A disk-backed settled-market corpus could not be read while it was being walked.
+
+    Raised by the lazy views fetch_all_settled_markets builds and returns
+    (_DaySliceStream over the day slices and _FrontierSpool over the live
+    frontier during assembly, SettledCorpus over the assembled cache
+    afterwards) when a file that was verified or written earlier in the run
+    disappears, is damaged, or no longer holds the records it held — and by
+    the assembly itself when its second walk does not reproduce its first. Loud by design: those records have already been
+    partly consumed, so the only alternatives would be a silently SHORT
+    corpus or a retry through a sequential walk that holds the whole range in
+    memory. The message names the file and the remedy (re-run: the damaged
+    file fails its validity check next time and is rebuilt). A RuntimeError
+    subclass, so the backtester's documented "the corpus did not iterate
+    identically" failures share one base class.
+    """
 
 
 def _discard_all(_record: dict) -> bool:
@@ -1161,6 +1235,157 @@ def _prune_stale_live_days(cutoff_ts: int) -> int:
     return pruned
 
 
+def _check_slice_meta(path: Path, meta: Any, expect_meta: dict) -> None:
+    """
+    Raise _SliceUnreadable unless a slice file's meta block matches expectations.
+
+    Args:
+        path (Path): The file being read, named in the error.
+        meta (Any): The file's parsed "meta" value. Absent/null reads as an
+            empty block (which then fails any non-empty expectation); anything
+            that is not a JSON object cannot have been written by this module
+            and is refused.
+        expect_meta (dict): Key/value pairs the block must match exactly.
+
+    Raises:
+        _SliceUnreadable: On a non-object meta block or any mismatched key.
+    """
+    meta = meta or {}
+    if not isinstance(meta, dict):
+        raise _SliceUnreadable(f"{path}: meta block is not a JSON object")
+    for key, want in expect_meta.items():
+        if meta.get(key) != want:
+            raise _SliceUnreadable(
+                f"{path}: meta {key}={meta.get(key)!r}, expected {want!r} "
+                f"(written under different conditions)"
+            )
+
+
+def _day_store_iter(
+    path: Path,
+    expect_meta: dict,
+    keep: Callable[[dict], bool] | None = None,
+) -> Iterator[dict]:
+    """
+    Yield a slice-format file's records one at a time, validating as it goes.
+
+    The single reader of the on-disk slice format, shared by _day_store_load
+    (which gathers it into a list, all or nothing), by _DaySliceStream (the
+    lazy per-phase view fetch_all_settled_markets assembles from) and by
+    SettledCorpus (the assembled cache). Reads BOTH formats (see the format
+    note above): the legacy single JSON document and the streamed "jsonl-v1"
+    line format. Routing is done on file CONTENT, never on whether a
+    whole-file parse succeeds — an empty "jsonl-v1" day is a lone meta line,
+    which parses perfectly well as a JSON document, so a "did json.loads
+    work?" test would misclassify it as legacy and silently report every
+    empty day as having no meta match.
+
+    The JSONL path parses and yields one line at a time, so neither a
+    multi-million-record day nor the assembled corpus is ever materialized by
+    this function; `keep` is applied per record before it is yielded. The
+    legacy path necessarily parses its whole document first (it is one JSON
+    value) and then yields from it.
+
+    The meta block is checked before the first record is yielded. A problem
+    found further in — a malformed line, a truncated or damaged stream —
+    raises _SliceUnreadable at that point, AFTER the records before it were
+    yielded: a caller that must be all-or-nothing collects first (as
+    _day_store_load does) and a caller that streams must treat the exception
+    as fatal to the whole walk (as _DaySliceStream and SettledCorpus do).
+    Nothing here ever returns a short result quietly.
+
+    Args:
+        path (Path): File path (a day slice from _day_store_path(), or the
+            assembled cache).
+        expect_meta (dict): Key/value pairs the file's meta block must match
+            exactly (e.g. cutoff_ts, include_mve, complete). A mismatch means
+            the file was written under different fetch conditions.
+        keep (Callable[[dict], bool] | None): Optional per-record predicate.
+            Records for which it returns False are discarded as they are read
+            and never yielded. Applying it here is equivalent to filtering the
+            output afterwards — order and membership are identical. Its own
+            exceptions propagate unchanged (they are not a fault of the file).
+
+    Yields:
+        dict: The file's compact market dicts, in file order, filtered by
+            `keep` when given. Every record is a fresh object.
+
+    Raises:
+        _SliceUnreadable: When the file is absent, not gzip, truncated,
+            damaged, not valid JSON, not of the expected shape (a non-object
+            record, meta block or document, or a non-list "markets"), or its
+            meta does not match `expect_meta`.
+    """
+    if not path.exists():
+        raise _SliceUnreadable(f"{path}: file does not exist")
+    try:
+        # Read as bytes so the orjson and stdlib parsers take the same input.
+        # Both accept UTF-8 bytes, and slices are plain JSON either way.
+        fh = gzip.open(path, "rb")
+    except OSError as exc:
+        raise _SliceUnreadable(f"{path}: cannot open ({exc})") from exc
+    with fh:
+        try:
+            first_line = fh.readline()
+        except _SLICE_READ_ERRORS as exc:
+            raise _SliceUnreadable(f"{path}: unreadable ({exc!r})") from exc
+        try:
+            head = _slice_loads(first_line)
+        except ValueError:
+            # Not a self-contained first line. The only way our own writers
+            # produce this is a corrupt file, but a legacy slice written by
+            # some other tool could be pretty-printed across lines, so fall
+            # through to the whole-document parse below rather than
+            # declaring the file dead.
+            head = None
+        if isinstance(head, dict) and "markets" not in head:
+            # JSONL: a dict first line WITHOUT a "markets" key is the meta
+            # line (the absence of "markets" is the discriminator, and it
+            # holds for the meta-only empty-day file too).
+            _check_slice_meta(path, head.get("meta"), expect_meta)
+            lines = iter(fh)
+            while True:
+                # Streaming, one record at a time: this is what keeps a
+                # multi-million-record file bounded on the read side. The
+                # read and the parse are guarded separately from `keep`, so a
+                # predicate failure is never mistaken for a damaged file.
+                try:
+                    line = next(lines)
+                except StopIteration:
+                    return
+                except _SLICE_READ_ERRORS as exc:
+                    raise _SliceUnreadable(f"{path}: unreadable ({exc!r})") from exc
+                if not line.strip():
+                    continue
+                try:
+                    record = _slice_loads(line)
+                except ValueError as exc:
+                    raise _SliceUnreadable(f"{path}: malformed record line ({exc})") from exc
+                if not isinstance(record, dict):
+                    raise _SliceUnreadable(f"{path}: a record line is not a JSON object")
+                if keep is None or keep(record):
+                    yield record
+        try:
+            rest = fh.read()
+        except _SLICE_READ_ERRORS as exc:
+            raise _SliceUnreadable(f"{path}: unreadable ({exc!r})") from exc
+    try:
+        payload = head if (head is not None and not rest.strip()) else _slice_loads(
+            first_line + rest
+        )
+    except ValueError as exc:
+        raise _SliceUnreadable(f"{path}: not valid JSON ({exc})") from exc
+    if not isinstance(payload, dict):
+        raise _SliceUnreadable(f"{path}: document is not a JSON object")
+    _check_slice_meta(path, payload.get("meta"), expect_meta)
+    markets = payload.get("markets") or []
+    if not isinstance(markets, list) or not all(isinstance(m, dict) for m in markets):
+        raise _SliceUnreadable(f"{path}: \"markets\" is not a list of JSON objects")
+    for m in markets:
+        if keep is None or keep(m):
+            yield m
+
+
 def _day_store_load(
     path: Path,
     expect_meta: dict,
@@ -1169,19 +1394,15 @@ def _day_store_load(
     """
     Load a day-slice file if it exists and its metadata matches expectations.
 
-    Reads BOTH slice formats (see the format note above): the legacy single
-    JSON document and the streamed "jsonl-v1" line format. Routing is done on
-    file CONTENT, never on whether a whole-file parse succeeds — an empty
-    "jsonl-v1" day is a lone meta line, which parses perfectly well as a JSON
-    document, so a "did json.loads work?" test would misclassify it as legacy
-    and silently report every empty day as having no meta match.
-
-    The JSONL path parses one line at a time and applies `keep` per record, so
-    a 4.8M-record day is never materialized in full just to be filtered down
-    afterwards. Any malformed line, unreadable file, or meta mismatch fails the
-    WHOLE slice (returns None → the caller refetches the day); a partially
-    decodable slice is never returned, which is the same all-or-nothing
-    contract the single-document format always had.
+    The all-or-nothing form of _day_store_iter (see there for both formats,
+    the content-based routing rule and the per-record `keep`): the records are
+    gathered into a list only once the whole file has been read cleanly. Any
+    malformed line, unreadable file, or meta mismatch fails the WHOLE slice
+    (returns None → the caller refetches the day); a partially decodable slice
+    is never returned, which is the same contract the single-document format
+    always had. Used by the phases' reuse prescans (with _discard_all, so
+    nothing is retained) and by direct callers; assembly streams through
+    _DaySliceStream instead.
 
     Args:
         path (Path): File path from _day_store_path().
@@ -1192,64 +1413,18 @@ def _day_store_load(
         keep (Callable[[dict], bool] | None): Optional per-record predicate.
             Records for which it returns False are discarded as they are read
             and never retained. Applying it here is equivalent to filtering the
-            returned list afterwards — order and membership are identical.
+            returned list afterwards — order and membership are identical. An
+            exception it raises propagates (it is not a fault of the file).
 
     Returns:
         list[dict] | None: The slice's compact market dicts (filtered by `keep`
             when given), or None when the file is absent, unreadable, or
             written under different conditions.
     """
-    if not path.exists():
-        return None
     try:
-        # Read as bytes so the orjson and stdlib parsers take the same input.
-        # Both accept UTF-8 bytes, and slices are plain JSON either way.
-        with gzip.open(path, "rb") as fh:
-            first_line = fh.readline()
-            try:
-                head = _slice_loads(first_line)
-            except ValueError:
-                # Not a self-contained first line. The only way our own writers
-                # produce this is a corrupt file, but a legacy slice written by
-                # some other tool could be pretty-printed across lines, so fall
-                # through to the whole-document parse below rather than
-                # declaring the file dead.
-                head = None
-            if isinstance(head, dict) and "markets" not in head:
-                # JSONL: a dict first line WITHOUT a "markets" key is the meta
-                # line (the tag is checked below for the log, not for routing —
-                # the absence of "markets" is the discriminator, and it holds
-                # for the meta-only empty-day file too).
-                meta = head.get("meta") or {}
-                if any(meta.get(k) != v for k, v in expect_meta.items()):
-                    return None
-                records: list[dict] = []
-                for line in fh:
-                    # Streaming, one record at a time: this is what keeps the
-                    # load side of a multi-million-record day bounded.
-                    if not line.strip():
-                        continue
-                    record = _slice_loads(line)
-                    if keep is None or keep(record):
-                        records.append(record)
-                return records
-            rest = fh.read()
-        payload = head if (head is not None and not rest.strip()) else _slice_loads(
-            first_line + rest
-        )
-    except (OSError, EOFError, ValueError):
-        # EOFError: gzip raises it for a stream truncated before its end-of-
-        # stream marker — the same "interrupted write" class as a short read.
+        return list(_day_store_iter(path, expect_meta, keep))
+    except _SliceUnreadable:
         return None
-    if not isinstance(payload, dict):
-        return None
-    meta = payload.get("meta") or {}
-    if any(meta.get(k) != v for k, v in expect_meta.items()):
-        return None
-    markets = payload.get("markets") or []
-    if keep is None:
-        return markets
-    return [m for m in markets if keep(m)]
 
 
 def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
@@ -1290,7 +1465,7 @@ def _day_store_save(path: Path, meta: dict, markets: list[dict]) -> None:
 
 class _DayStreamWriter:
     """
-    Incremental writer for one "jsonl-v1" day slice.
+    Incremental writer for one "jsonl-v1" file: a day slice, or the assembled cache.
 
     Exists so a fetch worker never accumulates a whole UTC day of records: at
     2026-08 volumes a single day reaches ~4.4–4.8M compact market dicts, and
@@ -1298,6 +1473,12 @@ class _DayStreamWriter:
     telemetry, 2026-08-31). The worker instead hands over batches of at most
     SETTLED_FETCH_CHUNK_RECORDS records, which are serialized and compressed
     straight into the file and then dropped.
+
+    Since SS-1 fetch_all_settled_markets also writes the assembled
+    settled-market cache (settled_markets_*.jsonl.gz) through it, one record
+    at a time (write_record) as its second assembly walk produces them, so the
+    assembled corpus is never held in memory either; only the meta block it is
+    given differs from a day slice's.
 
     Atomicity contract is identical to _day_store_save: everything is written
     to `<path>.tmp` and only renamed into place by commit(), so the visible
@@ -1318,9 +1499,12 @@ class _DayStreamWriter:
         Open the temp file and write the meta line.
 
         Args:
-            path (Path): Final destination path from _day_store_path().
-            meta (dict): Metadata block from _day_store_meta(); the
-                "jsonl-v1" format tag is added here so callers cannot forget it.
+            path (Path): Final destination path — from _day_store_path(), or
+                the assembled cache's path in fetch_all_settled_markets.
+            meta (dict): Metadata block from _day_store_meta() (or, for the
+                assembled cache, _assembled_cache_meta() plus a timestamp);
+                the "jsonl-v1" format tag is added here so callers cannot
+                forget it.
 
         Raises:
             OSError: If the destination directory or temp file cannot be opened.
@@ -1359,6 +1543,25 @@ class _DayStreamWriter:
         for record in batch:
             write(_slice_dumps(record) + b"\n")
         self._records += len(batch)
+
+    def write_record(self, record: dict) -> None:
+        """
+        Append one record as a JSON line.
+
+        The streamed assembly (fetch_all_settled_markets) produces records one
+        at a time from a generator; writing each as it arrives, rather than
+        batching, keeps nothing of the corpus resident beyond the record in
+        hand.
+
+        Args:
+            record (dict): One compact market dict (see _market_to_dict).
+
+        Raises:
+            OSError: On a write failure; the caller must abort() the writer
+                (leaving a `with` block does so).
+        """
+        self._fh.write(_slice_dumps(record) + b"\n")
+        self._records += 1
 
     def commit(self) -> int:
         """
@@ -1437,21 +1640,164 @@ def _day_store_meta(lo: int, expect_meta: dict) -> dict:
     }
 
 
+class _DaySliceStream:
+    """
+    Lazy, re-iterable view of one phase's completed day slices, newest day first.
+
+    What a phase hands fetch_all_settled_markets instead of a list: every walk
+    (`for m in stream`) re-opens the slice files and yields their records one
+    at a time through _day_store_iter, so no slice — and no phase — is ever
+    held in memory. The assembly walks each stream twice (once to count and
+    collect event tickers, once to write the assembled cache), and each walk
+    yields fresh dicts in the same order.
+
+    A slice that cannot be read DURING a walk — it disappeared, was damaged,
+    or was rewritten under different conditions since the phase verified or
+    wrote it — raises SettledCorpusError naming the day and the remedy. That
+    is a deliberate change from the old eager assembly, which read every slice
+    inside the phase and turned such a failure into _ShardedFetchUnsupported
+    and hence the sequential fallback: a walk under way has already handed
+    records to its consumer, so falling back would either duplicate them or
+    silently leave a SHORT corpus, and the sequential walk holds the whole
+    range in memory besides (unbounded at current volumes). The next run's
+    reuse prescan finds the damaged day invalid and fetches it again.
+    """
+
+    def __init__(
+        self,
+        store: str,
+        day_los: Iterable[int],
+        expect_meta: dict,
+        keep: Callable[[dict], bool] | None = None,
+    ):
+        """
+        Args:
+            store (str): Store subdirectory name ("archive_days" or "live_days").
+            day_los (Iterable[int]): UTC-midnight lower bounds of every day
+                known to have a valid slice on disk (reused or just written).
+                Copied and sorted newest-first here, once, so every walk yields
+                the same sequence however the caller's list later changes.
+            expect_meta (dict): Reuse-gating keys the slices must still match
+                (copied).
+            keep (Callable[[dict], bool] | None): Optional predicate applied per
+                record as slices are read, so records the caller would discard
+                anyway are never yielded (for "jsonl-v1" slices they are never
+                even retained past their own parse). Purely a memory
+                optimization — the assembly re-applies the same predicate. The
+                slice FILES are never filtered; they stay complete for other
+                start dates.
+        """
+        self._store = store
+        # Newest day first: the order the old in-memory assembly produced, and
+        # part of this module's output contract, since the caller's ticker
+        # dedup is first-wins. Paths are resolved here, once, so every walk
+        # reads the very files the phase verified or wrote (CACHE_DIR is read
+        # at call time by _day_store_path, and tests repoint it).
+        self._slices = [(lo, _day_store_path(store, lo))
+                        for lo in sorted(day_los, reverse=True)]
+        self._expect_meta = dict(expect_meta)
+        self._keep = keep
+
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Walk every slice, newest day first, yielding one record at a time.
+
+        Yields:
+            dict: Compact market dicts (fresh objects on every walk), filtered
+                by the stream's `keep`.
+
+        Raises:
+            SettledCorpusError: If a slice cannot be read during this walk.
+        """
+        for lo, path in self._slices:
+            try:
+                yield from _day_store_iter(path, self._expect_meta, self._keep)
+            except _SliceUnreadable as exc:
+                day = datetime.fromtimestamp(lo, tz=UTC).date().isoformat()
+                raise SettledCorpusError(
+                    f"The {self._store} slice for {day} could not be read while "
+                    f"the settled-market corpus was being assembled ({exc}). It "
+                    f"was verified or written earlier in this run, so it "
+                    f"disappeared or was damaged since. Re-run the backtest: "
+                    f"the reuse prescan will find the day missing or unreadable "
+                    f"and fetch it again. Not retried here through the "
+                    f"sequential walk, which would hold the whole range in "
+                    f"memory, and never skipped, which would leave the corpus "
+                    f"short."
+                ) from exc
+
+
+class _RecordChain:
+    """
+    Re-iterable concatenation of record sources, walked in order on every pass.
+
+    The live phase's return value: its frontier spool (_FrontierSpool)
+    followed by its past-day _DaySliceStream — the same records in the same
+    order as the old `frontier + [...]` list, without materializing either.
+    Each walk walks every part afresh, so the chain is re-iterable exactly
+    when its parts are (a list, a _FrontierSpool or a _DaySliceStream).
+    close() releases whichever parts hold a resource (the spool).
+    """
+
+    def __init__(self, *parts: Iterable[dict]):
+        """
+        Args:
+            *parts (Iterable[dict]): Re-iterable record sources, in the order
+                they are to be walked.
+        """
+        self._parts = parts
+
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Yields:
+            dict: Every record of every part, part by part, in order.
+        """
+        for part in self._parts:
+            yield from part
+
+    def close(self) -> None:
+        """
+        Close every part that can be closed (see _close_records); idempotent.
+        """
+        for part in self._parts:
+            _close_records(part)
+
+
+def _close_records(records: Any) -> None:
+    """
+    Release a phase result's resources, if it holds any.
+
+    A phase hands back a list, a _DaySliceStream, a _RecordChain or a test's
+    stand-in; only the live phase's frontier spool (reached through its
+    _RecordChain) holds anything that needs releasing. Anything without a
+    callable close() is left alone, so every one of those can be passed.
+
+    Args:
+        records (Any): The phase result (or any part of one).
+    """
+    close = getattr(records, "close", None)
+    if callable(close):
+        close()
+
+
 def _assemble_day_slices(
     store: str,
     day_los: list[int],
     expect_meta: dict,
     keep: Callable[[dict], bool] | None = None,
-) -> list[dict]:
+) -> _DaySliceStream:
     """
-    Rebuild a phase's record list by streaming completed day slices off disk.
+    Return a phase's day-slice records as a lazy stream off disk (never a list).
 
     Slices are read back rather than held in RAM because a full-history fetch
     spans ~900 days at up to ~200k records each — retaining every slice (and
     then flattening it into a second list) was measured at 2.7 GB RSS only 17%
     of the way through a run, and grew superlinearly as GC pressure mounted.
-    Reading them back costs one extra decode pass, which is minutes against a
-    multi-hour fetch.
+    Since SS-1 even the read-back is not collected: a 7-day window's past days
+    held 18,061,549 fetched records, of which 7,260,952 passed the backtester's
+    prefilter — about 28 GB at the 3,926 B/record measured on those records —
+    so this returns a _DaySliceStream that the assembly walks record by record,
+    and nothing is read until then.
 
     Days are emitted newest-first, matching the order the in-memory version
     produced — record order is part of this module's output contract, since the
@@ -1463,29 +1809,16 @@ def _assemble_day_slices(
             have a valid slice on disk (reused or just written).
         expect_meta (dict): Reuse-gating keys the slices must still match.
         keep (Callable[[dict], bool] | None): Optional predicate applied per
-            record as slices are read, so records the caller would discard
-            anyway are never retained. Pushed down into _day_store_load so that
-            for streamed "jsonl-v1" slices the rejected records are never even
-            materialized. Purely a memory optimization — the caller re-applies
-            the same predicate during merge. The slice FILES are never
-            filtered; they stay complete for other start dates.
+            record as slices are read (see _DaySliceStream). The slice FILES
+            are never filtered; they stay complete for other start dates.
 
     Returns:
-        list[dict]: Compact market dicts, newest day first.
-
-    Raises:
-        _ShardedFetchUnsupported: If a slice that was just verified or written
-            no longer loads — the caller then takes the sequential fallback
-            rather than silently returning a short result set.
+        _DaySliceStream: Compact market dicts, newest day first, re-read from
+            disk on every walk. A slice that cannot be read during a walk
+            raises SettledCorpusError there; it no longer takes the sequential
+            fallback (see _DaySliceStream for why).
     """
-    records: list[dict] = []
-    for lo in sorted(day_los, reverse=True):
-        path = _day_store_path(store, lo)
-        slice_records = _day_store_load(path, expect_meta, keep)
-        if slice_records is None:
-            raise _ShardedFetchUnsupported(f"day slice disappeared or corrupted: {path}")
-        records.extend(slice_records)
-    return records
+    return _DaySliceStream(store, day_los, expect_meta, keep)
 
 
 # ─── Archive (pre-cutoff) fetching ────────────────────────────────────────────
@@ -1921,7 +2254,7 @@ def _fetch_archive_phase(
     cutoff_ts: int,
     hist_kwargs: dict,
     keep: Callable[[dict], bool] | None = None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[Iterable[dict], list[dict]]:
     """
     Fetch the archive's contribution: created-day slices plus the below-start tail.
 
@@ -1933,10 +2266,14 @@ def _fetch_archive_phase(
     granularity instead of restarting the multi-hour walk.
 
     Slice records are never accumulated in memory: a worker streams its records
-    into its slice file in chunks and returns only a count, and the final list
-    is streamed back off disk by _assemble_day_slices (see there for why — a
-    ~900-day window otherwise runs to tens of GB, and a single 2026-08 day is
-    itself millions of records).
+    into its slice file in chunks and returns only a count, and the day-slice
+    records are handed back as a lazy _DaySliceStream from
+    _assemble_day_slices (see there for why — a ~900-day window otherwise runs
+    to tens of GB, and a single 2026-08 day is itself millions of records).
+    Nothing is read back here; the caller's assembly walks the stream. A slice
+    that cannot be read during that walk raises SettledCorpusError from the
+    walk itself — it no longer reaches the sequential fallback below, which
+    only covers failures inside this phase (see _DaySliceStream).
 
     Slice files are stamped with the cutoff_ts they were fetched under and are
     ONLY reused while the stamp matches the current cutoff: when Kalshi
@@ -1962,12 +2299,16 @@ def _fetch_archive_phase(
             counts unfiltered records); the caller's merge filters the tail.
 
     Returns:
-        tuple[list[dict], list[dict]]: (day-slice records newest-day first,
-            tail records). Day-slice records are NOT yet settlement-filtered
-            (the caller applies the [start_ts, cutoff_ts) window); tail
-            records already are. On the sequential fallback, everything is
-            returned settlement-filtered (and `keep`-filtered) in the first
-            list and the second is empty.
+        tuple[Iterable[dict], list[dict]]: (day-slice records newest-day
+            first, tail records). On the sharded path the first element is a
+            _DaySliceStream — re-iterable, read lazily off disk on every walk,
+            never a list; the tail is a list (its record cap bounds it). Day-
+            slice records are NOT yet settlement-filtered (the caller applies
+            the [start_ts, cutoff_ts) window); tail records already are. On
+            the sequential fallback, everything is returned
+            settlement-filtered (and `keep`-filtered) in the first element, a
+            list, and the second is empty; when the window starts at or after
+            the cutoff, both are empty lists.
     """
     if start_ts >= cutoff_ts:
         # The archive holds only markets that settled BEFORE the cutoff, so a
@@ -2016,10 +2357,11 @@ def _fetch_archive_phase(
         }
         # Only day identities are tracked here, never their records: the
         # prescan's loaded slices are discarded and re-read at assembly. That
-        # costs one extra decode of the reused days but keeps peak memory
-        # independent of how many days the window spans. _discard_all makes
-        # that literal — a streamed slice is fully parsed (so corruption is
-        # still caught) but nothing is retained from it.
+        # costs two extra decodes of the reused days (one per assembly walk)
+        # but keeps peak memory independent of how many days the window
+        # spans. _discard_all makes that literal — a streamed slice is fully
+        # parsed (so corruption is still caught) but nothing is retained from
+        # it.
         on_disk: list[int] = []
         to_fetch: list[int] = []
         for lo in day_los:
@@ -2071,6 +2413,8 @@ def _fetch_archive_phase(
         tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs,
                                    tail_progress)
 
+        # A lazy stream, not a list: nothing is read here, and every later
+        # walk re-reads the slices one record at a time (SS-1).
         return _assemble_day_slices("archive_days", on_disk, expect_meta, keep), tail
     except _ShardedFetchUnsupported as exc:
         logging.warning(
@@ -2112,9 +2456,10 @@ def _fetch_live_window(
             the buffer is dropped, and the return value is the record COUNT.
             Both production callers pass one: the past-day worker streams into
             its slice file, and the frontier window streams through a sink that
-            keeps only records passing the caller's predicate
-            (_fetch_live_phase / _extend_kept), so an unfiltered frontier
-            record is resident only while its batch is in flight. None returns
+            keeps only records passing the caller's predicate and spools them
+            to an anonymous temporary file (_fetch_live_phase / _extend_kept /
+            _FrontierSpool), so any frontier record, kept or not, is resident
+            only while its batch is in flight. None returns
             the accumulated list — the original behavior, retained for direct
             callers; the sequential fallback (_fetch_live_sequential) is a
             separate walk that never calls this function.
@@ -2270,13 +2615,12 @@ def _fetch_and_store_live_window(
     The archive-side counterpart is _fetch_and_store_archive_day; same
     rationale (records streamed out in chunks, freed in-thread, serialization
     off the main thread). Only past days go through here — the frontier day is
-    fetched directly and deliberately never persisted, since it was captured
-    mid-day. It is still streamed in chunks, but into an in-memory list that
-    keeps only the records passing the caller's predicate (see
-    _fetch_live_phase): with a predicate — the backtester always passes its
-    eligibility prefilter — what stays resident is the keep-passing subset of
-    the partial day plus one batch in flight; with none, every record passes
-    and the whole partial day is held, as it always was.
+    fetched directly and deliberately never persisted as a slice, since it was
+    captured mid-day. It is still streamed in chunks, but into a private,
+    anonymous spool file (_FrontierSpool) that keeps only the records passing
+    the caller's predicate (see _fetch_live_phase): what stays resident is one
+    batch in flight, whatever the predicate, and the spool vanishes with the
+    run.
 
     Args:
         live_client: KalshiClient from build_prod_live_client().
@@ -2306,8 +2650,175 @@ def _fetch_and_store_live_window(
     return int(count)
 
 
+class _FrontierSpool:
+    """
+    The frontier day's keep-passing records, spooled to an anonymous temporary file.
+
+    The live frontier (the current, partial UTC day) is never persisted as a
+    day slice — it was captured mid-day and must never be reused as complete —
+    so it used to be held as a list (filtered as its pages arrived), which the
+    assembly walks twice. Such a list is bounded by the prefilter alone, and
+    the prefilter's pass rate depends on the WEEKDAY: _can_ever_enter admits
+    every market that was open over a Monday checkpoint on/after start_date
+    and closes at least a day later, so a frontier captured the day after a
+    Monday can be mostly eligible — 7,190,452 of the 9,176,306 records
+    settled on Tuesday 2026-09-22 passed _can_ever_enter(m, 2026-09-17),
+    ~28 GB at the 3,926 B/record measured on eligible records of that window,
+    on a 16 GB host. So the frontier worker's sink (_extend_kept) streams
+    each kept batch into this spool instead, and every walk reads it back one
+    record at a time, exactly like a day slice.
+
+    The file is created with tempfile.TemporaryFile, which on POSIX unlinks
+    it immediately: it has no name, no later run can ever find or reuse it
+    (so it can never be mistaken for a complete day), and the operating
+    system reclaims it when it is closed or the process dies, however the
+    process dies — no stale spool can outlive a crash or an OOM kill. It is
+    created in CACHE_DIR, under PROJECT_ROOT, beside the slices it stands in
+    for. It carries the day slices' line framing (_slice_dumps, one record per
+    line, gzip level 1) and no meta block, since nothing but this object ever
+    reads it.
+
+    Lifecycle: extend() from the one frontier worker thread (under
+    _fetch_live_window's emit contract); seal() once, by the phase's thread,
+    after the frontier future has completed; then any number of walks, one
+    at a time (a new walk invalidates a suspended one, which raises if
+    resumed, since both would share the one file position); close() when the
+    assembly is done (fetch_all_settled_markets closes the live phase's
+    result in a `finally`), or on any failure of the phase.
+    """
+
+    def __init__(self, directory: Path):
+        """
+        Create the anonymous spool file and open its compressed writer.
+
+        Args:
+            directory (Path): Where the (immediately unlinked) file is
+                created — the caller passes CACHE_DIR, resolved at call time
+                so tests can repoint it. Created if absent.
+
+        Raises:
+            OSError: If the directory or the temporary file cannot be created.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        self._file = tempfile.TemporaryFile(dir=directory, prefix="frontier-spool-")
+        try:
+            self._gz = gzip.GzipFile(fileobj=self._file, mode="wb", compresslevel=1)
+        except BaseException:
+            self._file.close()
+            raise
+        self._count = 0
+        self._sealed = False
+        self._closed = False
+        # Bumped by every walk; a walk whose number is no longer current
+        # stops rather than read from a file position another walk moved.
+        self._walk = 0
+
+    def extend(self, records: Iterable[dict]) -> None:
+        """
+        Append records, in order, as JSON lines (the list-like sink interface).
+
+        Named for list.extend so _extend_kept can fill either; each record is
+        serialized and dropped as it is written, so nothing here retains one.
+
+        Args:
+            records (Iterable[dict]): Compact market dicts, in fetch order.
+
+        Raises:
+            RuntimeError: If the spool was already sealed or closed (a bug —
+                only the frontier worker writes, and only before seal()).
+            OSError: On a write failure (e.g. a full disk); it propagates to
+                the frontier future and out of the phase.
+        """
+        if self._sealed or self._closed:
+            raise RuntimeError("frontier spool written after it was sealed or closed")
+        write = self._gz.write
+        for record in records:
+            write(_slice_dumps(record) + b"\n")
+            self._count += 1
+
+    def seal(self) -> None:
+        """
+        Finish the compressed stream; from here on the spool is read-only.
+
+        Raises:
+            OSError: If the final flush fails.
+        """
+        self._gz.close()
+        self._sealed = True
+
+    def __len__(self) -> int:
+        """
+        Returns:
+            int: How many records have been spooled.
+        """
+        return self._count
+
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Read the spool back once, in the order it was written.
+
+        Yields:
+            dict: Compact market dicts, fresh objects on every walk.
+
+        Raises:
+            SettledCorpusError: If the spool is not sealed or already closed,
+                a newer walk started while this one was suspended, it cannot
+                be decoded, or a complete walk yields a different number of
+                records than were written — each a bug or a failing disk,
+                never a condition to paper over with a short frontier.
+        """
+        if self._closed or not self._sealed:
+            raise SettledCorpusError(
+                "The frontier spool was walked before it was sealed or after it "
+                "was closed — a bug in the live phase's lifecycle.")
+        self._walk += 1
+        walk = self._walk
+        self._file.seek(0)
+        walked = 0
+        try:
+            with gzip.GzipFile(fileobj=self._file, mode="rb") as reader:
+                for line in reader:
+                    if walk != self._walk:
+                        raise SettledCorpusError(
+                            "A walk over the frontier spool was resumed after a "
+                            "newer walk had started; walks must not interleave.")
+                    walked += 1
+                    yield _slice_loads(line)
+        except (*_SLICE_READ_ERRORS, ValueError) as exc:
+            raise SettledCorpusError(
+                f"The frontier spool could not be read back ({exc!r}). It is a "
+                f"private temporary file, so this is a failing disk or a bug; "
+                f"re-run the backtest (the frontier day is always refetched)."
+            ) from exc
+        if walked != self._count:
+            raise SettledCorpusError(
+                f"The frontier spool yielded {walked} records but {self._count} "
+                f"were written. Re-run the backtest (the frontier day is always "
+                f"refetched).")
+
+    def close(self) -> None:
+        """
+        Release the spool: the file and its disk space go immediately.
+
+        Safe to call more than once, and on a spool that was never sealed.
+        Never raises: it runs on error paths where the original exception
+        must survive.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._gz.close()
+        except Exception:
+            pass
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
 def _extend_kept(
-    dest: list[dict],
+    dest: "list[dict] | _FrontierSpool",
     keep: Callable[[dict], bool] | None,
     batch: list[dict],
 ) -> None:
@@ -2328,15 +2839,17 @@ def _extend_kept(
     Order is preserved exactly — records are appended in batch order and the
     batches arrive in fetch order from one worker thread — so `dest` ends up
     equal, element for element, to filtering the full list afterwards: same
-    predicate, same records, same order. Only the peak changes — and only by
-    the REJECTED records: every keep-passing record is still retained in
-    `dest` until the phase returns, which on the day after a Monday can be
-    most of the partial day (see _fetch_live_phase).
+    predicate, same records, same order. In production `dest` is the live
+    phase's _FrontierSpool, so a KEPT record is not retained either: it is
+    serialized into the spool and dropped with its batch (a list `dest`, as
+    the unit tests use, would retain every kept record — which on the day
+    after a Monday can be most of the partial day).
 
     Args:
-        dest (list[dict]): List to extend in place. Touched only from the one
-            worker thread running the window; the caller reads it only after
-            that window's future has completed (Future.result() is the
+        dest (list[dict] | _FrontierSpool): Anything with list-style
+            extend(); extended in place. Touched only from the one worker
+            thread running the window; the caller reads it only after that
+            window's future has completed (Future.result() is the
             synchronization point).
         keep (Callable[[dict], bool] | None): Per-record predicate, or None to
             keep every record. Runs on the worker thread, so it must be
@@ -2356,7 +2869,7 @@ def _fetch_live_phase(
     live_min_ts: int,
     now_ts: int,
     keep: Callable[[dict], bool] | None = None,
-) -> list[dict]:
+) -> Iterable[dict]:
     """
     Fetch the live endpoint's contribution: per-settled-day windows in parallel.
 
@@ -2369,32 +2882,36 @@ def _fetch_live_phase(
     otherwise be reused as if complete.
 
     As on the archive side, past-day records are streamed into the slice file
-    in chunks inside the worker and read back off disk at assembly rather than
-    accumulated in memory. The frontier window, which is never persisted, is
+    in chunks inside the worker and never accumulated in memory: they are
+    returned as a lazy _DaySliceStream that re-reads them off disk on every
+    walk of the assembly (SS-1; a slice that cannot be read during a walk
+    raises SettledCorpusError there and never reaches the sequential fallback
+    below). The frontier window, which is never persisted as a slice, is
     streamed in chunks too, through a sink (_extend_kept) that applies `keep`
-    to each batch as its pages arrive: only the keep-passing subset of the
-    partial day is ever retained, plus one batch in flight. It used to be
-    accumulated unfiltered and filtered only once the whole pool had drained —
-    the same records in the same order, at a peak that grows through the UTC
-    day (up to a full day's settlements, 9.2M records on 2026-09-22) whatever
-    the window length (SS-1). With keep=None every record passes and the whole
-    partial day is still held, exactly as before.
-
-    What that does NOT bound: the keep-passing subset is itself still held
-    whole, as a list, and how large it is depends on the weekday, not on the
-    window's length. The backtester's predicate (_can_ever_enter) admits every
-    market that was open over a Monday checkpoint on/after start_date and
-    closes at least a day later, so a frontier captured the day AFTER a Monday
-    can be mostly eligible — 7,190,452 of the 9,176,306 records settled on
-    Tuesday 2026-09-22 passed _can_ever_enter(m, 2026-09-17). Bounding that
-    requires not holding the frontier as a list at all, which this phase
-    cannot do while it returns one materialized list (the past days are
-    materialized by _assemble_day_slices too).
+    to each batch as its pages arrive and writes the survivors into a
+    _FrontierSpool — a private, anonymous temporary file that no later run can
+    find, read back one record at a time on every walk like a day slice. It
+    used to be accumulated unfiltered and filtered only once the whole pool
+    had drained — the same records in the same order, at a peak that grows
+    through the UTC day (up to a full day's settlements, 9.2M records on
+    2026-09-22) whatever the window length (SS-1). Filtering as it arrives
+    still left the keep-passing subset resident as a list, and how large that
+    is depends on the weekday, not on the window's length: the backtester's
+    predicate (_can_ever_enter) admits every market that was open over a
+    Monday checkpoint on/after start_date and closes at least a day later, so
+    a frontier captured the day AFTER a Monday can be mostly eligible —
+    7,190,452 of the 9,176,306 records settled on Tuesday 2026-09-22 passed
+    _can_ever_enter(m, 2026-09-17). Spooled, it holds one batch in flight
+    whatever the weekday, and with keep=None as well. The caller must close()
+    the returned chain once it is done walking it (fetch_all_settled_markets
+    does so in a `finally`), which releases the spool; it also vanishes with
+    the process.
 
     Falls back to _fetch_live_sequential if the server stops honoring
     max_settled_ts (detected per window by _fetch_live_window), passing the
-    same `keep`; the partial frontier collected so far is released first,
-    since the sequential sweep refetches today anyway.
+    same `keep`; the partial frontier spool is closed first (its disk
+    released), since the sequential sweep refetches today anyway. The
+    fallback's own result is still one list, as it always was.
 
     Args:
         live_client: KalshiClient from build_prod_live_client().
@@ -2410,9 +2927,17 @@ def _fetch_live_phase(
             sequential fallback (main thread). Slice FILES stay unfiltered.
 
     Returns:
-        list[dict]: Compact market dicts, frontier first then past days
+        Iterable[dict]: Compact market dicts, frontier first then past days
             newest-first (no settlement filtering beyond min_settled_ts; the
-            caller applies the backtest window).
+            caller applies the backtest window) — the same records in the same
+            order as the old `frontier + [...]` list. On the windowed path a
+            re-iterable _RecordChain of the sealed _FrontierSpool and a lazy
+            _DaySliceStream over the past days, never one list (close() it
+            when done); on the sequential fallback, the fallback's list.
+
+    Raises:
+        OSError: If the frontier spool cannot be created or written (e.g. a
+            full disk), like a day slice that cannot be written.
     """
     first_lo = live_min_ts - (live_min_ts % _DAY_SECONDS)
     today_lo = now_ts - (now_ts % _DAY_SECONDS)
@@ -2424,10 +2949,12 @@ def _fetch_live_phase(
         "include_mve": INCLUDE_MVE_MARKETS,
         "complete": True,
     }
-    # Filled ONLY by the frontier worker's sink below, and read by this thread
-    # only after frontier_future.result() has returned. Bound before the `try`
-    # so the fallback branch can always release it (see there).
-    frontier: list[dict] = []
+    # Filled ONLY by the frontier worker's sink below, and sealed and read by
+    # this thread only after frontier_future.result() has returned. Created
+    # before the `try` so every way out of this function can release it. It
+    # is an anonymous temporary file under CACHE_DIR (read at call time, so
+    # tests repoint it): no other run can ever see it (SS-1).
+    frontier = _FrontierSpool(CACHE_DIR)
     try:
         # As in _fetch_archive_phase: track day identities only, and re-read
         # the slices at assembly so peak memory doesn't scale with the number
@@ -2447,12 +2974,12 @@ def _fetch_live_phase(
         progress = _FetchProgress("Live settled sweep [windowed]")
         to_fetch.sort(reverse=True)
         with ThreadPoolExecutor(max_workers=SETTLED_FETCH_MAX_WORKERS) as pool:
-            # The frontier day is kept in memory rather than persisted — it was
-            # captured mid-day and must never be reused as a complete day. It
-            # streams through the emit contract like a past day, but into a
-            # sink that keeps only `keep`-passing records as each batch lands,
-            # so with a predicate the unfiltered partial day is never resident
-            # (SS-1).
+            # The frontier day is never persisted as a slice — it was captured
+            # mid-day and must never be reused as a complete day. It streams
+            # through the emit contract like a past day, but into a sink that
+            # keeps only `keep`-passing records as each batch lands and spools
+            # them to the anonymous file, so neither the unfiltered partial day
+            # nor its keep-passing subset is ever resident (SS-1).
             frontier_future = pool.submit(
                 _fetch_live_window, live_client, frontier_lo, None, progress,
                 partial(_extend_kept, frontier, keep),
@@ -2474,14 +3001,15 @@ def _fetch_live_phase(
                                         lo, count, started)
                 # LOAD-BEARING, not a leftover: this is the ONLY place a
                 # frontier-window failure surfaces — an ApiException that
-                # outlived its retries, a non-transient error, or `keep`
-                # raising on the worker thread. The pool's __exit__ waits for
-                # the worker whether or not this runs, so deleting it would not
-                # hang; it would silently return the batches already appended
-                # as if they were the whole frontier (a short corpus, pinned by
-                # TestFrontierStreamsThroughKeep's failure tests). The records
-                # themselves are already in `frontier`, filtered, so the
-                # returned count is deliberately discarded (never rebind it).
+                # outlived its retries, a non-transient error, `keep` raising
+                # on the worker thread, or a spool write failing. The pool's
+                # __exit__ waits for the worker whether or not this runs, so
+                # deleting it would not hang; it would silently return the
+                # batches already spooled as if they were the whole frontier
+                # (a short corpus, pinned by TestFrontierStreamsThroughKeep's
+                # failure tests). The records themselves are already in the
+                # spool, filtered, so the returned count is deliberately
+                # discarded (never rebind it).
                 frontier_future.result()
             except BaseException:
                 # Abandon queued windows immediately rather than draining them
@@ -2489,9 +3017,16 @@ def _fetch_live_phase(
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
 
-        # No post-hoc `keep` pass: the frontier sink already applied it in
-        # fetch order, so `frontier` is exactly the list that pass produced.
-        return frontier + _assemble_day_slices("live_days", on_disk, expect_meta, keep)
+        # The frontier worker has finished (result() above returned), so no
+        # write can race this: finish the compressed stream, read-only from
+        # here. No post-hoc `keep` pass: the sink already applied it in fetch
+        # order, so the spool holds exactly the list that pass produced.
+        frontier.seal()
+        # Chained rather than concatenated (SS-1): the frontier and the past
+        # days stay on disk, walked in the same order `frontier + [...]` had.
+        return _RecordChain(
+            frontier, _assemble_day_slices("live_days", on_disk, expect_meta, keep),
+        )
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Live fetch: windowed path unavailable (%s) — falling back to the "
@@ -2499,19 +3034,349 @@ def _fetch_live_phase(
             "on disk and will be reused by the next run.", exc,
         )
         # The sequential sweep refetches today as well, so the frontier the
-        # windowed path collected is dead weight here. Nothing writes it any
+        # windowed path spooled is dead weight here. Nothing writes it any
         # more — the pool's __exit__ joined the frontier worker (or its
         # cancel_futures dropped it while still queued) — and a running worker
         # finishes its whole window before that join returns, so without this
-        # the keep-passing frontier would sit beside the fallback's own copy of
-        # the same day for the whole serial walk. Cleared in place rather than
-        # rebound, so the records are released even while another reference
-        # to the list survives (the sink's partial stays reachable from
-        # frontier_future when the frontier window itself failed).
-        frontier.clear()
+        # the spool's disk would stay claimed for the whole serial walk. Closed
+        # explicitly rather than left to garbage collection, because the
+        # sink's partial keeps it reachable from frontier_future when the
+        # frontier window itself failed.
+        frontier.close()
         # Same prefilter as the windowed path, applied per record as each page
         # arrives; the walk still holds its whole keep-passing result.
         return _fetch_live_sequential(live_client, live_min_ts, keep)
+    except BaseException:
+        # Any other failure (a frontier or past-day window error, a spool that
+        # could not be written or sealed): release the spool, then propagate.
+        frontier.close()
+        raise
+
+
+# ─── Assembly and the assembled cache ─────────────────────────────────────────
+
+# Identifies an assembled-cache file's "kind" in its meta block, so a day
+# slice (or anything else in the jsonl-v1 framing) can never be mistaken for
+# one even if it were copied to the assembled cache's filename.
+_ASSEMBLED_CACHE_KIND = "settled_markets_assembled"
+
+
+def _assembled_cache_meta(start_date: date, prefilter_tag: str | None) -> dict:
+    """
+    The meta block an assembled cache file must carry to be served for a request.
+
+    Every key here is part of the RESULT's identity, exactly as each component
+    of the filename is (start date, prefilter tag, the DR-57 MVE flag): the
+    filename already separates them, and repeating them in the meta block means
+    a file copied or renamed onto another request's name is refused rather
+    than trusted. The format tag is the one _DayStreamWriter writes.
+
+    Args:
+        start_date (date): The window start the corpus was assembled for.
+        prefilter_tag (str | None): The prefilter's tag, or None when no
+            prefilter was applied.
+
+    Returns:
+        dict: The expected meta block (without the informational timestamp
+            the writer also records).
+    """
+    return {
+        "kind": _ASSEMBLED_CACHE_KIND,
+        "start_date": start_date.isoformat(),
+        "prefilter_tag": prefilter_tag,
+        "include_mve": INCLUDE_MVE_MARKETS,
+        "format": _SLICE_FORMAT_JSONL,
+    }
+
+
+def _assembled_records(
+    sources: Iterable[tuple[Iterable[dict], int | None]],
+    start_ts: int,
+    prefilter: Callable[[dict], bool] | None,
+    seen: set,
+) -> Iterator[dict]:
+    """
+    Yield the assembled corpus: settlement window, prefilter, first-wins ticker dedup.
+
+    The streaming form of the old in-memory `_merge` (SS-1), with identical
+    semantics and order. For each (records, max_settle) source in turn, and
+    each record in it in order, a record is yielded when its settlement_ts
+    parses, lies in [start_ts, max_settle) (max_settle None = unbounded
+    above), it passes `prefilter`, and its ticker is truthy and not yet in
+    `seen` — the ticker is then added. The old code kept the same records in
+    a ticker-keyed dict, whose insertion order is this yield order.
+
+    Adjacent day slices, the tail walk, and live windows deliberately overlap
+    at their boundaries so no record can fall in a gap; the dedup collapses
+    those overlaps without changing the set (tickers are unique per market).
+    Only tickers are held — never a record — so a walk costs one set of
+    ticker strings, not the corpus.
+
+    Args:
+        sources (Iterable[tuple[Iterable[dict], int | None]]): The record
+            sources in precedence order, each with its exclusive settlement
+            ceiling (the archive's cutoff_ts, or None for live).
+        start_ts (int): Inclusive settlement floor, epoch seconds.
+        prefilter (Callable[[dict], bool] | None): The caller's predicate.
+            Applied here, before the dedup, as the single point where it is
+            GUARANTEED for every source — day slices, the live frontier, both
+            sequential fallbacks (all of which also take the `keep` fast path)
+            and the tail (which does not). Re-checking records a phase already
+            filtered is idempotent, and because it runs before the dedup, a
+            phase dropping a record early can never change which record wins
+            a ticker.
+        seen (set): Tickers already yielded. Pass a FRESH set per walk; a walk
+            split across calls (the assembly's first walk, archive then live)
+            passes the same one to every call.
+
+    Yields:
+        dict: Each record of the assembled corpus, in first-wins order. They
+            are the sources' own objects; the caller may patch them.
+    """
+    for records, max_settle in sources:
+        for m in records:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or settle < start_ts:
+                continue
+            if max_settle is not None and settle >= max_settle:
+                continue
+            if prefilter is not None and not prefilter(m):
+                continue
+            ticker = m.get("ticker")
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                yield m
+
+
+def _assembly_identity(digest: int, m: dict) -> int:
+    """
+    Fold one assembled record into a running, order-sensitive identity hash.
+
+    The assembly walks its sources twice — once to count and collect event
+    tickers, once (after titles are resolved from those tickers) to write the
+    cache — so the second walk must reproduce the first. The count alone
+    cannot show that: a day slice rewritten between the walks could swap one
+    record for another and keep the count, and a record whose event_ticker
+    the first walk never saw would be written with a blank event title. This
+    covers exactly what the walks must agree on: the ticker (which record,
+    in which position) and the event_ticker (what the titles were resolved
+    for). Being a hash, a change could in principle slip through on a
+    collision; the guard is against a corpus that drifts, not an adversarial
+    one.
+
+    Args:
+        digest (int): The identity so far (0 before the first record).
+        m (dict): The next assembled record.
+
+    Returns:
+        int: The updated identity.
+    """
+    return hash((digest, m.get("ticker"), m.get("event_ticker")))
+
+
+def _count_assembled(
+    sources: Iterable[tuple[Iterable[dict], int | None]],
+    start_ts: int,
+    prefilter: Callable[[dict], bool] | None,
+    seen: set,
+    event_tickers: set[str],
+    identity: int,
+) -> tuple[int, int]:
+    """
+    The assembly's first walk over some sources: count, collect event tickers, fold identity.
+
+    A function of its own rather than a loop in fetch_all_settled_markets so
+    that no record outlives the walk: a loop variable left bound in the caller
+    would keep the last record alive through the whole title resolution that
+    follows. Nothing else is retained — only tickers (in `seen`) and event
+    tickers.
+
+    Args:
+        sources (Iterable[tuple[Iterable[dict], int | None]]): As for
+            _assembled_records.
+        start_ts (int): Inclusive settlement floor, epoch seconds.
+        prefilter (Callable[[dict], bool] | None): The caller's predicate.
+        seen (set): The walk's ticker set, shared by both halves of the walk.
+        event_tickers (set[str]): Extended in place with each yielded record's
+            truthy event_ticker — the set titles are resolved for, exactly the
+            old `{m.get("event_ticker") for m in selected.values() if ...}`.
+        identity (int): The walk's running _assembly_identity so far.
+
+    Returns:
+        tuple[int, int]: (records yielded by these sources, updated identity).
+    """
+    count = 0
+    for m in _assembled_records(sources, start_ts, prefilter, seen):
+        count += 1
+        identity = _assembly_identity(identity, m)
+        event_ticker = m.get("event_ticker")
+        if event_ticker:
+            event_tickers.add(event_ticker)
+    return count, identity
+
+
+class SettledCorpus:
+    """
+    The settled-market corpus as a disk-backed, re-iterable sequence of market dicts.
+
+    What fetch_all_settled_markets returns (except on a LEGACY cache hit, which
+    is still a list): a view of the assembled cache file
+    settled_markets_<start_date>[_<tag>][_nomve].jsonl.gz. Every `for m in
+    corpus` re-opens the file and yields its records one at a time, as fresh
+    dicts, in the assembled order, so the corpus is never held in memory — the
+    whole point of SS-1, where a 7-day window's eligible corpus measured
+    7,260,952 records at 3,926 B/record (~28 GB) on a 16 GB host. The
+    backtester walks it twice (_prepare_candidates' two passes); nothing needs
+    random access.
+
+    len() is the record count established when the corpus was built — written
+    by the assembly, or counted by the full validation walk on a cache hit —
+    and every walk is held to it: a walk that cannot read the file, or that
+    ends on a different count, raises SettledCorpusError rather than returning
+    a short or different corpus. A walk abandoned early is not checked.
+    """
+
+    def __init__(self, path: Path, expect_meta: dict, count: int):
+        """
+        Args:
+            path (Path): The assembled cache file (jsonl-v1 framing).
+            expect_meta (dict): The meta block every walk re-checks
+                (_assembled_cache_meta()).
+            count (int): How many records the file holds, as written or as
+                validated. Callers other than fetch_all_settled_markets and
+                open_validated should not construct this directly.
+        """
+        self._path = path
+        self._expect_meta = dict(expect_meta)
+        self._count = count
+
+    @classmethod
+    def open_validated(cls, path: Path, expect_meta: dict) -> "SettledCorpus | None":
+        """
+        Validate an assembled cache file by one full streaming walk and wrap it.
+
+        All or nothing, like _day_store_load: the whole file must decode and
+        its meta must match, or it is a cache miss. Nothing is retained by the
+        walk — each record is parsed, counted and dropped.
+
+        Args:
+            path (Path): The assembled cache file to validate.
+            expect_meta (dict): The meta block it must carry.
+
+        Returns:
+            SettledCorpus | None: A corpus over the file with its validated
+                count, or None when the file is absent (silently) or
+                unreadable, truncated, damaged or written for a different
+                request (with a WARNING naming the reason).
+        """
+        if not path.exists():
+            return None
+        count = 0
+        try:
+            for _record in _day_store_iter(path, expect_meta):
+                count += 1
+        except _SliceUnreadable as exc:
+            logging.warning(
+                "Corrupt or mismatched settled-market cache — treating as cache "
+                "miss: %s", exc,
+            )
+            return None
+        return cls(path, expect_meta, count)
+
+    @property
+    def path(self) -> Path:
+        """
+        Returns:
+            Path: The assembled cache file this corpus streams.
+        """
+        return self._path
+
+    def __len__(self) -> int:
+        """
+        Returns:
+            int: The corpus's record count (see the class docstring).
+        """
+        return self._count
+
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Stream the corpus once, in assembled order.
+
+        Yields:
+            dict: Compact market dicts, fresh objects on every walk.
+
+        Raises:
+            SettledCorpusError: If the file cannot be read (it disappeared, was
+                damaged, or now carries a different meta block), or if a
+                complete walk yields a different number of records than len().
+        """
+        walked = 0
+        try:
+            for record in _day_store_iter(self._path, self._expect_meta):
+                walked += 1
+                yield record
+        except _SliceUnreadable as exc:
+            raise SettledCorpusError(
+                f"The assembled settled-market cache could not be read during a "
+                f"walk ({exc}). Re-run the backtest: a damaged file fails its "
+                f"validation next time and a missing one is simply absent, and "
+                f"either way the corpus is rebuilt from the day slices."
+            ) from exc
+        if walked != self._count:
+            raise SettledCorpusError(
+                f"The assembled settled-market cache {self._path} yielded "
+                f"{walked} records on this walk but held {self._count} when it "
+                f"was opened — it was replaced or altered in between. Re-run "
+                f"the backtest."
+            )
+
+    def __repr__(self) -> str:
+        """
+        Returns:
+            str: The class name, path and record count.
+        """
+        return f"SettledCorpus({str(self._path)!r}, {self._count} records)"
+
+
+def _retire_legacy_cache(legacy_path: Path, superseded_by: Path) -> None:
+    """
+    Delete a legacy settled_markets_*.json once a rebuild of the same identity is committed.
+
+    Before SS-1 a rebuild (a --no-cache run, or a miss) overwrote
+    settled_markets_<stem>.json in place, so an out-of-date assembly could
+    never come back. The rebuild now lands in settled_markets_<stem>.jsonl.gz
+    instead, and a legacy file left beside it would be served again the
+    moment that file went missing (this repo lives in iCloud-synced
+    ~/Documents, which has already reverted a committed rename) — silently,
+    and typically after the very rebuild meant to replace it (the BS-02 and
+    subtitle-drift remedies both end in one). Deleting it once the new file
+    is committed restores the old invariant: a rebuild of an identity
+    replaces that identity's previous assembly. It destroys exactly what the
+    old overwrite destroyed, and only after the replacement is safely on disk.
+
+    Args:
+        legacy_path (Path): The legacy cache for this request's name stem.
+        superseded_by (Path): The streamed cache just committed for it; named
+            in the log lines.
+    """
+    try:
+        legacy_path.unlink()
+    except FileNotFoundError:
+        # The common case: no legacy cache of this identity ever existed.
+        return
+    except OSError as exc:
+        logging.warning(
+            "Could not remove the superseded legacy settled-market cache %s (%s). "
+            "Delete it by hand: it holds an older assembly of this same request, "
+            "and it would be served again if %s ever went missing.",
+            legacy_path, exc, superseded_by.name,
+        )
+        return
+    logging.info(
+        "Removed the superseded legacy settled-market cache %s: this run "
+        "rebuilt the same request into %s, which replaces it.",
+        legacy_path.name, superseded_by.name,
+    )
 
 
 def fetch_all_settled_markets(
@@ -2521,9 +3386,9 @@ def fetch_all_settled_markets(
     use_cache: bool = True,
     prefilter: Callable[[dict], bool] | None = None,
     prefilter_tag: str | None = None,
-) -> list[dict]:
+) -> SettledCorpus | list[dict]:
     """
-    Fetch all settled Kalshi markets from start_date onward and return them as plain dicts.
+    Fetch all settled Kalshi markets from start_date onward, as a re-iterable corpus of dicts.
 
     Uses two complementary API endpoints to get full coverage:
     - /historical/markets — settled markets archived before the API cutoff
@@ -2547,18 +3412,59 @@ def fetch_all_settled_markets(
     fully-elapsed UTC days whose settlements are immutable — the current
     (frontier) day is always refetched.
 
-    The assembled result is serialized to a JSON cache file named
-    settled_markets_<start_date>[_<prefilter_tag>][_nomve].json, so subsequent
-    backtests skip fetching entirely. Every component of that name is part of
-    the result's identity: the prefilter tag because a filtered result is a
-    strict subset, and the _nomve marker because INCLUDE_MVE_MARKETS changes
-    which markets are fetched at all (DR-57). Only the False case is marked —
-    every assembled cache already on disk was built with MVE included, so the
-    default (True) filename is unchanged and no existing cache is orphaned.
-    Pass use_cache=False (--no-cache) to rebuild it — thanks to the day stores
-    that now only costs the frontier day plus any newly-appeared days. A
-    fresh result is always written back regardless of use_cache, so a
-    --no-cache run refreshes what the next default run will load.
+    Assembly is STREAMED and the corpus is never held in memory (SS-1). A
+    7-day window's past days held 18,061,549 fetched records of which
+    7,260,952 passed the backtester's prefilter, at 3,926 B/record (~28 GB) on
+    a 16 GB host, so the old assembly — a ticker-keyed dict of every selected
+    record, then a list copy, then one whole-list json.dumps — could never
+    finish. The phases now return lazy views (day slices are re-read off disk
+    per walk, and so is the live frontier, spooled to an anonymous temporary
+    file by _FrontierSpool and released when assembly ends; only the tail and
+    a sequential fallback's result are lists), and one generator,
+    _assembled_records, reproduces the old
+    `_merge` exactly: sources in the old order (archive day slices
+    newest-first, then the tail, both bounded above by cutoff_ts; then live:
+    frontier, then live day slices newest-first, unbounded above),
+    settlement >= start_ts, the prefilter, and first-wins ticker dedup. It is
+    walked TWICE. Walk A counts the records the "Historical endpoint" and
+    "Live endpoint" lines report (the same numbers as before) and collects
+    the unique event_tickers for title resolution; walk B patches event_title
+    exactly as before and writes every record straight into the assembled
+    cache, which the returned SettledCorpus then streams. Walk B must
+    reproduce walk A (same count, same order-sensitive identity over ticker
+    and event_ticker) or nothing is published and SettledCorpusError is
+    raised. A day slice that cannot be read during either walk raises
+    SettledCorpusError — deliberately NOT the sequential fallback the old
+    eager assembly took, which would hold the whole range in memory and could
+    not un-yield records already consumed (see _DaySliceStream).
+
+    The assembled result is streamed into a gzipped JSON-lines cache file
+    named settled_markets_<start_date>[_<prefilter_tag>][_nomve].jsonl.gz
+    (the day slices' "jsonl-v1" framing, written atomically through
+    _DayStreamWriter), so subsequent backtests skip fetching entirely. Every
+    component of that name is part of the result's identity, and its meta
+    block repeats them (_assembled_cache_meta): the prefilter tag because a
+    filtered result is a strict subset, and the _nomve marker because
+    INCLUDE_MVE_MARKETS changes which markets are fetched at all (DR-57). Only
+    the False case is marked — every assembled cache already on disk was
+    built with MVE included, so the default (True) filename is unchanged and
+    no existing cache is orphaned. On use_cache=True, when the .jsonl.gz file
+    exists it is validated by one full streaming walk (all or nothing: any
+    decode error, truncation or meta mismatch is a WARNING and a miss) and
+    served as a SettledCorpus — and a miss there REBUILDS: it never falls
+    through to a legacy file, which the streamed cache's own commit
+    superseded. Only when no .jsonl.gz exists at all is a LEGACY
+    settled_markets_<...>.json cache of the same identity (the single JSON
+    document every run before SS-1 wrote, some of them GB-scale) still loaded
+    exactly as before, whole, as a list; failing that, the corpus is fetched.
+    New runs never write the legacy format. Pass use_cache=False (--no-cache)
+    to rebuild — thanks to the day stores that now only costs the frontier
+    day plus any newly-appeared days. A fresh result is always written
+    regardless of use_cache, so a --no-cache run refreshes what the next
+    default run will load; and once it is committed, a legacy file of the
+    same identity is deleted (_retire_legacy_cache, with an INFO line), just
+    as the old code's rebuild overwrote it — otherwise that older assembly
+    would be served again whenever the .jsonl.gz went missing.
 
     Args:
         hist_client (Any): Authenticated KalshiClient from build_historical_client().
@@ -2571,7 +3477,7 @@ def fetch_all_settled_markets(
             saved to disk.
         prefilter (Callable[[dict], bool] | None): Optional per-record
             predicate; records failing it are dropped during assembly and
-            never reach the returned list or the assembled cache. Intended for
+            never reach the returned corpus or the assembled cache. Intended for
             a filter the caller would apply immediately anyway (the backtester
             passes _can_ever_enter), which makes it result-neutral while
             keeping peak memory and cache size proportional to the markets
@@ -2585,17 +3491,30 @@ def fetch_all_settled_markets(
 
     Raises:
         ValueError: If exactly one of prefilter / prefilter_tag is provided.
+        OSError: If the live frontier cannot be spooled (e.g. a full disk) or
+            the assembled cache cannot be written; nothing is published.
+        SettledCorpusError: If a day slice (or the frontier spool) cannot be
+            read during either assembly walk, or the second walk does not
+            reproduce the first; nothing is published in either case. Walking the returned
+            SettledCorpus later raises it too if the cache file cannot be
+            read or no longer holds len() records.
 
     Returns:
-        list[dict]: Flat list of market dicts, each with keys: ticker, event_ticker,
-            event_title, title, subtitle, result ("yes" | "no"), yes_ask_dollars,
-            no_ask_dollars, yes_bid_dollars, open_time, close_time (ISO str),
-            settlement_ts (ISO str), status, price_level_structure,
-            price_ranges, exchange_index. Only includes markets with a
-            non-null settlement_ts and a binary result; tickers are unique.
-            See _market_to_dict for the per-key notes (subtitle now falls
-            back to yes_sub_title; price_level_structure/price_ranges are
-            unread groundwork that older cache records lack entirely).
+        SettledCorpus | list[dict]: A re-iterable corpus of market dicts that
+            supports len() — a SettledCorpus streaming the assembled
+            .jsonl.gz cache (fresh dicts on every walk) after a fetch or a
+            new-format cache hit, or a plain list when a LEGACY .json cache
+            is served. Either way each record has the keys: ticker,
+            event_ticker, event_title, title, subtitle, result ("yes" |
+            "no"), yes_ask_dollars, no_ask_dollars, yes_bid_dollars,
+            open_time, close_time (ISO str), settlement_ts (ISO str), status,
+            price_level_structure, price_ranges, exchange_index. Only includes
+            markets with a non-null settlement_ts and a binary result; tickers
+            are unique. See _market_to_dict for the per-key notes (subtitle
+            now falls back to yes_sub_title; price_level_structure/
+            price_ranges are unread groundwork that older cache records lack
+            entirely). Consumers must only iterate it (as many times as they
+            like) and take its len(); nothing indexes it.
     """
     if (prefilter is None) != (prefilter_tag is None):
         raise ValueError(
@@ -2621,13 +3540,37 @@ def fetch_all_settled_markets(
     # invalidates them on the existing gate; their PATHS are not flag-keyed,
     # so each flip refetches and overwrites them.
     mve_suffix = "" if INCLUDE_MVE_MARKETS else "_nomve"
-    cache_path = (CACHE_DIR /
-                  f"settled_markets_{start_date.isoformat()}{suffix}{mve_suffix}.json")
+    stem = f"settled_markets_{start_date.isoformat()}{suffix}{mve_suffix}"
+    # The streamed format every run writes since SS-1, and the single JSON
+    # document every earlier run wrote — same identity, same name stem, so the
+    # DR-57 and prefilter-tag semantics above carry over unchanged.
+    cache_path = CACHE_DIR / f"{stem}.jsonl.gz"
+    legacy_cache_path = CACHE_DIR / f"{stem}.json"
+    cache_meta = _assembled_cache_meta(start_date, prefilter_tag)
     if use_cache:
-        cached = _load_json_cache(cache_path)
-        if cached is not None:
-            logging.info("Loaded %d settled markets from cache", len(cached))
-            return cached
+        if cache_path.exists():
+            # Preferred: the streamed cache, validated by one full walk and
+            # then served as a disk-backed corpus, so a hit never materializes
+            # it.
+            corpus = SettledCorpus.open_validated(cache_path, cache_meta)
+            if corpus is not None:
+                logging.info("Loaded %d settled markets from cache", len(corpus))
+                return corpus
+            # Present but invalid (its WARNING is already logged): a miss that
+            # REBUILDS, never a fall-through to a legacy file. A streamed cache
+            # of this identity was committed at some point, so any legacy file
+            # beside it is an OLDER assembly that commit superseded — serving
+            # it would quietly swap the corpus the operator last rebuilt for
+            # the one that rebuild replaced.
+        else:
+            # Otherwise a legacy cache, exactly as before SS-1: read whole, as
+            # a list (the backtester only iterates it). Existing GB-scale
+            # caches must keep loading; nothing writes this format any more,
+            # and the first rebuild of the same identity retires it (below).
+            cached = _load_json_cache(legacy_cache_path)
+            if cached is not None:
+                logging.info("Loaded %d settled markets from cache", len(cached))
+                return cached
 
     # Convert start_date to a unix timestamp for filtering individual market records
     start_ts = int(datetime(start_date.year, start_date.month, start_date.day,
@@ -2671,37 +3614,21 @@ def fetch_all_settled_markets(
         hist_client, start_ts, cutoff_ts, hist_kwargs, prefilter
     )
 
-    # Assembly: settlement-window filter + first-wins ticker dedup. Adjacent
-    # day slices, the tail walk, and live windows deliberately overlap at
-    # their boundaries so no record can fall in a gap; dedup collapses those
-    # overlaps without changing the set (tickers are unique per market).
-    selected: dict[str, dict] = {}
+    # Assembly: settlement-window filter, prefilter and first-wins ticker
+    # dedup, streamed (_assembled_records) rather than collected into a dict
+    # of every selected record (SS-1). The sources, their order and their
+    # ceilings are exactly the old _merge calls': archive day slices then the
+    # tail, both below cutoff_ts; then live, unbounded above.
+    archive_sources = ((day_records, cutoff_ts), (tail_records, cutoff_ts))
 
-    def _merge(records: list[dict], max_settle: int | None) -> None:
-        """Merge compact dicts into `selected`, keeping settlements within
-        [start_ts, max_settle) (max_settle None = unbounded above)."""
-        for m in records:
-            settle = _iso_epoch(m.get("settlement_ts"))
-            if settle is None or settle < start_ts:
-                continue
-            if max_settle is not None and settle >= max_settle:
-                continue
-            # Single point where the caller's prefilter is GUARANTEED, so it
-            # covers every source — day slices, the live frontier, BOTH
-            # sequential fallbacks (all of which also take the `keep` fast
-            # path) and the tail (which does not). Re-checking records the
-            # phases already filtered is idempotent and cheap, and because it
-            # runs before the first-wins dedup below, a phase dropping a
-            # record early can never change which record wins a ticker.
-            if prefilter is not None and not prefilter(m):
-                continue
-            ticker = m.get("ticker")
-            if ticker and ticker not in selected:
-                selected[ticker] = m
-
-    _merge(day_records, cutoff_ts)
-    _merge(tail_records, cutoff_ts)
-    archive_count = len(selected)
+    # Walk A, archive half: count what the old `len(selected)` reported and
+    # collect the event_tickers titles are resolved for. One `seen` set spans
+    # both halves of this walk (the dedup is global); only tickers are held.
+    seen_a: set = set()
+    event_tickers: set[str] = set()
+    archive_count, identity_a = _count_assembled(
+        archive_sources, start_ts, prefilter, seen_a, event_tickers, 0,
+    )
     logging.info("Historical endpoint: %d markets from %s", archive_count, start_date)
 
     # ── Live endpoint (recently settled) ─────────────────────────────────────
@@ -2718,41 +3645,92 @@ def fetch_all_settled_markets(
     live_min_ts = max(cutoff_ts, start_ts)
     # Windowed parallel fetch with settled-day disk reuse; sequential on fallback
     live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()), prefilter)
-    _merge(live_records, None)
-    logging.info("Live endpoint: %d recently settled markets", len(selected) - archive_count)
+    try:
+        live_sources = ((live_records, None),)
+        # Walk A, live half: same `seen` set, so a live record whose ticker the
+        # archive already supplied is dropped exactly as the old merge dropped it.
+        live_count, identity_a = _count_assembled(
+            live_sources, start_ts, prefilter, seen_a, event_tickers, identity_a,
+        )
+        logging.info("Live endpoint: %d recently settled markets", live_count)
+        # Walk A is done; its ticker set is the one piece of it worth releasing
+        # before titles are resolved (walk B builds its own).
+        del seen_a
 
-    # ── Attach event titles ───────────────────────────────────────────────────
-    # Collect unique event_tickers and look up their titles in one batch so the
-    # backtester can build (event_title + market_title) grouping keys — for
-    # binary markets too: the live scanner attaches _event_title to EVERY
-    # market regardless of INCLUDE_MVE_MARKETS (scanner._market_from_dict on
-    # the binary listing path of fetch_open_events_with_markets), so the
-    # same-title key is (event_title, title, subtitle) live in both modes.
-    # Resolving only when MVE is on made the flag silently collapse the
-    # backtester's key to (title, subtitle) and pair binary markets live
-    # keeps apart. The flag now gates only the MVE-listing phase inside
-    # _load_or_build_event_titles (no MVE ticker can be wanted when every
-    # market fetch passed mve_filter="exclude").
-    unique_tickers = {m.get("event_ticker") for m in selected.values()
-                      if m.get("event_ticker")}
-    logging.info("Resolving event titles for %d unique event_tickers", len(unique_tickers))
-    # Resolve event_ticker -> title so grouping keys match the live scanner's
-    titles = _load_or_build_event_titles(live_client, unique_tickers, use_cache=use_cache)
+        # ── Attach event titles ───────────────────────────────────────────────
+        # Collect unique event_tickers and look up their titles in one batch so the
+        # backtester can build (event_title + market_title) grouping keys — for
+        # binary markets too: the live scanner attaches _event_title to EVERY
+        # market regardless of INCLUDE_MVE_MARKETS (scanner._market_from_dict on
+        # the binary listing path of fetch_open_events_with_markets), so the
+        # same-title key is (event_title, title, subtitle) live in both modes.
+        # Resolving only when MVE is on made the flag silently collapse the
+        # backtester's key to (title, subtitle) and pair binary markets live
+        # keeps apart. The flag now gates only the MVE-listing phase inside
+        # _load_or_build_event_titles (no MVE ticker can be wanted when every
+        # market fetch passed mve_filter="exclude").
+        logging.info("Resolving event titles for %d unique event_tickers", len(event_tickers))
+        # Resolve event_ticker -> title so grouping keys match the live scanner's
+        titles = _load_or_build_event_titles(live_client, event_tickers, use_cache=use_cache)
+        del event_tickers
 
-    all_markets: list[dict] = list(selected.values())
-    if titles:
-        # Day-store records were normalized before titles existed, so the
-        # event_title field is patched in here rather than at _market_to_dict time.
-        for m in all_markets:
-            m["event_title"] = titles.get(m.get("event_ticker") or "", "")
-    logging.info("Total settled markets from %s: %d", start_date, len(all_markets))
-
-    # Always persist a fresh fetch — use_cache only controls whether reads are
-    # allowed to come from disk. Gating the save on use_cache meant --no-cache
-    # runs (whose whole point is to refresh stale data) never updated the file
-    # the very next default run would load.
-    _save_json_cache(cache_path, all_markets)
-    return all_markets
+        # Walk B: the same sources in the same order with a FRESH `seen` set, so
+        # it yields walk A's records again. Each is patched and streamed straight
+        # into the assembled cache — nothing of the corpus is held — through the
+        # day slices' atomic writer: the file becomes visible only on commit(),
+        # and leaving this block by any exception deletes the temp file, so a
+        # failed or disagreeing walk can never publish a partial cache.
+        #
+        # Always persist a fresh fetch — use_cache only controls whether reads are
+        # allowed to come from disk. Gating the save on use_cache meant --no-cache
+        # runs (whose whole point is to refresh stale data) never updated the file
+        # the very next default run would load.
+        expected = archive_count + live_count
+        written = 0
+        identity_b = 0
+        with _DayStreamWriter(
+            cache_path, {**cache_meta, "assembled_at": datetime.now(UTC).isoformat()},
+        ) as writer:
+            for m in _assembled_records(archive_sources + live_sources, start_ts,
+                                        prefilter, set()):
+                if titles:
+                    # Day-store records were normalized before titles existed, so
+                    # the event_title field is patched in here rather than at
+                    # _market_to_dict time — only when titles resolved at all,
+                    # exactly as before.
+                    m["event_title"] = titles.get(m.get("event_ticker") or "", "")
+                identity_b = _assembly_identity(identity_b, m)
+                writer.write_record(m)
+                written += 1
+            if written != expected or identity_b != identity_a:
+                # A day slice changed between the walks (rewritten or pruned by a
+                # concurrent run). The titles were resolved for walk A's records,
+                # so walk B's cannot be trusted to carry the right ones; raising
+                # here aborts the writer and publishes nothing.
+                raise SettledCorpusError(
+                    f"The settled-market assembly did not reproduce itself: the "
+                    f"first walk yielded {expected} markets and the second "
+                    f"{written}"
+                    + ("" if written != expected else " with a different order or "
+                       "different tickers/event_tickers")
+                    + ". A day slice changed between the two walks (another run "
+                      "may be writing or pruning backtest_cache/ concurrently). "
+                      "Nothing was cached; re-run the backtest."
+                )
+            logging.info("Total settled markets from %s: %d", start_date, written)
+            writer.commit()
+        # A committed rebuild of this identity supersedes any legacy .json of
+        # the same stem, exactly as the old code's rebuild overwrote it; left
+        # on disk it would be served again whenever the .jsonl.gz goes missing.
+        _retire_legacy_cache(legacy_cache_path, cache_path)
+        # Handed back as a stream over the file just written, never as a list.
+        return SettledCorpus(cache_path, cache_meta, written)
+    finally:
+        # The live phase's frontier spool (an anonymous temporary file inside
+        # its _RecordChain) is walked only by the two assembly walks above;
+        # release it now, on success and failure alike, rather than whenever
+        # the chain happens to be collected. A no-op for a fallback's list.
+        _close_records(live_records)
 
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────

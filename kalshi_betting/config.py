@@ -737,14 +737,21 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # 184,255 share a key — the gap between those two numbers is what the eligible
 # count would over-state now.
 #
-# Known residual: the corpus fetch_all_settled_markets returns is still ONE
-# list, and since the prefilter is applied during its assembly it IS the
-# eligible set — resident, and counted by the "Peak RSS before grouping"
-# line, until _prepare_candidates releases it right after its second walk,
-# just before this warning. The warning does not count those records, so a
-# run whose eligible count is far above this threshold but whose groupable
-# count is not gets no warning for the list that set its peak (its eligible
-# count is still on the "Eligibility prefilter" and "Groupable subset" lines).
+# Known residual, narrowed by SS-1's Commit C: fetch_all_settled_markets now
+# returns a historical.SettledCorpus that streams the assembled
+# settled_markets_*.jsonl.gz cache on every walk, so a fetched or
+# streamed-cache corpus is never resident (during its assembly only the
+# archive tail, capped by ARCHIVE_TAIL_MAX_RECORDS, and a sequential
+# fallback's result are lists; day slices and the live frontier stream off
+# disk, the frontier through an anonymous spool file). Only a hit on a LEGACY
+# settled_markets_*.json cache still hands over ONE list — read whole, and
+# since the prefilter was applied during its assembly it IS the eligible set —
+# resident, and counted by the "Peak RSS before grouping" line, until
+# _prepare_candidates releases it right after its second walk, just before
+# this warning. The warning does not count those records, so such a run whose
+# eligible count is far above this threshold but whose groupable count is not
+# gets no warning for the list that set its peak (its eligible count is still
+# on the "Eligibility prefilter" and "Groupable subset" lines).
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
 # phase right after it held the whole window as one list and built two group
@@ -767,6 +774,9 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 #     extraction added only 161 MiB to the high-water mark there; the rest was
 #     the cache read itself, since historical._load_json_cache does
 #     json.loads(path.read_text()) over a 1.43 GB assembled cache file.
+#     (Since SS-1's Commit C that whole-file read is the LEGACY .json path
+#     only; assembled caches are now written as settled_markets_*.jsonl.gz
+#     and streamed record by record, so this figure describes a legacy hit.)
 # The warning is the operator's budget line on a smaller host; it never caps or
 # drops anything.
 #
@@ -875,13 +885,17 @@ TRADER_MAX_WORKERS = 8
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
 # markets are dropped during assembly instead of being held in memory and
 # written to the assembled cache. The tag is part of that cache's filename
-# (settled_markets_<start_date>_<tag>[_nomve].json — the trailing marker is
-# INCLUDE_MVE_MARKETS=False's, DR-57), so a cache built under one filter can
-# never be served to code expecting another. Because that marker is a bare
+# (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz since SS-1, and the
+# same stem with .json for the legacy caches still served — the trailing
+# marker is INCLUDE_MVE_MARKETS=False's, DR-57) and of the streamed cache's
+# meta block, so a cache built under one filter can never be served to code
+# expecting another. Because that marker is a bare
 # suffix rather than a delimited field, a tag ending in "_nomve" would collide
 # with the same tag minus the suffix under the other flag setting; harmless
 # while the tag is this single hand-edited constant, worth a delimiter if tags
-# ever become caller-supplied.
+# ever become caller-supplied. (A streamed cache would still be refused on
+# such a collision, because its meta block carries the tag and the flag
+# separately; a legacy .json has no meta block to check.)
 #
 # MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
 # stale prefiltered cache is silently reused and the backtest sees a market set
@@ -965,7 +979,8 @@ ARCHIVE_TAIL_MAX_PAGES = 2000
 # Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
 # the page cap above. The tail and the two sequential fallbacks are the fetch
 # walks with no chunked `emit` sink (the day workers stream into slice files;
-# the live frontier streams through a prefilter-applying in-memory sink), and
+# the live frontier streams through a prefilter-applying sink into an
+# anonymous temporary spool file, historical._FrontierSpool), and
 # the tail is the one of them that applies no prefilter either, so its whole
 # unfiltered result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
 # that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,

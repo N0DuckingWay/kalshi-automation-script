@@ -148,14 +148,18 @@ Notes:
     of two or more, in order, so the groups and pairs are exactly those of
     the whole eligible list; a hash collision can only keep an extra record,
     which the exact grouping then drops. The corpus itself is whatever
-    historical.fetch_all_settled_markets returns — today still ONE list, and
-    since the prefilter runs during its assembly that list IS the eligible
-    set, resident through both walks until _prepare_candidates releases it;
-    the two walks are written so a corpus that streams can replace it. The
-    corpus must re-iterate identically, and a second walk that disagrees with
-    the first on anything the subset was chosen from (the eligible count, or
-    an eligible record's ticker or grouping fields) raises rather than
-    misaligning the subset.
+    historical.fetch_all_settled_markets returns — since SS-1 a disk-backed
+    historical.SettledCorpus that streams the assembled
+    settled_markets_*.jsonl.gz cache afresh on each walk, so the eligible set
+    is never resident as a whole; only a hit on a LEGACY
+    settled_markets_*.json cache still hands over one list (read whole, as
+    before), resident through both walks until _prepare_candidates releases
+    it. The corpus must re-iterate identically, and a second walk that
+    disagrees with the first on anything the subset was chosen from (the
+    eligible count, or an eligible record's ticker or grouping fields) raises
+    rather than misaligning the subset — as does a SettledCorpus walk that
+    cannot read its file or ends on a different record count
+    (historical.SettledCorpusError, a RuntimeError).
 
     Time-series pairs buy YES on the earlier-closing contract (market A) and
     NO on the later one (market B) — scanner.leg_sides is the only source of
@@ -2868,6 +2872,15 @@ def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCov
     below_floor = subtitle_fraction < BACKTEST_OUTCOME_LABEL_WARN_FRACTION
 
     if below_floor:
+        # Known residual (SS-1 Commit C): the remedy's "equivalently" clause
+        # names only the LEGACY settled_markets_*.json. Since that commit the
+        # assembled cache is settled_markets_*.jsonl.gz, so deleting the .json
+        # alone leaves the streamed cache to be served; the primary remedy
+        # (--no-cache after deleting the day slices) is unaffected. The text is
+        # kept byte-identical because SS-1 must not change any log line or
+        # dashboard section (dashboard._label_coverage_html renders the same
+        # sentence and tests/test_dashboard.py::TestGoldenSections pins it);
+        # correcting both is a follow-up that re-captures that golden.
         logging.warning(
             "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
             "eligible markets carry no subtitle, so the time-series key falls "
@@ -3271,13 +3284,17 @@ def _prepare_candidates(
     RAM-budget warning now counts the groupable records it describes rather
     than every eligible one.
 
-    What this does NOT remove is the corpus itself. fetch_all_settled_markets
-    still returns one list, and because the prefilter is applied during its
-    assembly that list IS the eligible set: it stays resident through both
-    walks, and the "Peak RSS before grouping" line counts it, until it is
-    released right after the second pass. The two walks are written for any
-    corpus that re-iterates identically, so a streaming corpus can replace the
-    list without touching this function.
+    The corpus itself is not held either, since SS-1's Commit C:
+    fetch_all_settled_markets returns a historical.SettledCorpus that streams
+    the assembled settled_markets_*.jsonl.gz cache off disk on every walk
+    (fresh dicts each time), so neither walk ever has more than a record in
+    hand besides what it keeps. The one exception is a hit on a LEGACY
+    settled_markets_*.json cache, which is still read whole and handed over as
+    one list: because the prefilter was applied during its assembly that list
+    IS the eligible set, resident through both walks — and counted by the
+    "Peak RSS before grouping" line — until it is released right after the
+    second pass. Both walks are written for any corpus that re-iterates
+    identically, which is why neither form needed a change here.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -3318,7 +3335,10 @@ def _prepare_candidates(
             corpus did not iterate identically on its two walks (a different
             eligible count, or a different ticker at some eligible position):
             the groupable subset is chosen by position, so continuing would
-            group records chosen for a different corpus.
+            group records chosen for a different corpus. Also propagates as
+            historical.SettledCorpusError (a RuntimeError subclass) out of
+            either walk over a streamed corpus whose cache file cannot be
+            read, or whose complete walk yields a different record count.
     """
 
     # Feasibility pre-check, BEFORE any network call: a trade can only ever be
@@ -3381,11 +3401,11 @@ def _prepare_candidates(
     # Two walks over the corpus, and no eligible list of this function's own
     # (SS-1). The corpus is treated as any RE-ITERABLE of market dicts: it is
     # walked here and once more by _materialize_groupable, and nothing else in
-    # this function iterates it. (Today the fetch still returns ONE list, and
-    # since the prefilter ran during its assembly that list is the eligible
-    # set — resident until the `del markets` below. What SS-1 removes here is
-    # the second, filtered copy and the grouping over every eligible record;
-    # a corpus that streams is what would remove the list itself.)
+    # this function iterates it. The fetch returns a historical.SettledCorpus,
+    # which streams the assembled cache file on each walk (so the corpus is
+    # never resident), or — on a hit on a LEGACY .json cache only — one list,
+    # which since the prefilter ran during its assembly is the eligible set,
+    # resident until the `del markets` below.
     #
     # Pass 1 counts every record (the "Total settled markets" figure), applies
     # the eligibility prefilter below, feeds each eligible record to the
@@ -3434,10 +3454,10 @@ def _prepare_candidates(
     )
     # Nothing below reads the corpus or the first pass's index: `groupable`
     # holds every record grouping needs, and the census has its counts. For a
-    # corpus held as a list (what fetch_all_settled_markets returns today, or
-    # a test stub) this is what lets every eligible record that shares no key
-    # be collected BEFORE the group maps are built, rather than after pair
-    # extraction.
+    # corpus held as a list (a legacy .json cache hit, or a test stub) this is
+    # what lets every eligible record that shares no key be collected BEFORE
+    # the group maps are built, rather than after pair extraction; for a
+    # streamed SettledCorpus it only drops a small handle.
     del markets, key_index
 
     # Logged BEFORE the RAM-budget warning below so the two read in causal
@@ -3456,15 +3476,16 @@ def _prepare_candidates(
     # GROUPABLE count, not the eligible one, because the subset is what stays
     # resident from here on: the corpus was released just above.
     #
-    # Known residual, recorded rather than implied away: while the corpus is
-    # a list (always, today — see the note at the fetch), every eligible
-    # record WAS resident up to that release, and the peak RSS line above
-    # includes all of them, yet this warning does not count them. So a run
-    # whose eligible count is far above the threshold but whose groupable
-    # count is not (the 7-day window above: 7,260,952 eligible, 184,255
-    # groupable) gets no warning for the list that set its peak; its eligible
-    # count is still on the "Eligibility prefilter" and "Groupable subset"
-    # lines, and the cost on the RSS line. It deliberately carries only THIS
+    # Known residual, recorded rather than implied away: when the corpus is a
+    # list — only on a hit on a LEGACY settled_markets_*.json cache since
+    # SS-1's Commit C; a fetched or streamed-cache corpus is never resident —
+    # every eligible record WAS resident up to that release, and the peak RSS
+    # line above includes all of them, yet this warning does not count them.
+    # So such a run whose eligible count is far above the threshold but whose
+    # groupable count is not (the 7-day window above: 7,260,952 eligible,
+    # 184,255 groupable) gets no warning for the list that set its peak; its
+    # eligible count is still on the "Eligibility prefilter" and "Groupable
+    # subset" lines, and the cost on the RSS line. It deliberately carries only THIS
     # run's numbers; the historical measurements live in config.py beside
     # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them
     # current, rather than in a string emitted on every run (TS-07). Advisory
