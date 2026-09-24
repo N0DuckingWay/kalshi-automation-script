@@ -47,7 +47,13 @@ Dependencies:
     SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS from
     config.py; fetch_all_settled_markets(),
-    fetch_candlesticks(), and infer_category() from historical.py. Also
+    fetch_candlesticks(), and infer_category() from historical.py, plus its
+    SettledCorpus and LegacySettledCorpus (read by TYPE, to take the
+    corpus's provenance) and CorpusProvenance (carried out on
+    BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
+    imports only from here). Exports max_trades_simulated(), read by
+    dashboard.py and backtest.py to test a carried post-cutoff verdict
+    against the run's own trades. Also
     depends on pandas (external) for the equity-curve DataFrame and numpy
     (external, a declared dependency pandas already pulls in) for counting
     the grouping-key hashes behind the groupable subset. Does NOT
@@ -226,6 +232,9 @@ from .config import (
     time_series_spread_too_wide,
 )
 from .historical import (
+    CorpusProvenance,
+    LegacySettledCorpus,
+    SettledCorpus,
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
@@ -807,6 +816,16 @@ class _Candidates:
             same argument both _extract_pairs calls were handed and every
             entry pass hands _find_entry (see above for when None resolves
             the same way in both).
+        corpus_provenance (CorpusProvenance | None): What the fetched corpus
+            says about itself — when it was assembled, whether it was served
+            from an earlier run's cache, and the archive cutoff / post-cutoff
+            verdict as of that assembly — taken off the corpus BY TYPE (a
+            historical.SettledCorpus, or the historical.LegacySettledCorpus
+            list a legacy settled_markets_*.json hit returns, whose
+            provenance carries its file time and no cutoff) before it is
+            released. None when the corpus was a plain list (a test stub).
+            Carried to BacktestSweep.corpus_provenance for the dashboard
+            header.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -814,6 +833,7 @@ class _Candidates:
     start_date: date
     max_horizon_days: int | None
     same_event_ladders: bool | None
+    corpus_provenance: CorpusProvenance | None = None
 
 
 @dataclass
@@ -892,6 +912,25 @@ class BacktestSweep:
             scenario and both checked populations, so every cell's halves
             cover the same two stretches of history. None when the band sweep
             is off or the window was infeasible.
+        corpus_provenance (CorpusProvenance | None): What this run's
+            settled-market corpus covers (DR-13, M2/M3 of the 2026-09-24
+            review): when it was assembled — it holds nothing settled after
+            that, while the window nominally runs to today — whether it came
+            from an earlier run's cache, and the archive cutoff and
+            structurally-0-trade verdict AS OF that assembly. It hangs off the
+            sweep for the reason label_coverage does: one fact about one
+            corpus, valid at every point. The dashboard renders it under the
+            Period line whether healthy or not (DR-66: absence must never be
+            the only signal); a legacy settled_markets_*.json hit carries its
+            file time (legacy=True) and no cutoff. A True verdict can go stale
+            after assembly, so both renderers read it beside
+            max_trades_simulated(sweep): any simulated trade proves it stale.
+            None when not recorded: the feasibility short-circuit (no fetch),
+            a test that stubs the fetch with a plain list, or a hand-built
+            sweep. DEFAULTED, like
+            label_coverage, so no existing construction breaks; the one
+            production construction that has a corpus
+            (_sweep_from_candidates) always passes it.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -903,6 +942,41 @@ class BacktestSweep:
         default_factory=dict)
     same_event_ladders: bool | None = None
     split_date: date | None = None
+    corpus_provenance: CorpusProvenance | None = None
+
+
+def max_trades_simulated(sweep: BacktestSweep) -> int:
+    """
+    The trade count of the busiest point a sweep simulated — the evidence a stamped post-cutoff verdict is stale.
+
+    CorpusProvenance.post_cutoff is a verdict AS OF ASSEMBLY: a cached corpus
+    stamped when start_date sat at or after the archive cutoff keeps saying so
+    after the cutoff has moved past start_date, and a hit never re-reads it.
+    Once it has moved, the corpus's markets are archived, their candlesticks
+    exist (404s are never cached), and the run can trade — while the header
+    banner and the closing WARNING said "no trade could be entered". A trade
+    at ANY simulated point disproves that sentence, so this is the one
+    definition both renderers (dashboard._corpus_provenance_html and
+    backtest._log_corpus_provenance) test a True verdict against; the page
+    and the log therefore always agree on whether it still holds. It counts
+    every point the page can show — the primary, each swept k, each
+    band-sweep scenario and the same-title point — because the k dropdown
+    and the scenario explorer put all of them on the same page. Zero proves
+    nothing either way: an entry that Kelly then rejected at every k also
+    shows the window could trade.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        int: The largest len(trades) over sweep.primary, sweep.points,
+            sweep.scenarios and sweep.same_title_point (when present); 0 when
+            none of them traded.
+    """
+    points = [sweep.primary, *sweep.points, *sweep.scenarios]
+    if sweep.same_title_point is not None:
+        points.append(sweep.same_title_point)
+    return max(len(point.trades) for point in points)
 
 
 @dataclass
@@ -3316,8 +3390,9 @@ def _prepare_candidates(
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
             then same-title), their candle series, this run's
-            OutcomeLabelCoverage, and the start date / horizon / ladder flag
-            every entry pass must reuse. None — the codebase's
+            OutcomeLabelCoverage, the corpus's provenance (None for a plain
+            list corpus), and the start date / horizon / ladder flag every
+            entry pass must reuse. None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
             window at all" signal distinct from "no pair was ever tradeable";
@@ -3395,6 +3470,17 @@ def _prepare_candidates(
         hist_client, live_client, start_date, use_cache,
         prefilter=lambda m: _can_ever_enter(m, start_date),
         prefilter_tag=SETTLED_PREFILTER_CACHE_TAG,
+    )
+    # What the corpus says about itself — assembly time, cache or fresh, and
+    # the archive cutoff / post-cutoff verdict as of assembly — taken now,
+    # before `markets` is released, for the dashboard header (DR-13, M2).
+    # Read by TYPE, never by attribute probing: a plain list (a test stub) has
+    # no provenance, and a MagicMock would answer any attribute with nonsense.
+    # A legacy-cache hit is a LegacySettledCorpus, whose provenance carries
+    # its file time.
+    corpus_provenance = (
+        markets.provenance
+        if isinstance(markets, (SettledCorpus, LegacySettledCorpus)) else None
     )
     # Two walks over the corpus, and no eligible list of this function's own
     # (SS-1). The corpus is treated as any RE-ITERABLE of market dicts: it is
@@ -3583,6 +3669,7 @@ def _prepare_candidates(
         start_date=start_date,
         max_horizon_days=max_horizon_days,
         same_event_ladders=same_event_ladders,
+        corpus_provenance=corpus_provenance,
     )
 
 
@@ -5047,7 +5134,8 @@ def _sweep_from_candidates(
         BacktestSweep: primary, points (the primary band's k sweep),
             calibration (the primary band's), label_coverage (carried from
             candidates), scenarios, same_title_point, calibrations_by_band,
-            same_event_ladders (resolved) and split_date — see BacktestSweep.
+            same_event_ladders (resolved), split_date and corpus_provenance
+            (carried from candidates) — see BacktestSweep.
 
     Raises:
         ValueError: From config.time_series_spread_band, if spread_band is not
@@ -5155,9 +5243,10 @@ def _sweep_from_candidates(
     # single-band path (whose pair list died with _prepare_entries' locals),
     # holds no pair tuple through the simulations: the entry dicts carry the
     # market records they need (mA/mB) and never a candle. Only the scalar
-    # fields — label_coverage, start_date, same_event_ladders — are read after
-    # this point. The pre-pass's rescan list is a list of pair tuples too, so
-    # it goes with them (its entries already live on in entries_by_band).
+    # fields — label_coverage, start_date, same_event_ladders,
+    # corpus_provenance — are read after this point. The pre-pass's rescan
+    # list is a list of pair tuples too, so it goes with them (its entries
+    # already live on in entries_by_band).
     del candidates.candles_by_ticker, candidates.all_pairs
     del rescan, no_band_entries
 
@@ -5340,6 +5429,9 @@ def _sweep_from_candidates(
         calibrations_by_band=calibrations_by_band,
         same_event_ladders=ladders,
         split_date=split_date,
+        # One fact about the one corpus, like label_coverage: the header's
+        # corpus line and post-cutoff banner read it (DR-13, M2)
+        corpus_provenance=candidates.corpus_provenance,
     )
 
 
@@ -5451,7 +5543,8 @@ def run_backtest_sweep(
             outcome-label census, None when the feasibility short-circuit
             skipped the fetch), and the band-sweep payload — scenarios,
             same_title_point, calibrations_by_band, split_date — plus the
-            resolved same_event_ladders (see BacktestSweep).
+            resolved same_event_ladders and the corpus's provenance, None when
+            not recorded (see BacktestSweep).
 
     Raises:
         ValueError: From config.time_series_spread_band, before any fetch, if
@@ -5525,11 +5618,14 @@ def run_backtest_sweep(
         # label_coverage is None on this path by construction — the fetch was
         # skipped, so nothing was censused. The dashboard renders that as "not
         # measured" rather than as healthy coverage, and it is what tells an
-        # empty scenarios list here apart from a band sweep that was off.
+        # empty scenarios list here apart from a band sweep that was off. No
+        # corpus was fetched either, so there is no provenance to report: the
+        # header says "not recorded" rather than inventing one.
         return BacktestSweep(primary=empty, points=[empty], calibration=None,
                              label_coverage=None, scenarios=[],
                              calibrations_by_band={},
-                             same_event_ladders=bool(ladders))
+                             same_event_ladders=bool(ladders),
+                             corpus_provenance=None)
 
     # Every entry pass and every simulation. It deletes the candle series and
     # the pair list itself once the last entry pass is done (before any

@@ -907,6 +907,33 @@ TRADER_MAX_WORKERS = 8
 # the current predicate would not have produced.
 SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
 
+# How young an EMPTY assembled settled-market cache must be to still be served
+# (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it
+# records only that nothing qualified when it was assembled (or that a run was
+# cut short), and a cache hit makes zero network calls, so an empty cache used
+# to be a PERMANENT hit — the 2-byte "[]" settled_markets_2026-08-29_*.json on
+# disk, last written 2026-09-01 00:16 UTC (its file time), was still being
+# served on 2026-09-24. Under this age (measured from the assembly time the
+# streamed cache's meta records, or a legacy .json's file time) an empty cache
+# is served with a WARNING; at or over it, when its assembly time cannot be
+# read, or when that time is in the future, it is a miss and the corpus is
+# re-assembled. So a legitimately empty window re-checks at most once per this
+# interval — and each re-check is an ordinary miss: a full re-assembly of the
+# window from the day-slice stores (fetching any day not stored or no longer
+# valid, and always the current day), not a top-up, so for a long window it is
+# a full-volume run (the 2026-08-29 file's rebuild covers 26 days; the fresh
+# 7-day 2026-09-17 run of 2026-09-24 assembled 7,274,215 records, took 2,382 s
+# and peaked at 2,916,679,680 bytes max RSS). A NON-empty cache is never expired
+# by age — it is announced (its assembly time and what --no-cache costs to
+# extend it) and served; that is the operator decision "announce, don't
+# enforce". One day, in seconds; the same value as, but deliberately not the
+# same constant as, historical's private _DAY_SECONDS (a day-slice geometry
+# fact) and backtester's private _DAY_SECONDS (a calendar step), and as
+# historical's private _EMPTY_CANDLE_TTL_SECONDS — the older, separate staleness
+# rule for an EMPTY candlestick cache file, which (unlike this one) serves a
+# future-dated file; that rule predates this one and is left as it is.
+EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS = 86_400
+
 # Hard cap on the per-ticker event-title fallback in
 # historical._load_or_build_event_titles. That fallback exists for the handful
 # of archived events the bulk listings no longer carry, and it costs ONE HTTP

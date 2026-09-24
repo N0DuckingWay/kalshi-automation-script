@@ -3669,6 +3669,74 @@ class TestOutcomeLabelCoverageIsCarried:
         assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
 
 
+class TestCorpusProvenanceIsCarried:
+    """DR-13 / M2 (P2): what the fetched corpus says about itself — when it was
+    assembled, whether it came from an earlier run's cache, and the archive
+    cutoff and post-cutoff verdict as of that assembly — rides from the
+    SettledCorpus through _Candidates onto BacktestSweep.corpus_provenance,
+    exactly the way label_coverage travels, so the dashboard header can render
+    it. None whenever it was never recorded."""
+
+    PROV = historical.CorpusProvenance(
+        from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
+        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC), post_cutoff=True)
+
+    def test_the_sweep_carries_the_provenance(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders"),
+                                corpus_provenance=self.PROV))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.corpus_provenance is self.PROV
+
+    def test_the_infeasible_window_carries_none(self, monkeypatch):
+        # No fetch ran, so there is no corpus to describe.
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.corpus_provenance is None
+
+    @staticmethod
+    def _point(n_trades, k=0.75):
+        return backtester.SweepPoint(k=k, trades=[object()] * n_trades,
+                                     equity_df=pd.DataFrame())
+
+    @pytest.mark.parametrize("where, expected", [
+        ("none", 0), ("primary", 3), ("points", 5), ("scenarios", 7),
+        ("same_title_point", 2),
+    ])
+    def test_max_trades_simulated_reads_every_point_the_page_can_show(
+            self, where, expected):
+        # The one test both renderers apply to a carried post-cutoff verdict:
+        # a trade at ANY simulated point proves it stale, since the k dropdown
+        # and the scenario explorer put every point on the same page.
+        primary = self._point(3 if where == "primary" else 0)
+        sweep = backtester.BacktestSweep(
+            primary=primary,
+            points=[primary, self._point(5 if where == "points" else 0, k=0.5)],
+            calibration=None,
+            scenarios=[self._point(7 if where == "scenarios" else 0, k=0.9)],
+            same_title_point=(self._point(2) if where == "same_title_point"
+                              else None))
+        assert backtester.max_trades_simulated(sweep) == expected
+
+    def test_existing_constructions_default_to_none(self):
+        # Defaulted, like label_coverage: a hand-built sweep or candidates
+        # object needs no change and reads as "not recorded".
+        point = backtester.SweepPoint(k=0.75, trades=[], equity_df=pd.DataFrame())
+        assert backtester.BacktestSweep(primary=point, points=[point],
+                                        calibration=None).corpus_provenance is None
+        assert backtester._Candidates(
+            all_pairs=[], candles_by_ticker={}, label_coverage=None,
+            start_date=date(2026, 1, 1), max_horizon_days=None,
+            same_event_ladders=None).corpus_provenance is None
+
+
 class TestRunBacktestFeasibilityPreCheck:
     """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
     ever be entered, so run_backtest must skip the fetch entirely rather than
@@ -6335,6 +6403,44 @@ class TestPrepareCandidatesOverASettledCorpus:
         assert [p for p, _ in from_corpus.all_pairs] == [p for p, _ in from_list.all_pairs]
         assert from_corpus.label_coverage == from_list.label_coverage
         assert len(walks) == 2
+
+    def test_the_corpus_provenance_rides_out_on_the_candidates(
+        self, tmp_path, monkeypatch,
+    ):
+        # Taken off the corpus BY TYPE before it is released: a SettledCorpus
+        # hands over its provenance, and so does the LegacySettledCorpus list
+        # a legacy-cache hit returns (its file time, no cutoff); a plain list
+        # (a test stub) has none; and a MagicMock — which would answer
+        # .provenance with a truthy auto-attribute — is not mistaken for one.
+        template = _ss1_corpus(0)
+        corpus = self._corpus(tmp_path, template)
+        prov = historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 1, 5, 9, tzinfo=UTC),
+            archive_cutoff=datetime(2025, 12, 1, tzinfo=UTC), post_cutoff=True)
+        with_prov = historical.SettledCorpus(corpus.path, historical._assembled_cache_meta(
+            _SS1_START, "t"), len(corpus), provenance=prov)
+        TestGroupableSubset._patch(monkeypatch, with_prov)
+        assert TestGroupableSubset._prepare().corpus_provenance is prov
+        TestGroupableSubset._patch(monkeypatch, template)
+        assert TestGroupableSubset._prepare().corpus_provenance is None
+        legacy_prov = historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
+            archive_cutoff=None, post_cutoff=None, legacy=True)
+        legacy = historical.LegacySettledCorpus(template, legacy_prov)
+        TestGroupableSubset._patch(monkeypatch, legacy)
+        prepared = TestGroupableSubset._prepare()
+        assert prepared.corpus_provenance is legacy_prov
+        # ...and the legacy list prepares exactly what the plain list does.
+        TestGroupableSubset._patch(monkeypatch, template)
+        plain = TestGroupableSubset._prepare()
+        assert prepared.all_pairs == plain.all_pairs
+        assert prepared.label_coverage == plain.label_coverage
+        stub = MagicMock()
+        stub.__iter__.return_value = iter([])
+        stub.provenance = prov
+        TestGroupableSubset._patch(monkeypatch, stub)
+        assert backtester._prepare_candidates(
+            MagicMock(), MagicMock(), _SS1_START, True, None).corpus_provenance is None
 
     def test_a_cache_replaced_between_the_two_passes_is_refused(
         self, tmp_path, monkeypatch,

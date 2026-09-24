@@ -415,7 +415,33 @@ python3 -m kalshi_betting.backtest --no-band-sweep           # skip the spread-b
 
 `--start-date` should predate the Kalshi archive cutoff. Markets that settled
 after the cutoff have no historical candlestick data, so a window starting after
-it produces no trades regardless of how many pairs it finds.
+it produces no trades regardless of how many pairs it finds. A run that fetches
+the settled markets says so in three places: a WARNING when they are fetched, a
+warning line at the end of the run's log summary, and a red banner under the
+dashboard's "Period:" line. A cached re-run repeats the verdict "as of" the
+cache's assembly, without re-reading the cutoff, but only for a cache assembled
+since this was added: a legacy `settled_markets_*.json`, or a
+`settled_markets_*.jsonl.gz` written before it (the 2026-09-17 one on disk),
+recorded no cutoff, so its re-run says the cutoff was "not recorded" and shows
+no verdict at all. Run once with `--no-cache` to re-check the cutoff and stamp
+it. If a cached run nevertheless enters trades under a post-cutoff verdict, the
+cutoff has moved since the cache was assembled, and the log and dashboard say
+the verdict is stale instead of repeating it.
+
+**Cached runs say what they cover.** The assembled market list
+(`backtest_cache/settled_markets_*.jsonl.gz`, or a legacy `.json`) is a
+snapshot: it holds no market that settled after it was assembled, while the
+report's period always runs to today. A run that reuses it logs when it was
+assembled (a legacy file's modification time) and how long ago, and the
+dashboard shows the same under the "Period:" line. Pass `--no-cache` to extend
+it, and expect it to cost close to a full fetch for any window that reaches back
+before the archive cutoff: it re-assembles the whole corpus, reusing a stored day
+slice only while it is still valid (an archive day slice goes stale whenever the
+cutoff advances), and it also re-fetches every pair's candlesticks and
+re-resolves event titles. A non-empty cache is never expired automatically. An
+**empty** one is reused only while it is less than a day old
+(`EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS`), and after that the next run with that
+`--start-date` rebuilds it — a full assembly of the window, not a quick check.
 
 `--interval-discount K` (`0 <= K <= 1`) overrides the time-series interval
 discount `k` for this backtest run only — it never reaches live trading, which
@@ -512,7 +538,9 @@ zero-trade path already produces — instead of spending minutes fetching
 millions of settled-market records into a cache that was always going to
 produce zero trades. `historical.py` separately warns (without aborting) when
 `--start-date` is on or after the archive cutoff, since that also makes the
-window structurally 0-trade — see the paragraph above.
+window structurally 0-trade. The warning also appears on the dashboard and, for
+a cache assembled since this was added, on a cached re-run "as of" the cache's
+assembly — see the paragraph above for which caches record no cutoff.
 
 `--max-horizon-days` only enters trades where the later-closing leg is within the
 given number of days of the *simulated* entry checkpoint (each Monday evaluated
