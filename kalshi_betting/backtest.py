@@ -213,7 +213,7 @@ def main() -> None:
         n_win        = sum(1 for t in trades if t.profit > 0)
         logging.info("Backtest Summary")
         # UTC, matching the window the backtester actually simulates
-        # (_prepare_entries' feasibility end and _build_equity_curve's last
+        # (_prepare_candidates' feasibility end and _build_equity_curve's last
         # row are both UTC dates) — a local date here would print a period
         # the run did not cover (TS-13).
         logging.info("  Period:        %s → %s", start_date, datetime.now(UTC).date())

@@ -107,15 +107,18 @@ SHORT_DEADLINE_GAP_DAYS       = 15
 # ceiling enforcement, so a band can never go live half-wired.
 BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 
-# Band grid for the backtest's band x k scenario sweep, to be crossed with
+# Band grid for the backtest's band x k scenario sweep, crossed with
 # INTERVAL_DISCOUNT_SWEEP: 6 floors x 6 ceilings = 36 bands x 13 k = 468
-# scenarios over ONE fetch. No module reads the grid yet: backtester._find_entry
-# applies ONE band per call (its spread_band, resolved through
-# time_series_spread_band), and the sweep that crosses this grid with the k
-# grid is not built yet. Every floor sits below every ceiling, so all 36
-# bands are valid; every ceiling sits above both deadline-gap tiers, so no
-# grid band empties a tier (see time_series_spread_band); and the default
-# band above is a member, so a default run adds no 37th.
+# scenarios over ONE fetch. Read only by backtester._sweep_from_candidates
+# (reached through run_backtest_sweep(band_sweep=True)), which runs one
+# _find_entry pass per band — _find_entry applies ONE band per call, its
+# spread_band resolved through time_series_spread_band — and then simulates
+# every band at every k of the same k grid. Every floor sits below every
+# ceiling, so all 36 bands are valid; every ceiling sits above both
+# deadline-gap tiers, so no grid band empties a tier (see
+# time_series_spread_band); and the default band above is a member, so a
+# default run adds no 37th (an off-grid primary band does, as its own exact
+# member).
 # Cost measured 2026-09-23 on the DR-73 calibration corpus (10,733 time-series
 # pairs, 10,530 with candles on both legs, start 2020-01-01, ladders on): ~1 s
 # per band (the time-series _find_entry pass, ~91-97 us per pair across
@@ -123,8 +126,14 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 # band and at 0.30-0.60 and 0.40-0.50 — it scales with the window's pair
 # count; 330 entries at no band, 183 at 0.30-0.60) and ~2-11 ms per
 # simulation over its 330 entries (best of 3; it falls with the trade count,
-# from 94 trades at k = 0.40 to none at k = 1.00). A floor at or below a
-# pair's tier is inert for it.
+# from 94 trades at k = 0.40 to none at k = 1.00). The whole band sweep over
+# that corpus (also 2026-09-23, the production _sweep_from_candidates: 468 "all"
+# scenarios, 468 ladder and 468 cross-event points, each "all" point's two
+# halves, and an ex-top re-simulation on each of the 423 "all" points with a
+# traded event — the other 45 entered no trade — 2,763 simulations in all)
+# took 49.9 and 50.1 s in two runs and kept 1,404 equity frames of ~138 KB
+# each (2,460 daily rows), ~194 MB in all. A floor at or below a pair's tier
+# is inert for it.
 SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
 SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
 

@@ -3,6 +3,7 @@ import gc
 import inspect
 import logging
 import re
+import statistics
 import time
 import weakref
 from dataclasses import astuple
@@ -3444,8 +3445,12 @@ class TestOutcomeLabelCoverageIsCarried:
             below_floor=True,
             cumulative_markets=1, snapshot_markets=1, unknown_deadline_markets=2,
         )
-        monkeypatch.setattr(backtester, "_prepare_entries",
-                            lambda *a, **k: ([], census))
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=census, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders")))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         result = backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
@@ -3454,8 +3459,8 @@ class TestOutcomeLabelCoverageIsCarried:
     def test_the_infeasible_window_carries_no_census(self, monkeypatch):
         # The fetch never ran, so nothing was censused — None, distinct from a
         # censused corpus that held zero records.
-        monkeypatch.setattr(backtester, "_prepare_entries",
-                            lambda *a, **k: (None, None))
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: None)
         result = backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
         assert result.label_coverage is None
@@ -5018,7 +5023,7 @@ class TestRunBacktestSweep:
         self._patch(monkeypatch)
         calls = {"prepare": 0, "calibrate": 0, "simulate": 0}
         real = {
-            "prepare": backtester._prepare_entries,
+            "prepare": backtester._prepare_candidates,
             "calibrate": backtester._interval_calibration,
             "simulate": backtester._simulate_at_discount,
         }
@@ -5029,7 +5034,7 @@ class TestRunBacktestSweep:
                 return real[name](*a, **kw)
             return wrapper
 
-        monkeypatch.setattr(backtester, "_prepare_entries", counted("prepare"))
+        monkeypatch.setattr(backtester, "_prepare_candidates", counted("prepare"))
         monkeypatch.setattr(backtester, "_interval_calibration", counted("calibrate"))
         monkeypatch.setattr(backtester, "_simulate_at_discount", counted("simulate"))
 
@@ -5141,7 +5146,12 @@ class TestSimulationsAreLabelledWithTheirDiscount:
 
     def test_every_swept_point_is_distinguishable(self, monkeypatch, caplog):
         monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", [0.50, 0.75])
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders")))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -5153,7 +5163,12 @@ class TestSimulationsAreLabelledWithTheirDiscount:
         assert len(completions) == len({c.split(":")[0] for c in completions})
 
     def test_the_primary_slot_is_announced(self, monkeypatch, caplog):
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders")))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -5172,9 +5187,12 @@ class TestSimulationsAreLabelledWithTheirDiscount:
 
         def _fake(*args, **kwargs):
             seen["ladders"] = kwargs.get("same_event_ladders", "MISSING")
-            return [], None
+            return backtester._Candidates(
+                all_pairs=[], candles_by_ticker={}, label_coverage=None,
+                start_date=date(2026, 1, 1), max_horizon_days=None,
+                same_event_ladders=kwargs.get("same_event_ladders"))
 
-        monkeypatch.setattr(backtester, "_prepare_entries", _fake)
+        monkeypatch.setattr(backtester, "_prepare_candidates", _fake)
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
@@ -5187,7 +5205,12 @@ class TestSimulationsAreLabelledWithTheirDiscount:
         self, monkeypatch, caplog, configured, expected,
     ):
         monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
-        monkeypatch.setattr(backtester, "_prepare_entries", lambda *a, **k: ([], None))
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders")))
         monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -5876,3 +5899,787 @@ class TestBacktestTradePopulationLabels:
         t = TestEquityCurveOpensAtTheInitialBalance()._trade(10, 0.30, 0.40, "yes", 0.0)
         assert t.event_ticker == ""
         assert t.same_event_ladder is False
+
+
+# ─── PB3: the band x k x population sweep ────────────────────────────────────
+
+# The 36 grid bands, resolved exactly as the sweep resolves them.
+_GRID_BANDS = sorted({(float(lo), float(hi)) for lo in SPREAD_BAND_SWEEP_FLOORS
+                      for hi in SPREAD_BAND_SWEEP_CEILINGS})
+
+
+class _LogCapture(logging.Handler):
+    """Collect every record's message; a class-scoped fixture cannot use caplog."""
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def _completion_prefixes(messages: list[str]) -> list[str]:
+    """The text up to the ':' of every "Backtest complete" line — the part
+    TS-21 requires to be unique within one sweep."""
+    return [m.split(":")[0] for m in messages if m.startswith("Backtest complete")]
+
+
+@pytest.fixture(scope="class")
+def golden_band_sweep():
+    """ONE full band sweep (36 bands x 13 k, ladders on) over the
+    TestPrepareEntriesGolden fixture, with spies on every seam the tests
+    below read, plus a band_sweep=False run of the same fixture. Class-scoped
+    so the whole class pays for one sweep, not one per test."""
+    mp = pytest.MonkeyPatch()
+    handler = _LogCapture()
+    root = logging.getLogger()
+    old_level = root.level
+    try:
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        calls: dict = {"prepare": 0, "entries": [], "simulate": [], "candidates": []}
+        real_prepare = backtester._prepare_candidates
+        real_entries = backtester._entries_for_band
+        real_simulate = backtester._simulate_at_discount
+
+        def prepare_spy(*a, **kw):
+            calls["prepare"] += 1
+            c = real_prepare(*a, **kw)
+            calls["candidates"].append(c)
+            return c
+
+        def entries_spy(candidates, spread_band=None, *, pair_types=("time_series", "same_title")):
+            out = real_entries(candidates, spread_band, pair_types=pair_types)
+            calls["entries"].append((spread_band, pair_types, out))
+            return out
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all"):
+            # Were the candles and the pair list already released when this
+            # simulation ran?
+            released = all(not hasattr(c, "candles_by_ticker") and not hasattr(c, "all_pairs")
+                           for c in calls["candidates"])
+            point = real_simulate(raw_entries, start_date, initial_balance, k=k,
+                                  spread_band=spread_band, population=population)
+            calls["simulate"].append({"entries": list(raw_entries), "band": spread_band,
+                                      "population": population, "k": k,
+                                      "point": point, "released": released})
+            return point
+
+        mp.setattr(backtester, "_prepare_candidates", prepare_spy)
+        mp.setattr(backtester, "_entries_for_band", entries_spy)
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        result = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=golden._START, initial_balance=10_000.0,
+            same_event_ladders=True, band_sweep=True,
+        )
+        root.removeHandler(handler)
+        mp.undo()
+
+        # The same fixture with the band sweep OFF — the pre-band single-band
+        # k sweep, the oracle for points/primary.
+        golden._patch(mp)
+        single = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=golden._START, initial_balance=10_000.0,
+            same_event_ladders=True, band_sweep=False,
+        )
+        yield SimpleNamespace(result=result, single=single, calls=calls,
+                              messages=handler.messages, start=golden._START)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+        mp.undo()
+
+
+@pytest.mark.usefixtures("golden_band_sweep")
+class TestBandSweep:
+    """run_backtest_sweep(band_sweep=True): every band of the config grid x
+    every swept k over ONE fetch, with standalone ladder / cross-event /
+    same-title populations, a split-half check and a concentration check.
+
+    The fixture (TestPrepareEntriesGolden, ladders on) is small enough to
+    reason about by hand: the ladder (spread 0.40, 19-day stated gap) enters
+    at every grid band; the cross-event pairs are EA/EB (0.30, 13-day gap —
+    kept at floors <= 0.30), TA/TB (0.15 — floor 0 only) and WA/WB (0.98 —
+    ceiling 1.0 only), so the cross-event population is empty at exactly the
+    ten bands with floor 0.35 or 0.40 and a ceiling below 1.0; and the
+    same-title pair trades at every band and k."""
+
+    # Floors 0 / 0.20 / 0.25 / 0.30 keep EA/EB at every ceiling; floors 0.35
+    # and 0.40 keep only WA/WB, and only at the 1.0 ceiling.
+    _CROSS_BANDS = sorted(
+        [(lo, hi) for lo in (0.0, 0.20, 0.25, 0.30) for hi in SPREAD_BAND_SWEEP_CEILINGS]
+        + [(0.35, 1.0), (0.40, 1.0)])
+
+    def test_scenario_counts(self, golden_band_sweep):
+        res = golden_band_sweep.result
+        by_pop: dict = {}
+        for p in res.scenarios:
+            by_pop.setdefault(p.population, []).append(p)
+        assert set(by_pop) == {"all", "ladder", "cross"}
+        # 36 bands x 13 k "all" scenarios, on a rectangular grid
+        assert len(_GRID_BANDS) == 36 and len(INTERVAL_DISCOUNT_SWEEP) == 13
+        assert sorted((p.spread_band, p.k) for p in by_pop["all"]) == sorted(
+            (b, k) for b in _GRID_BANDS for k in INTERVAL_DISCOUNT_SWEEP)
+        # ... each with both robustness checks
+        assert all(p.halves is not None and p.ex_top_event is not None
+                   for p in by_pop["all"])
+        # A ladder point at every band (the ladder enters everywhere) and a
+        # cross point exactly where the cross population is non-empty — an
+        # empty population is skipped, never simulated as an empty scenario.
+        assert sorted({p.spread_band for p in by_pop["ladder"]}) == _GRID_BANDS
+        assert len(by_pop["ladder"]) == 36 * 13
+        assert sorted({p.spread_band for p in by_pop["cross"]}) == self._CROSS_BANDS
+        assert len(by_pop["cross"]) == 26 * 13
+        # ... plus ONE same-title point, outside the scenarios
+        assert res.same_title_point is not None
+        assert res.same_title_point.population == "same_title"
+        assert [t.pair_type for t in res.same_title_point.trades] == ["same_title"]
+
+    def test_scenarios_are_ordered_band_then_k_then_population(self, golden_band_sweep):
+        order = {"all": 0, "ladder": 1, "cross": 2}
+        keys = [(p.spread_band, p.k, order[p.population])
+                for p in golden_band_sweep.result.scenarios]
+        assert keys == sorted(keys)
+
+    def test_points_and_primary_equal_a_single_band_run(self, golden_band_sweep):
+        res, single = golden_band_sweep.result, golden_band_sweep.single
+        assert single.scenarios == [] and single.same_title_point is None
+        assert single.split_date is None
+        assert [p.k for p in res.points] == [p.k for p in single.points]
+        for swept, alone in zip(res.points, single.points, strict=True):
+            assert (swept.spread_band, swept.population) == (alone.spread_band,
+                                                             alone.population)
+            assert [astuple(t) for t in swept.trades] == [astuple(t) for t in alone.trades]
+            pd.testing.assert_frame_equal(swept.equity_df, alone.equity_df)
+        assert res.primary.k == single.primary.k
+        assert [astuple(t) for t in res.primary.trades] == [
+            astuple(t) for t in single.primary.trades]
+        pd.testing.assert_frame_equal(res.primary.equity_df, single.primary.equity_df)
+        assert res.calibration == single.calibration
+        # The primary band's points are the default band's, and ARE scenarios
+        assert all(p.spread_band == BACKTEST_DEFAULT_SPREAD_BAND for p in res.points)
+        assert any(p is res.primary for p in res.points)
+        for p in res.points:
+            assert any(s is p for s in res.scenarios)
+
+    def test_preparation_once_and_one_time_series_pass_per_band(self, golden_band_sweep):
+        calls = golden_band_sweep.calls
+        assert calls["prepare"] == 1
+        ts_bands = [band for band, types, _ in calls["entries"] if types == ("time_series",)]
+        st_passes = [band for band, types, _ in calls["entries"] if types == ("same_title",)]
+        assert sorted(ts_bands) == _GRID_BANDS           # each band exactly once
+        assert len(st_passes) == 1                       # same-title entries once
+        assert len(calls["entries"]) == 36 + 1           # and nothing else
+
+    def test_the_candles_are_released_before_any_simulation(self, golden_band_sweep):
+        # ... and the pair list with them: nothing after the entry passes
+        # reads either, so neither may stay resident through the simulations.
+        calls = golden_band_sweep.calls
+        assert calls["simulate"] and all(c["released"] for c in calls["simulate"])
+
+    def test_every_completion_prefix_is_unique_and_468_are_all(self, golden_band_sweep):
+        # The band_sweep twin of TS-21's uniqueness test.
+        prefixes = _completion_prefixes(golden_band_sweep.messages)
+        assert len(prefixes) == len(set(prefixes))
+        labels = [p.rsplit(", ", 1)[1] for p in prefixes]
+        assert labels.count("all") == 468
+        # 468 x (all + ladder + H1 + H2 + ex-top) + 26 x 13 cross + 1 same-title
+        assert len(prefixes) == 468 * 5 + 26 * 13 + 1
+        assert labels.count("same_title") == 1
+
+    def test_every_scenario_s_entries_lie_within_its_stamped_band(self, golden_band_sweep):
+        eps = backtester.PRICE_EPSILON
+        by_point = {id(c["point"]): c for c in golden_band_sweep.calls["simulate"]}
+        sizes = set()
+        for point in golden_band_sweep.result.scenarios:
+            call = by_point[id(point)]
+            # The stamp IS the band the entries were detected under
+            assert call["band"] == point.spread_band
+            lo, hi = point.spread_band
+            ts = [rec["entry"] for rec in call["entries"] if rec["pair_type"] == "time_series"]
+            sizes.add(len(ts))
+            for e in ts:
+                spread = e["pB"] - e["pA"]
+                assert spread <= hi + eps
+                assert spread >= min_price_diff_for_gap(e["gap_days"], spread_min=lo) - eps
+            for t in point.trades:
+                if t.pair_type == "time_series":
+                    assert lo - eps <= t.entry_pB - t.entry_pA <= hi + eps
+        # Not vacuous: the bands really did select different entry sets
+        assert len(sizes) > 1
+
+    def test_robustness_checks_live_only_on_band_sweep_all_points(self, golden_band_sweep):
+        res, single = golden_band_sweep.result, golden_band_sweep.single
+        for p in res.scenarios:
+            if p.population == "all":
+                assert p.halves is not None and p.ex_top_event is not None
+            else:
+                assert p.halves is None and p.ex_top_event is None
+        assert res.same_title_point.halves is None
+        assert res.same_title_point.ex_top_event is None
+        assert all(p.halves is None and p.ex_top_event is None for p in single.points)
+        # No retained point carries a split-half / ex-top run label
+        assert all("/" not in p.population for p in res.scenarios)
+
+    def test_the_same_title_point_is_simulated_once(self, golden_band_sweep):
+        sims = [c for c in golden_band_sweep.calls["simulate"]
+                if c["population"] == "same_title"]
+        assert len(sims) == 1
+        assert sims[0]["point"] is golden_band_sweep.result.same_title_point
+        # Band- and k-independent: its band stamp is None, its k the primary's
+        assert golden_band_sweep.result.same_title_point.spread_band is None
+        assert golden_band_sweep.result.same_title_point.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert all(rec["pair_type"] == "same_title" for rec in sims[0]["entries"])
+
+    def test_populations_are_standalone_simulations_of_their_entries(self, golden_band_sweep):
+        start = golden_band_sweep.start
+        by_point = {id(c["point"]): c for c in golden_band_sweep.calls["simulate"]}
+        for p in golden_band_sweep.result.scenarios:
+            entries = by_point[id(p)]["entries"]
+            if p.population == "ladder":
+                assert entries and all(
+                    rec["entry"]["mA"]["event_ticker"] == rec["entry"]["mB"]["event_ticker"]
+                    for rec in entries)
+                assert all(t.same_event_ladder for t in p.trades)
+            elif p.population == "cross":
+                assert entries and all(
+                    rec["pair_type"] == "time_series"
+                    and rec["entry"]["mA"]["event_ticker"] != rec["entry"]["mB"]["event_ticker"]
+                    for rec in entries)
+                assert not any(t.same_event_ladder for t in p.trades)
+        # A population's result is its own run from the initial balance, not a
+        # slice of the "all" run: at the default band and k it re-simulates to
+        # the same trades on a fresh balance.
+        ladder = next(p for p in golden_band_sweep.result.scenarios
+                      if p.population == "ladder" and p.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT
+                      and p.spread_band == BACKTEST_DEFAULT_SPREAD_BAND)
+        again = backtester._simulate_at_discount(
+            by_point[id(ladder)]["entries"], start, 10_000.0,
+            k=ladder.k, spread_band=ladder.spread_band, population="ladder")
+        assert [astuple(t) for t in again.trades] == [astuple(t) for t in ladder.trades]
+        assert again.trades[0].balance_at_entry == pytest.approx(10_000.0)
+
+    def test_halves_and_ex_top_event_are_resimulations(self, golden_band_sweep):
+        res, start = golden_band_sweep.result, golden_band_sweep.start
+        by_point = {id(c["point"]): c for c in golden_band_sweep.calls["simulate"]}
+        entries = by_point[id(res.primary)]["entries"]
+        # split_date is the median_low of the primary band's entry dates: four
+        # of its five entries enter on Monday 1, the ladder on Monday 2.
+        assert sorted(rec["entry"]["entry_date"] for rec in entries) == [
+            date(2026, 1, 5)] * 4 + [date(2026, 1, 12)]
+        assert res.split_date == date(2026, 1, 5)
+        # H1 (strictly before the split) is empty, so H2 is every entry and
+        # must reproduce the primary's own return and trade count.
+        h = res.primary.halves
+        assert (h.h1_return, h.h1_trades) == (0.0, 0)
+        final = float(res.primary.equity_df["portfolio_value"].iloc[-1])
+        assert h.h2_return == pytest.approx((final - 10_000.0) / 10_000.0)
+        assert h.h2_trades == len(res.primary.trades)
+        # ex_top_event: the event with the largest summed profit, and the
+        # return of a re-simulation WITHOUT that event's entries.
+        pnl: dict = {}
+        for t in res.primary.trades:
+            pnl[t.event_ticker] = pnl.get(t.event_ticker, 0.0) + t.profit
+        top = max(pnl, key=pnl.get)
+        assert res.primary.ex_top_event[0] == top
+        rest = [rec for rec in entries if rec["entry"]["mA"]["event_ticker"] != top]
+        again = backtester._simulate_at_discount(rest, start, 10_000.0,
+                                                 k=res.primary.k,
+                                                 spread_band=res.primary.spread_band)
+        final_without = float(again.equity_df["portfolio_value"].iloc[-1])
+        assert res.primary.ex_top_event[1] == pytest.approx(
+            (final_without - 10_000.0) / 10_000.0)
+
+    @staticmethod
+    def _return(point):
+        return (float(point.equity_df["portfolio_value"].iloc[-1]) - 10_000.0) / 10_000.0
+
+    def test_every_all_point_s_checks_read_its_own_entries(self, golden_band_sweep):
+        # The test above re-simulates the PRIMARY cell by hand; this one pins
+        # the wiring at EVERY one of the 468 "all" cells: each split-half and
+        # ex-top run is handed that point's OWN entries (never the primary
+        # band's), split at the one split date, at the point's own k and
+        # band — and the numbers on the point are those runs' results.
+        res = golden_band_sweep.result
+        calls = golden_band_sweep.calls["simulate"]
+        by_point = {id(c["point"]): c for c in calls}
+        by_key: dict = {}
+        for c in calls:
+            key = (c["band"], c["point"].k, c["population"])
+            assert key not in by_key          # one simulation per (band, k, label)
+            by_key[key] = c
+        split = res.split_date
+        alls = [p for p in res.scenarios if p.population == "all"]
+        assert len(alls) == 468
+        contents = set()
+        for p in alls:
+            own = by_point[id(p)]["entries"]
+            contents.add(tuple(sorted((r["entry"]["mA"]["ticker"], r["entry"]["mB"]["ticker"])
+                                      for r in own)))
+            h1 = by_key[(p.spread_band, p.k, "all/H1")]
+            h2 = by_key[(p.spread_band, p.k, "all/H2")]
+            assert [id(r) for r in h1["entries"]] == [
+                id(r) for r in own if r["entry"]["entry_date"] < split]
+            assert [id(r) for r in h2["entries"]] == [
+                id(r) for r in own if r["entry"]["entry_date"] >= split]
+            assert p.halves == backtester.HalfSplit(
+                h1_return=self._return(h1["point"]), h2_return=self._return(h2["point"]),
+                h1_trades=len(h1["point"].trades), h2_trades=len(h2["point"].trades))
+            pnl: dict = {}
+            for t in p.trades:
+                if t.event_ticker:
+                    pnl[t.event_ticker] = pnl.get(t.event_ticker, 0.0) + t.profit
+            top = min(pnl, key=lambda ev: (-pnl[ev], ev))
+            ex = by_key[(p.spread_band, p.k, "all/ex-top")]
+            assert [id(r) for r in ex["entries"]] == [
+                id(r) for r in own if r["entry"]["mA"]["event_ticker"] != top]
+            assert p.ex_top_event == (top, self._return(ex["point"]))
+        # Not vacuous: the bands hand their checks different entry SETS, not
+        # merely different copies of one set.
+        assert len(contents) > 1
+
+    def test_a_non_primary_cell_s_checks_re_simulate_independently(self, golden_band_sweep):
+        # (0.35, 1.0) keeps a different entry set from the primary band's, so
+        # a check computed from the primary's entries would not match here.
+        res, start = golden_band_sweep.result, golden_band_sweep.start
+        by_point = {id(c["point"]): c for c in golden_band_sweep.calls["simulate"]}
+        p = next(s for s in res.scenarios if s.population == "all"
+                 and s.spread_band == (0.35, 1.0) and s.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+        own = by_point[id(p)]["entries"]
+        primary_own = by_point[id(res.primary)]["entries"]
+        assert sorted(r["entry"]["mA"]["ticker"] for r in own) != sorted(
+            r["entry"]["mA"]["ticker"] for r in primary_own)
+        for half, ret, n in (
+            ([r for r in own if r["entry"]["entry_date"] < res.split_date],
+             p.halves.h1_return, p.halves.h1_trades),
+            ([r for r in own if r["entry"]["entry_date"] >= res.split_date],
+             p.halves.h2_return, p.halves.h2_trades),
+        ):
+            alone = backtester._simulate_at_discount(half, start, 10_000.0, k=p.k)
+            assert ret == pytest.approx(self._return(alone))
+            assert n == len(alone.trades)
+        top, without = p.ex_top_event
+        rest = [r for r in own if r["entry"]["mA"]["event_ticker"] != top]
+        again = backtester._simulate_at_discount(rest, start, 10_000.0, k=p.k)
+        assert without == pytest.approx(self._return(again))
+
+    def test_every_band_has_its_own_calibration(self, golden_band_sweep):
+        res = golden_band_sweep.result
+        assert sorted(res.calibrations_by_band) == _GRID_BANDS
+        assert res.calibration is res.calibrations_by_band[BACKTEST_DEFAULT_SPREAD_BAND]
+        # At a 0.35 floor only the ladder (19-day stated gap, the 0.30 tier)
+        # is measurable, and its row is labelled with the floor it cleared.
+        raised = res.calibrations_by_band[(0.35, 1.0)]
+        assert [(b.label, b.tier) for b in raised.buckets] == [("16-30d", 0.35)]
+        # ... while the default band labels the tiers alone
+        assert {b.label: b.tier for b in res.calibration.buckets} == {
+            "8-15d": min_price_diff_for_gap(15), "16-30d": min_price_diff_for_gap(30)}
+        # Only the primary band's table is logged
+        headers = [m for m in golden_band_sweep.messages
+                   if m.startswith("Interval-discount calibration")]
+        assert len(headers) == 1
+
+    def test_phase_one_announces_every_band(self, golden_band_sweep):
+        announced = [m for m in golden_band_sweep.messages if m.startswith("Spread band ")]
+        assert len(announced) == 36
+        assert announced[0] == "Spread band 1/36: 0-0.5"
+        assert "Spread band 6/36: 0-1 (primary)" in announced
+        assert sum(m.endswith("(primary)") for m in announced) == 1
+
+    def test_the_sweep_records_the_resolved_ladder_setting(self, golden_band_sweep):
+        assert golden_band_sweep.result.same_event_ladders is True
+        assert golden_band_sweep.single.same_event_ladders is True
+
+
+class TestBandSweepEdges:
+    """The band sweep's other shapes: --no-sweep, an off-grid primary band, an
+    infeasible window, and the argument handling at the top of
+    run_backtest_sweep."""
+
+    def _run(self, monkeypatch, **kwargs):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        return run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=golden._START, initial_balance=10_000.0,
+                                  same_event_ladders=True, **kwargs)
+
+    def test_no_sweep_with_the_band_sweep_gives_one_k_per_band(self, monkeypatch):
+        res = self._run(monkeypatch, sweep=False, band_sweep=True)
+        alls = [p for p in res.scenarios if p.population == "all"]
+        assert sorted(p.spread_band for p in alls) == _GRID_BANDS     # 36 x 1
+        assert {p.k for p in alls} == {TIME_SERIES_INTERVAL_PROB_DISCOUNT}
+        assert res.points == [res.primary]
+
+    def test_an_off_grid_primary_band_is_its_own_exact_band(self, monkeypatch):
+        res = self._run(monkeypatch, sweep=False, band_sweep=True, spread_band=(0.33, 0.66))
+        alls = [p for p in res.scenarios if p.population == "all"]
+        assert len(alls) == 37
+        assert res.primary.spread_band == (0.33, 0.66)
+        assert any(p is res.primary for p in alls)
+        assert (0.33, 0.66) in res.calibrations_by_band
+
+    @pytest.mark.parametrize("band", [(0.3000001, 0.6), (0.1 + 0.2, 0.6)])
+    def test_a_near_grid_primary_band_is_labelled_distinctly(self, monkeypatch, caplog, band):
+        # %g prints both of these as "0.3-0.6", the label of a grid band the
+        # sweep also runs; the announcement and every completion prefix must
+        # still tell the 37 bands apart (TS-21).
+        with caplog.at_level(logging.INFO):
+            res = self._run(monkeypatch, sweep=False, band_sweep=True, spread_band=band)
+        assert len([p for p in res.scenarios if p.population == "all"]) == 37
+        messages = [r.getMessage() for r in caplog.records]
+        labels = [m.split(": ", 1)[1].removesuffix(" (primary)")
+                  for m in messages if m.startswith("Spread band ")]
+        assert len(labels) == len(set(labels)) == 37
+        assert "0.3-0.6" in labels
+        prefixes = _completion_prefixes(messages)
+        assert len(prefixes) == len(set(prefixes))
+
+    def test_a_near_grid_primary_k_is_labelled_distinctly(self, monkeypatch, caplog):
+        # "%.3f" prints 0.75 and 0.7500001 alike; the grid holds both.
+        with caplog.at_level(logging.INFO):
+            res = self._run(monkeypatch, interval_discount=0.7500001)
+        assert len(res.points) == 14
+        prefixes = _completion_prefixes([r.getMessage() for r in caplog.records])
+        assert len(prefixes) == len(set(prefixes)) == 14
+        assert "Backtest complete at k=0.750, band 0-1, all" in prefixes
+        assert "Backtest complete at k=0.7500001, band 0-1, all" in prefixes
+
+    def test_a_single_band_run_keeps_the_pre_band_log_wording(self, monkeypatch, caplog):
+        # Band sweep off: the entry and re-simulation lines read as they did
+        # before the band existed, and the band-sweep-only lines are absent.
+        with caplog.at_level(logging.INFO):
+            res = self._run(monkeypatch)
+        assert len(res.points) == 13 and res.scenarios == []
+        messages = [r.getMessage() for r in caplog.records]
+        # The golden fixture prepares five entries: three cross-event pairs
+        # and the same-title pair on Monday 1, the ladder on Monday 2.
+        prepared = [m for m in messages if m.startswith("Prepared ")]
+        assert prepared == ["Prepared 5 candidate entries for sizing"]
+        assert ("Re-simulating 5 prepared entries at 13 interval discounts "
+                "(primary k = 0.750)") in messages
+        assert not any(m.startswith(("Same-title candidate entries", "Split-half check",
+                                     "Simulating spread band", "Simulating the same-title"))
+                       for m in messages)
+        assert [m for m in messages if m.startswith("Spread band ")] == [
+            "Spread band 1/1: 0-1 (primary)"]
+
+    def test_the_infeasible_window_has_no_scenarios(self, monkeypatch):
+        res = TestRunBacktestSweep()._infeasible(monkeypatch, band_sweep=True,
+                                                 same_event_ladders=True)
+        assert res.scenarios == []
+        assert res.calibrations_by_band == {}
+        assert res.same_title_point is None and res.split_date is None
+        assert res.label_coverage is None
+        # The resolved ladder setting is still recorded, and the empty point
+        # still carries the band it would have been simulated at
+        assert res.same_event_ladders is True
+        assert res.primary.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
+
+    def test_a_single_band_run_keeps_its_calibration_keyed_by_band(self, monkeypatch):
+        res = self._run(monkeypatch, sweep=False)
+        assert res.calibrations_by_band == {BACKTEST_DEFAULT_SPREAD_BAND: res.calibration}
+        assert res.scenarios == [] and res.same_title_point is None
+        assert res.primary.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
+
+    def test_an_invalid_band_fails_before_anything_is_logged_or_fetched(
+        self, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must not run"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError, match="spread band"):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               spread_band=(0.6, 0.3))
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("band,source", [
+        (None, "config.BACKTEST_DEFAULT_SPREAD_BAND"),
+        ((0.3, 0.6), "run-level override"),
+    ])
+    def test_the_resolved_band_is_logged_with_its_source(self, monkeypatch, caplog,
+                                                         band, source):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               spread_band=band, band_sweep=True)
+        label = "0-1" if band is None else "0.3-0.6"
+        assert (f"Time-series spread band (backtest only): {label} ({source}); "
+                "band sweep on") in caplog.text
+
+    def test_a_harness_may_pass_no_band_to_the_second_half(self, monkeypatch):
+        # _sweep_from_candidates resolves the band itself too, so a caller
+        # holding its own _Candidates gets the default band.
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), golden._START, True, None, same_event_ladders=True)
+        res = backtester._sweep_from_candidates(
+            candidates, 10_000.0, interval_discount=None, sweep=False,
+            spread_band=None, band_sweep=False)
+        assert res.primary.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
+        # ... and the candidates are consumed: a second sweep fails loudly
+        # rather than running on no candles
+        assert not hasattr(candidates, "candles_by_ticker")
+        assert not hasattr(candidates, "all_pairs")
+        with pytest.raises(AttributeError):
+            backtester._sweep_from_candidates(
+                candidates, 10_000.0, interval_discount=None, sweep=False,
+                spread_band=None, band_sweep=False)
+
+
+class TestSweepHelpers:
+    """The split-date, split-half and excluding-top-event helpers on their own."""
+
+    def test_split_date_is_the_median_low(self):
+        recs = [{"entry": {"entry_date": d}} for d in
+                (date(2026, 1, 19), date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 26))]
+        # Even length: median_low takes the lower middle value (median would
+        # try to average two dates and raise).
+        assert backtester._split_date(recs, date(2026, 1, 1)) == date(2026, 1, 12)
+
+    def test_split_date_falls_back_to_the_window_midpoint(self, monkeypatch):
+        fixed = datetime(2026, 1, 21, 12, tzinfo=UTC)
+        frozen = type("FrozenDateTime",
+                      (TestRunBacktestFeasibilityPreCheck._FrozenDateTime,),
+                      {"_fixed": fixed})
+        monkeypatch.setattr(backtester, "datetime", frozen)
+        # [Jan 1, Jan 21] is 20 days; its midpoint is Jan 11
+        assert backtester._split_date([], date(2026, 1, 1)) == date(2026, 1, 11)
+
+    def test_half_split_simulates_each_half_alone(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        first = [r for r in entries if r["entry"]["entry_date"] < date(2026, 1, 12)]
+        second = [r for r in entries if r["entry"]["entry_date"] >= date(2026, 1, 12)]
+        assert first and second
+        split = backtester._half_split((first, second), golden._START, 10_000.0, 0.75,
+                                       BACKTEST_DEFAULT_SPREAD_BAND)
+        for half, ret, n in ((first, split.h1_return, split.h1_trades),
+                             (second, split.h2_return, split.h2_trades)):
+            alone = backtester._simulate_at_discount(half, golden._START, 10_000.0, k=0.75)
+            final = float(alone.equity_df["portfolio_value"].iloc[-1])
+            assert ret == pytest.approx((final - 10_000.0) / 10_000.0)
+            assert n == len(alone.trades)
+
+    @staticmethod
+    def _trade(event, profit):
+        t = TestEquityCurveOpensAtTheInitialBalance()._trade(10, 0.30, 0.40, "yes", 0.0)
+        t.event_ticker, t.profit = event, profit
+        return t
+
+    def test_ex_top_event_picks_the_largest_summed_profit(self, monkeypatch):
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append(([r["entry"]["mA"]["event_ticker"] for r in raw_entries], k))
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0, 90.0]}))
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        point = backtester.SweepPoint(
+            k=0.6, equity_df=pd.DataFrame(),
+            trades=[self._trade("E1", 5.0), self._trade("E2", 4.0), self._trade("E2", 3.0),
+                    self._trade("", 50.0)])   # no event ticker: never "an event"
+        entries = [{"entry": {"mA": {"event_ticker": ev}}} for ev in ("E1", "E2", "E2", "")]
+        top, ret = backtester._ex_top_event(point, entries, date(2026, 1, 1), 100.0,
+                                            (0.3, 0.6))
+        # E2's 4 + 3 beats E1's 5; the event-less 50 is ignored
+        assert top == "E2"
+        assert ret == pytest.approx(-0.10)
+        # ONE re-simulation, of every entry not on E2, at the point's k and band
+        assert seen == [(["E1", ""], {"k": 0.6, "spread_band": (0.3, 0.6),
+                                      "population": "all/ex-top"})]
+
+    def test_ex_top_event_ties_go_to_the_first_ticker_and_losses_count(self, monkeypatch):
+        monkeypatch.setattr(
+            backtester, "_simulate_at_discount",
+            lambda *a, **k: SimpleNamespace(
+                equity_df=pd.DataFrame({"portfolio_value": [100.0]})))
+        point = backtester.SweepPoint(
+            k=0.6, equity_df=pd.DataFrame(),
+            trades=[self._trade("EB", -2.0), self._trade("EA", -2.0), self._trade("EC", -3.0)])
+        # Every event lost; the least-losing is still the largest P&L
+        assert backtester._ex_top_event(point, [], date(2026, 1, 1), 100.0,
+                                        (0.0, 1.0))[0] == "EA"
+
+    def test_ex_top_event_is_none_without_an_event(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_simulate_at_discount",
+                            lambda *a, **k: pytest.fail("nothing to re-simulate"))
+        point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
+                                      trades=[self._trade("", 1.0)])
+        assert backtester._ex_top_event(point, [], date(2026, 1, 1), 100.0,
+                                        (0.0, 1.0)) is None
+
+
+class TestSimulationLabelsAndStamps:
+    """_simulate_at_discount's spread_band and population only label and
+    stamp — they change no trade."""
+
+    def test_the_completion_line_names_k_band_and_population(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.75,
+                                             spread_band=(0.3, 0.6), population="cross")
+        assert [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Backtest complete")] == [
+            "Backtest complete at k=0.750, band 0.3-0.6, cross: 0 trades, 0 profitable"]
+
+    def test_a_none_band_renders_the_default_and_stamps_none(self, caplog):
+        with caplog.at_level(logging.INFO):
+            point = backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0)
+        assert "band 0-1, all:" in caplog.text
+        assert point.spread_band is None and point.population == "all"
+
+    @pytest.mark.parametrize("band", [(0, 1), (-0.0, 1.0), (0.0, 1.0)])
+    def test_a_given_band_is_stamped_resolved(self, band):
+        point = backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0,
+                                                 spread_band=band)
+        assert point.spread_band == (0.0, 1.0)
+        assert all(type(x) is float for x in point.spread_band)
+
+    def test_labels_change_no_trade(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        plain = backtester._simulate_at_discount(entries, golden._START, 10_000.0)
+        labelled = backtester._simulate_at_discount(
+            entries, golden._START, 10_000.0, spread_band=(0.4, 0.5), population="all/H2")
+        assert [astuple(t) for t in plain.trades] == [astuple(t) for t in labelled.trades]
+        pd.testing.assert_frame_equal(plain.equity_df, labelled.equity_df)
+
+    @pytest.mark.parametrize("population", ["All", "ladders", "H1", ""])
+    def test_an_unknown_population_is_refused(self, population):
+        with pytest.raises(ValueError, match="population"):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0,
+                                             population=population)
+
+
+class TestIntervalCalibrationBandFloor:
+    """_interval_calibration(spread_min=...) labels each gap band with the
+    floor its entries were actually detected under."""
+
+    def test_the_0_7d_tier_reads_the_floor_above_it(self):
+        entries = [_cal_entry(3, 0.10, 0.70, "no", "yes")]
+        assert _interval_calibration(entries).buckets[0].tier == min_price_diff_for_gap(3)
+        raised = _interval_calibration(entries, spread_min=0.30)
+        assert [(b.label, b.tier) for b in raised.buckets] == [("0-7d", 0.30)]
+        # A floor below the tier is inert
+        assert _interval_calibration(entries, spread_min=0.10).buckets[0].tier == \
+            min_price_diff_for_gap(3)
+        # Labelling only: the measurement itself does not move
+        assert raised.pooled == _interval_calibration(entries).pooled
+
+
+class TestBandSweepSplitAndPopulationWiring:
+    """_sweep_from_candidates over hand-built entries whose dates and event
+    tickers DEPEND on the band — a shape the golden fixture cannot produce
+    (its entry dates never move with the band, so a per-band split date or a
+    population taken from the wrong band reads identically there). Pins the
+    ONE split date — the primary band's median_low, never a per-band or
+    first-band one — and every band's populations and halves coming from
+    that band's own entries."""
+
+    _D1, _D2, _D3, _D4 = (date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19),
+                          date(2026, 1, 26))
+
+    @staticmethod
+    def _rec(i, when, ladder):
+        # A time-series record carrying only what the sweep reads before
+        # simulating: its entry date and both legs' event tickers.
+        event = f"EV{i}"
+        return {"pair_type": "time_series", "canon": f"c{i}", "group_key": f"g{i}",
+                "entry": {"entry_date": when,
+                          "mA": {"ticker": f"A{i}", "event_ticker": event},
+                          "mB": {"ticker": f"B{i}",
+                                 "event_ticker": event if ladder else f"X{i}"}}}
+
+    def test_split_date_halves_and_populations_follow_each_band(self, monkeypatch):
+        D1, D2, D3, D4 = self._D1, self._D2, self._D3, self._D4
+        primary = BACKTEST_DEFAULT_SPREAD_BAND
+        by_band: dict = {}
+
+        def entries_for_band(candidates, spread_band=None, *, pair_types=()):
+            if pair_types == ("same_title",):
+                return []
+            if spread_band == primary:
+                spec = [(D1, True), (D2, False), (D3, True)]            # median_low D2
+            else:
+                # Its own median_low is D3 — including at bands[0], (0, 0.5)
+                # — and its ladder rungs differ from the primary's.
+                spec = [(D1, False), (D2, True), (D3, True), (D4, False), (D4, True)]
+            recs = [self._rec(i, when, ladder) for i, (when, ladder) in enumerate(spec)]
+            by_band[spread_band] = recs
+            return recs
+
+        sims: list = []
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all"):
+            point = backtester.SweepPoint(
+                k=TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
+                equity_df=pd.DataFrame({"portfolio_value": [initial_balance]}),
+                spread_band=spread_band, population=population)
+            sims.append((spread_band, population, list(raw_entries)))
+            return point
+
+        monkeypatch.setattr(backtester, "_entries_for_band", entries_for_band)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        candidates = backtester._Candidates(
+            all_pairs=[], candles_by_ticker={}, label_coverage=None,
+            start_date=date(2026, 1, 1), max_horizon_days=None, same_event_ladders=True)
+        res = backtester._sweep_from_candidates(
+            candidates, 10_000.0, interval_discount=None, sweep=False,
+            spread_band=None, band_sweep=True)
+
+        # ONE split date, the primary band's median_low
+        assert res.split_date == D2
+        assert sorted(by_band) == _GRID_BANDS
+        seen = {(band, label): entries for band, label, entries in sims}
+        for band, own in by_band.items():
+            ids = [id(r) for r in own]
+            ladder = [id(r) for r in own
+                      if r["entry"]["mA"]["event_ticker"] == r["entry"]["mB"]["event_ticker"]]
+            cross = [i for i in ids if i not in ladder]
+            assert [id(r) for r in seen[(band, "all")]] == ids
+            assert [id(r) for r in seen[(band, "all/H1")]] == [
+                id(r) for r in own if r["entry"]["entry_date"] < D2]
+            assert [id(r) for r in seen[(band, "all/H2")]] == [
+                id(r) for r in own if r["entry"]["entry_date"] >= D2]
+            assert [id(r) for r in seen[(band, "ladder")]] == ladder
+            assert [id(r) for r in seen[(band, "cross")]] == cross
+        # Not vacuous: a non-primary band's own median_low (D3) would have
+        # split its entries differently from the one split date (D2).
+        other = by_band[(0.0, 0.5)]
+        assert statistics.median_low(r["entry"]["entry_date"] for r in other) == D3
+        assert ([r for r in other if r["entry"]["entry_date"] < D3]
+                != [r for r in other if r["entry"]["entry_date"] < D2])
+
+
+class TestExactLabels:
+    """_exact_label / _band_label: the short form for every grid value, an
+    exact one whenever the short form would merge two different values."""
+
+    @pytest.mark.parametrize("band,label", [
+        ((0.0, 1.0), "0-1"),
+        ((0.3, 0.6), "0.3-0.6"),
+        ((0.35, 0.9), "0.35-0.9"),
+        ((0.3000001, 0.6), "0.3000001-0.6"),
+        ((0.1 + 0.2, 0.6), "0.30000000000000004-0.6"),
+    ])
+    def test_band_labels(self, band, label):
+        assert backtester._band_label(band) == label
+
+    @pytest.mark.parametrize("k,label", [
+        (0.75, "0.750"), (0.62, "0.620"), (1.0, "1.000"), (0.7500001, "0.7500001"),
+    ])
+    def test_k_labels(self, k, label):
+        assert backtester._exact_label(k, ".3f") == label
+
+    def test_every_grid_value_keeps_its_short_form(self):
+        for x in SPREAD_BAND_SWEEP_FLOORS + SPREAD_BAND_SWEEP_CEILINGS:
+            assert backtester._exact_label(float(x), "g") == format(x, "g")
+        for k in INTERVAL_DISCOUNT_SWEEP:
+            assert backtester._exact_label(k, ".3f") == format(k, ".3f")
