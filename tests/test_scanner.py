@@ -635,6 +635,62 @@ class TestOneEventSeriesIsTwoFixtures:
         assert len(lines) == 1
         assert lines[0].endswith(": 1")
 
+    def test_the_time_series_skip_is_reported_once_per_candidate(self, caplog):
+        # M10: the time-series finder's one-series conjunct used to `continue`
+        # with no count, so a run whose time-series zero it caused logged no
+        # cause at all (the same-title finder has always counted its twin).
+        # THREE game days of one fixture make three candidates, so a counter
+        # bumped once per GROUP (which would read 1) cannot pass.
+        mA, mB = self._npb_markets()
+        mC = _mock_market(
+            ticker="KXNPBRFI-26SEP140500FUKORI-Y",
+            event_ticker="KXNPBRFI-26SEP140500FUKORI",
+            title=self._NPB_TITLE, subtitle="Yes", event_title=self._NPB_EVENT_TITLE,
+            yes_ask=0.50, no_ask=0.50,
+            close_time=mB.close_time - timedelta(days=1),
+        )
+        with caplog.at_level(logging.INFO):
+            assert find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=[mA, mB, mC],
+            ) == []
+        assert [m for m in caplog.messages if "two instances of one event series" in m] == [
+            "Time-series candidates skipped as two instances of one event series "
+            "(identical wording, different fixture; counted before the gap and "
+            "price filters): 3"
+        ]
+
+    def test_the_time_series_skip_is_silent_at_zero(self, caplog):
+        # control: a dated pair of one series is not identical wording, so
+        # the conjunct never fires and nothing is reported.
+        mA, mB = self._sold_family("by")
+        with caplog.at_level(logging.INFO):
+            assert len(find_time_series_pairs(
+                MagicMock(), held_tickers=set(), markets=[mA, mB],
+            )) == 1
+        assert "one event series" not in caplog.text
+
+    def test_a_same_event_same_title_skip_is_reported_once_per_candidate(self, caplog):
+        # M10: two markets of ONE event under one (event_title, title,
+        # subtitle) key are that event's own markets, not one question listed
+        # by two events. The skip was this finder's one uncounted refusal.
+        # Three such markets make three candidates, none of which reaches the
+        # series rule — so the two counters cannot stand in for each other.
+        markets = [
+            _mock_market(ticker=f"KXDUP-26-{i}", event_ticker="KXDUP-26",
+                         title="Q", subtitle="Yes", event_title="E",
+                         yes_ask=round(0.2 + 0.2 * i, 2),
+                         no_ask=round(0.8 - 0.2 * i, 2))
+            for i in range(3)
+        ]
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs(markets) == []
+        assert caplog.messages.count(
+            "Same-title candidates skipped because both markets carry the same "
+            "event ticker (one event's own markets, not one question listed by "
+            "two events): 3"
+        ) == 1
+        assert "one event series" not in caplog.text
+
     def test_two_matches_of_one_table_tennis_player_are_rejected(self):
         # Two matches of one player within half an hour of each other,
         # which settled yes and no — the shape a close-time gate would have
@@ -971,6 +1027,8 @@ class TestEventSeries:
         with caplog.at_level(logging.INFO):
             assert len(find_same_title_pairs([mA, mB])) == 1
         assert "one event series" not in caplog.text
+        # M10's same-event count follows the same idiom.
+        assert "same event ticker" not in caplog.text
 
 
 class TestTimeSeriesGroupKey:

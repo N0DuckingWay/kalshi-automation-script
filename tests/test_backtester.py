@@ -720,9 +720,11 @@ class TestPhrasingSkipCounts:
             ) and line.endswith(": 3")
             for line in lines
         )
-        # This function does no gap-window logging of its own (the sweep
-        # window is a performance bound, not a reported filter) — mirrored
-        # here only to record that it stays absent.
+        # This function has no gap-CAP line of its own: its close-date window
+        # is a performance bound, not a rule. (Since M10 the pairs beyond
+        # that window are counted as never visited — worded apart from the
+        # live finder's gap-cap line, which counts pairs already worded as two
+        # cumulative deadlines.) Recorded here so the two stay distinct.
         assert not any("gap cap" in m for m in (r.getMessage() for r in caplog.records))
 
     def test_silent_at_zero(self, caplog):
@@ -738,6 +740,369 @@ class TestPhrasingSkipCounts:
             pairs = _extract_pairs(groups)
         assert len(pairs) == 1
         assert self._refusal_lines(caplog) == []
+
+
+# M10: the lines _extract_pairs gained, by prefix — four refusals, plus the two
+# things the time-series sweep sets aside before visiting anything. The DR-72
+# and DR-73 lines are read by the same prefix table so a test can check that
+# EVERY pair of a group's members is accounted for.
+_TS_UNDATED = "Time-series group members without a readable close_time"
+_TS_BEYOND = "Time-series candidate pairs the sweep never visits"
+_TS_SAME_EVENT = ("Time-series candidates skipped because both markets carry "
+                  "the same event ticker")
+_TS_SERIES = "Time-series candidates skipped as two instances of one event series"
+_ST_SAME_EVENT = ("Same-title candidates skipped because both markets carry the "
+                  "same event ticker")
+_ST_SERIES = "Same-title candidates skipped as two instances of one event series"
+_TS_WORDING = "Time-series candidates refused because"
+_LADDER_REFUSED = "Same-event ladder candidates refused because"
+_LADDER_GAP_CAP = "Same-event ladder candidates worded as two different cumulative"
+_LADDER_FORMED = "Same-event ladder candidates among the time-series candidates"
+# _prepare_candidates' always-logged grouping line (M10), for the empty-grouping
+# case _extract_pairs cannot see.
+_GROUPS = "Groups of two or more markets:"
+
+
+def _logged_counts(caplog) -> dict[str, int]:
+    """Sum the trailing ': N' of every _extract_pairs count line, by prefix.
+
+    Every count is of candidate PAIRS except _TS_UNDATED's, which counts
+    group MEMBERS — read it on its own, never in a sum with the others.
+    """
+    out: dict[str, int] = defaultdict(int)
+    prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _ST_SAME_EVENT,
+                _ST_SERIES, _TS_WORDING, _LADDER_REFUSED, _LADDER_GAP_CAP,
+                _LADDER_FORMED)
+    for message in caplog.messages:
+        for prefix in prefixes:
+            if message.startswith(prefix):
+                out[prefix] += int(message.rsplit(": ", 1)[1])
+    return out
+
+
+class TestOneSeriesAndSameEventCounts:
+    """M10: every pair of a group's members is returned or counted.
+
+    The one-series rule (DR-02, DR-54, both branches) and the same-event skip
+    were bare `continue`s here, so the 2026-09-24 7-day run logged "Potential
+    pairs: 0 time-series, 0 same-title" over 184,178 groupable markets with
+    no cause for the same-title zero. Each now has a silent-at-zero INFO line,
+    and so do the two things the time-series sweep sets aside before visiting
+    anything (members with no readable close_time, pairs beyond its
+    close-date window); an EMPTY grouping, which reaches _extract_pairs as {},
+    is reported by _prepare_candidates' always-logged group-count line.
+    Counting must move no control flow: the pair lists are pinned by every
+    other test in this module, and the partition test below proves that the
+    counts and the returned pairs together account for each pair exactly
+    once.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, wording, close):
+        # The shape of a real combo record in a day slice: title == subtitle
+        # (the leg wording), event_title blank (it is patched in at assembly
+        # for well under 1% of records).
+        return {"ticker": ticker, "event_ticker": event_ticker, "event_title": "",
+                "title": wording, "subtitle": wording, "close_time": close}
+
+    @classmethod
+    def _combo_heavy(cls):
+        """Eight records in three groups (seven candidates), every candidate
+        refused by one of M10's two rules.
+
+        W1: two tickets on ONE combo event (1 same-event candidate) and one
+        under a different KXMVE prefix (2 one-series candidates, DR-55).
+        W2: two tickets under two KXMVE prefixes (1 one-series candidate).
+        MLB: three game days of one non-combo series (3 one-series candidates).
+        Same-event 1, one-series 6: different counts, so swapping the two
+        counters cannot pass.
+        """
+        w1 = "yes Over 5.5 runs scored,no Over 2.5 runs scored"
+        w2 = "yes Lakers win,yes Over 3.5 runs scored"
+        mlb = "Over 5.5 runs scored"
+        return [
+            cls._rec("KXMVECROSSCATEGORY-S1-A", "KXMVECROSSCATEGORY-S1", w1,
+                     "2026-09-18T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY-S1-B", "KXMVECROSSCATEGORY-S1", w1,
+                     "2026-09-18T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY0-S2-A", "KXMVECROSSCATEGORY0-S2", w1,
+                     "2026-09-19T23:59:00Z"),
+            cls._rec("KXMVESPORTSMULTIGAMEEXTENDED-S3-A",
+                     "KXMVESPORTSMULTIGAMEEXTENDED-S3", w2, "2026-09-20T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY-S4-A", "KXMVECROSSCATEGORY-S4", w2,
+                     "2026-09-21T23:59:00Z"),
+            cls._rec("KXMLBTOTAL-26SEP181840STLPIT-5", "KXMLBTOTAL-26SEP181840STLPIT",
+                     mlb, "2026-09-18T23:57:58Z"),
+            cls._rec("KXMLBTOTAL-26SEP191840STLPIT-5", "KXMLBTOTAL-26SEP191840STLPIT",
+                     mlb, "2026-09-19T23:57:58Z"),
+            cls._rec("KXMLBTOTAL-26SEP201840STLPIT-5", "KXMLBTOTAL-26SEP201840STLPIT",
+                     mlb, "2026-09-20T23:57:58Z"),
+        ]
+
+    @staticmethod
+    def _group_sizes(groups):
+        return sorted(len(members) for members in groups.values())
+
+    @pytest.mark.parametrize("grouping,same_event,series", [
+        (_group_by_exact_title, _ST_SAME_EVENT, _ST_SERIES),
+        (_group_by_normalized_title, _TS_SAME_EVENT, _TS_SERIES),
+    ])
+    def test_a_combo_heavy_zero_is_fully_explained(
+        self, caplog, grouping, same_event, series,
+    ):
+        # regression — fails on the pre-M10 code, which returned [] here and
+        # logged none of these lines, so the zero had no cause in the log.
+        groups = grouping(self._combo_heavy())
+        # Not vacuous: three groups of 3, 2 and 3, so 3 + 1 + 3 = 7 candidates.
+        assert self._group_sizes(groups) == [2, 3, 3]
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=False) == []
+        counts = _logged_counts(caplog)
+        assert counts[same_event] == 1
+        assert counts[series] == 6
+        # Every one of the seven candidates is on exactly one of the two lines.
+        assert sum(counts.values()) == 7
+
+    def test_with_ladders_on_the_sweep_leaves_same_event_candidates_to_the_sub_pass(
+        self, caplog,
+    ):
+        # control — kills counting the sweep's same-event skip unconditionally.
+        # With the switch on, a same-event candidate is the ladder sub-pass's,
+        # which counts it (here: identical wording); counting it on the
+        # sweep's line as well would report it twice.
+        groups = _group_by_normalized_title(self._combo_heavy())
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=True) == []
+        counts = _logged_counts(caplog)
+        assert _TS_SAME_EVENT not in counts
+        assert counts[_TS_SERIES] == 6
+        assert counts[_LADDER_REFUSED] == 1
+        assert counts[_LADDER_FORMED] == 0
+
+    def test_the_same_title_lines_are_the_live_finders_verbatim(self, caplog):
+        # The backtest mirrors find_same_title_pairs' two lines word for word,
+        # so one grep reads either path. Same fixture through both: the live
+        # finder gets priced namespaces, the backtester the dicts.
+        recs = self._combo_heavy()
+        live = [SimpleNamespace(ticker=r["ticker"], event_ticker=r["event_ticker"],
+                                title=r["title"], subtitle=r["subtitle"],
+                                _event_title=r["event_title"], yes_ask_dollars="0.50",
+                                no_ask_dollars="0.50",
+                                close_time=_parse_iso_datetime(r["close_time"]))
+                for r in recs]
+        with caplog.at_level(logging.INFO):
+            scanner.find_same_title_pairs(live)
+        live_lines = [m for m in caplog.messages
+                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(_group_by_exact_title(recs))
+        backtest_lines = [m for m in caplog.messages
+                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+        assert len(live_lines) == 2
+        assert backtest_lines == live_lines
+
+    def test_the_time_series_series_line_shares_the_live_prefix(self, caplog):
+        # Only the parenthesis differs from find_time_series_pairs' line, as
+        # it does for the DR-72 lines: the sweep is windowed, the live loop
+        # is not.
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(_group_by_normalized_title(self._combo_heavy()))
+        [line] = [m for m in caplog.messages if m.startswith(_TS_SERIES)]
+        assert line == (
+            "Time-series candidates skipped as two instances of one event series "
+            "(identical wording, different fixture; within the deadline-gap "
+            "window, before price filters): 6"
+        )
+
+    @pytest.mark.parametrize("grouping", [_group_by_exact_title, _group_by_normalized_title])
+    def test_silent_at_zero(self, caplog, grouping):
+        # control — kills a mutant that drops any of the four `if count:`
+        # guards. Two different series asking one cumulative question at two
+        # deadlines: nothing is refused by either rule on either branch.
+        recs = [
+            self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+            self._rec("KXBB-1-T", "KXBB-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+        ]
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(grouping(recs), same_event_ladders=False)
+        counts = _logged_counts(caplog)
+        for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES,
+                       _ST_SAME_EVENT, _ST_SERIES):
+            assert prefix not in counts
+
+    @pytest.mark.parametrize("ladders", [False, True])
+    def test_a_zero_the_sweep_never_visits_is_explained(self, caplog, ladders):
+        # regression — fails on the first cut of M10, which counted only the
+        # candidates the sweep VISITS: a group whose dated members close 61
+        # days apart, beside one with no close_time, returned [] and logged
+        # nothing (the P4 critics' reproducer). Worded as two different
+        # cumulative deadlines on two series, so no rule would refuse the
+        # pair — the window and the missing close are the whole cause.
+        recs = [
+            self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+            self._rec("KXBB-1-T", "KXBB-1", "Will X happen by May 1, 2026?",
+                      "2026-05-01T00:00:00Z"),
+            self._rec("KXCC-1-T", "KXCC-1", "Will X happen by April 1, 2026?", None),
+        ]
+        groups = _group_by_normalized_title(recs)
+        assert self._group_sizes(groups) == [3]
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=ladders) == []
+        counts = _logged_counts(caplog)
+        assert counts[_TS_UNDATED] == 1
+        assert counts[_TS_BEYOND] == 1
+        # Nothing was visited, so nothing was refused.
+        for prefix in (_TS_SAME_EVENT, _TS_SERIES, _TS_WORDING, _LADDER_REFUSED,
+                       _LADDER_GAP_CAP):
+            assert prefix not in counts
+        [line] = [m for m in caplog.messages if m.startswith(_TS_BEYOND)]
+        # Not the live finder's gap-cap line: no rule was evaluated here.
+        assert "more than 31 days apart" in line and "gap cap" not in line
+
+    def test_an_empty_grouping_is_reported_by_prepare_candidates(
+        self, monkeypatch, caplog,
+    ):
+        # regression — fails on the first cut of M10. A grouping with no
+        # group of two or more reaches _extract_pairs as {}, where every line
+        # is silent, so "0 same-title" had no cause in the log. Here the two
+        # markets share only the time-series key (their titles differ), so
+        # the same-title grouping is empty.
+        corpus = [
+            _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026",
+                        event_title="RAIN", close="2026-03-01"),
+            _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026",
+                        event_title="RAIN", close="2026-03-20"),
+        ]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            TestGroupableSubset._prepare(ladders=False)
+        messages = caplog.messages
+        [groups_at] = [i for i, m in enumerate(messages) if m.startswith(_GROUPS)]
+        assert messages[groups_at] == (
+            "Groups of two or more markets: 1 time-series (2 markets), "
+            "0 same-title (0 markets) — pairs form only inside a group"
+        )
+        census_at = next(i for i, m in enumerate(messages)
+                         if m.startswith("Deadline phrasing over"))
+        pairs_at = next(i for i, m in enumerate(messages)
+                        if m.startswith("Potential pairs:"))
+        # After the census, before any per-candidate line and the pair count.
+        assert census_at < groups_at < pairs_at
+        assert messages[pairs_at] == "Potential pairs: 1 time-series, 0 same-title"
+
+    @staticmethod
+    def _fuzz(seed: int) -> list[dict]:
+        """Every rule's shape at random: one-series fixtures, KXMVE prefixes,
+        same-event duplicates, empty event tickers, ladders, and cumulative,
+        snapshot and deadline-less wording, over a 60-day close spread so the
+        sweep's window cuts some candidates."""
+        rng = random.Random(seed)
+        stems = ["Will X happen", "Will Y win", "Starship launches", "Q"]
+        preps = ["by", "before", "on", "in", ""]
+        months = ["March", "April", "May"]
+        series = ["KXAA", "KXBB", "KXMVECROSSCATEGORY", "KXMVECROSSCATEGORY0", ""]
+        recs = []
+        for i in range(240):
+            prep = rng.choice(preps)
+            stem = rng.choice(stems)
+            title = (f"{stem} {prep} {rng.choice(months)} {rng.randint(1, 28)}, 2026?"
+                     if prep else f"{stem}?")
+            ser = rng.choice(series)
+            rec = {
+                "ticker": f"F{seed}-{i:04d}",
+                "event_ticker": f"{ser}-{rng.randint(0, 5)}" if ser else "",
+                "event_title": rng.choice(["", "Event A"]),
+                "title": title,
+                "subtitle": rng.choice(["", "Yes", title]),
+                "close_time": (datetime(2026, 3, 1, tzinfo=UTC)
+                               + timedelta(days=rng.randint(0, 60))).isoformat(),
+            }
+            if recs and rng.random() < 0.25:
+                # Re-list an earlier market's exact wording — on its own event
+                # half the time (a same-event duplicate), otherwise on this
+                # record's random event — so every rule has candidates to
+                # refuse whatever the seed.
+                src = rng.choice(recs)
+                rec.update(title=src["title"], subtitle=src["subtitle"],
+                           event_title=src["event_title"])
+                if rng.random() < 0.5:
+                    rec["event_ticker"] = src["event_ticker"]
+            recs.append(rec)
+        return recs
+
+    @pytest.mark.parametrize("ladders", [False, True])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_every_candidate_is_returned_or_counted_exactly_once(
+        self, caplog, seed, ladders,
+    ):
+        # The property the finding asks for: the counts EXPLAIN the result.
+        # The candidates are enumerated here independently of _extract_pairs
+        # (the sweep's window is the only rule restated), then compared with
+        # what it returned plus what it counted.
+        recs = self._fuzz(seed)
+        # Some members with no readable close_time, which the sweep sets
+        # aside before visiting anything (one malformed, the rest absent).
+        for k, rec in enumerate(recs):
+            if k % 17 == 5:
+                rec["close_time"] = "not a date" if k == 5 else None
+        margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
+        ts_groups = _group_by_normalized_title(recs)
+        st_groups = _group_by_exact_title(recs)
+
+        cross = same_event_in_window = ladder_population = 0
+        undated = beyond = dated_pairs = 0
+        for members in ts_groups.values():
+            dated = [m for m in members if _parse_iso_date(m["close_time"]) is not None]
+            undated += len(members) - len(dated)
+            dated_pairs += len(dated) * (len(dated) - 1) // 2
+            for x, a in enumerate(dated):
+                for b in dated[x + 1:]:
+                    gap = abs(_parse_iso_date(a["close_time"]) - _parse_iso_date(b["close_time"]))
+                    if gap > margin:
+                        beyond += 1
+                        continue
+                    if a["event_ticker"] == b["event_ticker"]:
+                        same_event_in_window += 1
+                    else:
+                        cross += 1
+            buckets = defaultdict(int)
+            for m in dated:
+                buckets[m["event_ticker"]] += 1
+            ladder_population += sum(n * (n - 1) // 2 for n in buckets.values())
+        st_candidates = sum(len(v) * (len(v) - 1) // 2 for v in st_groups.values())
+
+        with caplog.at_level(logging.INFO):
+            ts_pairs = _extract_pairs(ts_groups, same_event_ladders=ladders)
+        ts = _logged_counts(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            st_pairs = _extract_pairs(st_groups, same_event_ladders=ladders)
+        st = _logged_counts(caplog)
+
+        ladder_pairs = ts[_LADDER_FORMED]
+        # Not vacuous: each rule fires, and something survives.
+        assert ts[_TS_SERIES] and st[_ST_SERIES] and st[_ST_SAME_EVENT]
+        assert len(ts_pairs) and len(st_pairs)
+        # What the sweep set aside before visiting anything, and the whole
+        # partition of the dated members' pairs: beyond the window, or
+        # visited (same-event or cross-event).
+        assert ts[_TS_UNDATED] == undated > 0
+        assert ts[_TS_BEYOND] == beyond > 0
+        assert dated_pairs == beyond + same_event_in_window + cross
+        assert cross == (len(ts_pairs) - ladder_pairs) + ts[_TS_SERIES] + ts[_TS_WORDING]
+        if ladders:
+            assert _TS_SAME_EVENT not in ts
+            assert ladder_population == (
+                ts[_LADDER_REFUSED] + ts[_LADDER_GAP_CAP] + ladder_pairs
+            )
+        else:
+            assert ts[_TS_SAME_EVENT] == same_event_in_window > 0
+            assert ladder_pairs == 0
+        assert st_candidates == len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
 
 
 class TestDeadlineProfileParity:

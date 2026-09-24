@@ -1610,17 +1610,69 @@ def _extract_pairs(
     rejects any time-series pair whose close dates differ by more than
     MAX_DEADLINE_GAP_DAYS, so pairs outside that window can never produce an
     entry and are skipped without ever being materialized as a candidate
-    pair. The +1 day margin is slack only (it can never cause a pair within
-    the true limit to be skipped) — _find_entry() still applies the exact
+    pair (they are counted, never enumerated — see below). The +1 day margin
+    is slack only (it can never cause a pair within the true limit to be
+    skipped) — _find_entry() still applies the exact
     `.days > MAX_DEADLINE_GAP_DAYS` cutoff itself. Members with a missing or
-    unparseable close_time are dropped from this sweep (group-local only —
-    _group_by_exact_title's same-title groups are untouched), because
-    _find_entry() unconditionally requires close_time on both legs and
-    returns None immediately without it, regardless of pair type.
+    unparseable close_time are dropped from this sweep, and counted
+    (group-local only — _group_by_exact_title's same-title groups are
+    untouched), because _find_entry() unconditionally requires close_time on
+    both legs and returns None immediately without it, regardless of pair
+    type.
 
     3-tuple-keyed (same-title) groups have no deadline-gap concept, so they
     stay naive — the eligibility prefilter (_can_ever_enter, applied in
     run_backtest before grouping) keeps these groups small in practice.
+
+    EVERY PAIR OF A GROUP'S MEMBERS IS ACCOUNTED FOR (M10). Each count below
+    is reported once, at the end of the call, on its own silent-at-zero INFO
+    line, and together with the pairs returned they cover every pair of
+    members of every group this call receives:
+      - a same-title group is swept naively, so each of its pairs is visited
+        and is either returned or refused as both markets on one event
+        ticker, or as two events of one series (DR-02, DR-54);
+      - a time-series group first sets aside its members with no readable
+        close_time (counted as MEMBERS, not pairs — no pair involving one is
+        ever formed), then splits the pairs of the rest at the sweep's
+        close-date window: the pairs beyond it are counted as never visited
+        (no rule is evaluated on them — the window is a performance bound:
+        _find_entry rejects a cross-event pair that far apart anyway, and a
+        same-event one would be refused with the ladder switch off and is
+        judged by the ladder sub-pass with it on), and each pair inside it
+        is either returned or refused as both markets on one event ticker
+        (counted only while the ladder switch is off; with it on the pair
+        belongs to the ladder sub-pass, which counts it there), as two
+        events of one series worded identically, or for one of the three
+        DR-72 wording reasons. With the switch on, the sub-pass's own lines
+        count every same-event pair of the group, INCLUDING those the
+        sweep's window excludes, so its population overlaps the
+        never-visited count by exactly the same-event pairs beyond the
+        window.
+    The one exception is the `seen` guard, an uncounted `continue` that can
+    fire only on a ticker listed twice in one group — a corpus the assembly's
+    first-wins ticker dedup never produces — and that cannot cause a zero
+    even then, since `seen` holds only pairs already returned for the group
+    and so refuses nothing but a repeat of one. And a grouping with NO group
+    of two or more members reaches this function as an empty dict, which
+    says nothing about which kind of grouping it was, so _prepare_candidates
+    logs both groupings' sizes on every run before calling it; between that
+    line and these, every zero "Potential pairs" count has a logged cause.
+
+    The one-series and same-event checks used to be bare `continue`s, so a
+    corpus whose candidates they refused — the shape a combo-heavy window
+    takes, where identically worded KXMVE tickets share a group key —
+    reported "Potential pairs: 0" with no logged cause at all (DR-66).
+    Counting changes no control flow: every check, its order and every pair
+    returned are exactly as before. The same-title one-series line is the
+    verbatim mirror of scanner.find_same_title_pairs'; the same-title
+    same-event and time-series one-series lines mirror the lines M10 added to
+    the two live finders; the time-series same-event line has no live twin
+    that counts the same thing — the live finder's disabled-ladder count is
+    unwindowed and over actively priced markets — and neither do the
+    never-visited and no-close_time lines, since the live finder sweeps
+    every pair of a group (its gap cap is a counted rule, applied after the
+    wording check) and drops a market without a close_time before grouping,
+    with its own WARNING.
 
     SAME-EVENT DEADLINE LADDERS (DR-73), when same_event_ladders resolves
     True, are the mirror of scanner.find_time_series_pairs' ladder branch: two
@@ -1720,6 +1772,33 @@ def _extract_pairs(
     snapshot_skips = 0
     no_deadline_skips = 0
     same_deadline_skips = 0
+    # The one-series and same-event refusals (M10), counted where they fire,
+    # per CANDIDATE pair, and reported beside the three above (silent at
+    # zero). They were bare `continue`s, so the 2026-09-24 7-day run logged
+    # "Potential pairs: 0 time-series, 0 same-title" over 184,178 groupable
+    # markets with 748 time-series wording refusals and nothing that named a
+    # cause for the rest of that zero. A counter is only ever incremented
+    # immediately before the `continue` it explains, so no check moves and
+    # no pair changes.
+    #
+    # ts_same_event_skips counts ONLY while the ladder switch is off: with it
+    # on, a same-event candidate is not refused here but handed to the ladder
+    # sub-pass below, which counts every one of them (unwindowed) on its own
+    # lines, so counting it here as well would report it twice.
+    ts_same_event_skips = 0
+    ts_series_skips = 0
+    st_same_event_skips = 0
+    st_series_skips = 0
+    # The two things the time-series sweep drops BEFORE any candidate is
+    # visited (M10), so that a zero caused by them has a cause in the log
+    # too. ts_undated_members counts MEMBERS (a member without a readable
+    # close_time forms no pair at all); ts_beyond_window counts the pairs of
+    # dated members the close-date window excludes. Both are tallied once per
+    # outer index or per group — never per candidate — so the sweep's
+    # O(n * window) cost is unchanged: at the window's `break`, every later
+    # index is also beyond it (the members are sorted by close date).
+    ts_undated_members = 0
+    ts_beyond_window = 0
     # DR-73's same-event ladder sub-pass keeps its OWN counters, for the same
     # reason the live branch does: they count candidates INSIDE one event, a
     # population the three above have never seen, and folding them in blurs
@@ -1729,8 +1808,12 @@ def _extract_pairs(
     # ladder_disabled_skips is live-only: counting the disabled population
     # here would mean enumerating every same-event pair just to feed a
     # counter, which is 615,266 pairs on one real strike-blind day slice — the
-    # switch-off path must do no pairwise work at all. ladder_price_sum_skips
-    # has nothing to count: this function applies no price filter of any kind.
+    # switch-off path must do no pairwise work at all. (ts_same_event_skips
+    # above is not that census: it counts only the same-event candidates the
+    # windowed sweep already visits, so it costs no pairwise work of its own,
+    # and it is a windowed subset of that census, not the census itself.)
+    # ladder_price_sum_skips has nothing to count: this function applies no
+    # price filter of any kind.
     ladder_no_event_skips = 0
     ladder_identical_wording_skips = 0
     ladder_snapshot_skips = 0
@@ -1773,6 +1856,8 @@ def _extract_pairs(
             # naive O(n^2) double loop over the whole group.
             dated = [(_parse_iso_date(m.get("close_time")), m) for m in members]
             dated = [(d, m) for d, m in dated if d is not None]
+            # Members the sweep cannot place (M10): counted, never paired.
+            ts_undated_members += len(members) - len(dated)
             dated.sort(key=lambda pair: pair[0])
             margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
             n = len(dated)
@@ -1787,19 +1872,30 @@ def _extract_pairs(
             group_profiles = [_deadline_profile_dict(m) for _d, m in dated]
             for i in range(n):
                 close_a, mA = dated[i]
+                # The first index the window excludes for this mA; n when the
+                # window reaches the end of the group (M10's never-visited
+                # count — set only at the `break`, so no candidate pays for it).
+                stop = n
                 for j in range(i + 1, n):
                     close_b, mB = dated[j]
                     if close_b - close_a > margin:
                         # Sorted ascending by close_time — every further j is
                         # at least this far from mA, so nothing later qualifies.
+                        stop = j
                         break
                     if mA["event_ticker"] == mB["event_ticker"]:
+                        # Two markets of ONE event: refused here with the
+                        # ladder switch off; with it on, the ladder sub-pass
+                        # below judges (and counts) the candidate instead.
+                        if not ladders_on:
+                            ts_same_event_skips += 1
                         continue
                     # Mirror of the scanner's time-series conjunct: identical
                     # wording across two events of one series is two instances
                     # of one recurring fixture, not one question at two
                     # deadlines (DR-02, DR-54).
                     if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                        ts_series_skips += 1
                         continue
                     # Mirror of the scanner's cumulative-deadline rule, through
                     # the SAME scanner.cumulative_deadline_pair: the two legs
@@ -1832,6 +1928,8 @@ def _extract_pairs(
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
+                # Indexes stop..n-1 were never visited for this mA.
+                ts_beyond_window += n - stop
 
             # ── DR-73: the same-event deadline ladder sub-pass ────────────
             # A SEPARATE pass, not a relaxation of the sweep above, for two
@@ -1993,17 +2091,91 @@ def _extract_pairs(
             for i, mA in enumerate(members):
                 for mB in members[i + 1:]:
                     if mA["event_ticker"] == mB["event_ticker"]:
+                        # Mirror of scanner.find_same_title_pairs' same-event
+                        # skip, counted as it now is there (M10).
+                        st_same_event_skips += 1
                         continue
                     # Mirror of scanner.find_same_title_pairs' one-series rule:
                     # the group key already guarantees identical wording, so
                     # two events of one series are two fixtures (DR-02, DR-54).
                     if _same_series_dicts(mA, mB):
+                        st_series_skips += 1
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
                         continue
                     seen.add(pair_key)
                     pairs.append((mA, mB, canon, key))
+    # What the time-series sweep set aside before visiting anything (M10),
+    # each silent at zero: without these, a zero caused by an unreadable
+    # close_time or by a group whose members all close too far apart logged
+    # nothing at all. Neither has a live twin (see the docstring). Worded as
+    # never VISITED, not refused, and without "gap cap": no rule was evaluated
+    # on these pairs, and the live finder's gap-cap line counts something
+    # else — pairs already worded as two cumulative deadlines.
+    if ts_undated_members:
+        logging.info(
+            "Time-series group members without a readable close_time, left "
+            "out of pair extraction (_find_entry cannot enter a pair without "
+            "one; counted as markets, not pairs): %d",
+            ts_undated_members,
+        )
+    if ts_beyond_window:
+        logging.info(
+            "Time-series candidate pairs the sweep never visits because their "
+            "close dates are more than %d days apart (a performance bound, no "
+            "rule evaluated — _find_entry rejects a cross-event pair past %d "
+            "days; with same-event ladders on, the ladder sub-pass still judges "
+            "the same-event ones): %d",
+            MAX_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS, ts_beyond_window,
+        )
+    # The one-series and same-event refusals (M10), each silent at zero.
+    # _prepare_candidates hands each call ONE grouping (the time-series or
+    # the same-title one), so a production call logs at most one pair of
+    # these. The time-series lines say "within the deadline-gap window,
+    # before price filters" like the DR-72 lines below, because the windowed
+    # sweep never visits a candidate beyond that window; the same-title lines
+    # are unwindowed, like the branch that counts them.
+    if ts_same_event_skips:
+        # Backtest-only: the live finder's nearest line ("Same-event
+        # candidates skipped because same-event deadline ladders are
+        # disabled ...") counts EVERY same-event candidate of a group, while
+        # this counts only those inside the sweep's window, over eligible
+        # settled markets — two different numbers, so two different wordings.
+        # Logged only with the switch off; with it on, the ladder sub-pass's
+        # own lines below account for the same candidates.
+        logging.info(
+            "Time-series candidates skipped because both markets carry the "
+            "same event ticker and same-event deadline ladders are off for "
+            "this run (within the deadline-gap window, before price "
+            "filters): %d",
+            ts_same_event_skips,
+        )
+    if ts_series_skips:
+        # Mirror of the line find_time_series_pairs logs for its one-series
+        # conjunct (M10); the parenthesis differs as the DR-72 lines' does.
+        logging.info(
+            "Time-series candidates skipped as two instances of one event "
+            "series (identical wording, different fixture; within the "
+            "deadline-gap window, before price filters): %d",
+            ts_series_skips,
+        )
+    if st_same_event_skips:
+        # Verbatim mirror of find_same_title_pairs' same-event line (M10).
+        logging.info(
+            "Same-title candidates skipped because both markets carry the "
+            "same event ticker (one event's own markets, not one question "
+            "listed by two events): %d",
+            st_same_event_skips,
+        )
+    if st_series_skips:
+        # Verbatim mirror of find_same_title_pairs' long-standing one-series
+        # line: both count every refused candidate before any price filter
+        # (this function applies none), so the two numbers mean the same.
+        logging.info(
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): %d", st_series_skips,
+        )
     # Mirror of the live scanner's three-way split (DR-72), each silent at
     # zero: within the deadline-gap window this sweep already restricted
     # itself to, before any price filter runs (this function does no price
@@ -2032,7 +2204,8 @@ def _extract_pairs(
     # DR-73's own reporting, the mirror of the live finder's. Every line below
     # counts candidates INSIDE one event — a population none of the counters
     # above has ever seen — and each is silent at zero, so a run with the
-    # switch off adds no line at all to this function's output. They say
+    # switch off adds no LADDER line to this function's output (the sweep's
+    # own same-event line above is not a ladder line). They say
     # "same-event sub-pass" rather than "within the deadline-gap window",
     # because that sub-pass is deliberately unwindowed (see the docstring).
     if ladder_no_event_skips:
@@ -3711,6 +3884,21 @@ def _prepare_candidates(
     # eligible list would have produced.
     ts_groups    = _group_by_normalized_title(groupable)
     same_groups  = _group_by_exact_title(groupable)
+    # Both groupings' sizes, logged on EVERY run, zero included (M10). A
+    # grouping with no group of two or more members reaches _extract_pairs as
+    # an empty dict, which cannot say which kind of grouping it was, and
+    # every per-candidate line there is silent at zero — so without this
+    # line an empty grouping and one whose every candidate was refused
+    # would read the same ("Potential pairs: 0 ..." and nothing else),
+    # absence of a warning being the only signal (DR-66). Linear in the
+    # number of groups; the groupable-subset line above counts the markets
+    # that share a key, this one what those keys actually grouped.
+    logging.info(
+        "Groups of two or more markets: %d time-series (%d markets), "
+        "%d same-title (%d markets) — pairs form only inside a group",
+        len(ts_groups), sum(len(v) for v in ts_groups.values()),
+        len(same_groups), sum(len(v) for v in same_groups.values()),
+    )
     # The ladder flag rides through unresolved (None included): the two calls
     # here and every _find_entry call of every later entry pass (it is carried
     # on the returned _Candidates) receive the same argument and resolve the
