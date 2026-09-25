@@ -29,7 +29,12 @@ Dependencies:
     constants, and stated_deadline / same_event_ladder with its SAME_DAY
     sentinel (the single definition of which calendar day a rung's deadline
     names and of how two rungs of one event are ordered and gapped — DR-73,
-    so the live and backtest ladder rules can never disagree), from
+    so the live and backtest ladder rules can never disagree), and
+    closes_apart (the single definition of the same-title close gate — DR-74,
+    so the two paths can never disagree about which cross-series pair closes
+    at one moment) with close_gap_bound_text (the bound its refusal line
+    prints, read from the same scanner binding the gate reads, so the line
+    stays the live one's verbatim twin), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
     time_series_profit_prob), the backtest-only spread-band helpers
@@ -250,6 +255,8 @@ from .scanner import (
     REFUSED_SAME_DEADLINE,
     REFUSED_SNAPSHOT,
     SAME_DAY,
+    close_gap_bound_text,
+    closes_apart,
     cumulative_deadline_pair,
     deadline_pair_refusal,
     deadline_profile,
@@ -1347,6 +1354,46 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
     return not sa or not sb or sa == sb
 
 
+def _comparable_closes_dicts(mA: dict, mB: dict) -> tuple[datetime, datetime] | None:
+    """
+    Both records' close_time parsed, or None when they cannot be compared.
+
+    The dict-world READER of the same-title close gate (DR-74): the verdict
+    itself is scanner.closes_apart, called by _extract_pairs on what this
+    returns, so the live finder and this one can never disagree about which
+    cross-series pair closes at one moment. Readability is split out here,
+    rather than left to closes_apart's own fail-closed branch, because the two
+    paths do NOT see the same population: the live finder never reaches a
+    market without a close_time (_filter_active_markets drops it before
+    grouping, with its own WARNING), while the backtest's same-title groups
+    are not close-filtered — _can_ever_enter keeps a market whose close_time
+    it cannot parse. So an unreadable close is counted on its own
+    backtest-only line, and the close-gap line stays verbatim with the live
+    one for every READABLE pair. One shape splits the two paths' lines: a
+    naive close beside an aware one lands here, on the unreadable line,
+    while the live finder, whose gate has one line only, counts it on its
+    close-gap line. Both refuse it, and the live path cannot reach it today
+    (Kalshi's close strings end in "Z"; every cached close does too). The
+    backtest reads the REALIZED close Kalshi recorded for a settled market,
+    where the live finder reads the SCHEDULED close of an open one.
+
+    Args:
+        mA (dict): A market dict in the compact historical._market_to_dict form.
+        mB (dict): A second market dict, same form.
+
+    Returns:
+        tuple[datetime, datetime] | None: (close_a, close_b) parsed by
+            _parse_iso_datetime. None when either close_time is absent or
+            unparseable, or when one parses naive and the other aware (their
+            subtraction would raise). Never raises.
+    """
+    ca = _parse_iso_datetime(mA.get("close_time"))
+    cb = _parse_iso_datetime(mB.get("close_time"))
+    if ca is None or cb is None or (ca.utcoffset() is None) != (cb.utcoffset() is None):
+        return None
+    return ca, cb
+
+
 def _deadline_profile_dict(m: dict) -> tuple:
     """
     Dict-world mirror of scanner._market_deadline_profile over cached records.
@@ -1522,11 +1569,12 @@ def _group_by_exact_title(markets: Iterable[dict]) -> dict[tuple, list[dict]]:
     The key is _st_group_key's, shared with _index_eligible_keys so the
     groupable-subset decision in _prepare_candidates is taken on this exact key.
 
-    Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54):
-    two events of one recurring fixture still land in one group, and
-    _extract_pairs is what refuses to pair them. Keeping the rule in one place
-    mirrors the live scanner, where find_same_title_pairs groups first and
-    filters inside its inner loop.
+    Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54)
+    and by the close gate (DR-74): two events of one recurring fixture, and
+    two games on two series closing hours apart, still land in one group, and
+    _extract_pairs is what refuses to pair them. Keeping each rule in one
+    place mirrors the live scanner, where find_same_title_pairs groups first
+    and filters inside its inner loop.
 
     Args:
         markets (Iterable[dict]): Market dicts in the compact
@@ -1640,7 +1688,9 @@ def _extract_pairs(
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
     the two markets have different event_tickers — or, with same-event deadline
     ladders enabled, are two dated cumulative rungs of ONE event — AND are not
-    two events of one series worded identically. No price filtering at this stage.
+    two events of one series worded identically, AND, for a same-title group,
+    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74). No
+    price filtering at this stage.
 
     The one-series rule (DR-02, DR-54) mirrors both live finders through
     _same_series_dicts / _identical_wording_dicts: two events resolving to one
@@ -1651,6 +1701,19 @@ def _extract_pairs(
     guarantees the wording is identical; the string (time-series) branch tests
     the conjunct, because there the wording is only date-stripped-equal and a
     genuine cumulative pair (deadline IN the wording) must survive.
+
+    The same-title close gate (DR-74) mirrors scanner.find_same_title_pairs
+    through the ONE definition, scanner.closes_apart, on the close times
+    _comparable_closes_dicts parses: identical wording on two DIFFERENT series
+    is one question only when both markets close at the same moment — a men's
+    and a women's college basketball game between the same two schools
+    (KXNCAAMBGAME / KXNCAAWBGAME) share every word of the key and close hours
+    apart, and two competitions' fixtures of one matchup days apart. It runs
+    after the series test, on the 3-tuple branch only: identical wording can
+    never form a time-series pair (DR-67), so the time-series branch needs no
+    twin. The backtest reads REALIZED closes where the live finder reads
+    SCHEDULED ones (see CLAUDE.md's DR-74 gotcha for what that difference
+    admits and refuses).
 
     For string-keyed (time-series) groups only, both legs must also be
     CUMULATIVE-deadline markets ("will X happen BY <date>") stating two
@@ -1694,8 +1757,14 @@ def _extract_pairs(
     type.
 
     3-tuple-keyed (same-title) groups have no deadline-gap concept, so they
-    stay naive — the eligibility prefilter (_can_ever_enter, applied in
-    run_backtest before grouping) keeps these groups small in practice.
+    are swept naively — every pair of members is visited — and the
+    eligibility prefilter (_can_ever_enter, applied in run_backtest before
+    grouping) keeps these groups small in practice. Their pairs ARE gated on
+    close time (DR-74 above), but per visited candidate, not by a sorted
+    window: the gate is a one-hour bound that refuses most candidates, not a
+    performance bound, and these groups are not close-filtered at all — a
+    member whose close_time cannot be parsed is kept in the group and
+    refused per candidate on its own line.
 
     EVERY PAIR OF A GROUP'S MEMBERS IS ACCOUNTED FOR (M10). Each count below
     is reported once, at the end of the call, on its own silent-at-zero INFO
@@ -1703,7 +1772,9 @@ def _extract_pairs(
     members of every group this call receives:
       - a same-title group is swept naively, so each of its pairs is visited
         and is either returned or refused as both markets on one event
-        ticker, or as two events of one series (DR-02, DR-54);
+        ticker, as two events of one series (DR-02, DR-54), as two markets
+        whose close_time cannot be read or compared, or as two markets
+        closing more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74);
       - a time-series group first sets aside its members with no readable
         close_time (counted as MEMBERS, not pairs — no pair involving one is
         ever formed), then splits the pairs of the rest at the sweep's
@@ -1735,9 +1806,17 @@ def _extract_pairs(
     corpus whose candidates they refused — the shape a combo-heavy window
     takes, where identically worded KXMVE tickets share a group key —
     reported "Potential pairs: 0" with no logged cause at all (DR-66).
-    Counting changes no control flow: every check, its order and every pair
-    returned are exactly as before. The same-title one-series line is the
-    verbatim mirror of scanner.find_same_title_pairs'; the same-title
+    M10's counting changed no control flow: it added counts only, so every
+    check, its order and every pair returned stayed exactly as before it
+    (DR-74's close gate, which came later, is a new check and does refuse
+    pairs). The same-title one-series line is the verbatim mirror of
+    scanner.find_same_title_pairs', and so is the same-title close-gap line
+    (DR-74) for READABLE closes; the same-title close-time readability line
+    has no live twin, because the live finder drops a market without a
+    close_time before grouping and so never reaches such a pair (and
+    Kalshi's live close strings are all aware) — a naive close beside an
+    aware one lands on this line here, but on the live finder's close-gap
+    line, the only line the live gate has; the same-title
     same-event and time-series one-series lines mirror the lines M10 added to
     the two live finders; the time-series same-event line has no live twin
     that counts the same thing — the live finder's disabled-ladder count is
@@ -1826,7 +1905,9 @@ def _extract_pairs(
             then that group's ladder pairs. Empty if no group has two members
             on different event_tickers of different event series whose
             wording, for a string-keyed group, states two different cumulative
-            deadlines, and no group holds an admissible ladder.
+            deadlines, or whose closes, for a 3-tuple-keyed group, are readable
+            and within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other, and no
+            group holds an admissible ladder.
     """
     pairs = []
     # Resolved at CALL time, never bound as a def-time default: the constant
@@ -1862,6 +1943,15 @@ def _extract_pairs(
     ts_series_skips = 0
     st_same_event_skips = 0
     st_series_skips = 0
+    # The same-title close gate (DR-74), counted after the series test so the
+    # two counts above do not move and each candidate lands on one line.
+    # st_undated_skips is backtest-only: a same-title group is not
+    # close-filtered (_can_ever_enter keeps a market whose close_time it cannot
+    # parse), while the live finder drops such a market before grouping — so
+    # readability is counted apart, and st_close_gap_skips stays the verbatim
+    # twin of the live finder's close-gap count.
+    st_undated_skips = 0
+    st_close_gap_skips = 0
     # The two things the time-series sweep drops BEFORE any candidate is
     # visited (M10), so that a zero caused by them has a cause in the log
     # too. ts_undated_members counts MEMBERS (a member without a readable
@@ -2160,7 +2250,8 @@ def _extract_pairs(
                             ladder_pairs += 1
                             pairs.append((mA, mB, canon, key))
         else:
-            # Same-title: no deadline-gap constraint, stays naive.
+            # Same-title: no deadline-gap concept, so swept naively — but each
+            # candidate is gated on close-time proximity below (DR-74).
             for i, mA in enumerate(members):
                 for mB in members[i + 1:]:
                     if mA["event_ticker"] == mB["event_ticker"]:
@@ -2173,6 +2264,20 @@ def _extract_pairs(
                     # two events of one series are two fixtures (DR-02, DR-54).
                     if _same_series_dicts(mA, mB):
                         st_series_skips += 1
+                        continue
+                    # Mirror of find_same_title_pairs' close gate (DR-74): same
+                    # wording on two series is one question only when both close
+                    # at the same moment. An unreadable close is refused on its
+                    # own backtest-only line (no live twin: the live finder drops
+                    # a missing close before grouping).
+                    closes = _comparable_closes_dicts(mA, mB)
+                    if closes is None:
+                        st_undated_skips += 1
+                        continue
+                    # The ONE definition of the gate, shared with the live finder
+                    # so the two paths cannot disagree on "one moment".
+                    if closes_apart(*closes):
+                        st_close_gap_skips += 1
                         continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
@@ -2248,6 +2353,26 @@ def _extract_pairs(
         logging.info(
             "Same-title candidates skipped as two instances of one event series "
             "(identical wording, different fixture): %d", st_series_skips,
+        )
+    if st_close_gap_skips:
+        # Verbatim mirror of find_same_title_pairs' close-gap line (DR-74).
+        # The bound is printed through scanner.close_gap_bound_text, which
+        # reads the binding closes_apart read — this module holds no copy of
+        # the constant, so the line cannot state a bound its gate did not use.
+        logging.info(
+            "Same-title candidates refused because the two markets close more "
+            "than %s apart (two different games or instants, not one "
+            "question listed twice): %d",
+            close_gap_bound_text(), st_close_gap_skips,
+        )
+    if st_undated_skips:
+        # Backtest-only (DR-74): the live finder never reaches a market
+        # without a close_time, so this has no live twin.
+        logging.info(
+            "Same-title candidate pairs refused because a market's close_time "
+            "cannot be read (fail closed; the live finder drops such markets "
+            "before grouping): %d",
+            st_undated_skips,
         )
     # Mirror of the live scanner's three-way split (DR-72), each silent at
     # zero: within the deadline-gap window this sweep already restricted
@@ -2922,7 +3047,10 @@ def _fetch_candles_parallel(
     is what the sequential version did — there is no window to request. A
     present-but-unparseable close_time is handled the same way (with a warning):
     it is a data defect in one market, not a reason to abort the whole run from
-    the main thread before any worker starts.
+    the main thread before any worker starts (BS-07). Since DR-74 no candidate
+    pair of either type carries such a market — the time-series sweep sets it
+    aside and the same-title close gate refuses the pair — so this branch is
+    defence in depth for a caller that hands one over directly.
 
     Worker exceptions are deliberately NOT caught: fetch_candlesticks already
     fail-softs network errors to an empty list internally, so anything that

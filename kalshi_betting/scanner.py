@@ -16,7 +16,8 @@ Purpose:
     ("price ON <date>"), whose probabilities do not nest and which the date
     stripping would otherwise collapse into one group; and (2)
     same-title pairs — contracts with identical title and subtitle on
-    different event tickers of DIFFERENT event series, traded as a
+    different event tickers of DIFFERENT event series whose two markets close
+    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74), traded as a
     near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
     diverge. Both paths then check the live order book to replace best-ask
     prices with depth-weighted fill prices and confirm the edge survives real
@@ -38,12 +39,14 @@ Dependencies:
     DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
     on WHY a candidate was refused (DR-72), and stated_deadline/
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
-    same-event deadline ladder's leg order and gap (DR-73)). pair_gap_days()
-    is the single reader of that gap for everything downstream of pair
-    formation. historical.py imports event_series too, so the backtest's
-    event-title lookup budget tells a combo ticker from any other exactly as
-    the one-series rule does (DR-51). Depends on the KalshiClient produced by
-    auth.py.
+    same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
+    the one definition of the same-title close gate, with
+    close_gap_bound_text, the bound its refusal line prints (DR-74)).
+    pair_gap_days() is the single reader of that gap for everything
+    downstream of pair formation. historical.py imports event_series too, so
+    the backtest's event-title lookup budget tells a combo ticker from any
+    other exactly as the one-series rule does (DR-51). Depends on the
+    KalshiClient produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -64,6 +67,17 @@ Notes:
     the 95% co-resolution prior nor the cumulative-deadline premise applies. Both
     finders carry the rule because the same two tickers qualify for both; see
     _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
+
+    Different series is necessary for a same-title pair but not sufficient:
+    the two markets must also close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of
+    each other (closes_apart, DR-74). A men's and a women's college basketball
+    game between the same two schools share every word of the same-title key
+    on two different series, and close hours apart; so do two competitions'
+    fixtures of one matchup, days apart. The gate is on the same-title finder
+    only, deliberately: identical wording can never form a time-series pair
+    (DR-67), so it cannot relabel the trade. It fails closed on a close time
+    it cannot compare, and the backtester mirrors it through the same
+    closes_apart — see CLAUDE.md's DR-74 gotcha.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -135,6 +149,7 @@ from .config import (
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
+    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
@@ -747,7 +762,11 @@ class CandidatePair:
                    two identical questions co-resolve, so the trade is a
                    near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
                    prior — which is why the finder only forms such a pair
-                   across two DIFFERENT event series (see _same_series).
+                   across two DIFFERENT event series (see _same_series) whose
+                   two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+                   of each other (see closes_apart, DR-74): identical wording
+                   on two series closing hours apart is two games, not one
+                   question listed twice.
       time_series: YES on market_a (the EARLIER contract) at pA, NO on
                    market_b (the later one) at nB. "Earlier" means earlier by
                    close_time for a cross-event pair, and earlier by STATED
@@ -1130,6 +1149,111 @@ def _same_series(mA: Any, mB: Any) -> bool:
     """
     sa, sb = event_series(mA.event_ticker), event_series(mB.event_ticker)
     return not sa or not sb or sa == sb
+
+
+def closes_apart(close_a: Any, close_b: Any) -> bool:
+    """
+    True when two close times are more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    apart, or when they cannot be compared.
+
+    The single definition of the same-title close gate (DR-74), used by both
+    paths: find_same_title_pairs reads it through _closes_apart, and
+    backtester._extract_pairs' same-title branch calls it directly on the
+    close times it has already parsed. Identical wording on two DIFFERENT
+    series is one question only when both markets resolve at the same moment
+    — a men's and a women's college basketball game between the same two
+    schools share title, subtitle and event title and close hours apart, and
+    two competitions' fixtures of one matchup close days apart.
+
+    Fails CLOSED, like _same_series: a same-title pair is priced on the
+    SAME_TITLE_CO_RESOLVE_PROB prior only when both markets DEMONSTRABLY
+    resolve at the same moment, so anything that is not a datetime, and a
+    naive/aware mix (whose subtraction would raise), reads as "apart".
+
+    Args:
+        close_a (Any): The first market's close time; a datetime to be
+            comparable.
+        close_b (Any): The second market's close time, same shape.
+
+    Returns:
+        bool: True when the two closes are more than
+            SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (strictly: a gap of exactly
+            the bound is NOT apart), or when either is not a datetime, or when
+            one is naive and the other aware. False only for two comparable
+            closes within the bound.
+    """
+    if not isinstance(close_a, datetime) or not isinstance(close_b, datetime):
+        return True
+    # A naive and an aware datetime cannot be subtracted (TypeError); an
+    # unreadable gap is not a demonstrated same-moment resolution.
+    if (close_a.utcoffset() is None) != (close_b.utcoffset() is None):
+        return True
+    return abs((close_a - close_b).total_seconds()) > SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+
+
+def _closes_apart(mA: Any, mB: Any) -> bool:
+    """
+    Live reader of the same-title close gate: closes_apart over .close_time.
+
+    The attribute is read by TYPE, not presence — closes_apart tests
+    isinstance(datetime) — so a MagicMock's auto-attribute, which is not a
+    datetime, fails closed rather than comparing two mocks. The live finder
+    only ever reaches readable, aware closes: _filter_active_markets drops a
+    market with a missing close_time before grouping, and Kalshi's close
+    strings end in "Z", so _market_from_dict parses them aware.
+
+    Unlike the backtest, the live finder has ONE refusal line for this gate,
+    so a pair whose closes cannot be compared (a non-datetime, or one naive
+    beside one aware) is counted on the close-gap line, whose wording says the
+    two markets "close more than N minutes apart" — where
+    backtester._extract_pairs counts the same shape on its backtest-only
+    unreadable-close line. The two close-gap lines are therefore verbatim
+    twins for READABLE closes only. That case is unreachable live today (see
+    above), and it fails closed on both paths either way.
+
+    Args:
+        mA (Any): First market object with a .close_time attribute.
+        mB (Any): Second market object, same shape.
+
+    Returns:
+        bool: closes_apart(mA.close_time, mB.close_time), with a missing
+            attribute read as None (and therefore apart).
+    """
+    return closes_apart(getattr(mA, "close_time", None), getattr(mB, "close_time", None))
+
+
+def close_gap_bound_text(seconds: int | None = None) -> str:
+    """
+    The same-title close gate's bound as a log line or message prints it.
+
+    With no argument it reads SAME_TITLE_MAX_CLOSE_GAP_SECONDS from THIS
+    module at call time — the binding closes_apart reads — so the bound a
+    refusal line prints is always the one its gate applied, on both paths:
+    find_same_title_pairs and backtester._extract_pairs format their
+    verbatim-twin close-gap lines with it, and a test that narrows
+    scanner.SAME_TITLE_MAX_CLOSE_GAP_SECONDS narrows the gate and both lines
+    together (DR-74). Resolved at call time, never bound as a def-time
+    default, for the same reason time_series_profit_prob's k is: a default
+    would freeze the value at import and ignore a patch. A caller that
+    describes a bound it holds itself (main._no_pairs_msg, reading its own
+    binding like every other threshold it names) passes it in.
+
+    A whole number of minutes prints as minutes ("60 minutes", "1 minute");
+    anything else prints in seconds ("90 seconds"), so the text never
+    truncates a bound into a different, false one.
+
+    Args:
+        seconds (int | None): The bound to render, in seconds. None (the
+            default) renders this module's SAME_TITLE_MAX_CLOSE_GAP_SECONDS.
+
+    Returns:
+        str: e.g. "60 minutes" for the shipped 3,600-second bound.
+    """
+    bound = SAME_TITLE_MAX_CLOSE_GAP_SECONDS if seconds is None else seconds
+    if bound % 60 == 0:
+        minutes = bound // 60
+        return f"{minutes} minute{'' if minutes == 1 else 's'}"
+    return f"{bound} second{'' if bound == 1 else 's'}"
 
 
 def _field_phrasing(text: Any) -> str | None:
@@ -3773,9 +3897,28 @@ def find_same_title_pairs(
     end as an INFO line. So are candidates whose two markets carry the SAME
     event ticker (M10), on a line of their own: before M10 that skip was the
     one refusal ahead of the price filters here with no count (the price and
-    5% gate `continue`s are still uncounted). Both lines are silent at zero,
-    and backtester._extract_pairs logs both verbatim for its same-title
-    branch.
+    5% gate `continue`s are still uncounted).
+
+    Different series is NECESSARY, not sufficient: the two markets must also
+    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (_closes_apart,
+    over the one definition closes_apart, DR-74). A men's and a women's college
+    basketball game between the same two schools (KXNCAAMBGAME / KXNCAAWBGAME)
+    share title, subtitle and event title on two different series, and so do
+    the Champions League and La Liga fixtures of one matchup — two games that
+    close hours or days apart, for which the co-resolution prior is false.
+    Refused candidates are counted after the series test on a third INFO
+    line of their own. The gate fails closed on a close time it cannot read or
+    compare. find_time_series_pairs deliberately carries no twin: identical
+    wording states the same deadline spans, or none, so it can never form a
+    time-series pair (DR-67), and a same-title-only gate cannot relabel the
+    trade. All three lines are silent at zero, and backtester._extract_pairs
+    logs all three verbatim for its same-title branch (plus a backtest-only
+    line for a close_time it cannot read, which the live finder never reaches
+    because _filter_active_markets drops such a market before grouping). The
+    close-gap line is a verbatim twin for READABLE closes: a naive close
+    beside an aware one — unreachable live today — is counted on it here and
+    on the backtest's unreadable line there (see _closes_apart). Both paths
+    print its bound through close_gap_bound_text, from this module's binding.
 
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
@@ -3788,9 +3931,11 @@ def find_same_title_pairs(
     falsely paired as the same contract under the 95% co-resolution assumption.
 
     Filters: different event_ticker (to exclude multi-choice options), different
-    event SERIES (to exclude two instances of one recurring fixture), both
-    actively priced (1%-99%), not in held_tickers. One best pair per title
-    group.
+    event SERIES (to exclude two instances of one recurring fixture), closes
+    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (to exclude two
+    different games or instants on two series, DR-74), both actively priced
+    (1%-99%), not in held_tickers. One best pair per title group — so refusing
+    a group's best candidate PROMOTES its runner-up.
 
     Args:
         markets (list): ApiMarket objects to scan (already fetched by the
@@ -3803,7 +3948,8 @@ def find_same_title_pairs(
         list: CandidatePair objects, one per (event_title, title, subtitle)
             group that produced a pair, each carrying pair_type="same_title".
             Empty if no group has two markets on different event_tickers of
-            different event series.
+            different event series that close within
+            SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     # warn_missing_close=False: both run modes call find_time_series_pairs on
@@ -3836,6 +3982,12 @@ def find_same_title_pairs(
     # with the same one-summary-line idiom: a refusal nothing reports cannot
     # be told apart, in the log, from a grouping that never formed a group.
     same_event_skips = 0
+    # Two different series whose markets close more than
+    # SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74) — two games or two
+    # instants that share every word of the key. Counted after the series test,
+    # so each candidate lands on exactly one of the three lines below and the
+    # two older counts do not move.
+    close_gap_skips = 0
     # members = all active markets that share this exact (event_title, title, subtitle)
     # key. Each entry is a separate market object from a different event — any two of
     # them are candidates for a same-title pair if their prices diverge.
@@ -3864,6 +4016,16 @@ def find_same_title_pairs(
                 # is identical, so the series test is the whole rule here.
                 if _same_series(m_outer, m_inner):
                     series_skips += 1
+                    continue
+
+                # Same wording on two DIFFERENT series is one question only when
+                # both resolve at the same moment: a men's and a women's game
+                # between the same schools, or two competitions' fixtures of one
+                # matchup, share every word of the key and close hours or days
+                # apart (DR-74). find_time_series_pairs needs no twin: identical
+                # wording cannot form a time-series pair (DR-67).
+                if _closes_apart(m_outer, m_inner):
+                    close_gap_skips += 1
                     continue
 
                 try:
@@ -3936,6 +4098,18 @@ def find_same_title_pairs(
         logging.info(
             "Same-title candidates skipped as two instances of one event series "
             "(identical wording, different fixture): %d", series_skips,
+        )
+    # Worded apart from the two lines above on purpose: its own prefix, and
+    # neither "one event series" nor "same event ticker", which tests pin as
+    # ABSENT from runs that never skip on those rules (DR-74). The bound is
+    # printed through close_gap_bound_text, which reads the same binding the
+    # gate did, so the line can never state a bound the gate did not apply.
+    if close_gap_skips:
+        logging.info(
+            "Same-title candidates refused because the two markets close more "
+            "than %s apart (two different games or instants, not one "
+            "question listed twice): %d",
+            close_gap_bound_text(), close_gap_skips,
         )
 
     logging.info(

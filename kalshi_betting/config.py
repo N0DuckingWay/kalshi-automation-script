@@ -151,7 +151,31 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 
 # Prior probability that a same-title pair co-resolves (i.e. both YES or both NO).
 # Set at 95% — divergence is an anomaly, so we assume high correlation by default.
+# It applies only to a pair that passed BOTH pairing rules: its two event
+# tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
+# and its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each
+# other (DR-74). Identical wording that fails either rule is two different
+# fixtures of one question, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
+
+# Largest gap between the two markets' close times that a same-title pair may
+# have, in seconds (DR-74). Identical wording on two DIFFERENT series is one
+# question only when both markets resolve at the same moment: a men's and a
+# women's college basketball game between the same two schools (KXNCAAMBGAME /
+# KXNCAAWBGAME, "Western Illinois at Eastern Illinois Winner?") share title,
+# subtitle and event title, and so do the Champions League and La Liga
+# "Atletico vs Barcelona" matches. On the 365-day backtest (start 2025-09-24,
+# the backtest's population: event_title blank on ~95% of eligible records)
+# the 1,906 same-title candidates closed either at the identical instant (245
+# pairs, 243 settled the same way — including 226/226 commodity and 15/15
+# financial; the other 2 are the KXRTBLACKPHONE2/KXBLACKPHONE2 anomaly) or at
+# least 1.17 h (4,217 s) apart (1,661 pairs, 60.7% settled the same way).
+# Live close_time is the SCHEDULED close — for a game, tip-off plus a fixed
+# number of days, which keeps a doubleheader's two games hours apart (checked
+# on archived pairs) — and the backtest's is the REALIZED close. Not covered:
+# futures decided early, whose live close_time is a family-wide placeholder
+# (all KXOSCAR* at 2027-12-31T15:00Z), pass live at a 0 s gap.
+SAME_TITLE_MAX_CLOSE_GAP_SECONDS = 60 * 60
 
 # Maximum number of calendar days allowed between the deadlines of the two legs
 # in a time-series pair. The wider the gap, the more of the market-implied

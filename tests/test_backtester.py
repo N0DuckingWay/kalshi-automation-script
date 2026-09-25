@@ -278,10 +278,17 @@ class TestExtractPairsCanonHandling:
         # assertion below would have failed for a reason that has nothing to do
         # with canon selection. Two DIFFERENT series restore the shape the
         # same-title strategy was built for.
+        #
+        # RE-PINNED (DR-74): the same-title close gate refuses a pair whose
+        # close_time is missing (fail closed), so both records now carry one
+        # shared close — added HERE, not to the shared _md, whose other
+        # callers group or key records and never reach the gate.
         mA = _md("A1", "EVA-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
         mB = _md("B1", "EVB-1", title="Republicans win majority",
                  event_title="2026 Senate Control")
+        for m in (mA, mB):
+            m["close_time"] = "2026-11-04T05:00:00Z"
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
         assert len(pairs) == 1
@@ -293,10 +300,18 @@ class TestExtractPairsCanonHandling:
         # DIFFERENT group_keys even though they share the same display canon —
         # otherwise run_backtest's one-pair-per-group dedup collapses two
         # legitimate, independent pairs into one.
+        #
+        # RE-PINNED (DR-74): each group's two records share a close_time, which
+        # the same-title close gate needs (a missing one fails closed). Added
+        # locally rather than to the shared _md.
         mA1 = _md("E1-A", "EVT1A", title="Trump", event_title="Election Winner")
         mA2 = _md("E1-B", "EVT1B", title="Trump", event_title="Election Winner")
         mB1 = _md("E2-A", "EVT2A", title="Trump", event_title="Person of the Year")
         mB2 = _md("E2-B", "EVT2B", title="Trump", event_title="Person of the Year")
+        for m in (mA1, mA2):
+            m["close_time"] = "2026-11-04T05:00:00Z"
+        for m in (mB1, mB2):
+            m["close_time"] = "2026-12-10T15:00:00Z"
         groups = _group_by_exact_title([mA1, mA2, mB1, mB2])
         pairs = _extract_pairs(groups)
         assert len(pairs) == 2
@@ -754,6 +769,12 @@ _TS_SERIES = "Time-series candidates skipped as two instances of one event serie
 _ST_SAME_EVENT = ("Same-title candidates skipped because both markets carry the "
                   "same event ticker")
 _ST_SERIES = "Same-title candidates skipped as two instances of one event series"
+# DR-74: the same-title close gate's two lines — the close-gap refusal
+# (verbatim with find_same_title_pairs') and the backtest-only unreadable-close
+# one. Distinct prefixes ("candidates" vs "candidate pairs"), so neither can be
+# read as the other.
+_ST_CLOSE_GAP = "Same-title candidates refused because the two markets close more than"
+_ST_UNDATED = "Same-title candidate pairs refused because a market's close_time"
 _TS_WORDING = "Time-series candidates refused because"
 _LADDER_REFUSED = "Same-event ladder candidates refused because"
 _LADDER_GAP_CAP = "Same-event ladder candidates worded as two different cumulative"
@@ -771,8 +792,8 @@ def _logged_counts(caplog) -> dict[str, int]:
     """
     out: dict[str, int] = defaultdict(int)
     prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _ST_SAME_EVENT,
-                _ST_SERIES, _TS_WORDING, _LADDER_REFUSED, _LADDER_GAP_CAP,
-                _LADDER_FORMED)
+                _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED, _TS_WORDING, _LADDER_REFUSED,
+                _LADDER_GAP_CAP, _LADDER_FORMED)
     for message in caplog.messages:
         for prefix in prefixes:
             if message.startswith(prefix):
@@ -790,7 +811,10 @@ class TestOneSeriesAndSameEventCounts:
     and so do the two things the time-series sweep sets aside before visiting
     anything (members with no readable close_time, pairs beyond its
     close-date window); an EMPTY grouping, which reaches _extract_pairs as {},
-    is reported by _prepare_candidates' always-logged group-count line.
+    is reported by _prepare_candidates' always-logged group-count line. DR-74
+    added two more same-title lines, counted after the series test: a pair
+    whose two markets close more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart,
+    and (backtest-only) a pair whose close_time cannot be read or compared.
     Counting must move no control flow: the pair lists are pinned by every
     other test in this module, and the partition test below proves that the
     counts and the returned pairs together account for each pair exactly
@@ -893,12 +917,12 @@ class TestOneSeriesAndSameEventCounts:
         with caplog.at_level(logging.INFO):
             scanner.find_same_title_pairs(live)
         live_lines = [m for m in caplog.messages
-                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
         caplog.clear()
         with caplog.at_level(logging.INFO):
             _extract_pairs(_group_by_exact_title(recs))
         backtest_lines = [m for m in caplog.messages
-                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
         assert len(live_lines) == 2
         assert backtest_lines == live_lines
 
@@ -917,9 +941,11 @@ class TestOneSeriesAndSameEventCounts:
 
     @pytest.mark.parametrize("grouping", [_group_by_exact_title, _group_by_normalized_title])
     def test_silent_at_zero(self, caplog, grouping):
-        # control — kills a mutant that drops any of the four `if count:`
+        # control — kills a mutant that drops any of the six `if count:`
         # guards. Two different series asking one cumulative question at two
-        # deadlines: nothing is refused by either rule on either branch.
+        # deadlines: nothing is refused by either rule on either branch — and
+        # the two records share a close, so the same-title close gate
+        # (DR-74) refuses nothing either.
         recs = [
             self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
                       "2026-03-01T00:00:00Z"),
@@ -930,7 +956,7 @@ class TestOneSeriesAndSameEventCounts:
             _extract_pairs(grouping(recs), same_event_ladders=False)
         counts = _logged_counts(caplog)
         for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES,
-                       _ST_SAME_EVENT, _ST_SERIES):
+                       _ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED):
             assert prefix not in counts
 
     @pytest.mark.parametrize("ladders", [False, True])
@@ -999,7 +1025,14 @@ class TestOneSeriesAndSameEventCounts:
         """Every rule's shape at random: one-series fixtures, KXMVE prefixes,
         same-event duplicates, empty event tickers, ladders, and cumulative,
         snapshot and deadline-less wording, over a 60-day close spread so the
-        sweep's window cuts some candidates."""
+        sweep's window cuts some candidates.
+
+        Every other re-listed duplicate also copies its source's close_time
+        (DR-74), so some same-title candidates close at one instant and survive
+        the close gate while the rest are refused by it. That copy is keyed on
+        the record's index, not on a random draw, so the rng stream — and with
+        it every other field of every record — is the one the fuzz always
+        drew."""
         rng = random.Random(seed)
         stems = ["Will X happen", "Will Y win", "Starship launches", "Q"]
         preps = ["by", "before", "on", "in", ""]
@@ -1031,6 +1064,8 @@ class TestOneSeriesAndSameEventCounts:
                            event_title=src["event_title"])
                 if rng.random() < 0.5:
                     rec["event_ticker"] = src["event_ticker"]
+                if i % 2 == 0:
+                    rec["close_time"] = src["close_time"]
             recs.append(rec)
         return recs
 
@@ -1045,7 +1080,11 @@ class TestOneSeriesAndSameEventCounts:
         # what it returned plus what it counted.
         recs = self._fuzz(seed)
         # Some members with no readable close_time, which the sweep sets
-        # aside before visiting anything (one malformed, the rest absent).
+        # aside before visiting anything (one malformed, the rest absent). The
+        # same-title branch does NOT set them aside — its groups are not
+        # close-filtered — so they are what feeds its backtest-only
+        # unreadable-close count (DR-74; 1/3/5 such candidates for seeds
+        # 0/1/2).
         for k, rec in enumerate(recs):
             if k % 17 == 5:
                 rec["close_time"] = "not a date" if k == 5 else None
@@ -1084,8 +1123,12 @@ class TestOneSeriesAndSameEventCounts:
         st = _logged_counts(caplog)
 
         ladder_pairs = ts[_LADDER_FORMED]
-        # Not vacuous: each rule fires, and something survives.
+        # Not vacuous: each rule fires, and something survives — including
+        # both same-title close-gate refusals (DR-74): the malformed/absent
+        # close_times set above supply the unreadable ones, and the fuzz's
+        # uncopied closes the ones more than an hour apart.
         assert ts[_TS_SERIES] and st[_ST_SERIES] and st[_ST_SAME_EVENT]
+        assert st[_ST_UNDATED] and st[_ST_CLOSE_GAP]
         assert len(ts_pairs) and len(st_pairs)
         # What the sweep set aside before visiting anything, and the whole
         # partition of the dated members' pairs: beyond the window, or
@@ -1102,7 +1145,175 @@ class TestOneSeriesAndSameEventCounts:
         else:
             assert ts[_TS_SAME_EVENT] == same_event_in_window > 0
             assert ladder_pairs == 0
-        assert st_candidates == len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
+        assert st_candidates == (
+            len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
+            + st[_ST_UNDATED] + st[_ST_CLOSE_GAP]
+        )
+
+
+class TestSameTitleCloseGapBacktest:
+    """DR-74 mirror: _extract_pairs' same-title branch refuses identical
+    wording on two DIFFERENT series unless both markets close within
+    SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other.
+
+    The verdict is scanner.closes_apart, the ONE definition the live finder
+    uses; the backtest only parses the cached close strings first
+    (_comparable_closes_dicts) and counts a pair it cannot date on a line of
+    its own, because the live finder never reaches such a market. The backtest
+    reads REALIZED closes. Mirror of test_scanner.py::TestSameTitleCloseGap.
+    """
+
+    _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
+
+    @classmethod
+    def _wiu(cls, *, womens_close="2026-01-13T23:30:00Z"):
+        # The real pair's REALIZED closes sat 2 h 41 m apart (the clock times
+        # here are the fixture's own; the gap is the measured one).
+        def rec(ticker, event_ticker, close):
+            return {"ticker": ticker, "event_ticker": event_ticker,
+                    "event_title": "Western Illinois at Eastern Illinois",
+                    "title": cls._WIU_TITLE, "subtitle": "Western Illinois",
+                    "close_time": close}
+        return [
+            rec("KXNCAAMBGAME-26JAN13WIUEIU-WIU", "KXNCAAMBGAME-26JAN13WIUEIU",
+                "2026-01-14T02:11:00Z"),
+            rec("KXNCAAWBGAME-26JAN13WIUEIU-WIU", "KXNCAAWBGAME-26JAN13WIUEIU",
+                womens_close),
+        ]
+
+    def test_mens_and_womens_game_are_refused_and_counted_once(self, caplog):
+        recs = self._wiu()
+        gap = abs(_parse_iso_datetime(recs[0]["close_time"])
+                  - _parse_iso_datetime(recs[1]["close_time"]))
+        assert gap == timedelta(hours=2, minutes=41)
+        assert backtester._same_series_dicts(*recs) is False
+        groups = _group_by_exact_title(recs)
+        assert len(groups) == 1
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups) == []
+        counts = _logged_counts(caplog)
+        assert counts[_ST_CLOSE_GAP] == 1
+        assert _ST_UNDATED not in counts
+        assert _ST_SERIES not in counts
+
+    def test_the_same_pair_at_one_close_instant_is_a_candidate(self):
+        # Positive control: only the women's close moves.
+        recs = self._wiu(womens_close="2026-01-14T02:11:00Z")
+        assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
+
+    @pytest.mark.parametrize("gap_seconds,pairs", [
+        (0, 1), (3_600, 1), (3_601, 0),
+    ])
+    def test_the_bound_is_one_hour_inclusive(self, gap_seconds, pairs):
+        close = datetime(2026, 1, 14, 2, 11, tzinfo=UTC) - timedelta(seconds=gap_seconds)
+        recs = self._wiu(womens_close=close.isoformat())
+        assert len(_extract_pairs(_group_by_exact_title(recs))) == pairs
+
+    def test_the_gate_is_the_scanner_definition(self, monkeypatch, caplog):
+        # The backtest has no bound of its own: narrowing scanner's binding
+        # (the one closes_apart reads) narrows this gate too — and the bound
+        # its refusal line PRINTS, which must be the one the gate applied, not
+        # a second copy of the constant still reading 60 minutes.
+        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
+        base = datetime(2026, 1, 14, 2, 11, tzinfo=UTC)
+        at_60 = self._wiu(womens_close=(base - timedelta(seconds=60)).isoformat())
+        at_61 = self._wiu(womens_close=(base - timedelta(seconds=61)).isoformat())
+        assert len(_extract_pairs(_group_by_exact_title(at_60))) == 1
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(_group_by_exact_title(at_61)) == []
+        assert [m for m in caplog.messages if m.startswith(_ST_CLOSE_GAP)] == [
+            "Same-title candidates refused because the two markets close more "
+            "than 1 minute apart (two different games or instants, not one "
+            "question listed twice): 1"
+        ]
+
+    @pytest.mark.parametrize("womens_close", [
+        None,                     # absent
+        "",                       # blank
+        "not-a-timestamp",        # malformed
+        "2026-01-14T02:11:00",    # naive, beside an aware partner
+    ])
+    def test_an_unreadable_close_is_refused_on_its_own_line(self, caplog, womens_close):
+        # Fail CLOSED, and on the backtest-only line: the live finder never
+        # reaches such a market (_filter_active_markets drops a missing close
+        # before grouping), so counting it on the close-gap line would make
+        # that line stop being the live one's twin.
+        recs = self._wiu(womens_close=womens_close)
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(_group_by_exact_title(recs)) == []
+        counts = _logged_counts(caplog)
+        assert counts[_ST_UNDATED] == 1
+        assert _ST_CLOSE_GAP not in counts
+        assert caplog.messages.count(
+            "Same-title candidate pairs refused because a market's close_time "
+            "cannot be read (fail closed; the live finder drops such markets "
+            "before grouping): 1"
+        ) == 1
+
+    def test_the_lines_are_silent_at_zero(self, caplog):
+        recs = self._wiu(womens_close="2026-01-14T02:11:00Z")
+        with caplog.at_level(logging.INFO):
+            assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
+        counts = _logged_counts(caplog)
+        assert _ST_CLOSE_GAP not in counts and _ST_UNDATED not in counts
+
+    def test_the_close_gap_line_is_the_live_finders_verbatim(self, caplog):
+        # A SEPARATE fixture that reaches the gate: two non-combo series,
+        # identical wording, closes more than an hour apart (the combo-heavy
+        # fixture is refused by the series rule first and never gets here).
+        # One grep reads either path, so the two lines must match word for
+        # word — the count included.
+        recs = self._wiu() + [
+            {"ticker": "KXNCAAWBGAME-26FEB10WIUEIU-WIU",
+             "event_ticker": "KXNCAAWBGAME-26FEB10WIUEIU",
+             "event_title": "Western Illinois at Eastern Illinois",
+             "title": self._WIU_TITLE, "subtitle": "Western Illinois",
+             "close_time": "2026-02-10T23:30:00Z"},
+        ]
+        live = [SimpleNamespace(ticker=r["ticker"], event_ticker=r["event_ticker"],
+                                title=r["title"], subtitle=r["subtitle"],
+                                _event_title=r["event_title"],
+                                yes_ask_dollars=str(0.40 - 0.1 * i),
+                                no_ask_dollars=str(0.60 + 0.1 * i),
+                                close_time=_parse_iso_datetime(r["close_time"]))
+                for i, r in enumerate(recs)]
+        with caplog.at_level(logging.INFO):
+            assert scanner.find_same_title_pairs(live) == []
+        live_lines = [m for m in caplog.messages
+                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(_group_by_exact_title(recs)) == []
+        backtest_lines = [m for m in caplog.messages
+                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
+        # Men's vs each women's listing: two close-gap refusals; the two
+        # women's listings of one series: one series refusal.
+        assert live_lines == [
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): 1",
+            "Same-title candidates refused because the two markets close more "
+            "than 60 minutes apart (two different games or instants, not one "
+            "question listed twice): 2",
+        ]
+        assert backtest_lines == live_lines
+
+    @pytest.mark.parametrize("a,b,readable", [
+        ({}, {"close_time": "2026-01-14T02:11:00Z"}, False),
+        ({"close_time": None}, {"close_time": "2026-01-14T02:11:00Z"}, False),
+        ({"close_time": "not-a-timestamp"}, {"close_time": "2026-01-14T02:11:00Z"}, False),
+        ({"close_time": "2026-01-14T02:11:00"}, {"close_time": "2026-01-14T02:11:00Z"}, False),
+        ({"close_time": "2026-01-14T02:11:00Z"}, {"close_time": "2026-01-14T02:11:00"}, False),
+        ({"close_time": "2026-01-14T02:11:00"}, {"close_time": "2026-01-14T05:00:00"}, True),
+        ({"close_time": "2026-01-14T02:11:00Z"}, {"close_time": "2026-01-15T02:11:00+00:00"}, True),
+    ])
+    def test_comparable_closes_dicts(self, a, b, readable):
+        out = backtester._comparable_closes_dicts(a, b)
+        if not readable:
+            assert out is None
+            return
+        ca, cb = out
+        assert ca == _parse_iso_datetime(a["close_time"])
+        assert cb == _parse_iso_datetime(b["close_time"])
 
 
 class TestDeadlineProfileParity:
@@ -1356,10 +1567,14 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
         # fixture. The tickers name two DIFFERENT series so this test keeps
         # pinning what it is for — that an old cache record missing the tick
         # and subtitle keys still pairs.
+        #
+        # RE-PINNED (DR-74): the two records closed a week apart, which the
+        # same-title close gate now refuses as two different fixtures; they
+        # share one close so the pair again turns on the missing fields alone.
         mA = self._old_style_dict("A1", "EVA-1", "Republicans win majority",
                                    "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
         mB = self._old_style_dict("B1", "EVB-1", "Republicans win majority",
-                                   "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
+                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
         groups = _group_by_exact_title([mA, mB])
         pairs = _extract_pairs(groups)
         assert len(pairs) == 1
@@ -1913,35 +2128,70 @@ class TestKellyShrinkParity:
 class TestRunBacktestMalformedTimestamps:
     """A single market with an unparseable close_time must not kill a run.
 
-    The time-series extraction path already drops such members while windowing
-    by close date (TestExtractPairsWindowedEquivalence), but the same-title path
-    is naive and carries them straight into the candlestick fetch, where the
-    pre-pool window computation used a bare datetime.fromisoformat — on the main
-    thread, before any worker starts, so it aborted the whole backtest (BS-07).
+    The time-series extraction path drops such members while windowing by
+    close date (TestExtractPairsWindowedEquivalence). The same-title path is
+    naive and used to carry them straight into the candlestick fetch, where
+    the pre-pool window computation used a bare datetime.fromisoformat — on
+    the main thread, before any worker starts, so it aborted the whole
+    backtest (BS-07); _fetch_candles_parallel then learned to resolve such a
+    ticker to an empty series with a WARNING.
+
+    Since DR-74 the same-title branch refuses the pair itself, before any
+    candle is requested: the close gate cannot show that a market it cannot
+    date closes with its partner, so it fails closed and counts the pair on
+    its own backtest-only line. The pipeline therefore no longer reaches
+    BS-07's branch at all, and the second test below calls
+    _fetch_candles_parallel directly so that branch stays covered.
     """
 
     def test_malformed_close_time_is_skipped_not_raised(self, monkeypatch, caplog):
         markets = _same_title_markets(close_time_b="not-a-timestamp")
-        # Only SA has a fetchable window; a KeyError here would mean SB reached
-        # the fetch despite having no parseable close_time.
-        candles = {"SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)]}
+        fetched = []
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
-                            lambda _c, ticker, *a, **k: candles[ticker])
+                            lambda _c, ticker, *a, **k: fetched.append(ticker) or [])
 
-        with caplog.at_level("WARNING"):
+        with caplog.at_level(logging.INFO):
             trades, equity = run_backtest(
                 hist_client=MagicMock(), live_client=MagicMock(),
                 start_date=date(2026, 1, 1), initial_balance=1000.0,
             )
 
-        # No trade: _find_entry can't derive a scan window for the bad leg
+        # No trade, no exception — and no candle request at all: the pair was
+        # refused before the fetch, so neither leg is a needed ticker.
         assert trades == []
         assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(1000.0)
-        # The dropped ticker is named, so an empty series can't be mistaken for
-        # "this market genuinely had no prices"
+        assert fetched == []
+        # Refused on the backtest-only unreadable-close line (DR-74), not on
+        # the close-gap line — the gap between them was never measurable.
+        assert caplog.messages.count(
+            "Same-title candidate pairs refused because a market's close_time "
+            "cannot be read (fail closed; the live finder drops such markets "
+            "before grouping): 1"
+        ) == 1
+        assert not any(m.startswith(_ST_CLOSE_GAP) for m in caplog.messages)
+        assert "Potential pairs: 0 time-series, 0 same-title" in caplog.messages
+
+    def test_the_candle_fetch_still_resolves_an_unparseable_close_to_nothing(
+        self, monkeypatch, caplog,
+    ):
+        # BS-07's branch, called directly now that the pipeline cannot reach
+        # it: a malformed close_time resolves to an empty series with a
+        # WARNING naming the ticker, requests nothing, and never raises.
+        def must_not_fetch(*_a, **_k):
+            raise AssertionError("fetch_candlesticks called for an undatable market")
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", must_not_fetch)
+        with caplog.at_level(logging.WARNING):
+            out = _fetch_candles_parallel(
+                MagicMock(), {"SB": {"ticker": "SB", "close_time": "not-a-timestamp"}},
+                date(2026, 1, 1), False,
+            )
+        assert out == {"SB": []}
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        # The dropped ticker is named, so an empty series can't be mistaken
+        # for "this market genuinely had no prices".
         assert any("SB" in msg and "close_time" in msg for msg in warnings)
 
 
@@ -1953,23 +2203,38 @@ class TestActiveTickerRelease:
     backtest used to add tickers to active_tickers and never remove them, so one
     early trade blocked that ticker for the entire remaining simulation.
 
-    Fixture: TX/TY share an exact title (same-title pair, entering at the first
-    Monday); TX/TZ share a normalized title with an 18-day deadline gap
-    (time-series pair, which can only enter at the second Monday because TZ has
-    no earlier candle). Both candidates therefore contain TX, at different entry
-    dates. TX settles before its close_time — an early determination, which is
-    what makes re-entry on a shared ticker reachable at all.
+    Fixture: TX/TY share an exact title and one close instant, 2026-02-02 (a
+    same-title pair, entering at the first Monday — the one close is what the
+    same-title close gate, DR-74, requires); TX/TZ share a normalized title
+    with an 18-day deadline gap (time-series pair, which can only enter at the
+    second Monday because TZ has no earlier candle). Both candidates therefore
+    contain TX, at different entry dates. TX settles before its close_time —
+    an early determination, which is what makes re-entry on a shared ticker
+    reachable at all (TY settles early too, on 2026-01-08).
 
-    Prices: TX yes 0.40 / no 0.60, TY yes 0.30 / no 0.70, TZ yes 0.75 / no
-    0.25. Same-title TX/TY: TX is the pricier side, gap 0.10 >= 0.05, legs
-    nA+pB = 0.60+0.30 = 0.90 <= 0.95. Time-series TX/TZ: TX is the earlier
-    contract and TZ (later) is priced 0.35 higher, clearing the 30% long-gap
-    tier; legs pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval
-    discount (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so
-    the pair really is entered. TX/TY as a time-series pair (13-day gap, TY
-    earlier at 0.30 vs TX 0.40) misses the 15% tier, and TY/TZ is 31 days
-    apart — beyond MAX_DEADLINE_GAP_DAYS — so TX/TZ is the only time-series
-    candidate.
+    Prices: TX yes 0.40 / no 0.60 throughout; TY yes 0.30 / no 0.70 at the
+    first Monday and 0.60 / 0.40 from the second; TZ yes 0.75 / no 0.25 from
+    the second Monday. Same-title TX/TY at the first Monday: TX is the pricier
+    side, gap 0.10 >= 0.05, legs nA+pB = 0.60+0.30 = 0.90 <= 0.95.
+    Time-series TX/TZ at the second Monday: TX is the earlier contract and TZ
+    (later) is priced 0.35 higher, clearing the 30% long-gap tier; legs
+    pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval discount
+    (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so the pair
+    really is entered. TX/TY is never a time-series candidate: their titles
+    are identical, so they state one deadline ("by March 2026") twice and the
+    cumulative-deadline rule refuses them (DR-67). TY/TZ IS a candidate — TY
+    now closes with TX, 18 days before TZ, and the two are worded as two
+    different deadlines — which is why TY carries a second-Monday candle: at
+    0.60, TZ's 0.75 is only 0.15 above it, under the 30% long-gap tier, and at
+    the first Monday TZ has no candle at all. So TX/TZ is the only
+    time-series entry.
+
+    RE-DESIGNED (DR-74): TY used to close on 2026-01-20, 13 days before TX,
+    which the same-title close gate now refuses as two fixtures; aligning TY's
+    close alone was not enough, because it brought TY/TZ inside the 30-day
+    deadline-gap cap (it had been 31 days apart), where TY's first-Monday 0.30
+    would have entered it at the second Monday. Its second-Monday candle keeps
+    it out. No assertion changed.
     """
 
     _M2 = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
@@ -1985,7 +2250,8 @@ class TestActiveTickerRelease:
             {"ticker": "TY", "event_ticker": "EY", "event_title": "EV",
              "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
              "open_time": "2026-01-01T00:00:00+00:00",
-             "close_time": "2026-01-20T00:00:00+00:00",
+             # TX's close instant: the same-title close gate (DR-74).
+             "close_time": "2026-02-02T00:00:00+00:00",
              "settlement_ts": "2026-01-08T12:00:00+00:00"},
             {"ticker": "TZ", "event_ticker": "EZ", "event_title": "EV",
              "title": "Team wins by April 2026", "subtitle": "", "result": "yes",
@@ -1999,7 +2265,10 @@ class TestActiveTickerRelease:
             # TX: pricier than TY (same-title gap) yet cheaper than the
             # later-closing TZ (time-series gap) — see the class docstring
             "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
-            "TY": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            # TY: 0.30 at the first Monday (the same-title entry), then 0.60 —
+            # keeps TY/TZ (18 days apart, like TX/TZ) under the 30% tier at the
+            # second Monday; see the class docstring
+            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(self._M2, 0.60, 0.40)],
             # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
             # enter until then
             "TZ": [_candle(self._M2, 0.75, 0.25)],
@@ -2436,7 +2705,11 @@ def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
     and far enough either way to reach the next Monday), plus singletons,
     with candles obeying the measured rule at prices every such pair clears
     the gates at. The ladder rungs both close at one instant, so only their
-    STATED deadlines order and tier them (and only with ladders on)."""
+    STATED deadlines order and tier them (and only with ladders on). The two
+    legs of a same-title family close at one instant too — the later of their
+    two close draws — which the same-title close gate (DR-74) requires; the
+    draws themselves are unchanged, so every other record of the corpus is
+    the one it always was."""
     rng = random.Random(seed)
     markets: list[dict] = []
     candles: dict[str, list[dict]] = {}
@@ -2457,11 +2730,19 @@ def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
         candles[ticker] = _p5_candles(open_dt, close_dt, yes, no)
 
     for i in range(40):   # same-title: one question on two series
+        legs = []
         for leg, yes, no in (("A", 0.70, 0.32), ("B", 0.55, 0.47)):
             o = opening()
             close = (datetime(o.year, o.month, o.day, 12, tzinfo=UTC)
                      + timedelta(days=rng.choice((1, 2, 3, 6, 8, 9, 13))))
-            add(f"S{i}{leg}", f"SER{leg}{i}-1", f"ST{i}", "Q", o, close, yes, no)
+            legs.append((leg, yes, no, o, close))
+        # RE-PINNED (DR-74): one close for both legs, the later of the two
+        # draws, so the pair passes the same-title close gate. The draws are
+        # made in the same order as before, and each leg's candles are built
+        # from the shared close.
+        shared_close = max(close for *_, close in legs)
+        for leg, yes, no, o, _close in legs:
+            add(f"S{i}{leg}", f"SER{leg}{i}-1", f"ST{i}", "Q", o, shared_close, yes, no)
     for j in range(40):   # time-series: two cumulative deadlines, 14 days apart
         for leg, deadline, close, yes, no in (
             ("A", "January 20", datetime(2026, 1, 20, tzinfo=UTC), 0.30, 0.72),
@@ -5268,20 +5549,33 @@ class TestRunBacktestCrossTypeDedup:
     from the two finders, and this pins WHY.
 
     Fixture shape: two markets sharing an identical (event_title, title,
-    subtitle) — so _group_by_exact_title pairs them as same_title — whose
+    subtitle) — so _group_by_exact_title groups them as same_title — whose
     titles therefore also normalize to one key, so _group_by_normalized_title
     GROUPS the same two tickers for time_series too.
 
     That used to yield both copies, which is what _drop_cross_type_duplicates
     was built to resolve. It no longer can: a time-series pair must state two
     DIFFERENT cumulative deadlines, and identical wording cannot state two of
-    anything. The two conditions are now mutually exclusive on one ticker pair,
-    so Pass 1 produces the same-title copy alone and the dedup has nothing to
-    drop. The helper stays — it is still the right thing to do if a collision
-    ever arises another way — and TestDropCrossTypeDuplicates unit-tests it
-    directly; what changed is that the FINDERS no longer manufacture one.
+    anything. The two conditions are mutually exclusive on one ticker pair,
+    so Pass 1 produces at most the same-title copy and the dedup has nothing
+    to drop. The helper stays — it is still the right thing to do if a
+    collision ever arises another way — and TestDropCrossTypeDuplicates
+    unit-tests it directly; what changed is that the FINDERS no longer
+    manufacture one.
+
+    Two versions of the fixture, since DR-74. _ALIGNED_MARKETS close at one
+    instant, so the same-title close gate admits the pair and the same-title
+    copy is the only one. _MARKETS close a week apart — two fixtures, not one
+    question — so the close gate refuses the same-title copy, and because
+    identical wording can never form a time-series pair (DR-67) the refused
+    copy does not come back relabelled as one: NOTHING reaches the dedup.
+    That second version is the relabel guard for a same-title-only gate.
     """
 
+    # Closes a week apart: DA Feb 1, DB Feb 8 — two fixtures of one
+    # identically worded question on two series. The same-title close gate
+    # (DR-74) refuses the pair and the time-series branch refuses identical
+    # wording, so no candidate of either type forms.
     _MARKETS = [
         {"ticker": "DA", "event_ticker": "EA", "event_title": "EV",
          "title": "Q", "subtitle": "", "result": "yes",
@@ -5292,14 +5586,19 @@ class TestRunBacktestCrossTypeDedup:
          "close_time": "2026-02-08T00:00:00+00:00",
          "settlement_ts": "2026-02-08T12:00:00+00:00"},
     ]
-    # DA (earlier, closes Feb 1) yes 0.30 / no 0.70; DB (later, Feb 8) yes
-    # 0.60 / no 0.40 — the flow-through fixture. Same-title copy: DB is the
-    # pricier side, gap 0.30 >= 0.05, legs nA+pB = 0.40+0.30 = 0.70 <= 0.95.
-    # The time-series copy would once have formed too — the later contract is
-    # priced 0.30 higher, clearing the 15% short-gap tier, with legs
-    # pA+nB = 0.30+0.40 = 0.70 <= 0.85 and a positive Kelly fraction. It is now
-    # refused earlier than any of that, at extraction: both legs are worded
-    # "Q", so they state no deadline at all, let alone two different ones.
+    # The same two markets closing at ONE instant (both Feb 1) — the
+    # flow-through fixture. DA yes 0.30 / no 0.70; DB yes 0.60 / no 0.40.
+    # Same-title copy: DB is the pricier side, gap 0.30 >= 0.05, legs
+    # nA+pB = 0.40+0.30 = 0.70 <= 0.95. A time-series copy would clear the
+    # 15% short-gap tier on price alone (DB priced 0.30 above DA, legs
+    # pA+nB = 0.30+0.40 = 0.70 <= 0.85), but it is refused earlier than any
+    # of that, at extraction: both legs are worded "Q", so they state no
+    # deadline at all, let alone two different ones.
+    _ALIGNED_MARKETS = [
+        {**_MARKETS[0]},
+        {**_MARKETS[1], "close_time": "2026-02-01T00:00:00+00:00",
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+    ]
     _CANDLES = {
         "DA": [_candle(_MONDAY_TS, 0.30, 0.70)],
         "DB": [_candle(_MONDAY_TS, 0.60, 0.40)],
@@ -5308,22 +5607,32 @@ class TestRunBacktestCrossTypeDedup:
     def test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate(self):
         # GROUPING is untouched by the cumulative-deadline rule, so the pair is
         # still discovered by both keys...
-        assert len(_group_by_exact_title(self._MARKETS)) == 1
-        assert len(_group_by_normalized_title(self._MARKETS)) == 1
+        assert len(_group_by_exact_title(self._ALIGNED_MARKETS)) == 1
+        assert len(_group_by_normalized_title(self._ALIGNED_MARKETS)) == 1
         # ...but only the same-title branch produces a candidate. The legs are
         # worded "Q", so they state no deadline at all, and the time-series
         # branch refuses them.
-        assert len(_extract_pairs(_group_by_exact_title(self._MARKETS))) == 1
+        assert len(_extract_pairs(_group_by_exact_title(self._ALIGNED_MARKETS))) == 1
+        assert _extract_pairs(_group_by_normalized_title(self._ALIGNED_MARKETS)) == []
+
+    def test_differing_closes_yield_no_candidate_of_either_type(self):
+        # regression (DR-74) — the relabel guard. The same two tickers, a week
+        # apart: still discovered by both keys, and now refused by both
+        # branches — the same-title one by the close gate, the time-series
+        # one by the wording rule, as before.
+        assert len(_group_by_exact_title(self._MARKETS)) == 1
+        assert len(_group_by_normalized_title(self._MARKETS)) == 1
+        assert _extract_pairs(_group_by_exact_title(self._MARKETS)) == []
         assert _extract_pairs(_group_by_normalized_title(self._MARKETS)) == []
 
-    def test_no_time_series_duplicate_reaches_the_dedup(self, monkeypatch):
+    def _run_with_dedup_spy(self, monkeypatch, markets):
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: self._MARKETS)
+                            lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: self._CANDLES[ticker])
 
         real = backtester._drop_cross_type_duplicates
-        seen: dict = {}
+        seen: dict = {"in": [], "out": []}
 
         def _spy(candidates):
             seen["in"] = list(candidates)
@@ -5337,28 +5646,42 @@ class TestRunBacktestCrossTypeDedup:
             hist_client=MagicMock(), live_client=MagicMock(),
             start_date=date(2026, 1, 1), initial_balance=1000.0,
         )
+        return trades, seen
 
+    @staticmethod
+    def _typed(cands, pair_type):
         key = frozenset({"DA", "DB"})
+        return [c for c in cands
+                if c["pair_type"] == pair_type
+                and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
 
-        def _typed(cands, pair_type):
-            return [c for c in cands
-                    if c["pair_type"] == pair_type
-                    and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
+    def test_no_time_series_duplicate_reaches_the_dedup(self, monkeypatch):
+        trades, seen = self._run_with_dedup_spy(monkeypatch, self._ALIGNED_MARKETS)
 
         # Pass 1 produces the same-title copy ONLY: identical wording cannot
         # state two different deadlines, so the time-series copy is refused at
         # extraction and never reaches the dedup at all.
-        assert len(_typed(seen["in"], "same_title")) == 1
-        assert _typed(seen["in"], "time_series") == []
+        assert len(self._typed(seen["in"], "same_title")) == 1
+        assert self._typed(seen["in"], "time_series") == []
         # The dedup is therefore a no-op here, and the same-title copy is
         # carried into Pass 2 unchanged.
-        assert len(_typed(seen["out"], "same_title")) == 1
-        assert _typed(seen["out"], "time_series") == []
+        assert len(self._typed(seen["out"], "same_title")) == 1
+        assert self._typed(seen["out"], "time_series") == []
 
         assert len(trades) == 1
         assert trades[0].pair_type == "same_title"
         # The same-title copy canonicalizes A as the pricier side (DB)
         assert (trades[0].ticker_a, trades[0].ticker_b) == ("DB", "DA")
+
+    def test_nothing_reaches_the_dedup_when_the_closes_differ(self, monkeypatch):
+        # regression (DR-74) — the relabel guard end to end: with the closes a
+        # week apart the same-title copy is refused and no time-series copy
+        # replaces it, so the dedup sees no candidate for these tickers and no
+        # trade is made.
+        trades, seen = self._run_with_dedup_spy(monkeypatch, self._MARKETS)
+        assert self._typed(seen["in"], "same_title") == []
+        assert self._typed(seen["in"], "time_series") == []
+        assert trades == []
 
     def test_dated_identical_wording_is_same_title_only(self):
         # control — kills a mutant that drops the spans-differ requirement
@@ -5370,14 +5693,15 @@ class TestRunBacktestCrossTypeDedup:
         # fixture states a deadline IDENTICALLY on two DIFFERENT series, so
         # the refusal comes from the spans-differ conjunct alone (the two
         # spans are equal) — the one-series rule does not fire here, since
-        # _same_series_dicts is False on two different series. Mirror of
-        # test_scanner.py::TestDeadlineGuardFinders::
+        # _same_series_dicts is False on two different series. Both legs close
+        # at one instant, so the same-title close gate (DR-74) admits the
+        # same-title copy. Mirror of test_scanner.py::TestDeadlineGuardFinders::
         # test_dated_identical_wording_is_same_title_only.
         title = "Will X happen by Dec 31, 2026?"
         mA = _md("A1", "EVA-1", title=title, event_title="EV")
         mA["close_time"] = "2026-12-01T00:00:00Z"
         mB = _md("B1", "EVB-1", title=title, event_title="EV")
-        mB["close_time"] = "2026-12-20T00:00:00Z"
+        mB["close_time"] = "2026-12-01T00:00:00Z"
         assert len(_group_by_normalized_title([mA, mB])) == 1
         assert backtester._deadline_profile_dict(mA) == (
             scanner.DEADLINE_CUMULATIVE, ("by dec 31, 2026",),
@@ -5387,17 +5711,41 @@ class TestRunBacktestCrossTypeDedup:
         )
         assert backtester._identical_wording_dicts(mA, mB) is True
         assert backtester._same_series_dicts(mA, mB) is False
+        assert backtester._comparable_closes_dicts(mA, mB) is not None
         assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
         assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
 
         # Positive control: B's wording states a DIFFERENT deadline on the
-        # same two series, same close times. The spans now differ, so the
-        # time-series pair forms — proving the [] above comes from the
-        # spans-differ conjunct rather than from the price tier, the deadline
-        # gap, or the two series being distinct.
+        # same two series, at the same prices and the same close instant — the
+        # WORDING is the only thing that changed. The spans now differ, so the
+        # time-series candidate forms — proving the [] above comes from the
+        # spans-differ conjunct rather than from the close times or the two
+        # series being distinct.
         mB3 = _md("B1", "EVB-1", title="Will X happen by Dec 20, 2026?", event_title="EV")
-        mB3["close_time"] = "2026-12-20T00:00:00Z"
+        mB3["close_time"] = mA["close_time"]
         assert len(_extract_pairs(_group_by_normalized_title([mA, mB3]))) == 1
+
+    @pytest.mark.parametrize("title", ["Q", "Will X happen by Dec 31, 2026?"])
+    def test_identical_wording_closing_apart_forms_no_pair_of_either_type(self, title):
+        # regression (DR-74) — the relabel guard through both _extract_pairs
+        # branches, undated and dated. Identical wording on two DIFFERENT
+        # series closing 19 days apart: the same-title branch refuses it at
+        # the close gate, and the time-series branch refuses identical wording
+        # whether it states no deadline ("Q") or one deadline twice. Mirror of
+        # test_scanner.py::TestDeadlineGuardFinders::
+        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
+        mA = _md("A1", "EVA-1", title=title, event_title="EV")
+        mA["close_time"] = "2026-12-01T00:00:00Z"
+        mB = _md("B1", "EVB-1", title=title, event_title="EV")
+        mB["close_time"] = "2026-12-20T00:00:00Z"
+        assert backtester._same_series_dicts(mA, mB) is False
+        assert len(_group_by_exact_title([mA, mB])) == 1
+        assert len(_group_by_normalized_title([mA, mB])) == 1
+        assert _extract_pairs(_group_by_exact_title([mA, mB])) == []
+        assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
+        # Positive control: B on A's close instant — the same-title pair forms.
+        mB["close_time"] = mA["close_time"]
+        assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
 
 
 class TestCheckpointOpeningBalanceSizing:
@@ -6782,10 +7130,33 @@ def _ss1_record(ticker, event_ticker, title, *, subtitle="", event_title="",
             "settlement_ts": close_t}
 
 
+# Fill titles that can never form a TIME-SERIES pair (no stated deadline, a
+# snapshot wording, a title that normalizes away, or one deadline shared by
+# every record that carries it). Their fill records all close at one instant
+# (DR-74), so their same-title candidates survive the close gate and keep
+# SS-1's exactness tests covering the same-title branch with real pairs; the
+# Rain/Snow fill keeps its random closes, so those tests still cover the
+# gate's refusals too, and every time-series pair is unchanged.
+_SS1_SAME_TITLE_ONLY_TITLES = frozenset({
+    "Q", "March 1, 2026", "Bitcoin price on Sep 15, 2026?",
+    "Will X happen by March 5, 2026?",
+})
+_SS1_SHARED_CLOSE = "2026-02-20"
+
+
 def _ss1_corpus(seed: int) -> list[dict]:
     """Hand-placed anchors for every case the subset must get right, plus a
     seeded random fill whose small title/subtitle/event pools make keys
-    collide (shared) about as often as they stay unique (singletons)."""
+    collide (shared) about as often as they stay unique (singletons).
+
+    Since DR-74 a same-title candidate forms only when its two markets close
+    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS, and a 50-day random close spread
+    would refuse nearly every one (measured: 4/5/4 same-title pairs for
+    seeds 0/1/2, against 126/117/93 before the gate). So a fill record whose
+    title can only ever pair as same-title closes at _SS1_SHARED_CLOSE — the
+    anchors' default close, so those records share it with SA/SB and DA/DB —
+    giving 78/65/50. The random close is still DRAWN for every record, so the
+    rng stream, every other field and every time-series pair are unchanged."""
     anchors = [
         # A cross-event time-series pair: shared time-series key, distinct
         # same-title keys ...
@@ -6836,6 +7207,8 @@ def _ss1_corpus(seed: int) -> list[dict]:
         title = (f"Unique question {seed}-{i}" if rng.random() < 0.4
                  else rng.choice(titles))
         close = (date(2026, 2, 1) + timedelta(days=rng.randint(0, 50))).isoformat()
+        if title in _SS1_SAME_TITLE_ONLY_TITLES:
+            close = _SS1_SHARED_CLOSE
         rec = _ss1_record(
             f"R{seed}-{i}",
             f"{rng.choice('ABCDE')}SER-{rng.randint(1, 4)}",
@@ -7013,6 +7386,10 @@ class TestGroupableSubset:
         # Not vacuous: both pair types present, and the ladder with ladders on.
         types = {pt for _, pt in c.all_pairs}
         assert types == {"time_series", "same_title"}
+        # ... and the same-title branch with real pairs, not the anchors' token
+        # few: the fill's same-title-only titles share one close (DR-74), so
+        # their candidates survive the close gate (78/65 for seeds 0/1).
+        assert sum(pt == "same_title" for _, pt in c.all_pairs) >= 40
         ladder = {"L1", "L2"}
         assert any({mA["ticker"], mB["ticker"]} == ladder
                    for (mA, mB, _c, _k), _pt in c.all_pairs) is ladders
