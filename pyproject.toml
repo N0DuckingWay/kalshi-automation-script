@@ -30,6 +30,17 @@ perf = [
     "orjson>=3.9",
 ]
 
+# Package discovery is EXPLICIT, not automatic. setuptools' flat-layout
+# auto-discovery treats every top-level directory whose name is a Python
+# identifier as a candidate package, and a checkout that has run a backtest
+# also holds backtest_cache/ at the root (historical.CACHE_DIR), so
+# `pip install -e ".[dev]"` refused to build ("Multiple top-level packages
+# discovered in a flat-layout: ['kalshi_betting', 'backtest_cache']") on
+# exactly the machines that run backtests. CI never saw it: a fresh checkout
+# has no cache. Pinned by tests/test_packaging.py.
+[tool.setuptools.packages.find]
+include = ["kalshi_betting*"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100

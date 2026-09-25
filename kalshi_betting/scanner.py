@@ -40,7 +40,10 @@ Dependencies:
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
     same-event deadline ladder's leg order and gap (DR-73)). pair_gap_days()
     is the single reader of that gap for everything downstream of pair
-    formation. Depends on the KalshiClient produced by auth.py.
+    formation. historical.py imports event_series too, so the backtest's
+    event-title lookup budget tells a combo ticker from any other exactly as
+    the one-series rule does (DR-51). Depends on the KalshiClient produced by
+    auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -1044,6 +1047,11 @@ def event_series(event_ticker: Any) -> str:
     config.MVE_SERIES_FAMILY_PREFIX for the census and the measured
     cross-prefix co-resolution rate behind the family rule, and for why an
     allowlist was rejected.
+
+    It has a second reader outside pairing: historical._is_combo_event, which
+    decides which event-title lookups the backtest spends its capped budget on
+    (DR-51), so "combo" means the same thing there as it does to the
+    one-series rule.
 
     Args:
         event_ticker (Any): The market's event_ticker. Anything that is not a
@@ -3067,7 +3075,11 @@ def find_time_series_pairs(
          refuses the same shape; if only it did, this finder would simply
          relabel the pair as a time-series bet and main._dedup_pairs — which
          drops the time-series copy only when a same-title copy exists — would
-         have nothing to drop it against.
+         have nothing to drop it against. Such candidates are counted and
+         reported once after the loop on their own silent-at-zero INFO line
+         (M10), as find_same_title_pairs reports its own one-series skips;
+         backtester._extract_pairs logs its sweep's count on a line that
+         differs only in its parenthesis.
       4. Both legs are CUMULATIVE-deadline markets ("will X happen BY
          <date>") stating two DIFFERENT deadlines — cumulative_deadline_pair
          over deadline_phrasing. Kalshi also lists SNAPSHOT markets ("Bitcoin
@@ -3254,6 +3266,14 @@ def find_time_series_pairs(
     # deadlines at all".
     gap_cap_skips = 0
     price_sum_skips = 0
+    # Cross-event candidates refused by the one-series conjunct (M10):
+    # identical wording across two events of one series. It was the one
+    # refusal ahead of the price filters in this branch with no count, so a
+    # run whose time-series zero it caused logged no cause; counted where it
+    # fires, before the wording check, exactly as find_same_title_pairs
+    # counts its own series skips. (The price-parse and tier `continue`s
+    # further down stay uncounted, as they always were.)
+    series_skips = 0
     # DR-73's same-event ladder branch keeps its OWN counters rather than
     # adding to the six above. They count a DIFFERENT population — candidates
     # inside one event, which every previous version of this finder refused
@@ -3417,6 +3437,7 @@ def find_time_series_pairs(
                     # time-series bet — main._dedup_pairs only ever dropped the
                     # time-series copy because a same-title copy existed.
                     if _identical_wording(mA, mB) and _same_series(mA, mB):
+                        series_skips += 1
                         continue
 
                     # The pair must be one question asked at two different
@@ -3575,6 +3596,19 @@ def find_time_series_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
+    # The one-series conjunct's count (M10), silent at zero: the same line
+    # backtester._extract_pairs logs for its sweep, whose parenthesis says
+    # "within the deadline-gap window" instead, as its DR-72 lines do. The
+    # words "two instances of one event series" are shared on purpose with
+    # find_same_title_pairs' line, so one grep finds the rule on both paths
+    # and in both finders.
+    if series_skips:
+        logging.info(
+            "Time-series candidates skipped as two instances of one event "
+            "series (identical wording, different fixture; counted before the "
+            "gap and price filters): %d",
+            series_skips,
+        )
     # Three separate INFO lines, each silent at zero (DR-72) — the same
     # summary idiom find_same_title_pairs uses for its series skips, split by
     # REASON instead of folded into one "not a cumulative-deadline pair"
@@ -3736,7 +3770,12 @@ def find_same_title_pairs(
     events and the co-resolution prior does not apply at all: the 2026-09-15
     sweep's own NPB pair was quoted 0.97 and 0.01 (DR-02, DR-54). Such
     candidates are skipped and counted, and the count is reported once at the
-    end as an INFO line.
+    end as an INFO line. So are candidates whose two markets carry the SAME
+    event ticker (M10), on a line of their own: before M10 that skip was the
+    one refusal ahead of the price filters here with no count (the price and
+    5% gate `continue`s are still uncounted). Both lines are silent at zero,
+    and backtester._extract_pairs logs both verbatim for its same-title
+    branch.
 
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
@@ -3793,6 +3832,10 @@ def find_same_title_pairs(
     # i.e. two instances of one recurring fixture. One line each would bury the
     # run's real output; one summary INFO after the loop instead.
     series_skips = 0
+    # Same event ticker on both markets (M10) — counted for the same reason,
+    # with the same one-summary-line idiom: a refusal nothing reports cannot
+    # be told apart, in the log, from a grouping that never formed a group.
+    same_event_skips = 0
     # members = all active markets that share this exact (event_title, title, subtitle)
     # key. Each entry is a separate market object from a different event — any two of
     # them are candidates for a same-title pair if their prices diverge.
@@ -3809,6 +3852,7 @@ def find_same_title_pairs(
                 # Same event_ticker means these are options in the same multi-choice event,
                 # not separate markets asking the same question — skip them
                 if m_outer.event_ticker == m_inner.event_ticker:
+                    same_event_skips += 1
                     continue
 
                 # Same wording, same series, different event: two instances of
@@ -3881,6 +3925,13 @@ def find_same_title_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
+    if same_event_skips:
+        logging.info(
+            "Same-title candidates skipped because both markets carry the "
+            "same event ticker (one event's own markets, not one question "
+            "listed by two events): %d",
+            same_event_skips,
+        )
     if series_skips:
         logging.info(
             "Same-title candidates skipped as two instances of one event series "

@@ -13,12 +13,17 @@ Purpose:
     backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report.
     Prints a summary of key metrics (trade count, win rate, total return) to
-    the log on completion.
+    the log on completion, closed on every run by what settled-market corpus
+    the run read (its assembly time, whether it was cached, and the archive
+    cutoff as of assembly — a WARNING when the window starts at or after it).
 
 Dependencies:
-    Imports run_backtest_sweep from backtester.py, generate_dashboard from
-    dashboard.py, and build_historical_client / build_prod_live_client from
-    historical.py. Imports from config.py: PROJECT_ROOT,
+    Imports run_backtest_sweep, BacktestSweep and max_trades_simulated (the
+    closing corpus line tests a stamped post-cutoff verdict against the run's
+    own trades with it, as the dashboard header does) from backtester.py,
+    generate_dashboard from dashboard.py, and build_historical_client /
+    build_prod_live_client from historical.py. Imports from config.py:
+    PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -89,7 +94,7 @@ import logging
 import logging.handlers
 from datetime import UTC, date, datetime
 
-from .backtester import run_backtest_sweep
+from .backtester import BacktestSweep, max_trades_simulated, run_backtest_sweep
 from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -104,6 +109,88 @@ from .config import (
 )
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client
+
+
+def _log_corpus_provenance(sweep: BacktestSweep) -> None:
+    """
+    Close the run's report with what settled-market corpus it read.
+
+    The "Period:" line prints start_date → today (the simulated window), but
+    the corpus holds no market settled after its assembly, and a cached re-run
+    reads a corpus an earlier run assembled (DR-13). A window at or after the
+    archive cutoff can enter no trade at all (M2): historical.py logs that as
+    a WARNING at fetch time (and, "as of assembly", on a cache hit), which on
+    a long run sits far above the result it explains, so it is repeated here,
+    beside it. Logged on every run, "not recorded" included — absence must
+    never be the only signal (DR-66). Worded as a bound, not a cause: such a
+    window may also have formed no pairs at all. And a stamped verdict can go
+    stale once the cutoff moves past start_date, so it is read beside
+    backtester.max_trades_simulated — the same test the dashboard header
+    applies: if any simulated point traded, the verdict is reported as stale
+    instead of repeated.
+
+    Takes the sweep WHOLE, like dashboard._section_interval_discount, so the
+    provenance and the trade counts it is judged against cannot drift apart.
+
+    Args:
+        sweep (BacktestSweep): The run's result. Its corpus_provenance is None
+            when not recorded (no corpus was fetched, or it did not come from
+            an assembled cache); a legacy settled_markets_*.json hit carries
+            its file time (legacy=True) and no cutoff.
+    """
+    provenance = sweep.corpus_provenance
+    if provenance is None:
+        logging.info(
+            "Settled-market corpus: assembly time and archive cutoff not recorded "
+            "(no corpus was fetched, or it did not come from an assembled cache)"
+        )
+        return
+    if provenance.assembled_at is None:
+        assembled = "assembly time not recorded"
+    elif provenance.legacy:
+        assembled = (f"last written {provenance.assembled_at:%Y-%m-%d %H:%M} UTC "
+                     "(a legacy cache's file time), holding no market settled "
+                     "after that")
+    else:
+        assembled = (f"assembled {provenance.assembled_at:%Y-%m-%d %H:%M} UTC, "
+                     "holding no market settled after that")
+    if provenance.archive_cutoff is not None:
+        cutoff = f"{provenance.archive_cutoff:%Y-%m-%d}"
+    elif provenance.legacy:
+        cutoff = "not recorded (the legacy format records none)"
+    else:
+        cutoff = "not recorded"
+    logging.info(
+        "Settled-market corpus: %s (%s); archive cutoff at assembly: %s",
+        assembled,
+        "served from an earlier run's cache; --no-cache extends it"
+        if provenance.from_cache else "assembled by this run",
+        cutoff,
+    )
+    if not provenance.post_cutoff:
+        return
+    # A trade at any simulated point disproves "no trade could be entered" —
+    # the one test the dashboard header applies too, so page and log agree
+    traded = max_trades_simulated(sweep)
+    if traded:
+        logging.warning(
+            "The archive cutoff recorded %s is at or after this window's start "
+            "date, which would mean no trade could be entered — but this run "
+            "entered trades (up to %d in one simulated scenario), so that "
+            "verdict is stale: the cutoff has since moved past the start date. "
+            "--no-cache re-reads the cutoff and re-stamps the cache.",
+            "at this corpus's assembly" if provenance.from_cache else "by this run",
+            traded,
+        )
+        return
+    logging.warning(
+        "This window starts at or after the archive cutoff as of its "
+        "corpus's assembly — post-cutoff markets have no historical "
+        "candlesticks, so no trade could be entered whatever pairs formed; "
+        "a zero-trade result here is structural, not a strategy result%s",
+        " (a cached run does not re-read the cutoff; --no-cache re-checks it)"
+        if provenance.from_cache else "",
+    )
 
 
 def main() -> None:
@@ -391,6 +478,12 @@ def main() -> None:
         logging.info("  Total return:  %+.1f%%", total_return * 100)
         # %-style logging has no thousands-separator flag — pre-format the value
         logging.info("  Final balance: $%s", f"{final_value:,.2f}")
+
+    # After either branch: the window (the Period line, when printed) runs to
+    # today but the corpus only to its assembly, and a post-cutoff window's
+    # zero is structural — say so beside the result rather than only at the
+    # top of a long log (DR-13, M2)
+    _log_corpus_provenance(result)
 
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
     # don't duplicate that line here, just point the user at the file.

@@ -352,7 +352,10 @@ INCLUDE_MVE_MARKETS           = True
 # co-resolution prior (and, identically worded, as a time-series pair).
 #
 # Census of backtest_cache/event_titles.json (3,996,906 keys, 2,444 distinct
-# prefixes), measured 2026-09-16. Reproduce with:
+# prefixes), measured 2026-09-16. That file was mostly "" entries for combo
+# tickers nobody looked up; DR-51 migrates its titled entries into
+# event_titles_v2.json and deletes it, so the command below reproduces the
+# census only on a pre-DR-51 copy. Reproduce with:
 #   python3 -c "import json,collections;c=collections.Counter(k.split('-')[0] for k in json.load(open('backtest_cache/event_titles.json')));print([(k,v) for k,v in c.most_common() if k.startswith('KXMVE')])"
 #   KXMVECROSSCATEGORY            2,960,840
 #   KXMVESPORTSMULTIGAMEEXTENDED    906,157
@@ -734,8 +737,12 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # held for grouping; since SS-1 the subset is what stays resident from the
 # warning onward, so the eligible count would over-state it. A 7-day window
 # (--start-date 2026-09-17) measured 7,260,952 eligible records of which
-# 184,255 share a key — the gap between those two numbers is what the eligible
-# count would over-state now.
+# 184,255 share a key — the gap between those two numbers is what counting
+# eligible records over-stated on that run. Both were measured under the pre-P5
+# prefilter (SETTLED_PREFILTER_CACHE_TAG "monday-eligibility-v1"), which also
+# admitted markets opened after that window's only checkpoint; the current
+# prefilter admits a subset, so both numbers and the gap between them are
+# smaller now (not re-measured).
 #
 # Known residual, narrowed by SS-1's Commit C: fetch_all_settled_markets now
 # returns a historical.SettledCorpus that streams the assembled
@@ -751,7 +758,7 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # this warning. The warning does not count those records, so such a run whose
 # eligible count is far above this threshold but whose groupable count is not
 # gets no warning for the list that set its peak (its eligible count is still
-# on the "Eligibility prefilter" and "Groupable subset" lines).
+# on the "Markets to analyze" and "Groupable subset" lines).
 #
 # BS-15 hardened the settled-market FETCH to stream day slices to disk, but the
 # phase right after it held the whole window as one list and built two group
@@ -835,9 +842,11 @@ BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 # toward (title, subtitle) — the TS-11 direction. It is legitimately near zero
 # on a HEALTHY cache (0.57% and 2.87% on the two post-fix caches above), because
 # the corpus is overwhelmingly MVE combo markets, whose titles the bulk
-# get_events listings exclude by API design and whose per-ticker fallback is
-# capped at EVENT_TITLE_FALLBACK_MAX_LOOKUPS. Warning on it would fire on every
-# run and train the operator to ignore the line.
+# get_events listings exclude by API design and whose per-ticker lookups are
+# deferred whenever a run's unresolved set exceeds
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS (DR-51 — every bulk window at 2026-09
+# volume, so expect it lower still after that change). Warning on it would
+# fire on every run and train the operator to ignore the line.
 #
 # Advisory only: the census drops, filters and alters nothing.
 BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
@@ -899,8 +908,59 @@ TRADER_MAX_WORKERS = 8
 #
 # MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
 # stale prefiltered cache is silently reused and the backtest sees a market set
-# the current predicate would not have produced.
-SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
+# the current predicate would not have produced. Since M9 (P3) half of that is
+# no longer silent: _prepare_candidates re-applies the predicate to every
+# fetched corpus, and a re-check that rejects anything on a corpus assembled
+# under this tag is a WARNING naming this constant
+# (backtester._log_corpus_prefilter) — which catches a TIGHTENED predicate. A
+# LOOSENED one is still invisible, since the records the old predicate dropped
+# are simply absent from the cache.
+#
+# History: "monday-eligibility-v1" read open_time as a DATE, so it kept every
+# market that opened later on the checkpoint Monday itself — 2,192,241 of the
+# 7,274,215 records of the 2026-09-17 window's assembled cache (30.1%, the
+# 2026-09-24 review's M8) and 336,750 of the 570,506 of the 2026-07-13 one
+# (59.0%, streamed for P5). "monday-checkpoint-v2" (P5) compares open_time with
+# the 09:00 UTC checkpoint INSTANT (backtester._can_ever_enter). v2 admits a
+# subset of what v1 admitted (for every real UTC offset) and drops only
+# markets that can never be entered, so the entries a backtest finds over the
+# same settled records are unchanged. The bump ORPHANS every assembled cache
+# written under v1: the name stem changed, so none of them is ever read
+# again, and a rebuild retires only a legacy file of its OWN stem, so none is
+# ever deleted either — remove
+# backtest_cache/settled_markets_*_monday-eligibility-v1.* by hand. The day
+# slices are not keyed by this tag and are unaffected. Every eligible-record
+# count quoted in this repo from before P5 — 7,274,215 and 7,260,952 for the
+# 2026-09-17 window (and its 184,255 groupable), the frontier's 7,190,452 of
+# 9,176,306, 570,506 for 2026-07-13 — was measured under v1.
+SETTLED_PREFILTER_CACHE_TAG = "monday-checkpoint-v2"
+
+# How young an EMPTY assembled settled-market cache must be to still be served
+# (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it
+# records only that nothing qualified when it was assembled (or that a run was
+# cut short), and a cache hit makes zero network calls, so an empty cache used
+# to be a PERMANENT hit — the 2-byte "[]" settled_markets_2026-08-29_*.json on
+# disk, last written 2026-09-01 00:16 UTC (its file time), was still being
+# served on 2026-09-24. Under this age (measured from the assembly time the
+# streamed cache's meta records, or a legacy .json's file time) an empty cache
+# is served with a WARNING; at or over it, when its assembly time cannot be
+# read, or when that time is in the future, it is a miss and the corpus is
+# re-assembled. So a legitimately empty window re-checks at most once per this
+# interval — and each re-check is an ordinary miss: a full re-assembly of the
+# window from the day-slice stores (fetching any day not stored or no longer
+# valid, and always the current day), not a top-up, so for a long window it is
+# a full-volume run (the 2026-08-29 file's rebuild covers 26 days; the fresh
+# 7-day 2026-09-17 run of 2026-09-24 assembled 7,274,215 records, took 2,382 s
+# and peaked at 2,916,679,680 bytes max RSS). A NON-empty cache is never expired
+# by age — it is announced (its assembly time and what --no-cache costs to
+# extend it) and served; that is the operator decision "announce, don't
+# enforce". One day, in seconds; the same value as, but deliberately not the
+# same constant as, historical's private _DAY_SECONDS (a day-slice geometry
+# fact) and backtester's private _DAY_SECONDS (a calendar step), and as
+# historical's private _EMPTY_CANDLE_TTL_SECONDS — the older, separate staleness
+# rule for an EMPTY candlestick cache file, which (unlike this one) serves a
+# future-dated file; that rule predates this one and is left as it is.
+EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS = 86_400
 
 # Hard cap on the per-ticker event-title fallback in
 # historical._load_or_build_event_titles. That fallback exists for the handful
@@ -910,16 +970,65 @@ SETTLED_PREFILTER_CACHE_TAG = "monday-eligibility-v1"
 # 2026-08-03: 289,235 unique event_tickers for a 21-day window) — sequentially
 # that is many hours with no visible progress, which reads as a hang.
 #
-# Tickers past the cap are recorded as "" (the same poison pill used for a
-# failed lookup): the backtester then treats those markets as ungrouped, which
-# is the identical outcome a failed lookup already produced. Correctness is
-# unaffected; only MVE grouping coverage degrades, and the log says by how much.
+# How the cap is spent (DR-51, 2026-09). When every ticker still unresolved
+# after the bulk listings fits under the cap, all of them are looked up. When
+# they do not, the cap is spent on NON-combo tickers only, and every combo
+# ticker — the KXMVE family, MVE_SERIES_FAMILY_PREFIX, read through
+# scanner.event_series — is deferred. The non-combo slice is taken in ticker
+# order, tickers the accumulator has never answered first, so a later run
+# resolves the next slice: with the cache on because answered tickers are no
+# longer unresolved, and under --no-cache (which re-resolves every requested
+# ticker) because the never-answered ones outrank those it already holds.
+# A combo's event title has no measured effect on which pairs form: the
+# one-series rule refuses every combo-vs-combo same-title pair (DR-54/DR-55),
+# and on the 2026-09-08/09 day slices no combo record shared even the coarser
+# time-series grouping key with any non-combo record (CLAUDE.md, DR-67 notes).
+# A non-combo title can (TS-11), and the old single sorted list spent the whole
+# cap on the tickers sorting before "KXMVE" plus the head of the combo block:
+# on the 2026-09-24 7-day run 3,987,139 tickers reached the fallback, 5,000
+# were looked up and 3,982,139 skipped, and one non-combo event sorting after
+# "KXMVE" (KXNFLEVERYWEEKCOMPETE-27, 34 markets) was skipped with them.
+#
+# Deferring combos changes an INPUT to grouping, not a rule. A combo the old
+# cap reached was looked up and titled: that run's census logged event_title on
+# 27,934 of 7,274,215 eligible records, and 18,671 of those were among its
+# 18,705 non-combo records, so 9,263 combo records carried a title. A deferred
+# combo now stays blank unless the accumulator already holds its title, which
+# moves those markets' grouping keys and the backtest's event_title and
+# deadline-phrasing census figures (a post-DR-51 fresh backtest's outcome-label
+# census is not comparable with a pre-DR-51 one) but not which pairs form: the
+# 2026-09-08/09 measurement above was taken on day-slice records, which carry
+# no event_title at all (it is patched in at assembly), i.e. with every
+# combo's event title already blank.
+#
+# A deferred ticker is not looked up and nothing is stored for it: it is
+# untitled for that run unless the accumulator already holds its title, and a
+# later run tries it again. Storing "" for it grew
+# backtest_cache/event_titles.json from 3,996,906 to 7,986,570 keys (202 MB to
+# 374 MB) in that one run, 7,918,449 of them KXMVE tickers mapped to "", which
+# every later fetch loaded whole. Only a genuine answer is stored — a title,
+# or "" for a lookup that failed or an event listed without one. Correctness is
+# unaffected either way: an untitled market groups by market title alone,
+# exactly as after a failed lookup, and the log names how many were deferred.
 EVENT_TITLE_FALLBACK_MAX_LOOKUPS = 5_000
 
 # Worker threads for the per-ticker event-title fallback. Each lookup is an
 # independent read-only GET, so this is pure I/O overlap — the same rationale
 # (and the same retry-per-worker behaviour) as SETTLED_FETCH_MAX_WORKERS.
 EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
+
+# Pause, in seconds, that each event-title fallback worker takes after every
+# lookup (DR-51) — the same 0.15 s each fetch_candlesticks worker takes between
+# pages (its rate_limit_sleep default), against the same API with the same
+# worker count. Unpaced, the fallback's 5,000 lookups on the 2026-09-24 7-day
+# run took 2m03s (about 41 requests/s) and drew 268 HTTP 429s. Read the
+# evidence for what pacing does and does not buy: the candlestick fetch paced
+# this way ran at about 24 requests/s (37,326 single-request tickers in 25m56s
+# on 2026-09-13) and still drew 429s on 4-5% of its requests, all retried by
+# api_call_with_retry, as the 268 were. So this lowers the aggregate rate; it is
+# not a guarantee of zero 429s. What removes the storm at bulk-window volume is
+# the budget rule above: combo tickers no longer reach the fallback at all.
+EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS = 0.15
 
 # Abandon a bulk event listing after this many CONSECUTIVE pages that resolve
 # no new titles. Same "productivity bail-out" idiom as MVE_MAX_EMPTY_PAGES.

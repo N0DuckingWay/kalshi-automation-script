@@ -22,9 +22,10 @@ happen. PROJECT_ROOT is redirected at tmp_path and logging.basicConfig is
 stubbed, so the run's RotatingFileHandler can neither write into the repo root
 nor leak a handler onto the root logger for the rest of the session.
 """
+import dataclasses
 import logging
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,7 +33,7 @@ import pandas as pd
 import pytest
 
 from kalshi_betting import backtest, config
-from kalshi_betting.backtester import BacktestSweep, SweepPoint
+from kalshi_betting.backtester import BacktestSweep, CorpusProvenance, SweepPoint
 from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -619,6 +620,81 @@ class TestSummaryBlock:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
+
+
+class TestCorpusProvenanceLine:
+    """DR-13 / M2 (P2): the run's report closes, on every run, with what
+    settled-market corpus it read — the Period line runs to today, the corpus
+    only to its assembly — and a post-cutoff window's zero is called
+    structural beside the result, not only at the top of a long log, unless
+    the run's own trades prove that stamped verdict stale."""
+
+    PROV = CorpusProvenance(
+        from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC),
+        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC), post_cutoff=False)
+
+    @pytest.mark.parametrize("n_trades", [0, 2])
+    def test_the_corpus_line_closes_every_run(self, cli, monkeypatch, caplog, n_trades):
+        cli["result"] = _sweep(n_trades=n_trades)
+        cli["result"].corpus_provenance = self.PROV
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
+                "market settled after that (served from an earlier run's cache; "
+                "--no-cache extends it); archive cutoff at assembly: 2026-07-25"
+                ) in caplog.text
+        assert "structural" not in caplog.text
+
+    def test_a_post_cutoff_window_is_called_structural(self, cli, monkeypatch, caplog):
+        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, post_cutoff=True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("starts at or after the archive cutoff as of its corpus's assembly"
+                   in m and "no trade could be entered whatever pairs formed" in m
+                   and "--no-cache re-checks it" in m for m in warned)
+        assert not any("that verdict is stale" in m for m in warned)
+
+    def test_a_post_cutoff_verdict_contradicted_by_trades_is_reported_as_stale(
+            self, cli, monkeypatch, caplog):
+        # P2 review (R3/C3/ADV-3): after a trade summary, "no trade could be
+        # entered" would be false on its face. The same helper the dashboard
+        # header reads (backtester.max_trades_simulated) turns it into a
+        # stale-verdict WARNING, so the page and the log agree.
+        cli["result"] = _sweep(n_trades=2)
+        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, post_cutoff=True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert not any("no trade could be entered whatever pairs formed" in m
+                       for m in warned)
+        assert any("The archive cutoff recorded at this corpus's assembly is at or "
+                   "after this window's start date" in m
+                   and "entered trades (up to 2 in one simulated scenario), so that "
+                   "verdict is stale" in m and "--no-cache re-reads the cutoff" in m
+                   for m in warned)
+
+    def test_a_legacy_cache_names_its_file_time(self, cli, monkeypatch, caplog):
+        # P2 review (C1/ADV-1): a legacy .json hit carries its file time here
+        # too, named as such, and claims no cutoff.
+        cli["result"].corpus_provenance = CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
+            archive_cutoff=None, post_cutoff=None, legacy=True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: last written 2026-08-03 19:05 UTC (a legacy "
+                "cache's file time), holding no market settled after that (served "
+                "from an earlier run's cache; --no-cache extends it); archive cutoff "
+                "at assembly: not recorded (the legacy format records none)"
+                ) in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"
+                    and "archive cutoff" in r.getMessage()]
+
+    def test_no_provenance_says_not_recorded(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: assembly time and archive cutoff not "
+                "recorded") in caplog.text
 
 
 class TestRejectedArgumentLeavesNoLogFile:

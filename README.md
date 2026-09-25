@@ -73,7 +73,9 @@ config.py (constants), _http.py (retry + raw-response fetch)
                     backtest.py (CLI entry)
 
     (historical.py also imports auth.py's build_client for its own client
-     builders, and _http.py directly for its raw signed GETs; backtester.py
+     builders, _http.py directly for its raw signed GETs, and scanner.py's
+     event_series so the event-title lookup budget's combo test agrees with
+     the one-series rule; backtester.py
      also imports scanner.py's time_series_group_key — the one definition of
      the time-series grouping key, title plus outcome label, shared with the
      live scanner — event_series, the one definition of an event's series
@@ -134,14 +136,21 @@ backtest.py (CLI)
   │    │    ├─ historical.fetch_all_settled_markets() — market metadata, returned as a SettledCorpus
   │    │    │     │                                    (streams settled_markets_*.jsonl.gz on every walk;
   │    │    │     │                                    a legacy .json cache hit is still one list)
-  │    │    │     ├─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly
-  │    │    │     └─ assembly walk A / walk B         — both stream the day slices (and the current
-  │    │    │                                          day, spooled to an anonymous temp file) lazily
-  │    │    │                                          through one merge generator: A counts and
+  │    │    │     ├─ prefilter=_can_ever_enter        — drop never-tradeable markets during assembly;
+  │    │    │     │                                    the log reports the window's settled records
+  │    │    │     │                                    beside the eligible ones it kept
+  │    │    │     └─ assembly walk A / walk B         — both stream the day slices (unfiltered) and
+  │    │    │                                          the current day (spooled to an anonymous temp
+  │    │    │                                          file, prefiltered as it arrived) lazily
+  │    │    │                                          through one merge generator: A counts — the
+  │    │    │                                          kept markets, and the settled records the
+  │    │    │                                          prefilter or the dedup removed — and
   │    │    │                                          collects event tickers for title resolution,
-  │    │    │                                          B patches titles and writes the cache — the
-  │    │    │                                          corpus is never held
-  │    │    ├─ _index_eligible_keys()                 — walk 1: count, prefilter, census, hash both grouping keys
+  │    │    │                                          B patches titles and writes the cache, the
+  │    │    │                                          counts in its meta — the corpus is never held
+  │    │    ├─ _index_eligible_keys()                 — walk 1: count, re-check the prefilter (a no-op on a
+  │    │    │                                           fetched corpus, which says so), census, hash both
+  │    │    │                                           grouping keys
   │    │    ├─ _materialize_groupable()               — walk 2: keep only eligible markets sharing a key with
   │    │    │                                           another (the rest form single-member groups, which both
   │    │    │                                           groupings drop) — then group and extract pairs on those
@@ -177,14 +186,14 @@ backtest.py (CLI)
 | `config.py` | All tunable constants (price thresholds, Kelly cap, fee rates, API URLs, file paths), the two fee helper functions, `max_affordable_pairs()` — the single budget-to-contracts definition shared by the scanner's depth bound and the sizer — and the backtest-only time-series spread-band helpers `time_series_spread_band()` / `time_series_spread_too_wide()` plus the `SPREAD_BAND_SWEEP_FLOORS` / `SPREAD_BAND_SWEEP_CEILINGS` grid the scenario explorer sweeps; nothing on the live path reads a band value. |
 | `auth.py` | Reads RSA credentials from `secrets.json` and the PEM key file, constructs an authenticated `KalshiClient`, and provides `verify_auth()` to confirm credentials and read the live account balance per exchange shard (`{exchange_index: cents}`; callers sum for sizing). |
 | `_http.py` | Shared HTTP helpers used across the package (auth, scanner, historical, trader, and v2_probe): `api_call_with_retry()` (exponential backoff on 429/5xx for market-data calls) and `fetch_json_page()` (parses the SDK's raw `*_without_preload_content` responses, re-raising non-2xx as `ApiException`), and `signed_request_json()` (signed GET/POST against an arbitrary API path for routes the pinned SDK has no method for — retry-free, since order submission and the collateral transfer call it directly). |
-| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles and appends each market's outcome label (subtitle) to group time-series pairs, detects same-title pairs via exact match, refuses a same-title pair between two events of one series, a time-series pair whose wording is identical across one series (two instances of one recurring fixture — a genuine two-deadline family of one series spells its deadline in the wording and can still pair, if both legs are worded as cumulative deadlines; `event_series()` reads the prefix before the first hyphen, except that every `KXMVE*` combo prefix collapses onto one family so two combos listed under two different combo series are still refused), a time-series pair between two markets of ONE event unless `TIME_SERIES_SAME_EVENT_LADDERS` is on and they are two dated rungs of that event's deadline ladder (`stated_deadline()` / `same_event_ladder()`, which order the legs and measure the gap on the STATED deadlines; `pair_gap_days()` is the one place anything downstream reads that gap), and a time-series pair whose legs are not both worded as cumulative "by \<date\>" deadlines at two different dates (compared as normalized text, not parsed calendar dates — see the note above; `deadline_phrasing()` — a snapshot family such as "Solana price on Sep 14/18, 2026?" still groups but no longer pairs; `deadline_pair_refusal()` names WHY a refused pair was refused — snapshot wording, no stated deadline, or the same deadline stated twice — feeding three separate, honestly-labelled skip counts instead of one folded one, DR-72), and enriches tradeable pairs with live order book depth to compute real fill prices — averaged over the contracts the balance could actually buy, not the whole book, with the qualifying levels kept on the pair (`depth_levels`) for the sizer to re-price against via `prefix_fill_prices()`. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades, and to the V2 order-price grid arithmetic (`tick_size_for_price()`, `ceil_to_tick()`, `v2_limit_price()`, `v2_effective_cap()`) — it lives here, not in `trader.py`, so the sizer can test a candidate size against the very limit the trader will submit without importing it. |
+| `scanner.py` | Fetches all open Kalshi markets, strips date tokens from titles and appends each market's outcome label (subtitle) to group time-series pairs, detects same-title pairs via exact match, refuses a same-title pair between two events of one series, a time-series pair whose wording is identical across one series (two instances of one recurring fixture — a genuine two-deadline family of one series spells its deadline in the wording and can still pair, if both legs are worded as cumulative deadlines; `event_series()` reads the prefix before the first hyphen, except that every `KXMVE*` combo prefix collapses onto one family so two combos listed under two different combo series are still refused), a time-series pair between two markets of ONE event unless `TIME_SERIES_SAME_EVENT_LADDERS` is on and they are two dated rungs of that event's deadline ladder (`stated_deadline()` / `same_event_ladder()`, which order the legs and measure the gap on the STATED deadlines; `pair_gap_days()` is the one place anything downstream reads that gap), and a time-series pair whose legs are not both worded as cumulative "by \<date\>" deadlines at two different dates (compared as normalized text, not parsed calendar dates — see the note above; `deadline_phrasing()` — a snapshot family such as "Solana price on Sep 14/18, 2026?" still groups but no longer pairs; `deadline_pair_refusal()` names WHY a refused pair was refused — snapshot wording, no stated deadline, or the same deadline stated twice — feeding three separate, honestly-labelled skip counts instead of one folded one, DR-72; every one-series refusal, in both finders, and every same-title same-event skip is counted on its own silent-at-zero line too, M10), and enriches tradeable pairs with live order book depth to compute real fill prices — averaged over the contracts the balance could actually buy, not the whole book, with the qualifying levels kept on the pair (`depth_levels`) for the sizer to re-price against via `prefix_fill_prices()`. Also home to `leg_sides()` / `leg_prices()`, the single mapping from a pair's type to the side and price each leg actually trades, and to the V2 order-price grid arithmetic (`tick_size_for_price()`, `ceil_to_tick()`, `v2_limit_price()`, `v2_effective_cap()`) — it lives here, not in `trader.py`, so the sizer can test a candidate size against the very limit the trader will submit without importing it. |
 | `strategy.py` | Solves size and price together — binary-searching the book for the largest contract count whose own marginal fill price still justifies it AND that the resulting fill-or-kill limit can actually buy — then applies the Kelly criterion to size each trade, computes the profit floor for same-title pairs / the win-scenario profit for time-series pairs and the monthly-normalized return, and greedily selects a portfolio that fits within the available balance. |
 | `trader.py` | Converts `TradeSpec` objects into orders and submits each pair's two legs sequentially (fill-or-kill, NO leg then YES leg — the NO leg is `market_a` for a same-title pair and `market_b`, the later contract, for a time-series pair) via the Kalshi API, with automatic rollback of the filled NO leg if the YES leg doesn't fill. Multiple pairs execute concurrently. Submission goes to the V2 order endpoint by default and to the retained legacy endpoint when `config.ORDER_API_VERSION` is flipped — see "Order API version" below. |
 | `reporter.py` | Writes trade results to Excel. In production, appends to a persistent `trade_log.xlsx`. In dev mode, writes a fresh timestamped simulation file with two sheets (trades + all candidates). Market cells are rendered by `scanner.display_title`, so they carry the event title and the outcome label alongside the market title. |
 | `main.py` | Top-level CLI orchestrator for the live trading pipeline. Dispatches to `_run_dev()` (sandbox simulation) or `_run_prod()` (real-money trading) based on `--mode`. |
 | `scheduler.py` | Long-running daemon that fires the production bot every Monday at 09:00 using the `schedule` library. Also prints the equivalent cron job command. |
 | `historical.py` | Fetches and disk-caches historical settled market metadata (from two API endpoints, sharded into parallel per-day slices that are cached individually so interrupted or repeated fetches resume instead of re-walking months of history) and hourly candlestick price series needed by the backtester (candlesticks are fetched in parallel across tickers and cached per ticker, so workers never share a cache file and a repeat run re-reads them from disk). |
-| `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs (including, behind `TIME_SERIES_SAME_EVENT_LADDERS`, two dated rungs of one event's deadline ladder — formed by a separate, deliberately unwindowed per-event sub-pass and ordered and gapped on their stated deadlines through the same `scanner.stated_deadline()` / `same_event_ladder()` the live finder uses), scans weekly Monday snapshots for the first tradeable entry — at a BACKTEST-only time-series spread band (`_entries_for_band()`, `_find_entry()`) that live trading never reads — applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its day-0 charges as a real daily return and a real drawdown. The curve is a portfolio value, not a cash balance: an open position is carried at its cost basis for its whole holding period, so committing capital does not move the curve and the drawdown/Sharpe/Sortino figures derived from it measure realized loss rather than peak deployment. The work is split at the band and the interval discount `k`: `_prepare_candidates()` (fetch through candlesticks) depends on neither, `_entries_for_band()` depends only on the band, and `_simulate_at_discount()` — the Kelly gate, dedup, P&L, equity curve — depends on `k`; `_sweep_from_candidates()` composes all three into the band x `k` x population scenario grid (`SweepPoint`, `HalfSplit`, `BacktestSweep`) the dashboard's scenario explorer renders. |
+| `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs (including, behind `TIME_SERIES_SAME_EVENT_LADDERS`, two dated rungs of one event's deadline ladder — formed by a separate, deliberately unwindowed per-event sub-pass and ordered and gapped on their stated deadlines through the same `scanner.stated_deadline()` / `same_event_ladder()` the live finder uses), scans weekly Monday snapshots for the first tradeable entry — at a BACKTEST-only time-series spread band (`_entries_for_band()`, `_find_entry()`) that live trading never reads — applies Kelly sizing, records actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its day-0 charges as a real daily return and a real drawdown. The curve is a portfolio value, not a cash balance: an open position is carried at its cost basis for its whole holding period, so committing capital does not move the curve and the drawdown/Sharpe/Sortino figures derived from it measure realized loss rather than peak deployment. The work is split at the band and the interval discount `k`: `_prepare_candidates()` (fetch through candlesticks) depends on neither, `_entries_for_band()` depends only on the band, and `_simulate_at_discount()` — the Kelly gate, dedup, P&L, equity curve — depends on `k`; `_sweep_from_candidates()` composes all three into the band x `k` x population scenario grid (`SweepPoint`, `HalfSplit`, `BacktestSweep`) the dashboard's scenario explorer renders. Pair extraction accounts for every pair of every group's members, each on its own silent-at-zero line — the three wording reasons, the one-series rule, the same-event skip, each ladder reason and, for time-series groups, the pairs its close-date window never visits and the members with no readable close time — and the size of each grouping is logged on every run, zero included, so a run that forms no pairs still logs why (M10). |
 | `dashboard.py` | Generates a self-contained HTML performance report from backtest results — eight sections: equity curve / Sharpe/Sortino/drawdown KPIs, returns decomposition, price calibration analysis, an interval-discount (`k`) calibration section with a dropdown that switches the equity curve between every swept `k`, a scenario-explorer section (a fragility banner, a spread-band x `k` heatmap and a per-population KPI table over the band sweep, with its own band/`k` `<select>`s), trade diagnostics, risk metrics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. The page header names the run's primary spread band and same-event-ladder setting. |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount`, `--no-sweep`, `--same-event-ladders` / `--no-same-event-ladders`, and the backtest-only `--spread-min` / `--spread-max` / `--no-band-sweep`), builds the historical API clients, calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()`, and logs a summary of the primary result. |
 | `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. A 2xx order body that is not a JSON object, in either step that reads one (DR-58), and — in the NO-buy step only — an object whose fill counts are unreadable (DR-60), are a clean FAIL that still reads the position, re-reads it once when that first read is `None` or `0`, and reports lookup-failed, position-open and genuinely-flat as three distinct outcomes, never a traceback out of the fill readers. Two of the unfillable-ask step's branches are recorded residuals — its unreadable-fill-counts branch and its `not killed` branch both FAIL without re-reading the account. The NO-buy step classifies readable fill counts into three outcomes, not two — a complete fill, a true kill, and a fill-or-kill invariant violation — so a partial fill FAILs naming the counts and re-reading the account rather than being reported as a clean kill with the account "still flat" (DR-20); the unfillable-ask step always read a partial that way. Both steps judge on `fill_count` AND `remaining_count`, which is deliberately stricter than the live `trader._v2_fill_status`, whose contract is `fill_count` alone. `--dest-shard` equal to the source shard is refused with a NEUTRAL at the top of the transfer step, before any transfer I/O, so it can no longer POST a net-zero self-transfer and then report a false in-flight FAIL (DR-22). Never imported by the pipeline. |
@@ -216,6 +225,8 @@ pip install -e ".[dev,perf]"
 ```
 
 Dependencies are declared in `pyproject.toml`: `kalshi-python-sync` (pinned to `3.2.0` — do not bump, see `CLAUDE.md`), `schedule`, `tabulate`, `cryptography`, `python-dateutil`, `openpyxl`, `plotly`, `pandas`, `numpy`, `scipy`, `yfinance`. The `[dev]` extra adds `pytest` and `ruff`. The `[perf]` extra adds `orjson`, which speeds up the backtest's settled-market fetch — that fetch parses tens of millions of JSON records and is CPU-bound on JSON decoding. It is entirely optional: without it the code falls back to the stdlib `json` module, and because `orjson` emits plain JSON the on-disk cache format is identical either way, so installing or removing it never invalidates a cache.
+
+The package to install is named explicitly (`[tool.setuptools.packages.find]` includes only `kalshi_betting*`). Otherwise the `backtest_cache/` directory a backtest leaves at the repo root is auto-discovered as a second package, and `pip install -e` refuses to build.
 
 ### Credentials
 
@@ -269,7 +280,15 @@ falls back to `kalshi_private_key.pem` when it's absent.
                                     .jsonl.gz exists at all, are never written any more,
                                     and are deleted once a rebuild of the same name stem
                                     has written its .jsonl.gz
-    event_titles.json             ← Cross-run event-title accumulator (merged, not overwritten)
+    event_titles_v2.json          ← Cross-run event-title accumulator (merged, not overwritten).
+                                    Stores genuine answers only — a title, or "" for a
+                                    lookup that failed — never a ticker the lookup cap
+                                    deferred. A legacy event_titles.json (which also
+                                    stored "" for every deferred ticker, millions per
+                                    bulk window) is migrated into it once, keeping only
+                                    its titled entries, and then deleted; one found
+                                    beside it later is never read, and is named in a
+                                    WARNING on every run until it is removed
     archive_days/                 ← Per-created-day archive slices (incremental/resumable)
     live_days/                    ← Per-settled-day recent-market slices (incremental/resumable)
     candlesticks/                 ← Per-ticker hourly price series
@@ -405,7 +424,33 @@ python3 -m kalshi_betting.backtest --no-band-sweep           # skip the spread-b
 
 `--start-date` should predate the Kalshi archive cutoff. Markets that settled
 after the cutoff have no historical candlestick data, so a window starting after
-it produces no trades regardless of how many pairs it finds.
+it produces no trades regardless of how many pairs it finds. A run that fetches
+the settled markets says so in three places: a WARNING when they are fetched, a
+warning line at the end of the run's log summary, and a red banner under the
+dashboard's "Period:" line. A cached re-run repeats the verdict "as of" the
+cache's assembly, without re-reading the cutoff, but only for a cache assembled
+since this was added: a legacy `settled_markets_*.json`, or a
+`settled_markets_*.jsonl.gz` written before it (the 2026-09-17 one on disk),
+recorded no cutoff, so its re-run says the cutoff was "not recorded" and shows
+no verdict at all. Run once with `--no-cache` to re-check the cutoff and stamp
+it. If a cached run nevertheless enters trades under a post-cutoff verdict, the
+cutoff has moved since the cache was assembled, and the log and dashboard say
+the verdict is stale instead of repeating it.
+
+**Cached runs say what they cover.** The assembled market list
+(`backtest_cache/settled_markets_*.jsonl.gz`, or a legacy `.json`) is a
+snapshot: it holds no market that settled after it was assembled, while the
+report's period always runs to today. A run that reuses it logs when it was
+assembled (a legacy file's modification time) and how long ago, and the
+dashboard shows the same under the "Period:" line. Pass `--no-cache` to extend
+it, and expect it to cost close to a full fetch for any window that reaches back
+before the archive cutoff: it re-assembles the whole corpus, reusing a stored day
+slice only while it is still valid (an archive day slice goes stale whenever the
+cutoff advances), and it also re-fetches every pair's candlesticks and
+re-resolves event titles. A non-empty cache is never expired automatically. An
+**empty** one is reused only while it is less than a day old
+(`EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS`), and after that the next run with that
+`--start-date` rebuilds it — a full assembly of the window, not a quick check.
 
 `--interval-discount K` (`0 <= K <= 1`) overrides the time-series interval
 discount `k` for this backtest run only — it never reaches live trading, which
@@ -502,7 +547,9 @@ zero-trade path already produces — instead of spending minutes fetching
 millions of settled-market records into a cache that was always going to
 produce zero trades. `historical.py` separately warns (without aborting) when
 `--start-date` is on or after the archive cutoff, since that also makes the
-window structurally 0-trade — see the paragraph above.
+window structurally 0-trade. The warning also appears on the dashboard and, for
+a cache assembled since this was added, on a cached re-run "as of" the cache's
+assembly — see the paragraph above for which caches record no cutoff.
 
 `--max-horizon-days` only enters trades where the later-closing leg is within the
 given number of days of the *simulated* entry checkpoint (each Monday evaluated
@@ -518,7 +565,14 @@ with the run. The market records are never assembled in memory either: once
 every slice is present, the slices are streamed off disk twice (once to count
 the markets and collect the event tickers whose titles are resolved, once to
 write every market into the assembled `settled_markets_*.jsonl.gz` cache), and
-the backtester then streams that file on each of its own walks. What still
+the backtester then streams that file on each of its own walks. The first walk
+also counts every record that settled in the window and how many of them the
+backtester's eligibility prefilter rejected, so the log reads "N eligible
+markets of M records settled ..." instead of calling the survivors settled
+markets; those counts are stored in the assembled cache, repeated when a later
+run is served from it, and quoted on the backtester's own "Markets to analyze"
+line, whose prefilter re-check then reports the zero it finds as expected
+rather than as "skipping 0". What still
 grows with the run is much smaller, because it holds strings rather than whole
 records: the set of market tickers each of those two walks keeps to drop
 duplicates, and the event tickers and titles being resolved. Three record lists
@@ -548,6 +602,38 @@ in-window settlement, and — because a single long-dated settler resets that
 counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (2000) pages total, which
 logs a WARNING when hit (markets created deeper than that may be missed; raise
 the constant if a run needs them).
+
+**Prefilter tag bump (P5): delete the old assembled caches by hand.** The
+backtester's eligibility prefilter now drops a market that opened at or after
+every Monday-09:00-UTC checkpoint it could be entered at — those dated from
+`--start-date` to the day before its close. It used to compare the opening
+DATE, so it kept markets opened later on a checkpoint Monday, which that
+Monday's checkpoint can never enter: 30% of the 2026-09-17 window's cache, 59%
+of the 2026-07-13 one. For the same settled records, trades and returns are
+unchanged and only the eligible-market counts shrink; a re-assembled corpus can
+still differ from an old one, as any two assemblies made at different times do
+(see the prefilter gotcha in `CLAUDE.md`). Because the predicate names the
+assembled cache, its tag moved from `monday-eligibility-v1` to
+`monday-checkpoint-v2`, so every
+`backtest_cache/settled_markets_*_monday-eligibility-v1.*` file is never read
+again and is not deleted by any rebuild (a rebuild only replaces a legacy file
+of its own name). None of them held a usable result: the three that start
+before the archive cutoff (2026-05-01, 05-28, 07-13) were assembled on
+2026-08-03, before the subtitle fix, so they group strike-blind; the one for
+2026-08-29 is empty and more than a day old, which the cache lookup already
+treats as a miss; and the other four start after the cutoff, so they are
+0-trade by construction. Take any before/after baseline you want from them with
+a checkout from before this change, then delete them. The next run of each
+start date re-assembles its corpus from the day slices, which are unaffected.
+For a window that starts after the cutoff that is one extra assembly, plus any
+live day not on disk (the 7-day 2026-09-17 window: 2,382 s fresh against
+1,040 s from its cache). For one that starts before it, it is close to a full fetch: on
+2026-09-24 none of the archive day slices such a window needs was valid under
+the current cutoff, and 35 of its 61 past live days were not on disk. That is
+the rebuild the strike-blind caches needed anyway. It is not a complete fix
+for them, though: the live slices for 2026-07-25..08-02, 08-29 and 08-30 were
+also written before the subtitle fix and are reused unless you delete them
+(see the subtitle-drift gotcha in `CLAUDE.md`).
 
 Candlesticks are then fetched with `CANDLESTICK_FETCH_MAX_WORKERS` (default 8)
 parallel workers, one independent request per ticker. Cache files are keyed per

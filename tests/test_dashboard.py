@@ -22,7 +22,7 @@ import dataclasses
 import json
 import math
 import re
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +32,7 @@ from kalshi_betting import backtester, config, dashboard
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
+    CorpusProvenance,
     HalfSplit,
     IntervalCalibration,
     IntervalCalibrationBucket,
@@ -1798,6 +1799,143 @@ class TestRunSettingsHeader:
         line = f"Primary spread band: max(tier,0.3)-0.6 | same-event ladders: {word}</p>"
         assert line in page
         assert page.index("Period:") < page.index(line) < page.index("Portfolio Performance")
+
+
+class TestCorpusProvenanceHeader:
+    """DR-13 / M2 (P2): directly under the Period line the header says what
+    settled-market corpus the run read — its assembly time (the Period runs to
+    today, the corpus only to that moment), whether it came from an earlier
+    run's cache, and the archive cutoff as of assembly — on EVERY run, healthy
+    or not (DR-66). A window at or after that cutoff gets a red banner that
+    states a bound (no trade could be entered whatever pairs formed), never a
+    cause — unless some simulated point traded, which proves the verdict stale
+    and gets an amber stale-verdict line instead. A legacy .json hit shows its
+    file time. Rendered through generate_dashboard(), because a unit test that
+    does not prove the string reaches the page is the gap DR-66b was about."""
+
+    ASSEMBLED = datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC)
+    CUTOFF = datetime(2026, 7, 25, tzinfo=UTC)
+
+    def _page(self, monkeypatch, tmp_path, prov=None, *, sweep=True,
+              n_trades=0, other_point_trades=0) -> str:
+        # The page's trades and the sweep's primary point agree, as they do in
+        # production (backtest.py passes result.primary.trades); a second k
+        # point can carry trades of its own, as the k dropdown can show.
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        trades = [make_trade() for _ in range(n_trades)]
+        pt = _scn_point((0.3, 0.6), 0.75, trades=trades)
+        other = _scn_point((0.3, 0.6), 0.5,
+                           trades=[make_trade() for _ in range(other_point_trades)])
+        kwargs = {}
+        if sweep:
+            kwargs["sweep"] = BacktestSweep(primary=pt, points=[other, pt],
+                                            calibration=None, corpus_provenance=prov)
+        out_path = dashboard.generate_dashboard(
+            trades, make_equity([1000.0, 1010.0, 1005.0]), date(2026, 1, 5),
+            1000.0, **kwargs)
+        return out_path.read_text(encoding="utf-8")
+
+    def _prov(self, **overrides):
+        fields = {"from_cache": False, "assembled_at": self.ASSEMBLED,
+                  "archive_cutoff": self.CUTOFF, "post_cutoff": False}
+        fields.update(overrides)
+        return CorpusProvenance(**fields)
+
+    @staticmethod
+    def _corpus_line(page: str) -> str:
+        start = page.index("Settled-market corpus:")
+        return page[start: page.index("</p>", start)]
+
+    def test_a_healthy_fresh_run_still_shows_its_assembly(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, self._prov())
+        line = self._corpus_line(page)
+        assert ("assembled 2026-09-24 12:37 UTC — it holds no market settled "
+                "after that") in line
+        assert "(assembled by this run)" in line
+        assert "archive cutoff at assembly: 2026-07-25" in line
+        assert "archive cutoff (" not in page  # no banner on a pre-cutoff window
+        # Directly under the Period line, above the run settings and every section
+        assert (page.index("Period:") < page.index("Settled-market corpus:")
+                < page.index("Primary spread band:") < page.index("Portfolio Performance"))
+
+    def test_a_cached_run_names_its_cache_and_the_remedy(self, monkeypatch, tmp_path):
+        line = self._corpus_line(self._page(monkeypatch, tmp_path,
+                                            self._prov(from_cache=True)))
+        assert "served from an earlier run&#x27;s cache; --no-cache extends it" in line
+
+    @pytest.mark.parametrize("from_cache", [False, True])
+    def test_a_post_cutoff_window_gets_the_banner(self, monkeypatch, tmp_path, from_cache):
+        page = self._page(monkeypatch, tmp_path,
+                          self._prov(post_cutoff=True, from_cache=from_cache))
+        assert ("This window starts at or after the archive cutoff (2026-07-25, as "
+                "of the corpus's assembly).") in page
+        assert "no trade could be entered in this window whatever pairs formed" in page
+        assert "says nothing about the strategy" in page
+        # Only a cached verdict can have gone stale — only it says so.
+        assert ("a cached run does not re-read it; --no-cache re-checks" in page) \
+            is from_cache
+        assert page.index("Settled-market corpus:") < page.index(
+            "This window starts at or after") < page.index("Portfolio Performance")
+        assert "that verdict is stale" not in page
+
+    @pytest.mark.parametrize("from_cache", [False, True])
+    @pytest.mark.parametrize("n_trades, other_point_trades", [(2, 0), (0, 3)])
+    def test_a_post_cutoff_verdict_contradicted_by_trades_is_reported_as_stale(
+            self, monkeypatch, tmp_path, from_cache, n_trades, other_point_trades):
+        # P2 review (R3/C3/ADV-3): a stamped verdict goes stale once the cutoff
+        # moves past start_date, and the run can then trade — a red "no trade
+        # could be entered" beside "Trades found: N" would be false on its
+        # face. A trade at ANY simulated point (the primary, or another k the
+        # dropdown shows) turns it into a stale-verdict line instead.
+        page = self._page(monkeypatch, tmp_path,
+                          self._prov(post_cutoff=True, from_cache=from_cache),
+                          n_trades=n_trades, other_point_trades=other_point_trades)
+        assert f"Trades found: {n_trades}" in page
+        assert "This window starts at or after" not in page
+        assert "no trade could be entered in this window" not in page
+        recorded = ("at this corpus&#x27;s assembly" if from_cache else "by this run")
+        assert f"The archive cutoff recorded {recorded} (2026-07-25)" in page
+        assert (f"this run entered trades (up to {max(n_trades, other_point_trades)} "
+                "in one simulated scenario), so that verdict is stale") in page
+        assert "--no-cache re-reads the cutoff and re-stamps the cache." in page
+        assert page.index("Settled-market corpus:") < page.index(
+            "The archive cutoff recorded") < page.index("Portfolio Performance")
+
+    def test_a_legacy_cache_shows_its_file_time(self, monkeypatch, tmp_path):
+        # P2 review (C1/ADV-1): a legacy settled_markets_*.json hit carries its
+        # file time to the page, named as such, and claims no cutoff.
+        line = self._corpus_line(self._page(monkeypatch, tmp_path, self._prov(
+            from_cache=True, archive_cutoff=None, post_cutoff=None, legacy=True)))
+        assert ("last written 2026-09-24 12:37 UTC (the file time of a legacy "
+                "settled_markets_*.json, which records no assembly stamp) — it "
+                "holds no market settled after that") in line
+        assert ("served from an earlier run&#x27;s cache; --no-cache extends it "
+                "and rebuilds it in the streamed format") in line
+        assert ("archive cutoff at assembly: not recorded (the legacy format "
+                "records none; --no-cache re-checks it)") in line
+
+    def test_an_unrecorded_cutoff_says_so_and_claims_no_verdict(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, self._prov(
+            from_cache=True, archive_cutoff=None, post_cutoff=None))
+        assert ("archive cutoff at assembly: not recorded (--no-cache re-checks it)"
+                in self._corpus_line(page))
+        assert "This window starts at or after" not in page
+
+    def test_an_unrecorded_assembly_time_says_so(self, monkeypatch, tmp_path):
+        line = self._corpus_line(self._page(monkeypatch, tmp_path,
+                                            self._prov(assembled_at=None)))
+        assert "assembly time not recorded" in line
+
+    @pytest.mark.parametrize("sweep", [True, False])
+    def test_no_provenance_reads_not_recorded(self, monkeypatch, tmp_path, sweep):
+        # An infeasible window, a stubbed corpus, or no sweep at all: said,
+        # never silently absent (a legacy .json hit now carries its file time).
+        page = self._page(monkeypatch, tmp_path, None, sweep=sweep)
+        assert ("Settled-market corpus: assembly time and archive cutoff not "
+                "recorded for this run (no sweep was passed to the report") in page
+        assert "This window starts at or after" not in page
 
 
 class TestFigHtmlDivId:

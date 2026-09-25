@@ -10,7 +10,7 @@ import weakref
 from array import array
 from collections import defaultdict
 from dataclasses import astuple
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -720,9 +720,11 @@ class TestPhrasingSkipCounts:
             ) and line.endswith(": 3")
             for line in lines
         )
-        # This function does no gap-window logging of its own (the sweep
-        # window is a performance bound, not a reported filter) — mirrored
-        # here only to record that it stays absent.
+        # This function has no gap-CAP line of its own: its close-date window
+        # is a performance bound, not a rule. (Since M10 the pairs beyond
+        # that window are counted as never visited — worded apart from the
+        # live finder's gap-cap line, which counts pairs already worded as two
+        # cumulative deadlines.) Recorded here so the two stay distinct.
         assert not any("gap cap" in m for m in (r.getMessage() for r in caplog.records))
 
     def test_silent_at_zero(self, caplog):
@@ -738,6 +740,369 @@ class TestPhrasingSkipCounts:
             pairs = _extract_pairs(groups)
         assert len(pairs) == 1
         assert self._refusal_lines(caplog) == []
+
+
+# M10: the lines _extract_pairs gained, by prefix — four refusals, plus the two
+# things the time-series sweep sets aside before visiting anything. The DR-72
+# and DR-73 lines are read by the same prefix table so a test can check that
+# EVERY pair of a group's members is accounted for.
+_TS_UNDATED = "Time-series group members without a readable close_time"
+_TS_BEYOND = "Time-series candidate pairs the sweep never visits"
+_TS_SAME_EVENT = ("Time-series candidates skipped because both markets carry "
+                  "the same event ticker")
+_TS_SERIES = "Time-series candidates skipped as two instances of one event series"
+_ST_SAME_EVENT = ("Same-title candidates skipped because both markets carry the "
+                  "same event ticker")
+_ST_SERIES = "Same-title candidates skipped as two instances of one event series"
+_TS_WORDING = "Time-series candidates refused because"
+_LADDER_REFUSED = "Same-event ladder candidates refused because"
+_LADDER_GAP_CAP = "Same-event ladder candidates worded as two different cumulative"
+_LADDER_FORMED = "Same-event ladder candidates among the time-series candidates"
+# _prepare_candidates' always-logged grouping line (M10), for the empty-grouping
+# case _extract_pairs cannot see.
+_GROUPS = "Groups of two or more markets:"
+
+
+def _logged_counts(caplog) -> dict[str, int]:
+    """Sum the trailing ': N' of every _extract_pairs count line, by prefix.
+
+    Every count is of candidate PAIRS except _TS_UNDATED's, which counts
+    group MEMBERS — read it on its own, never in a sum with the others.
+    """
+    out: dict[str, int] = defaultdict(int)
+    prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _ST_SAME_EVENT,
+                _ST_SERIES, _TS_WORDING, _LADDER_REFUSED, _LADDER_GAP_CAP,
+                _LADDER_FORMED)
+    for message in caplog.messages:
+        for prefix in prefixes:
+            if message.startswith(prefix):
+                out[prefix] += int(message.rsplit(": ", 1)[1])
+    return out
+
+
+class TestOneSeriesAndSameEventCounts:
+    """M10: every pair of a group's members is returned or counted.
+
+    The one-series rule (DR-02, DR-54, both branches) and the same-event skip
+    were bare `continue`s here, so the 2026-09-24 7-day run logged "Potential
+    pairs: 0 time-series, 0 same-title" over 184,178 groupable markets with
+    no cause for the same-title zero. Each now has a silent-at-zero INFO line,
+    and so do the two things the time-series sweep sets aside before visiting
+    anything (members with no readable close_time, pairs beyond its
+    close-date window); an EMPTY grouping, which reaches _extract_pairs as {},
+    is reported by _prepare_candidates' always-logged group-count line.
+    Counting must move no control flow: the pair lists are pinned by every
+    other test in this module, and the partition test below proves that the
+    counts and the returned pairs together account for each pair exactly
+    once.
+    """
+
+    @staticmethod
+    def _rec(ticker, event_ticker, wording, close):
+        # The shape of a real combo record in a day slice: title == subtitle
+        # (the leg wording), event_title blank (it is patched in at assembly
+        # for well under 1% of records).
+        return {"ticker": ticker, "event_ticker": event_ticker, "event_title": "",
+                "title": wording, "subtitle": wording, "close_time": close}
+
+    @classmethod
+    def _combo_heavy(cls):
+        """Eight records in three groups (seven candidates), every candidate
+        refused by one of M10's two rules.
+
+        W1: two tickets on ONE combo event (1 same-event candidate) and one
+        under a different KXMVE prefix (2 one-series candidates, DR-55).
+        W2: two tickets under two KXMVE prefixes (1 one-series candidate).
+        MLB: three game days of one non-combo series (3 one-series candidates).
+        Same-event 1, one-series 6: different counts, so swapping the two
+        counters cannot pass.
+        """
+        w1 = "yes Over 5.5 runs scored,no Over 2.5 runs scored"
+        w2 = "yes Lakers win,yes Over 3.5 runs scored"
+        mlb = "Over 5.5 runs scored"
+        return [
+            cls._rec("KXMVECROSSCATEGORY-S1-A", "KXMVECROSSCATEGORY-S1", w1,
+                     "2026-09-18T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY-S1-B", "KXMVECROSSCATEGORY-S1", w1,
+                     "2026-09-18T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY0-S2-A", "KXMVECROSSCATEGORY0-S2", w1,
+                     "2026-09-19T23:59:00Z"),
+            cls._rec("KXMVESPORTSMULTIGAMEEXTENDED-S3-A",
+                     "KXMVESPORTSMULTIGAMEEXTENDED-S3", w2, "2026-09-20T23:59:00Z"),
+            cls._rec("KXMVECROSSCATEGORY-S4-A", "KXMVECROSSCATEGORY-S4", w2,
+                     "2026-09-21T23:59:00Z"),
+            cls._rec("KXMLBTOTAL-26SEP181840STLPIT-5", "KXMLBTOTAL-26SEP181840STLPIT",
+                     mlb, "2026-09-18T23:57:58Z"),
+            cls._rec("KXMLBTOTAL-26SEP191840STLPIT-5", "KXMLBTOTAL-26SEP191840STLPIT",
+                     mlb, "2026-09-19T23:57:58Z"),
+            cls._rec("KXMLBTOTAL-26SEP201840STLPIT-5", "KXMLBTOTAL-26SEP201840STLPIT",
+                     mlb, "2026-09-20T23:57:58Z"),
+        ]
+
+    @staticmethod
+    def _group_sizes(groups):
+        return sorted(len(members) for members in groups.values())
+
+    @pytest.mark.parametrize("grouping,same_event,series", [
+        (_group_by_exact_title, _ST_SAME_EVENT, _ST_SERIES),
+        (_group_by_normalized_title, _TS_SAME_EVENT, _TS_SERIES),
+    ])
+    def test_a_combo_heavy_zero_is_fully_explained(
+        self, caplog, grouping, same_event, series,
+    ):
+        # regression — fails on the pre-M10 code, which returned [] here and
+        # logged none of these lines, so the zero had no cause in the log.
+        groups = grouping(self._combo_heavy())
+        # Not vacuous: three groups of 3, 2 and 3, so 3 + 1 + 3 = 7 candidates.
+        assert self._group_sizes(groups) == [2, 3, 3]
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=False) == []
+        counts = _logged_counts(caplog)
+        assert counts[same_event] == 1
+        assert counts[series] == 6
+        # Every one of the seven candidates is on exactly one of the two lines.
+        assert sum(counts.values()) == 7
+
+    def test_with_ladders_on_the_sweep_leaves_same_event_candidates_to_the_sub_pass(
+        self, caplog,
+    ):
+        # control — kills counting the sweep's same-event skip unconditionally.
+        # With the switch on, a same-event candidate is the ladder sub-pass's,
+        # which counts it (here: identical wording); counting it on the
+        # sweep's line as well would report it twice.
+        groups = _group_by_normalized_title(self._combo_heavy())
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=True) == []
+        counts = _logged_counts(caplog)
+        assert _TS_SAME_EVENT not in counts
+        assert counts[_TS_SERIES] == 6
+        assert counts[_LADDER_REFUSED] == 1
+        assert counts[_LADDER_FORMED] == 0
+
+    def test_the_same_title_lines_are_the_live_finders_verbatim(self, caplog):
+        # The backtest mirrors find_same_title_pairs' two lines word for word,
+        # so one grep reads either path. Same fixture through both: the live
+        # finder gets priced namespaces, the backtester the dicts.
+        recs = self._combo_heavy()
+        live = [SimpleNamespace(ticker=r["ticker"], event_ticker=r["event_ticker"],
+                                title=r["title"], subtitle=r["subtitle"],
+                                _event_title=r["event_title"], yes_ask_dollars="0.50",
+                                no_ask_dollars="0.50",
+                                close_time=_parse_iso_datetime(r["close_time"]))
+                for r in recs]
+        with caplog.at_level(logging.INFO):
+            scanner.find_same_title_pairs(live)
+        live_lines = [m for m in caplog.messages
+                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(_group_by_exact_title(recs))
+        backtest_lines = [m for m in caplog.messages
+                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES))]
+        assert len(live_lines) == 2
+        assert backtest_lines == live_lines
+
+    def test_the_time_series_series_line_shares_the_live_prefix(self, caplog):
+        # Only the parenthesis differs from find_time_series_pairs' line, as
+        # it does for the DR-72 lines: the sweep is windowed, the live loop
+        # is not.
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(_group_by_normalized_title(self._combo_heavy()))
+        [line] = [m for m in caplog.messages if m.startswith(_TS_SERIES)]
+        assert line == (
+            "Time-series candidates skipped as two instances of one event series "
+            "(identical wording, different fixture; within the deadline-gap "
+            "window, before price filters): 6"
+        )
+
+    @pytest.mark.parametrize("grouping", [_group_by_exact_title, _group_by_normalized_title])
+    def test_silent_at_zero(self, caplog, grouping):
+        # control — kills a mutant that drops any of the four `if count:`
+        # guards. Two different series asking one cumulative question at two
+        # deadlines: nothing is refused by either rule on either branch.
+        recs = [
+            self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+            self._rec("KXBB-1-T", "KXBB-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+        ]
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(grouping(recs), same_event_ladders=False)
+        counts = _logged_counts(caplog)
+        for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES,
+                       _ST_SAME_EVENT, _ST_SERIES):
+            assert prefix not in counts
+
+    @pytest.mark.parametrize("ladders", [False, True])
+    def test_a_zero_the_sweep_never_visits_is_explained(self, caplog, ladders):
+        # regression — fails on the first cut of M10, which counted only the
+        # candidates the sweep VISITS: a group whose dated members close 61
+        # days apart, beside one with no close_time, returned [] and logged
+        # nothing (the P4 critics' reproducer). Worded as two different
+        # cumulative deadlines on two series, so no rule would refuse the
+        # pair — the window and the missing close are the whole cause.
+        recs = [
+            self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
+                      "2026-03-01T00:00:00Z"),
+            self._rec("KXBB-1-T", "KXBB-1", "Will X happen by May 1, 2026?",
+                      "2026-05-01T00:00:00Z"),
+            self._rec("KXCC-1-T", "KXCC-1", "Will X happen by April 1, 2026?", None),
+        ]
+        groups = _group_by_normalized_title(recs)
+        assert self._group_sizes(groups) == [3]
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, same_event_ladders=ladders) == []
+        counts = _logged_counts(caplog)
+        assert counts[_TS_UNDATED] == 1
+        assert counts[_TS_BEYOND] == 1
+        # Nothing was visited, so nothing was refused.
+        for prefix in (_TS_SAME_EVENT, _TS_SERIES, _TS_WORDING, _LADDER_REFUSED,
+                       _LADDER_GAP_CAP):
+            assert prefix not in counts
+        [line] = [m for m in caplog.messages if m.startswith(_TS_BEYOND)]
+        # Not the live finder's gap-cap line: no rule was evaluated here.
+        assert "more than 31 days apart" in line and "gap cap" not in line
+
+    def test_an_empty_grouping_is_reported_by_prepare_candidates(
+        self, monkeypatch, caplog,
+    ):
+        # regression — fails on the first cut of M10. A grouping with no
+        # group of two or more reaches _extract_pairs as {}, where every line
+        # is silent, so "0 same-title" had no cause in the log. Here the two
+        # markets share only the time-series key (their titles differ), so
+        # the same-title grouping is empty.
+        corpus = [
+            _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026",
+                        event_title="RAIN", close="2026-03-01"),
+            _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026",
+                        event_title="RAIN", close="2026-03-20"),
+        ]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            TestGroupableSubset._prepare(ladders=False)
+        messages = caplog.messages
+        [groups_at] = [i for i, m in enumerate(messages) if m.startswith(_GROUPS)]
+        assert messages[groups_at] == (
+            "Groups of two or more markets: 1 time-series (2 markets), "
+            "0 same-title (0 markets) — pairs form only inside a group"
+        )
+        census_at = next(i for i, m in enumerate(messages)
+                         if m.startswith("Deadline phrasing over"))
+        pairs_at = next(i for i, m in enumerate(messages)
+                        if m.startswith("Potential pairs:"))
+        # After the census, before any per-candidate line and the pair count.
+        assert census_at < groups_at < pairs_at
+        assert messages[pairs_at] == "Potential pairs: 1 time-series, 0 same-title"
+
+    @staticmethod
+    def _fuzz(seed: int) -> list[dict]:
+        """Every rule's shape at random: one-series fixtures, KXMVE prefixes,
+        same-event duplicates, empty event tickers, ladders, and cumulative,
+        snapshot and deadline-less wording, over a 60-day close spread so the
+        sweep's window cuts some candidates."""
+        rng = random.Random(seed)
+        stems = ["Will X happen", "Will Y win", "Starship launches", "Q"]
+        preps = ["by", "before", "on", "in", ""]
+        months = ["March", "April", "May"]
+        series = ["KXAA", "KXBB", "KXMVECROSSCATEGORY", "KXMVECROSSCATEGORY0", ""]
+        recs = []
+        for i in range(240):
+            prep = rng.choice(preps)
+            stem = rng.choice(stems)
+            title = (f"{stem} {prep} {rng.choice(months)} {rng.randint(1, 28)}, 2026?"
+                     if prep else f"{stem}?")
+            ser = rng.choice(series)
+            rec = {
+                "ticker": f"F{seed}-{i:04d}",
+                "event_ticker": f"{ser}-{rng.randint(0, 5)}" if ser else "",
+                "event_title": rng.choice(["", "Event A"]),
+                "title": title,
+                "subtitle": rng.choice(["", "Yes", title]),
+                "close_time": (datetime(2026, 3, 1, tzinfo=UTC)
+                               + timedelta(days=rng.randint(0, 60))).isoformat(),
+            }
+            if recs and rng.random() < 0.25:
+                # Re-list an earlier market's exact wording — on its own event
+                # half the time (a same-event duplicate), otherwise on this
+                # record's random event — so every rule has candidates to
+                # refuse whatever the seed.
+                src = rng.choice(recs)
+                rec.update(title=src["title"], subtitle=src["subtitle"],
+                           event_title=src["event_title"])
+                if rng.random() < 0.5:
+                    rec["event_ticker"] = src["event_ticker"]
+            recs.append(rec)
+        return recs
+
+    @pytest.mark.parametrize("ladders", [False, True])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_every_candidate_is_returned_or_counted_exactly_once(
+        self, caplog, seed, ladders,
+    ):
+        # The property the finding asks for: the counts EXPLAIN the result.
+        # The candidates are enumerated here independently of _extract_pairs
+        # (the sweep's window is the only rule restated), then compared with
+        # what it returned plus what it counted.
+        recs = self._fuzz(seed)
+        # Some members with no readable close_time, which the sweep sets
+        # aside before visiting anything (one malformed, the rest absent).
+        for k, rec in enumerate(recs):
+            if k % 17 == 5:
+                rec["close_time"] = "not a date" if k == 5 else None
+        margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
+        ts_groups = _group_by_normalized_title(recs)
+        st_groups = _group_by_exact_title(recs)
+
+        cross = same_event_in_window = ladder_population = 0
+        undated = beyond = dated_pairs = 0
+        for members in ts_groups.values():
+            dated = [m for m in members if _parse_iso_date(m["close_time"]) is not None]
+            undated += len(members) - len(dated)
+            dated_pairs += len(dated) * (len(dated) - 1) // 2
+            for x, a in enumerate(dated):
+                for b in dated[x + 1:]:
+                    gap = abs(_parse_iso_date(a["close_time"]) - _parse_iso_date(b["close_time"]))
+                    if gap > margin:
+                        beyond += 1
+                        continue
+                    if a["event_ticker"] == b["event_ticker"]:
+                        same_event_in_window += 1
+                    else:
+                        cross += 1
+            buckets = defaultdict(int)
+            for m in dated:
+                buckets[m["event_ticker"]] += 1
+            ladder_population += sum(n * (n - 1) // 2 for n in buckets.values())
+        st_candidates = sum(len(v) * (len(v) - 1) // 2 for v in st_groups.values())
+
+        with caplog.at_level(logging.INFO):
+            ts_pairs = _extract_pairs(ts_groups, same_event_ladders=ladders)
+        ts = _logged_counts(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            st_pairs = _extract_pairs(st_groups, same_event_ladders=ladders)
+        st = _logged_counts(caplog)
+
+        ladder_pairs = ts[_LADDER_FORMED]
+        # Not vacuous: each rule fires, and something survives.
+        assert ts[_TS_SERIES] and st[_ST_SERIES] and st[_ST_SAME_EVENT]
+        assert len(ts_pairs) and len(st_pairs)
+        # What the sweep set aside before visiting anything, and the whole
+        # partition of the dated members' pairs: beyond the window, or
+        # visited (same-event or cross-event).
+        assert ts[_TS_UNDATED] == undated > 0
+        assert ts[_TS_BEYOND] == beyond > 0
+        assert dated_pairs == beyond + same_event_in_window + cross
+        assert cross == (len(ts_pairs) - ladder_pairs) + ts[_TS_SERIES] + ts[_TS_WORDING]
+        if ladders:
+            assert _TS_SAME_EVENT not in ts
+            assert ladder_population == (
+                ts[_LADDER_REFUSED] + ts[_LADDER_GAP_CAP] + ladder_pairs
+            )
+        else:
+            assert ts[_TS_SAME_EVENT] == same_event_in_window > 0
+            assert ladder_pairs == 0
+        assert st_candidates == len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
 
 
 class TestDeadlineProfileParity:
@@ -1730,8 +2095,12 @@ class TestParseIsoDatetime:
 
 class TestCanEverEnter:
     """_can_ever_enter mirrors _find_entry's exact scan-window construction:
-    lower = max(open_time, start_date), upper = close_time - 1 day, and the
-    market is eligible iff a Monday falls in [lower, upper]."""
+    upper = close_time's date - 1 day, and the market is eligible iff some
+    Monday on/after start_date and on or before upper has its 09:00 UTC
+    checkpoint strictly after open_time. Every market here opens at MIDNIGHT
+    UTC, where that is the same as the pre-P5 date test (a Monday on/after
+    max(open date, start_date)); the time-of-day cases are
+    TestCanEverEnterAtTheCheckpointInstant's."""
 
     def test_two_hour_market_never_spans_a_monday(self):
         # open == close date (a 2-hour market truncates to the same calendar
@@ -1798,6 +2167,534 @@ class TestCanEverEnter:
         m = _mkt(open_d, close_d)
         earlier_start = prev_monday - timedelta(days=10)
         assert _can_ever_enter(m, start_date=earlier_start) is True
+
+
+# ─── P5 (M8): the prefilter tests the checkpoint INSTANT, not the date ────────
+
+def _date_granular_can_ever_enter(m: dict, start_date: date) -> bool:
+    """The pre-P5 backtester._can_ever_enter, verbatim: open_time read as a DATE.
+
+    The reference the checkpoint-precise predicate must never widen, and the
+    predicate the result-neutrality tests below run the old pipeline under.
+    """
+    open_d = _parse_iso_date(m.get("open_time"))
+    close_d = _parse_iso_date(m.get("close_time"))
+    if open_d is None or close_d is None:
+        return True
+    lower = max(open_d, start_date)
+    upper = close_d - timedelta(days=1)
+    if lower > upper:
+        return False
+    d = lower
+    while d.weekday() != 0:
+        d += timedelta(days=1)
+    return d <= upper
+
+
+_P5_HOUR = 3_600
+
+
+def _first_candle_ts(open_dt: datetime) -> int:
+    """The earliest candle a market can carry under the measured rule: none
+    ends at or before the start of the hour it opened in, so the first ends at
+    the next top of the hour (historical.fetch_candlesticks stores the period
+    END as a candle's ts)."""
+    ts = int(open_dt.timestamp())
+    return ts - ts % _P5_HOUR + _P5_HOUR
+
+
+def _scan_reachable(m: dict, start_date: date) -> bool:
+    """An independent statement of what _find_entry could ever reach with this
+    market as a leg: some checkpoint _monday_timestamps would scan for SOME
+    partner (the union of every partner's window is [start_date, close date
+    - 1 day]) has a candle of this market at or before it, i.e. is at or after
+    the market's first possible candle. A naive open_time has no instant, so
+    the date test is its whole answer."""
+    open_dt = _parse_iso_datetime(m.get("open_time"))
+    close_d = _parse_iso_date(m.get("close_time"))
+    if open_dt is None or close_d is None:
+        return True
+    if open_dt.utcoffset() is None:
+        return _date_granular_can_ever_enter(m, start_date)
+    first = _first_candle_ts(open_dt)
+    return any(first <= c for c in backtester._monday_timestamps(
+        start_date, close_d - timedelta(days=1)))
+
+
+def _mkt_at(open_time: str | None, close_time: str | None) -> dict:
+    """A market dict carrying only the two timestamps _can_ever_enter reads."""
+    return {"open_time": open_time, "close_time": close_time}
+
+
+class TestCanEverEnterAtTheCheckpointInstant:
+    """M8 of the 2026-09-24 review (P5): _find_entry needs a candle at or
+    before Monday 09:00 UTC for both legs and a market has none before its
+    opening hour, so a market that opened AT or AFTER its only checkpoint can
+    never be entered. The pre-P5 predicate compared open_time by DATE and kept
+    it. 2026-09-21 is the 7-day review window's only Monday."""
+
+    _START = date(2026, 9, 17)
+    _CLOSE = "2026-09-24T12:15:33Z"   # no later Monday is admissible
+
+    def test_the_review_example_is_dropped_and_the_date_test_kept_it(self):
+        # KXLOLMAP-26SEP240800MVKACBC-1-MVKA, the first record of the
+        # 2026-09-17 assembled cache: opened Monday 22:16 UTC, closes Thursday.
+        m = _mkt_at("2026-09-21T22:16:00Z", self._CLOSE)
+        assert _can_ever_enter(m, self._START) is False
+        assert _date_granular_can_ever_enter(m, self._START) is True
+
+    @pytest.mark.parametrize(("open_time", "kept"), [
+        ("2026-09-21T08:00:00Z", True),
+        # its first candle ends at 09:00, which _candle_at_or_before accepts
+        ("2026-09-21T08:30:00Z", True),
+        ("2026-09-21T08:59:59Z", True),
+        ("2026-09-21T08:59:59.999999Z", True),
+        # opened AT the checkpoint: its first candle ends at 10:00
+        ("2026-09-21T09:00:00Z", False),
+        ("2026-09-21T09:00:01Z", False),
+        ("2026-09-21T23:59:59Z", False),
+    ])
+    def test_the_boundary_is_strictly_before_the_checkpoint(self, open_time, kept):
+        assert _can_ever_enter(_mkt_at(open_time, self._CLOSE), self._START) is kept
+
+    def test_a_late_monday_opening_waits_for_the_next_monday(self):
+        # The next Monday (09-28) is admissible only when the close date is
+        # 09-29 or later (upper = close date - 1 day).
+        opened = "2026-09-21T10:00:00Z"
+        assert _can_ever_enter(_mkt_at(opened, "2026-09-29T00:00:00Z"), self._START) is True
+        assert _can_ever_enter(_mkt_at(opened, "2026-09-28T23:00:00Z"), self._START) is False
+
+    @pytest.mark.parametrize(("open_time", "kept"), [
+        ("2026-09-21T04:59:59-04:00", True),    # 08:59:59Z
+        ("2026-09-21T05:00:00-04:00", False),   # 09:00:00Z
+        ("2026-09-21T22:59:59+14:00", True),    # 08:59:59Z
+        # a Tuesday local date, 10:30Z on the Monday: dropped either way
+        ("2026-09-22T00:30:00+14:00", False),
+        # a SUNDAY local date, 11:30Z on the Monday: the date test read Sunday
+        # and kept it; the instant is after the checkpoint
+        ("2026-09-20T23:30:00-12:00", False),
+    ])
+    def test_the_opening_is_compared_as_a_utc_instant(self, open_time, kept):
+        assert _can_ever_enter(_mkt_at(open_time, self._CLOSE), self._START) is kept
+
+    def test_a_naive_opening_keeps_the_date_test(self):
+        # No offset: the instant is unknown, so the looser date test stands.
+        m = _mkt_at("2026-09-21T22:16:00", self._CLOSE)
+        assert _can_ever_enter(m, self._START) is True
+        assert _can_ever_enter(m, self._START) == _date_granular_can_ever_enter(m, self._START)
+
+    @pytest.mark.parametrize(("open_time", "close_time", "kept"), [
+        # The UTC instant falls outside datetime's range (astimezone(UTC)
+        # raises OverflowError): the pre-P5 date test decides, exactly as it
+        # did.
+        ("0001-01-01T00:00:00+14:00", "2026-01-20T00:00:00Z", True),
+        ("9999-12-31T23:00:00-05:00", "9999-12-31T23:00:00Z", False),
+        # Monday 9999-12-27 opened after its checkpoint: the next Monday lies
+        # past date.max, so adding the week would raise ...
+        ("9999-12-27T10:00:00Z", "9999-12-31T00:00:00Z", False),
+        # ... and before it, that Monday is still reachable.
+        ("9999-12-27T08:00:00Z", "9999-12-31T00:00:00Z", True),
+        # The advance to Monday would pass date.max, and a close on date.min
+        # would put the upper bound before it: the pre-P5 predicate raised on
+        # both.
+        ("9999-12-28T00:00:00Z", "9999-12-31T00:00:00Z", False),
+        ("2026-01-01T00:00:00Z", "0001-01-01T00:00:00Z", False),
+    ])
+    def test_the_ends_of_the_date_range_never_raise(self, open_time, close_time, kept):
+        # The predicate runs inside the fetch's assembly workers, where an
+        # exception ends the run; any parseable timestamp must give a verdict.
+        assert _can_ever_enter(_mkt_at(open_time, close_time), date(2026, 1, 1)) is kept
+
+    def test_the_ends_of_the_date_range_stay_a_subset_of_the_date_test(self):
+        # Seeded sweep of openings, closes and start dates within a few weeks
+        # of either end of datetime's range, in offsets from -12:00 to +14:00:
+        # never an exception, and never a market the date test dropped.
+        rng = random.Random(1_2026_0924)
+        zones = [timezone(timedelta(minutes=15 * q)) for q in range(-48, 57)]
+        lo, hi = datetime(1, 1, 1), datetime(9999, 12, 31, 23, 59)
+        cases = 0
+        for _ in range(20_000):
+            end = rng.choice((lo, hi))
+            sign = 1 if end is lo else -1
+
+            def near(end=end, sign=sign):
+                return end + sign * timedelta(minutes=rng.randrange(0, 60 * 24 * 40))
+
+            open_s = near().replace(tzinfo=rng.choice(zones)).isoformat()
+            close_s = near().replace(tzinfo=rng.choice(zones)).isoformat()
+            start = near().date()
+            m = _mkt_at(open_s, close_s)
+            new = _can_ever_enter(m, start)
+            try:
+                old = _date_granular_can_ever_enter(m, start)
+            except OverflowError:
+                continue   # the pre-P5 predicate had no verdict to compare
+            cases += 1
+            assert not (new and not old), (open_s, close_s, start)
+        assert cases > 10_000
+
+    def test_a_start_date_on_the_opening_monday(self):
+        monday = date(2026, 9, 21)
+        assert _can_ever_enter(_mkt_at("2026-09-21T07:00:00Z", self._CLOSE), monday) is True
+        assert _can_ever_enter(_mkt_at("2026-09-21T12:00:00Z", self._CLOSE), monday) is False
+
+    def test_an_opening_before_start_date_is_unaffected(self):
+        m = _mkt_at("2026-09-10T15:00:00Z", self._CLOSE)
+        assert _can_ever_enter(m, self._START) is True
+
+    def test_the_checkpoint_is_the_scans_shared_definition(self, monkeypatch):
+        # The prefilter reads the checkpoint through the one helper
+        # _monday_timestamps builds the scan from, so moving it moves both.
+        monday = date(2026, 9, 21)
+        assert backtester._monday_timestamps(monday, monday) == [
+            int(backtester._checkpoint_datetime(monday).timestamp())]
+        assert backtester._checkpoint_datetime(monday) == datetime(2026, 9, 21, 9, tzinfo=UTC)
+        m = _mkt_at("2026-09-21T09:30:00Z", self._CLOSE)
+        assert _can_ever_enter(m, self._START) is False
+        monkeypatch.setattr(backtester, "_checkpoint_datetime",
+                            lambda d: datetime(d.year, d.month, d.day, 10, tzinfo=UTC))
+        assert _can_ever_enter(m, self._START) is True
+
+
+def _p5_grid() -> list[tuple[dict, date]]:
+    """Every (market, start_date) the grid tests sweep: openings every 30
+    minutes over three weeks from Monday 2026-09-14 plus one second either
+    side of each Monday's checkpoint, rendered in four UTC offsets in turn
+    (every seventh also naive), against eight close dates and seven start
+    dates (one of each weekday)."""
+    zones = [UTC, timezone(timedelta(hours=-5)), timezone(timedelta(hours=14)),
+             timezone(timedelta(hours=5, minutes=30))]
+    base = datetime(2026, 9, 14, tzinfo=UTC)
+    instants = [base + timedelta(minutes=30 * i) for i in range(21 * 48)]
+    for week in range(3):
+        cp = base + timedelta(weeks=week, hours=9)
+        instants += [cp - timedelta(seconds=1), cp, cp + timedelta(seconds=1)]
+    opens: list[datetime] = []
+    for i, t in enumerate(instants):
+        opens.append(t.astimezone(zones[i % len(zones)]))
+        if i % 7 == 0:
+            opens.append(t.replace(tzinfo=None))   # naive, same wall clock
+    starts = [date(2026, 9, 10) + timedelta(days=k) for k in range(7)]
+    grid = []
+    for o in opens:
+        od = o.date()
+        for k in (0, 1, 2, 6, 7, 8, 9, 14):
+            close = datetime(od.year, od.month, od.day, 12, tzinfo=UTC) + timedelta(days=k)
+            m = _mkt_at(o.isoformat(), close.isoformat())
+            grid.extend((m, s) for s in starts)
+    return grid
+
+
+class TestCanEverEnterMatchesTheScan:
+    """The predicate is EXACTLY what the scan could ever reach — no looser
+    (the M8 slack) and no tighter (a dropped market that could enter would
+    move a result) — and it never admits a market the pre-P5 date test
+    dropped, so a corpus assembled under it is a subset of an old one."""
+
+    def test_the_predicate_is_exactly_what_the_scan_can_reach(self):
+        grid = _p5_grid()
+        assert len(grid) > 50_000
+        mismatches = [(m, s) for m, s in grid if _can_ever_enter(m, s) != _scan_reachable(m, s)]
+        assert mismatches == []
+
+    def test_it_never_admits_what_the_date_test_dropped(self):
+        grid = _p5_grid()
+        new = [_can_ever_enter(m, s) for m, s in grid]
+        old = [_date_granular_can_ever_enter(m, s) for m, s in grid]
+        assert not any(n and not o for n, o in zip(new, old, strict=True))
+        # ... and it is a real tightening on this grid, not a relabelling
+        assert sum(o and not n for n, o in zip(new, old, strict=True)) > 1_000
+        assert sum(n for n in new) > 1_000
+
+
+_P5_START = date(2026, 1, 1)                       # a Thursday
+_P5_MONDAYS = [date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19)]
+# Seconds from a Monday's 09:00 UTC checkpoint: the boundary on both sides,
+# and openings far enough either way to exercise the next Monday.
+_P5_OFFSETS = [-3 * 86_400, -5 * _P5_HOUR, -_P5_HOUR, -1_800, -1, 0, 1, 1_800,
+               _P5_HOUR, 5 * _P5_HOUR, 14 * _P5_HOUR + 3_540]
+
+
+def _p5_candles(open_dt: datetime, close_dt: datetime,
+                yes_ask: float, no_ask: float) -> list[dict]:
+    """A candle series obeying the measured rule: hourly for a day and a half
+    from the first possible candle, then every six hours, plus every Monday
+    checkpoint the market is open over — never a candle ending at or before
+    the start of its opening hour."""
+    first = _first_candle_ts(open_dt)
+    end = int(close_dt.timestamp())
+    stamps = set(range(first, min(end, first + 36 * _P5_HOUR) + 1, _P5_HOUR))
+    stamps.update(range(first, end + 1, 6 * _P5_HOUR))
+    stamps.update(c for c in backtester._monday_timestamps(_P5_START, close_dt.date())
+                  if first <= c <= end)
+    return [_candle(ts, yes_ask, no_ask) for ts in sorted(stamps)]
+
+
+def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Same-title, cross-event time-series and same-event ladder families
+    whose legs open around a Monday checkpoint (both sides of the boundary,
+    and far enough either way to reach the next Monday), plus singletons,
+    with candles obeying the measured rule at prices every such pair clears
+    the gates at. The ladder rungs both close at one instant, so only their
+    STATED deadlines order and tier them (and only with ladders on)."""
+    rng = random.Random(seed)
+    markets: list[dict] = []
+    candles: dict[str, list[dict]] = {}
+
+    def opening() -> datetime:
+        monday = rng.choice(_P5_MONDAYS)
+        off = rng.choice(_P5_OFFSETS)
+        if off not in (-1, 0, 1):
+            off += rng.randrange(0, 1_800)
+        return backtester._checkpoint_datetime(monday) + timedelta(seconds=off)
+
+    def add(ticker, event_ticker, event_title, title, open_dt, close_dt, yes, no):
+        close = close_dt.isoformat()
+        markets.append({"ticker": ticker, "event_ticker": event_ticker,
+                        "event_title": event_title, "title": title, "subtitle": "",
+                        "result": "yes", "open_time": open_dt.isoformat(),
+                        "close_time": close, "settlement_ts": close})
+        candles[ticker] = _p5_candles(open_dt, close_dt, yes, no)
+
+    for i in range(40):   # same-title: one question on two series
+        for leg, yes, no in (("A", 0.70, 0.32), ("B", 0.55, 0.47)):
+            o = opening()
+            close = (datetime(o.year, o.month, o.day, 12, tzinfo=UTC)
+                     + timedelta(days=rng.choice((1, 2, 3, 6, 8, 9, 13))))
+            add(f"S{i}{leg}", f"SER{leg}{i}-1", f"ST{i}", "Q", o, close, yes, no)
+    for j in range(40):   # time-series: two cumulative deadlines, 14 days apart
+        for leg, deadline, close, yes, no in (
+            ("A", "January 20", datetime(2026, 1, 20, tzinfo=UTC), 0.30, 0.72),
+            ("B", "February 3", datetime(2026, 2, 3, tzinfo=UTC), 0.60, 0.42),
+        ):
+            add(f"R{j}{leg}", f"RAIN{leg}{j}-1", f"RAIN{j}",
+                f"Rain falls by {deadline}, 2026", opening(), close, yes, no)
+    for j in range(30):   # same-event ladders: two rungs of ONE event (DR-73)
+        # Both rungs close at one instant, early enough on some families that
+        # only the first Monday is admissible.
+        close = rng.choice((datetime(2026, 1, 7, tzinfo=UTC), datetime(2026, 1, 14, tzinfo=UTC),
+                            datetime(2026, 2, 3, tzinfo=UTC)))
+        for leg, deadline, yes, no in (("A", "January 20", 0.30, 0.72),
+                                       ("B", "February 3", 0.60, 0.42)):
+            add(f"L{j}{leg}", f"LAD{j}-1", f"LADDER{j}",
+                f"Will it launch by {deadline}, 2026?", opening(), close, yes, no)
+    for k in range(30):   # singletons: counted by the census, never grouped
+        o = opening()
+        add(f"N{k}", f"NOISE{k}-1", f"N{k}", f"Unique question {k}", o,
+            o + timedelta(days=rng.choice((1, 4, 9))), 0.5, 0.5)
+    return markets, candles
+
+
+class TestCheckpointPrefilterIsResultNeutral:
+    """The tightened prefilter drops only markets _find_entry can never enter,
+    so it removes pairs that could never enter and nothing else: the pairs it
+    keeps are exactly the old ones minus those with a dropped leg (nothing is
+    added, and each group's own pairs keep their order), every one enters
+    exactly as before, every pair it drops entered nowhere, and a run's
+    trades and equity curve are identical. What it CAN move is the order of
+    whole groups: a group whose first eligible member is dropped first
+    appears later in the eligible stream, so its pairs move later in the list
+    (test_a_group_whose_first_member_is_dropped_moves_later; measured on the
+    real 2026-05-01 corpus: 826 of 2,054 pairs kept, 9 order inversions, the
+    same 3 trades). Run through the real _prepare_candidates /
+    _entries_for_band / run_backtest with the fetch and candle seams mocked;
+    the OLD pipeline is the same code with the pre-P5 predicate patched in."""
+
+    @staticmethod
+    def _patch(monkeypatch, seed, old):
+        markets, candles = _p5_corpus(seed)
+        requested: list[str] = []
+
+        def fetch_candles(_c, ticker, *a, **k):
+            requested.append(ticker)
+            return candles[ticker]
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks", fetch_candles)
+        if old:
+            monkeypatch.setattr(backtester, "_can_ever_enter", _date_granular_can_ever_enter)
+        return markets, requested
+
+    def _candidates(self, monkeypatch, seed, old, ladders=None):
+        with monkeypatch.context() as mp:
+            markets, requested = self._patch(mp, seed, old)
+            c = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _P5_START, True, None,
+                same_event_ladders=ladders)
+        return markets, requested, c
+
+    @staticmethod
+    def _key(item):
+        (mA, mB, _canon, _group_key), pair_type = item
+        return pair_type, mA["ticker"], mB["ticker"]
+
+    @staticmethod
+    def _every_entry(c) -> dict:
+        """_find_entry for EVERY candidate pair, None included."""
+        out = {}
+        for item in c.all_pairs:
+            (mA, mB, _canon, _group_key), pair_type = item
+            out[TestCheckpointPrefilterIsResultNeutral._key(item)] = _find_entry(
+                c.candles_by_ticker[mA["ticker"]], c.candles_by_ticker[mB["ticker"]],
+                mA, mB, pair_type, c.start_date,
+                max_horizon_days=c.max_horizon_days,
+                same_event_ladders=c.same_event_ladders)
+        return out
+
+    @pytest.mark.parametrize("ladders", [False, True])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_it_drops_only_pairs_that_never_enter(self, monkeypatch, seed, ladders):
+        markets, req_old, old = self._candidates(monkeypatch, seed, True, ladders)
+        _, req_new, new = self._candidates(monkeypatch, seed, False, ladders)
+        if ladders:
+            # the ladder sub-pass contributes pairs of its own, and loses some
+            ladder_old = [k for k in map(self._key, old.all_pairs) if k[1].startswith("L")]
+            ladder_new = [k for k in map(self._key, new.all_pairs) if k[1].startswith("L")]
+            assert ladder_new and len(ladder_new) < len(ladder_old)
+        kept = {m["ticker"] for m in markets if _can_ever_enter(m, _P5_START)}
+
+        old_keys = [self._key(i) for i in old.all_pairs]
+        new_keys = [self._key(i) for i in new.all_pairs]
+        # The new candidate list is the old one minus every pair with a
+        # dropped leg, nothing added. On THIS corpus it is also in the old
+        # order, because every family has exactly two members, so a surviving
+        # group always keeps its first member. A larger group can lose its
+        # first member and move later in the list; see
+        # test_a_group_whose_first_member_is_dropped_moves_later.
+        assert new_keys == [k for k in old_keys if k[1] in kept and k[2] in kept]
+        new_set = set(new_keys)
+        dropped = [k for k in old_keys if k not in new_set]
+        assert dropped   # the tightening actually bites on this corpus
+
+        old_entries = self._every_entry(old)
+        new_entries = self._every_entry(new)
+        # Every pair the tightening removed could never have entered ...
+        assert all(old_entries[k] is None for k in dropped)
+        # ... and every pair it kept enters exactly as before.
+        assert new_entries == {k: old_entries[k] for k in new_keys}
+        assert TestPrepareEntriesGolden._rows(backtester._entries_for_band(new)) == \
+            TestPrepareEntriesGolden._rows(backtester._entries_for_band(old))
+        assert sum(e is not None for e in new_entries.values()) >= 10
+
+        # What the change does move: the eligible census shrinks by exactly
+        # the dropped markets, and fewer tickers are fetched.
+        n_dropped = sum(1 for m in markets
+                        if _date_granular_can_ever_enter(m, _P5_START) and m["ticker"] not in kept)
+        assert n_dropped > 0
+        assert new.label_coverage.total == old.label_coverage.total - n_dropped
+        assert set(req_new) < set(req_old)
+
+    def test_the_boundary_is_exercised_on_both_sides(self, monkeypatch):
+        # Non-vacuity on seed 0: a leg that opened in the hour before a
+        # checkpoint enters AT that checkpoint, and every market that opened
+        # AT a checkpoint and closes before the next Monday is admissible is
+        # dropped — the two sides of the boundary, both present in the corpus.
+        markets, _req, new = self._candidates(monkeypatch, 0, old=False)
+        by_ticker = {m["ticker"]: m for m in markets}
+        entered_at_the_edge = False
+        for key, e in self._every_entry(new).items():
+            if e is None:
+                continue
+            cp = backtester._checkpoint_datetime(e["entry_date"])
+            for t in key[1:]:
+                opened = datetime.fromisoformat(by_ticker[t]["open_time"])
+                entered_at_the_edge |= cp - timedelta(hours=1) <= opened < cp
+        assert entered_at_the_edge
+        on_the_checkpoint = [
+            m for m in markets
+            if datetime.fromisoformat(m["open_time"]) in
+            {backtester._checkpoint_datetime(d) for d in _P5_MONDAYS}]
+        assert on_the_checkpoint
+        assert not any(_can_ever_enter(m, _P5_START) for m in on_the_checkpoint
+                       if datetime.fromisoformat(m["close_time"]).date()
+                       - datetime.fromisoformat(m["open_time"]).date() < timedelta(days=8))
+
+    def test_a_group_whose_first_member_is_dropped_moves_later(self, monkeypatch):
+        # A same-title group on THREE series whose first member (in corpus
+        # order) opened an hour AFTER the only admissible checkpoint: the old
+        # date test keeps it, the checkpoint test drops it, and the other two
+        # members still pair. A two-member group sits between them in the
+        # corpus. Groups are keyed in first-appearance order, so the first
+        # group now first appears AFTER the second. The pair SET is the old
+        # one minus the dropped leg's pairs, each group's pairs keep their own
+        # order, and the two groups swap places in the candidate list. Nothing
+        # enters differently. The two groups' pairs are priced identically,
+        # so they tie exactly in _simulate_at_discount's sort, and the LISTING
+        # order of their simultaneous trades may follow the list. Cash does
+        # not bind here, so every trade and the equity curve are unchanged.
+        cp = backtester._checkpoint_datetime(_P5_MONDAYS[0])
+        before, after = cp - timedelta(days=2), cp + timedelta(hours=1)
+        close = cp + timedelta(days=4)          # before the next Monday
+        markets: list[dict] = []
+        candles: dict[str, list[dict]] = {}
+        for ticker, series, group, opened, yes, no in (
+            ("X1", "SXA", "GX", after, 0.70, 0.32),
+            ("Y1", "SYA", "GY", before, 0.70, 0.32),
+            ("Y2", "SYB", "GY", before, 0.55, 0.47),
+            ("X2", "SXB", "GX", before, 0.70, 0.32),
+            ("X3", "SXC", "GX", before, 0.55, 0.47),
+        ):
+            markets.append({"ticker": ticker, "event_ticker": f"{series}-1",
+                            "event_title": group, "title": "Q", "subtitle": "",
+                            "result": "yes", "open_time": opened.isoformat(),
+                            "close_time": close.isoformat(),
+                            "settlement_ts": close.isoformat()})
+            candles[ticker] = _p5_candles(opened, close, yes, no)
+        assert _date_granular_can_ever_enter(markets[0], _P5_START)
+        assert not _can_ever_enter(markets[0], _P5_START)
+
+        def run(old: bool):
+            with monkeypatch.context() as mp:
+                mp.setattr(backtester, "fetch_all_settled_markets",
+                           lambda *a, **k: markets)
+                mp.setattr(backtester, "fetch_candlesticks",
+                           lambda _c, ticker, *a, **k: candles[ticker])
+                if old:
+                    mp.setattr(backtester, "_can_ever_enter",
+                               _date_granular_can_ever_enter)
+                c = backtester._prepare_candidates(
+                    MagicMock(), MagicMock(), _P5_START, True, None)
+                trades, eq = run_backtest(
+                    hist_client=MagicMock(), live_client=MagicMock(),
+                    start_date=_P5_START, initial_balance=10_000.0)
+            return c, trades, eq
+
+        old, trades_old, eq_old = run(True)
+        new, trades_new, eq_new = run(False)
+        old_keys = [self._key(i) for i in old.all_pairs]
+        new_keys = [self._key(i) for i in new.all_pairs]
+        survivors = [k for k in old_keys if "X1" not in k[1:]]
+        assert set(new_keys) == set(survivors)          # nothing added
+        assert new_keys != survivors                    # ... but reordered
+        assert [k for k in new_keys if k[1].startswith("Y")] == \
+            [k for k in survivors if k[1].startswith("Y")]
+        assert [k for k in new_keys if k[1].startswith("X")] == \
+            [k for k in survivors if k[1].startswith("X")]
+        assert new_keys.index(survivors[-1]) < new_keys.index(survivors[0])
+
+        old_entries = self._every_entry(old)
+        new_entries = self._every_entry(new)
+        assert all(old_entries[k] is None for k in old_keys if k not in set(new_keys))
+        assert new_entries == {k: old_entries[k] for k in new_keys}
+        assert sum(e is not None for e in new_entries.values()) == 2
+
+        assert len(trades_new) == 2
+        assert sorted(map(astuple, trades_new)) == sorted(map(astuple, trades_old))
+        pd.testing.assert_frame_equal(eq_new, eq_old)
+
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_run_backtest_is_unchanged(self, monkeypatch, seed):
+        results = {}
+        for old in (True, False):
+            with monkeypatch.context() as mp:
+                self._patch(mp, seed, old)
+                results[old] = run_backtest(
+                    hist_client=MagicMock(), live_client=MagicMock(),
+                    start_date=_P5_START, initial_balance=10_000.0)
+        (trades_old, eq_old), (trades_new, eq_new) = results[True], results[False]
+        assert trades_old
+        assert [astuple(t) for t in trades_new] == [astuple(t) for t in trades_old]
+        pd.testing.assert_frame_equal(eq_new, eq_old)
 
 
 def _ts_member(ticker: str, event_ticker: str, close_d: date | None) -> dict:
@@ -3129,7 +4026,7 @@ class TestPrepareEntriesMemoryInstrumentation:
         labels = [r.args[0] for r in caplog.records
                   if r.getMessage().startswith("Peak RSS")]
         # In order, and exactly the two that bracket grouping/pairing — the
-        # window between the existing "Total settled markets" and "Potential
+        # window between the existing "Markets to analyze" and "Potential
         # pairs" lines, where the peak lives and is otherwise invisible.
         assert labels == ["before grouping", "after pair extraction"]
 
@@ -3667,6 +4564,74 @@ class TestOutcomeLabelCoverageIsCarried:
         trades, equity = out
         assert trades == []
         assert list(equity.columns) == ["date", "portfolio_value", "daily_return"]
+
+
+class TestCorpusProvenanceIsCarried:
+    """DR-13 / M2 (P2): what the fetched corpus says about itself — when it was
+    assembled, whether it came from an earlier run's cache, and the archive
+    cutoff and post-cutoff verdict as of that assembly — rides from the
+    SettledCorpus through _Candidates onto BacktestSweep.corpus_provenance,
+    exactly the way label_coverage travels, so the dashboard header can render
+    it. None whenever it was never recorded."""
+
+    PROV = historical.CorpusProvenance(
+        from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
+        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC), post_cutoff=True)
+
+    def test_the_sweep_carries_the_provenance(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders"),
+                                corpus_provenance=self.PROV))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.corpus_provenance is self.PROV
+
+    def test_the_infeasible_window_carries_none(self, monkeypatch):
+        # No fetch ran, so there is no corpus to describe.
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        result = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert result.corpus_provenance is None
+
+    @staticmethod
+    def _point(n_trades, k=0.75):
+        return backtester.SweepPoint(k=k, trades=[object()] * n_trades,
+                                     equity_df=pd.DataFrame())
+
+    @pytest.mark.parametrize("where, expected", [
+        ("none", 0), ("primary", 3), ("points", 5), ("scenarios", 7),
+        ("same_title_point", 2),
+    ])
+    def test_max_trades_simulated_reads_every_point_the_page_can_show(
+            self, where, expected):
+        # The one test both renderers apply to a carried post-cutoff verdict:
+        # a trade at ANY simulated point proves it stale, since the k dropdown
+        # and the scenario explorer put every point on the same page.
+        primary = self._point(3 if where == "primary" else 0)
+        sweep = backtester.BacktestSweep(
+            primary=primary,
+            points=[primary, self._point(5 if where == "points" else 0, k=0.5)],
+            calibration=None,
+            scenarios=[self._point(7 if where == "scenarios" else 0, k=0.9)],
+            same_title_point=(self._point(2) if where == "same_title_point"
+                              else None))
+        assert backtester.max_trades_simulated(sweep) == expected
+
+    def test_existing_constructions_default_to_none(self):
+        # Defaulted, like label_coverage: a hand-built sweep or candidates
+        # object needs no change and reads as "not recorded".
+        point = backtester.SweepPoint(k=0.75, trades=[], equity_df=pd.DataFrame())
+        assert backtester.BacktestSweep(primary=point, points=[point],
+                                        calibration=None).corpus_provenance is None
+        assert backtester._Candidates(
+            all_pairs=[], candles_by_ticker={}, label_coverage=None,
+            start_date=date(2026, 1, 1), max_horizon_days=None,
+            same_event_ladders=None).corpus_provenance is None
 
 
 class TestRunBacktestFeasibilityPreCheck:
@@ -6069,7 +7034,7 @@ class TestGroupableSubset:
             assert len(hits) == 1, prefix
             return hits[0]
 
-        total = f"Total settled markets to analyze: {len(markets)}"
+        total = f"Markets to analyze: {len(markets)}"
         prefilter = (f"Eligibility prefilter: skipping "
                      f"{len(markets) - len(eligible)}/{len(markets)} markets")
         groupable = (f"Groupable subset: materializing {len(subset)} of "
@@ -6336,6 +7301,44 @@ class TestPrepareCandidatesOverASettledCorpus:
         assert from_corpus.label_coverage == from_list.label_coverage
         assert len(walks) == 2
 
+    def test_the_corpus_provenance_rides_out_on_the_candidates(
+        self, tmp_path, monkeypatch,
+    ):
+        # Taken off the corpus BY TYPE before it is released: a SettledCorpus
+        # hands over its provenance, and so does the LegacySettledCorpus list
+        # a legacy-cache hit returns (its file time, no cutoff); a plain list
+        # (a test stub) has none; and a MagicMock — which would answer
+        # .provenance with a truthy auto-attribute — is not mistaken for one.
+        template = _ss1_corpus(0)
+        corpus = self._corpus(tmp_path, template)
+        prov = historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 1, 5, 9, tzinfo=UTC),
+            archive_cutoff=datetime(2025, 12, 1, tzinfo=UTC), post_cutoff=True)
+        with_prov = historical.SettledCorpus(corpus.path, historical._assembled_cache_meta(
+            _SS1_START, "t"), len(corpus), provenance=prov)
+        TestGroupableSubset._patch(monkeypatch, with_prov)
+        assert TestGroupableSubset._prepare().corpus_provenance is prov
+        TestGroupableSubset._patch(monkeypatch, template)
+        assert TestGroupableSubset._prepare().corpus_provenance is None
+        legacy_prov = historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
+            archive_cutoff=None, post_cutoff=None, legacy=True)
+        legacy = historical.LegacySettledCorpus(template, legacy_prov)
+        TestGroupableSubset._patch(monkeypatch, legacy)
+        prepared = TestGroupableSubset._prepare()
+        assert prepared.corpus_provenance is legacy_prov
+        # ...and the legacy list prepares exactly what the plain list does.
+        TestGroupableSubset._patch(monkeypatch, template)
+        plain = TestGroupableSubset._prepare()
+        assert prepared.all_pairs == plain.all_pairs
+        assert prepared.label_coverage == plain.label_coverage
+        stub = MagicMock()
+        stub.__iter__.return_value = iter([])
+        stub.provenance = prov
+        TestGroupableSubset._patch(monkeypatch, stub)
+        assert backtester._prepare_candidates(
+            MagicMock(), MagicMock(), _SS1_START, True, None).corpus_provenance is None
+
     def test_a_cache_replaced_between_the_two_passes_is_refused(
         self, tmp_path, monkeypatch,
     ):
@@ -6357,6 +7360,154 @@ class TestPrepareCandidatesOverASettledCorpus:
         # matches, so pass 2's own identity check stops the run there.
         with pytest.raises(RuntimeError, match="did not iterate identically"):
             TestGroupableSubset._prepare()
+
+
+class TestPrefilterLinesSayItRanDuringAssembly:
+    """M9 of the 2026-09-24 7-day-run review: _prepare_candidates re-applies
+    the eligibility prefilter to a corpus the fetch already prefiltered, so
+    "Eligibility prefilter: skipping 0/7274215" was printed beside "Total
+    settled markets to analyze: 7274215" although the assembly had kept
+    those 7,274,215 of about 24.6M settled records (the review's estimate).
+    A corpus that carries provenance (it came from the fetch) is now
+    reported as ELIGIBLE markets, with the assembly's own rejections when it
+    recorded them, and its re-check is named as one; a re-check that rejects
+    anything is a WARNING, since only a predicate changed without a tag bump
+    (or an altered cache) can do that."""
+
+    TAG = backtester.SETTLED_PREFILTER_CACHE_TAG
+    COUNTS = historical.AssemblyCounts(settled=40, rejected=25, duplicates=3)
+
+    @staticmethod
+    def _prov(**fields):
+        base = {"from_cache": False, "assembled_at": datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
+                "archive_cutoff": datetime(2026, 7, 25, tzinfo=UTC), "post_cutoff": True}
+        base.update(fields)
+        return historical.CorpusProvenance(**base)
+
+    @staticmethod
+    def _lines(caplog):
+        return [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_a_fresh_prefiltered_corpus_quotes_what_the_assembly_rejected(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(12, 12, self._prov(assembly_counts=self.COUNTS))
+        assert self._lines(caplog) == [
+            ("INFO", f"Markets to analyze: 12 eligible — the eligibility prefilter "
+                     f"({self.TAG}) ran during assembly and rejected 25 of the 40 "
+                     f"records settled in the window (3 more were duplicate or blank "
+                     f"tickers; counted by this run)"),
+            ("INFO", "Eligibility prefilter re-check: 0 of 12 markets rejected — "
+                     "none expected, since it already ran during assembly"),
+        ]
+        assert "skipping 0/" not in caplog.text
+
+    def test_a_cache_hit_says_the_counts_are_as_of_its_assembly(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(
+                12, 12, self._prov(from_cache=True, assembly_counts=self.COUNTS))
+        assert "(3 more were duplicate or blank tickers; counted at this cache's " \
+            "assembly)" in caplog.text
+
+    @pytest.mark.parametrize("legacy, noun", [(False, "cache"), (True, "legacy cache")])
+    def test_a_corpus_without_counts_says_it_records_none(self, caplog, legacy, noun):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(
+                7, 7, self._prov(from_cache=True, legacy=legacy,
+                                 archive_cutoff=None, post_cutoff=None))
+        assert self._lines(caplog)[0] == (
+            "INFO", f"Markets to analyze: 7 eligible — the eligibility prefilter "
+                    f"({self.TAG}) ran during assembly, but this {noun} records no "
+                    f"count of the records it rejected")
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    @pytest.mark.parametrize("counts", [None, COUNTS])
+    def test_a_re_check_that_rejects_anything_is_a_warning(self, caplog, counts):
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(12, 9, self._prov(assembly_counts=counts))
+        lines = self._lines(caplog)
+        warned = [m for level, m in lines if level == "WARNING"]
+        assert len(warned) == 1
+        assert warned[0].startswith(
+            f"Eligibility prefilter re-check: 3 of 12 markets rejected, although "
+            f"the prefilter ({self.TAG}) already ran during this corpus's assembly")
+        assert "config.SETTLED_PREFILTER_CACHE_TAG" in warned[0]
+        # The INFO line above that WARNING must not call all 12 eligible when
+        # the WARNING says 3 of them are not: it names both counts.
+        assert lines[0][0] == "INFO"
+        assert lines[0][1].startswith(
+            f"Markets to analyze: 12 assembled as eligible, 9 still eligible "
+            f"after the re-check below — the eligibility prefilter ({self.TAG}) "
+            f"ran during assembly")
+        assert "12 eligible" not in lines[0][1]
+
+    def test_a_plain_list_keeps_the_old_skip_line(self, caplog):
+        # No provenance, so no assembly is known to have filtered it: the
+        # re-check IS its prefilter, and says so in the words it always used.
+        with caplog.at_level(logging.INFO):
+            backtester._log_corpus_prefilter(10, 6, None)
+        assert self._lines(caplog) == [
+            ("INFO", "Markets to analyze: 10 (no assembly record — whether a "
+                     "prefilter ran while this corpus was assembled is unknown)"),
+            ("INFO", "Eligibility prefilter: skipping 4/10 markets that cannot "
+                     "appear in any tradeable pair"),
+        ]
+
+    def test_prepare_candidates_reports_a_fetched_corpus_through_it(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # End to end over a real streamed corpus that WAS prefiltered, as the
+        # fetch returns it: the corpus is its eligible markets, the assembly's
+        # counts are quoted, the re-check rejects nothing, nothing warns.
+        eligible = TestGroupableSubset._eligible(_ss1_corpus(0))
+        written = TestPrepareCandidatesOverASettledCorpus._corpus(tmp_path, eligible)
+        counts = historical.AssemblyCounts(
+            settled=len(eligible) + 30, rejected=30, duplicates=0)
+        corpus = historical.SettledCorpus(
+            written.path, historical._assembled_cache_meta(_SS1_START, "t"),
+            len(written), provenance=self._prov(assembly_counts=counts))
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            TestGroupableSubset._prepare()
+        messages = [r.getMessage() for r in caplog.records]
+        assert (f"Markets to analyze: {len(eligible)} eligible — the eligibility "
+                f"prefilter ({self.TAG}) ran during assembly and rejected 30 of "
+                f"the {len(eligible) + 30} records settled in the window") in caplog.text
+        assert (f"Eligibility prefilter re-check: 0 of {len(eligible)} markets "
+                f"rejected") in caplog.text
+        # (the stubbed candle fetch returns nothing, which warns on its own)
+        assert not [r for r in caplog.records if r.levelname == "WARNING"
+                    and "prefilter" in r.getMessage()]
+        # Still before the groupable line, as the old pair of lines was.
+        first = next(i for i, m in enumerate(messages) if m.startswith("Markets to analyze"))
+        group = next(i for i, m in enumerate(messages) if m.startswith("Groupable subset"))
+        assert first < group
+
+    def test_prepare_candidates_warns_on_a_fetched_corpus_it_can_still_filter(
+        self, monkeypatch, caplog,
+    ):
+        # A corpus claiming to come from the fetch that still holds records
+        # the predicate rejects: the stale-tag case. Dropped AND warned about.
+        template = _ss1_corpus(0)
+        legacy = historical.LegacySettledCorpus(
+            template, self._prov(from_cache=True, legacy=True,
+                                 archive_cutoff=None, post_cutoff=None))
+        TestGroupableSubset._patch(monkeypatch, legacy)
+        with caplog.at_level(logging.INFO):
+            prepared = TestGroupableSubset._prepare()
+        rejected = len(template) - len(TestGroupableSubset._eligible(template))
+        assert rejected > 0
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+                  and r.getMessage().startswith("Eligibility prefilter re-check")]
+        assert len(warned) == 1 and warned[0].startswith(
+            f"Eligibility prefilter re-check: {rejected} of {len(template)} markets rejected")
+        # ...and the line above it names both counts, never all of them eligible.
+        assert (f"Markets to analyze: {len(template)} assembled as eligible, "
+                f"{len(template) - rejected} still eligible after the re-check "
+                f"below — the eligibility prefilter ({self.TAG}) ran during "
+                f"assembly, but this legacy cache records no count") in caplog.text
+        # ...and the dropped records are dropped exactly as before.
+        TestGroupableSubset._patch(monkeypatch, template)
+        assert prepared.all_pairs == TestGroupableSubset._prepare().all_pairs
 
 
 class TestEntriesForBand:

@@ -21,10 +21,14 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
 Dependencies:
-    Imports BacktestSweep, BacktestTrade, OutcomeLabelCoverage and SweepPoint
+    Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
+    re-exported by backtester.py), OutcomeLabelCoverage and SweepPoint
     from backtester.py, plus its _exact_label() — the injective float formatter
     its completion lines use, reused so no two scenario-explorer labels can
-    collide — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
+    collide — and max_trades_simulated() (the one test of a carried
+    post-cutoff verdict against the run's own trades, shared with
+    backtest.py's closing line), and BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
+    PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     create_new_output(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
@@ -68,7 +72,18 @@ Notes:
     call plus two plain HTML table re-renders — no new dependency, and no
     hand-rolled charting: Plotly still owns every pixel that gets drawn.
 
-    The page header names the run's primary spread band and its same-event
+    Directly under the Period line the header says what settled-market corpus
+    the run read (BacktestSweep.corpus_provenance): when it was assembled (a
+    legacy settled_markets_*.json's file time, named as such) — the Period
+    runs to today, the corpus only to that moment — whether it was served
+    from an earlier run's cache, and the archive cutoff as of that assembly,
+    with a red banner when the window starts at or after it and so could
+    never enter a trade (DR-13, M2) — or, when some simulated point DID
+    trade (backtester.max_trades_simulated), an amber line saying that
+    verdict is stale instead. It renders on every run, "not recorded"
+    included, never as a silence (DR-66).
+
+    The page header also names the run's primary spread band and its same-event
     ladder setting (DR-73) under the Period line, or "not recorded" when the
     run passed no sweep: the ladder setting decides which pairs exist and the
     band which of them are ever entered, so, like DR-66b's strike-blind
@@ -97,9 +112,11 @@ from plotly.subplots import make_subplots
 from .backtester import (
     BacktestSweep,
     BacktestTrade,
+    CorpusProvenance,
     OutcomeLabelCoverage,
     SweepPoint,
     _exact_label,
+    max_trades_simulated,
 )
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
@@ -1657,6 +1674,114 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     )
 
 
+def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
+    """
+    Render the page-header lines saying what settled-market corpus the run read.
+
+    DR-13 and M2/M3 of the 2026-09-24 review. The Period line above it prints
+    start_date → today because the equity curve runs to today, but the corpus
+    holds no market settled after its assembly — and a cached re-run serves a
+    corpus assembled by an earlier run, so the two can be days apart. And a
+    window starting at or after the archive cutoff cannot enter any trade
+    (post-cutoff markets have no historical candlesticks), which used to
+    reach only the log, and only on a cache miss: a cached re-run, and the
+    HTML on every run, showed a flat 0.0% result with no caveat.
+
+    Always renders a line, healthy or not — absence must never be the only
+    signal (DR-66): the assembly time (a legacy settled_markets_*.json's
+    file time, named as such), whether it came from an earlier run's cache
+    (and that --no-cache extends it), and the archive cutoff at assembly.
+    When the carried verdict says the window starts at or after that cutoff,
+    a second line follows, in one of two forms decided by
+    backtester.max_trades_simulated — the one definition the log's closing
+    WARNING also reads, so page and log agree:
+      * no simulated point traded: a red banner stating a BOUND, not a cause
+        — no trade could be entered whatever pairs formed; such a run may
+        also have formed no pairs at all (the 2026-09-17 window formed 0).
+      * some simulated point traded: the verdict is proven stale (the cutoff
+        has since moved past the start date, or the run could not have
+        traded), so the page says THAT instead of a red "no trade could be
+        entered" beside "Trades found: N".
+    The verdict is the one historical._corpus_provenance CARRIED, never
+    re-derived here.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+
+    Returns:
+        str: One grey <p> line, plus a red or amber <p> when the carried
+            post-cutoff verdict is True. "not recorded" when there is no
+            sweep or it carries no provenance (the window's fetch was
+            skipped, a stubbed corpus, a hand-built sweep).
+    """
+    prov: CorpusProvenance | None = None if sweep is None else sweep.corpus_provenance
+    grey = '<p style="color:#616161; font-size:14px;">'
+    if prov is None:
+        return (
+            f"{grey}Settled-market corpus: assembly time and archive cutoff not "
+            "recorded for this run (no sweep was passed to the report, the "
+            "window's fetch was skipped, or the corpus did not come from an "
+            "assembled cache).</p>"
+        )
+    if prov.assembled_at is None:
+        assembled = "assembly time not recorded"
+    elif prov.legacy:
+        assembled = (f"last written {prov.assembled_at:%Y-%m-%d %H:%M} UTC (the "
+                     "file time of a legacy settled_markets_*.json, which records "
+                     "no assembly stamp) — it holds no market settled after that")
+    else:
+        assembled = (f"assembled {prov.assembled_at:%Y-%m-%d %H:%M} UTC — it holds "
+                     "no market settled after that")
+    if not prov.from_cache:
+        source = "assembled by this run"
+    elif prov.legacy:
+        source = ("served from an earlier run's cache; --no-cache extends it and "
+                  "rebuilds it in the streamed format")
+    else:
+        source = "served from an earlier run's cache; --no-cache extends it"
+    if prov.archive_cutoff is not None:
+        cutoff = f"archive cutoff at assembly: {prov.archive_cutoff:%Y-%m-%d}"
+    elif prov.legacy:
+        cutoff = ("archive cutoff at assembly: not recorded (the legacy format "
+                  "records none; --no-cache re-checks it)")
+    else:
+        cutoff = "archive cutoff at assembly: not recorded (--no-cache re-checks it)"
+    line = (f"{grey}Settled-market corpus: {html.escape(assembled)} "
+            f"({html.escape(source)}) | {html.escape(cutoff)}</p>")
+    if not prov.post_cutoff:
+        return line
+    cutoff_day = (f"{prov.archive_cutoff:%Y-%m-%d}" if prov.archive_cutoff is not None
+                  else "not recorded")
+    # A trade at any simulated point disproves "no trade could be entered":
+    # the one test the log's closing WARNING applies too
+    traded = max_trades_simulated(sweep)
+    if traded:
+        recorded = "at this corpus's assembly" if prov.from_cache else "by this run"
+        notice = (
+            f"The archive cutoff recorded {recorded} ({cutoff_day}) is at or "
+            "after this window's start date, which would mean no trade could be "
+            f"entered — but this run entered trades (up to {traded} in one "
+            "simulated scenario), so that verdict is stale: the cutoff has since "
+            "moved past the start date. --no-cache re-reads the cutoff and "
+            "re-stamps the cache."
+        )
+        return line + (
+            '<p style="color:#E65100; font-size:14px; font-weight:700;">'
+            f"{html.escape(notice)}</p>"
+        )
+    stale = (" If the cutoff has since moved past the start date this may no "
+             "longer hold — a cached run does not re-read it; --no-cache "
+             "re-checks." if prov.from_cache else "")
+    return line + (
+        '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+        f"This window starts at or after the archive cutoff ({cutoff_day}, as "
+        "of the corpus's assembly). Post-cutoff markets have no historical "
+        "candlesticks, so no trade could be entered in this window whatever "
+        "pairs formed: a zero-trade result on this page is structural and "
+        f"says nothing about the strategy.{html.escape(stale)}</p>"
+    )
+
+
 def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     """
     Build the "Scenario Explorer" HTML section.
@@ -2416,6 +2541,15 @@ def generate_dashboard(
             also emitted under the Period line, because a strike-blind corpus
             changes which pairs exist and so taints all eight sections, not
             just the one that renders the census (DR-66b).
+
+            Its corpus_provenance is rendered directly under the Period line
+            on every run (_corpus_provenance_html): when the corpus was
+            assembled — the Period runs to today, the corpus only to that
+            moment — whether it came from an earlier run's cache, and the
+            archive cutoff at assembly, with a red banner when the window
+            starts at or after it (DR-13, M2), or an amber stale-verdict line
+            when a simulated point traded anyway. "not recorded" when the
+            sweep carries none or there is no sweep.
         interval_discount (float | None): The interval discount `trades` were
             SIZED at, threaded into the Risk section's Kelly scatter. Separate
             from `sweep` because that scatter needs it even on a run that
@@ -2457,6 +2591,13 @@ def generate_dashboard(
     # when there is no sweep.
     run_settings = _run_settings_html(sweep)
 
+    # Directly under the Period line, which it qualifies: the corpus holds
+    # nothing settled after its assembly even though the period runs to today,
+    # and a window at or after the archive cutoff could never enter a trade
+    # (unless a simulated point traded, which proves that verdict stale).
+    # Rendered on every run, healthy or not (DR-13, M2; DR-66's rule).
+    corpus_note = _corpus_provenance_html(sweep)
+
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
         _section_decomposition(trades),
@@ -2495,6 +2636,7 @@ def generate_dashboard(
   Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
   Trades found: {len(trades)}
 </p>
+{corpus_note}
 {run_settings}
 {header_note}
 {''.join(sections)}

@@ -3,6 +3,8 @@ import copy
 import gzip
 import json
 import logging
+import os
+import threading
 import weakref
 import zlib
 from datetime import UTC, date, datetime, timedelta
@@ -124,10 +126,24 @@ def _patch_single_event_lookups(monkeypatch,
 
 @pytest.fixture
 def isolated_cache(tmp_path, monkeypatch):
-    """Redirect _EVENT_TITLES_CACHE to a temp file so tests don't touch real cache."""
-    cache_file = tmp_path / "event_titles.json"
+    """Redirect the event-title accumulator (event_titles_v2.json) and its
+    legacy file (event_titles.json) to temp files so tests don't touch the real
+    cache, and return the accumulator's path. tests/conftest.py already applies
+    the same redirect to every test; this fixture names the path for the tests
+    that seed or read the file."""
+    cache_file = tmp_path / "event_titles_v2.json"
     monkeypatch.setattr(historical, "_EVENT_TITLES_CACHE", cache_file)
+    monkeypatch.setattr(historical, "_LEGACY_EVENT_TITLES_CACHE",
+                        tmp_path / "event_titles.json")
     return cache_file
+
+
+@pytest.fixture(autouse=True)
+def _unpaced_title_lookups(monkeypatch):
+    """Zero the per-lookup pause of the event-title fallback (DR-51) for every
+    test in this module, so lookups cost no wall time; the pacing test sets its
+    own value."""
+    monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS", 0)
 
 
 class TestEventTitlesCache:
@@ -288,7 +304,8 @@ class TestEventTitlesCache:
         # written for a handful of stragglers, but a 21-day window measured
         # 289,235 unresolved tickers live (2026-08-03) — uncapped and
         # sequential that is hours of silent grinding. Past the cap, tickers
-        # are poison-pilled to "" exactly as a failed lookup already did.
+        # are "" for this run, exactly as after a failed lookup — but since
+        # DR-51 they are DEFERRED, not stored (see TestEventTitleAccumulatorBound).
         monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
         client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
         wanted = {f"E{i:02d}" for i in range(10)}
@@ -299,7 +316,7 @@ class TestEventTitlesCache:
         with caplog.at_level(logging.WARNING):
             result = historical._load_or_build_event_titles(client, wanted)
 
-        # Every requested ticker is present — capped ones as the "" poison pill.
+        # Every requested ticker is present — deferred ones as "" this run.
         assert set(result) == wanted
         assert fallback.call_count == 3
         resolved = {t for t, v in result.items() if v}
@@ -307,9 +324,15 @@ class TestEventTitlesCache:
         assert all(result[t] == "" for t in wanted - resolved)
         # The cap is deterministic (sorted), so a re-run can't shuffle coverage.
         assert resolved == {"E00", "E01", "E02"}
-        # And it must never be silent about what it skipped.
-        assert any("marking the remaining 7 as untitled" in r.getMessage()
-                   for r in caplog.records)
+        # And it must never be silent about what it skipped — these are
+        # non-combo tickers, whose titles can change a pair, so it WARNs.
+        assert any("deferring the other 7 non-combo tickers" in r.getMessage()
+                   and r.levelno == logging.WARNING for r in caplog.records)
+        # DR-51: the deferred seven were never looked up, so nothing is stored
+        # for them — only the three genuine answers reach the accumulator.
+        assert json.loads(isolated_cache.read_text()) == {
+            t: f"Title {t}" for t in ("E00", "E01", "E02")
+        }
 
     def test_per_ticker_fallback_runs_in_parallel(self, isolated_cache, monkeypatch):
         # Each lookup is an independent read-only GET, so they must overlap
@@ -1503,6 +1526,7 @@ class TestShardedFetch:
         assert list(out_pref) == [m for m in out_full if pred(m)]
         # Sanity: the predicate actually removed something, and kept something.
         assert 0 < len(out_pref) < len(out_full)
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
 
         # The day-slice FILES must stay complete — they are shared across start
         # dates and other callers, so filtering them would corrupt the cache.
@@ -2281,11 +2305,15 @@ class TestFrontierStreamsThroughKeep:
         assert out == self._oracle(markets, None)
         assert len(out) == len(markets)
 
-    def test_whole_phase_equals_filtering_the_unfiltered_phase(self, tmp_path,
-                                                               monkeypatch):
+    def test_whole_phase_filters_only_the_frontier_and_counts_its_rejections(
+            self, tmp_path, monkeypatch):
         # With past days on disk as well: frontier first, then past days
-        # newest-first, each filtered by the same predicate in the same order —
-        # exactly [m for m in unfiltered_phase if keep(m)].
+        # newest-first. Only the frontier is filtered by the phase (its records
+        # would otherwise be spooled); the past days come back UNFILTERED since
+        # M9, because the assembly applies the same predicate to them and
+        # counts what it rejects — so filtering the phase's output still
+        # equals filtering the unfiltered phase, and the tally holds exactly
+        # the frontier's rejections, the only ones the assembly never sees.
         monkeypatch.setattr(historical, "SETTLED_FETCH_CHUNK_RECORDS", 3)
         past = [
             _mk_raw_market(f"P{d}{i}", "2026-09-21T00:00:00Z",
@@ -2300,22 +2328,32 @@ class TestFrontierStreamsThroughKeep:
             _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW), None,
         )
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "kept")
+        tally = historical._AssemblyTally()
         filtered = historical._fetch_live_phase(
             _FakeLive(markets, page_size=2), live_min_ts, self._ts(self.NOW),
-            self._keep,
+            self._keep, tally=tally,
         )
 
-        assert list(filtered) == [m for m in unfiltered if self._keep(m)]
-        tickers = [m["ticker"] for m in unfiltered]
+        everything, got = list(unfiltered), list(filtered)
+        # What the assembly can keep is unchanged: it re-applies `keep`.
+        assert [m for m in got if self._keep(m)] == [
+            m for m in everything if self._keep(m)]
+        tickers = [m["ticker"] for m in everything]
         # Frontier first, then 09-23, then 09-22 — the contract the merge's
         # first-wins dedup depends on.
         assert tickers[:11] == [f"F{i:02d}" for i in range(10, -1, -1)]
         assert tickers[11:18] == [f"P3{i}" for i in range(6, -1, -1)]
         assert tickers[18:] == [f"P2{i}" for i in range(6, -1, -1)]
-        # The predicate bit on the frontier AND on the past days.
-        dropped = set(tickers) - {m["ticker"] for m in filtered}
-        assert any(t.startswith("F") for t in dropped)
-        assert any(t.startswith("P") for t in dropped)
+        # The frontier is filtered where it is fetched; the past days are not.
+        frontier_kept = [m for m in everything[:11] if self._keep(m)]
+        assert got == frontier_kept + everything[11:]
+        # The predicate bit on the frontier, and the past days still carry
+        # records it rejects — they reach the assembly, which counts them.
+        rejected_at_fetch = 11 - len(frontier_kept)
+        assert rejected_at_fetch > 0
+        assert any(not self._keep(m) for m in got[len(frontier_kept):])
+        assert tally == historical._AssemblyTally(
+            settled=rejected_at_fetch, rejected=rejected_at_fetch, duplicates=0)
 
     def test_rejected_frontier_record_is_never_retained(self, tmp_path, monkeypatch):
         # The point of SS-1. Every compact record is made weakly referenceable
@@ -2504,22 +2542,25 @@ class TestFrontierStreamsThroughKeep:
         alive_at_fallback: list[int] = []
         real_sequential = historical._fetch_live_sequential
 
-        def spy_sequential(live_client, live_min_ts, keep=None):
+        def spy_sequential(live_client, live_min_ts, keep=None, **kwargs):
             # Every tracked record made so far came from the frontier window
             # (each past-day window raises on its first record, before
             # building one), so this counts the frontier still resident.
             alive_at_fallback.append(sum(r() is not None for r in kept_refs))
-            return real_sequential(live_client, live_min_ts, keep)
+            return real_sequential(live_client, live_min_ts, keep, **kwargs)
 
         monkeypatch.setattr(historical, "_fetch_live_sequential", spy_sequential)
 
         markets = self._frontier_markets() + self._past_days()
         live_min_ts = self._ts("2026-09-22T00:00:00+00:00")
+        tally = historical._AssemblyTally()
         out = historical._fetch_live_phase(
             _FakeLive(markets, page_size=2, ignore_max=True), live_min_ts,
-            self._ts(self.NOW), self._keep,
+            self._ts(self.NOW), self._keep, tally=tally,
         )
 
+        # The frontier's first page is F10 and F09, and `keep` rejects F09, so
+        # a spooled frontier record means the frontier had rejected one too.
         assert kept_refs, "the frontier must have kept records before the fallback"
         assert alive_at_fallback == [0]
         assert len(spools) == 1 and spools[0]._closed and len(spools[0]) > 0
@@ -2527,6 +2568,12 @@ class TestFrontierStreamsThroughKeep:
         unfiltered = real_sequential(_FakeLive(markets, page_size=2), live_min_ts)
         assert out == [m for m in unfiltered if self._keep(m)]
         assert 0 < len(out) < len(unfiltered)
+        # M9: only the sequential walk's rejections are counted — the
+        # discarded frontier had rejected some of the same day's records too,
+        # and counting them as well would report them twice.
+        rejected = len(unfiltered) - len(out)
+        assert tally == historical._AssemblyTally(
+            settled=rejected, rejected=rejected, duplicates=0)
 
 
 class TestSequentialFallbacksApplyKeep:
@@ -2580,12 +2627,18 @@ class TestSequentialFallbacksApplyKeep:
                 _FakeLive(markets, page_size=1), live_min_ts)
         lines_none = self._progress_lines(caplog, label)
         caplog.clear()
+        tally = historical._AssemblyTally()
         with caplog.at_level(logging.INFO):
             filtered = historical._fetch_live_sequential(
-                _FakeLive(markets, page_size=1), live_min_ts, self._keep)
+                _FakeLive(markets, page_size=1), live_min_ts, self._keep, tally=tally)
         lines_keep = self._progress_lines(caplog, label)
 
         assert filtered == [m for m in unfiltered if self._keep(m)]
+        # M9: the assembly never sees what this walk dropped, so the walk
+        # reports it — every one a record settled in the window
+        dropped = len(unfiltered) - len(filtered)
+        assert tally == historical._AssemblyTally(
+            settled=dropped, rejected=dropped, duplicates=0)
         # The returned list IS what the walk retained: nothing rejected in it.
         assert all(self._keep(m) for m in filtered)
         assert 0 < len(filtered) < len(unfiltered)
@@ -2597,7 +2650,7 @@ class TestSequentialFallbacksApplyKeep:
         markets = self._markets("A", "2026-09-17T06:00:00+00:00")
         label = "Historical archive [sequential]"
 
-        def run(keep):
+        def run(keep, tally=None):
             archive = _FakeArchive(markets, page_size=1)
             monkeypatch.setattr(
                 historical, "_signed_raw_get",
@@ -2605,17 +2658,22 @@ class TestSequentialFallbacksApplyKeep:
             )
             return historical._fetch_archive_sequential(
                 MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
-                {"limit": 1000}, keep)
+                {"limit": 1000}, keep, tally=tally)
 
         with caplog.at_level(logging.INFO):
             unfiltered = run(None)
         lines_none = self._progress_lines(caplog, label)
         caplog.clear()
+        tally = historical._AssemblyTally()
         with caplog.at_level(logging.INFO):
-            filtered = run(self._keep)
+            filtered = run(self._keep, tally)
         lines_keep = self._progress_lines(caplog, label)
 
         assert filtered == [m for m in unfiltered if self._keep(m)]
+        # M9: the in-window records `keep` dropped, which the assembly never sees
+        dropped = len(unfiltered) - len(filtered)
+        assert tally == historical._AssemblyTally(
+            settled=dropped, rejected=dropped, duplicates=0)
         assert all(self._keep(m) for m in filtered)
         assert 0 < len(filtered) < len(unfiltered)
         assert lines_keep == lines_none == [
@@ -2674,10 +2732,98 @@ class TestSequentialFallbacksApplyKeep:
                              prefilter_tag="testpred")
         assert list(out_pref) == [m for m in out_full if self._keep(m)]
         assert 0 < len(out_pref) < len(out_full)
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
         assert {m["ticker"][0] for m in out_pref} == {"A", "L"}
         # The fixture really did take the fallback(s) it is parametrized for.
         assert ("Archive fetch: sharded path unavailable" in caplog.text) is opaque
         assert ("Live fetch: windowed path unavailable" in caplog.text) is ignore_max
+
+    @pytest.mark.parametrize("opaque, ignore_max", [
+        (False, False), (True, False), (False, True), (True, True),
+    ])
+    def test_a_frontier_that_rejects_records_is_counted_once_on_every_path(
+            self, tmp_path, monkeypatch, caplog, opaque, ignore_max):
+        # M9 end to end with a NON-EMPTY frontier. Every other end-to-end
+        # count test runs at the real "now", whose frontier day holds no
+        # fixture record, so the frontier's own rejections (its window's
+        # emitted count minus the spool's length) were pinned only at phase
+        # level. "Now" is pinned to 2026-09-21 12:00 UTC here: the 09-20
+        # records are a past day (walk A counts their rejections), the 09-21
+        # ones the frontier (its sink drops L006, L009 and L010 before the
+        # assembly sees them). With max_settled_ts ignored, the past day trips
+        # the live fallback AFTER the frontier has spooled — the ordering is
+        # forced below — so a frontier whose rejections were counted anyway
+        # would show 14 settled records instead of 11.
+        archive_markets = self._markets("A", "2026-09-17T06:00:00+00:00", n=12)
+        live_markets = self._markets("L", "2026-09-20T06:00:00+00:00", n=12,
+                                     step=180)
+        now_ts = self._ts("2026-09-21T12:00:00+00:00")
+        real_phase = historical._fetch_live_phase
+        monkeypatch.setattr(
+            historical, "_fetch_live_phase",
+            lambda client, lo, _now, keep=None, **kw: real_phase(
+                client, lo, now_ts, keep, **kw),
+        )
+        real_extend = historical._extend_kept
+        real_store = historical._fetch_and_store_live_window
+
+        def fetch(sub, **kwargs):
+            sink_dropped: list[int] = []
+            frontier_done = threading.Event()
+
+            def spy_extend(dest, keep, batch):
+                # The frontier's sink: record what it drops, then let the
+                # past-day windows run, so the fallback (when it fires) always
+                # discards a frontier that has already spooled its batch.
+                real_extend(dest, keep, batch)
+                sink_dropped.append(0 if keep is None
+                                    else sum(1 for m in batch if not keep(m)))
+                frontier_done.set()
+
+            def past_day_after_the_frontier(*args, **kw):
+                assert frontier_done.wait(timeout=30), "the frontier never emitted"
+                return real_store(*args, **kw)
+
+            monkeypatch.setattr(historical, "_extend_kept", spy_extend)
+            monkeypatch.setattr(historical, "_fetch_and_store_live_window",
+                                past_day_after_the_frontier)
+            _install_sharded_fakes(
+                monkeypatch, tmp_path / sub,
+                _FakeArchive(archive_markets, page_size=2, opaque_cursors=opaque),
+                "2026-09-20T00:00:00Z",
+            )
+            out = historical.fetch_all_settled_markets(
+                MagicMock(),
+                _FakeLive(live_markets, page_size=2, ignore_max=ignore_max),
+                start_date=date(2026, 9, 17), use_cache=False, **kwargs,
+            )
+            return out, sink_dropped
+
+        with caplog.at_level(logging.INFO):
+            out_full, dropped_full = fetch("full")
+        full_text = caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            out_pref, dropped_pref = fetch("pref", prefilter=self._keep,
+                                           prefilter_tag="testpred")
+        pref_text = caplog.text
+
+        # The frontier really held records, and the prefilter really dropped
+        # three of them in its sink (L007, voided, never reaches it).
+        assert dropped_full == [0] and dropped_pref == [3]
+        assert list(out_pref) == [m for m in out_full if self._keep(m)]
+        _assert_counts_cover_the_prefilter(out_full, out_pref)
+        # Exact, per endpoint: 11 binary live records, 5 of them rejected —
+        # L000/L003 by walk A (past day, or the fallback's own walk) and
+        # L006/L009/L010 in the frontier's sink (or, on the fallback, the
+        # sequential walk that refetched the day). Counted once either way.
+        assert ("Live endpoint: 11 settled markets of 11 recently settled records "
+                "in the window (0 duplicate or blank tickers)") in full_text
+        assert ("Live endpoint: 6 eligible markets of 11 recently settled records "
+                "in the window (5 rejected by the prefilter testpred, 0 duplicate "
+                "or blank tickers)") in pref_text
+        assert ("Live fetch: windowed path unavailable" in pref_text) is ignore_max
+        assert ("Archive fetch: sharded path unavailable" in pref_text) is opaque
 
 
 class TestJsonCacheDurability:
@@ -3434,6 +3580,406 @@ class TestEventTitlesReturnsMergedView:
         assert "1 of this run's tickers answered from the accumulator" in caplog.text
 
 
+class TestEventTitleAccumulatorBound:
+    """
+    DR-51 / DR-42: the event-title accumulator stores genuine answers only.
+
+    Before DR-51 every ticker the per-ticker fallback's cap skipped was stored
+    as "" — tickers nobody ever looked up — so one fresh 7-day run
+    (2026-09-24) grew backtest_cache/event_titles.json from 3,996,906 to
+    7,986,570 keys, 7,918,449 of them KXMVE combo tickers mapped to "", and
+    every later fetch parsed the whole file and held two full copies of it.
+    The one sorted cap also spent its 5,000 lookups on whatever sorted first,
+    so a non-combo event sorting after "KXMVE" was skipped along with millions
+    of combos. And the closing summary counted the whole seeded accumulator as
+    "this run" (DR-42). These tests pin what replaced all of it: deferred
+    tickers are not stored, a genuine failure still is, the cap goes to
+    non-combo tickers first, lookups are paced, the accumulator is merged in
+    place and rewritten only when it changed, the summary counts this call, and
+    the legacy file is migrated exactly once.
+    """
+
+    @staticmethod
+    def _combo(n: int) -> str:
+        return f"KXMVECROSSCATEGORY-SHARD1-S{n:04d}"
+
+    def test_deferred_tickers_are_not_stored_and_a_later_run_takes_the_next_slice(
+        self, isolated_cache, monkeypatch,
+    ):
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        wanted = {f"E{i:02d}" for i in range(7)}
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+
+        historical._load_or_build_event_titles(client, wanted)
+        assert set(json.loads(isolated_cache.read_text())) == {"E00", "E01", "E02"}
+
+        # The deferred four are unknown, not pilled, so the next run looks
+        # them up — the sorted cap reaching the next slice.
+        second = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), wanted,
+        )
+        assert fallback.call_count == 6
+        assert set(json.loads(isolated_cache.read_text())) == {
+            "E00", "E01", "E02", "E03", "E04", "E05",
+        }
+        assert second["E05"] == "Title E05" and second["E06"] == ""
+
+    def test_a_genuine_failure_is_still_stored_beside_deferred_tickers(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: only the never-looked-up tickers lose their pill. A lookup
+        # that was made and FAILED is a genuine answer and is stored, so it is
+        # not re-paid every run.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 2)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"E00": "Title E00"},
+            single_failures={"E01"},
+        )
+        historical._load_or_build_event_titles(client, {"E00", "E01", "E02"})
+        assert json.loads(isolated_cache.read_text()) == {
+            "E00": "Title E00", "E01": "",
+        }
+
+    def test_over_the_cap_the_lookups_go_to_non_combo_tickers(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # M5 on the 2026-09-24 run: one sorted list spent the whole cap on the
+        # tickers before "KXMVE" plus the head of the combo block, so
+        # KXNFLEVERYWEEKCOMPETE-27 (sorting after it) was skipped and its 34
+        # markets went untitled. Non-combo tickers now take the cap first, and
+        # combos — whose titles have no measured effect on pairing — are
+        # deferred whole, under every KXMVE* prefix (scanner.event_series).
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        combos = {self._combo(i) for i in range(4)} | {
+            "KXMVESPORTSMULTIGAMEEXTENDED-SHARD1-S0001",
+        }
+        non_combo = {"AAA-26", "KXNFLEVERYWEEKCOMPETE-27", "KXPRIMARYTURNOUT-26"}
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        looked_up: list[str] = []
+
+        def fake_signed_get(_client, path, **_params):
+            tkr = path.rsplit("/", 1)[-1]
+            looked_up.append(tkr)
+            return _raw_resp({"event": {"title": f"Title {tkr}"}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=fake_signed_get))
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, combos | non_combo)
+
+        assert sorted(looked_up) == sorted(non_combo)
+        assert all(result[t] == f"Title {t}" for t in non_combo)
+        assert all(result[t] == "" for t in combos)
+        # Every non-combo fit, so nothing pairing-relevant was lost: INFO, not
+        # WARNING — a line that fires on every bulk window must not warn.
+        assert "deferring the 5 combo (KXMVE-family) tickers" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # And no combo was stored.
+        assert set(json.loads(isolated_cache.read_text())) == non_combo
+
+    def test_under_the_cap_every_ticker_is_looked_up_combos_included(
+        self, isolated_cache, monkeypatch,
+    ):
+        # GUARD: the combo deferral applies only when the miss set does not
+        # fit. Under the cap nothing changes from before DR-51.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 10)
+        wanted = {self._combo(i) for i in range(3)} | {"AAA-26", "ZZZ-26"}
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        fallback = _patch_single_event_lookups(
+            monkeypatch, single_lookups={t: f"Title {t}" for t in wanted},
+        )
+        result = historical._load_or_build_event_titles(client, wanted)
+        assert fallback.call_count == 5
+        assert result == {t: f"Title {t}" for t in wanted}
+
+    def test_every_lookup_is_paced_success_or_failure(self, isolated_cache, monkeypatch):
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS",
+                            0.125)
+        sleeps: list[float] = []
+        monkeypatch.setattr(historical.time, "sleep", sleeps.append)
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"E1": "One", "E2": "Two", "E3": "Three"},
+            single_failures={"E4"},
+        )
+        historical._load_or_build_event_titles(client, {"E1", "E2", "E3", "E4"})
+        assert sleeps == [0.125] * 4
+
+    def test_the_summary_counts_this_call_with_the_cache_on(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # DR-42: with use_cache on, the old line reported the whole seeded
+        # accumulator as "N this run" (7,986,570 on the 2026-09-24 run, which
+        # resolved at most ~7,525) and "0 answered from the accumulator" by
+        # construction. The five counts now partition the request.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 2)
+        isolated_cache.write_text(json.dumps(
+            {"D1": "Disk Title", "D2": "", "OTHER": "Unrelated"}))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(
+            monkeypatch, single_lookups={"N1": "Looked Up"},
+            single_failures={"N2"},
+        )
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(
+                client, {"D1", "D2", "L1", "N1", "N2", "N3"})
+
+        assert result == {"D1": "Disk Title", "D2": "", "L1": "Listed Title",
+                          "N1": "Looked Up", "N2": "", "N3": ""}
+        assert (
+            "Event titles for 6 requested tickers: 2 resolved by this run (1 from "
+            "the bulk listings, 1 from per-ticker lookups), 1 of this run's "
+            "tickers answered from the accumulator, 3 untitled (2 recorded as "
+            "unresolvable, 1 deferred and not stored). Accumulator: 3 -> 6 "
+            "entries."
+        ) in caplog.text
+
+    def test_the_accumulator_is_merged_in_place_not_copied(
+        self, isolated_cache, monkeypatch,
+    ):
+        # The old code held the parsed file, a full seed copy and a full merge
+        # copy at once — the title phase's peak on a fresh fetch. The object
+        # loaded must be the object saved.
+        isolated_cache.write_text("{}")
+        loaded = {"D1": "Disk Title"}
+        monkeypatch.setattr(historical, "_read_title_file",
+                            lambda _path: (loaded, historical._TITLE_FILE_OK, ""))
+        saved: list = []
+        monkeypatch.setattr(historical, "_save_json_cache",
+                            lambda path, data: saved.append((path, data)))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+
+        historical._load_or_build_event_titles(client, {"D1", "L1"})
+
+        assert len(saved) == 1
+        assert saved[0][0] == isolated_cache
+        assert saved[0][1] is loaded
+        assert loaded == {"D1": "Disk Title", "L1": "Listed Title"}
+
+    def test_an_unchanged_accumulator_is_not_rewritten(self, isolated_cache, monkeypatch):
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title", "D2": ""}))
+        saves: list = []
+        monkeypatch.setattr(historical, "_save_json_cache",
+                            lambda path, data: saves.append(path))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        result = historical._load_or_build_event_titles(client, {"D1", "D2"})
+        assert result == {"D1": "Disk Title", "D2": ""}
+        assert saves == []
+
+    def test_an_empty_request_reads_nothing(self, isolated_cache, monkeypatch):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        assert historical._load_or_build_event_titles(client, set()) == {}
+        assert legacy.exists() and not isolated_cache.exists()
+
+    def test_the_legacy_file_is_migrated_once_keeping_exactly_its_titles(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({
+            "A": "Title A", "B": "", self._combo(1): "", "D": "Title D", "E": 5,
+        }))
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("B", "Title B")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, {"A", "B"})
+
+        # A legacy "" is dropped, so B is unknown again and re-resolved.
+        assert result == {"A": "Title A", "B": "Title B"}
+        assert json.loads(isolated_cache.read_text()) == {
+            "A": "Title A", "D": "Title D", "B": "Title B",
+        }
+        assert not legacy.exists()
+        assert "keeping its 2 titled entries and dropping the other 3" in caplog.text
+
+        # Once the v2 file exists the legacy file is never read again, even if
+        # an older build writes one back.
+        legacy.write_text(json.dumps({"Z": "Legacy Z"}))
+        fallback = _patch_single_event_lookups(monkeypatch, single_failures={"Z"})
+        again = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), {"Z"})
+        assert again == {"Z": ""}
+        assert fallback.call_count == 1
+        assert legacy.exists()
+
+    def test_a_migration_whose_run_resolves_nothing_still_commits(
+        self, isolated_cache, monkeypatch,
+    ):
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        assert historical._load_or_build_event_titles(client, {"A"}) == {"A": "Title A"}
+        assert client.get_events_without_preload_content.call_count == 0
+        assert json.loads(isolated_cache.read_text()) == {"A": "Title A"}
+        assert not legacy.exists()
+
+    def test_a_legacy_file_with_bad_content_is_left_in_place(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # Content that is not a JSON object will not heal, so the migration
+        # gives up: the v2 file is written as the marker (or every run would
+        # re-read the whole damaged file and store nothing), the legacy file is
+        # kept for inspection, and the WARNING names the way back.
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text('{"A": "Half A Titl')
+        client = _make_client_with_event_pages(non_mve_pages=[], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch, single_failures={"A"})
+        with caplog.at_level(logging.WARNING):
+            assert historical._load_or_build_event_titles(client, {"A"}) == {"A": ""}
+        assert "could not be read as a JSON object" in caplog.text
+        assert "delete " + str(isolated_cache) + " and re-run" in caplog.text
+        # Nothing of it was destroyed, and the v2 file now exists as the marker.
+        assert legacy.read_text() == '{"A": "Half A Titl'
+        assert json.loads(isolated_cache.read_text()) == {"A": ""}
+
+    @staticmethod
+    def _unreadable(monkeypatch, path):
+        """Make reading `path` raise the OSError an offline iCloud file or a
+        permission error raises; every other file reads normally."""
+        real_read_text = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        return lambda: monkeypatch.setattr(Path, "read_text", real_read_text)
+
+    def test_a_legacy_file_that_cannot_be_read_defers_the_migration(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: a READ failure (an OSError) used to be folded into "not a
+        # JSON object", so the v2 marker was written with this run's answers
+        # alone and the legacy titles were abandoned for good. Now nothing is
+        # written, and the next readable run migrates.
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"A": "Title A", "B": ""}))
+        restore = self._unreadable(monkeypatch, legacy)
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("N", "Title N")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            result = historical._load_or_build_event_titles(client, {"A", "N"})
+        assert result == {"A": "", "N": "Title N"}
+        assert not isolated_cache.exists()
+        assert json.loads(legacy.read_bytes()) == {"A": "Title A", "B": ""}
+        assert "the next run retries it" in caplog.text
+        assert "PermissionError" in caplog.text
+        assert "(NOT written: a file could not be read" in caplog.text
+
+        restore()
+        again = historical._load_or_build_event_titles(
+            _make_client_with_event_pages(non_mve_pages=[[("N", "Title N")]],
+                                          mve_pages=[]), {"A", "N"})
+        assert again == {"A": "Title A", "N": "Title N"}
+        assert json.loads(isolated_cache.read_text()) == {"A": "Title A", "N": "Title N"}
+        assert not legacy.exists()
+
+    def test_a_v2_file_that_cannot_be_read_is_not_overwritten(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # Same rule for the accumulator itself: the old code overwrote it with
+        # this run's answers alone, destroying every title it could not see.
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title"}))
+        before = isolated_cache.read_bytes()
+        self._unreadable(monkeypatch, isolated_cache)
+        client = _make_client_with_event_pages(
+            non_mve_pages=[[("L1", "Listed Title")]], mve_pages=[])
+        _patch_single_event_lookups(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            result = historical._load_or_build_event_titles(client, {"D1", "L1"})
+        assert result == {"D1": "", "L1": "Listed Title"}
+        assert isolated_cache.read_bytes() == before
+        assert "the next run reads it again" in caplog.text
+
+    def test_a_legacy_file_beside_the_v2_file_is_named_every_call_and_kept(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: a legacy file that outlives the migration (a failed or
+        # interrupted delete, or an older build writing it back) was ignored
+        # in silence forever. It is still never read and never deleted — it
+        # may be that older build's live accumulator — but every call names it.
+        isolated_cache.write_text(json.dumps({"D1": "Disk Title"}))
+        legacy = isolated_cache.with_name("event_titles.json")
+        legacy.write_text(json.dumps({"Z": "Legacy Z"}))
+        _patch_single_event_lookups(monkeypatch, single_failures={"Z"})
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                result = historical._load_or_build_event_titles(
+                    _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]),
+                    {"D1", "Z"})
+            assert result == {"D1": "Disk Title", "Z": ""}
+            warned = [r.getMessage() for r in caplog.records
+                      if "sits beside event_titles_v2.json" in r.getMessage()]
+            assert len(warned) == 1 and str(legacy) in warned[0]
+            assert json.loads(legacy.read_text()) == {"Z": "Legacy Z"}
+
+        # And no warning at all once it is gone.
+        legacy.unlink()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            historical._load_or_build_event_titles(
+                _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]), {"D1"})
+        assert "sits beside" not in caplog.text
+
+    def test_repeated_no_cache_runs_advance_through_the_deferred_tail(
+        self, isolated_cache, monkeypatch, caplog,
+    ):
+        # P1 review: under use_cache=False every requested ticker is
+        # re-resolved, so a plainly sorted cap looked up the same head on every
+        # --no-cache run and never reached the tail. Tickers the accumulator
+        # has never answered now take the cap first, then its stored pills
+        # (A00 sorts first but was already looked up and failed), then the
+        # tickers it already titles.
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_MAX_LOOKUPS", 3)
+        isolated_cache.write_text(json.dumps({"A00": ""}))
+        wanted = {f"E{i:02d}" for i in range(7)} | {"A00"}
+        looked_up: list[list[str]] = []
+
+        def fake_signed_get(_client, path, **_params):
+            looked_up[-1].append(path.rsplit("/", 1)[-1])
+            return _raw_resp({"event": {"title": "Title " + path.rsplit("/", 1)[-1]}})
+
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(side_effect=fake_signed_get))
+        results = []
+        for _ in range(3):
+            looked_up.append([])
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                results.append(historical._load_or_build_event_titles(
+                    _make_client_with_event_pages(non_mve_pages=[], mve_pages=[]),
+                    wanted, use_cache=False))
+        assert [sorted(batch) for batch in looked_up] == [
+            ["E00", "E01", "E02"], ["E03", "E04", "E05"], ["A00", "E00", "E06"],
+        ]
+        assert json.loads(isolated_cache.read_text()) == {t: f"Title {t}" for t in wanted}
+        # The third run deferred E01..E05, which the accumulator titles, so
+        # they keep their titles — the WARNING must not call them untitled.
+        assert results[2] == {t: f"Title {t}" for t in wanted}
+        assert "is not looked up this run" in caplog.text
+        assert "untitled THIS run" not in caplog.text
+
+    def test_the_suite_never_reaches_the_real_accumulator(self, tmp_path):
+        # tests/conftest.py's autouse guard: a test that reaches the real
+        # function through fetch_all_settled_markets must not read, migrate or
+        # delete the operator's real backtest_cache files.
+        assert tmp_path in historical._EVENT_TITLES_CACHE.parents
+        assert tmp_path in historical._LEGACY_EVENT_TITLES_CACHE.parents
+
+
 # ─── SS-1 Commit C: the streamed assembly and the streamed assembled cache ────
 #
 # A 7-day backtest (--start-date 2026-09-17) could not fit on a 16 GB host:
@@ -3544,6 +4090,61 @@ def _old_assembly(day_records, tail_records, live_records, start_ts, cutoff_ts,
         for m in all_markets:
             m["event_title"] = titles.get(m.get("event_ticker") or "", "")
     return all_markets, archive_count, live_count, unique
+
+
+def _assert_counts_cover_the_prefilter(out_full, out_pref):
+    """M9's end-to-end invariant, for one fixture assembled twice.
+
+    `out_full` was assembled with no prefilter and `out_pref` with one, from
+    the same records. The records settled in the window are the same records
+    either way, so the two assemblies must report the same `settled` count —
+    whichever path fetched them and wherever the prefilter dropped them: a
+    rejection hidden from the count (the old read-back filter) makes it
+    smaller, and one counted twice (a discarded frontier beside the fallback
+    that refetches its day) makes it larger. Every market the prefilter cost
+    is rejected at least once, and each count keeps exactly its corpus.
+    """
+    full = out_full.provenance.assembly_counts
+    pref = out_pref.provenance.assembly_counts
+    assert full.settled == pref.settled
+    assert (full.rejected, full.kept) == (0, len(out_full))
+    assert pref.kept == len(out_pref)
+    assert pref.rejected >= len(out_full) - len(out_pref) > 0
+
+
+def _old_assembly_counts(endpoints, start_ts, prefilter):
+    """The old merge's walk, counting instead of keeping (M9's oracle).
+
+    `endpoints` is one [(records, max_settle)] source list per endpoint, in
+    merge order; the ticker dedup spans all of them, as the old merge's one
+    `selected` dict did. Every record whose settlement lies in
+    [start_ts, max_settle) is SETTLED; of those, the ones the prefilter
+    refuses are REJECTED, and the ones that pass but whose ticker is blank or
+    already kept are DUPLICATES. Returns one historical.AssemblyCounts per
+    endpoint.
+    """
+    seen: set = set()
+    out = []
+    for sources in endpoints:
+        settled = rejected = duplicates = 0
+        for records, max_settle in sources:
+            for m in records:
+                settle = historical._iso_epoch(m.get("settlement_ts"))
+                if settle is None or settle < start_ts:
+                    continue
+                if max_settle is not None and settle >= max_settle:
+                    continue
+                settled += 1
+                if prefilter is not None and not prefilter(m):
+                    rejected += 1
+                    continue
+                ticker = m.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                else:
+                    duplicates += 1
+        out.append(historical.AssemblyCounts(settled, rejected, duplicates))
+    return out
 
 
 def _mapped_titles(tickers):
@@ -4126,13 +4727,16 @@ class TestStreamedAssemblyParity:
                 for lo, recs in zip(los, days, strict=True):
                     _write_jsonl(historical._day_store_path(store, lo), meta, recs)
             # Handed over oldest first, as pool completion order may; the
-            # stream sorts newest first itself.
+            # stream sorts newest first itself. UNFILTERED, as the phases hand
+            # their day slices over since M9; only the frontier is filtered
+            # where it is fetched (this fixture's frontier has nothing the
+            # prefilter rejects, so no fetch-time count is lost by stubbing
+            # the phase here).
             day_src = historical._assemble_day_slices(
-                "archive_days", sorted(archive_los), meta_a, prefilter)
+                "archive_days", sorted(archive_los), meta_a)
             live_src = historical._RecordChain(
                 [m for m in frontier if prefilter is None or prefilter(m)],
-                historical._assemble_day_slices("live_days", sorted(live_los), meta_l,
-                                                prefilter))
+                historical._assemble_day_slices("live_days", sorted(live_los), meta_l))
         monkeypatch.setattr(historical, "_fetch_archive_phase",
                             lambda *a, **k: (day_src, tail))
         monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: live_src)
@@ -4175,14 +4779,48 @@ class TestStreamedAssemblyParity:
         assert len(out) == len(expected)
         assert asked == [unique]               # titles resolved for the same set
 
+        # M9: every count line reports the settled records beside the kept
+        # ones, split into what the prefilter and the dedup removed.
+        archive_counts, live_counts = _old_assembly_counts(
+            [[(newer_day + older_day, cutoff_ts), (tail, cutoff_ts)],
+             [(frontier + live_newer + live_older, None)]], start_ts, prefilter)
+        total = historical._total_counts(archive_counts, live_counts)
+        # Not vacuous: the fixture's numbers, worked by hand. The settled
+        # counts do not depend on the prefilter; the kept ones match the
+        # old merge's.
+        if use_prefilter:
+            assert (archive_counts, live_counts) == (
+                historical.AssemblyCounts(13, 2, 4), historical.AssemblyCounts(8, 1, 2))
+        else:
+            assert (archive_counts, live_counts) == (
+                historical.AssemblyCounts(13, 0, 5), historical.AssemblyCounts(8, 0, 3))
+        assert (archive_counts.kept, live_counts.kept, total.kept) == (
+            archive_count, live_count, len(expected))
+
+        def said(counts):
+            dup = f"{counts.duplicates} duplicate or blank tickers"
+            return (f"{counts.rejected} rejected by the prefilter t, {dup}"
+                    if use_prefilter else dup)
+
+        noun = "eligible markets" if use_prefilter else "settled markets"
         messages = [r.getMessage() for r in caplog.records]
-        lines = [f"Historical endpoint: {archive_count} markets from 2026-06-05",
+        lines = [f"Historical endpoint: {archive_count} {noun} of "
+                 f"{archive_counts.settled} records settled in the window before "
+                 f"the archive cutoff ({said(archive_counts)})",
                  "Fetching recently settled markets (after API cutoff)...",
-                 f"Live endpoint: {live_count} recently settled markets",
+                 f"Live endpoint: {live_count} {noun} of {live_counts.settled} "
+                 f"recently settled records in the window ({said(live_counts)})",
                  f"Resolving event titles for {len(unique)} unique event_tickers",
-                 f"Total settled markets from 2026-06-05: {len(expected)}"]
+                 f"Assembled {len(expected)} {noun} of {total.settled} records "
+                 f"settled since 2026-06-05 ({said(total)})"]
         positions = [messages.index(line) for line in lines]
         assert positions == sorted(positions)
+        # ...and the total rides the corpus out, and into the cache's meta.
+        assert out.provenance.assembly_counts == total
+        with gzip.open(out.path, "rt", encoding="utf-8") as fh:
+            assert json.loads(fh.readline())["meta"]["assembly_counts"] == {
+                "settled": total.settled, "rejected": total.rejected,
+                "duplicates": total.duplicates}
 
         # Not vacuous: every rule in the fixture actually decided something.
         by_ticker = {m["ticker"]: m for m in expected}
@@ -4358,7 +4996,10 @@ class TestStreamedAssembledCache:
         (tmp_path / "cache" / "settled_markets_2026-06-05.json").write_text(json.dumps(legacy))
         with caplog.at_level(logging.INFO):
             out, live = self._again(live_markets)
-        assert type(out) is list and out == legacy
+        # Served whole, as a list: since P2 a LegacySettledCorpus, the list
+        # subclass that only adds the file time as provenance (DR-13).
+        assert isinstance(out, list) and type(out) is historical.LegacySettledCorpus
+        assert not isinstance(out, historical.SettledCorpus) and out == legacy
         assert archive.calls == 0 and live.calls == 0
         assert "Loaded 2 settled markets from cache" in caplog.text
         assert not list((tmp_path / "cache").glob("*.jsonl.gz"))  # a hit writes nothing
@@ -4394,8 +5035,9 @@ class TestStreamedAssembledCache:
         # SS-1 review: a legacy .json of the same identity used to outlive the
         # rebuild that superseded it and come back whenever the .jsonl.gz was
         # damaged (after a WARNING claiming a cache miss) or missing (silently)
-        # — including the way iCloud has already reverted a committed rename in
-        # this repo. The stale corpus must never be served.
+        # — including the way iCloud reverted a committed rename while this repo
+        # lived in iCloud-synced ~/Documents (until 2026-09-24). The stale
+        # corpus must never be served.
         stale = [{"ticker": "STALE1"}, {"ticker": "STALE2"}]
         (tmp_path / "cache").mkdir(parents=True)
         legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
@@ -4499,6 +5141,495 @@ class TestStreamedAssembledCache:
         out.path.unlink()
         with pytest.raises(historical.SettledCorpusError, match="Re-run"):
             list(out)
+
+
+class _NoNetwork:
+    """A client that fails the test on ANY attribute access — a stronger zero-
+    network pin than counting the calls one fake happens to serve."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"a cache hit touched the network client ({name})")
+
+
+def _forbid_network(monkeypatch):
+    """Make every network path of fetch_all_settled_markets fail the test:
+    the signed raw GET (the cutoff read and the archive walk) and event-title
+    resolution. Clients passed in should be _NoNetwork()."""
+    def signed(*_a, **_k):
+        raise AssertionError("a cache hit issued a signed GET")
+
+    def titles(*_a, **_k):
+        raise AssertionError("a cache hit resolved event titles")
+
+    monkeypatch.setattr(historical, "_signed_raw_get", signed)
+    monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+
+
+class TestCorpusProvenance:
+    """DR-13 and M2/M3 of the 2026-09-24 7-day-run review. A cache hit used to
+    log one "Loaded N" line and return: nothing said the corpus stops at its
+    assembly while the window runs to today, the post-cutoff "structurally
+    0-trade" WARNING — logged only after the cutoff read, which a hit never
+    reaches — vanished from every cached re-run, and an EMPTY cache was a
+    permanent hit. Now the archive cutoff is stamped into the streamed cache
+    (informational, never part of its identity), every hit announces what it
+    covers and repeats the verdict "as of assembly" with ZERO network calls,
+    and an empty cache is served only while younger than
+    EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS."""
+
+    PRE = date(2026, 6, 5)     # before TestShardedFetch.CUTOFF (2026-06-10)
+    POST = date(2026, 6, 10)   # exactly on it: at-or-after is post-cutoff
+    CUTOFF_DT = datetime(2026, 6, 10, tzinfo=UTC)
+
+    def _fetch(self, tmp_path, monkeypatch, start):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
+        out = historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=start, use_cache=False)
+        return out, archive, live_markets
+
+    @staticmethod
+    def _hit(start):
+        return historical.fetch_all_settled_markets(
+            _NoNetwork(), _NoNetwork(), start_date=start, use_cache=True)
+
+    @staticmethod
+    def _meta_of(path):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            return json.loads(fh.readline())["meta"]
+
+    # ── the stamp and the fresh provenance ────────────────────────────────
+
+    def test_a_fresh_assembly_stamps_the_cutoff_and_carries_its_provenance(
+            self, tmp_path, monkeypatch):
+        before = datetime.now(UTC)
+        out, _, _ = self._fetch(tmp_path, monkeypatch, self.PRE)
+        after = datetime.now(UTC)
+        meta = self._meta_of(out.path)
+        assert meta["archive_cutoff_ts"] == int(self.CUTOFF_DT.timestamp())
+        assert before <= datetime.fromisoformat(meta["assembled_at"]) <= after
+        prov = out.provenance
+        # M9: the assembly's counts ride along too — with no prefilter nothing
+        # is rejected, and the counts keep exactly the corpus's records
+        counts = prov.assembly_counts
+        assert counts is not None and counts.rejected == 0
+        assert counts.kept == len(out) and counts.settled >= len(out)
+        assert meta["assembly_counts"] == {
+            "settled": counts.settled, "rejected": 0, "duplicates": counts.duplicates}
+        assert prov == historical.CorpusProvenance(
+            from_cache=False, assembled_at=datetime.fromisoformat(meta["assembled_at"]),
+            archive_cutoff=self.CUTOFF_DT, post_cutoff=False, assembly_counts=counts)
+
+    def test_the_stamp_is_informational_not_identity(self, tmp_path, monkeypatch):
+        # A file whose informational keys differ from anything this run would
+        # write is still served — they describe WHEN, not WHICH request.
+        out, _, _ = self._fetch(tmp_path, monkeypatch, self.PRE)
+        records = list(out)
+        meta = {**historical._assembled_cache_meta(self.PRE, None),
+                "assembled_at": "2026-06-20T08:00:00+00:00",
+                "archive_cutoff_ts": int(datetime(2026, 5, 1, tzinfo=UTC).timestamp())}
+        _write_jsonl(out.path, meta, records)
+        _forbid_network(monkeypatch)
+        hit = self._hit(self.PRE)
+        assert list(hit) == records
+        assert hit.provenance.archive_cutoff == datetime(2026, 5, 1, tzinfo=UTC)
+        assert hit.provenance.assembled_at == datetime(2026, 6, 20, 8, tzinfo=UTC)
+
+    # ── the hit announcement ──────────────────────────────────────────────
+
+    def test_a_hit_announces_what_it_covers_with_zero_network_calls(
+            self, tmp_path, monkeypatch, caplog):
+        out, _, _ = self._fetch(tmp_path, monkeypatch, self.PRE)
+        fresh = out.provenance
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit(self.PRE)
+        assert list(hit) == list(out)
+        # The same meta block, read back: identical facts, flagged as cached.
+        assert hit.provenance == historical.CorpusProvenance(
+            from_cache=True, assembled_at=fresh.assembled_at,
+            archive_cutoff=fresh.archive_cutoff, post_cutoff=False,
+            assembly_counts=fresh.assembly_counts)
+        text = caplog.text
+        assert f"Loaded {len(out)} settled markets from cache" in text
+        # ...with the assembly's counts, as of assembly (M9)
+        counts = fresh.assembly_counts
+        assert (f"Loaded {len(out)} settled markets from cache — as assembled, of "
+                f"{counts.settled} records settled since {self.PRE} "
+                f"({counts.duplicates} duplicate or blank tickers)") in text
+        assert (f"Assembled cache {out.path.name} was assembled at "
+                f"{fresh.assembled_at:%Y-%m-%d %H:%M UTC}") in text
+        assert "holds no market settled after that moment" in text
+        assert "the window nominally runs to today" in text
+        assert "archive cutoff at assembly: 2026-06-10" in text
+        assert "Pass --no-cache to extend it" in text
+        # The remedy is priced honestly (P2 review): a re-assembly that reuses
+        # only still-valid day slices, plus a candlestick and title refetch —
+        # never "mainly the current day".
+        assert "re-assembles the whole corpus" in text
+        assert "archive day slice goes stale whenever the archive cutoff advances" in text
+        assert "re-fetches every pair's candlesticks and re-resolves event titles" in text
+        assert "close to a full fetch" in text
+        assert "mainly the current day" not in text
+        # A pre-cutoff window's hit repeats no post-cutoff WARNING.
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_a_post_cutoff_hit_repeats_the_warning_as_of_assembly_with_zero_network_calls(
+            self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING):
+            out, _, _ = self._fetch(tmp_path, monkeypatch, self.POST)
+        # The miss path's WARNING is unchanged, word for word.
+        miss = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+                and "archive cutoff" in r.getMessage()]
+        assert miss == ["start_date (2026-06-10) is at or after the archive cutoff "
+                        "(2026-06-10) — post-cutoff markets 404 on the historical "
+                        "candlesticks endpoint, so this window is structurally 0-trade"]
+        assert out.provenance.post_cutoff is True
+
+        caplog.clear()
+        _forbid_network(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            hit = self._hit(self.POST)
+        assert hit.provenance.post_cutoff is True and hit.provenance.from_cache is True
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warned) == 1
+        assert "start_date (2026-06-10) is at or after the archive cutoff (2026-06-10)" \
+            in warned[0]
+        assert "as of this cached corpus's assembly" in warned[0]
+        assert "structurally 0-trade unless the cutoff has since moved" in warned[0]
+        assert "pass --no-cache to re-check it" in warned[0]
+
+    def test_a_cache_written_before_the_stamp_is_served_and_says_so(
+            self, tmp_path, monkeypatch, caplog):
+        # The real 2026-09-17 cache on disk carries assembled_at but no
+        # archive_cutoff_ts: it must still hit, with an unknown verdict — and
+        # no post-cutoff WARNING can be claimed without a network read.
+        out, _, _ = self._fetch(tmp_path, monkeypatch, self.POST)
+        records = list(out)
+        _write_jsonl(out.path, {**historical._assembled_cache_meta(self.POST, None),
+                                "assembled_at": "2026-06-11T09:30:00+00:00"}, records)
+        _forbid_network(monkeypatch)
+        caplog.clear()  # the fresh fetch above logged the miss path's WARNING
+        with caplog.at_level(logging.INFO):
+            hit = self._hit(self.POST)
+        assert list(hit) == records
+        assert hit.provenance == historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 6, 11, 9, 30, tzinfo=UTC),
+            archive_cutoff=None, post_cutoff=None)
+        assert "the archive cutoff was not recorded when it was assembled" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_a_legacy_hit_names_its_file_time_and_carries_it_as_provenance(
+            self, tmp_path, monkeypatch, caplog):
+        # Seven of the eight assembled caches on disk on 2026-09-24 were
+        # legacy files: their file time must reach the page, not only the log
+        # (P2 review, DR-66) — so the list comes back as a LegacySettledCorpus.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        (tmp_path / "cache").mkdir(parents=True)
+        legacy = tmp_path / "cache" / "settled_markets_2026-06-10.json"
+        legacy.write_text(json.dumps([{"ticker": "OLD1"}]))
+        written = datetime(2026, 6, 12, 7, 45, tzinfo=UTC)
+        os.utime(legacy, (written.timestamp(), written.timestamp()))
+        _forbid_network(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            out = self._hit(self.POST)
+        assert type(out) is historical.LegacySettledCorpus
+        assert out == [{"ticker": "OLD1"}] and len(out) == 1
+        assert out.provenance == historical.CorpusProvenance(
+            from_cache=True, assembled_at=written, archive_cutoff=None,
+            post_cutoff=None, legacy=True)
+        assert ("Legacy assembled cache settled_markets_2026-06-10.json was last "
+                "written at 2026-06-12 07:45 UTC") in caplog.text
+        assert "its file time" in caplog.text
+        assert "the legacy format records no archive cutoff" in caplog.text
+        assert "(and rebuild it in the streamed format)" in caplog.text
+        # No cutoff was recorded, so no verdict is claimed on a legacy hit.
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_a_legacy_file_that_is_not_a_list_is_returned_as_before(
+            self, tmp_path, monkeypatch):
+        # Only a list is wrapped: whatever else a damaged legacy file holds is
+        # handed back exactly as before P2, untouched.
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        (tmp_path / "cache").mkdir(parents=True)
+        (tmp_path / "cache" / "settled_markets_2026-06-10.json").write_text(
+            json.dumps({"ticker": "NOT-A-LIST"}))
+        _forbid_network(monkeypatch)
+        out = self._hit(self.POST)
+        assert type(out) is dict and out == {"ticker": "NOT-A-LIST"}
+
+    # ── an EMPTY assembled cache (DR-13's empty-cache rule) ───────────────
+
+    @pytest.mark.parametrize("age_s, served", [
+        (60, True),
+        (historical.EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS - 60, True),
+        (historical.EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS + 60, False),
+        (30 * 86_400, False),
+        (None, False),          # no readable assembly time: fail toward a miss
+        (-3_600, False),        # a future stamp is not "young" either
+    ])
+    def test_an_empty_streamed_cache_is_served_only_while_young(
+            self, tmp_path, monkeypatch, caplog, age_s, served):
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch, self.PRE)
+        fresh = list(out)
+        meta = historical._assembled_cache_meta(self.PRE, None)
+        if age_s is not None:
+            meta["assembled_at"] = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
+        _write_jsonl(out.path, meta, [])
+        archive.calls = 0
+        live = _FakeLive(live_markets)
+        with caplog.at_level(logging.WARNING):
+            again = historical.fetch_all_settled_markets(
+                MagicMock(), live, start_date=self.PRE, use_cache=True)
+        if served:
+            assert len(again) == 0 and list(again) == []
+            assert archive.calls == 0 and live.calls == 0
+            assert "is EMPTY" in caplog.text and "serving it" in caplog.text
+        else:
+            assert archive.calls > 0  # re-assembled from the API + day slices
+            assert list(again) == fresh
+            assert "is EMPTY and was assembled" in caplog.text
+            assert "treating it as a miss and re-assembling" in caplog.text
+
+    def test_an_empty_stale_streamed_cache_rebuilds_and_never_falls_through_to_legacy(
+            self, tmp_path, monkeypatch, caplog):
+        # P2 review (R4): the stale-empty branch is a miss that REBUILDS, like
+        # an invalid streamed cache — a legacy file of the same stem beside it
+        # is an older assembly and must not be served, and the rebuild's
+        # commit retires it.
+        out, archive, live_markets = self._fetch(tmp_path, monkeypatch, self.PRE)
+        fresh = list(out)
+        meta = {**historical._assembled_cache_meta(self.PRE, None),
+                "assembled_at": (datetime.now(UTC) - timedelta(days=30)).isoformat()}
+        _write_jsonl(out.path, meta, [])
+        legacy = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy.write_text(json.dumps([{"ticker": "LEG"}]))
+        archive.calls = 0
+        with caplog.at_level(logging.INFO):
+            again = historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=self.PRE,
+                use_cache=True)
+        assert isinstance(again, historical.SettledCorpus)
+        assert archive.calls > 0 and list(again) == fresh
+        assert "LEG" not in {m["ticker"] for m in again}
+        assert not legacy.exists()
+        assert "treating it as a miss and re-assembling" in caplog.text
+        assert "Removed the superseded legacy settled-market cache" in caplog.text
+
+    @pytest.mark.parametrize("age_s, served", [(3_600, True), (24 * 86_400, False)])
+    def test_an_empty_legacy_cache_is_served_only_while_young(
+            self, tmp_path, monkeypatch, caplog, age_s, served):
+        # The 2-byte "[]" settled_markets_2026-08-29_*.json on disk was last
+        # written 2026-09-01 00:16 UTC (its file time) and was still a hit on
+        # 2026-09-24, some 23 days later.
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
+        (tmp_path / "cache").mkdir(parents=True)
+        legacy = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy.write_text("[]")
+        stamp = datetime.now(UTC).timestamp() - age_s
+        os.utime(legacy, (stamp, stamp))
+        with caplog.at_level(logging.INFO):
+            out = historical.fetch_all_settled_markets(
+                MagicMock(), _FakeLive(live_markets), start_date=self.PRE,
+                use_cache=True)
+        if served:
+            assert type(out) is historical.LegacySettledCorpus and out == []
+            assert out.provenance.legacy is True and out.provenance.from_cache is True
+            assert archive.calls == 0
+            assert legacy.exists()
+        else:
+            assert archive.calls > 0
+            assert isinstance(out, historical.SettledCorpus) and len(out) > 0
+            # The rebuild supersedes the empty legacy file like any other.
+            assert not legacy.exists()
+            assert "Removed the superseded legacy settled-market cache" in caplog.text
+
+    # ── the derivation itself ─────────────────────────────────────────────
+
+    @pytest.mark.parametrize("meta, expected", [
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": 1_781_049_600},
+         (datetime(2026, 6, 10, tzinfo=UTC), True)),          # start == cutoff
+        ({"start_date": "2026-06-09", "archive_cutoff_ts": 1_781_049_600},
+         (datetime(2026, 6, 10, tzinfo=UTC), False)),         # a day before
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": 1_781_049_601},
+         (datetime(2026, 6, 10, 0, 0, 1, tzinfo=UTC), False)),  # a second later
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": True}, (None, None)),
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": "1781049600"}, (None, None)),
+        ({"start_date": "2026-06-10"}, (None, None)),
+        ({"start_date": "garbage", "archive_cutoff_ts": 1_781_049_600}, (None, None)),
+    ])
+    def test_the_verdict_derivation(self, meta, expected):
+        prov = historical._corpus_provenance(meta, from_cache=True)
+        assert (prov.archive_cutoff, prov.post_cutoff) == expected
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("2026-09-24T12:37:49.789667+00:00",
+         datetime(2026, 9, 24, 12, 37, 49, 789667, tzinfo=UTC)),
+        ("2026-09-24T05:37:49-07:00", datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC)),
+        ("2026-09-24T12:37:49", datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC)),
+        ("yesterday", None),
+        (1_790_000_000, None),
+        (None, None),
+    ])
+    def test_the_assembly_stamp_is_read_as_a_utc_instant(self, raw, expected):
+        assert historical._parse_assembled_at(raw) == expected
+
+
+class TestAssemblyCounts:
+    """M9 of the 2026-09-24 7-day-run review: the fetch's count lines counted
+    only prefilter SURVIVORS while calling them settled markets, and nothing
+    reported what the prefilter dropped. The assembly's first walk now counts
+    every record settled in the window and what the prefilter and the dedup
+    removed; the total is stamped into the assembled cache (informational,
+    never identity), read back on a hit, and quoted on the hit's count line —
+    which names its records "eligible markets" when a prefilter ran."""
+
+    START = date(2026, 6, 5)
+
+    @staticmethod
+    def _pred(m):
+        return not m["ticker"].endswith("1")
+
+    def _fetch(self, tmp_path, monkeypatch):
+        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
+        _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                               TestShardedFetch.CUTOFF)
+        return historical.fetch_all_settled_markets(
+            MagicMock(), _FakeLive(live_markets), start_date=self.START,
+            use_cache=False, prefilter=self._pred, prefilter_tag="t")
+
+    def _hit(self):
+        return historical.fetch_all_settled_markets(
+            _NoNetwork(), _NoNetwork(), start_date=self.START, use_cache=True,
+            prefilter=self._pred, prefilter_tag="t")
+
+    @staticmethod
+    def _rewrite_meta(path, **changes):
+        records = list(historical._day_store_iter(
+            path, historical._assembled_cache_meta(TestAssemblyCounts.START, "t")))
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            meta = json.loads(fh.readline())["meta"]
+        meta.update(changes)
+        meta = {k: v for k, v in meta.items() if v is not None}
+        _write_jsonl(path, meta, records)
+        return records
+
+    def test_a_prefiltered_fresh_fetch_logs_settled_beside_eligible(
+            self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            out = self._fetch(tmp_path, monkeypatch)
+        counts = out.provenance.assembly_counts
+        assert counts.kept == len(out) and counts.rejected > 0
+        messages = [r.getMessage() for r in caplog.records]
+        total = [m for m in messages if m.startswith("Assembled ")]
+        assert total == [
+            f"Assembled {len(out)} eligible markets of {counts.settled} records "
+            f"settled since {self.START} ({counts.rejected} rejected by the "
+            f"prefilter t, {counts.duplicates} duplicate or blank tickers)"]
+        # The endpoint lines name eligible markets too, and sum to the total.
+        hist = [m for m in messages if m.startswith("Historical endpoint: ")]
+        live = [m for m in messages if m.startswith("Live endpoint: ")]
+        assert len(hist) == len(live) == 1
+        assert " eligible markets of " in hist[0] and " eligible markets of " in live[0]
+        assert "rejected by the prefilter t" in hist[0] + live[0]
+        # The misstatements M9 names are gone: no line counts the survivors
+        # as "settled markets" any more.
+        assert not [m for m in messages if m.startswith("Total settled markets")
+                    or (m.startswith("Live endpoint: ")
+                        and "recently settled markets" in m)]
+
+    def test_a_prefiltered_hit_names_eligible_markets_and_quotes_the_counts(
+            self, tmp_path, monkeypatch, caplog):
+        out = self._fetch(tmp_path, monkeypatch)
+        fresh = out.provenance.assembly_counts
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == list(out)
+        assert hit.provenance.assembly_counts == fresh
+        assert (f"Loaded {len(out)} eligible markets from cache — as assembled, of "
+                f"{fresh.settled} records settled since {self.START} "
+                f"({fresh.rejected} rejected by the prefilter t, "
+                f"{fresh.duplicates} duplicate or blank tickers)") in caplog.text
+        assert "settled markets from cache" not in caplog.text
+
+    def test_a_cache_written_before_the_counts_says_it_records_none(
+            self, tmp_path, monkeypatch, caplog):
+        # The real 2026-09-17 cache on disk has no assembly_counts: served,
+        # with the line saying the counts are missing rather than implying
+        # that nothing was rejected.
+        out = self._fetch(tmp_path, monkeypatch)
+        records = self._rewrite_meta(out.path, assembly_counts=None)
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == records
+        assert hit.provenance.assembly_counts is None
+        assert (f"Loaded {len(records)} eligible markets from cache — the "
+                "prefilter t ran during its assembly, but this cache records no "
+                "count of the records it rejected") in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_counts_that_do_not_keep_the_corpus_are_dropped_loudly(
+            self, tmp_path, monkeypatch, caplog):
+        # A block whose counts keep a different number of records than the
+        # file holds describes some other assembly: served, counts dropped.
+        out = self._fetch(tmp_path, monkeypatch)
+        records = self._rewrite_meta(
+            out.path, assembly_counts={"settled": len(out) + 50, "rejected": 10,
+                                       "duplicates": 0})
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = self._hit()
+        assert list(hit) == records
+        assert hit.provenance.assembly_counts is None
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warned == [
+            f"Settled-market cache {out.path.name} records assembly counts that "
+            f"keep {len(out) + 40} records, but it holds {len(records)} — "
+            f"ignoring those counts"]
+        assert "records no count of the records it rejected" in caplog.text
+
+    def test_a_legacy_hit_under_a_prefilter_says_it_records_no_counts(
+            self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        (tmp_path / "cache").mkdir(parents=True)
+        (tmp_path / "cache" / f"settled_markets_{self.START}_t.json").write_text(
+            json.dumps([{"ticker": "OLD1"}]))
+        _forbid_network(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            out = self._hit()
+        assert out == [{"ticker": "OLD1"}]
+        assert out.provenance.assembly_counts is None
+        assert ("Loaded 1 eligible markets from cache — the prefilter t ran "
+                "during its assembly, but this cache records no count of the "
+                "records it rejected") in caplog.text
+
+    @pytest.mark.parametrize("raw", [
+        None, "12", [13, 2, 4], {"settled": 13, "rejected": 2},
+        {"settled": 13, "rejected": 2, "duplicates": True},
+        {"settled": 13, "rejected": -1, "duplicates": 4},
+        {"settled": 13, "rejected": 2.0, "duplicates": 4},
+        {"settled": 13, "rejected": "2", "duplicates": 4},
+        {"settled": 5, "rejected": 2, "duplicates": 4},
+    ])
+    def test_unreadable_counts_read_as_none(self, raw):
+        assert historical._parse_assembly_counts(raw) is None
+
+    def test_readable_counts_parse(self):
+        counts = historical._parse_assembly_counts(
+            {"settled": 13, "rejected": 2, "duplicates": 4, "extra": "ignored"})
+        assert counts == historical.AssemblyCounts(13, 2, 4)
+        assert counts.kept == 7
+        assert historical._parse_assembly_counts(
+            {"settled": 0, "rejected": 0, "duplicates": 0}).kept == 0
 
 
 class TestNothingIsMaterialized:
