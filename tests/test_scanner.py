@@ -1031,6 +1031,292 @@ class TestEventSeries:
         assert "same event ticker" not in caplog.text
 
 
+class TestSameTitleCloseGap:
+    """DR-74: identical wording on two DIFFERENT series is one question only
+    when both markets close at the same moment.
+
+    The one-series rule (DR-02/DR-54) is necessary but not sufficient. A men's
+    and a women's college basketball game between the same two schools
+    (KXNCAAMBGAME / KXNCAAWBGAME) share title, subtitle and event title on two
+    different series; so do the Champions League and La Liga fixtures of one
+    matchup. They close hours or days apart, and the 95% co-resolution prior
+    is false for them: on the 365-day backtest 17 of 21 trades were such M/W
+    pairs. scanner.closes_apart is the one definition of the gate, and
+    find_same_title_pairs reads it through _closes_apart, right after the
+    series test. Live close_time is the SCHEDULED close. Mirror:
+    test_backtester.py::TestSameTitleCloseGapBacktest.
+    """
+
+    _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
+    _REFUSAL = (
+        "Same-title candidates refused because the two markets close more than "
+        "60 minutes apart (two different games or instants, not one question "
+        "listed twice): "
+    )
+
+    @classmethod
+    def _wiu_markets(cls, *, womens_close=None):
+        # The real pair: KXNCAAMBGAME-26JAN13WIUEIU-WIU vs
+        # KXNCAAWBGAME-26JAN13WIUEIU-WIU — identical title, subtitle and event
+        # title on two series. Their SCHEDULED closes (what live reads) fall at
+        # 01:30Z and 23:00Z, 2.5 h apart, as checked on archived payloads; the
+        # calendar day here is the fixture's own.
+        mens = _mock_market(
+            ticker="KXNCAAMBGAME-26JAN13WIUEIU-WIU",
+            event_ticker="KXNCAAMBGAME-26JAN13WIUEIU",
+            title=cls._WIU_TITLE, subtitle="Western Illinois",
+            event_title="Western Illinois at Eastern Illinois",
+            yes_ask=0.40, no_ask=0.60,
+            close_time=datetime(2026, 1, 28, 1, 30, tzinfo=UTC),
+        )
+        womens = _mock_market(
+            ticker="KXNCAAWBGAME-26JAN13WIUEIU-WIU",
+            event_ticker="KXNCAAWBGAME-26JAN13WIUEIU",
+            title=cls._WIU_TITLE, subtitle="Western Illinois",
+            event_title="Western Illinois at Eastern Illinois",
+            yes_ask=0.25, no_ask=0.75,
+            close_time=womens_close or datetime(2026, 1, 27, 23, 0, tzinfo=UTC),
+        )
+        return mens, womens
+
+    @staticmethod
+    def _refusals(caplog) -> list[str]:
+        return [m for m in caplog.messages if "close more than" in m]
+
+    def test_mens_and_womens_game_are_refused_and_counted_once(self, caplog):
+        mens, womens = self._wiu_markets()
+        # The fixture is the shape the gate must catch: identical wording,
+        # two different series, so the one-series rule does NOT fire.
+        assert scanner._identical_wording(mens, womens) is True
+        assert scanner._same_series(mens, womens) is False
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([mens, womens]) == []
+        assert self._refusals(caplog) == [self._REFUSAL + "1"]
+
+    def test_the_same_game_pair_at_one_close_instant_forms(self):
+        # Positive control: move the women's game onto the men's close and
+        # nothing else — the pair forms, so the refusal above is the gate.
+        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        [pair] = find_same_title_pairs([mens, womens])
+        assert {pair.market_a.ticker, pair.market_b.ticker} == {mens.ticker, womens.ticker}
+
+    def test_champions_league_and_la_liga_fixtures_are_refused(self):
+        # Two competitions' fixtures of one matchup, ten days apart.
+        title = "Atletico Madrid vs Barcelona Winner?"
+        ucl = _mock_market(
+            ticker="KXUCLGAME-26OCT21ATMBAR-BAR", event_ticker="KXUCLGAME-26OCT21ATMBAR",
+            title=title, subtitle="Barcelona", event_title="Atletico Madrid vs Barcelona",
+            yes_ask=0.55, no_ask=0.45, close_time=datetime(2026, 10, 21, 21, tzinfo=UTC),
+        )
+        liga = _mock_market(
+            ticker="KXLALIGAGAME-26OCT31ATMBAR-BAR", event_ticker="KXLALIGAGAME-26OCT31ATMBAR",
+            title=title, subtitle="Barcelona", event_title="Atletico Madrid vs Barcelona",
+            yes_ask=0.40, no_ask=0.60, close_time=datetime(2026, 10, 31, 20, tzinfo=UTC),
+        )
+        assert scanner._same_series(ucl, liga) is False
+        assert find_same_title_pairs([ucl, liga]) == []
+
+    def test_weekly_and_monthly_listings_at_one_close_still_pair(self):
+        # The shape the same-title strategy was built for, and what the
+        # 365-day backtest's 3 surviving trades were: one Brent question listed
+        # by a weekly and a monthly series, both closing at 21:00Z the same
+        # day. (Series names here are stand-ins for the weekly and monthly
+        # Brent series.)
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        title = "Brent crude oil price on Sep 25, 2026?"
+        weekly = _mock_market(
+            ticker="KXBRENTW-26SEP25-T70", event_ticker="KXBRENTW-26SEP25",
+            title=title, subtitle="$70 or above", event_title="Brent crude oil price",
+            yes_ask=0.45, no_ask=0.55, close_time=close,
+        )
+        monthly = _mock_market(
+            ticker="KXBRENTMON-26SEP-T70", event_ticker="KXBRENTMON-26SEP",
+            title=title, subtitle="$70 or above", event_title="Brent crude oil price",
+            yes_ask=0.35, no_ask=0.65, close_time=close,
+        )
+        assert scanner._closes_apart(weekly, monthly) is False
+        assert len(find_same_title_pairs([weekly, monthly])) == 1
+
+    @pytest.mark.parametrize("gap_seconds,pairs", [
+        (0, 1),
+        (3_599, 1),
+        # Exactly the bound is NOT apart: the gate is a strict `>` (kills a
+        # `>=` mutant).
+        (3_600, 1),
+        (3_601, 0),
+    ])
+    def test_the_bound_is_one_hour_inclusive(self, gap_seconds, pairs):
+        assert config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS == 3_600
+        mens, womens = self._wiu_markets(
+            womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
+            - timedelta(seconds=gap_seconds),
+        )
+        assert len(find_same_title_pairs([mens, womens])) == pairs
+
+    def test_the_gate_reads_the_scanner_binding(self, monkeypatch, caplog):
+        # The finder reads scanner's by-value binding of the constant, so a
+        # test narrows the bound by patching THAT name (the precedent
+        # TIME_SERIES_SAME_EVENT_LADDERS set; patching config.* would be a
+        # silent no-op here). A 60 s bound admits 60 s and refuses 61 s, and
+        # the refusal line prints the patched bound (one minute — singular).
+        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
+        base = datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
+        mens, at_60 = self._wiu_markets(womens_close=base - timedelta(seconds=60))
+        assert len(find_same_title_pairs([mens, at_60])) == 1
+        mens, at_61 = self._wiu_markets(womens_close=base - timedelta(seconds=61))
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([mens, at_61]) == []
+        assert self._refusals(caplog) == [
+            self._REFUSAL.replace("60 minutes", "1 minute") + "1"
+        ]
+
+    def test_a_naive_and_an_aware_close_are_refused(self, caplog):
+        # Fail CLOSED: the two cannot be subtracted, so the pair cannot be
+        # shown to close at one moment — even though the wall-clock readings
+        # coincide.
+        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30))
+        assert womens.close_time.utcoffset() is None
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([mens, womens]) == []
+        assert self._refusals(caplog) == [self._REFUSAL + "1"]
+
+    def test_the_line_is_silent_at_zero(self, caplog):
+        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        with caplog.at_level(logging.INFO):
+            assert len(find_same_title_pairs([mens, womens])) == 1
+        assert self._refusals(caplog) == []
+
+    def test_the_line_avoids_the_absence_pinned_substrings(self, caplog):
+        # Other tests pin "one event series" and "same event ticker" as ABSENT
+        # from runs that never skip on those rules, so the close-gap line must
+        # not contain either — or it would fail them for the wrong reason.
+        mens, womens = self._wiu_markets()
+        with caplog.at_level(logging.INFO):
+            find_same_title_pairs([mens, womens])
+        assert self._refusals(caplog)
+        assert "one event series" not in caplog.text
+        assert "same event ticker" not in caplog.text
+
+    def test_each_candidate_is_counted_once_on_one_line(self, caplog):
+        # The gate sits AFTER the series test: a one-series candidate is
+        # counted on the series line and never reaches the close gate, so the
+        # two counts partition the refusals. Three markets, three candidates:
+        # M/W (two series, apart) is a close-gap refusal; the two women's
+        # listings of ONE series (apart too) are a series refusal; the men's
+        # game vs the second women's listing is a close-gap refusal.
+        mens, womens = self._wiu_markets()
+        womens_2 = _mock_market(
+            ticker="KXNCAAWBGAME-26FEB10WIUEIU-WIU",
+            event_ticker="KXNCAAWBGAME-26FEB10WIUEIU",
+            title=self._WIU_TITLE, subtitle="Western Illinois",
+            event_title="Western Illinois at Eastern Illinois",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 2, 24, 23, tzinfo=UTC),
+        )
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([mens, womens, womens_2]) == []
+        assert self._refusals(caplog) == [self._REFUSAL + "2"]
+        assert caplog.messages.count(
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): 1"
+        ) == 1
+
+    def test_refusing_the_widest_candidate_promotes_the_runner_up(self):
+        # One best pair per group: the widest divergence (A vs B, 0.40) closes
+        # two days apart and is refused, so the group's slot goes to A vs C
+        # (0.20), which close at one instant. A pairs table diff is therefore
+        # not a pure deletion.
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        common = {"title": "Q", "subtitle": "Yes", "event_title": "E"}
+        mA = _mock_market(ticker="KXA-1-Y", event_ticker="KXA-1", yes_ask=0.60,
+                          no_ask=0.40, close_time=close, **common)
+        mB = _mock_market(ticker="KXB-1-Y", event_ticker="KXB-1", yes_ask=0.20,
+                          no_ask=0.80, close_time=close + timedelta(days=2), **common)
+        mC = _mock_market(ticker="KXC-1-Y", event_ticker="KXC-1", yes_ask=0.40,
+                          no_ask=0.60, close_time=close, **common)
+        [pair] = find_same_title_pairs([mA, mB, mC])
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXA-1-Y", "KXC-1-Y")
+        assert pair.pA - pair.pB == pytest.approx(0.20)
+        # Control: with B on the shared close the widest candidate wins.
+        mB_aligned = _mock_market(ticker="KXB-1-Y", event_ticker="KXB-1", yes_ask=0.20,
+                                  no_ask=0.80, close_time=close, **common)
+        [pair] = find_same_title_pairs([mA, mB_aligned, mC])
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXA-1-Y", "KXB-1-Y")
+
+
+class TestClosesApart:
+    """Unit contract of scanner.closes_apart — the ONE definition of the
+    same-title close gate — and its live reader _closes_apart (DR-74)."""
+
+    _T = datetime(2026, 9, 25, 21, tzinfo=UTC)
+
+    @pytest.mark.parametrize("a,b", [
+        (None, _T),
+        (_T, None),
+        (None, None),
+        ("2026-09-25T21:00:00Z", _T),
+        (_T, "2026-09-25T21:00:00Z"),
+        (MagicMock(), _T),
+        (1_790_000_000, _T),
+        (date(2026, 9, 25), _T),
+    ])
+    def test_anything_that_is_not_a_datetime_fails_closed(self, a, b):
+        # A date is not a datetime instant (and date(..) is not an instance of
+        # datetime), so it cannot demonstrate a same-moment close either.
+        assert scanner.closes_apart(a, b) is True
+
+    def test_a_naive_and_an_aware_close_fail_closed(self):
+        naive = datetime(2026, 9, 25, 21)
+        assert scanner.closes_apart(naive, self._T) is True
+        assert scanner.closes_apart(self._T, naive) is True
+
+    def test_two_naive_closes_compare(self):
+        a = datetime(2026, 9, 25, 21)
+        assert scanner.closes_apart(a, a) is False
+        assert scanner.closes_apart(a, a + timedelta(hours=2)) is True
+
+    def test_one_instant_in_two_offsets_is_not_apart(self):
+        from datetime import timezone
+        cest = self._T.astimezone(timezone(timedelta(hours=2)))
+        assert cest.hour == 23
+        assert scanner.closes_apart(self._T, cest) is False
+
+    @pytest.mark.parametrize("seconds,apart", [
+        (0, False), (3_600, False), (3_601, True), (-3_600, False), (-3_601, True),
+    ])
+    def test_the_bound_is_symmetric_and_inclusive(self, seconds, apart):
+        assert scanner.closes_apart(self._T, self._T + timedelta(seconds=seconds)) is apart
+        assert scanner.closes_apart(self._T + timedelta(seconds=seconds), self._T) is apart
+
+    @pytest.mark.parametrize("seconds,text", [
+        (3_600, "60 minutes"),
+        (15 * 60, "15 minutes"),
+        (60, "1 minute"),
+        # Not a whole number of minutes: printed in seconds, never truncated
+        # into a different bound ("1 minutes" for 90 s would be false).
+        (90, "90 seconds"),
+        (59, "59 seconds"),
+        (1, "1 second"),
+    ])
+    def test_the_bound_text_never_misstates_the_bound(self, seconds, text):
+        assert scanner.close_gap_bound_text(seconds) == text
+
+    def test_the_bound_text_reads_the_gates_binding_at_call_time(self, monkeypatch):
+        # No argument reads scanner's binding at CALL time — the one
+        # closes_apart reads — so a patched bound reaches the refusal lines of
+        # both paths, and never a def-time copy.
+        assert scanner.close_gap_bound_text() == "60 minutes"
+        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 90)
+        assert scanner.close_gap_bound_text() == "90 seconds"
+
+    def test_the_live_reader_reads_close_time_by_type(self):
+        dated = SimpleNamespace(close_time=self._T)
+        assert scanner._closes_apart(dated, SimpleNamespace(close_time=self._T)) is False
+        # A MagicMock's auto-attribute is not a datetime; a missing attribute
+        # reads as None. Both fail closed.
+        assert scanner._closes_apart(dated, MagicMock()) is True
+        assert scanner._closes_apart(dated, SimpleNamespace()) is True
+
+
 class TestTimeSeriesGroupKey:
     """Unit-level contract of scanner.time_series_group_key()."""
 
@@ -2671,17 +2957,20 @@ class TestDeadlineGuardFinders:
         # spans-differ conjunct (the two spans are equal) — NOT by the
         # one-series rule. The two legs sit on DIFFERENT series here, so
         # _same_series is False and would not refuse the pair on its own;
-        # only the spans-differ check does. Mirror of
-        # test_backtester.py::TestRunBacktestCrossTypeDedup::
+        # only the spans-differ check does. Both legs close at the SAME
+        # instant, so the same-title close gate (DR-74) admits the same-title
+        # copy — the one-pair, one-type exclusivity DR-67 guarantees. Mirror
+        # of test_backtester.py::TestRunBacktestCrossTypeDedup::
         # test_dated_identical_wording_is_same_title_only.
         title = "Will X happen by Dec 31, 2026?"
+        close = datetime(2026, 12, 1, tzinfo=UTC)
         mA = _mock_market(
             ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
-            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),
+            yes_ask=0.30, no_ask=0.70, close_time=close,
         )
         mB = _mock_market(
             ticker="B1", event_ticker="EVB-1", title=title, event_title="EV",
-            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 12, 20, tzinfo=UTC),
+            yes_ask=0.60, no_ask=0.40, close_time=close,
         )
         assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
         assert scanner._market_deadline_profile(mA) == (
@@ -2692,24 +2981,71 @@ class TestDeadlineGuardFinders:
         )
         assert scanner._identical_wording(mA, mB) is True
         assert scanner._same_series(mA, mB) is False
+        assert scanner._closes_apart(mA, mB) is False
         assert len(find_same_title_pairs([mA, mB])) == 1
         assert find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[mA, mB],
         ) == []
 
         # Positive control: B's wording states a DIFFERENT deadline ("Dec
-        # 20" instead of "Dec 31") on the same two series, same prices, same
-        # close times. The spans now differ, so the time-series pair forms —
-        # proving the [] above comes from the spans-differ conjunct, not from
-        # the price tier, the deadline gap, or the two series being distinct.
+        # 20" instead of "Dec 31") on the same two series, at the same prices
+        # and the same close instant — the WORDING is the only thing that
+        # changed (a 0-day close gap is a short-tier time-series pair, and
+        # 0.60 - 0.30 clears its tier). The spans now differ, so the
+        # time-series pair forms — proving the [] above comes from the
+        # spans-differ conjunct, not from the price tier, the close times or
+        # the two series being distinct.
         mB3 = _mock_market(
             ticker="B1", event_ticker="EVB-1", title="Will X happen by Dec 20, 2026?",
-            event_title="EV", yes_ask=0.60, no_ask=0.40,
-            close_time=datetime(2026, 12, 20, tzinfo=UTC),
+            event_title="EV", yes_ask=0.60, no_ask=0.40, close_time=close,
         )
         assert len(find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[mA, mB3],
         )) == 1
+
+    @pytest.mark.parametrize("title", ["Q", "Will X happen by Dec 31, 2026?"])
+    def test_identical_wording_closing_apart_forms_no_pair_of_either_type(self, title):
+        # regression (DR-74) — the RELABEL guard. Identical wording on two
+        # DIFFERENT series whose markets close 19 days apart is two fixtures,
+        # so the same-title close gate refuses it; and because the finders
+        # are mutually exclusive on one ticker pair (DR-67: identical wording
+        # states the same deadline spans, or none), the refused same-title
+        # copy cannot come back as a time-series pair either — undated ("Q",
+        # unknown wording) or dated (one deadline stated twice). So nothing
+        # reaches main._dedup_pairs, and a same-title-only gate cannot
+        # relabel the trade. Mirror of test_backtester.py::
+        # TestRunBacktestCrossTypeDedup::
+        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
+        from kalshi_betting.main import _dedup_pairs
+
+        mA = _mock_market(
+            ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
+            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),
+        )
+        mB = _mock_market(
+            ticker="B1", event_ticker="EVB-1", title=title, event_title="EV",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 12, 20, tzinfo=UTC),
+        )
+        assert normalize_title(pair_key(mA)) == normalize_title(pair_key(mB))
+        assert scanner._identical_wording(mA, mB) is True
+        assert scanner._same_series(mA, mB) is False
+        assert scanner._closes_apart(mA, mB) is True
+        same_title = find_same_title_pairs([mA, mB])
+        time_series = find_time_series_pairs(
+            MagicMock(), held_tickers=set(), markets=[mA, mB],
+        )
+        assert same_title == []
+        assert time_series == []
+        assert _dedup_pairs(same_title, time_series) == []
+
+        # Positive control: B moved onto A's close instant, nothing else
+        # changed — the same-title pair forms, so the [] above is the close
+        # gate and not the price, the wording or the series.
+        mB_aligned = _mock_market(
+            ticker="B1", event_ticker="EVB-1", title=title, event_title="EV",
+            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 12, 1, tzinfo=UTC),
+        )
+        assert len(find_same_title_pairs([mA, mB_aligned])) == 1
 
 
 class TestSpansFromDecidingField:
@@ -3529,16 +3865,20 @@ class TestTimeSeriesTieredThreshold:
         )
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
-    def test_same_title_pairs_ignore_deadline_gap(self):
-        # Same-title pairs keep the flat 5% threshold — a 6% divergence on
-        # markets closing 20 days apart is still a candidate (the deadline gap
-        # tiers apply only to time-series pairs)
+    def test_same_title_pairs_ignore_the_deadline_tier_but_not_the_close_gap(self):
+        # Same-title pairs keep the flat 5% threshold — a 6% divergence, far
+        # under either time-series tier, is still a candidate when the two
+        # markets close at one instant (the deadline-gap tiers apply only to
+        # time-series pairs).
         #
-        # RE-PINNED (DR-02/DR-54): the two event tickers used to be EVT-A and
-        # EVT-B, one series, which the finder now reads as two instances of one
-        # recurring fixture and refuses. They name two DIFFERENT series now, so
-        # the 20-day assertion below passes UNCHANGED — the close gap is
-        # irrelevant to the one-series rule.
+        # INVERTED (DR-74): this test used to pin that a pair closing 20 DAYS
+        # apart "is still a candidate" — exactly the shape DR-74 refuses.
+        # Identical wording on two series closing 20 days apart is two
+        # fixtures (two games, two instants), not one question, so the
+        # co-resolution prior does not apply; the same-title close gate now
+        # refuses it. RE-PINNED earlier (DR-02/DR-54): the two event tickers
+        # were EVT-A and EVT-B, one series; they name two DIFFERENT series, so
+        # only the close gate decides the first assertion below.
         from datetime import UTC, datetime
         mA = _mock_market(
             ticker="A1", event_ticker="EVA-1",
@@ -3552,8 +3892,18 @@ class TestTimeSeriesTieredThreshold:
             yes_ask=0.30, no_ask=0.70,
             close_time=datetime(2026, 3, 21, tzinfo=UTC),
         )
-        pairs = find_same_title_pairs([mA, mB])
+        assert find_same_title_pairs([mA, mB]) == []
+
+        # Within the gap: B at A's close instant — the 6% divergence pairs.
+        mB_aligned = _mock_market(
+            ticker="B1", event_ticker="EVB-1",
+            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
+            yes_ask=0.30, no_ask=0.70,
+            close_time=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+        pairs = find_same_title_pairs([mA, mB_aligned])
         assert len(pairs) == 1
+        assert pairs[0].pA - pairs[0].pB == pytest.approx(0.06)
 
 
 def _raw_book_response(ob: dict) -> SimpleNamespace:

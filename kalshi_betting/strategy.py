@@ -217,7 +217,13 @@ def _kelly_p(pair: CandidatePair) -> float:
     Divergence is an anomaly, not an expected outcome, so a fixed base rate is more
     appropriate than market prices. This prior is calibrated for binary contracts and
     applies equally to MVE option markets once cross-event collisions are eliminated by
-    the event_title component of the grouping key.
+    the event_title component of the grouping key. Matching wording alone does not confirm
+    one question: the prior applies only to a pair that passed both of
+    scanner.find_same_title_pairs' pairing rules — its two event tickers belong to two
+    DIFFERENT series (the one-series rule, DR-02/DR-54) AND its two markets close within
+    config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (the close gate, DR-74). A men's
+    and a women's game between the same two schools pass the first and fail the second, and
+    for them the 95% prior is false.
 
     Args:
         pair (CandidatePair): The candidate pair. Uses pair.pair_type to select

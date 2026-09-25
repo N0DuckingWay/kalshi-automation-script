@@ -779,6 +779,37 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_same_series_dicts", "event_series")
         assert _function_calls(scanner, "_same_series", "event_series")
 
+    def test_ast_both_paths_apply_the_same_title_close_gap(self):
+        # DR-74: identical wording on two DIFFERENT series is one question only
+        # when both markets close at the same moment (a men's and a women's
+        # game between the same schools close hours apart). Gating only the
+        # live finder would leave the backtester replaying the M/W trades
+        # instead of detecting them — 17 of its 21 trades on the 365-day run.
+        # The live finder reaches the gate through its attribute reader; the
+        # backtester calls the one definition directly on parsed closes.
+        assert _function_calls(scanner, "find_same_title_pairs", "_closes_apart")
+        assert _function_calls(backtester, "_extract_pairs", "closes_apart")
+        assert _function_calls(backtester, "_extract_pairs", "_comparable_closes_dicts")
+        # And deliberately NOT on the time-series finder: identical wording can
+        # never form a time-series pair (DR-67), so a same-title-only gate
+        # cannot relabel the trade, and a close gate there would refuse every
+        # genuine cross-event deadline pair, whose closes differ by design.
+        assert not _function_calls(scanner, "find_time_series_pairs", "_closes_apart")
+        assert not _function_calls(scanner, "find_time_series_pairs", "closes_apart")
+
+    def test_ast_the_close_gap_has_one_definition(self):
+        # Only the close-time READ differs between the paths (an attribute
+        # live, a parsed cache string in the backtest); the verdict is one
+        # function, so the two can never disagree about which pair closes at
+        # one moment. Same shape as the series-prefix pin above.
+        assert _function_calls(scanner, "_closes_apart", "closes_apart")
+        # And the bound each path's refusal line PRINTS comes from the one
+        # renderer, which reads the binding closes_apart reads — so neither
+        # line can state a bound its gate did not apply, and the two stay
+        # verbatim twins under a patched bound.
+        assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
+        assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
+
     def test_ast_backtest_band_reaches_find_entry_through_config(self):
         # The backtest band's halves each have ONE home in config: the band is
         # resolved and validated by time_series_spread_band, its floor is

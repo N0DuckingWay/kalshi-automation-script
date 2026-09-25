@@ -65,6 +65,7 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     ORDER_API_VERSION,
+    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     TRANSFER_PATH,
     V2_ORDER_PATH,
@@ -154,9 +155,22 @@ class TestNoPairsMsg:
             assert f"{MIN_PRICE_DIFF_SHORT_GAP:.0%}" in msg
             assert f"{MIN_PRICE_DIFF_LONG_GAP:.0%}" in msg
             assert f"{SAME_TITLE_MIN_PRICE_DIFF:.0%}" in msg
+            # DR-74: the same-title rule also needs two different series whose
+            # markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS — named in
+            # the message, with the minutes derived from the constant.
+            assert (
+                f"on two different series closing within "
+                f"{SAME_TITLE_MAX_CLOSE_GAP_SECONDS // 60} minutes"
+            ) in msg
 
         assert "sandbox" in dev_msg
         assert "sandbox" not in prod_msg
+
+    def test_the_close_gap_clause_follows_the_constant(self, monkeypatch):
+        # Derived, not spelled: a different bound changes the message.
+        monkeypatch.setattr(main, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 15 * 60)
+        assert "closing within 15 minutes" in main._no_pairs_msg()
+        assert "closing within 60 minutes" not in main._no_pairs_msg()
 
 
 class TestSetupLogging:

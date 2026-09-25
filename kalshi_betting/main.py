@@ -22,11 +22,13 @@ Purpose:
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, price-gap thresholds, and file
-    paths), reporter.py (Excel output), scanner.py (market fetching, pair
-    detection, and leg_sides — the only source of truth for which side each
-    leg buys), strategy.py (trade sizing and portfolio selection), and
-    trader.py (order execution). Entry point for
+    (balance threshold, exit-code contract, price-gap thresholds, the
+    same-title close-gap bound the no-pairs message names, and file paths),
+    reporter.py (Excel output), scanner.py (market fetching, pair detection,
+    leg_sides — the only source of truth for which side each leg buys — and
+    close_gap_bound_text, which renders that close-gap bound in the same
+    words the finders' refusal lines use), strategy.py (trade sizing and
+    portfolio selection), and trader.py (order execution). Entry point for
     `python3 -m kalshi_betting.main`.
 
 Notes:
@@ -70,11 +72,13 @@ from .config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
+    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
 )
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     check_shard_coverage,
+    close_gap_bound_text,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
@@ -200,7 +204,12 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
     actually enforce. Names the cumulative-deadline requirement too: since
     that rule landed, price is no longer the only reason a time-series
     candidate can be absent, and an operator reading this line would otherwise
-    go looking at the thresholds for a result the WORDING decided.
+    go looking at the thresholds for a result the WORDING decided. Names the
+    same-title pairing rules for the same reason: a same-title pair also needs
+    two different event series whose markets close within
+    SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-02/DR-54, DR-74), with
+    the bound read from that constant and rendered by
+    scanner.close_gap_bound_text.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -215,7 +224,10 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
         "(“by <date>”, two different ones) with the later leg priced "
         f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
         "earlier (deadline-gap-tiered), or same-title: "
-        f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff"
+        f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
+        # This module's own binding, like every threshold above; the scanner
+        # helper only renders it, in the words the refusal lines use.
+        f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
     )
     if sandbox:
         return f"No qualifying pairs found in sandbox ({thresholds})."
