@@ -204,26 +204,81 @@ class TestSameEventLaddersArgument:
         assert kwargs["interval_discount"] == pytest.approx(0.4)
         assert kwargs["sweep"] is False
 
-    def test_the_config_echo_names_the_effective_setting(self, cli, monkeypatch, caplog):
+    @pytest.mark.parametrize("flag, configured, word", [
+        ("--same-event-ladders", False, "on"),
+        ("--no-same-event-ladders", True, "off"),
+    ])
+    def test_the_config_echo_names_the_effective_setting(self, cli, monkeypatch, caplog,
+                                                         flag, configured, word):
         # Echoed BEFORE the fetch, beside k, so an operator can abort a
-        # multi-hour run configured the wrong way round.
+        # multi-hour run configured the wrong way round. Each flag is run
+        # against the OPPOSITE configured value, so the echo can only print
+        # `word` by honouring the flag: a flag that agreed with the constant
+        # would pass an echo that ignores the flag entirely.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--same-event-ladders")
-        assert "ladders=on" in caplog.text
+            _run(monkeypatch, flag)
+        assert f"ladders={word}" in caplog.text
 
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        # The flag's help is built when main() builds its parser, from
+        # backtest's own binding, so it names the value a flagless run uses and
+        # cannot go stale when the shipped value changes. argparse wraps help
+        # lines, so whitespace is collapsed before matching.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        assert f"currently {word})" in " ".join(capsys.readouterr().out.split())
+
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
     def test_the_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch,
-                                                             caplog):
-        # Patched to the NON-shipped value on purpose: with the constant set
-        # to its own default (False) this row passes for any implementation
-        # that ignores it entirely, including `bool(args.same_event_ladders)`
-        # — and would then print "off" on a genuinely ON run the moment the
-        # switch is flipped, which is exactly what this echo exists to catch.
-        # The module attribute is the seam, not config's: backtest.py binds
-        # the constant by value at import.
-        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+                                                             caplog, configured, word):
+        # Patched to BOTH values: one row at either value passes an echo
+        # hard-coded to that value (`bool(args.same_event_ladders)` prints
+        # "off" on a genuinely ON run, a literal "on" prints "on" on an OFF
+        # one) — the misreport this pre-fetch echo exists to catch before a
+        # multi-hour fetch. The module attribute is the seam, not config's:
+        # backtest.py binds the constant by value at import.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert "ladders=on" in caplog.text
+        assert f"ladders={word}" in caplog.text
+
+    @pytest.mark.parametrize("configured, flag, echo", [
+        (True, "--no-same-event-ladders", "ladders=off (config: on) | spread band="),
+        (False, "--same-event-ladders", "ladders=on (config: off) | spread band="),
+    ])
+    def test_the_config_echo_names_a_departure_from_the_configured_switch(
+        self, cli, monkeypatch, caplog, configured, flag, echo,
+    ):
+        # A run overridden the OTHER way measures a strategy this checkout's
+        # live finder does not trade — the echo names the CONFIGURED value
+        # (not just the resolved one) so an operator reading it before a
+        # multi-hour fetch can see the run departs from what the bot trades.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, flag)
+        assert echo in caplog.text
+
+    @pytest.mark.parametrize("configured, flags", [
+        (True, ["--same-event-ladders"]),
+        (False, ["--no-same-event-ladders"]),
+        (True, []),
+        (False, []),
+    ])
+    def test_the_config_echo_names_no_departure_when_the_run_matches(
+        self, cli, monkeypatch, caplog, configured, flags,
+    ):
+        # Whether by an override that agrees with the config or by leaving the
+        # flag to it, a run that replays the configured switch gets the bare
+        # on/off reading, with no "(config: ...)" clause to depart from.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert f"ladders={'on' if configured else 'off'} | spread band=" in caplog.text
+        assert "(config:" not in caplog.text
 
 
 class TestSpreadBandArguments:
@@ -352,6 +407,9 @@ class TestSpreadBandEcho:
     def test_echo_keeps_the_k_and_ladders_substrings(self, cli, monkeypatch, caplog):
         # The existing "k=..."/"ladders=..." substrings other tests and
         # tooling grep for must survive the appended band fields verbatim.
+        # The switch is pinned off, the setting this row was written under,
+        # so its "ladders=on" comes from the flag and not from the constant.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", False)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--interval-discount", "0.62", "--same-event-ladders")
         text = caplog.text

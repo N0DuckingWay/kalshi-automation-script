@@ -189,8 +189,8 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # Kalshi often lists a question's several deadlines as separate markets
 # inside a SINGLE event — "Will SpaceX launch another Starship
 # by Sep 23, 2026?" and "... by Oct 16, 2026?" are both KXSPACEXSTARSHIP-14 —
-# and both finders have refused every same-event candidate since the first
-# commit, on the rationale that a shared event ticker means multi-choice
+# and both finders refused every same-event candidate from the first commit
+# until DR-73, on the rationale that a shared event ticker means multi-choice
 # OPTIONS. That is true of an MVE event's option labels and false of a dated
 # ladder, whose two rungs are the time-series premise itself: the earlier
 # deadline's event nests inside the later one's. A ladder pair is ordered and
@@ -198,16 +198,20 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # same_event_ladder), never on close_time, which a settled or single-instant
 # event gives every rung alike.
 #
-# READ THIS BEFORE FLIPPING IT. What the switch buys and what it puts at risk,
-# measured rather than assumed:
+# ON BY OPERATOR DECISION OF 2026-09-26, to make same-event ladder runs the
+# default, live and backtest (it shipped False with DR-73). What the switch
+# buys and what it puts at risk, measured rather than assumed — read this
+# before relying on it. To turn it back off, set it False, re-pin
+# tests/test_config.py::TestSameEventLadderSwitch to ship it off and reword
+# this header, keeping the evidence below:
 #
-#   Nesting holds for ladders, and does not for what we trade today. Over 284
+#   Nesting holds for ladders, and does not for the cross-event pairs. Over 284
 #   cached day slices (257 archive, 27 live), 1,821 same-event cumulative
 #   pairs read to two different stated deadlines and the impossible
 #   A=YES/B=NO cell occurs 0
 #   times (0 of the 975 within MAX_DEADLINE_GAP_DAYS). The CROSS-EVENT
 #   baseline on the same corpus is 2,872 of 22,080 — 13.01%. The premise
-#   violations in the archive come from the pairs this finder admits TODAY.
+#   violations in the archive come from the CROSS-EVENT pairs this finder admits.
 #
 #   Live funnel (2026-09-22 snapshot, 113,303 markets, on which the finder
 #   emits 0 time-series and 0 same-title pairs with the switch off): 3,354
@@ -238,7 +242,11 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   the time IF THE FIVE UNDERLYINGS ARE INDEPENDENT — the figure is the
 #   PRODUCT of the five marginal loss probabilities, and nothing here models
 #   correlation, which can only raise it (53.5% at market prices, by the same
-#   product). Each loses its full stake in that cell.
+#   product). Each loses its full stake in that cell. At the account's real
+#   balance ($64.44 at the 2026-09-25 prod dry run) the same snapshot selects
+#   6 trades deploying $63.84 — 99% of it — at a market-implied EV of -$19.58,
+#   leaving the cash under MIN_BALANCE_CENTS, so later runs exit 10 until those
+#   positions settle.
 #
 #   Selection effect. The one-best-pair-per-group rule picks the LARGEST
 #   pB - pA in a group, and a stale quote is by definition one out of line
@@ -252,14 +260,51 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   one-best rule actually contests). Those are counts of EVENTS and GROUPS,
 #   not of emitted pairs: on the same snapshot NONE of the 24 emitted pairs
 #   has an intervening rung of its own event priced outside [pA, pB], so the
-#   guard below would change nothing today — the effect is latent in the
-#   population, not present in the current selection. An intervening-rung
-#   staleness guard is the natural answer and is deliberately not built here.
+#   guard below would have changed nothing on that snapshot — the effect is
+#   latent in the population, not present in that snapshot's selection. An
+#   intervening-rung staleness guard is the natural answer and is deliberately
+#   not built here.
 #
-# Off by default until the interval discount is calibrated where the capital
-# actually goes — k-hat in the widest (pB - pA > 0.60) band, not pooled: p and
-# b depend on the spread, not on the gap in days, and the only k-hat ever
-# computed (1.114) was measured on snapshot pairs DR-67 refuses and is void.
+#   The gate it shipped behind, and its result. DR-73 left the switch off
+#   until k-hat was calibrated where the capital goes — the widest
+#   (pB - pA > 0.60) band, not pooled, since p and b depend on the spread
+#   rather than the gap in days (the earlier 1.114 was measured on snapshot
+#   pairs DR-67 refuses and is void) — and was to stay off unless that k-hat
+#   was materially below 1: enabling it bets the operator's belief, k, against
+#   real scheduled-event information. Entries measured 2026-09-23 with the real
+#   _find_entry on the pre-cutoff same-event pairs, banded 2026-09-26 on exact
+#   decimal spreads (float band edges, as first recorded, read 0.93 on n=52 for
+#   the first run): over the archive extended back to 2021 (start 2020-01-01,
+#   299 ladder entries) k-hat is 0.87 above 0.60 (n=71), 0.70 at 0.30-0.60
+#   (n=174), 0.56 below 0.30 (n=54), 0.75 pooled; the first, smaller run (start
+#   2024-01-01; 178 entries dated 2025-10-27 to 2026-07-20, from 40 events, 0
+#   premise violations) read 0.92 above 0.60 (51 entries from 22 events), 0.81
+#   pooled — n counts entries, not events. The two runs are not independent:
+#   only 22 of the extended archive's 1,448 ladder pairs close before 2025, so
+#   both, and the backtest below, largely share one 2025-2026 population (see
+#   backtester._stated_deadline_dict for how an archive corpus differs from the
+#   live ladder population). Live sizing assumes k = 0.75
+#   (TIME_SERIES_INTERVAL_PROB_DISCOUNT), below the k-hat above a 0.60 spread in
+#   both runs, where the capital concentrates, so it sizes those trades on more
+#   edge than was measured. The operator turned the switch on regardless.
+#
+#   Backtest. The 365-day window from 2025-09-24 (corpus assembled 2026-09-25
+#   11:06 UTC; k 0.75, default band; run 2026-09-26 on main @ ba00633) with
+#   ladders on: 61 trades, 45.9% won, +111.8% ($10,000 -> $21,181.24), pooled
+#   k-hat 0.889 (over this corpus's 399 entries, all ladders — not the
+#   calibration runs above), Sharpe 0.90. It rests on one trade: YES on
+#   KXFISAEXTEND-26MAY "before Jun 1" at $0.04 and NO on "before Jun 15" at
+#   $0.06 (27,347 contracts, $2,916.18, entered 2026-05-04) made +$24,430.82,
+#   2.2x the run's whole net gain; that event is 41% of the run's POSITIVE
+#   event P&L, and the run re-simulated without its entries returns -92.8%.
+#   The median trade lost 100%. Re-simulated alone from $10,000, the entries
+#   before 2026-04-20 return +98.9% and those on or after it -15.3%. The max
+#   drawdown, -82.2% on 2026-06-12, is read off the cost-basis curve, which
+#   carried that winner at its cost until it paid out on 2026-06-15, so it
+#   bounds the marked-to-market drawdown in neither direction. Of the 468
+#   time-series band x k cells, 20.3% are positive (22.5% of the 423 that
+#   traded), and the split-half Spearman of their returns is -0.519. The same
+#   window with the switch off: 3 trades, all same-title, +4.8%.
 #
 # BOTH PATHS IMPLEMENT THIS since DR-73c: backtester._extract_pairs forms the
 # same pairs from a per-event sub-pass and _find_entry orders and gaps them on
@@ -272,21 +317,29 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # funnel narrows 87 eligible ladder candidates to 24 emitted, so that contest
 # decides 63 of them). backtest.py's
 # --same-event-ladders / --no-same-event-ladders overrides this constant for
-# ONE run, which is how the k-hat the gate above demands gets measured without
-# flipping the switch first; scanner.py binds the constant at import, so that
+# ONE run — --no-same-event-ladders replays the rule as it stood before the
+# switch was turned on; scanner.py binds the constant at import, so that
 # override never reaches the live finder. The backtest's HTML dashboard also
 # renders the resolved setting, not just kalshi_backtest.log:
 # dashboard._run_settings_html prints "same-event ladders: on / off / not
 # recorded" in the page header (BacktestSweep.same_event_ladders), alongside
 # the primary spread band, so a ladder-enabled run's dashboard is no longer
-# indistinguishable from a switch-off one.
+# indistinguishable from a switch-off one. A recorded on/off is also read
+# against this switch: "(same as this checkout's config)", or, when the run
+# departs from it, a note that it is not a replay of the live rule. The
+# pre-fetch echo flags a departure too ("ladders=off (config: on)" or the
+# reverse), from backtest.py's binding, and run_backtest_sweep's ladder line
+# names it, from backtester's; the header reads backtester's binding through
+# BacktestSweep.config_same_event_ladders, which the sweep records.
 #
 # scanner.py, backtester.py AND backtest.py each bind this by VALUE at import
 # (the SCANNER_MAX_PAGES idiom), so a test or harness flipping it at runtime
 # must patch the constant on the MODULE it wants to affect — scanner for the
 # live finder, backtester for _extract_pairs/_find_entry, backtest for the CLI
-# echo — and never on this module: patching config here is a silent no-op that
-# reads as a switch-ON run and produces a switch-OFF result. This is NOT the
+# echo — and never on this module, where a patch is a silent no-op: the harness
+# looks as if it set the patched value, but every module still runs, and
+# reports, the shipped one (since the flip, an "off" harness that patches config
+# still pairs ladders, and its logs say "on"). This is NOT the
 # config.time_series_profit_prob(k=None) idiom, which works only because that
 # helper lives here and reads THIS module's global; the sentinel arguments named
 # same_event_ladders resolve their own module's binding at call time, which is
@@ -294,7 +347,7 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # def-time default would not. For a backtest the supported lever needs no
 # patching at all: run_backtest_sweep(same_event_ladders=...) or
 # backtest.py --same-event-ladders / --no-same-event-ladders.
-TIME_SERIES_SAME_EVENT_LADDERS = False
+TIME_SERIES_SAME_EVENT_LADDERS = True
 
 # ── Time-series strategy model (2026-09 inversion) ────────────────────────────
 #

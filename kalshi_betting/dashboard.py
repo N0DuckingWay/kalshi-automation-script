@@ -152,7 +152,10 @@ Notes:
     ladder setting (DR-73) under the Period line, or "not recorded" when the
     run passed no sweep: the ladder setting decides which pairs exist and the
     band which of them are ever entered, so, like DR-66b's strike-blind
-    notice, they qualify every section rather than only the explorer.
+    notice, they qualify every section rather than only the explorer. The
+    ladder reading is itself read against the configured switch the run
+    recorded (BacktestSweep.config_same_event_ladders), naming a departure
+    from this checkout's config rather than rendering a bare on/off.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -2574,12 +2577,26 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     (no sweep at all — the four-positional generate_dashboard call — or a
     hand-built sweep).
 
+    A run's resolved ladder setting can depart from the switch this
+    checkout's config sets (a --same-event-ladders/--no-same-event-ladders
+    override the other way), and that departure means the run does not
+    replay what the live finder trades. When both the resolved setting and
+    the configured switch (BacktestSweep.config_same_event_ladders) are
+    carried as real bools, the ladders reading is suffixed to say whether
+    they agree or, naming the configured value, that they do not; a sweep
+    that carries no configured value (an older caller, a hand-built sweep)
+    renders the bare on/off/not-recorded reading unchanged.
+
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
 
     Returns:
         str: One <p> line: "Primary spread band: <label> | same-event
-            ladders: on / off / not recorded".
+            ladders: on / off / not recorded", with an on/off reading
+            suffixed " (same as this checkout's config)", or " (departs from
+            this checkout's config.TIME_SERIES_SAME_EVENT_LADDERS, which was
+            on|off: not a replay of its live rule)", whenever both
+            same_event_ladders and config_same_event_ladders are real bools.
     """
     band = ladders = "not recorded"
     if sweep is not None:
@@ -2589,6 +2606,16 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
             ladders = "on"
         elif sweep.same_event_ladders is False:
             ladders = "off"
+        config_ladders = sweep.config_same_event_ladders
+        # By TYPE: both must be real bools, or there is nothing to compare
+        if type(sweep.same_event_ladders) is bool and type(config_ladders) is bool:
+            if sweep.same_event_ladders == config_ladders:
+                ladders += " (same as this checkout's config)"
+            else:
+                ladders += (" (departs from this checkout's "
+                            "config.TIME_SERIES_SAME_EVENT_LADDERS, which was "
+                            f"{'on' if config_ladders else 'off'}: not a replay of its "
+                            "live rule)")
     return (
         '<p style="color:#616161; font-size:14px;">'
         f"Primary spread band: {html.escape(band)} | same-event ladders: {ladders}</p>"

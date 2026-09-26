@@ -443,13 +443,27 @@ class TestCreateNewOutput:
 
 
 class TestSameEventLadderSwitch:
-    """DR-73: same-event deadline ladders ship OFF.
+    """DR-73: same-event deadline ladders ship ON (operator decision,
+    2026-09-26; they shipped OFF with DR-73).
 
     The switch changes which pairs exist, and turning it on was measured to
     deploy 98% of a $10,000 balance into 6 trades at -31% market-implied EV
-    (see the constant's own comment). It must not be flipped by accident, and
-    a default flip must fail a test rather than reach a Monday prod run.
+    (see the constant's own comment). It must not change by accident in either
+    direction: a change to the shipped value must fail a test rather than
+    silently change what the next prod run trades.
     """
 
-    def test_same_event_ladders_ship_off(self):
-        assert config.TIME_SERIES_SAME_EVENT_LADDERS is False
+    def test_same_event_ladders_ship_on(self):
+        assert config.TIME_SERIES_SAME_EVENT_LADDERS is True
+
+    def test_every_module_binding_matches_the_config(self):
+        # scanner, backtester and backtest each bind the constant BY VALUE at
+        # import, and they are what actually run: the live finder, the
+        # backtest's pair extraction and entry, and the CLI echo. A stray
+        # re-binding in any of them would change what trades or what a
+        # backtest measures while the pin above stays green. Value-independent,
+        # so a change to the shipped value still fails only that pin.
+        from kalshi_betting import backtest, backtester, scanner
+        for module in (scanner, backtester, backtest):
+            assert module.TIME_SERIES_SAME_EVENT_LADDERS is \
+                config.TIME_SERIES_SAME_EVENT_LADDERS, module.__name__

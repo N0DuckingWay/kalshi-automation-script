@@ -1823,6 +1823,43 @@ class TestRunSettingsHeader:
         assert line in page
         assert page.index("Period:") < page.index(line) < page.index("Portfolio Performance")
 
+    @pytest.mark.parametrize("ladders, configured, tail", [
+        (True, True, "on (same as this checkout's config)"),
+        (False, False, "off (same as this checkout's config)"),
+        (False, True, "off (departs from this checkout's config.TIME_SERIES_SAME_EVENT_LADDERS, "
+                      "which was on: not a replay of its live rule)"),
+        (True, False, "on (departs from this checkout's config.TIME_SERIES_SAME_EVENT_LADDERS, "
+                      "which was off: not a replay of its live rule)"),
+    ])
+    def test_ladder_reading_is_judged_against_the_configured_switch(
+        self, monkeypatch, tmp_path, ladders, configured, tail,
+    ):
+        # A run's resolved setting is read beside the switch this checkout's
+        # config actually carries — agreeing renders one clause, departing
+        # renders another, naming the CONFIGURED value so a reader knows what
+        # the live finder would have traded.
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=[],
+                              same_event_ladders=ladders,
+                              config_same_event_ladders=configured)
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+        assert f"| same-event ladders: {tail}</p>" in page
+
+    def test_an_unrecorded_setting_stays_not_recorded_whatever_the_config(
+        self, monkeypatch, tmp_path,
+    ):
+        # same_event_ladders itself unrecorded still reads "not recorded",
+        # whatever config_same_event_ladders happens to carry — there is
+        # nothing to compare it against.
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=[],
+                              same_event_ladders=None,
+                              config_same_event_ladders=True)
+        page = self._page(monkeypatch, tmp_path, sweep=sweep)
+        assert "| same-event ladders: not recorded</p>" in page
+
 
 class TestCorpusProvenanceHeader:
     """DR-13 / M2 (P2): directly under the Period line the header says what
