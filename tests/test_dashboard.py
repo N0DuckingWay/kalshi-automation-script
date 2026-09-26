@@ -2227,7 +2227,11 @@ class TestReturnsByCategory:
         trades = [self._t("KXNCAAMBGAME-A", 30.0), self._t("KXNCAAMBGAME-B", -10.0),
                   self._t("KXFISAEXTEND-C", 50.0), self._t("KXUCLGAME-D", -5.0)]
         section = dashboard._section_decomposition(trades, self.SERIES)
-        titles = re.findall(r'"title":\s*\{"text":\s*"([^"]*)"', section)
+        # Decoded as JSON strings, not read raw: without orjson (as in CI)
+        # plotly serialises through the stdlib json module, which writes the
+        # "·" as ·
+        titles = [json.loads(t) for t in re.findall(
+            r'"title":\s*\{"text":\s*("(?:[^"\\]|\\.)*")', section)]
         assert "P&L by Category ($)" in titles
         assert "P&L by Category · Tag ($)" in titles
         table = section[section.index("Returns by category · tag"):]
