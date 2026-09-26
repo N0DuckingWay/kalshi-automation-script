@@ -163,6 +163,7 @@ from .config import (
     MVE_TITLE_LOOKUP_MAX_PAGES,
     PROD_URL,
     PROJECT_ROOT,
+    SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
@@ -236,6 +237,116 @@ def infer_category(event_ticker: str) -> str:
         if upper.startswith(prefix):
             return cat
     return "Other"
+
+
+# Disk copy of Kalshi's /series listing: {"fetched_at": ISO, "series":
+# {series_ticker: [category, [tags...]]}}. See load_series_categories.
+_SERIES_CATEGORIES_CACHE = CACHE_DIR / "series_categories.json"
+# /series served every series in one response when checked (2026-09-25, no
+# cursor); should it ever paginate, this bounds the walk.
+_SERIES_LIST_MAX_PAGES = 100
+
+
+def _parse_series_categories(raw: Any) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """
+    Read a series_categories.json "series" block back into the returned shape.
+
+    Args:
+        raw (Any): The cached "series" value; anything but a dict reads as empty.
+
+    Returns:
+        dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
+            tags), skipping any entry that is not [str, [str, ...]].
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for ticker, value in raw.items():
+        if (isinstance(ticker, str) and isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], str) and isinstance(value[1], list)):
+            out[ticker] = (value[0], tuple(t for t in value[1] if isinstance(t, str)))
+    return out
+
+
+def load_series_categories(
+    client: Any,
+    max_age_seconds: int = SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
+) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """
+    Map every Kalshi series ticker to its official category and tags.
+
+    Kalshi's /series listing carries, per series, the category the exchange
+    files it under ("Sports", "Politics", "Commodities", ... — 20 of them) and
+    finer tags ("Basketball", "Congress", "Oil & Gas", ...). The backtest
+    dashboard breaks returns down by them, because infer_category's ticker
+    prefixes predate the "KX" prefix every current series carries and so file
+    nearly every trade under "Other". Reporting only: nothing is priced,
+    sized, paired or settled on these labels.
+
+    The listing is cached in backtest_cache/series_categories.json and reused
+    while younger than max_age_seconds. It is one read-only GET (retried like
+    every other historical read). This never raises: on any failure it logs a
+    WARNING and falls back to the cached copy however old, or to {} when there
+    is none — in which case the dashboard files trades under infer_category's
+    labels, exactly as before.
+
+    Args:
+        client (Any): A KalshiClient pointed at prod (build_prod_live_client()).
+        max_age_seconds (int): Reuse the cached copy while it is younger than
+            this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS.
+
+    Returns:
+        dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
+            tags). A series with no category maps to ""; with no tags to ().
+    """
+    cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
+    cached_map: dict[str, tuple[str, tuple[str, ...]]] = {}
+    fetched_at: datetime | None = None
+    if isinstance(cached, dict):
+        cached_map = _parse_series_categories(cached.get("series"))
+        try:
+            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+        except (TypeError, ValueError):
+            fetched_at = None
+    now = datetime.now(UTC)
+    if (cached_map and fetched_at is not None and fetched_at.tzinfo is not None
+            and 0 <= (now - fetched_at).total_seconds() < max_age_seconds):
+        return cached_map
+    try:
+        fresh: dict[str, tuple[str, tuple[str, ...]]] = {}
+        cursor, seen = None, set()
+        for _ in range(_SERIES_LIST_MAX_PAGES):
+            params = {"cursor": cursor} if cursor else {}
+            data = _historical_get(client, f"{_API_PREFIX}/series", **params)
+            if not isinstance(data, dict):
+                raise ValueError(f"/series returned a {type(data).__name__}, not an object")
+            for s in data.get("series") or []:
+                if isinstance(s, dict) and isinstance(s.get("ticker"), str) and s["ticker"]:
+                    tags = s.get("tags") if isinstance(s.get("tags"), list) else []
+                    fresh[s["ticker"]] = (
+                        s.get("category") if isinstance(s.get("category"), str) else "",
+                        tuple(t for t in tags if isinstance(t, str)),
+                    )
+            cursor = data.get("cursor")
+            if not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        if not fresh:
+            raise ValueError("/series returned no series")
+        _save_json_cache(_SERIES_CATEGORIES_CACHE, {
+            "fetched_at": now.isoformat(),
+            "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
+        })
+        logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
+        return fresh
+    except Exception as exc:  # reporting only — never end a backtest over it
+        logging.warning(
+            "Series category listing unavailable (%s) — %s",
+            _exception_summary(exc),
+            f"using the cached copy of {len(cached_map)} series" if cached_map
+            else "the dashboard falls back to ticker-prefix categories",
+        )
+        return cached_map
 
 
 def _signed_raw_get(client: Any, path: str, **params):

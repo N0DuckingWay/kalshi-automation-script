@@ -8183,6 +8183,32 @@ class TestBacktestTradePopulationLabels:
         t = TestEquityCurveOpensAtTheInitialBalance()._trade(10, 0.30, 0.40, "yes", 0.0)
         assert t.event_ticker == ""
         assert t.same_event_ladder is False
+        # The per-leg report fields default too
+        assert (t.subtitle_a, t.subtitle_b) == ("", "")
+        assert (t.close_date_a, t.close_date_b, t.settled_date_a, t.settled_date_b) == (
+            None, None, None, None)
+
+    def test_each_legs_label_close_and_settlement_dates_are_recorded(self):
+        # Market A closes and settles before market B, and each carries its own
+        # outcome label: the trade must keep them per leg, not collapse them
+        # into exit_date (which is the LATER settlement).
+        mA = {"ticker": "XA", "result": "yes", "subtitle": "Label A",
+              "close_time": "2026-02-01T00:00:00+00:00",
+              "settlement_ts": "2026-02-02T12:00:00+00:00"}
+        mB = {"ticker": "XB", "result": "yes", "subtitle": None,
+              "close_time": "2026-02-14T00:00:00+00:00",
+              "settlement_ts": "2026-02-15T12:00:00+00:00"}
+        entry = {"entry_date": date(2026, 1, 5), "pA": 0.30, "pB": 0.60,
+                 "nA": 0.70, "nB": 0.40, "gap_days": 13, "mA": mA, "mB": mB}
+        point = backtester._simulate_at_discount(
+            [{"pair_type": "time_series", "canon": "c", "group_key": "c", "entry": entry}],
+            date(2026, 1, 1), 10_000.0,
+        )
+        (t,) = point.trades
+        assert (t.subtitle_a, t.subtitle_b) == ("Label A", "")
+        assert (t.close_date_a, t.close_date_b) == (date(2026, 2, 1), date(2026, 2, 14))
+        assert (t.settled_date_a, t.settled_date_b) == (date(2026, 2, 2), date(2026, 2, 15))
+        assert t.exit_date == date(2026, 2, 15)
 
 
 # ─── PB3: the band x k x population sweep ────────────────────────────────────

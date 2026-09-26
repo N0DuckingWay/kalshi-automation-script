@@ -104,6 +104,10 @@ def cli(monkeypatch, tmp_path):
     monkeypatch.setattr(backtest, "build_prod_live_client", lambda: MagicMock())
     monkeypatch.setattr(backtest, "run_backtest_sweep", _fake_sweep)
     monkeypatch.setattr(backtest, "generate_dashboard", _fake_dashboard)
+    # Never read the real backtest_cache or the network for series categories
+    calls["series_categories"] = {"KXTEST": ("Sports", ("Basketball",))}
+    monkeypatch.setattr(backtest, "load_series_categories",
+                        lambda client: calls["series_categories"])
     return calls
 
 
@@ -588,6 +592,11 @@ class TestDashboardHandoff:
         # The k the plotted trades were SIZED at — read back off the point, not
         # re-derived from the CLI flag, so the two can never disagree
         assert kwargs["interval_discount"] == result.primary.k
+
+    def test_the_series_categories_are_passed_through(self, cli, monkeypatch):
+        _run(monkeypatch)
+        _, kwargs = cli["dashboard"]
+        assert kwargs["series_categories"] is cli["series_categories"]
 
 
 class TestSummaryBlock:
