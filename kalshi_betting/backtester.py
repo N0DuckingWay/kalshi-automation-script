@@ -69,11 +69,13 @@ Dependencies:
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
     OutcomeLabelCoverage and BacktestSweep (BacktestTrade, BacktestSweep,
     OutcomeLabelCoverage and SweepPoint are consumed by dashboard.py, which
-    also imports the private helpers _exact_label and _leg_prices_for; an
-    IntervalCalibration carries the CalibrationObservations its pooled row
-    was reduced from, so a report can regroup that population through
-    _calibration_bucket, the one definition of the k-hat arithmetic) plus
-    run_backtest() and run_backtest_sweep() (called by backtest.py).
+    also imports the private helpers _exact_label, _leg_prices_for and
+    _build_equity_curve — the one definition of an equity curve, which its
+    page-wide filter runs over a category's or tag's trades for that slice's
+    curve; an IntervalCalibration carries the CalibrationObservations its
+    pooled row was reduced from, so a report can regroup that population
+    through _calibration_bucket, the one definition of the k-hat arithmetic)
+    plus run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
