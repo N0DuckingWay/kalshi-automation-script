@@ -51,8 +51,9 @@ Notes:
     reaches the live finder — scanner.py binds that constant at import. Unlike
     k, it changes WHICH PAIRS EXIST rather than how they are priced, so it
     applies identically to every swept discount and a run with it on is not
-    comparable to a baseline taken without it. It is the way to measure the
-    ladder strategy the switch gates before flipping the switch.
+    comparable to a baseline taken without it. The switch is on by the
+    operator's 2026-09-26 decision, so a default run pairs ladders and
+    --no-same-event-ladders replays the rule as it stood before it.
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page

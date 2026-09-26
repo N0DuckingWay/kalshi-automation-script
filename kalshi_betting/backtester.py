@@ -1557,9 +1557,10 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
       a Nov/Dec rung pair whose subtitle "Before November" states no year).
 
     So a ladder-enabled backtest's pair population is NOT a subset of the live
-    one on a subtitle-blank corpus, and the k-hat the flip gate demands is
-    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual list and
-    the plan's own "prove the corpus before spending on it" step).
+    one on a subtitle-blank corpus, and the k-hat of the rule the switch
+    shipped behind (not met — see config.TIME_SERIES_SAME_EVENT_LADDERS) was
+    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual
+    list and the plan's own "prove the corpus before spending on it" step).
 
     Args:
         m (dict): A market dict in the compact historical._market_to_dict form.
@@ -1951,10 +1952,10 @@ def _extract_pairs(
     the measurement is small: on that same 2026-05-01 slice the whole
     615,266-pair sub-pass costs +0.3 to +0.5 s against a ~19 s switch-off call
     (measured 2026-09-23, two runs each way), and it is paid only with the
-    switch on. A per-call aggregate guard is the alternative and is
-    deliberately not built; if the cost ever stops being negligible, sum
-    len(idxs)*(len(idxs)-1)//2 across buckets here and warn past a second
-    threshold.
+    switch on — every default run since the 2026-09-26 decision. A per-call aggregate guard
+    is the alternative and is deliberately not built; if the cost ever stops
+    being negligible, sum len(idxs)*(len(idxs)-1)//2 across buckets here and
+    warn past a second threshold.
 
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
@@ -5475,9 +5476,10 @@ def run_backtest(
     # exact pre-DR-73 signature for every existing caller, and omitting the
     # keyword leaves _prepare_entries' None sentinel to resolve this module's
     # TIME_SERIES_SAME_EVENT_LADDERS (bound from config at import) at call
-    # time — the value live sizing uses. A harness that wants ladders here must
-    # patch backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config
-    # attribute, which this module never reads; the supported lever is
+    # time — the value the live finder uses. A harness that wants ladders on or
+    # off here (they follow the switch, on by the 2026-09-26 decision) must patch
+    # backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config attribute, which
+    # this module never reads; the supported lever is
     # run_backtest_sweep(same_event_ladders=...), which needs no patching.
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
