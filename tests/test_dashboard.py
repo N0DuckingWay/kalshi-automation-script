@@ -1349,8 +1349,9 @@ class TestScenarioExplorerControls:
             f"Mean per trade (equal stake) by spread band x k — {pop}")
         buttons = layout["updatemenus"][0]["buttons"]
         assert [b["label"] for b in buttons] == [
-            "Mean per trade (equal stake)", "Total return", "H1 return",
-            "H2 return", "Trade count"]
+            "Mean per trade (equal stake)", "Median per trade (equal stake)",
+            "Total return", "H1 return", "H2 return", "Trade count",
+            "Empirical k̂ (pooled per band)"]
         for b in buttons:
             # "restyle" would read the second argument as trace indices and
             # drop the title silently; "update" relayouts it.
@@ -1365,7 +1366,7 @@ class TestScenarioExplorerControls:
         assert z["H2 return"] == [[0.03, -0.01], [0.05, 0.0], [0.02, 0.02]]
         assert heat[0]["z"] == z["Mean per trade (equal stake)"]
         # A count is never negative: its own colour scale, auto-ranged.
-        count = buttons[4]["args"][0]
+        count = buttons[5]["args"][0]
         assert count["zmid"] == [None]
         assert count["colorscale"] != buttons[0]["args"][0]["colorscale"]
         assert buttons[0]["args"][0]["zmid"] == [0]
@@ -2004,6 +2005,320 @@ class TestScenarioExplorerPageSize:
             trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
         size = out_path.stat().st_size
         assert size <= 5_000_000, f"page was {size} bytes"
+
+
+class TestMedianReturns:
+    """Median per-trade return beside the mean (performance cards, the explorer's
+    KPI table and heatmap), and the median CALENDAR-MONTH return card."""
+
+    @staticmethod
+    def _month_curve(values_by_day: dict[date, float]) -> pd.DataFrame:
+        df = pd.DataFrame({"date": list(values_by_day),
+                           "portfolio_value": list(values_by_day.values())})
+        df["daily_return"] = df["portfolio_value"].pct_change().fillna(0.0)
+        return df
+
+    def test_months_chain_from_the_opening_row(self):
+        # Opening 1000 on Jan 31, so January's own return is 0.0; then
+        # +10% / -5% / +10% month over month -> median of [0, .10, -.05, .10]
+        curve = self._month_curve({
+            date(2026, 1, 31): 1000.0,
+            date(2026, 2, 14): 1300.0,          # intra-month values are ignored
+            date(2026, 2, 28): 1100.0,
+            date(2026, 3, 31): 1045.0,
+            date(2026, 4, 30): 1149.5,
+        })
+        assert dashboard._median_monthly_return(curve) == pytest.approx(0.05)
+
+    def test_flat_months_count_as_zero(self):
+        # One active month out of three: the median describes the months lived
+        curve = self._month_curve({date(2026, 1, 1): 1000.0, date(2026, 2, 1): 1200.0,
+                                   date(2026, 3, 1): 1200.0})
+        assert dashboard._median_monthly_return(curve) == 0.0
+
+    def test_undefined_curves_are_none_not_zero(self):
+        assert dashboard._median_monthly_return(None) is None
+        assert dashboard._median_monthly_return(make_equity([])) is None
+        assert dashboard._median_monthly_return(make_equity([0.0, 10.0])) is None
+
+    def test_performance_cards_show_both_medians(self):
+        # Skewed on purpose: one big win pulls the mean far from the median
+        trades = [make_trade(profit=p) for p in (-1.0, 0.5, 0.6, 40.0)]
+        # Jan 30 -> Jan 31 -> Feb 1: January +2.0%, February +1.97%, total +4.0%
+        curve = make_equity([1000.0, 1020.0, 1040.1], start=date(2026, 1, 30))
+        section = dashboard._section_performance(curve, trades, date(2026, 1, 30), 1000.0)
+        ratios = sorted(t.profit_ratio for t in trades)
+        median = (ratios[1] + ratios[2]) / 2
+
+        def card(label: str) -> str:
+            # The value div follows the label div inside one card (_KPI_TEMPLATE)
+            match = re.search(re.escape(label) + r"</div>\s*<div[^>]*>([^<]*)</div>", section)
+            return match.group(1).strip()
+
+        assert card("Median Return/Trade") == f"{median:.1%}"
+        assert card("Avg Return/Trade") != card("Median Return/Trade")
+        assert card("Median Monthly Return") == "+2.0%"
+        assert card("Total Return") == "+4.0%"
+
+    def test_point_kpis_carry_the_median(self):
+        trades = [make_trade(profit=p) for p in (-1.0, 0.5, 40.0)]
+        kpis = dashboard._point_kpis(_scn_point((0.0, 1.0), 0.75, trades=trades))
+        assert kpis["median_per_trade"] == pytest.approx(
+            sorted(t.profit_ratio for t in trades)[1])
+        assert kpis["median_per_trade"] != pytest.approx(kpis["mean_per_trade"])
+        empty = dashboard._point_kpis(_scn_point((0.0, 1.0), 0.75, trades=[]))
+        assert empty["median_per_trade"] is None
+
+    def test_the_explorer_table_and_heatmap_carry_the_median(self):
+        section = _Grid.section()
+        assert "<th style=\"padding:8px 16px;\">Median/Trade</th>" in section
+        assert "fmtPct(k.median_per_trade)" in section
+        # The primary cell (band 1, k index 1) is cell 3, whose trades differ
+        data = _scn_data(section)
+        ts = data["cells"][1][1][data["populations"].index("time_series")]
+        ratios = sorted(t.profit_ratio for t in _Grid.all_trades(3))
+        assert ts["median_per_trade"] == pytest.approx((ratios[1] + ratios[2]) / 2)
+        _, layout = _first_figure(section)
+        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
+        median = buttons["Median per trade (equal stake)"]
+        assert median["z"][0][1][1] == pytest.approx(ts["median_per_trade"])
+        assert median["zmid"] == [0]
+
+
+def _typed_trade(pair_type: str, ladder: bool, entry: date, exit_: date,
+                 profit: float) -> BacktestTrade:
+    """make_trade with a chosen pair type, ladder flag, dates and profit, its
+    payoff set so profit = actual_payoff - total_cost - fees holds."""
+    t = make_trade(profit=profit)
+    return dataclasses.replace(
+        t, pair_type=pair_type, same_event_ladder=ladder, entry_date=entry,
+        exit_date=exit_, actual_payoff=profit + t.total_cost + t.fees)
+
+
+class TestReturnByTradeType:
+    """The performance section's first chart: total return plus one line per
+    trade type, booked exactly as _build_equity_curve books each trade."""
+
+    def test_type_lines_sum_to_the_total_return(self):
+        start = date(2026, 1, 5)
+        trades = [
+            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
+            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
+            _typed_trade("time_series", False, date(2026, 1, 7), date(2026, 1, 9), 5.0),
+            _typed_trade("same_title", False, date(2026, 1, 8), date(2026, 1, 9), -4.0),
+        ]
+        curve = backtester._build_equity_curve(trades, start, 1000.0)
+        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
+        assert [label for label, _, _ in lines] == [
+            "Same-title", "Time-series: ladder", "Time-series: cross-event"]
+        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
+        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
+        assert summed == pytest.approx(list(total), abs=1e-9)
+        # Each type ends at its own profit
+        ends = {label: s[-1] for label, _, s in lines}
+        assert ends["Same-title"] == pytest.approx((30.0 - 4.0) / 10)
+        assert ends["Time-series: ladder"] == pytest.approx(-1.2)
+        assert ends["Time-series: cross-event"] == pytest.approx(0.5)
+
+    def test_only_types_with_trades_get_a_line(self):
+        trades = [_typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0)]
+        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
+        assert [x for x, _, _ in dashboard._return_by_trade_type(trades, curve, 1000.0)] == [
+            "Same-title"]
+        assert dashboard._return_by_trade_type([], curve, 1000.0) == []
+
+    def test_the_first_chart_carries_the_total_and_the_type_lines(self):
+        trades = [
+            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0),
+            _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), -1.0),
+        ]
+        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
+        section = dashboard._section_performance(curve, trades, date(2026, 1, 5), 1000.0)
+        data, layout = _first_figure(section)
+        assert [tr["name"] for tr in data] == [
+            "Total return", "Same-title", "Time-series: cross-event"]
+        assert layout["title"]["text"].startswith("Cumulative Return by Trade Type")
+
+
+class TestBestWorstTradeRows:
+    """Each best/worst row spells out both legs: the YES and NO prices paid,
+    what each leg bought and when its market closed, and how each settled."""
+
+    @staticmethod
+    def _row(**overrides) -> str:
+        t = dataclasses.replace(
+            make_trade(profit=-10.0), title_a="Game <1>", title_b="Game <1>",
+            subtitle_a="Western Illinois", subtitle_b="Western Illinois",
+            ticker_a="KXNCAAWBGAME-X-WIU", ticker_b="KXNCAAMBGAME-X-WIU",
+            close_date_a=date(2026, 1, 13), close_date_b=date(2026, 1, 14),
+            settled_date_a=date(2026, 1, 14), settled_date_b=date(2026, 1, 15),
+            **overrides)
+        return dashboard._trade_row(t, "#FFF")
+
+    @staticmethod
+    def _cells(row: str) -> list[str]:
+        return re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.S)
+
+    def test_a_same_title_row_pays_no_on_a_and_yes_on_b(self):
+        row = self._row(pair_type="same_title", entry_nA=0.32, entry_pB=0.35,
+                        outcome_a="yes", outcome_b="no")
+        cells = self._cells(row)
+        assert cells[2:4] == ["$0.35", "$0.32"]          # YES paid, NO paid
+        details, outcome = cells[4], cells[5]
+        assert details.index("<b>NO</b> on Game &lt;1&gt; — Western Illinois") < details.index(
+            "<b>YES</b> on")
+        assert "(closes Jan 13, 2026) at $0.32" in details
+        assert "(closes Jan 14, 2026) at $0.35" in details
+        assert "KXNCAAWBGAME-X-WIU" in details and "KXNCAAMBGAME-X-WIU" in details
+        assert "A: settled <b>YES</b> on Jan 14, 2026 (lost)" in outcome
+        assert "B: settled <b>NO</b> on Jan 15, 2026 (lost)" in outcome
+
+    def test_a_time_series_row_pays_yes_on_a_and_no_on_b(self):
+        cells = self._cells(self._row(pair_type="time_series", entry_pA=0.30,
+                                      entry_nB=0.40, outcome_a="no", outcome_b="no"))
+        assert cells[2:4] == ["$0.30", "$0.40"]
+        assert "A: settled <b>NO</b> on Jan 14, 2026 (lost)" in cells[5]
+        assert "B: settled <b>NO</b> on Jan 15, 2026 (won)" in cells[5]
+
+    def test_missing_dates_and_labels_degrade_readably(self):
+        t = dataclasses.replace(make_trade(), subtitle_a="", subtitle_b="")
+        cells = self._cells(dashboard._trade_row(t, "#FFF"))
+        assert "(closes date unknown)" in cells[4]
+        assert "on date unknown" in cells[5]
+        assert " — " not in cells[4]
+
+
+class TestReturnsByCategory:
+    """Returns Decomposition files every trade under Kalshi's official series
+    category and first tag, with a per-category·tag table."""
+
+    SERIES = {
+        "KXNCAAMBGAME": ("Sports", ("Basketball",)),
+        "KXUCLGAME": ("Sports", ("Soccer", "Europe")),
+        "KXFISAEXTEND": ("Politics", ("Congress",)),
+        "KXSCOTUSLAST": ("Politics", ()),
+        "KXMVECROSSCATEGORY": ("", ()),
+    }
+
+    @staticmethod
+    def _t(event_ticker: str, profit: float) -> BacktestTrade:
+        return dataclasses.replace(make_trade(profit=profit), event_ticker=event_ticker)
+
+    @pytest.mark.parametrize("event_ticker,expected", [
+        ("KXNCAAMBGAME-26JAN13WIUEIU", ("Sports", "Sports · Basketball")),
+        ("KXUCLGAME-26APR14ATMBAR", ("Sports", "Sports · Soccer")),       # FIRST tag
+        ("KXSCOTUSLAST-26", ("Politics", "Politics · General")),         # no tags
+        ("KXMVECROSSCATEGORY-S2026X", ("Uncategorised", "Uncategorised · General")),
+    ])
+    def test_a_trade_is_filed_under_its_series(self, event_ticker, expected):
+        assert dashboard._trade_category(self._t(event_ticker, 1.0), self.SERIES) == expected
+
+    def test_an_unknown_series_or_no_map_falls_back_to_the_prefix_label(self):
+        t = dataclasses.replace(self._t("KXNOTLISTED-1", 1.0), category="Crypto")
+        assert dashboard._trade_category(t, self.SERIES) == ("Crypto", "Crypto · General")
+        assert dashboard._trade_category(t, None) == ("Crypto", "Crypto · General")
+
+    def test_combo_series_are_looked_up_literally(self):
+        # Not scanner.event_series, which folds every KXMVE* series together
+        assert dashboard._series_ticker("KXMVECROSSCATEGORY0-S1") == "KXMVECROSSCATEGORY0"
+        assert dashboard._series_ticker("") == ""
+
+    def test_the_section_charts_and_tabulates_each_category_tag(self):
+        trades = [self._t("KXNCAAMBGAME-A", 30.0), self._t("KXNCAAMBGAME-B", -10.0),
+                  self._t("KXFISAEXTEND-C", 50.0), self._t("KXUCLGAME-D", -5.0)]
+        section = dashboard._section_decomposition(trades, self.SERIES)
+        titles = re.findall(r'"title":\s*\{"text":\s*"([^"]*)"', section)
+        assert "P&L by Category ($)" in titles
+        assert "P&L by Category · Tag ($)" in titles
+        table = section[section.index("Returns by category · tag"):]
+        table = table[:table.index("</table>")]
+        assert "(3 groups" in table
+        rows = [re.findall(r"<td[^>]*>(.*?)</td>", r)
+                for r in re.findall(r"<tr style='border-bottom[^>]*>(.*?)</tr>", table)]
+        # Largest P&L first; win rate, P&L and share of the 65.00 total
+        assert [r[0] for r in rows] == ["Politics · Congress", "Sports · Basketball",
+                                         "Sports · Soccer"]
+        assert rows[1][1:5] == ["2", "50%", "$+20.00", "31%"]
+        assert rows[2][2:4] == ["0%", "$-5.00"]
+
+
+class TestDashboardFileIsOverwritten:
+    """Every run writes the one backtest_dashboard.html, replacing the last."""
+
+    def test_a_second_run_replaces_the_first(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        first = dashboard.generate_dashboard([], make_equity([1000.0, 1000.0]),
+                                             date(2026, 1, 5), 1000.0)
+        (tmp_path / first.name).write_text("stale")
+        second = dashboard.generate_dashboard([make_trade()], make_equity([1000.0, 1010.0]),
+                                              date(2026, 1, 5), 1000.0)
+        assert first == second == tmp_path / "backtest_dashboard.html"
+        assert "stale" not in second.read_text(encoding="utf-8")
+        # Nothing else is left behind: no timestamped page, no temporary file
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["backtest_dashboard.html"]
+
+
+class TestEmpiricalKHatByBand:
+    """k-hat per spread band on the explorer's grid: a heatmap metric that
+    repeats each band's POOLED k-hat across every k column (k-hat does not
+    depend on k), with the entries behind it, plus the same figures as a table."""
+
+    KHAT = "Empirical k̂ (pooled per band)"
+
+    @staticmethod
+    def _sweep() -> BacktestSweep:
+        sweep = _Grid.sweep()
+        base = _scn_calibration()
+        wide = dataclasses.replace(base, pooled=dataclasses.replace(
+            base.pooled, n=4, realised_rate=0.27, mean_implied=0.30, empirical_k=0.90))
+        undefined = dataclasses.replace(base, pooled=dataclasses.replace(
+            base.pooled, n=0, realised_rate=0.0, mean_implied=0.0, empirical_k=None))
+        return dataclasses.replace(sweep, calibrations_by_band={
+            _Grid.BANDS[0]: base, _Grid.BANDS[1]: wide, _Grid.BANDS[2]: undefined})
+
+    def test_each_band_row_repeats_its_pooled_khat(self):
+        _, layout = _first_figure(_section_scenario_explorer(self._sweep()))
+        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
+        khat = buttons[self.KHAT]
+        assert khat["z"][0] == [[0.60, 0.60], [0.90, 0.90], [None, None]]
+        # Its hover reads the entries pooled, not the trade count
+        assert khat["customdata"][0] == [[10, 10], [4, 4], [0, 0]]
+        # Centred on the run's primary k (the primary cell sits at k = 0.75)
+        assert khat["zmid"] == [0.75]
+        assert "entries pooled" in khat["hovertemplate"][0]
+
+    def test_every_other_metric_restores_the_trade_counts(self):
+        # customdata travels with every button, so switching back from k-hat
+        # must put the trade counts back under the other metrics' hovers
+        _, layout = _first_figure(_section_scenario_explorer(self._sweep()))
+        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
+        trades = buttons["Trade count"]["z"][0]
+        for label, args in buttons.items():
+            if label != self.KHAT:
+                assert args["customdata"][0] == trades, label
+
+    def test_a_band_without_a_calibration_is_blank(self):
+        sweep = dataclasses.replace(self._sweep(), calibrations_by_band={
+            _Grid.BANDS[0]: _scn_calibration()})
+        _, layout = _first_figure(_section_scenario_explorer(sweep))
+        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
+        assert buttons[self.KHAT]["z"][0] == [[0.60, 0.60], [None, None], [None, None]]
+
+    def test_the_table_lists_every_band(self):
+        section = _section_scenario_explorer(self._sweep())
+        assert "Empirical k&#770; by spread band" in section
+        table = section[section.index("Empirical k&#770; by spread band"):]
+        table = table[:table.index("</table>")]
+        rows = re.findall(r"<tr style='border-bottom[^>]*>(.*?)</tr>", table)
+        cells = [re.findall(r"<td[^>]*>(.*?)</td>", r) for r in rows]
+        labels = [html_label for html_label, *_ in cells]
+        assert labels == [dashboard._row_label(b).replace("&", "&amp;")
+                          for b in _Grid.BANDS]
+        assert cells[0][1:] == ["10", "0.1200", "0.2000", "0.600"]
+        assert cells[1][1:] == ["4", "0.2700", "0.3000", "0.900"]
+        assert cells[2][1:] == ["0", "0.0000", "0.0000", "—"]
 
 
 class TestGoldenSections:

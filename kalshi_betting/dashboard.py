@@ -30,7 +30,7 @@ Dependencies:
     backtest.py's closing line), and BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
-    create_new_output(), fee_per_pair_approx() and
+    fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
@@ -99,6 +99,7 @@ import html
 import json
 import logging
 import math
+import os
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -116,6 +117,7 @@ from .backtester import (
     OutcomeLabelCoverage,
     SweepPoint,
     _exact_label,
+    _leg_prices_for,
     max_trades_simulated,
 )
 from .config import (
@@ -124,10 +126,13 @@ from .config import (
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
     TRADING_DAYS_PER_YEAR,
-    create_new_output,
     fee_per_pair_approx,
     time_series_profit_prob,
 )
+from .scanner import leg_sides
+
+# The one dashboard file every backtest run writes (and overwrites) in PROJECT_ROOT.
+DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
@@ -252,6 +257,109 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
     max_dd = float(dd.min())
     when = dd.idxmin()
     return max_dd, when
+
+
+# Trade-type lines of the performance chart, in display order: (label, colour).
+_TRADE_TYPE_LINES = (
+    ("Same-title", "#8E24AA"),
+    ("Time-series: ladder", "#FB8C00"),
+    ("Time-series: cross-event", "#43A047"),
+)
+
+
+def _trade_type_label(trade: BacktestTrade) -> str:
+    """
+    Name the trade-type line a trade belongs to.
+
+    Args:
+        trade (BacktestTrade): A completed trade.
+
+    Returns:
+        str: "Same-title" for any pair type other than time_series (the same
+            fail-safe reading scanner.leg_sides applies), otherwise
+            "Time-series: ladder" or "Time-series: cross-event" by
+            BacktestTrade.same_event_ladder.
+    """
+    if trade.pair_type != "time_series":
+        return "Same-title"
+    return "Time-series: ladder" if trade.same_event_ladder else "Time-series: cross-event"
+
+
+def _return_by_trade_type(
+    trades: list[BacktestTrade], equity_df: pd.DataFrame, initial_balance: float,
+) -> list[tuple[str, str, list[float]]]:
+    """
+    Attribute the equity curve's cumulative return to each trade type.
+
+    Books every trade exactly as backtester._build_equity_curve does — minus
+    its fees on the entry date, plus (actual_payoff - total_cost) on the exit
+    date — so each type's line is that type's share of the curve and the lines
+    sum to the total return on every date (up to float noise). A step dated
+    outside the curve's own dates is booked on the first curve date on or
+    after it, or dropped if there is none, the same days the curve itself
+    would have seen it.
+
+    Args:
+        trades (list[BacktestTrade]): The run's completed trades.
+        equity_df (pd.DataFrame): The run's equity curve (_build_equity_curve).
+        initial_balance (float): Starting balance the percentages divide by.
+
+    Returns:
+        list[tuple[str, str, list[float]]]: (label, colour, cumulative return in
+            percent per curve date), in _TRADE_TYPE_LINES order, for the types
+            that have at least one trade. Empty when there are no trades, the
+            curve is empty, or initial_balance is not positive.
+    """
+    if not trades or equity_df.empty or initial_balance <= 0:
+        return []
+    dates = pd.to_datetime(equity_df["date"]).to_numpy()
+    steps: dict[str, np.ndarray] = {}
+    for t in trades:
+        label = _trade_type_label(t)
+        row = steps.setdefault(label, np.zeros(len(dates)))
+        for when, amount in ((t.entry_date, -t.fees),
+                             (t.exit_date, t.actual_payoff - t.total_cost)):
+            i = int(np.searchsorted(dates, np.datetime64(pd.Timestamp(when)), side="left"))
+            if i < len(dates):
+                row[i] += amount
+    return [
+        (label, color, list(np.cumsum(steps[label]) / initial_balance * 100))
+        for label, color in _TRADE_TYPE_LINES if label in steps
+    ]
+
+
+def _median_monthly_return(equity_df: pd.DataFrame | None) -> float | None:
+    """
+    Compute the median calendar-month return of an equity curve.
+
+    Each month's return is its last portfolio value over the previous month's
+    last value, minus one; the first month is measured against the curve's
+    opening row, which _build_equity_curve always sets to the untouched
+    initial balance (DR-03), so the months chain from the same base every
+    other figure on the page uses. Every calendar month the curve spans counts,
+    including months with no trade in them (a 0.0 return): the median describes
+    the run's months as lived, not only its active ones.
+
+    Args:
+        equity_df (pd.DataFrame | None): Daily equity curve with columns
+            [date, portfolio_value, ...] as produced by _build_equity_curve().
+
+    Returns:
+        float | None: The median monthly return as a fraction (e.g. 0.012 for
+            +1.2%). None when the curve is absent or empty, or its opening
+            value is not a positive number (no return is defined from it).
+    """
+    if equity_df is None or equity_df.empty:
+        return None
+    values = equity_df["portfolio_value"].set_axis(pd.to_datetime(equity_df["date"]))
+    opening = float(values.iloc[0])
+    if not math.isfinite(opening) or opening <= 0:
+        return None
+    month_end = values.groupby(values.index.to_period("M")).last().to_numpy(dtype=float)
+    previous = np.concatenate(([opening], month_end[:-1]))
+    returns = month_end / previous - 1.0
+    returns = returns[np.isfinite(returns)]
+    return float(np.median(returns)) if returns.size else None
 
 
 def _brier_score(trades: list[BacktestTrade]) -> float:
@@ -464,8 +572,13 @@ def _section_performance(
     """
     Build the "Portfolio Performance" HTML section.
 
-    Computes summary KPIs (total return, Sharpe, Sortino, max drawdown, win rate)
-    and renders two charts: the equity curve and a drawdown percentage plot.
+    Computes summary KPIs (total return, Sharpe, Sortino, max drawdown, win
+    rate, mean and median return per trade, median monthly return) and renders
+    two charts: cumulative return as a series of lines — the total plus one per
+    trade type (_return_by_trade_type, which sum to the total) — and a
+    drawdown percentage plot. The median per
+    trade sits beside the mean because a few large wins or total losses can
+    carry the mean on their own; the two disagreeing is the signal.
 
     Args:
         equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value,
@@ -490,8 +603,11 @@ def _section_performance(
     )
     win_rate     = sum(1 for t in trades if t.profit > 0) / len(trades) if trades else 0
     avg_ret      = np.mean([t.profit_ratio for t in trades]) if trades else 0
+    med_ret      = np.median([t.profit_ratio for t in trades]) if trades else 0
+    med_month    = _median_monthly_return(equity_df)
 
     dd_str = f"({dd_when})" if dd_when else ""
+    med_month_str = "—" if med_month is None else f"{med_month:+.1%}"
 
     kpis = "".join([
         _kpi("Total Return",  f"{total_return:+.1%}", "#2196F3"),
@@ -500,17 +616,28 @@ def _section_performance(
         _kpi("Max Drawdown",  f"{max_dd:.1%} {dd_str}", "#F44336"),
         _kpi("Win Rate",      f"{win_rate:.1%}", "#4CAF50"),
         _kpi("Avg Return/Trade", f"{avg_ret:.1%}"),
+        _kpi("Median Return/Trade", f"{med_ret:.1%}"),
+        _kpi("Median Monthly Return", med_month_str),
         _kpi("Total Trades",  str(len(trades))),
     ])
 
-    # Equity curve
+    # Cumulative return, total and per trade type: one line each, in percent of
+    # the starting balance. The per-type lines attribute each trade exactly as
+    # _build_equity_curve books it, so they add up to the total line.
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=equity_df["date"], y=equity_df["portfolio_value"],
-        name="Strategy", line={"color": _COLORS["strategy"], "width": 2},
+        x=equity_df["date"],
+        y=(equity_df["portfolio_value"] / initial_balance - 1.0) * 100,
+        name="Total return", line={"color": _COLORS["strategy"], "width": 3},
     ))
-    fig.update_layout(title="Equity Curve", yaxis_title="Portfolio Value ($)",
-                      xaxis_title="Date")
+    for label, color, series in _return_by_trade_type(trades, equity_df, initial_balance):
+        fig.add_trace(go.Scatter(
+            x=equity_df["date"], y=series, name=label,
+            line={"color": color, "width": 1.5, "dash": "dot"},
+        ))
+    fig.update_layout(title="Cumulative Return by Trade Type (% of starting balance)",
+                      yaxis_title="Cumulative return (%)", xaxis_title="Date",
+                      legend={"orientation": "h", "y": -0.2})
 
     # Drawdown chart
     rolling_max = equity_df["portfolio_value"].cummax()
@@ -532,15 +659,119 @@ def _section_performance(
 
 # ─── Section 2: Returns Decomposition ────────────────────────────────────────
 
-def _section_decomposition(trades: list[BacktestTrade]) -> str:
+def _series_ticker(event_ticker: str) -> str:
+    """
+    The series part of an event ticker (everything before its first hyphen).
+
+    Deliberately NOT scanner.event_series, which collapses every KXMVE* combo
+    series onto one family for the one-series pairing rule: Kalshi files each
+    literal series under its own category, and that is what is looked up here.
+
+    Args:
+        event_ticker (str): An event ticker, e.g. "KXNCAAMBGAME-26JAN13WIUEIU".
+
+    Returns:
+        str: The series ticker ("KXNCAAMBGAME"), or "" for an empty ticker.
+    """
+    return (event_ticker or "").split("-", 1)[0]
+
+
+def _trade_category(
+    trade: BacktestTrade,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+) -> tuple[str, str]:
+    """
+    File a trade under Kalshi's official category and its first tag.
+
+    Looks up market A's series (both legs of a same-title pair ask one
+    question, and a time-series pair's legs share a series, so A speaks for
+    the pair) in historical.load_series_categories' map. Without a map, or for
+    a series missing from it, it falls back to BacktestTrade.category (the
+    ticker-prefix label) so the breakdown still renders.
+
+    Args:
+        trade (BacktestTrade): A completed trade.
+        series_categories (dict | None): series ticker -> (category, tags), or
+            None when the listing was not loaded.
+
+    Returns:
+        tuple[str, str]: (category, "category · tag"). The tag reads "General"
+            when the series has none; the category "Uncategorised" when Kalshi
+            gives it none.
+    """
+    entry = (series_categories or {}).get(_series_ticker(trade.event_ticker))
+    if entry is None:
+        return trade.category, f"{trade.category} · General"
+    category = entry[0] or "Uncategorised"
+    tag = entry[1][0] if entry[1] else "General"
+    return category, f"{category} · {tag}"
+
+
+def _category_table(df: pd.DataFrame) -> str:
+    """
+    Tabulate returns per category · tag, largest P&L first.
+
+    Args:
+        df (pd.DataFrame): One row per trade with columns subcategory, profit
+            and profit_ratio.
+
+    Returns:
+        str: An HTML table: trades, win rate, P&L, share of total P&L, and the
+            mean and median return per trade (each trade's profit over its own
+            fee-inclusive stake).
+    """
+    total = df["profit"].sum()
+    grouped = df.groupby("subcategory").agg(
+        trades=("profit", "size"),
+        wins=("profit", lambda p: int((p > 0).sum())),
+        pnl=("profit", "sum"),
+        mean_ret=("profit_ratio", "mean"),
+        median_ret=("profit_ratio", "median"),
+    ).sort_values("pnl", ascending=False)
+    td = "<td style='padding:4px 12px;'>"
+    rows = "".join(
+        "<tr style='border-bottom:1px solid #E0E0E0'>"
+        + td + html.escape(str(name)) + "</td>"
+        + td + str(int(r.trades)) + "</td>"
+        + td + f"{r.wins / r.trades:.0%}</td>"
+        + f"<td style='padding:4px 12px;color:{_COLORS['profit'] if r.pnl >= 0 else _COLORS['loss']};'>"
+        + f"${r.pnl:+,.2f}</td>"
+        + td + ("—" if total == 0 else f"{r.pnl / total:.0%}") + "</td>"
+        + td + f"{r.mean_ret:+.1%}</td>"
+        + td + f"{r.median_ret:+.1%}</td></tr>"
+        for name, r in grouped.iterrows()
+    )
+    return (
+        "<div style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+        f"<b>Returns by category · tag</b> ({len(grouped)} groups, Kalshi's own series "
+        "categories and tags)"
+        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+        "<tr style='background:#E8F5E9;font-weight:bold;'>"
+        "<th style='padding:6px 12px;'>Category · tag</th><th style='padding:6px 12px;'>Trades</th>"
+        "<th style='padding:6px 12px;'>Win rate</th><th style='padding:6px 12px;'>P&amp;L</th>"
+        "<th style='padding:6px 12px;'>Share of P&amp;L</th>"
+        "<th style='padding:6px 12px;'>Mean/trade</th><th style='padding:6px 12px;'>Median/trade</th>"
+        "</tr>" + rows + "</table></div>"
+    )
+
+
+def _section_decomposition(
+    trades: list[BacktestTrade],
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
+) -> str:
     """
     Build the "Returns Decomposition" HTML section.
 
-    Shows four charts: monthly P&L bar chart, P&L by market category, P&L by entry
-    price bucket, and a holding-period histogram.
+    Shows a monthly P&L bar chart, P&L by Kalshi's official market category,
+    P&L by category · tag (the finer breakdown) with a table of trades, win
+    rate, P&L and mean/median return per category · tag, P&L by entry price
+    bucket, and a holding-period histogram.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades to decompose.
+        series_categories (dict | None): historical.load_series_categories'
+            series ticker -> (category, tags) map. None (default) files every
+            trade under its ticker-prefix BacktestTrade.category instead.
 
     Returns:
         str: Self-contained HTML section string. Returns a "No trades" placeholder
@@ -554,7 +785,8 @@ def _section_decomposition(trades: list[BacktestTrade]) -> str:
         "exit_date":     t.exit_date,
         "profit_ratio":  t.profit_ratio,
         "profit":        t.profit,
-        "category":      t.category,
+        "category":      _trade_category(t, series_categories)[0],
+        "subcategory":   _trade_category(t, series_categories)[1],
         "holding_days":  t.holding_days,
         "entry_pA":      t.entry_pA,
         "n":             t.n,
@@ -578,6 +810,14 @@ def _section_decomposition(trades: list[BacktestTrade]) -> str:
         marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in cat.values],
     ))
     fig_cat.update_layout(title="P&L by Category ($)", xaxis_title="P&L ($)")
+
+    # The finer breakdown: category · tag, same colouring
+    sub = df.groupby("subcategory")["profit"].sum().sort_values()
+    fig_sub = go.Figure(go.Bar(
+        y=sub.index, x=sub.values, orientation="h",
+        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in sub.values],
+    ))
+    fig_sub.update_layout(title="P&L by Category · Tag ($)", xaxis_title="P&L ($)")
 
     # Entry price bucket. entry_pA is market A's YES ask at entry for both pair
     # types, but its meaning differs: for a time_series row it is the price
@@ -606,6 +846,8 @@ def _section_decomposition(trades: list[BacktestTrade]) -> str:
         _SECTION_STYLE.format(title="Returns Decomposition")
         + _fig_html(fig_monthly)
         + _fig_html(fig_cat, height=350)
+        + _fig_html(fig_sub, height=max(350, 28 * len(sub) + 120))
+        + _category_table(df)
         + _fig_html(fig_price)
         + _fig_html(fig_dur)
     )
@@ -1394,12 +1636,14 @@ def _point_kpis(point: SweepPoint) -> dict:
         point (SweepPoint): One simulated scenario, band sweep or not.
 
     Returns:
-        dict: {trades, win_rate, mean_per_trade, total_return, final_balance,
-            max_drawdown, sharpe, sortino}. win_rate counts trades with
-            profit STRICTLY above zero. mean_per_trade is the mean of
-            BacktestTrade.profit_ratio, which the backtester defines as
-            profit / (total_cost + fees) — the return on each trade's own
-            fee-inclusive stake, equal-weighted across trades. Sharpe and
+        dict: {trades, win_rate, mean_per_trade, median_per_trade,
+            total_return, final_balance, max_drawdown, sharpe, sortino}.
+            win_rate counts trades with profit STRICTLY above zero.
+            mean_per_trade is the mean of BacktestTrade.profit_ratio, which
+            the backtester defines as profit / (total_cost + fees) — the
+            return on each trade's own fee-inclusive stake, equal-weighted
+            across trades; median_per_trade is the median of the same
+            quantity, which a few outsized trades cannot move. Sharpe and
             Sortino are annualised on the calendar-day base (365), like every
             other figure computed on a strategy curve. Every value is None
             where the underlying quantity is undefined (no trades, or an
@@ -1409,6 +1653,7 @@ def _point_kpis(point: SweepPoint) -> dict:
     n = len(trades)
     win_rate = (sum(1 for t in trades if t.profit > 0) / n) if n else None
     mean_per_trade = float(np.mean([t.profit_ratio for t in trades])) if n else None
+    median_per_trade = float(np.median([t.profit_ratio for t in trades])) if n else None
     eq = point.equity_df
     if eq is None or eq.empty:
         total_return = final_balance = max_dd = sharpe = sortino = None
@@ -1424,7 +1669,7 @@ def _point_kpis(point: SweepPoint) -> dict:
         sortino = _sortino(eq["daily_return"]) if "daily_return" in eq else None
     return {
         "trades": n, "win_rate": win_rate, "mean_per_trade": mean_per_trade,
-        "total_return": total_return, "final_balance": final_balance,
+        "median_per_trade": median_per_trade, "total_return": total_return, "final_balance": final_balance,
         "max_drawdown": max_dd, "sharpe": sharpe, "sortino": sortino,
     }
 
@@ -1541,7 +1786,8 @@ _SCENARIO_EXPLORER_JS = r"""
     k = k || {};
     return '<tr style="border-bottom:1px solid #E0E0E0">' + TD + label + '</td>'
       + TD + fmtInt(k.trades) + '</td>' + TD + fmtPct(k.win_rate) + '</td>'
-      + TD + fmtPct(k.mean_per_trade) + '</td>' + TD + fmtPct(k.total_return) + '</td>'
+      + TD + fmtPct(k.mean_per_trade) + '</td>' + TD + fmtPct(k.median_per_trade) + '</td>'
+      + TD + fmtPct(k.total_return) + '</td>'
       + TD + fmtMoney(k.final_balance) + '</td>' + TD + fmtPct(k.max_drawdown) + '</td>'
       + TD + fmtFixed(k.sharpe, 2) + ' / ' + fmtFixed(k.sortino, 2) + '</td></tr>';
   }
@@ -1816,13 +2062,19 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
          population's, and that the KPI table below labels its own rows.
       2. A band (row) x k (column) heatmap of the time-series population,
          titled with it, with a native Plotly `updatemenus` metric toggle:
-         mean per trade (the default), total return, H1 return, H2 return and
-         trade count. Each button is an "update" — it swaps the trace's z,
-         colour scale and hover format AND the chart title together (a
-         "restyle" button's second argument is read as trace indices, so a
-         title placed there would be silently dropped). Row labels read
-         "max(tier,<floor>)-<ceiling>" (_row_label). A half with no entries
-         reads null (rendered "—") in the H1/H2 views.
+         mean per trade (the default), median per trade, total return, H1
+         return, H2 return, trade count and empirical k-hat. Each button is
+         an "update" — it swaps the trace's z, colour scale, hover format and
+         customdata AND the chart title together (a "restyle" button's second
+         argument is read as trace indices, so a title placed there would be
+         silently dropped). Row labels read "max(tier,<floor>)-<ceiling>"
+         (_row_label). A half with no entries reads null (rendered "—") in the
+         H1/H2 views. The k-hat view repeats each band's POOLED k-hat
+         (BacktestSweep.calibrations_by_band) across every k column, because
+         k-hat is measured over the band's entries and cannot depend on k; it
+         is centred on the primary k, its hover shows the entries pooled, and
+         a band with no calibration reads null. The same figures follow as a
+         static one-row-per-band table ("Empirical k-hat by spread band").
       3. Two <select>s (band, k), preselected to the primary scenario and
          marked "(primary)", driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
@@ -1976,25 +2228,51 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     pct_hover = ("band=%{y}<br>%{x}<br>value=%{z:.2%}<br>trades=%{customdata}"
                  "<extra></extra>")
     count_hover = "band=%{y}<br>%{x}<br>trades=%{z}<extra></extra>"
-    # (field, label, colour scale, zmid, hover). zmid None lets the scale
-    # auto-range: a trade count is never negative, so centring it on zero
-    # would spend half the colour scale on values that cannot occur.
+    # Empirical k-hat is measured ONCE per spread band — over that band's
+    # time-series entries, read off the prepared entries rather than any
+    # k-sized simulation (backtester._interval_calibration), so it cannot
+    # depend on k — and its row therefore repeats one figure across every k
+    # column. Its hover names the entries it pooled, since a k-hat over a
+    # handful of entries is not a measurement worth reading.
+    def band_pooled(band: tuple[float, float]):
+        cal = sweep.calibrations_by_band.get(band)
+        return None if cal is None else cal.pooled
+
+    pooled_by_band = [band_pooled(b) for b in bands]
+    khat_matrix = [[None if p is None else p.empirical_k] * len(ks) for p in pooled_by_band]
+    khat_n_matrix = [[None if p is None else p.n] * len(ks) for p in pooled_by_band]
+    khat_hover = ("band=%{y}<br>k̂=%{z:.3f} (the same at every k)"
+                  "<br>entries pooled=%{customdata}<extra></extra>")
+
+    # (field, label, colour scale, zmid, hover, customdata field). zmid None
+    # lets the scale auto-range: a trade count is never negative, so centring
+    # it on zero would spend half the colour scale on values that cannot
+    # occur. k-hat is centred on the run's primary k, so the colour says which
+    # side of the discount the sizing assumed each band's evidence falls on.
     heatmap_fields = [
-        ("mean_per_trade", "Mean per trade (equal stake)", diverging, 0, pct_hover),
-        ("total_return", "Total return", diverging, 0, pct_hover),
-        ("h1_return", "H1 return", diverging, 0, pct_hover),
-        ("h2_return", "H2 return", diverging, 0, pct_hover),
-        ("trades", "Trade count", sequential, None, count_hover),
+        ("mean_per_trade", "Mean per trade (equal stake)", diverging, 0, pct_hover, "trades"),
+        ("median_per_trade", "Median per trade (equal stake)", diverging, 0, pct_hover,
+         "trades"),
+        ("total_return", "Total return", diverging, 0, pct_hover, "trades"),
+        ("h1_return", "H1 return", diverging, 0, pct_hover, "trades"),
+        ("h2_return", "H2 return", diverging, 0, pct_hover, "trades"),
+        ("trades", "Trade count", sequential, None, count_hover, "trades"),
+        ("empirical_k", "Empirical k̂ (pooled per band)", diverging, sweep.primary.k,
+         khat_hover, "empirical_k_n"),
     ]
     # _json_safe here too: the button args are free-form JSON that no Plotly
     # validator touches, so a NaN cell must already be None when it gets there.
-    matrices = {field: _json_safe(metric_matrix(field)) for field, *_ in heatmap_fields}
+    matrices = {field: _json_safe(metric_matrix(field))
+                for field, *_ in heatmap_fields if field != "empirical_k"}
+    matrices["empirical_k"] = _json_safe(khat_matrix)
+    matrices["empirical_k_n"] = _json_safe(khat_n_matrix)
 
-    _, default_label, default_scale, default_zmid, default_hover = heatmap_fields[0]
+    _, default_label, default_scale, default_zmid, default_hover, default_custom = (
+        heatmap_fields[0])
     hfig = go.Figure()
     hfig.add_trace(go.Heatmap(
         z=matrices["mean_per_trade"], x=k_labels, y=band_labels,
-        customdata=matrices["trades"], colorscale=default_scale, zmid=default_zmid,
+        customdata=matrices[default_custom], colorscale=default_scale, zmid=default_zmid,
         hovertemplate=default_hover,
     ))
     # The title names the population, on every metric (each button re-sets
@@ -2011,14 +2289,49 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
                 {
                     "label": label, "method": "update",
                     "args": [
+                        # customdata travels with every button: k-hat's hover
+                        # reads entry counts, every other metric's trade counts
                         {"z": [matrices[field]], "colorscale": [scale],
-                         "zmid": [zmid], "hovertemplate": [hover]},
+                         "zmid": [zmid], "hovertemplate": [hover],
+                         "customdata": [matrices[custom]]},
                         {"title.text": f"{label} {heat_title}"},
                     ],
                 }
-                for field, label, scale, zmid, hover in heatmap_fields
+                for field, label, scale, zmid, hover, custom in heatmap_fields
             ],
         }],
+    )
+
+    # ── Empirical k-hat for EVERY band at once (the heatmap's k-hat metric in
+    # table form, with the counts behind it). One row per band, pooled over
+    # that band's time-series entries; the per-gap-bucket breakdown of the
+    # SELECTED band stays in the calibration table the selects drive. ───────
+    def fmt(value, spec: str) -> str:
+        return "—" if value is None or not math.isfinite(value) else format(value, spec)
+
+    td = "<td style='padding:4px 12px;'>"
+    khat_rows = "".join(
+        "<tr style='border-bottom:1px solid #E0E0E0'>"
+        + td + html.escape(label) + "</td>"
+        + td + ("—" if p is None else str(p.n)) + "</td>"
+        + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
+        + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
+        + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
+        for label, p in zip(band_labels, pooled_by_band, strict=True)
+    )
+    khat_table = (
+        "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+        f"<summary><b>Empirical k&#770; by spread band</b> (pooled over each band's "
+        f"time-series entries; the same at every k — compare with the primary "
+        f"k = {sweep.primary.k:.3f})</summary>"
+        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+        "<tr style='background:#E8F5E9;font-weight:bold;'>"
+        "<th style='padding:6px 12px;'>Spread band</th>"
+        "<th style='padding:6px 12px;'>n</th>"
+        "<th style='padding:6px 12px;'>Realised in-between rate</th>"
+        "<th style='padding:6px 12px;'>Mean implied gap</th>"
+        "<th style='padding:6px 12px;'>Pooled k&#770;</th></tr>"
+        + khat_rows + "</table></details>"
     )
 
     # ── The <select>s, preselected to (and marking) the primary scenario ─────
@@ -2051,6 +2364,7 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
   <th style="padding:8px 16px;">Trades</th>
   <th style="padding:8px 16px;">Win Rate</th>
   <th style="padding:8px 16px;">Mean/Trade</th>
+  <th style="padding:8px 16px;">Median/Trade</th>
   <th style="padding:8px 16px;">Total Return</th>
   <th style="padding:8px 16px;">Final Balance</th>
   <th style="padding:8px 16px;">Max Drawdown</th>
@@ -2136,6 +2450,7 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         title
         + banner
         + _fig_html(hfig, height=450)
+        + khat_table
         + selects
         + kpi_table
         + _fig_html(efig, height=400, div_id="scn-equity")
@@ -2146,12 +2461,107 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 
 # ─── Section 6: Trade-Level Diagnostics ──────────────────────────────────────
 
+def _fmt_day(d: date | None) -> str:
+    """
+    Format a calendar date for the trade tables, e.g. "Jan 14, 2026".
+
+    Args:
+        d (date | None): The date, or None when the trade does not carry it.
+
+    Returns:
+        str: The formatted date, or "date unknown" for None.
+    """
+    return "date unknown" if d is None else f"{d:%b} {d.day}, {d.year}"
+
+
+def _leg_market(title: str, subtitle: str, ticker: str) -> str:
+    """
+    Describe one leg's market as escaped HTML: its question, its outcome label,
+    and its ticker in small grey text.
+
+    The outcome label is appended unless the title already contains it, because
+    it is what tells two same-titled markets apart ("Western Illinois" vs
+    "Eastern Illinois" under one game question). The ticker is shown because
+    it names the series: KXNCAAMBGAME and KXNCAAWBGAME are the men's and the
+    women's game under identical wording.
+
+    Args:
+        title (str): The market's question (Kalshi-controlled text).
+        subtitle (str): The market's outcome label ("" when absent).
+        ticker (str): The market's ticker.
+
+    Returns:
+        str: An HTML fragment, every Kalshi-controlled string escaped.
+    """
+    text = title if not subtitle or subtitle in title else f"{title} — {subtitle}"
+    return (f"{html.escape(text)} "
+            f"<span style='color:#9E9E9E;font-size:11px;'>{html.escape(ticker)}</span>")
+
+
+def _trade_row(t: BacktestTrade, color: str) -> str:
+    """
+    Render one best/worst-trade table row for a BacktestTrade.
+
+    Each leg is described in market order (A, then B): the side it bought, the
+    market, the date that market closed for trading and the price paid per
+    contract — and, separately, the side the market settled on and when, marked
+    won or lost for the side this trade held. Which side each leg bought comes
+    from scanner.leg_sides and the prices from backtester._leg_prices_for, the
+    same single sources the simulation priced and paid out with.
+
+    Args:
+        t (BacktestTrade): Trade to display.
+        color (str): CSS background color for the row (e.g. "#F9FBE7").
+
+    Returns:
+        str: An HTML <tr>...</tr> string: entry date, pair type, the YES and NO
+            prices paid, the trade details, the outcome, contract count,
+            fee-inclusive cost and profit/return.
+    """
+    side_a, side_b = leg_sides(t.pair_type)
+    price_a, price_b = _leg_prices_for(t.pair_type, t.entry_pA, t.entry_nA,
+                                       t.entry_pB, t.entry_nB)
+    paid = {side_a: price_a, side_b: price_b}
+    legs = (
+        (side_a, price_a, t.title_a, t.subtitle_a, t.ticker_a, t.close_date_a,
+         t.outcome_a, t.settled_date_a),
+        (side_b, price_b, t.title_b, t.subtitle_b, t.ticker_b, t.close_date_b,
+         t.outcome_b, t.settled_date_b),
+    )
+    details = "<br>".join(
+        f"<b>{side.upper()}</b> on {_leg_market(title, sub, ticker)} "
+        f"(closes {_fmt_day(closes)}) at ${price:.2f}"
+        for side, price, title, sub, ticker, closes, _, _ in legs
+    )
+    outcome = "<br>".join(
+        f"{name}: settled <b>{str(result).upper()}</b> on {_fmt_day(settled)} "
+        f"({'won' if result == side else 'lost'})"
+        for name, (side, _, _, _, _, _, result, settled) in zip(("A", "B"), legs, strict=True)
+    )
+    cell = "<td style='padding:4px 8px;vertical-align:top;'>"
+    return (f"<tr style='background:{color}'>"
+            f"{cell}{t.entry_date}</td>"
+            f"{cell}{html.escape(t.pair_type)}</td>"
+            f"{cell}${paid['yes']:.2f}</td>"
+            f"{cell}${paid['no']:.2f}</td>"
+            f"{cell}{details}</td>"
+            f"{cell}{outcome}</td>"
+            f"{cell}{t.n}</td>"
+            f"{cell}${t.total_cost + t.fees:.2f}</td>"
+            f"<td style='padding:4px 8px;vertical-align:top;"
+            f"color:{'#2E7D32' if t.profit >= 0 else '#C62828'}'>"
+            f"${t.profit:+.2f} ({t.profit_ratio:.1%})</td>"
+            f"</tr>")
+
+
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     """
     Build the "Trade-Level Diagnostics" HTML section.
 
     Renders a per-trade return distribution histogram, a slippage histogram, and
-    HTML tables listing the top 5 and worst 5 trades by dollar profit.
+    HTML tables listing the top 5 and worst 5 trades by dollar profit. Each row
+    (_trade_row) shows the YES and NO prices paid, each leg's side, market,
+    close date and price, and how each leg settled and when.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades to diagnose.
@@ -2195,48 +2605,21 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     best  = sorted_trades[:5]
     worst = sorted_trades[-5:]
 
-    def _trow(t: BacktestTrade, color: str) -> str:
-        """
-        Render a single HTML table row for a BacktestTrade.
-
-        Args:
-            t (BacktestTrade): Trade to display.
-            color (str): CSS background color string for the row (e.g. "#F9FBE7").
-
-        Returns:
-            str: An HTML <tr>...</tr> string with entry date, title, pair type,
-                contract count, total cost, and profit/return.
-        """
-        # title_a is Kalshi-controlled (market question text) and rendered
-        # into raw HTML below — escape it so a market title can't inject
-        # markup or break out of the <td>.
-        safe_title = html.escape(t.title_a[:40])
-        return (f"<tr style='background:{color}'>"
-                f"<td>{t.entry_date}</td>"
-                f"<td style='max-width:200px;overflow:hidden;white-space:nowrap;'>{safe_title}</td>"
-                f"<td>{t.pair_type}</td>"
-                f"<td>{t.n}</td>"
-                f"<td>${t.total_cost + t.fees:.2f}</td>"
-                f"<td style='color:{'#2E7D32' if t.profit>=0 else '#C62828'}'>"
-                f"${t.profit:+.2f} ({t.profit_ratio:.1%})</td>"
-                f"</tr>")
-
-    table_html = """
+    header = ("<th>Entry</th><th>Type</th><th>YES paid</th><th>NO paid</th>"
+              "<th>Trade details</th><th>Outcome</th><th>n</th>"
+              "<th>Cost incl. fees</th><th>Profit</th>")
+    table_html = f"""
 <div style="margin:16px 0; font-family:sans-serif;">
 <b>Top 5 Trades</b>
 <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
-<tr style="background:#E8F5E9;font-weight:bold;">
-  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost incl. fees</th><th>Profit</th>
-</tr>
-""" + "".join(_trow(t, "#F9FBE7") for t in best) + """
+<tr style="background:#E8F5E9;font-weight:bold;">{header}</tr>
+""" + "".join(_trade_row(t, "#F9FBE7") for t in best) + f"""
 </table>
 <br>
 <b>Worst 5 Trades</b>
 <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;">
-<tr style="background:#FFEBEE;font-weight:bold;">
-  <th>Entry</th><th>Title</th><th>Type</th><th>n</th><th>Cost incl. fees</th><th>Profit</th>
-</tr>
-""" + "".join(_trow(t, "#FFF8F8") for t in worst) + """
+<tr style="background:#FFEBEE;font-weight:bold;">{header}</tr>
+""" + "".join(_trade_row(t, "#FFF8F8") for t in worst) + """
 </table>
 </div>
 """
@@ -2494,17 +2877,21 @@ def generate_dashboard(
     *,
     sweep: BacktestSweep | None = None,
     interval_discount: float | None = None,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> Path:
     """
     Assemble all eight dashboard sections into a single self-contained HTML file.
 
     Calls each _section_*() builder in order, concatenates the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag, then
-    writes the file to PROJECT_ROOT. The output file is timestamped to
-    microsecond precision AND created exclusively, so multiple backtest runs can
-    be compared without overwriting previous results even when two runs finish in
-    the same second — which was observed happening under the old second-precision
-    name (TS-18).
+    writes the file to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
+    previous run's page (operator decision, 2026-09-25: one current dashboard
+    rather than a timestamped one per run, which TS-18 had made collision-free).
+    The page is written to a temporary file beside it first and then renamed
+    over it (os.replace, atomic on one filesystem), so a browser or a second
+    reader never sees a half-written page and a failed write leaves the
+    previous dashboard intact. Two runs finishing together each write a
+    complete page and the later rename wins.
 
     The two sweep-related parameters are keyword-only WITH defaults, so the
     existing four-argument positional call still works verbatim. Omit both and
@@ -2555,14 +2942,16 @@ def generate_dashboard(
             from `sweep` because that scatter needs it even on a run that
             produced no sweep. None (default) means "no override" and resolves
             to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+        series_categories (dict | None): historical.load_series_categories'
+            series ticker -> (category, tags) map, which the Returns
+            Decomposition section files each trade's P&L under. None (default)
+            falls back to each trade's ticker-prefix category.
 
     Returns:
-        Path: Absolute path to the HTML file actually created
-            (PROJECT_ROOT / "backtest_dashboard_YYYY-MM-DD_HHMMSS_ffffff.html",
-            with a "-1", "-2", … stem suffix on collision).
+        Path: Absolute path to the HTML file written,
+            PROJECT_ROOT / "backtest_dashboard.html".
     """
-    ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
-    out_path = PROJECT_ROOT / f"backtest_dashboard_{ts}.html"
+    out_path = PROJECT_ROOT / DASHBOARD_FILENAME
     # The window's last day for the Period line. UTC, like every other
     # "today" the backtest reads (TS-13).
     today = datetime.now(UTC).date()
@@ -2600,7 +2989,7 @@ def generate_dashboard(
 
     sections = [
         _section_performance(equity_df, trades, start_date, initial_balance),
-        _section_decomposition(trades),
+        _section_decomposition(trades, series_categories),
         _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k)
         _section_interval_discount(sweep),
@@ -2643,10 +3032,14 @@ def generate_dashboard(
 </body>
 </html>"""
 
-    # create_new_output hands back a binary handle, so encode explicitly rather
-    # than adding a text-mode parameter to the shared helper (TS-18)
-    out_path, fh = create_new_output(out_path)
-    with fh:
-        fh.write(page_html.encode("utf-8"))
+    # Written beside the target, then renamed over it: the rename is atomic,
+    # so the previous dashboard is replaced only by a complete page. The
+    # temporary name carries the pid so two concurrent runs never share one.
+    tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_bytes(page_html.encode("utf-8"))
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     logging.info("Dashboard written: %s", out_path)
     return out_path

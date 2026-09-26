@@ -402,6 +402,14 @@ class BacktestTrade:
             cannot be shown to be one event. Reporting only — it lets a report
             separate the ladder and cross-event populations, which price and
             settle identically here.
+        subtitle_a (str): Market A's outcome label ("" when absent).
+        subtitle_b (str): Market B's outcome label ("" when absent).
+        close_date_a (date | None): The date market A closed for trading.
+        close_date_b (date | None): The date market B closed for trading.
+        settled_date_a (date | None): The date market A settled.
+        settled_date_b (date | None): The date market B settled. All six are
+            reporting only, read by the dashboard's best/worst trade tables;
+            None/"" on a trade constructed without them.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -445,6 +453,19 @@ class BacktestTrade:
     # sizes, prices or settles on either field.
     event_ticker: str = ""
     same_event_ladder: bool = False
+    # Each leg's own market: its outcome label (the subtitle — for a game
+    # "Western Illinois", for a strike "$80,000 or above"), the date it closed
+    # for trading and the date it settled. Set by _simulate_at_discount for
+    # the dashboard's best/worst trade tables, which spell out what each leg
+    # bought and how it resolved; defaulted so a trade constructed without
+    # them (test fixtures) still builds. Reporting only — nothing sizes,
+    # prices or settles on any of them (exit_date is what settlement reads).
+    subtitle_a: str = ""
+    subtitle_b: str = ""
+    close_date_a: date | None = None
+    close_date_b: date | None = None
+    settled_date_a: date | None = None
+    settled_date_b: date | None = None
 
 
 @dataclass(frozen=True)
@@ -4605,6 +4626,9 @@ def _simulate_at_discount(
             "holding_days": holding_days,
             "title_a": title_a,
             "title_b": title_b,
+            # Per-leg dates for the dashboard's trade tables (reporting only)
+            "close_date_a": close_a_d, "close_date_b": close_b_d,
+            "settled_date_a": exit_date_a, "settled_date_b": exit_date_b,
             # Carried straight from _find_entry (None for same_title) so the
             # recorded trade reports the same gap the tier was chosen from
             "gap_days": entry["gap_days"],
@@ -4831,6 +4855,12 @@ def _simulate_at_discount(
             deadline_gap_days=c["gap_days"],
             event_ticker=event_a,
             same_event_ladder=is_ladder,
+            subtitle_a=mA.get("subtitle") or "",
+            subtitle_b=mB.get("subtitle") or "",
+            close_date_a=c["close_date_a"],
+            close_date_b=c["close_date_b"],
+            settled_date_a=c["settled_date_a"],
+            settled_date_b=c["settled_date_b"],
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit

@@ -5682,3 +5682,100 @@ class TestNothingIsMaterialized:
         during = [alive() for _record in out]
         assert len(during) == n and max(during) <= 2
         assert alive() == 0
+
+
+# ─── load_series_categories: Kalshi's official category + tags per series ──────
+
+class TestLoadSeriesCategories:
+    """One cached, read-only GET of /series; never raises, never ends a run."""
+
+    LISTING = {"series": [
+        {"ticker": "KXNCAAMBGAME", "category": "Sports", "tags": ["Basketball"]},
+        {"ticker": "KXFISAEXTEND", "category": "Politics", "tags": ["Congress"]},
+        {"ticker": "KXSCOTUSLAST", "category": "Politics", "tags": None},
+        {"ticker": "KXODD", "category": None, "tags": ["Tag", 7]},
+        {"category": "Sports"},                      # no ticker: skipped
+        "not an object",                              # skipped
+    ]}
+
+    @pytest.fixture
+    def cache(self, monkeypatch, tmp_path):
+        path = tmp_path / "series_categories.json"
+        monkeypatch.setattr(historical, "_SERIES_CATEGORIES_CACHE", path)
+        return path
+
+    def _stub(self, monkeypatch, response):
+        calls = []
+
+        def fake_get(client, path, **params):
+            calls.append((path, params))
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(historical, "_historical_get", fake_get)
+        return calls
+
+    def test_a_fetch_maps_every_series_and_is_cached(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        got = historical.load_series_categories(MagicMock())
+        assert got == {
+            "KXNCAAMBGAME": ("Sports", ("Basketball",)),
+            "KXFISAEXTEND": ("Politics", ("Congress",)),
+            "KXSCOTUSLAST": ("Politics", ()),
+            "KXODD": ("", ("Tag",)),
+        }
+        assert calls == [("/trade-api/v2/series", {})]
+        on_disk = json.loads(cache.read_text())
+        assert on_disk["series"]["KXNCAAMBGAME"] == ["Sports", ["Basketball"]]
+        assert datetime.fromisoformat(on_disk["fetched_at"]).tzinfo is not None
+
+    def test_a_fresh_cache_is_served_without_a_request(self, cache, monkeypatch):
+        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
+                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_categories(MagicMock()) == {"KXA": ("Sports", ("Soccer",))}
+        assert calls == []
+
+    def test_a_stale_cache_is_refetched(self, cache, monkeypatch):
+        old = datetime.now(UTC) - timedelta(seconds=historical.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS + 1)
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert "KXNCAAMBGAME" in historical.load_series_categories(MagicMock())
+        assert len(calls) == 1
+
+    def test_a_failed_fetch_falls_back_to_the_stale_copy(self, cache, monkeypatch, caplog):
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(MagicMock()) == {
+                "KXA": ("Sports", ("Soccer",))}
+        assert "using the cached copy of 1 series" in caplog.text
+
+    @pytest.mark.parametrize("response", [RuntimeError("offline"), ["a list"], {"series": []}])
+    def test_no_cache_and_no_listing_is_empty_not_an_error(self, cache, monkeypatch,
+                                                          caplog, response):
+        self._stub(monkeypatch, response)
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(MagicMock()) == {}
+        assert "falls back to ticker-prefix categories" in caplog.text
+        assert not cache.exists()
+
+    def test_a_paginated_listing_is_followed_and_a_repeated_cursor_stops(self, cache,
+                                                                        monkeypatch):
+        pages = iter([
+            {"series": [{"ticker": "KXA", "category": "Sports", "tags": []}], "cursor": "c1"},
+            {"series": [{"ticker": "KXB", "category": "World", "tags": []}], "cursor": "c1"},
+        ])
+        calls = []
+
+        def fake_get(client, path, **params):
+            calls.append(params)
+            return next(pages)
+
+        monkeypatch.setattr(historical, "_historical_get", fake_get)
+        assert set(historical.load_series_categories(MagicMock())) == {"KXA", "KXB"}
+        assert calls == [{}, {"cursor": "c1"}]

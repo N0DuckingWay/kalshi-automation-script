@@ -962,6 +962,15 @@ SETTLED_PREFILTER_CACHE_TAG = "monday-checkpoint-v2"
 # future-dated file; that rule predates this one and is left as it is.
 EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS = 86_400
 
+# How long historical.load_series_categories reuses its cached copy of Kalshi's
+# /series listing (every series' official category and tags — 14,391 series in
+# ONE response, measured 2026-09-25) before fetching it again. It feeds only the
+# backtest dashboard's returns-by-category breakdown, and a series' category
+# rarely changes, so a week is plenty; a series missing from the cached copy is
+# not refetched early — it reads as "Uncategorised" until the next refresh.
+# Seven days in seconds.
+SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS = 7 * 86_400
+
 # Hard cap on the per-ticker event-title fallback in
 # historical._load_or_build_event_titles. That fallback exists for the handful
 # of archived events the bulk listings no longer carry, and it costs ONE HTTP

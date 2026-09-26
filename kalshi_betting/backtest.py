@@ -22,7 +22,8 @@ Dependencies:
     closing corpus line tests a stamped post-cutoff verdict against the run's
     own trades with it, as the dashboard header does) from backtester.py,
     generate_dashboard from dashboard.py, and build_historical_client /
-    build_prod_live_client from historical.py. Imports from config.py:
+    build_prod_live_client / load_series_categories (the dashboard's
+    returns-by-category labels) from historical.py. Imports from config.py:
     PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo), the deadline-gap tier constants
@@ -108,7 +109,7 @@ from .config import (
     time_series_spread_too_wide,
 )
 from .dashboard import generate_dashboard
-from .historical import build_historical_client, build_prod_live_client
+from .historical import build_historical_client, build_prod_live_client, load_series_categories
 
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
@@ -492,8 +493,14 @@ def main() -> None:
     # the scenario explorer's band x k payload and the header's run-settings
     # line; interval_discount is the resolved k these trades were sized at,
     # which the Risk section's Kelly scatter must price on
+    #
+    # series_categories files each trade under Kalshi's own series category and
+    # tags for the Returns Decomposition breakdown: one cached read-only GET of
+    # /series, which never raises (it falls back to a stale copy or to {})
+    series_categories = load_series_categories(live_client)
     generate_dashboard(trades, equity_df, start_date, args.balance,
-                       sweep=result, interval_discount=result.primary.k)
+                       sweep=result, interval_discount=result.primary.k,
+                       series_categories=series_categories)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
 
 
