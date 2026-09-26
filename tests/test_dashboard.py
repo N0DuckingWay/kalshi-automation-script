@@ -30,6 +30,7 @@ import shutil
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -61,7 +62,10 @@ from kalshi_betting.dashboard import (
     _section_scenario_explorer,
 )
 
+# test_backtester as a module, never its classes: a Test* class imported
+# here would be collected twice
 from . import dashboard_golden
+from . import test_backtester as _tb
 
 _XSS_TITLE = "<script>alert(1)</script>Will BTC exceed $80k by December 2026 or later?"
 
@@ -1790,9 +1794,11 @@ class TestScenarioExplorerEmptyStates:
 
 
 class TestRunSettingsHeader:
-    """The page header names the primary spread band and the ladder setting,
-    under the Period line and above every section — both decide which pairs
-    exist, so they qualify the whole page."""
+    """The page header names the primary spread band, the ladder setting and
+    the per-trade size cap, under the Period line and above every section —
+    the first two decide which pairs exist and the cap how big every trade
+    is, so they qualify the whole page; whether the size-cap sweep ran says
+    why the filter bar's Size cap select offers one cap or many."""
 
     @staticmethod
     def _page(monkeypatch, tmp_path, **kwargs) -> str:
@@ -1807,7 +1813,7 @@ class TestRunSettingsHeader:
     def test_no_sweep_says_not_recorded(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         assert ("Primary spread band: not recorded | same-event ladders: not recorded"
-                in page)
+                " | per-trade cap: not recorded (size-cap sweep not recorded)</p>" in page)
         assert "strike-blind" not in page
         assert "Outcome-label coverage" not in page
 
@@ -1819,9 +1825,48 @@ class TestRunSettingsHeader:
                               label_coverage=_scn_coverage(), scenarios=[],
                               same_event_ladders=ladders)
         page = self._page(monkeypatch, tmp_path, sweep=sweep)
-        line = f"Primary spread band: max(tier,0.3)-0.6 | same-event ladders: {word}</p>"
+        # A hand-built point records no cap; a run with a census but no cap
+        # sweep ran with --no-cap-sweep
+        line = (f"Primary spread band: max(tier,0.3)-0.6 | same-event ladders: {word}"
+                " | per-trade cap: not recorded (size-cap sweep off, --no-cap-sweep)</p>")
         assert line in page
         assert page.index("Period:") < page.index(line) < page.index("Portfolio Performance")
+
+    @pytest.mark.parametrize("cap, cap_sweep, coverage, clause", [
+        (0.2, True, True, "per-trade cap: 20% (size-cap sweep on)"),
+        (0.2, False, True, "per-trade cap: 20% (size-cap sweep off, --no-cap-sweep)"),
+        # No census: this may be the infeasible window, which carries no cap
+        # sweep either — so it is not called "off"
+        (0.2, False, False, "per-trade cap: 20% (size-cap sweep not recorded)"),
+        (1.0, False, True, "per-trade cap: off (full Kelly) (size-cap sweep off, "
+                           "--no-cap-sweep)"),
+        (None, True, True, "per-trade cap: not recorded (size-cap sweep on)"),
+    ])
+    def test_the_cap_clause(self, cap, cap_sweep, coverage, clause):
+        pt = dataclasses.replace(_scn_point((0.3, 0.6), 0.75), size_cap=cap)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage() if coverage else None,
+                              cap_sweep=object() if cap_sweep else None,
+                              same_event_ladders=True)
+        line = dashboard._run_settings_html(sweep)
+        assert line.endswith(f"same-event ladders: on | {clause}</p>")
+
+    def test_a_cap_sweep_the_bar_could_not_use_says_so(self):
+        # The run carried a size-cap sweep, but the bar fell back to the
+        # run's own cap: the one-option Size cap select's reason is on the
+        # page, not only in the log (DR-66)
+        pt = dataclasses.replace(_scn_point((0.3, 0.6), 0.75), size_cap=0.2)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), cap_sweep=object(),
+                              same_event_ladders=True)
+        line = dashboard._run_settings_html(sweep, cap_sweep_unused=True)
+        assert line.endswith(
+            "per-trade cap: 20% (size-cap sweep on, but it could not be used — the filter "
+            "bar offers the run's own cap only; the log names why)</p>")
+        # Without a size-cap sweep there is nothing it could not use
+        off = dataclasses.replace(sweep, cap_sweep=None)
+        assert dashboard._run_settings_html(off, cap_sweep_unused=True) \
+            == dashboard._run_settings_html(off)
 
 
 class TestCorpusProvenanceHeader:
@@ -2397,7 +2442,7 @@ class TestEmpiricalKHatByBand:
         assert cells[2][1:] == ["0", "0.0000", "0.0000", "—"]
 
 
-# ═══ The page-wide filter: spread band x Kalshi category x tag ══════════════
+# ═══ The page-wide filter: spread band x k x size cap x category x tag ═══════
 
 _FLT_START = date(2026, 1, 5)
 _FLT_SERIES = {
@@ -2447,51 +2492,88 @@ def _flt_calibration(filed: list[tuple[str, str]]) -> IntervalCalibration:
                                buckets=[], excluded_premise_violations=0, observations=obs)
 
 
-def _flt_sweep():
-    """Three bands at k 0.75 (the primary, 0-1, holding every trade; 0.3-0.6
-    holding only the same-title ones; 0.3-1 an EQUAL copy of 0.3-0.6's list),
-    plus decoy points the filter must never read: another k at the primary
-    band AND at 0.3-0.6 (listed after that band's own point, so a filter that
-    ignored k would keep it), another population, and a point with no band.
-    Only the primary band carries a k-hat population; KXSPACEX has no trade
-    and no map entry, so its observation files under its fallback category,
-    "Science", which no trade carries."""
+def _flt_sweep(size_cap: float | None = 0.2) -> BacktestSweep:
+    """Three bands at k 0.75 — the primary, 0-1, holding every trade; 0.3-0.6
+    holding only the same-title ones; 0.3-1 an EQUAL copy of 0.3-0.6's list
+    — plus one more k at the primary band (0.60) and at 0.3-0.6 (1.00). The
+    bar's k axis is therefore 0.60 / 0.75 / 1.00 and the grid is ragged: (0-1,
+    1.00), (0.3-0.6, 0.60) and 0.3-1 at 0.60 and 1.00 were never simulated.
+    The k 0.60 and 1.00 points trade EQUAL lists (one same-title trade each),
+    which the bar still keeps apart: a list's Kelly scatter is priced at its
+    k. Two points the bar must never read: another population at 0.3-0.6 and
+    k 0.75, and a point with no band. Every point is stamped `size_cap` — the
+    run's own cap, 0.2 as production stamps it (the summary then reads "20%
+    cap per trade"; None pins "cap not recorded"). Only the primary band
+    carries a k-hat population; KXSPACEX has no trade and no map entry, so its
+    observation files under its fallback category, "Science", which no trade
+    carries."""
     trades = _flt_trades()
     st = [t for t in trades if t.pair_type == "same_title"]
     curve = backtester._build_equity_curve
-    primary = SweepPoint(k=0.75, trades=trades, equity_df=curve(trades, _FLT_START, 1000.0),
-                         spread_band=(0.0, 1.0), population="all")
-    narrow = SweepPoint(k=0.75, trades=st, equity_df=curve(st, _FLT_START, 1000.0),
-                        spread_band=(0.3, 0.6), population="all")
-    wide = SweepPoint(k=0.75, trades=list(st), equity_df=curve(st, _FLT_START, 1000.0),
-                      spread_band=(0.3, 1.0), population="all")
-    one = curve(st[:1], _FLT_START, 1000.0)
-    decoys = [
-        SweepPoint(k=0.60, trades=st[:1], equity_df=one, spread_band=(0.0, 1.0),
-                   population="all"),
-        SweepPoint(k=1.00, trades=st[:1], equity_df=one, spread_band=(0.3, 0.6),
-                   population="all"),
-        SweepPoint(k=0.75, trades=st[:1], equity_df=one, spread_band=(0.3, 0.6),
-                   population="time_series"),
-        SweepPoint(k=0.75, trades=st[:1], equity_df=one, spread_band=None, population="all"),
+
+    def point(k, listed, band, population="all"):
+        return SweepPoint(k=k, trades=listed, equity_df=curve(listed, _FLT_START, 1000.0),
+                          spread_band=band, population=population, size_cap=size_cap)
+
+    primary = point(0.75, trades, (0.0, 1.0))
+    others = [
+        point(0.75, st, (0.3, 0.6)),
+        point(0.75, list(st), (0.3, 1.0)),
+        point(0.60, st[:1], (0.0, 1.0)),
+        point(1.00, st[:1], (0.3, 0.6)),
+        point(0.75, st[:1], (0.3, 0.6), population="time_series"),
+        point(0.75, st[:1], None),
     ]
     cals = {(0.0, 1.0): _flt_calibration([("KXNHLHART-27", "Other"),
                                           ("KXSPACEX-14", "Science"),
                                           ("KXOTHER-1", "Other")]),
             (0.3, 0.6): None, (0.3, 1.0): None}
     return BacktestSweep(primary=primary, points=[primary], calibration=cals[(0.0, 1.0)],
-                         label_coverage=_scn_coverage(),
-                         scenarios=[primary, narrow, wide, *decoys],
+                         label_coverage=_scn_coverage(), scenarios=[primary, *others],
                          calibrations_by_band=cals, same_event_ladders=True)
 
 
+# The flt fixture's primary scenario: band 0-1, k 0.75, the one cap
+_FLT_PRIMARY = (0, 1, 0)
+
+# One packed block of the page: <script type="text/plain" id=... data-encoding=...>
+_PACKED = re.compile(
+    r'<script type="text/plain" id="([^"]+)" data-encoding="gzip\+base64">([^<]*)</script>')
+
+
+def _decode_block(body: str) -> dict:
+    """A packed block's body, inflated as the script inflates it (base64, then
+    gzip) and parsed strictly (a NaN/Infinity token fails the test)."""
+    raw = gzip.decompress(base64.b64decode(body, validate=True))
+    return json.loads(raw.decode("utf-8"), parse_constant=_fail_on_constant)
+
+
+def _unpack(block: str) -> dict:
+    """One packed <script> element (_packed_json_script's output), decoded."""
+    return _decode_block(_PACKED.fullmatch(block).group(2))
+
+
+def _packed_blocks(page: str) -> dict[str, dict]:
+    """Every packed block on a page, decoded, by element id."""
+    return {element_id: _decode_block(body) for element_id, body in _PACKED.findall(page)}
+
+
+def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES):
+    """Walk a grid as generate_dashboard does: (the grid walked, the base
+    block, {chunk id: chunk})."""
+    walked, chunker, _ = dashboard._build_filter_grid(
+        source, trades, curve, k_used, _FLT_START, 1000.0, series)
+    base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, series)
+    return walked, base, {cid: _unpack(block) for cid, block in enumerate(chunker.chunks)}
+
+
 def _flt_payload(sweep=None):
+    """(sweep, the grid walked, the base block, {chunk id: chunk}) — the
+    page-wide filter as generate_dashboard builds it, at k 0.75."""
     sweep = sweep or _flt_sweep()
-    runs, primary_idx = dashboard._band_runs(sweep, sweep.primary.trades,
-                                             sweep.primary.equity_df)
-    payload = dashboard._filter_payload(runs, primary_idx, _FLT_START, 1000.0,
-                                        _FLT_SERIES, 0.75, "k = 0.75")
-    return sweep, runs, primary_idx, payload
+    trades, curve = sweep.primary.trades, sweep.primary.equity_df
+    source = dashboard._grid_source(sweep, trades, curve, 0.75)
+    return (sweep, *_flt_walk(source, trades, curve))
 
 
 def _expand(sparse: list, n: int) -> list:
@@ -2506,82 +2588,173 @@ def _expand(sparse: list, n: int) -> list:
     return out
 
 
-def _view(payload: dict, band: int, key: str) -> dict:
-    return payload["lists"][payload["bands"][band]["list"]]["views"][key]
+def _chunk_at(base: dict, chunks: dict, bi: int, ki: int, ci: int) -> dict:
+    """The chunk behind one scenario (grid[band][k][cap])."""
+    return chunks[base["grid"][bi][ki][ci]]
 
 
-def _key(payload: dict, category: str, tag: str | None = None) -> str:
-    ci = payload["categories"].index(category)
+def _view(base: dict, chunks: dict, bi: int, ki: int, ci: int, key: str) -> dict:
+    """One view of one scenario's list."""
+    return _chunk_at(base, chunks, bi, ki, ci)["list"]["views"][key]
+
+
+def _key(base: dict, category: str, tag: str | None = None) -> str:
+    ci = base["categories"].index(category)
     if tag is None:
         return f"c{ci}"
-    return f"s{payload['subcats'].index([ci, tag])}"
+    return f"s{base['subcats'].index([ci, tag])}"
 
 
-class TestFilterBandRuns:
-    """Which run each spread band the bar offers shows."""
+def _phrase(base: dict, bi: int, ki: int, ci: int) -> str:
+    """A scenario in the summary's words, from the base block, as the script
+    builds it (D.text.scenario)."""
+    return dashboard._scenario_phrase(base["bands"][bi]["where"], base["ks"][ki]["text"],
+                                      base["caps"][ci]["text"])
 
-    def test_each_band_is_its_all_point_at_the_primary_k(self):
+
+def _row_html(base: dict, chunk: dict, pairs: list) -> list[str]:
+    """Best/worst rows as the script joins them: head from the base block's
+    shared table, tail from the chunk's own strings."""
+    return [base["rows"][h] + chunk["strings"][t] for h, t in pairs]
+
+
+class TestFilterGrid:
+    """Which scenario each band x k x size cap the bar offers shows, and which
+    chunk carries it."""
+
+    def test_the_axes_are_every_band_k_and_cap_the_sweep_simulated(self):
+        _, source, base, _ = _flt_payload()
+        assert source.bands == ((0.0, 1.0), (0.3, 0.6), (0.3, 1.0))
+        assert source.ks == (0.6, 0.75, 1.0)
+        assert source.caps == (0.2,)
+        assert source.primary == _FLT_PRIMARY and base["primary"] == list(_FLT_PRIMARY)
+        assert [b["label"] for b in base["bands"]] == [
+            dashboard._row_label(b) for b in source.bands]
+        assert [(k["label"], k["text"], k["value"]) for k in base["ks"]] == [
+            ("k = 0.60", "k = 0.60", 0.6), ("k = 0.75", "k = 0.75", 0.75),
+            ("k = 1.00", "k = 1.00", 1.0)]
+        assert base["caps"] == [{"label": "20%", "text": "20% cap per trade", "value": 0.2}]
+
+    def test_a_scenario_the_sweep_never_simulated_is_null(self):
+        _, _, base, chunks = _flt_payload()
+        grid = base["grid"]
+        assert [[grid[b][k][0] is None for k in range(3)] for b in range(3)] == [
+            [False, False, True], [True, False, False], [True, False, True]]
+        # Another population never makes a cell: 0.3-0.6 at k 0.75 is its
+        # "all" point (3 trades), not the one-trade "time_series" point
+        assert _view(base, chunks, 1, 1, 0, "all")["n"] == 3
+        # Each extra k is its own run
+        assert _view(base, chunks, 0, 0, 0, "all")["n"] == 1
+
+    def test_the_primary_scenario_is_what_the_page_renders(self):
+        # The page's own trades and curve (not the sweep's point looked up
+        # again) build the primary chunk — chunk 0, the first built. Both
+        # differ in CONTENT from the sweep's primary here (one trade fewer,
+        # another with a different profit, the curve shifted), so a chunk
+        # built from the sweep's trades or curve cannot pass
         sweep = _flt_sweep()
-        runs, primary_idx = dashboard._band_runs(sweep, sweep.primary.trades,
-                                                 sweep.primary.equity_df)
-        assert [r.band for r in runs] == [(0.0, 1.0), (0.3, 0.6), (0.3, 1.0)]
-        assert primary_idx == 0
-        assert [r.label for r in runs] == [dashboard._row_label(r.band) for r in runs]
-        # Never another k's point (0.3-0.6 has one listed after its own),
-        # another population's, or a point with no band
-        assert [len(r.trades) for r in runs] == [5, 3, 3]
-        assert runs[1].trades is sweep.scenarios[1].trades
-        assert runs[0].calibration is sweep.calibration
-        assert runs[1].calibration is runs[2].calibration is None
+        page_trades = [dataclasses.replace(t, profit=t.profit + 50.0,
+                                           profit_ratio=t.profit_ratio + 0.5) if i == 0 else t
+                       for i, t in enumerate(sweep.primary.trades[:4])]
+        page_curve = sweep.primary.equity_df.assign(
+            portfolio_value=sweep.primary.equity_df["portfolio_value"] + 1.0)
+        source = dashboard._grid_source(sweep, page_trades, page_curve, 0.75)
+        _, base, chunks = _flt_walk(source, page_trades, page_curve)
+        assert base["grid"][0][1][0] == 0
+        chunk = _chunk_at(base, chunks, *_FLT_PRIMARY)
+        view = chunk["list"]["views"]["all"]
+        assert view["n"] == len(page_trades) == 4
+        assert chunk["list"]["ret"] == pytest.approx(
+            [t.profit_ratio * 100 for t in page_trades])
+        best, worst = dashboard._best_and_worst(page_trades)
+        assert _row_html(base, chunk, view["best"]) == [
+            dashboard._trade_row(t, dashboard._BEST_ROW_COLOR) for t in best]
+        assert _row_html(base, chunk, view["worst"]) == [
+            dashboard._trade_row(t, dashboard._WORST_ROW_COLOR) for t in worst]
+        assert _expand(view["eq"], len(base["dates"])) == pytest.approx(
+            list(page_curve["portfolio_value"]))
 
-    def test_the_primary_band_is_what_the_page_renders(self):
-        sweep = _flt_sweep()
-        page_trades, page_curve = list(sweep.primary.trades), sweep.primary.equity_df.copy()
-        runs, i = dashboard._band_runs(sweep, page_trades, page_curve)
-        assert runs[i].trades is page_trades and runs[i].equity_df is page_curve
+    def test_the_primary_band_s_calibration_falls_back_to_the_sweep_s(self):
+        sweep, source, _, _ = _flt_payload()
+        assert source.calibrations[(0.0, 1.0)] is sweep.calibration
+        assert source.calibrations[(0.3, 0.6)] is source.calibrations[(0.3, 1.0)] is None
+        # A sweep whose per-band map lacks the primary band still has one
+        bare = dataclasses.replace(sweep, calibrations_by_band={})
+        source = dashboard._grid_source(bare, bare.primary.trades, bare.primary.equity_df, 0.75)
+        assert source.calibrations[(0.0, 1.0)] is sweep.calibration
+        assert source.calibrations[(0.3, 0.6)] is None
 
-    def test_no_sweep_or_no_recorded_band_is_one_unlabelled_run(self):
-        trades = _flt_trades()
-        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        runs, i = dashboard._band_runs(None, trades, curve)
-        assert (i, [(r.band, r.label) for r in runs]) == (0, [(None, "not recorded")])
-        hand_built = BacktestSweep(primary=SweepPoint(k=0.75, trades=trades, equity_df=curve),
-                                   points=[], calibration=None)
-        runs, i = dashboard._band_runs(hand_built, trades, curve)
-        assert [(r.band, r.label) for r in runs] == [(None, "not recorded")]
+    def test_equal_lists_share_a_chunk_only_at_the_same_k(self):
+        _, _, base, chunks = _flt_payload()
+        grid = base["grid"]
+        # 0.3-0.6 and 0.3-1 traded equal lists at k 0.75: one chunk
+        assert grid[1][1][0] == grid[2][1][0]
+        # (0-1, 0.60) and (0.3-0.6, 1.00) traded equal lists at two ks: two
+        assert grid[0][0][0] != grid[1][2][0]
+        assert len(chunks) == 4
+        assert sorted({c for band in grid for ks in band for c in ks if c is not None}) \
+            == [0, 1, 2, 3]
 
-    def test_bands_with_equal_trades_share_one_list(self):
-        _, _, _, payload = _flt_payload()
-        assert [b["list"] for b in payload["bands"]] == [0, 1, 1]
-        assert len(payload["lists"]) == 2
-
-    def test_the_primary_list_is_built_first(self):
+    def test_the_primary_chunk_is_built_first(self):
         # The primary band sorts SECOND here, and a band before it trades the
-        # same list: the shared list must keep the primary's own curve (the
-        # page's), not the other band's (a curve built later can run a day on)
+        # same list at the same k: the shared chunk must keep the primary's
+        # own curve (the page's), not the other band's (a curve built later can
+        # run a day on)
         st = [t for t in _flt_trades() if t.pair_type == "same_title"]
         page_curve = backtester._build_equity_curve(st, _FLT_START, 1000.0)
         other_curve = page_curve.assign(portfolio_value=page_curve["portfolio_value"] + 1.0)
         primary = SweepPoint(k=0.75, trades=st, equity_df=page_curve,
-                             spread_band=(0.3, 0.6), population="all")
+                             spread_band=(0.3, 0.6), population="all", size_cap=0.2)
         other = SweepPoint(k=0.75, trades=list(st), equity_df=other_curve,
-                           spread_band=(0.0, 1.0), population="all")
+                           spread_band=(0.0, 1.0), population="all", size_cap=0.2)
         sweep = BacktestSweep(primary=primary, points=[primary], calibration=None,
                               scenarios=[primary, other])
-        _, runs, primary_idx, payload = _flt_payload(sweep)
-        assert primary_idx == 1 and [b["list"] for b in payload["bands"]] == [0, 0]
-        n = len(payload["dates"])
-        assert _expand(_view(payload, 0, "all")["eq"], n) == pytest.approx(
-            list(page_curve["portfolio_value"]))
+        _, source, base, chunks = _flt_payload(sweep)
+        assert source.primary == (1, 0, 0) and base["grid"] == [[[0]], [[0]]]
+        assert _expand(_view(base, chunks, 0, 0, 0, "all")["eq"], len(base["dates"])) \
+            == pytest.approx(list(page_curve["portfolio_value"]))
+
+    def test_no_sweep_or_no_recorded_band_is_one_unlabelled_scenario(self):
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        source = dashboard._grid_source(None, trades, curve, None)
+        assert (source.bands, source.ks, source.caps, source.primary) == (
+            (None,), (None,), (None,), (0, 0, 0))
+        _, base, chunks = _flt_walk(source, trades, curve, k_used=None)
+        assert base["bands"] == [{"label": "not recorded",
+                                  "where": "the primary spread band (not recorded)"}]
+        assert base["ks"] == [{"label": "not recorded", "text": "k not recorded",
+                               "value": None}]
+        assert base["caps"] == [{"label": "not recorded", "text": "cap not recorded",
+                                 "value": None}]
+        assert base["grid"] == [[[0]]] and len(chunks) == 1
+        hand_built = BacktestSweep(primary=SweepPoint(k=0.75, trades=trades, equity_df=curve),
+                                   points=[], calibration=None)
+        source = dashboard._grid_source(hand_built, trades, curve, 0.75)
+        assert (source.bands, source.ks, source.caps) == ((None,), (0.75,), (None,))
+
+    def test_a_no_band_sweep_keeps_every_k(self):
+        # A hand-built multi-k sweep with no band: one "not recorded" band,
+        # and a scenario per swept k
+        trades = _flt_trades()
+        points = [SweepPoint(k=k, trades=trades[:n],
+                             equity_df=backtester._build_equity_curve(trades[:n], _FLT_START,
+                                                                      1000.0))
+                  for k, n in ((0.9, 3), (0.6, 1), (0.75, 5))]
+        sweep = BacktestSweep(primary=points[2], points=points, calibration=None)
+        _, source, base, chunks = _flt_payload(sweep)
+        assert (source.bands, source.ks, source.primary) == ((None,), (0.6, 0.75, 0.9),
+                                                            (0, 1, 0))
+        assert [_view(base, chunks, 0, ki, 0, "all")["n"] for ki in range(3)] == [1, 5, 3]
 
 
 class TestFilterViews:
     """Every view's figures, computed by the helpers the sections render with."""
 
     def test_the_default_view_is_exactly_the_rendered_page(self):
-        sweep, _, _, payload = _flt_payload()
+        sweep, _, base, chunks = _flt_payload()
         trades, curve = sweep.primary.trades, sweep.primary.equity_df
-        view = _view(payload, payload["primary"], "all")
+        view = _view(base, chunks, *base["primary"], "all")
         kpis = dashboard._performance_kpis(curve, trades, 1000.0)
         assert view["kpi"] == {key: value for key, _, value, _ in kpis}
         section = dashboard._section_performance(curve, trades, _FLT_START, 1000.0)
@@ -2591,7 +2764,7 @@ class TestFilterViews:
         rel = dashboard._reliability(trades)
         assert view["cal"]["brier"] == f"{rel['brier']:.4f}"
         # The sparse series expand back to the curve the section draws
-        n = len(payload["dates"])
+        n = len(base["dates"])
         assert _expand(view["eq"], n) == pytest.approx(list(curve["portfolio_value"]))
         total, _, drawdown = dashboard._performance_series(curve, trades, 1000.0)
         assert _expand(view["total"], n) == pytest.approx(list(total), abs=1e-4)
@@ -2600,27 +2773,27 @@ class TestFilterViews:
         assert _expand(view["dep"], n) == pytest.approx(deployed, abs=0.01)
 
     def test_categories_and_tags_partition_the_band(self):
-        _, _, _, payload = _flt_payload()
-        lst = payload["lists"][0]
-        assert payload["categories"] == ["Commodities", "Other", "Science", "Sports"]
-        assert payload["subcats"] == [[0, "Oil & Gas"], [1, "General"], [2, "General"],
-                                      [3, "Basketball"], [3, "Hockey"]]
+        _, _, base, chunks = _flt_payload()
+        lst = _chunk_at(base, chunks, *_FLT_PRIMARY)["list"]
+        assert base["categories"] == ["Commodities", "Other", "Science", "Sports"]
+        assert base["subcats"] == [[0, "Oil & Gas"], [1, "General"], [2, "General"],
+                                   [3, "Basketball"], [3, "Hockey"]]
         n_all = lst["views"]["all"]["n"]
         cats = {ci: lst["views"][f"c{ci}"]["n"] for ci in range(4) if f"c{ci}" in lst["views"]}
         assert sum(cats.values()) == n_all == 5
         for ci, n_cat in cats.items():
-            subs = [lst["views"][f"s{si}"]["n"] for si, (c, _) in enumerate(payload["subcats"])
+            subs = [lst["views"][f"s{si}"]["n"] for si, (c, _) in enumerate(base["subcats"])
                     if c == ci and f"s{si}" in lst["views"]]
             assert sum(subs) == n_cat
         # FIRST tag only: KXBRENTW's second tag ("Energy") files nothing
-        assert [0, "Energy"] not in payload["subcats"]
+        assert [0, "Energy"] not in base["subcats"]
 
     def test_a_slice_shows_its_trades_contribution(self):
-        _, _, _, payload = _flt_payload()
-        view = _view(payload, 0, _key(payload, "Sports"))
+        _, _, base, chunks = _flt_payload()
+        view = _view(base, chunks, *_FLT_PRIMARY, _key(base, "Sports"))
         sports = [t for t in _flt_trades() if t.event_ticker.startswith(("KXNCAA", "KXNHL"))]
         assert view["n"] == len(sports) == 3
-        n = len(payload["dates"])
+        n = len(base["dates"])
         pnl = sum(t.profit for t in sports)
         assert _expand(view["eq"], n)[-1] == pytest.approx(1000.0 + pnl, abs=0.01)
         assert _expand(view["total"], n)[-1] == pytest.approx(pnl / 1000.0 * 100, abs=1e-4)
@@ -2630,40 +2803,51 @@ class TestFilterViews:
         assert [label for label, _ in view["types"]] == ["Same-title", "Time-series: ladder"]
 
     def test_best_and_worst_rows_are_the_slices_own(self):
-        _, _, _, payload = _flt_payload()
-        key = _key(payload, "Sports", "Basketball")
-        view = _view(payload, 0, key)
+        _, _, base, chunks = _flt_payload()
+        key = _key(base, "Sports", "Basketball")
+        chunk = _chunk_at(base, chunks, *_FLT_PRIMARY)
+        view = chunk["list"]["views"][key]
         basketball = [t for t in _flt_trades() if t.event_ticker.startswith("KXNCAA")]
         best, worst = dashboard._best_and_worst(basketball)
-        assert [payload["strings"][i] for i in view["best"]] == [
+        # Each row is its shared head and its chunk's own tail, joined: the
+        # exact row the diagnostics section renders
+        assert _row_html(base, chunk, view["best"]) == [
             dashboard._trade_row(t, dashboard._BEST_ROW_COLOR) for t in best]
-        assert [payload["strings"][i] for i in view["worst"]] == [
+        assert _row_html(base, chunk, view["worst"]) == [
             dashboard._trade_row(t, dashboard._WORST_ROW_COLOR) for t in worst]
-        lst = payload["lists"][0]
+        for t in best:
+            assert dashboard._trade_row(t, "#FFF") == (
+                dashboard._trade_row_head(t, "#FFF") + dashboard._trade_row_tail(t))
+            # The head does not depend on the size: another n, the same head
+            resized = dataclasses.replace(t, n=t.n + 7, profit=t.profit * 2)
+            assert dashboard._trade_row_head(resized, "#FFF") == \
+                dashboard._trade_row_head(t, "#FFF")
+            assert dashboard._trade_row_tail(resized) != dashboard._trade_row_tail(t)
+        lst = chunk["list"]
         assert [lst["ret"][i] for i in view["idx"]] == pytest.approx(
             [t.profit_ratio * 100 for t in basketball])
 
     def test_a_band_without_a_category_has_no_view_for_it(self):
-        _, _, _, payload = _flt_payload()
-        narrow = payload["lists"][payload["bands"][1]["list"]]["views"]
-        assert _key(payload, "Sports", "Hockey") not in narrow
-        assert payload["empty"]["n"] == 0
-        n = len(payload["dates"])
-        assert set(_expand(payload["empty"]["eq"], n)) == {1000.0}
+        _, _, base, chunks = _flt_payload()
+        narrow = _chunk_at(base, chunks, 1, 1, 0)["list"]["views"]
+        assert _key(base, "Sports", "Hockey") not in narrow
+        assert base["empty"]["n"] == 0
+        n = len(base["dates"])
+        assert set(_expand(base["empty"]["eq"], n)) == {1000.0}
 
     def test_a_category_seen_only_in_khat_observations_is_offered(self):
-        _, _, _, payload = _flt_payload()
+        _, _, base, chunks = _flt_payload()
         # KXSPACEX has no trade and no map entry: its observation still files
         # it under its fallback category, which the bar must offer for the
         # k-hat breakdown (with no trade view behind it — the trade sections
         # show the empty view)
-        assert "Science" in payload["categories"]
-        assert _key(payload, "Science") not in payload["lists"][0]["views"]
+        assert "Science" in base["categories"]
+        assert _key(base, "Science") not in _chunk_at(base, chunks, *_FLT_PRIMARY)["list"]["views"]
 
     def test_an_empty_view_reports_no_drawdown_date(self):
         # A flat curve never falls, so there is no trough to date
-        _, _, _, payload = _flt_payload()
-        assert payload["empty"]["kpi"]["max_drawdown"] == "0.0%"
+        _, _, base, _ = _flt_payload()
+        assert base["empty"]["kpi"]["max_drawdown"] == "0.0%"
 
     def test_a_slice_curve_is_cut_at_the_pages_axis(self):
         # A page whose own curve stops early (built before midnight UTC, say):
@@ -2675,15 +2859,15 @@ class TestFilterViews:
         sweep = BacktestSweep(
             primary=SweepPoint(k=0.75, trades=trades, equity_df=cut, spread_band=(0.0, 1.0)),
             points=[], calibration=None)
-        _, _, _, payload = _flt_payload(sweep)
+        _, _, base, chunks = _flt_payload(sweep)
         sports = [t for t in trades if t.event_ticker.startswith(("KXNCAA", "KXNHL"))]
         slice_curve = backtester._build_equity_curve(sports, _FLT_START, 1000.0)
         on_axis = slice_curve[pd.to_datetime(slice_curve["date"])
-                              <= pd.Timestamp(payload["dates"][-1])]
+                              <= pd.Timestamp(base["dates"][-1])]
         assert len(on_axis) == len(cut) < len(slice_curve)
         kpis = {k: v for k, _, v, _ in dashboard._performance_kpis(on_axis, sports, 1000.0)}
         uncut = {k: v for k, _, v, _ in dashboard._performance_kpis(slice_curve, sports, 1000.0)}
-        view = _view(payload, 0, _key(payload, "Sports"))
+        view = _view(base, chunks, 0, 0, 0, _key(base, "Sports"))
         assert view["kpi"] == kpis != uncut
 
     def test_the_sparse_encoding_round_trips_and_gaps_are_none(self):
@@ -2697,7 +2881,7 @@ class TestFilterViews:
 
 
 class TestFilterPage:
-    """The bar, the data block and the script, on a whole rendered page."""
+    """The bar, the data blocks and the script, on a whole rendered page."""
 
     def _page(self, monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> str:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
@@ -2711,25 +2895,40 @@ class TestFilterPage:
 
     @staticmethod
     def _data(page: str) -> dict:
-        """The filter block, inflated as the script inflates it (base64, then
-        gzip) and parsed strictly (a NaN/Infinity token fails the test)."""
+        """The base block (id="dash-data"), inflated as the script inflates it
+        (base64, then gzip) and parsed strictly (a NaN/Infinity token fails the
+        test)."""
         opening = '<script type="text/plain" id="dash-data" data-encoding="gzip+base64">'
         start = page.index(opening) + len(opening)
         end = page.index("</script>", start)
-        raw = gzip.decompress(base64.b64decode(page[start:end], validate=True))
-        return json.loads(raw.decode("utf-8"), parse_constant=_fail_on_constant)
+        return _decode_block(page[start:end])
+
+    @staticmethod
+    def _chunks(page: str) -> dict[int, dict]:
+        """Every scenario chunk on the page (id="dash-chunk-<i>"), by chunk
+        id, inflated and parsed strictly."""
+        return {int(element_id[len("dash-chunk-"):]): data
+                for element_id, data in _packed_blocks(page).items()
+                if element_id.startswith("dash-chunk-")}
 
     def test_the_bar_preselects_the_primary_and_counts_its_trades(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
+        options = r'<option value="(\d+)"( selected)?>(.*?)</option>'
         band = re.search(r'<select id="flt-band"[^>]*>(.*?)</select>', page).group(1)
-        assert re.findall(r'<option value="(\d+)"( selected)?>(.*?)</option>', band) == [
+        assert re.findall(options, band) == [
             ("0", " selected", "max(tier,0)-1 (primary)"),
             ("1", "", "max(tier,0.3)-0.6"), ("2", "", "max(tier,0.3)-1")]
+        ks = re.search(r'<select id="flt-k"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(options, ks) == [
+            ("0", "", "k = 0.60"), ("1", " selected", "k = 0.75 (primary)"),
+            ("2", "", "k = 1.00")]
+        caps = re.search(r'<select id="flt-cap"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(options, caps) == [("0", " selected", "20% (primary)")]
         cats = re.search(r'<select id="flt-cat"[^>]*>(.*?)</select>', page).group(1)
         assert re.findall(r"<option value=\"\d*\">(.*?)</option>", cats) == [
             "All categories", "Commodities (1)", "Other (1)", "Science (0)", "Sports (3)"]
         assert ("Showing every trade of the run at the primary spread band max(tier,0)-1, "
-                "k = 0.75: 5 trades. Not filtered by this bar: "
+                "k = 0.75, 20% cap per trade: 5 trades. Not filtered by this bar: "
                 f"{dashboard._UNFILTERED_SECTIONS}.") in page
         assert re.search(r'Trades found: <span id="hdr-trades">5</span>', page)
 
@@ -2738,7 +2937,7 @@ class TestFilterPage:
         # Disabled until the script has inflated its data; autocomplete off,
         # so a reload cannot restore a choice the rendered page is not showing
         page = self._page(monkeypatch, tmp_path)
-        for sel in ("flt-band", "flt-cat", "flt-tag"):
+        for sel in ("flt-band", "flt-k", "flt-cap", "flt-cat", "flt-tag"):
             assert f'<select id="{sel}" disabled autocomplete="off">' in page
 
     def test_the_block_is_strict_json_and_escapes_kalshi_text(self, monkeypatch, tmp_path):
@@ -2750,15 +2949,19 @@ class TestFilterPage:
         series = {"KXNCAAMBGAME": ("<i>Sports</i>", ("B</script>",))}
         page = self._page(monkeypatch, tmp_path, sweep, series)
         data = self._data(page)            # strict: a NaN/Infinity token fails
+        chunks = self._chunks(page)        # every chunk, strictly too
         assert "<i>Sports</i>" in data["categories"]
-        assert all("<b>" not in text for text in data["lists"][0]["kt"])
+        assert all("<b>" not in text for text in chunks[0]["list"]["kt"])
         bar = page[page.index('<div id="flt-bar"'):page.index("</select>", page.index('id="flt-tag"'))]
         assert "<i>" not in bar and "&lt;i&gt;Sports&lt;/i&gt;" in bar
-        # Base64 has no "<", so nothing inside the block can close it early:
-        # the block ends exactly where the encoded bytes end
-        opening = 'data-encoding="gzip+base64">'
-        block = page[page.index(opening) + len(opening):]
-        assert re.fullmatch(r"[A-Za-z0-9+/=]+", block[:block.index("</script>")])
+        # Base64 has no "<", so nothing inside a block can close it early:
+        # each block ends exactly where its encoded bytes end
+        blocks = re.findall(r'id="(dash-[a-z0-9-]+)" data-encoding="gzip\+base64">', page)
+        assert blocks[-1] == "dash-data" and len(blocks) == len(chunks) + 1
+        for element_id in blocks:
+            opening = f'id="{element_id}" data-encoding="gzip+base64">'
+            body = page[page.index(opening) + len(opening):]
+            assert re.fullmatch(r"[A-Za-z0-9+/=]+", body[:body.index("</script>")])
 
     def test_the_block_encodes_deterministically(self):
         payload = {"a": [1.5, float("nan")], "b": "</script>"}
@@ -2775,14 +2978,24 @@ class TestFilterPage:
             _flt_sweep().primary.equity_df, _flt_trades(), 1000.0)}
         dynamic |= {f"{p}-{part}" for p in ("dec", "cal", "diag", "risk", "khat")
                     for part in ("empty", "body")}
+        # 'dash-chunk-' + id: every scenario's chunk the grid names
+        grid = self._data(page)["grid"]
+        chunk_ids = {c for band in grid for ks in band for c in ks if c is not None}
+        dynamic |= {f"dash-chunk-{c}" for c in chunk_ids}
         missing = sorted(i for i in literal | dynamic if f'id="{i}"' not in page)
-        assert literal and not missing
+        assert literal and chunk_ids and not missing
+        assert "'dash-chunk-' + id" in js
 
     def test_the_script_comes_after_every_section(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         assert page.index('id="flt-bar"') < page.index("Portfolio Performance")
-        assert page.index("Benchmark Comparison") < page.index('id="dash-data"')
-        assert page.index('id="dash-data"') < page.index("function inflate()")
+        script = page.index("function inflate(el)")
+        chunk_at = [page.index(f'id="dash-chunk-{c}"') for c in sorted(self._chunks(page))]
+        # Every chunk and the base block sit after the sections and before the
+        # script: an element a script reaches exists when it runs
+        assert page.index("Benchmark Comparison") < chunk_at[0]
+        assert chunk_at == sorted(chunk_at)
+        assert chunk_at[-1] < page.index('id="dash-data"') < script
 
     def test_every_redrawn_chart_is_captured_as_python_drew_it(self):
         # redraw() starts from the layout captured on load (CHARTS), never
@@ -2801,14 +3014,15 @@ class TestFilterPage:
         with caplog.at_level(logging.WARNING):
             page = self._page(monkeypatch, tmp_path)
         assert 'id="flt-bar"' not in page and 'id="dash-data"' not in page
+        assert 'id="dash-chunk-' not in page
         assert 'id="flt-unavailable"' in page and "Portfolio Performance" in page
-        assert "function inflate()" not in page
+        assert "function inflate(el)" not in page
         assert any("could not be built" in r.getMessage() for r in caplog.records)
 
     def test_one_k_prices_the_whole_page(self, monkeypatch, tmp_path):
         # No override: the sweep's primary k (0.60 here) prices the Risk
-        # section's Kelly scatter AND the filter's views of it, and is the k
-        # the summary names — never the config constant beside it
+        # section's Kelly scatter AND the primary chunk's copy of it, and is
+        # the k the summary names — never the config constant beside it
         sweep = _flt_sweep()
         sweep = dataclasses.replace(
             sweep, primary=dataclasses.replace(sweep.primary, k=0.60),
@@ -2821,9 +3035,41 @@ class TestFilterPage:
             sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0, sweep=sweep,
             series_categories=_FLT_SERIES).read_text(encoding="utf-8")
         kx, _ = dashboard._kelly_points(sweep.primary.trades, 0.60)
-        assert self._data(page)["lists"][0]["kx"] == pytest.approx(kx)
+        data = self._data(page)
+        assert self._chunks(page)[0]["list"]["kx"] == pytest.approx(kx)
+        assert data["ks"][data["primary"][1]]["value"] == 0.60
         assert kx != pytest.approx(dashboard._kelly_points(sweep.primary.trades, None)[0])
-        assert "max(tier,0)-1, k = 0.60: 5 trades." in page
+        assert "max(tier,0)-1, k = 0.60, 20% cap per trade: 5 trades." in page
+
+    def test_an_override_unlike_the_sweep_s_k_is_warned_about(
+            self, monkeypatch, tmp_path, caplog):
+        # Unsupported (backtest.py always passes the primary's own k): the
+        # override still prices the Kelly scatter and the primary chunk, but
+        # the bar's k axis is the sweep's — its summary names 0.75 — and the
+        # log says the page names two ks rather than letting it pass silently
+        sweep = _flt_sweep()
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        with caplog.at_level(logging.WARNING):
+            page = dashboard.generate_dashboard(
+                sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0,
+                sweep=sweep, interval_discount=0.6,
+                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "differs from the sweep's primary k" in r.getMessage()]
+        assert len(warned) == 1 and "0.6" in warned[0] and "0.75" in warned[0]
+        data = self._data(page)
+        assert data["ks"][data["primary"][1]]["value"] == 0.75
+        kx, _ = dashboard._kelly_points(sweep.primary.trades, 0.6)
+        assert self._chunks(page)[0]["list"]["kx"] == pytest.approx(kx)
+        assert "max(tier,0)-1, k = 0.75, 20% cap per trade: 5 trades." in page
+        # An override equal to the sweep's k is no conflict
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            self._page(monkeypatch, tmp_path)
+        assert not any("differs from the sweep's primary k" in r.getMessage()
+                       for r in caplog.records)
 
 
 class TestFilterSummary:
@@ -2833,16 +3079,22 @@ class TestFilterSummary:
     T = dashboard._SUMMARY_TEMPLATES
 
     def test_the_whole_band_and_a_slice(self):
-        where = "the primary spread band max(tier,0)-1, k = 0.75"
+        where = dashboard._scenario_phrase("the primary spread band max(tier,0)-1",
+                                           "k = 0.75", "20% cap per trade")
+        assert where == "the primary spread band max(tier,0)-1, k = 0.75, 20% cap per trade"
         assert dashboard._filter_summary_text(self.T, where, True, None, 5, 5) == (
             "Showing every trade of the run at the primary spread band max(tier,0)-1, "
-            f"k = 0.75: 5 trades. Not filtered by this bar: {dashboard._UNFILTERED_SECTIONS}.")
-        other = dashboard._filter_summary_text(self.T, "spread band x, k = 0.75", False,
-                                               None, 3, 3)
-        assert "3 trades. This band is its own simulation" in other
+            "k = 0.75, 20% cap per trade: 5 trades. Not filtered by this bar: "
+            f"{dashboard._UNFILTERED_SECTIONS}.")
+        other = dashboard._filter_summary_text(
+            self.T, dashboard._scenario_phrase("spread band x", "k = 0.60", "5% cap per trade"),
+            False, None, 3, 3)
+        assert ("k = 0.60, 5% cap per trade: 3 trades. This spread band, k and size cap "
+                "is its own simulation, not a slice of the primary run.") in other
         sliced = dashboard._filter_summary_text(self.T, where, True, "Sports · Hockey", 1, 5)
         assert sliced.startswith("Showing Sports · Hockey within the run at the primary "
-                                 "spread band max(tier,0)-1, k = 0.75: 1 of its 5 trades. ")
+                                 "spread band max(tier,0)-1, k = 0.75, 20% cap per trade: "
+                                 "1 of its 5 trades. ")
         # Every figure a slice draws from an equity curve is its contribution
         for figure in ("return", "drawdown", "Sharpe", "Sortino", "median monthly return",
                        "benchmark's strategy row"):
@@ -2863,12 +3115,26 @@ class TestFilterSummary:
         page = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0) \
             .read_text(encoding="utf-8")
         assert ("Showing every trade of the run at the primary spread band (not recorded), "
-                "k not recorded: 5 trades.") in page
+                "k not recorded, cap not recorded: 5 trades.") in page
+
+    def test_every_cap_is_named_for_the_select_and_the_summary(self):
+        assert [dashboard._cap_option(c) for c in (0.05, 0.2, 0.55, 1.0, None)] == [
+            "5%", "20%", "55%", "off (full Kelly)", "not recorded"]
+        assert [dashboard._cap_text(c) for c in (0.05, 0.2, 1.0, None)] == [
+            "5% cap per trade", "20% cap per trade", "no per-trade cap", "cap not recorded"]
+        # Injective, like the completion lines' labels: a double beside 0.2 is
+        # never printed as 20%
+        assert dashboard._cap_option(0.19999999999999998) != dashboard._cap_option(0.2)
+        assert dashboard._cap_text(0.19999999999999998) != dashboard._cap_text(0.2)
 
     def test_the_script_fills_the_templates_and_writes_none_of_its_own(self):
         js = dashboard._FILTER_JS
-        assert "T.all" in js and "T.slice" in js and "T.unfiltered" in js
-        for phrase in ("Showing", "contribution", "Not filtered", "its own simulation"):
+        for template in ("T.all", "T.slice", "T.unfiltered", "T.missing", "T.other_scenario",
+                         "D.text.scenario", "D.text.loading", "D.text.unavailable",
+                         "D.text.khat_sized_at"):
+            assert template in js
+        for phrase in ("Showing", "contribution", "Not filtered", "its own simulation",
+                       "Loading", "not simulated", "cap per trade", "sized at"):
             assert phrase not in js
 
 
@@ -2888,8 +3154,9 @@ def _js_runtime() -> str | None:
 
 
 def _page_elements(page: str) -> dict:
-    """The selects (options, "selected", "disabled") and every chart
-    (data and layout, typed arrays decoded) of a rendered page."""
+    """The selects (options, "selected", "disabled"), every chart (data and
+    layout, typed arrays decoded) and every element id of a rendered page —
+    the ids are the only elements a strict-mode run lets the script reach."""
     selects = {}
     for m in re.finditer(r'<select id="([^"]+)"([^>]*)>(.*?)</select>', page, re.S):
         options = [{"value": value, "text": html.unescape(text), "selected": bool(chosen)}
@@ -2907,33 +3174,48 @@ def _page_elements(page: str) -> dict:
             value, i = decoder.raw_decode(page, i)
             args.append(dashboard_golden._decode_typed_arrays(value))
         charts[m.group(1)] = {"data": args[0], "layout": args[1]}
-    return {"selects": selects, "charts": charts}
+    ids = sorted(set(re.findall(r"""\bid=["']([^"']+)["']""", page)))
+    return {"selects": selects, "charts": charts, "ids": ids}
 
 
 def _script_body() -> str:
-    """dashboard._FILTER_JS without its <script> tags, its inflate() handing
-    back the already-inflated data (the block's encoding is pinned by
-    TestFilterPage's strict decode)."""
+    """dashboard._FILTER_JS without its <script> tags, its inflate(el) handing
+    back the already-inflated block of that element (the harness's
+    __inflate, over every packed block of the page; the blocks' encoding is
+    pinned by TestFilterPage's strict decodes)."""
     body = dashboard._FILTER_JS.strip()
     body = body[len("<script>"):-len("</script>")]
-    start = body.index("  function inflate() {")
+    start = body.index("  function inflate(el) {")
     end = body.index("\n  }\n", start) + len("\n  }\n")
-    return body[:start] + "  function inflate() { return Promise.resolve(__DATA); }\n" + body[end:]
+    return body[:start] + "  function inflate(el) { return __inflate(el); }\n" + body[end:]
 
 
 def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
-                no_decompression: bool = False) -> dict:
+                no_decompression: bool = False, *, strict: bool = False,
+                damaged: tuple = (), keep: int | None = None,
+                deferred: tuple = ()) -> dict:
     """
     Run the filter script over a rendered page under tests/js/filter_harness.js.
 
     Args:
         tmp_path (Path): Where the assembled program is written.
         page (str): The rendered page.
-        steps (list): The harness's steps (["wait"], ["set", id, value],
-            ["fire", id], ["zoom", id], ["hide", id], ["snap", name]).
+        steps (list): The harness's steps (["wait"], ["settle"], ["set", id,
+            value], ["fire", id], ["zoom", id], ["hide", id], ["select", id],
+            ["repair", id], ["resolve", id], ["reject", id], ["snap", name]).
         pre (tuple): (select id, value) pairs set BEFORE the script runs — a
             browser restoring a reader's last choice.
         no_decompression (bool): Run as a browser without DecompressionStream.
+        strict (bool): Keyword-only. getElementById returns null for an id
+            the page does not hold, as a browser's does, so a script that
+            reaches a missing element fails the run.
+        damaged (tuple): Keyword-only. Block ids whose inflate throws (until a
+            ["repair", id] step), as a damaged block's would.
+        keep (int | None): Keyword-only. Replaces the script's KEEP (drawn
+            chunks kept besides the primary's).
+        deferred (tuple): Keyword-only. Block ids whose inflate waits for a
+            ["resolve", id] or ["reject", id] step, so a test can choose the
+            order in which chunks arrive.
 
     Returns:
         dict: The snapshots the steps took, by name.
@@ -2941,14 +3223,22 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
     runtime = _js_runtime()
     if runtime is None:
         pytest.skip("no JavaScript runtime (node or jsc) to run the filter script with")
+    elements = _page_elements(page)
+    elements["strict"] = strict
+    body = _script_body()
+    if keep is not None:
+        assert body.count("var KEEP = 16;") == 1
+        body = body.replace("var KEEP = 16;", f"var KEEP = {int(keep)};")
     program = "\n".join([
         _JS_HARNESS.read_text(encoding="utf-8"),
-        f"var __PAGE = {json.dumps(_page_elements(page))};",
-        f"var __DATA = {json.dumps(TestFilterPage._data(page))};",
+        f"var __PAGE = {json.dumps(elements)};",
+        f"__BLOCKS = {json.dumps(_packed_blocks(page))};",
+        *(f"__DAMAGED[{json.dumps(i)}] = true;" for i in damaged),
+        *(f"__DEFERRED[{json.dumps(i)}] = true;" for i in deferred),
         "__setup(__PAGE);",
         *(f"document.getElementById({json.dumps(i)}).value = {json.dumps(v)};" for i, v in pre),
         "window.DecompressionStream = undefined;" if no_decompression else "",
-        _script_body(),
+        body,
         f"__step({json.dumps(steps)}, 0);",
     ])
     path = tmp_path / "filter_run.js"
@@ -2969,7 +3259,7 @@ def _charts_redrawn() -> set[str]:
     return set(re.findall(r"'([a-z-]+)'", listed))
 
 
-_FLT_SELECTS = ("flt-band", "flt-cat", "flt-tag")
+_FLT_SELECTS = ("flt-band", "flt-k", "flt-cap", "flt-cat", "flt-tag")
 
 
 class TestFilterScript:
@@ -2981,16 +3271,31 @@ class TestFilterScript:
 
     def test_on_load_the_bar_is_reset_disabled_and_nothing_is_drawn(
             self, monkeypatch, tmp_path):
-        # A browser restored a reader's last choice (band 1, category 1)
+        # A browser restored a reader's last choice (band 1, k 0, category 1)
         page = self._page(monkeypatch, tmp_path)
-        snaps = _run_script(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                            pre=(("flt-band", "1"), ("flt-cat", "1")))
-        loaded, ready = snaps["loaded"], snaps["ready"]
+        data = TestFilterPage._data(page)
+        sports = str(data["categories"].index("Sports"))
+        snaps = _run_script(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"],
+            # The first choice after the bar is enabled, with no time to load
+            # anything: the primary scenario's chunk is already there
+            ["set", "flt-cat", sports], ["fire", "flt-cat"], ["snap", "at_once"]],
+            pre=(("flt-band", "1"), ("flt-k", "0"), ("flt-cat", "1")))
+        loaded, ready, at_once = snaps["loaded"], snaps["ready"], snaps["at_once"]
         assert {i: loaded["selects"][i]["value"] for i in _FLT_SELECTS} == {
-            "flt-band": "0", "flt-cat": "", "flt-tag": ""}
+            "flt-band": "0", "flt-k": "1", "flt-cap": "0", "flt-cat": "", "flt-tag": ""}
         assert all(loaded["selects"][i]["disabled"] for i in _FLT_SELECTS)
         assert not any(ready["selects"][i]["disabled"] for i in _FLT_SELECTS)
         assert loaded["reacts"] == ready["reacts"] == []
+        # Enabled only once the base block AND the primary scenario's chunk
+        # were inflated — and nothing else was
+        assert loaded["inflated"] == []
+        assert ready["inflated"] == ["dash-data", "dash-chunk-0"]
+        # ... so a category chosen at once is drawn at once, never "Loading"
+        assert at_once["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, *_FLT_PRIMARY), True, "Sports", 3, 5)
+        assert at_once["text"]["hdr-trades"] == "3"
+        assert at_once["inflated"] == ["dash-data", "dash-chunk-0"]
 
     def test_every_redraw_is_the_chart_python_drew_for_that_view(
             self, monkeypatch, tmp_path):
@@ -2998,8 +3303,8 @@ class TestFilterScript:
         # by the script, must be the page Python rendered
         page = self._page(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"],
-            ["set", "flt-band", "0"], ["fire", "flt-band"], ["snap", "back"]])["back"]
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"], ["snap", "back"]])["back"]
         charts = _page_elements(page)["charts"]
         drawn = {r["id"]: r for r in snap["reacts"]}
         assert set(drawn) == _charts_redrawn()
@@ -3027,7 +3332,8 @@ class TestFilterScript:
         snap = _run_script(tmp_path, page, [
             ["wait"], ["zoom", "perf-cum"], ["hide", "perf-cum"],
             ["select", "risk-kelly"],
-            ["set", "flt-band", "1"], ["fire", "flt-band"], ["snap", "after"]])["after"]
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["snap", "after"]])["after"]
         react = _last_react(snap, "perf-cum")
         python = _page_elements(page)["charts"]["perf-cum"]["layout"]
         assert react["layout"].get("xaxis") == python.get("xaxis")
@@ -3035,29 +3341,30 @@ class TestFilterScript:
         assert "visible" not in react["data"][0]
         assert "selectedpoints" not in _last_react(snap, "risk-kelly")["data"][0]
         # Another band's whole run, in the same words Python would use
-        data = TestFilterPage._data(page)
-        n = data["lists"][data["bands"][1]["list"]]["views"]["all"]["n"]
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        n = _view(data, chunks, 1, 1, 0, "all")["n"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], data["bands"][1]["scenario"], False, None, n, n)
+            data["text"], _phrase(data, 1, 1, 0), False, None, n, n)
 
     def test_a_tag_picked_under_all_categories_selects_its_category(
             self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
-        data = TestFilterPage._data(page)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         sports = data["categories"].index("Sports")
         hockey = data["subcats"].index([sports, "Hockey"])
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-tag", str(hockey)], ["fire", "flt-tag"], ["snap", "s"]])["s"]
+            ["wait"], ["set", "flt-tag", str(hockey)], ["fire", "flt-tag"], ["settle"],
+            ["snap", "s"]])["s"]
         assert snap["selects"]["flt-cat"]["value"] == str(sports)
         assert snap["selects"]["flt-tag"]["value"] == str(hockey)
         assert [text for _, text in snap["selects"]["flt-tag"]["options"]] == [
             "All tags", "Basketball (2)", "Hockey (1)"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], data["bands"][0]["scenario"], True, "Sports · Hockey", 1, 5)
+            data["text"], _phrase(data, *_FLT_PRIMARY), True, "Sports · Hockey", 1, 5)
         assert snap["text"]["hdr-trades"] == snap["text"]["kpi-trades"] == "1"
         # The row-dependent chart's height lands on both boxes, whichever one
         # the page's plotly.py wrote it on
-        h = data["lists"][0]["views"][f"s{hockey}"]["sub"]["h"]
+        h = _view(data, chunks, *_FLT_PRIMARY, f"s{hockey}")["sub"]["h"]
         assert snap["heights"]["dec-sub"] == snap["ownHeights"]["dec-sub"] == f"{h}px"
 
     def test_a_band_without_the_selection_shows_no_trades(self, monkeypatch, tmp_path):
@@ -3066,8 +3373,8 @@ class TestFilterScript:
         data = TestFilterPage._data(page)
         other = str(data["categories"].index("Other"))
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"],
-            ["set", "flt-cat", other], ["fire", "flt-cat"], ["snap", "s"]])["s"]
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-cat", other], ["fire", "flt-cat"], ["settle"], ["snap", "s"]])["s"]
         assert [text for _, text in snap["selects"]["flt-cat"]["options"]] == [
             "All categories", "Commodities (1)", "Other (0)", "Science (0)", "Sports (2)"]
         for prefix in ("dec", "cal", "diag", "risk"):
@@ -3075,13 +3382,15 @@ class TestFilterScript:
                 == ("", "none")
         assert snap["text"]["hdr-trades"] == "0"
         assert snap["text"]["kpi-max_drawdown"] == "0.0%"
-        assert "This band is its own simulation" not in snap["text"]["flt-summary"]
+        # A slice never claims to be a whole simulation
+        assert "This spread band, k and size cap is its own simulation" \
+            not in snap["text"]["flt-summary"]
 
     def test_the_khat_table_redraws_as_python_rendered_it(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"],
-            ["set", "flt-band", "0"], ["fire", "flt-band"], ["snap", "back"]])["back"]
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"], ["snap", "back"]])["back"]
         body = re.search(r'<tbody id="khat-rows">(.*?)</tbody>', page, re.S).group(1)
         python_rows = [[html.unescape(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr)]
                        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body)]
@@ -3096,7 +3405,7 @@ class TestFilterScript:
         commodities = str(data["categories"].index("Commodities"))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["set", "khat-group", "tag"], ["fire", "khat-group"],
-            ["set", "flt-cat", commodities], ["fire", "flt-cat"], ["snap", "empty"],
+            ["set", "flt-cat", commodities], ["fire", "flt-cat"], ["settle"], ["snap", "empty"],
             ["set", "khat-group", "category"], ["fire", "khat-group"], ["snap", "back"]])
         empty, back = snaps["empty"], snaps["back"]
         assert (empty["display"]["khat-body"], empty["display"]["khat-empty"]) == ("none", "")
@@ -3111,7 +3420,7 @@ class TestFilterScript:
         data = TestFilterPage._data(page)
         sports = str(data["categories"].index("Sports"))
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-cat", sports], ["fire", "flt-cat"],
+            ["wait"], ["set", "flt-cat", sports], ["fire", "flt-cat"], ["settle"],
             ["set", "khat-group", "band"], ["fire", "khat-group"], ["snap", "s"]])["s"]
         react = _last_react(snap, "khat-fig")
         colors = data["styles"]["khat"]
@@ -3132,7 +3441,7 @@ class TestFilterScript:
         sports = data["categories"].index("Sports")
         hockey = str(data["subcats"].index([sports, "Hockey"]))
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-tag", hockey], ["fire", "flt-tag"],
+            ["wait"], ["set", "flt-tag", hockey], ["fire", "flt-tag"], ["settle"],
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "s"]])["s"]
         react = _last_react(snap, "khat-fig")
         colors = data["styles"]["khat"]
@@ -3145,7 +3454,8 @@ class TestFilterScript:
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["snap", "s"]])["s"]
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["snap", "s"]])["s"]
         assert (snap["display"]["khat-body"], snap["display"]["khat-empty"]) == ("none", "")
         assert snap["text"]["khat-empty"] == data["text"]["khat_not_recorded"]
 
@@ -3157,7 +3467,623 @@ class TestFilterScript:
         assert all(snap["selects"][i]["disabled"] for i in (*_FLT_SELECTS, "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
-        assert snap["reacts"] == []
+        assert snap["reacts"] == [] and snap["inflated"] == []
+
+
+# ─── The k and size-cap axes ──────────────────────────────────────────────────
+
+_KC_B0, _KC_B1 = (0.0, 1.0), (0.3, 0.6)
+
+
+def _kc_resized(t: BacktestTrade, n: int) -> BacktestTrade:
+    """A trade of n contracts where it had t.n: cost, fees and payoffs scaled
+    with it, so it still books profit = payoff - cost - fees."""
+    s = n / t.n
+    return dataclasses.replace(t, n=n, total_cost=t.total_cost * s, fees=t.fees * s,
+                               profit=t.profit * s, actual_payoff=t.actual_payoff * s,
+                               expected_payoff=t.expected_payoff * s, slippage=t.slippage * s)
+
+
+def _kc_trades(n: int, count: int = 3) -> list[BacktestTrade]:
+    """`count` time-series trades of n contracts each — a time-series trade's
+    Kelly scatter depends on k, so the same list reads differently at two ks."""
+    trades = [
+        _ftrade("KXNHLHART-27", "time_series", date(2026, 1, 12), date(2026, 1, 20), 8.0,
+                ladder=True),
+        _ftrade("KXOTHER-1", "time_series", date(2026, 1, 13), date(2026, 1, 16), 4.0),
+        _ftrade("KXNCAAMBGAME-1", "time_series", date(2026, 1, 6), date(2026, 1, 8), -3.0),
+    ][:count]
+    return [_kc_resized(t, n) for t in trades]
+
+
+class _FakeCapSweep:
+    """
+    A backtester.CapSweep stand-in carrying exactly what the dashboard reads
+    of one: bands, ks, caps, primary_cap, checks, simulated / reused, cell(),
+    same_title() and entry_events().
+
+    By default 2 bands x 2 ks x 3 caps — 5%, 20% (the run's own) and 1.0 (no
+    cap). As CapSweep shares one simulation between every cap at or above a
+    cell's peak Kelly fraction, caps above the peak here share ONE trade list
+    object: at the primary band, 20% and no cap share a list and 5% trades a
+    smaller one; at 0.3-0.6 every cap shares one list. (0.3-0.6, k 0.60) was
+    never simulated. `raise_on` makes that cell's read raise, as a failed
+    simulation would; `reads` records every cell read.
+    """
+
+    checks = False
+
+    def __init__(self, points: dict, *, bands=(_KC_B0, _KC_B1), ks=(0.6, 0.75),
+                 caps=(0.05, 0.2, 1.0), raise_on=None):
+        self.points = points                    # (band, k, cap) -> SweepPoint
+        self.bands, self.ks, self.caps, self.primary_cap = bands, ks, caps, 0.2
+        self.raise_on = raise_on
+        self.reads: list = []
+        self.simulated = self.reused = 0
+
+    def cell(self, band, k):
+        self.reads.append((band, k))
+        if (band, k) == self.raise_on:
+            raise RuntimeError("the cap simulation failed")
+        return {cap: {"all": self.points[(band, k, cap)]}
+                for cap in self.caps if (band, k, cap) in self.points}
+
+    def same_title(self):
+        return {}
+
+    def entry_events(self):
+        return {(t.event_ticker, t.category) for p in self.points.values() for t in p.trades}
+
+
+def _kc_sweep(*, raise_on=None) -> BacktestSweep:
+    """_FakeCapSweep's default grid, with the eager points a run carries (every
+    cell at the run's own 20% cap) and a k-hat population at the primary band."""
+    full, small, other = _kc_trades(5), _kc_trades(2), _kc_trades(5, count=2)
+    curves: dict = {}
+
+    def point(band, k, cap, trades):
+        if id(trades) not in curves:
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        return SweepPoint(k=k, trades=trades, equity_df=curves[id(trades)],
+                          spread_band=band, size_cap=cap)
+
+    points = {}
+    for k in (0.6, 0.75):
+        for cap, trades in ((0.05, small), (0.2, full), (1.0, full)):
+            points[(_KC_B0, k, cap)] = point(_KC_B0, k, cap, trades)
+    for cap in (0.05, 0.2, 1.0):
+        points[(_KC_B1, 0.75, cap)] = point(_KC_B1, 0.75, cap, other)
+    primary = points[(_KC_B0, 0.75, 0.2)]
+    eager = [primary, points[(_KC_B0, 0.6, 0.2)], points[(_KC_B1, 0.75, 0.2)]]
+    cal = _flt_calibration([("KXNHLHART-27", "Other"), ("KXOTHER-1", "Other")])
+    return BacktestSweep(primary=primary, points=eager[:2], calibration=cal,
+                         label_coverage=_scn_coverage(), scenarios=eager,
+                         calibrations_by_band={_KC_B0: cal, _KC_B1: None},
+                         same_event_ladders=True,
+                         cap_sweep=_FakeCapSweep(points, raise_on=raise_on))
+
+
+def _kc_page(monkeypatch, tmp_path, sweep=None) -> str:
+    sweep = sweep or _kc_sweep()
+    return TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+
+
+# The _kc grid's chunks, in walk order (primary cell first, primary cap first)
+_KC_GRID = [[[3, 2, 2], [1, 0, 0]], [[None, None, None], [4, 4, 4]]]
+
+# The header's cap clause when the run carried a size-cap sweep but the bar
+# fell back to the run's own cap
+_KC_UNUSED_CLAUSE = ("per-trade cap: 20% (size-cap sweep on, but it could not be used — "
+                     "the filter bar offers the run's own cap only; the log names why)</p>")
+
+
+class TestFilterKAndCap:
+    """The bar's k and Size cap axes over a size-cap sweep: every scenario's
+    chunk, the options, the summary, and what a failure costs."""
+
+    def test_the_grid_maps_every_scenario_to_its_chunk(self):
+        sweep = _kc_sweep()
+        _, source, base, chunks = _flt_payload(sweep)
+        assert (source.bands, source.ks, source.caps, source.primary) == (
+            (_KC_B0, _KC_B1), (0.6, 0.75), (0.05, 0.2, 1.0), (0, 1, 1))
+        assert source.cap_sweep is sweep.cap_sweep and source.fallback is not None
+        # Caps above the peak share a list, and so a chunk; equal lists at
+        # another k do not; (0.3-0.6, 0.60) was never simulated
+        assert base["grid"] == _KC_GRID and len(chunks) == 5
+        assert [_view(base, chunks, 0, 1, ci, "all")["n"] for ci in range(3)] == [3, 3, 3]
+        tail = _chunk_at(base, chunks, 0, 1, 0)["strings"]
+        assert any(">2</td>" in s for s in tail)          # 5%: two contracts a trade
+        assert _chunk_at(base, chunks, 0, 0, 1)["list"]["kx"] != pytest.approx(
+            _chunk_at(base, chunks, 0, 1, 1)["list"]["kx"])
+        # The primary cell was read first, and every cell exactly once
+        assert sweep.cap_sweep.reads == [(_KC_B0, 0.75), (_KC_B0, 0.6), (_KC_B1, 0.6),
+                                         (_KC_B1, 0.75)]
+
+    def test_the_options_mark_the_run_s_own(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        options = r'<option value="(\d+)"( selected)?>(.*?)</option>'
+        ks = re.search(r'<select id="flt-k"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(options, ks) == [("0", "", "k = 0.60"),
+                                           ("1", " selected", "k = 0.75 (primary)")]
+        caps = re.search(r'<select id="flt-cap"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(options, caps) == [
+            ("0", "", "5%"), ("1", " selected", "20% (primary)"), ("2", "", "off (full Kelly)")]
+        assert ("Showing every trade of the run at the primary spread band max(tier,0)-1, "
+                "k = 0.75, 20% cap per trade: 3 trades.") in page
+        assert "| per-trade cap: 20% (size-cap sweep on)</p>" in page
+
+    def test_the_summary_names_every_scenario(self):
+        _, _, base, _ = _flt_payload(_kc_sweep())
+        assert _phrase(base, 1, 1, 2) == (
+            "spread band max(tier,0.3)-0.6, k = 0.75, no per-trade cap")
+        assert _phrase(base, 0, 0, 0) == (
+            "the primary spread band max(tier,0)-1, k = 0.60, 5% cap per trade")
+        # A scenario the run never simulated says so, in Python's words
+        assert base["text"]["missing"].format(scenario=_phrase(base, 1, 0, 1)) == (
+            "Showing nothing: spread band max(tier,0.3)-0.6, k = 0.60, 20% cap per trade "
+            "was not simulated by this run.")
+
+    def test_a_chunk_that_cannot_be_built_costs_only_the_bar(
+            self, monkeypatch, tmp_path, caplog):
+        real, calls = dashboard._list_payload, []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise ValueError("boom")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(dashboard, "_list_payload", second_fails)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path)
+        assert 'id="flt-unavailable"' in page and 'id="flt-bar"' not in page
+        assert 'id="dash-chunk-' not in page and 'id="dash-data"' not in page
+        assert "function inflate(el)" not in page
+        for heading in ("Portfolio Performance", "Scenario Explorer", "Benchmark Comparison"):
+            assert heading in page
+        assert "could not be built for this run" in page          # the k-hat notice
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("chunk could not be built" in m for m in warned) == 1
+
+    def test_a_cap_cell_that_cannot_be_simulated_falls_back_to_the_run_s_own_cap(
+            self, monkeypatch, tmp_path, caplog):
+        # The LAST cell walked raises: every chunk built so far is dropped and
+        # the eager points are walked instead — the page is complete, with the
+        # run's own cap as the only option
+        sweep = _kc_sweep(raise_on=(_KC_B1, 0.75))
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "size-cap sweep could not be simulated" in r.getMessage()]
+        assert len(warned) == 1 and warned[0].exc_info is not None
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert data["caps"] == [{"label": "20%", "text": "20% cap per trade", "value": 0.2}]
+        assert data["grid"] == [[[1], [0]], [[None], [2]]] and len(chunks) == 3
+        caps = re.search(r'<select id="flt-cap"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(r"<option[^>]*>(.*?)</option>", caps) == ["20% (primary)"]
+        for piece in ('id="flt-bar"', "function inflate(el)", "Portfolio Performance",
+                      "Benchmark Comparison"):
+            assert piece in page
+        # The one-option select's reason is on the page, not only in the log
+        assert _KC_UNUSED_CLAUSE in page
+        assert "(size-cap sweep on)" not in page
+
+    def test_a_cap_sweep_whose_events_cannot_be_read_costs_only_the_cap_axis(
+            self, monkeypatch, tmp_path, caplog):
+        # A failure outside cell() — reading the entries' events up front —
+        # costs what a cell failure costs: the cap axis, not the bar
+        sweep = _kc_sweep()
+
+        def broken():
+            raise ZeroDivisionError("entry events")
+        sweep.cap_sweep.entry_events = broken
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "size-cap sweep could not be simulated" in r.getMessage()]
+        assert len(warned) == 1 and warned[0].exc_info is not None
+        assert not any("filter could not be built" in r.getMessage() for r in caplog.records)
+        assert 'id="flt-bar"' in page and 'id="flt-unavailable"' not in page
+        caps = re.search(r'<select id="flt-cap"[^>]*>(.*?)</select>', page).group(1)
+        assert re.findall(r"<option[^>]*>(.*?)</option>", caps) == ["20% (primary)"]
+        assert TestFilterPage._data(page)["grid"] == [[[1], [0]], [[None], [2]]]
+        assert _KC_UNUSED_CLAUSE in page
+        # Nothing was simulated from the sweep that could not be read
+        assert sweep.cap_sweep.reads == []
+
+    def test_a_cap_sweep_on_a_run_without_a_band_is_set_aside_and_said(
+            self, monkeypatch, tmp_path, caplog):
+        # A hand-built sweep whose primary records no band cannot place the
+        # cap sweep's cells on a band axis: one "not recorded" band at the
+        # run's own cap, a WARNING, and the header saying the sweep went unused
+        sweep = _kc_sweep()
+        primary = dataclasses.replace(sweep.primary, spread_band=None)
+        sweep = dataclasses.replace(sweep, primary=primary, points=[primary], scenarios=[])
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        assert any("cannot be placed on a run whose primary records no spread band"
+                   in r.getMessage() for r in caplog.records)
+        data = TestFilterPage._data(page)
+        assert [c["label"] for c in data["caps"]] == ["20%"]
+        assert [b["label"] for b in data["bands"]] == ["not recorded"]
+        assert _KC_UNUSED_CLAUSE in page
+        assert sweep.cap_sweep.reads == []
+
+    def test_every_cap_point_counts_toward_the_stale_cutoff_verdict(self, monkeypatch, tmp_path):
+        # A window stamped at or after the cutoff: no EAGER point traded, but
+        # the no-cap scenario — which only the walk simulates — did. That
+        # disproves "no trade could be entered", so the header says the
+        # verdict is stale, counting the cap point's trades
+        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
+                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
+        traded = _kc_trades(5)
+        points = {(_KC_B0, 0.75, 0.05): dataclasses.replace(empty, size_cap=0.05),
+                  (_KC_B0, 0.75, 0.2): empty,
+                  (_KC_B0, 0.75, 1.0): SweepPoint(
+                      k=0.75, trades=traded, spread_band=_KC_B0, size_cap=1.0,
+                      equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
+        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
+                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
+                                post_cutoff=True)
+        sweep = BacktestSweep(primary=empty, points=[empty], calibration=None,
+                              label_coverage=_scn_coverage(), corpus_provenance=prov,
+                              cap_sweep=_FakeCapSweep(points, bands=(_KC_B0,), ks=(0.75,)))
+        assert backtester.max_trades_simulated(sweep) == 0
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
+                "verdict is stale") in page
+        assert "no trade could be entered in this window" not in page
+        # Without the cap sweep the eager points alone decide: the red banner
+        page = _kc_page(monkeypatch, tmp_path, dataclasses.replace(sweep, cap_sweep=None))
+        assert "no trade could be entered in this window whatever pairs formed" in page
+
+    def test_a_curve_built_after_midnight_is_cut_to_the_page_s_last_date(self, monkeypatch):
+        # A cell simulated after UTC midnight ends its curve a day past the
+        # page's; the walk hands every visitor a copy ending on the page's
+        # last date — and never modifies the point itself
+        class Clock(datetime):
+            moment = datetime(2026, 3, 1, 23, 58, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.moment if tz is None else cls.moment.astimezone(tz)
+        monkeypatch.setattr(backtester, "datetime", Clock)
+        trades = _kc_trades(5)
+        page_curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        Clock.moment = datetime(2026, 3, 2, 0, 2, tzinfo=UTC)
+        late_curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        assert late_curve["date"].iloc[-1] == page_curve["date"].iloc[-1] + timedelta(days=1)
+        late = SweepPoint(k=0.6, trades=trades, equity_df=late_curve, spread_band=_KC_B0,
+                          size_cap=0.2)
+        on_time = SweepPoint(k=0.75, trades=trades, equity_df=page_curve,
+                             spread_band=_KC_B0, size_cap=0.2)
+        cells = {0.6: {0.2: {"all": late, "time_series": late}},
+                 0.75: {0.2: {"all": on_time}}}
+        source = dashboard._GridSource(bands=(_KC_B0,), ks=(0.6, 0.75), caps=(0.2,),
+                                       primary=(0, 1, 0), cell=lambda b, k: cells[k],
+                                       calibrations={_KC_B0: None})
+        seen = []
+
+        class Spy:
+            def reset(self, _source):
+                pass
+
+            def __call__(self, bi, ki, ci, pops):
+                seen.append((ki, dict(pops)))
+        axis_end = pd.Timestamp(page_curve["date"].iloc[-1])
+        dashboard._walk_grid(source, [Spy()], axis_end)
+        assert [ki for ki, _ in seen] == [1, 0]
+        cut = seen[1][1]
+        assert cut["all"] is not late and cut["all"].trades is late.trades
+        # The two populations sharing one curve share its cut
+        assert cut["all"].equity_df is cut["time_series"].equity_df
+        assert list(cut["all"].equity_df["date"]) == list(page_curve["date"])
+        assert len(late.equity_df) == len(page_curve) + 1          # untouched
+        assert seen[0][1]["all"] is on_time                        # nothing to cut
+
+    def test_a_real_cap_sweep_pages_every_cap_at_its_own_simulation(
+            self, monkeypatch, tmp_path):
+        # A real run_backtest_sweep over the backtester's golden fixture,
+        # narrowed to one band and one k: every cap the page offers is the
+        # scenario a fresh simulation at that cap produces, figure for figure
+        golden = _tb.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.75,))
+        run = backtester.run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                            same_event_ladders=True, band_sweep=True,
+                                            cap_sweep=True)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        caps = run.cap_sweep.caps
+        assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
+        assert data["primary"] == [0, 0, caps.index(0.2)]
+        band = (0.0, 1.0)
+        end = run.primary.equity_df["date"].iloc[-1]
+        for ci, cap in enumerate(caps):
+            fresh = backtester._simulate_at_discount(
+                run.cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=0.75,
+                spread_band=band, size_cap=cap, quiet=True, end_date=end)
+            view = _view(data, chunks, 0, 0, ci, "all")
+            kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades, 10_000.0)
+            assert view["kpi"] == {key: value for key, _, value, _ in kpis}, cap
+        # Not vacuous: the caps below the fixture's peak size differently
+        assert len({c for c in data["grid"][0][0] if c is not None}) > 1
+
+    # ─── The script over the k and cap axes ───────────────────────────────────
+
+    def test_a_k_change_loads_its_chunk_and_redraws_every_chart(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["snap", "loading"],
+            ["settle"], ["snap", "k"]], strict=True)
+        # While its chunk inflates, the line says so, in Python's words
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=_phrase(data, 0, 0, 1))
+        snap = snaps["k"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        # The k's own Kelly scatter — not the primary's
+        kx = _chunk_at(data, chunks, 0, 0, 1)["list"]["kx"]
+        assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(kx)
+        assert kx != pytest.approx(_chunk_at(data, chunks, 0, 1, 1)["list"]["kx"])
+        # The k-hat chart's line moves to the chosen k
+        layout = _last_react(snap, "khat-fig")["layout"]
+        assert (layout["shapes"][0]["x0"], layout["shapes"][0]["x1"]) == (0.6, 0.6)
+        assert layout["annotations"][0]["text"] == "sized at k = 0.60"
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 0, 1), False, None, 3, 3)
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+
+    def test_a_cap_change_shows_that_cap_s_sizes(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"],
+            ["snap", "cap"]], strict=True)["cap"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        small = _kc_trades(2)
+        best, _ = dashboard._best_and_worst(small)
+        assert snap["html"]["diag-best"] == "".join(
+            dashboard._trade_row(t, dashboard._BEST_ROW_COLOR) for t in best)
+        view = _view(data, chunks, 0, 1, 0, "all")
+        assert {key: snap["text"][f"kpi-{key}"] for key in view["kpi"]} == view["kpi"]
+        assert snap["text"]["kpi-brier"] == view["cal"]["brier"]
+        assert "k = 0.75, 5% cap per trade: 3 trades. This spread band" \
+            in snap["text"]["flt-summary"]
+
+    def test_a_later_choice_supersedes_a_chunk_still_loading(self, monkeypatch, tmp_path):
+        # k, then the cap, before either chunk has loaded: only the LAST
+        # choice is drawn — the k's chunk, arriving after the cap was chosen,
+        # is never drawn over it
+        page = _kc_page(monkeypatch, tmp_path)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "s"]])["s"]
+        assert [r["id"] for r in snap["reacts"]].count("perf-cum") == 1
+        view = _view(data, chunks, 0, 0, 0, "all")
+        assert _last_react(snap, "perf-cum")["data"][0]["y"] == pytest.approx(
+            _expand(view["total"], len(data["dates"])))
+        assert snap["text"]["flt-summary"].startswith(
+            "Showing every trade of the run at "
+            "the primary spread band max(tier,0)-1, k = 0.60, 5% cap per trade: 3 trades.")
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2",
+                                    "dash-chunk-3"]
+
+    @pytest.mark.parametrize("keep, inflated", [
+        (None, ["dash-data", "dash-chunk-0", "dash-chunk-2", "dash-chunk-3"]),
+        (1, ["dash-data", "dash-chunk-0", "dash-chunk-2", "dash-chunk-3", "dash-chunk-2"]),
+    ])
+    def test_loaded_chunks_are_kept_least_recently_used_first(
+            self, monkeypatch, tmp_path, keep, inflated):
+        # k 0.60 (chunk 2), then 5% (chunk 3), then back to 20% (chunk 2), then
+        # the primary: with room for one chunk besides the primary's, chunk 2
+        # was dropped for chunk 3 and is inflated again; the primary's never is
+        page = _kc_page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"],
+            ["set", "flt-cap", "1"], ["fire", "flt-cap"], ["settle"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            keep=keep)["s"]
+        assert snap["inflated"] == inflated
+        assert snap["text"]["hdr-trades"] == "3"
+
+    def test_a_scenario_never_simulated_shows_nothing_and_says_so(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        assert snap["text"]["flt-summary"] == (
+            data["text"]["missing"].format(scenario=_phrase(data, 1, 0, 1))
+            + data["text"]["unfiltered"])
+        assert snap["text"]["hdr-trades"] == "0"
+        for prefix in ("dec", "cal", "diag", "risk"):
+            assert snap["display"][f"{prefix}-body"] == "none"
+        # Nothing to inflate for it
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-4"]
+
+    def test_a_chunk_that_cannot_be_loaded_is_named_and_can_be_retried(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "failed"],
+            ["repair", "dash-chunk-2"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "retried"]],
+            damaged=("dash-chunk-2",))
+        failed, retried = snaps["failed"], snaps["retried"]
+        # The line names the scenario that failed and the one still shown; the
+        # selects go back to the one shown, and stay usable
+        assert failed["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=_phrase(data, 0, 0, 1), reason="Error: damaged block dash-chunk-2",
+            scenario=_phrase(data, 0, 1, 1))
+        assert failed["selects"]["flt-k"]["value"] == "1"
+        assert not any(failed["selects"][i]["disabled"] for i in _FLT_SELECTS)
+        assert failed["reacts"] == []
+        # Chosen again, it is loaded again
+        assert retried["inflated"].count("dash-chunk-2") == 2
+        assert retried["selects"]["flt-k"]["value"] == "0"
+        assert "k = 0.60, 20% cap per trade: 3 trades." in retried["text"]["flt-summary"]
+
+    def test_a_failed_load_puts_the_category_and_tag_back_too(self, monkeypatch, tmp_path):
+        # k 0.60's chunk is still inflating when a category is chosen; then
+        # the chunk fails. Nothing was drawn for either choice, so EVERY
+        # select goes back to what the sections show — the category (and the
+        # tag list it rebuilds) as well as the scenario
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "loaded"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"],
+            ["set", "flt-cat", "0"], ["fire", "flt-cat"], ["snap", "pending"],
+            ["reject", "dash-chunk-2"], ["snap", "failed"]],
+            strict=True, deferred=("dash-chunk-2",))
+        loaded, pending, failed = snaps["loaded"], snaps["pending"], snaps["failed"]
+        assert pending["selects"]["flt-cat"]["value"] == "0"
+        for sid in _FLT_SELECTS:
+            assert failed["selects"][sid]["value"] == loaded["selects"][sid]["value"], sid
+            assert failed["selects"][sid]["options"] == loaded["selects"][sid]["options"], sid
+        assert not any(failed["selects"][sid]["disabled"] for sid in _FLT_SELECTS)
+        # Nothing is redrawn: the sections still show the unfiltered primary
+        assert pending["reacts"] == failed["reacts"] == []
+        assert "hdr-trades" not in failed["text"]
+        assert failed["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=_phrase(data, 0, 0, 1), reason="Error: damaged block dash-chunk-2",
+            scenario=_phrase(data, 0, 1, 1))
+
+    def test_the_khat_chart_describes_the_scenario_on_screen_while_one_loads(
+            self, monkeypatch, tmp_path):
+        # A Group-by change while another band's chunk is inflating draws the
+        # band the sections still show (the primary, which has a k-hat
+        # population) — not the band still loading (which has none) — so a
+        # failure of that chunk leaves the chart describing the page
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"],
+            ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "pending"],
+            ["reject", "dash-chunk-4"], ["snap", "failed"]],
+            strict=True, deferred=("dash-chunk-4",))
+        pending, failed = snaps["pending"], snaps["failed"]
+        assert [r["id"] for r in pending["reacts"]] == ["khat-fig"]
+        title = _last_react(pending, "khat-fig")["layout"]["title"]["text"]
+        assert data["bands"][0]["where"] in title and data["bands"][1]["where"] not in title
+        assert pending["display"]["khat-body"] == ""
+        # The failure redraws nothing: the chart already shows the band shown
+        assert failed["reacts"] == []
+        assert failed["selects"]["flt-band"]["value"] == "0"
+        assert failed["display"]["khat-body"] == ""
+
+    def test_a_load_the_reader_moved_past_never_pushes_out_the_chunk_on_screen(
+            self, monkeypatch, tmp_path):
+        # KEEP = 1. The 5% chunk is still inflating when the reader goes back
+        # to 20% at k 0.60 (drawn at once, from the chunk already loaded); the
+        # 5% chunk then arrives, superseded. It was never drawn, so it is not
+        # kept — and it does not push the chunk on screen out: a category
+        # change draws at once, with no second inflate and no "Loading" line.
+        # Chosen again, the 5% chunk is inflated again
+        page = _kc_page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["resolve", "dash-chunk-2"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"],
+            ["set", "flt-cap", "1"], ["fire", "flt-cap"], ["snap", "back"],
+            ["resolve", "dash-chunk-3"],
+            ["set", "flt-cat", "0"], ["fire", "flt-cat"], ["snap", "cat"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["resolve", "dash-chunk-3"],
+            ["snap", "again"]],
+            keep=1, deferred=("dash-chunk-2", "dash-chunk-3"))
+        back, cat, again = snaps["back"], snaps["cat"], snaps["again"]
+        assert back["text"]["flt-summary"].startswith("Showing every trade")
+        assert cat["text"]["flt-summary"].startswith("Showing ")
+        assert cat["inflated"].count("dash-chunk-2") == 1
+        assert {r["id"] for r in cat["reacts"]} >= {"perf-cum", "khat-fig"}
+        assert again["inflated"].count("dash-chunk-3") == 2
+        assert "5% cap per trade" in again["text"]["flt-summary"]
+
+    def test_at_the_shipped_keep_superseded_loads_never_evict_the_chunk_on_screen(
+            self, monkeypatch, tmp_path):
+        # KEEP = 16, 20 caps each trading its own list: step through 16 other
+        # caps while their chunks inflate, come back to the cap on screen, and
+        # let all 16 arrive. None was drawn, so none is kept or counted, and
+        # the chunk on screen stays loaded: the next category change draws at
+        # once, without inflating it again
+        caps = tuple(round(0.05 * i, 2) for i in range(1, 20)) + (1.0,)
+        points = {}
+        for i, cap in enumerate(caps):
+            listed = _kc_trades(i + 1)
+            points[(_KC_B0, 0.75, cap)] = SweepPoint(
+                k=0.75, trades=listed, spread_band=_KC_B0, size_cap=cap,
+                equity_df=backtester._build_equity_curve(listed, _FLT_START, 1000.0))
+        primary = points[(_KC_B0, 0.75, 0.2)]
+        sweep = BacktestSweep(primary=primary, points=[primary], calibration=None,
+                              label_coverage=_scn_coverage(),
+                              cap_sweep=_FakeCapSweep(points, bands=(_KC_B0,), ks=(0.75,),
+                                                      caps=caps))
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        grid = TestFilterPage._data(page)["grid"][0][0]
+        assert len(set(grid)) == len(caps)
+        shown = 0
+        others = [ci for ci in range(len(caps)) if ci not in (shown, caps.index(0.2))][:16]
+        steps = [["wait"], ["set", "flt-cap", str(shown)], ["fire", "flt-cap"],
+                 ["resolve", f"dash-chunk-{grid[shown]}"]]
+        for ci in others:
+            steps += [["set", "flt-cap", str(ci)], ["fire", "flt-cap"]]
+        steps += [["set", "flt-cap", str(shown)], ["fire", "flt-cap"], ["snap", "back"]]
+        steps += [["resolve", f"dash-chunk-{grid[ci]}"] for ci in others]
+        steps += [["set", "flt-cat", "0"], ["fire", "flt-cat"], ["snap", "cat"]]
+        deferred = tuple(f"dash-chunk-{c}" for c in grid if c != grid[caps.index(0.2)])
+        snaps = _run_script(tmp_path, page, steps, deferred=deferred)
+        assert snaps["back"]["text"]["flt-summary"].startswith("Showing every trade")
+        assert snaps["cat"]["text"]["flt-summary"].startswith("Showing ")
+        assert snaps["cat"]["inflated"].count(f"dash-chunk-{grid[shown]}") == 1
+        assert snaps["cat"]["pending"] == []
+
+    def test_a_primary_chunk_that_cannot_be_loaded_disables_the_bar(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
+                           damaged=("dash-chunk-0",))["s"]
+        assert all(snap["selects"][i]["disabled"] for i in (*_FLT_SELECTS, "khat-group"))
+        primary = _phrase(data, 0, 1, 1)
+        assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=primary, reason="Error: damaged block dash-chunk-0", scenario=primary)
+
+    def test_a_page_without_a_sweep_runs_strictly(self, monkeypatch, tmp_path):
+        # Placeholders for the Interval Discount and Scenario Explorer
+        # sections, one scenario: the script reaches no element the page lacks
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            trades, curve, _FLT_START, 1000.0, interval_discount=0.75,
+            series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tag", hockey], ["fire", "flt-tag"], ["settle"],
+            ["set", "khat-group", "band"], ["fire", "khat-group"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        assert not any(snap["selects"][i]["disabled"] for i in _FLT_SELECTS)
+        assert snap["text"]["hdr-trades"] == "1"
+        assert snap["text"]["flt-summary"].startswith(
+            "Showing Sports · Hockey within the run at the primary spread band (not "
+            "recorded), k = 0.75, cap not recorded: 1 of its 5 trades.")
 
 
 class TestKhatBreakdown:
@@ -3172,6 +4098,20 @@ class TestKhatBreakdown:
         return dashboard._khat_band(cal, _FLT_SERIES, {"Other": 0, "Science": 1, "Sports": 2},
                                     {("Other", "General"): 0, ("Science", "General"): 1,
                                      ("Sports", "Hockey"): 2})
+
+    @staticmethod
+    def _one_band_base(calibration) -> dict:
+        """The base block of a one-scenario grid (band 0-1, k 0.75, 20%) whose
+        band carries `calibration`."""
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        point = SweepPoint(k=0.75, trades=trades, equity_df=curve, spread_band=(0.0, 1.0),
+                           size_cap=0.2)
+        source = dashboard._GridSource(
+            bands=((0.0, 1.0),), ks=(0.75,), caps=(0.2,), primary=(0, 0, 0),
+            cell=lambda band, k: {0.2: {"all": point}},
+            calibrations={(0.0, 1.0): calibration})
+        return _flt_walk(source, trades, curve)[1]
 
     def test_the_all_group_is_the_pooled_row_exactly(self):
         cal = _flt_calibration(self.FILED)
@@ -3217,24 +4157,28 @@ class TestKhatBreakdown:
         assert dashboard._khat_band(None, None, {}, {}) is None
 
     def test_the_payload_carries_every_band_in_band_order(self):
-        _, runs, _, payload = _flt_payload()
-        assert len(payload["khat"]) == len(runs) == 3
-        assert payload["khat"][1] is None and payload["khat"][2] is None
-        groups = payload["khat"][0]["groups"]
+        _, source, base, _ = _flt_payload()
+        assert len(base["khat"]) == len(source.bands) == 3
+        assert base["khat"][1] is None and base["khat"][2] is None
+        groups = base["khat"][0]["groups"]
         # Science (seen only in an observation) is a group; Commodities (seen
         # only in trades) is not
-        assert _key(payload, "Science") in groups
-        assert _key(payload, "Commodities") not in groups
-        assert payload["khat_blank"] == ["—"] * 5
-        assert payload["styles"]["khat_height"] == list(dashboard._KHAT_HEIGHT)
+        assert _key(base, "Science") in groups
+        assert _key(base, "Commodities") not in groups
+        assert base["khat_blank"] == ["—"] * 5
+        assert base["styles"]["khat_height"] == list(dashboard._KHAT_HEIGHT)
         least, per_row, axes = dashboard._KHAT_HEIGHT
         assert dashboard._khat_chart_height(9) == max(least, per_row * 9 + axes)
+        # The reference line the script redraws at any k: no x, no text
+        ref = base["styles"]["khat_ref"]
+        assert "x0" not in ref["shape"] and "x" not in ref["annotation"]
+        assert "text" not in ref["annotation"]
 
     def test_the_default_render_is_by_category_at_the_primary_band(self):
-        _, _, _, payload = _flt_payload()
-        section = dashboard._section_khat(payload, 0.625)
+        _, _, base, _ = _flt_payload()
+        section = dashboard._section_khat(base, 0.625)
         data, layout = _nth_figure(section, 0)
-        groups = payload["khat"][0]["groups"]
+        groups = base["khat"][0]["groups"]
         assert data[0]["y"] == ["All categories", "Other", "Science", "Sports"]
         assert data[0]["x"] == pytest.approx(
             [groups["all"]["k"], groups["c1"]["k"], groups["c2"]["k"], groups["c3"]["k"]])
@@ -3246,32 +4190,39 @@ class TestKhatBreakdown:
         assert (data[0]["textposition"], data[0]["cliponaxis"]) == ("outside", False)
         assert layout["title"]["text"] == (
             "Empirical k̂ by category — the primary spread band max(tier,0)-1")
-        # The line marks the k the run was sized at, printed exactly
-        assert layout["shapes"][0]["x0"] == 0.625
-        assert layout["annotations"][0]["text"] == "sized at k = 0.625"
+        # The line marks the k the run was sized at, printed exactly — drawn
+        # from the base block's line, so the script redraws the same one
+        assert layout["shapes"][0] == {**base["styles"]["khat_ref"]["shape"],
+                                       "x0": 0.625, "x1": 0.625}
+        assert layout["annotations"][0] == {**base["styles"]["khat_ref"]["annotation"],
+                                            "x": 0.625, "text": "sized at k = 0.625"}
         # The table repeats the bars, one row each, with Python's cells
         assert section.count("<tr style='border-bottom:1px solid #E0E0E0'>") == 4
         assert "".join(f"<td style='padding:4px 12px;'>{c}</td>"
                        for c in groups["all"]["cells"]) in section
+
+    def test_the_section_reads_the_primary_scenario_s_band(self):
+        # The primary band sorts second: the section reads primary[0]
+        sweep = _flt_sweep()
+        _, _, base, _ = _flt_payload(dataclasses.replace(sweep, primary=sweep.scenarios[1]))
+        assert base["primary"][0] == 1 and base["khat"][1] is None
+        section = dashboard._section_khat(base, 0.75)
+        assert html.escape(dashboard._KHAT_TEXT["khat_not_recorded"]) in section
+        assert "the primary spread band max(tier,0.3)-0.6" in section
 
     def test_group_by_stays_outside_the_body_it_hides(self):
         # A selection with nothing to draw hides the body; the grouping that
         # could draw something must stay reachable, so the select sits
         # before the notice and outside the body — disabled until the
         # script has its data, and never restored by a reload
-        _, _, _, payload = _flt_payload()
-        section = dashboard._section_khat(payload, 0.75)
+        _, _, base, _ = _flt_payload()
+        section = dashboard._section_khat(base, 0.75)
         select = section.index('<select id="khat-group" disabled autocomplete="off">')
         assert select < section.index('<p id="khat-empty"') < section.index('<div id="khat-body"')
         assert '<option value="band">' in section
 
     def test_a_band_without_a_calibration_says_it_was_not_recorded(self):
-        trades = _flt_trades()
-        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        runs = [dashboard._BandRun((0.0, 1.0), "max(tier,0)-1", trades, curve, None)]
-        payload = dashboard._filter_payload(runs, 0, _FLT_START, 1000.0, _FLT_SERIES, 0.75,
-                                            "k = 0.75")
-        section = dashboard._section_khat(payload, None)
+        section = dashboard._section_khat(self._one_band_base(None), None)
         notice = html.escape(dashboard._KHAT_TEXT["khat_not_recorded"])
         assert f'color:#616161;">{notice}</p>' in section
         assert '<div id="khat-body" style="display:none">' in section
@@ -3282,12 +4233,7 @@ class TestKhatBreakdown:
         empty = IntervalCalibration(
             pooled=backtester._calibration_bucket("POOLED", 0.0, ()), buckets=[],
             excluded_premise_violations=3, observations=())
-        trades = _flt_trades()
-        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        runs = [dashboard._BandRun((0.0, 1.0), "max(tier,0)-1", trades, curve, empty)]
-        payload = dashboard._filter_payload(runs, 0, _FLT_START, 1000.0, _FLT_SERIES, 0.75,
-                                            "k = 0.75")
-        section = dashboard._section_khat(payload, 0.75)
+        section = dashboard._section_khat(self._one_band_base(empty), 0.75)
         assert html.escape(dashboard._KHAT_TEXT["khat_none"]) in section
         assert '<div id="khat-body" style="display:none">' in section
 
@@ -3324,12 +4270,22 @@ class TestKhatBreakdown:
 
 
 class TestFilterPageSize:
-    """A band sweep whose 36 bands each traded a DIFFERENT list — the
-    worst case for the filter, which ships a view per band list x category
-    x tag — stays well inside the page budget the scenario explorer set
-    (5 MB), because the payload is gzip-packed (_packed_json_script). Each
-    band also carries a 300-entry k-hat population, which the k-hat
-    breakdown ships per band x category x tag."""
+    """A band sweep whose 36 bands each traded a DIFFERENT list — the worst
+    case for the filter, which ships a chunk per distinct scenario list and a
+    view per list x category x tag — stays well inside the page budget the
+    scenario explorer set (5 MB), because every block is gzip-packed
+    (_packed_json_script) and every trade row's size-independent head is
+    shipped once (the base block's shared table). Each band also carries a
+    300-entry k-hat population, which the k-hat breakdown ships per band x
+    category x tag. Measured 810,784 bytes on this fixture (2026-09-26,
+    plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6), against 744,946 for the same
+    fixture's one-block page before the chunks existed: packing each list on
+    its own loses the compression one block shared across lists, and sharing
+    the rows' heads wins back part of it. The budget is the measurement + 20%
+    (the curve runs to today, so the page grows by a few bytes a day)."""
+
+    PAGE_BYTES_MEASURED = 810_784
+    BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
 
     def test_36_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path):
         import random
@@ -3357,7 +4313,7 @@ class TestFilterPageSize:
         for band in bands:
             trades = sorted((trade(i) for i in range(40)), key=lambda t: t.entry_date)
             scenarios.append(SweepPoint(
-                k=0.75, trades=trades, spread_band=band,
+                k=0.75, trades=trades, spread_band=band, size_cap=0.2,
                 equity_df=backtester._build_equity_curve(trades, start, 10_000.0)))
             obs = tuple(backtester.CalibrationObservation(
                 rng.randint(1, 30), rng.uniform(0.15, 0.8), rng.random() < 0.4,
@@ -3372,10 +4328,10 @@ class TestFilterPageSize:
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
         page = out.read_text(encoding="utf-8")
-        data = TestFilterPage._data(page)
-        assert len(data["lists"]) == 36          # nothing collapsed: every list is its own
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert len(chunks) == 36          # nothing collapsed: every list is its own
         assert all(band is not None for band in data["khat"])
-        assert out.stat().st_size <= 3_000_000, f"page was {out.stat().st_size} bytes"
+        assert out.stat().st_size <= self.BUDGET, f"page was {out.stat().st_size} bytes"
 
 
 class TestFilterableSections:

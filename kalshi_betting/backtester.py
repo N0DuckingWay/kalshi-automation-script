@@ -1523,19 +1523,20 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     banner and the closing WARNING said "no trade could be entered". A trade
     at ANY simulated point disproves that sentence, so this is the one
     definition both renderers (dashboard._corpus_provenance_html and
-    backtest._log_corpus_provenance) test a True verdict against; the page
-    and the log therefore always agree on whether it still holds. It counts
-    every point the page can show — the primary, each swept k, each
-    band-sweep scenario and the same-title point — because the k dropdown
-    and the scenario explorer put all of them on the same page. Zero proves
-    nothing either way: an entry that Kelly then rejected at every k also
-    shows the window could trade.
+    backtest._log_corpus_provenance) test a True verdict against. It counts
+    every EAGER point — the primary, each swept k, each band-sweep scenario
+    and the same-title point, every one simulated at the run's own size cap.
+    Zero proves nothing either way: an entry that Kelly then rejected at
+    every k also shows the window could trade.
 
-    It counts the EAGER points only — every point simulated at the run's own
-    size cap. A size-cap sweep (sweep.cap_sweep) simulates its other caps only
-    when a reader asks for a cell, never here, and a larger cap can turn an
-    n < 1 skip into a trade; a reader that simulates cap cells and shows them
-    beside the verdict must add their trade counts itself.
+    A size-cap sweep (sweep.cap_sweep) simulates its other caps only when a
+    reader asks for a cell, never here, and a larger cap can turn an n < 1
+    skip into a trade. The dashboard adds the trade counts of the cap points
+    it simulates (dashboard._corpus_provenance_html's traded argument), while
+    the log's closing line, written before the dashboard is built, sees the
+    eager points alone — so on a run where ONLY a non-default cap traded, the
+    page calls the verdict stale while the log still repeats it. Every eager
+    point agrees between the two.
 
     Args:
         sweep (BacktestSweep): The run's sweep.

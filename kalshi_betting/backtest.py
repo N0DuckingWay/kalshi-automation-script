@@ -20,7 +20,8 @@ Purpose:
 Dependencies:
     Imports run_backtest_sweep, BacktestSweep and max_trades_simulated (the
     closing corpus line tests a stamped post-cutoff verdict against the run's
-    own trades with it, as the dashboard header does) from backtester.py,
+    own trades with it — over the eager points; the dashboard header adds the
+    size-cap points its filter walk simulates) from backtester.py,
     generate_dashboard from dashboard.py, and build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
     returns-by-category labels) from historical.py. Imports from config.py:
@@ -95,9 +96,12 @@ Notes:
     (5%..95% and no cap), whose cells are simulated only when a report reads
     them — the run itself simulates nothing extra, and every point it returns,
     the summary block included, is sized at the run's own cap,
-    config.BUDGET_FRACTION. --no-cap-sweep returns cap_sweep=None. Like the
-    band and k sweeps it is backtest-only: live sizing reads
-    config.BUDGET_FRACTION and nothing here writes config.py.
+    config.BUDGET_FRACTION. The dashboard reads every cell as it is built,
+    for its filter bar's Size cap select. --no-cap-sweep returns
+    cap_sweep=None, and the dashboard then offers the run's own cap only — a
+    far smaller page, built far faster. Like the band and k sweeps it is
+    backtest-only: live sizing reads config.BUDGET_FRACTION and nothing here
+    writes config.py.
 """
 import argparse
 import logging
@@ -135,9 +139,12 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     never be the only signal (DR-66). Worded as a bound, not a cause: such a
     window may also have formed no pairs at all. And a stamped verdict can go
     stale once the cutoff moves past start_date, so it is read beside
-    backtester.max_trades_simulated — the same test the dashboard header
-    applies: if any simulated point traded, the verdict is reported as stale
-    instead of repeated.
+    backtester.max_trades_simulated: if any simulated point traded, the
+    verdict is reported as stale instead of repeated. That counts the EAGER
+    points only; the dashboard header, built after this line, tests the
+    larger of it and the size-cap points its filter walk simulates, so the
+    two agree unless only a size-cap scenario traded — then the page calls
+    the verdict stale while this line still repeats it.
 
     Takes the sweep WHOLE, like dashboard._section_interval_discount, so the
     provenance and the trade counts it is judged against cannot drift apart.
@@ -179,8 +186,9 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     )
     if not provenance.post_cutoff:
         return
-    # A trade at any simulated point disproves "no trade could be entered" —
-    # the one test the dashboard header applies too, so page and log agree
+    # A trade at any simulated point disproves "no trade could be entered".
+    # The eager points only: the dashboard header also counts the size-cap
+    # points its walk simulates, so the two agree unless only one of those traded
     traded = max_trades_simulated(sweep)
     if traded:
         logging.warning(
@@ -221,9 +229,11 @@ def main() -> None:
     effective interval discount, the primary spread band and the run's own
     per-trade size cap — so a default run's summary block reads exactly as
     the plain run_backtest() path's did. The other swept discounts and bands
-    exist only for the dashboard's k selector, its scenario explorer and the
+    exist only for the dashboard's k selectors (the Interval Discount
+    section's and the page-wide filter bar's), its scenario explorer and the
     calibration report, and the lazily simulated size caps
-    (result.cap_sweep) only for a report that reads its cells.
+    (result.cap_sweep) only for the dashboard's filter bar, which reads every
+    cell as the page is built.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -298,9 +308,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-cap-sweep", action="store_true",
-        help="Skip the per-trade size-cap sweep (the result's cap_sweep is "
-             "None): only the run's own cap, config.BUDGET_FRACTION, is left "
-             "for a report to show. Backtest only — live sizing always reads "
+        help="Skip the per-trade size-cap sweep: the dashboard offers the "
+             "run's own cap (config.BUDGET_FRACTION) only — a far smaller, "
+             "faster page. Backtest only — live sizing always reads "
              "config.BUDGET_FRACTION",
     )
     args = parser.parse_args()
@@ -483,9 +493,10 @@ def main() -> None:
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points and the band-sweep payload are consumed
-    # only by the dashboard's k selector and scenario explorer, and the lazy
-    # size-cap sweep (result.cap_sweep, simulated only when a cell is read)
-    # only by a report that reads its cells.
+    # only by the dashboard's k selectors, its filter bar and its scenario
+    # explorer, and the lazy size-cap sweep (result.cap_sweep, simulated only
+    # when a cell is read) only by the filter bar's Size cap select, whose
+    # cells generate_dashboard reads as the page is built.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -515,11 +526,12 @@ def main() -> None:
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
     # don't duplicate that line here, just point the user at the file.
     #
-    # sweep carries the calibration and every swept point for the k selector,
-    # the scenario explorer's band x k payload, the lazy size-cap sweep
-    # (cap_sweep, None under --no-cap-sweep) and the header's run-settings
-    # line; interval_discount is the resolved k these trades were sized at,
-    # which the Risk section's Kelly scatter must price on
+    # sweep carries the calibration and every swept point for the k
+    # selectors, the scenario explorer's band x k payload, the lazy size-cap
+    # sweep (cap_sweep, None under --no-cap-sweep — every cell of it is
+    # simulated here, as the filter bar's Size cap select is built) and the
+    # header's run-settings line; interval_discount is the resolved k these
+    # trades were sized at, which the Risk section's Kelly scatter must price on
     #
     # series_categories files each trade under Kalshi's own series category and
     # tags for the Returns Decomposition breakdown: one cached read-only GET of

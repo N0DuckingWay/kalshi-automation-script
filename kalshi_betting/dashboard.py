@@ -22,15 +22,18 @@ Purpose:
     yfinance) — into a single HTML file with embedded Plotly charts. The file
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
-    A sticky filter bar at the top of the page — Spread band, Category, Tag —
-    re-scopes every trade-derived section (performance, decomposition,
-    calibration, diagnostics, risk, the benchmark's strategy row) to the run
-    at another spread band and/or one Kalshi category or category · tag of
-    it, and moves the k-hat breakdown to the same band and selection. Every
-    figure a selection shows is computed here in Python by the
-    helpers the sections themselves render with (_filter_payload), packed
-    into one gzip + base64 data block, and swapped in by a small inline
-    script (_FILTER_JS) that draws nothing of its own.
+    A sticky filter bar at the top of the page — Spread band, k, Size cap,
+    Category, Tag — re-scopes every trade-derived section (performance,
+    decomposition, calibration, diagnostics, risk, the benchmark's strategy
+    row) to the run at another spread band, interval discount k and per-trade
+    size cap, and/or one Kalshi category or category · tag of it, and moves
+    the k-hat breakdown to the same band and selection (and its reference
+    line to the same k). Every figure a selection shows is computed here in
+    Python by the helpers the sections themselves render with, packed into
+    gzip + base64 data blocks — one base block (_filter_payload) and one
+    chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
+    by a small inline script (_FILTER_JS) that draws nothing of its own and
+    inflates a scenario's chunk only when a reader chooses it.
 
 Dependencies:
     Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
@@ -42,9 +45,12 @@ Dependencies:
     scenario-explorer labels can collide — _build_equity_curve() (the one
     definition of an equity curve, which the page-wide filter runs over a
     category's or tag's trades alone for that slice's attributed curve),
-    _leg_prices_for(), and max_trades_simulated() (the one test of a carried
+    _leg_prices_for(), max_trades_simulated() (the one test of a carried
     post-cutoff verdict against the run's own trades, shared with
-    backtest.py's closing line), and BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
+    backtest.py's closing line) and _cap_percent() (the injective size-cap
+    formatter the completion lines use, so no two Size cap options can read
+    alike) — and reads BacktestSweep.cap_sweep (a backtester.CapSweep) by
+    its attributes — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     fee_per_pair_approx() and
@@ -84,30 +90,52 @@ Notes:
 
     The page-wide filter bar (_filter_bar_html) is a third, separate set of
     controls, and the only one that reaches beyond its own section. Its
-    spread band choice shows that band's OWN run at the primary k (the band
-    sweep's "all" point there — a standalone simulation, so every figure is
-    genuine); its category and tag choices show a SLICE of that run, whose
-    figures drawn from an equity curve (return, drawdown, Sharpe, Sortino,
-    the median monthly return, the benchmark's strategy row) come from the
-    attributed curve — the starting balance plus the slice's P&L as the run
-    booked it (backtester._build_equity_curve over the slice) — i.e. its
-    contribution, not a standalone simulation, and the bar's summary line
-    says so. The header's trade count follows the selection too. A tag is
-    Kalshi's FIRST tag of the series (_series_labels), so every breakdown
-    partitions. It never re-scopes the interval-discount section or the
-    scenario explorer, which keep their own controls; the bar names them.
-    Every view is computed by the same helpers the sections render with
-    (_performance_kpis, _performance_series, _decomposition_aggregates,
-    _category_table, _reliability, _best_and_worst, _kelly_points,
-    _capital_deployed, _strategy_row), so the script only draws what Python
-    computed. The page as rendered IS the primary band's unfiltered view: the
-    script inflates the data block as the page loads, sets the bar back to
-    that view (a browser can restore a stale choice on reload) and keeps its
-    selects disabled until the data is ready, and redraws only when a
-    <select> changes — each chart from its layout as Python drew it, so a
-    zoom never carries over into another selection. A failure to build the
-    payload costs the bar, never the page: the page is written without it,
-    with a notice in its place and a WARNING in the log.
+    spread band, k and size cap choices pick a SCENARIO — that band's own run
+    at that k and per-trade cap, a standalone simulation, so every figure is
+    genuine: the band sweep's "all" point at the run's own cap, or, for any
+    other cap, the lazy size-cap sweep's (BacktestSweep.cap_sweep) point,
+    simulated as the page is built. Its category and tag choices show a
+    SLICE of that run, whose figures drawn from an equity curve (return,
+    drawdown, Sharpe, Sortino, the median monthly return, the benchmark's
+    strategy row) come from the attributed curve — the starting balance
+    plus the slice's P&L as the run booked it (backtester._build_equity_curve
+    over the slice) — i.e. its contribution, not a standalone simulation, and
+    the bar's summary line says so. The header's trade count follows the
+    selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
+    so every breakdown partitions. It never re-scopes the interval-discount
+    section or the scenario explorer, which keep their own controls; the bar
+    names them. Every view is computed by the same helpers the sections
+    render with (_performance_kpis, _performance_series,
+    _decomposition_aggregates, _category_table, _reliability,
+    _best_and_worst, _kelly_points, _capital_deployed, _strategy_row), so the
+    script only draws what Python computed.
+
+    The scenarios are one grid (_grid_source: bands x ks x caps, from the
+    sweep's eager points, or from its size-cap sweep when it carries one),
+    walked ONCE (_walk_grid) — one (band, k) cell at a time, primary cell and
+    primary cap first — by visitors that keep only what they build: the chunk
+    visitor packs one chunk per distinct (k, trade list), sharing it between
+    the scenarios that traded equal lists at one k (every cap at or above a
+    cell's peak Kelly fraction does), and a counter records the busiest
+    scenario for the header's stale-cutoff test (_MaxTrades). Only one cell's
+    points are ever alive, so a cap grid's points are never held in memory
+    together; the chunks are held as separate packed strings until each is
+    written, and the page is streamed to disk piece by piece, never joined
+    into one string or encoded whole. A size-cap cell (or the size-cap sweep
+    itself) that cannot be read costs the cap axis (the eager points are
+    walked instead, with one WARNING, and the header's run-settings line says
+    the sweep could not be used); a chunk that cannot be built,
+    or a base block that cannot be, costs the bar, never the page: the page
+    is written without it, with a notice in its place and a WARNING in the
+    log. The page as rendered IS the primary scenario's unfiltered view: the
+    script inflates the base block and the primary scenario's chunk as the
+    page loads, sets the bar back to that view (a browser can restore a stale
+    choice on reload) and keeps its selects disabled until both are ready,
+    and redraws only when a <select> changes — each chart from its layout as
+    Python drew it, so a zoom never carries over into another selection. A
+    scenario's chunk is inflated when it is first chosen, and the last ones
+    used are kept; a choice made while a chunk is still loading supersedes
+    it.
 
     The k-hat breakdown (_section_khat) is the one chart that follows the
     filter bar without describing trades. It regroups each band's carried
@@ -144,15 +172,18 @@ Notes:
     from an earlier run's cache, and the archive cutoff as of that assembly,
     with a red banner when the window starts at or after it and so could
     never enter a trade (DR-13, M2) — or, when some simulated point DID
-    trade (backtester.max_trades_simulated), an amber line saying that
+    trade (backtester.max_trades_simulated's eager points, or a size-cap
+    scenario the filter's walk simulated), an amber line saying that
     verdict is stale instead. It renders on every run, "not recorded"
     included, never as a silence (DR-66).
 
-    The page header also names the run's primary spread band and its same-event
-    ladder setting (DR-73) under the Period line, or "not recorded" when the
-    run passed no sweep: the ladder setting decides which pairs exist and the
-    band which of them are ever entered, so, like DR-66b's strike-blind
-    notice, they qualify every section rather than only the explorer.
+    The page header also names the run's primary spread band, its same-event
+    ladder setting (DR-73) and its per-trade size cap (and whether the
+    size-cap sweep ran) under the Period line, or "not recorded" when the
+    run passed no sweep: the ladder setting decides which pairs exist, the
+    band which of them are ever entered and the cap how big each trade is,
+    so, like DR-66b's strike-blind notice, they qualify every section rather
+    than only the explorer.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -161,13 +192,16 @@ Notes:
     own labelled KPI row.
 """
 import base64
+import dataclasses
 import gzip
+import hashlib
 import html
 import json
 import logging
 import math
 import os
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -187,6 +221,7 @@ from .backtester import (
     SweepPoint,
     _build_equity_curve,
     _calibration_bucket,
+    _cap_percent,
     _exact_label,
     _leg_prices_for,
     max_trades_simulated,
@@ -1493,8 +1528,10 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     Scope limit: the dropdown drives THIS section only, and the page-wide
     filter bar does not reach this section at all: it always reports the
     primary spread band's calibration and k sweep. Every other section
-    reflects the primary k, since return / drawdown / trade count is what one
-    actually compares k values on.
+    reflects the primary k as the page is rendered (the filter bar's own k
+    select then re-scopes the six trade-derived sections to another k's
+    run), since return / drawdown / trade count is what one actually
+    compares k values on.
 
     Args:
         sweep (BacktestSweep | None): The sweep payload from
@@ -1768,6 +1805,20 @@ _KHAT_TEXT = {
     "khat_not_recorded": ("k̂ was not recorded for this spread band: the run carries no "
                           "calibration for it (a dashboard built without a sweep, or from a "
                           "hand-built one)."),
+    # The reference line's label: {k} is a _k_label ("k = 0.75"). The line
+    # marks the k the page is showing — the run's own on the page as
+    # rendered, the filter bar's k after a choice.
+    "khat_sized_at": "sized at {k}",
+}
+
+# The k-hat chart's reference line, as drawn: a dashed vertical line and its
+# label above the plot, with no x (the k) and no label text — _section_khat
+# and the page's script both add those to these same dicts, so the line the
+# script redraws for a k is exactly the one Python drew for it.
+_KHAT_REF_LINE = {
+    "shape": {"type": "line", "yref": "paper", "y0": 0, "y1": 1,
+              "line": {"dash": "dash", "color": "#616161"}},
+    "annotation": {"y": 1, "yref": "paper", "yanchor": "bottom", "showarrow": False},
 }
 
 # The k-hat chart's height: (minimum, pixels per bar, room for the axes) —
@@ -1972,16 +2023,19 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
     and by Spread band every band for the selected category or tag — the
     grouping's own filter is ignored and its selected value highlighted. Each
     bar states the entries it pools and the distinct events behind them, and
-    a dashed line marks the k the run was sized at. Rendered here for the
+    a dashed line marks the k the page shows (the run's own here; the filter
+    bar's k once one is chosen). Rendered here for the
     default (by category, primary band, no filter); the filter script
     redraws it for every other choice from the same payload. The "Group by"
     <select> sits outside the chart's body, so it stays reachable when a
     selection has nothing to draw.
 
     Args:
-        payload (dict | None): _filter_payload's output (its "khat" per
-            band), or None when it could not be built — the section then says
-            so and draws nothing.
+        payload (dict | None): _filter_payload's output — the base block: its
+            "khat" per band, "bands", "categories", "primary" ([band, k,
+            cap] indexes; the band index is read) and "styles" (the bars'
+            colours and the reference line, "khat_ref") — or None when it
+            could not be built; the section then says so and draws nothing.
         k_used (float | None): The run's interval discount, drawn as the
             reference line; None draws none.
 
@@ -2008,7 +2062,9 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
                 "page-wide filter's data, which could not be built for this run (the log "
                 "names the error).</p>")
 
-    primary = payload["primary"]
+    # The primary scenario's band: the k-hat population depends on the band
+    # alone, never on k or the size cap
+    primary = payload["primary"][0]
     band = payload["khat"][primary]
     rows = []
     if band is not None:
@@ -2044,10 +2100,13 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
         "yaxis": {"autorange": "reversed"},
     }
     if k_used is not None:
-        layout["shapes"] = [{"type": "line", "x0": k_used, "x1": k_used, "yref": "paper",
-                             "y0": 0, "y1": 1, "line": {"dash": "dash", "color": "#616161"}}]
-        layout["annotations"] = [{"x": k_used, "y": 1, "yref": "paper", "yanchor": "bottom",
-                                  "text": f"sized at {_k_label(k_used)}", "showarrow": False}]
+        # From the payload's own line (_KHAT_REF_LINE), which the script
+        # redraws for every other k: the two can never draw it differently
+        ref = payload["styles"]["khat_ref"]
+        layout["shapes"] = [{**ref["shape"], "x0": k_used, "x1": k_used}]
+        layout["annotations"] = [{**ref["annotation"], "x": k_used,
+                                  "text": _KHAT_TEXT["khat_sized_at"].format(
+                                      k=_k_label(k_used))}]
     fig.update_layout(**layout)
 
     group_opts = "".join(f'<option value="{value}">{label}</option>'
@@ -2559,9 +2618,10 @@ def _scenario_explorer_empty_reason(sweep: BacktestSweep) -> str:
     return "band sweep off (--no-band-sweep / band_sweep=False)"
 
 
-def _run_settings_html(sweep: BacktestSweep | None) -> str:
+def _run_settings_html(sweep: BacktestSweep | None, *,
+                       cap_sweep_unused: bool = False) -> str:
     """
-    Render the page-header line naming the run's primary spread band and ladder setting.
+    Render the page-header line naming the run's primary spread band, ladder setting and size cap.
 
     Both settings shape the population every section reports on — the
     same-event ladder switch (DR-73) decides which pairs exist, admitting or
@@ -2569,19 +2629,36 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
     ever entered (it acts inside backtester._find_entry, after pair
     extraction) — so, like DR-66b's strike-blind notice,
     they taint every section of the page, not only the scenario explorer, and
-    belong in the header a reader sees before any figure. "not recorded" is
-    printed rather than a guess whenever the sweep does not carry the value
-    (no sweep at all — the four-positional generate_dashboard call — or a
-    hand-built sweep).
+    belong in the header a reader sees before any figure. The per-trade size
+    cap sizes every trade on the page as rendered, and whether the size-cap
+    sweep ran — and whether the filter bar could use it — decides whether
+    the bar's Size cap select offers any other cap, so a single-option
+    select always has its reason on the page: generate_dashboard renders
+    this line AFTER the filter's walk and passes cap_sweep_unused when the
+    run carried a size-cap sweep but the bar fell back to the run's own cap
+    (a cell or the sweep itself could not be read — the log's WARNING names
+    why). "not recorded" is printed rather than a guess whenever the sweep
+    does not carry the value (no sweep at all — the four-positional
+    generate_dashboard call — or a hand-built sweep). The sweep reads "off,
+    --no-cap-sweep" only when the run carries a census (label_coverage):
+    without one it may be the infeasible-window short-circuit, which carries
+    no cap sweep either (the rule _scenario_explorer_empty_reason applies to
+    the band sweep).
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
+        cap_sweep_unused (bool): Keyword-only. The sweep carries a size-cap
+            sweep but the filter bar offers the run's own cap only (the walk
+            fell back to the eager points). Ignored without a size-cap sweep.
 
     Returns:
         str: One <p> line: "Primary spread band: <label> | same-event
-            ladders: on / off / not recorded".
+            ladders: on / off / not recorded | per-trade cap: <cap>
+            (size-cap sweep on / on, but it could not be used — … / off,
+            --no-cap-sweep / not recorded)", the cap as the bar's Size cap
+            select names it (_cap_option).
     """
-    band = ladders = "not recorded"
+    band = ladders = cap = cap_sweep = "not recorded"
     if sweep is not None:
         if sweep.primary.spread_band is not None:
             band = _row_label(sweep.primary.spread_band)
@@ -2589,13 +2666,23 @@ def _run_settings_html(sweep: BacktestSweep | None) -> str:
             ladders = "on"
         elif sweep.same_event_ladders is False:
             ladders = "off"
+        cap = _cap_option(sweep.primary.size_cap)
+        if sweep.cap_sweep is not None and cap_sweep_unused:
+            cap_sweep = ("on, but it could not be used — the filter bar offers the "
+                         "run's own cap only; the log names why")
+        elif sweep.cap_sweep is not None:
+            cap_sweep = "on"
+        elif sweep.label_coverage is not None:
+            cap_sweep = "off, --no-cap-sweep"
     return (
         '<p style="color:#616161; font-size:14px;">'
-        f"Primary spread band: {html.escape(band)} | same-event ladders: {ladders}</p>"
+        f"Primary spread band: {html.escape(band)} | same-event ladders: {ladders}"
+        f" | per-trade cap: {cap} (size-cap sweep {cap_sweep})</p>"
     )
 
 
-def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
+def _corpus_provenance_html(sweep: BacktestSweep | None, *,
+                            traded: int | None = None) -> str:
     """
     Render the page-header lines saying what settled-market corpus the run read.
 
@@ -2613,9 +2700,11 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     file time, named as such), whether it came from an earlier run's cache
     (and that --no-cache extends it), and the archive cutoff at assembly.
     When the carried verdict says the window starts at or after that cutoff,
-    a second line follows, in one of two forms decided by
-    backtester.max_trades_simulated — the one definition the log's closing
-    WARNING also reads, so page and log agree:
+    a second line follows, in one of two forms decided by the most trades
+    any simulated scenario made — backtester.max_trades_simulated over the
+    eager points (the one count the log's closing WARNING reads too), or
+    `traded` when the caller adds the size-cap points the page shows, so
+    the two agree unless only a size-cap scenario traded (see below):
       * no simulated point traded: a red banner stating a BOUND, not a cause
         — no trade could be entered whatever pairs formed; such a run may
         also have formed no pairs at all (the 2026-09-17 window formed 0).
@@ -2626,8 +2715,21 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     The verdict is the one historical._corpus_provenance CARRIED, never
     re-derived here.
 
+    The page can also show size-cap scenarios the eager sweep never
+    simulated (BacktestSweep.cap_sweep, read by the filter bar's walk), and
+    a larger cap can turn an n < 1 skip into a trade, so generate_dashboard
+    passes `traded` — the larger of max_trades_simulated and the busiest cap
+    point the walk simulated (_MaxTrades). The log's closing line reads the
+    eager points only (backtest._log_corpus_provenance, which runs before the
+    dashboard is built), so on a run where ONLY a non-default cap traded the
+    page calls the verdict stale where the log still repeats it: the page
+    has the evidence and the log does not.
+
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
+        traded (int | None): Keyword-only. The most trades any scenario the
+            page shows made; None (default) reads
+            backtester.max_trades_simulated(sweep), the eager points only.
 
     Returns:
         str: One grey <p> line, plus a red or amber <p> when the carried
@@ -2674,8 +2776,10 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     cutoff_day = (f"{prov.archive_cutoff:%Y-%m-%d}" if prov.archive_cutoff is not None
                   else "not recorded")
     # A trade at any simulated point disproves "no trade could be entered":
-    # the one test the log's closing WARNING applies too
-    traded = max_trades_simulated(sweep)
+    # the one test the log's closing WARNING applies too (over the eager
+    # points; the caller adds the cap points the page's walk simulated)
+    if traded is None:
+        traded = max_trades_simulated(sweep)
     if traded:
         recorded = "at this corpus's assembly" if prov.from_cache else "by this run"
         notice = (
@@ -3184,6 +3288,11 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
     from scanner.leg_sides and the prices from backtester._leg_prices_for, the
     same single sources the simulation priced and paid out with.
 
+    The row is its two halves joined, _trade_row_head (everything that does
+    not depend on the trade's size) and _trade_row_tail (the size cells), so
+    the page-wide filter can ship each head once for every size-cap scenario
+    that trades it and still show exactly this row.
+
     Args:
         t (BacktestTrade): Trade to display.
         color (str): CSS background color for the row (e.g. "#F9FBE7").
@@ -3192,6 +3301,32 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
         str: An HTML <tr>...</tr> string: entry date, pair type, the YES and NO
             prices paid, the trade details, the outcome, contract count,
             fee-inclusive cost and profit/return.
+    """
+    return _trade_row_head(t, color) + _trade_row_tail(t)
+
+
+# One cell's opening tag in the best/worst-trade tables.
+_TRADE_CELL = "<td style='padding:4px 8px;vertical-align:top;'>"
+
+
+def _trade_row_head(t: BacktestTrade, color: str) -> str:
+    """
+    Render the size-independent half of a best/worst-trade row.
+
+    Everything from the <tr> through the outcome cell: the entry date, the
+    pair type, the prices paid, each leg's side, market and close date, and
+    how each leg settled. None of it depends on how many contracts were
+    bought, so every size-cap scenario that traded this pair on this entry
+    date shows the same head — which is why the filter payload stores heads
+    once, in a table shared by every chunk (_ChunkVisitor).
+
+    Args:
+        t (BacktestTrade): Trade to display.
+        color (str): CSS background color for the row.
+
+    Returns:
+        str: An HTML fragment opening a <tr>: six cells, every
+            Kalshi-controlled string escaped; _trade_row_tail closes it.
     """
     side_a, side_b = leg_sides(t.pair_type)
     price_a, price_b = _leg_prices_for(t.pair_type, t.entry_pA, t.entry_nA,
@@ -3213,15 +3348,32 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
         f"({'won' if result == side else 'lost'})"
         for name, (side, _, _, _, _, _, result, settled) in zip(("A", "B"), legs, strict=True)
     )
-    cell = "<td style='padding:4px 8px;vertical-align:top;'>"
+    cell = _TRADE_CELL
     return (f"<tr style='background:{color}'>"
             f"{cell}{t.entry_date}</td>"
             f"{cell}{html.escape(t.pair_type)}</td>"
             f"{cell}${paid['yes']:.2f}</td>"
             f"{cell}${paid['no']:.2f}</td>"
             f"{cell}{details}</td>"
-            f"{cell}{outcome}</td>"
-            f"{cell}{t.n}</td>"
+            f"{cell}{outcome}</td>")
+
+
+def _trade_row_tail(t: BacktestTrade) -> str:
+    """
+    Render the size-dependent half of a best/worst-trade row.
+
+    The contract count, the fee-inclusive cost and the profit and return —
+    the cells a different per-trade size cap changes — then the closing
+    </tr>. Appended to _trade_row_head, it completes _trade_row.
+
+    Args:
+        t (BacktestTrade): Trade to display.
+
+    Returns:
+        str: An HTML fragment: three cells and "</tr>".
+    """
+    cell = _TRADE_CELL
+    return (f"{cell}{t.n}</td>"
             f"{cell}${t.total_cost + t.fees:.2f}</td>"
             f"<td style='padding:4px 8px;vertical-align:top;"
             f"color:{'#2E7D32' if t.profit >= 0 else '#C62828'}'>"
@@ -3648,7 +3800,7 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     )
 
 
-# ─── Page-wide filter: spread band x Kalshi category x tag ───────────────────
+# ─── Page-wide filter: spread band x k x size cap x Kalshi category x tag ───
 
 # The view every trade list carries: all of its trades, no category or tag.
 _ALL_VIEW = "all"
@@ -3661,12 +3813,23 @@ _UNFILTERED_SECTIONS = "Interval Discount (k) Calibration and the Scenario Explo
 # The filter bar's summary line, as templates: _filter_summary_text fills them
 # for the page as rendered and the page's script fills them (D.text) for every
 # other selection, so the two can never word one selection differently.
-# {scenario} is a band's _band_scenario, {count} and {band_count} a
+# {scenario} is "scenario" filled (_scenario_phrase: a band's _band_where, a
+# k's text and a size cap's _cap_text), {count} and {band_count} a
 # _trade_count, {n} a bare count and {selection} a category or
-# "Category · Tag".
+# "Category · Tag". "missing" is a scenario the run never simulated (a cell a
+# hand-built sweep left out), "loading" the line shown while a scenario's
+# chunk is inflated, and "unavailable" a chunk that could not be loaded:
+# {failed} is the scenario asked for, {reason} the error and {scenario} the
+# one the sections still show.
 _SUMMARY_TEMPLATES = {
+    "scenario": "{where}, {k}, {cap}",
     "all": "Showing every trade of the run at {scenario}: {count}.",
-    "other_band": " This band is its own simulation, not a slice of the primary run.",
+    "other_scenario": (" This spread band, k and size cap is its own simulation, "
+                       "not a slice of the primary run."),
+    "missing": "Showing nothing: {scenario} was not simulated by this run.",
+    "loading": "Loading {scenario}…",
+    "unavailable": ("The filter could not load the data for {failed} ({reason}); "
+                    "the sections show {scenario}."),
     "slice": ("Showing {selection} within the run at {scenario}: {n} of its {band_count}. "
               "Every figure drawn from an equity curve (return, drawdown, Sharpe, "
               "Sortino, the median monthly return, the benchmark's strategy row) is this "
@@ -3682,76 +3845,823 @@ _FILTER_UNAVAILABLE_HTML = (
     "The page-wide filter could not be built for this run (the log names the error); "
     "every section shows the primary spread band's full run.</p>")
 
+# Every field of a BacktestTrade, in declaration order: _list_key's identity
+# of a trade list is these values, trade by trade.
+_TRADE_FIELDS = tuple(f.name for f in dataclasses.fields(BacktestTrade))
+
+# The walk logs its progress about this many times over a size-cap sweep's
+# grid, whose cells are simulated as they are read.
+_WALK_PROGRESS_LINES = 20
+
+
+def _no_same_title() -> dict:
+    """
+    The same-title population of a grid with none: no point at any cap.
+
+    Returns:
+        dict: {}.
+    """
+    return {}
+
 
 @dataclass(frozen=True)
-class _BandRun:
+class _GridSource:
     """
-    One spread band's own run at the run's primary k: what choosing that band
-    in the page's filter bar shows.
+    Every spread band x k x per-trade size cap scenario the page can show.
+
+    The filter bar's three scenario selects index these axes, and the one
+    walk over them (_walk_grid) hands each cell to the page's visitors. A
+    cell is simulated ON DEMAND when it comes from a size-cap sweep
+    (backtester.CapSweep.cell), or looked up among the sweep's eager points
+    otherwise — which is why the walk, not a dict of every point, is the
+    interface: a whole cap grid's points would hold gigabytes.
+
+    Built by _grid_source; the primary scenario always resolves to the
+    page's own trades and curve (the visitors substitute them), never to a
+    copy looked up again.
 
     Attributes:
-        band (tuple[float, float] | None): The resolved band, or None when the
-            run recorded none (no sweep was passed, or a hand-built one).
-        label (str): How the band reads on the page (_row_label, or "not
-            recorded").
-        trades (list[BacktestTrade]): That band's "all"-population trades — for
-            the primary band, the very list every section renders by default.
-        equity_df (pd.DataFrame): That band's own standalone equity curve.
-        calibration (IntervalCalibration | None): That band's k-hat
-            measurement, whose observations the k-hat breakdown regroups.
+        bands (tuple): Resolved (floor, ceiling) band tuples, ascending; or
+            (None,) when the run recorded none (no sweep, or a hand-built
+            one) — a single "not recorded" band.
+        ks (tuple): Interval discounts, ascending; (None,) when neither a
+            sweep nor an override recorded one.
+        caps (tuple): Per-trade size caps, ascending, 1.0 meaning no cap;
+            (the primary point's size_cap,) without a size-cap sweep — None
+            when not recorded.
+        primary (tuple[int, int, int]): The (band, k, cap) indexes of the
+            run's own scenario — the page as rendered.
+        cell: Callable (band, k) -> {cap: {population: SweepPoint}}; {} for a
+            cell the sweep never simulated (a ragged hand-built sweep). May
+            simulate (a size-cap sweep) and so may raise.
+        calibrations (dict): Band -> that band's IntervalCalibration (or
+            None). The primary band's falls back to sweep.calibration.
+        same_title: Callable () -> {cap: SweepPoint} — the band- and
+            k-independent same-title population; {} when there is none.
+        events (frozenset): (event ticker, fallback category) of every trade
+            any cell can show, so the bar can list every category and tag
+            before a cell is simulated.
+        checks (bool): Whether the band sweep ran (cells then carry the
+            "time_series", "ladder" and "cross" populations too).
+        cap_sweep: The backtester.CapSweep the cells come from, or None —
+            read only for its simulated / reused counters in the walk's log.
+        fallback: Callable () -> _GridSource, or None: the eager-only source
+            the walk falls back to when a size-cap cell cannot be simulated.
     """
-    band: tuple[float, float] | None
-    label: str
-    trades: list
-    equity_df: pd.DataFrame
-    calibration: IntervalCalibration | None
+    bands: tuple
+    ks: tuple
+    caps: tuple
+    primary: tuple[int, int, int]
+    cell: Callable[[tuple[float, float] | None, float | None], dict]
+    calibrations: dict
+    same_title: Callable[[], dict] = _no_same_title
+    events: frozenset = frozenset()
+    checks: bool = False
+    cap_sweep: object | None = None
+    fallback: Callable[[], "_GridSource"] | None = None
 
 
-def _band_runs(
+def _band_calibrations(sweep: BacktestSweep, bands: tuple) -> dict:
+    """
+    Each band's k-hat measurement, the primary band's falling back to the sweep's.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+        bands (tuple): The grid's bands.
+
+    Returns:
+        dict: Band -> IntervalCalibration | None. The primary band reads
+            sweep.calibrations_by_band, else sweep.calibration (a sweep that
+            ran without a band sweep carries only the latter); every other
+            band reads calibrations_by_band alone.
+    """
+    primary_band = sweep.primary.spread_band
+    return {band: (sweep.calibrations_by_band.get(band, sweep.calibration)
+                   if band == primary_band else sweep.calibrations_by_band.get(band))
+            for band in bands}
+
+
+def _trade_events(points) -> frozenset:
+    """
+    The (event ticker, fallback category) of every trade some points hold.
+
+    Args:
+        points: SweepPoints.
+
+    Returns:
+        frozenset: (BacktestTrade.event_ticker, BacktestTrade.category) pairs.
+    """
+    return frozenset((t.event_ticker, t.category) for point in points for t in point.trades)
+
+
+def _unbanded_source(
     sweep: BacktestSweep | None,
     trades: list[BacktestTrade],
     equity_df: pd.DataFrame,
-) -> tuple[list[_BandRun], int]:
+    k_used: float | None,
+) -> _GridSource:
     """
-    List every spread band the filter bar offers, each with its own run.
+    The grid of a run that recorded no spread band: one "not recorded" band.
 
-    A band sweep simulates every band at every k; the band the bar shows is
-    each band's "all"-population point at the run's PRIMARY k — the result of
-    running the backtest at that band, same-title trades included — so a
-    band choice is a real, standalone simulation, never a slice. The primary
-    band's run is the trades and curve the rest of the page renders (the
-    caller's own arguments), not a copy looked up again.
+    Without a sweep there is one scenario — the page's own trades, at k_used
+    and an unrecorded cap. With a sweep whose primary has no band (a
+    hand-built one), every k of sweep.points is a cell, so a multi-k sweep
+    keeps its per-k scenarios; the cap is the primary's.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep, or None.
-        trades (list[BacktestTrade]): The trades the page renders by default
-            (the primary scenario's).
-        equity_df (pd.DataFrame): Their equity curve.
+        trades (list[BacktestTrade]): The page's trades.
+        equity_df (pd.DataFrame): Their curve.
+        k_used (float | None): The page's k (no sweep only).
 
     Returns:
-        tuple[list[_BandRun], int]: The runs in ascending band order, and the
-            index of the primary one. A single run labelled "not recorded"
-            when there is no sweep or its primary records no band; the primary
-            band alone when the band sweep was off.
+        _GridSource: One band, its ks and one cap.
+    """
+    if sweep is None:
+        by_k = {k_used: SweepPoint(k=k_used, trades=trades, equity_df=equity_df)}
+        cap, primary_k, calibration, checks = None, k_used, None, False
+    else:
+        by_k = {}
+        for point in (sweep.primary, *sweep.points):
+            by_k.setdefault(point.k, point)
+        cap, primary_k = sweep.primary.size_cap, sweep.primary.k
+        calibration, checks = sweep.calibration, bool(sweep.scenarios)
+    ks = tuple(sorted(by_k)) if len(by_k) > 1 else tuple(by_k)
+
+    def cell(band, k) -> dict:
+        """
+        The one population ("all") of the point swept at k.
+
+        Args:
+            band: Ignored (the grid has one, unrecorded band).
+            k: The cell's k.
+
+        Returns:
+            dict: {cap: {"all": point}}, or {} for a k not swept.
+        """
+        point = by_k.get(k)
+        return {} if point is None else {cap: {_ALL_VIEW: point}}
+
+    return _GridSource(bands=(None,), ks=ks, caps=(cap,), primary=(0, ks.index(primary_k), 0),
+                       cell=cell, calibrations={None: calibration},
+                       events=_trade_events(by_k.values()), checks=checks)
+
+
+def _eager_source(sweep: BacktestSweep) -> _GridSource:
+    """
+    The grid of a sweep's eager points: every band x k it simulated, at its own cap.
+
+    Every point with a band — the primary, sweep.points, then
+    sweep.scenarios, the first wins — is filed by (band, k, population); the
+    axes are the bands and ks of the "all" points, and a (band, k) the sweep
+    never simulated is an empty cell. There is one cap: the primary's (the
+    run's own, config.BUDGET_FRACTION in production, or None when a
+    hand-built point records none).
+
+    Args:
+        sweep (BacktestSweep): A sweep whose primary records a band.
+
+    Returns:
+        _GridSource: Its bands, ks, one cap and the eager lookups.
+    """
+    eager: dict = {}
+    for point in (sweep.primary, *sweep.points, *sweep.scenarios):
+        if point.spread_band is not None:
+            eager.setdefault((point.spread_band, point.k, point.population), point)
+    alls = [(band, k) for band, k, population in eager if population == _ALL_VIEW]
+    bands = tuple(sorted({band for band, _ in alls}))
+    ks = tuple(sorted({k for _, k in alls}))
+    by_cell: dict = {}
+    for (band, k, population), point in eager.items():
+        by_cell.setdefault((band, k), {})[population] = point
+    cap = sweep.primary.size_cap
+    same_title = sweep.same_title_point
+
+    def cell(band, k) -> dict:
+        """
+        One (band, k)'s eager points.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+
+        Returns:
+            dict: {cap: {population: point}}, or {} for a cell never simulated.
+        """
+        pops = by_cell.get((band, k))
+        return {cap: dict(pops)} if pops else {}
+
+    def same_title_points() -> dict:
+        """
+        The same-title point at the run's own cap.
+
+        Returns:
+            dict: {cap: point}, or {} without one.
+        """
+        return {} if same_title is None else {cap: same_title}
+
+    return _GridSource(
+        bands=bands, ks=ks, caps=(cap,),
+        primary=(bands.index(sweep.primary.spread_band), ks.index(sweep.primary.k), 0),
+        cell=cell, calibrations=_band_calibrations(sweep, bands),
+        same_title=same_title_points, events=_trade_events(eager.values()),
+        checks=bool(sweep.scenarios))
+
+
+def _grid_source(
+    sweep: BacktestSweep | None,
+    trades: list[BacktestTrade],
+    equity_df: pd.DataFrame,
+    k_used: float | None,
+    *,
+    use_cap_sweep: bool = True,
+) -> _GridSource:
+    """
+    Pick the grid of scenarios the page offers, from what the sweep carries.
+
+    Three shapes, in order:
+      * no sweep, or a sweep whose primary records no band — one "not
+        recorded" band (_unbanded_source);
+      * a size-cap sweep (sweep.cap_sweep), when use_cap_sweep — its bands,
+        ks and caps, cells simulated on demand by CapSweep.cell as the walk
+        reads them, every category and tag listed up front from
+        CapSweep.entry_events, and the eager-only source as the walk's
+        fallback should a cell fail to simulate;
+      * otherwise the eager points alone, at the run's own cap
+        (_eager_source).
+    A size-cap sweep is not trusted when it does not hold the primary
+    scenario on its axes (never in production), and costs only the cap axis
+    when reading its axes or its entries' events raises (as a cell that
+    cannot be simulated does in the walk): a WARNING, and the eager source.
+    A size-cap sweep on a sweep whose primary records no band cannot be
+    placed on the band axis at all, and is set aside with a WARNING too, so
+    the header's "could not be used" clause always has its reason in the log.
+    In every shape the primary scenario's chunk is built from the page's own
+    trades and curve (the visitors substitute them), and the primary band's
+    calibration falls back to sweep.calibration.
+
+    The k axis is the sweep's own: its primary entry is sweep.primary.k,
+    never k_used, which names the one k only without a sweep. An
+    interval_discount override that differs from sweep.primary.k (never in
+    production, where backtest.py passes the primary's k) still prices the
+    primary scenario's chunk (the chunk visitor reads k_used) but is named
+    by no axis entry; generate_dashboard warns about it.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep, or None.
+        trades (list[BacktestTrade]): The trades the page renders.
+        equity_df (pd.DataFrame): Their equity curve.
+        k_used (float | None): The k the page names (used without a sweep).
+        use_cap_sweep (bool): Keyword-only. False ignores sweep.cap_sweep —
+            the walk's fallback.
+
+    Returns:
+        _GridSource: The grid.
     """
     if sweep is None or sweep.primary.spread_band is None:
-        calibration = None if sweep is None else sweep.calibration
-        return [_BandRun(None, "not recorded", trades, equity_df, calibration)], 0
-    primary_band = sweep.primary.spread_band
-    others = {pt.spread_band: pt for pt in sweep.scenarios
-              if pt.population == "all" and pt.k == sweep.primary.k
-              and pt.spread_band is not None and pt.spread_band != primary_band}
-    bands = sorted({primary_band, *others})
-    runs = []
-    for band in bands:
-        if band == primary_band:
-            runs.append(_BandRun(band, _row_label(band), trades, equity_df,
-                                 sweep.calibrations_by_band.get(band, sweep.calibration)))
-        else:
-            point = others[band]
-            runs.append(_BandRun(band, _row_label(band), point.trades, point.equity_df,
-                                 sweep.calibrations_by_band.get(band)))
-    return runs, bands.index(primary_band)
+        if use_cap_sweep and sweep is not None and sweep.cap_sweep is not None:
+            logging.warning("The size-cap sweep cannot be placed on a run whose primary "
+                            "records no spread band; the page offers the run's own cap only")
+        return _unbanded_source(sweep, trades, equity_df, k_used)
+    capped = sweep.cap_sweep
+    if use_cap_sweep and capped is not None:
+        primary = sweep.primary
+        try:
+            bands, ks, caps = tuple(capped.bands), tuple(capped.ks), tuple(capped.caps)
+            if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
+                return _GridSource(
+                    bands=bands, ks=ks, caps=caps,
+                    primary=(bands.index(primary.spread_band), ks.index(primary.k),
+                             caps.index(capped.primary_cap)),
+                    # Simulates the cell's caps as they are read (backtester's
+                    # lazy CapSweep): a cap grid is never held in memory whole
+                    cell=capped.cell, same_title=capped.same_title,
+                    calibrations=_band_calibrations(sweep, bands),
+                    # Every entry's event, as the simulation files its trades —
+                    # the categories and tags exist before any cell is simulated
+                    events=frozenset(capped.entry_events()),
+                    checks=bool(capped.checks), cap_sweep=capped,
+                    fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
+                                                  use_cap_sweep=False))
+        except Exception:
+            # The cap axis alone is lost, as when a cell cannot be simulated
+            # in the walk: the eager points still give the bar every band and k
+            logging.warning("The size-cap sweep could not be simulated; the page offers "
+                            "the run's own cap only", exc_info=True)
+            return _eager_source(sweep)
+        logging.warning(
+            "The size-cap sweep does not hold this run's primary scenario (band %s, "
+            "k %s, cap %s); the dashboard offers the run's own cap only",
+            primary.spread_band, primary.k, capped.primary_cap)
+    return _eager_source(sweep)
+
+
+def _filter_labels(
+    source: _GridSource,
+    trades: list[BacktestTrade],
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """
+    Every Kalshi category and category · tag the filter bar offers.
+
+    The union of every trade any cell can show (source.events), the page's
+    own trades, and every band's k-hat observations (the k-hat breakdown
+    shows a category even where no trade was made), each filed by
+    _series_labels — the rule the sections file trades by.
+
+    Args:
+        source (_GridSource): The grid.
+        trades (list[BacktestTrade]): The page's trades.
+        series_categories (dict | None): The series-category map.
+
+    Returns:
+        tuple[list[str], list[tuple[str, str]]]: The categories, sorted, and
+            the (category, tag) pairs, sorted.
+    """
+    pairs = {_series_labels(ticker, category, series_categories)
+             for ticker, category in source.events}
+    pairs.update(_series_labels(t.event_ticker, t.category, series_categories)
+                 for t in trades)
+    pairs.update(_series_labels(o.event_ticker, o.category, series_categories)
+                 for calibration in source.calibrations.values() if calibration is not None
+                 for o in calibration.observations)
+    return sorted({category for category, _ in pairs}), sorted(pairs)
+
+
+def _band_option(band: tuple[float, float] | None) -> str:
+    """
+    Name a spread band as the filter bar's Spread band select does.
+
+    Args:
+        band (tuple[float, float] | None): A resolved band, or None.
+
+    Returns:
+        str: _row_label's label, or "not recorded".
+    """
+    return "not recorded" if band is None else _row_label(band)
+
+
+def _k_option(k: float | None) -> str:
+    """
+    Name an interval discount as the filter bar's k select does.
+
+    Args:
+        k (float | None): A resolved k, or None.
+
+    Returns:
+        str: _k_label's "k = 0.75" (distinct for every distinct k), or "not
+            recorded".
+    """
+    return "not recorded" if k is None else _k_label(k)
+
+
+def _k_text(k: float | None) -> str:
+    """
+    Name an interval discount in the summary line's scenario phrase.
+
+    Args:
+        k (float | None): A resolved k, or None.
+
+    Returns:
+        str: "k = 0.75", or "k not recorded".
+    """
+    return "k not recorded" if k is None else _k_label(k)
+
+
+def _cap_option(cap: float | None) -> str:
+    """
+    Name a per-trade size cap as the filter bar's Size cap select does.
+
+    Through backtester._cap_percent, the injective formatter the cap
+    completion lines use, so two different caps never share a label.
+
+    Args:
+        cap (float | None): A resolved cap in (0, 1], 1.0 meaning no cap; or
+            None when not recorded.
+
+    Returns:
+        str: "20%", "off (full Kelly)" for 1.0 (Kelly's f* never exceeds 1,
+            so a 100% cap is no cap), or "not recorded".
+    """
+    if cap is None:
+        return "not recorded"
+    if cap >= 1.0:
+        return "off (full Kelly)"
+    # backtester's exact decimal shift of the cap, never a float product
+    return f"{_cap_percent(cap)}%"
+
+
+def _cap_text(cap: float | None) -> str:
+    """
+    Name a per-trade size cap in the summary line's scenario phrase.
+
+    Args:
+        cap (float | None): A resolved cap, or None.
+
+    Returns:
+        str: "20% cap per trade", "no per-trade cap" (1.0), or "cap not
+            recorded".
+    """
+    if cap is None:
+        return "cap not recorded"
+    if cap >= 1.0:
+        return "no per-trade cap"
+    return f"{_cap_percent(cap)}% cap per trade"
+
+
+def _list_key(k: float | None, trades: list[BacktestTrade]) -> str:
+    """
+    Identify one trade list priced at one k, for sharing a chunk.
+
+    Two scenarios that traded equal lists show the same views — except the
+    Kelly scatter, whose x values are priced at the scenario's k — so the
+    key holds k beside every field of every trade (_TRADE_FIELDS, the
+    dataclasses.astuple values of a flat BacktestTrade, read without its
+    deep copy). A SHA-256 of their repr: repr is exact for every field type a
+    trade carries (str, int, float, bool, date, None).
+
+    Args:
+        k (float | None): The k the list's Kelly scatter is priced at.
+        trades (list[BacktestTrade]): The list.
+
+    Returns:
+        str: A hex digest; equal lists at an equal k share it.
+    """
+    rows = [tuple(getattr(t, name) for name in _TRADE_FIELDS) for t in trades]
+    identity = repr((None if k is None else float(k), rows))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _cut_to_axis(by_cap: dict, axis_end: pd.Timestamp | None) -> dict:
+    """
+    End every point's equity curve on the page's last date, once per cell.
+
+    A curve runs to today (UTC) as read when it was built, and the page's
+    axis is its primary curve's dates: a point built on a later UTC day (an
+    eager cell simulated after midnight, or a cell a hand-built source
+    builds now) would run a day past it. Its figures are cut there anyway
+    (_view_payload), but a visitor reading a point's own curve — a Sharpe,
+    a return — must see the same span, so the cut is made here, before any
+    visitor reads it. The points themselves are never modified: a point
+    whose curve runs past the axis is replaced by a copy (dataclasses.replace)
+    holding the cut curve, and copies that shared one curve share its cut.
+
+    Args:
+        by_cap (dict): One cell: {cap: {population: SweepPoint}}.
+        axis_end (pd.Timestamp | None): The page's last date; None cuts
+            nothing (an empty axis).
+
+    Returns:
+        dict: The cell, with every over-long curve cut to axis_end.
+    """
+    if axis_end is None:
+        return by_cap
+    curves: dict[int, pd.DataFrame] = {}
+    points: dict[int, SweepPoint] = {}
+
+    def cut(point: SweepPoint) -> SweepPoint:
+        """
+        One point, its curve ending on axis_end.
+
+        Args:
+            point (SweepPoint): A cell's point.
+
+        Returns:
+            SweepPoint: The point itself, or a copy with a cut curve.
+        """
+        if id(point) in points:
+            return points[id(point)]
+        eq = point.equity_df
+        result = point
+        if eq is not None and len(eq) and pd.Timestamp(eq["date"].iloc[-1]) > axis_end:
+            if id(eq) not in curves:
+                curves[id(eq)] = eq[pd.to_datetime(eq["date"]) <= axis_end] \
+                    .reset_index(drop=True)
+            result = dataclasses.replace(point, equity_df=curves[id(eq)])
+        points[id(point)] = result
+        return result
+
+    return {cap: {population: cut(point) for population, point in pops.items()}
+            for cap, pops in by_cap.items()}
+
+
+def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
+               ) -> Exception | None:
+    """
+    Hand every scenario of a grid to each visitor, one (band, k) cell at a time.
+
+    The primary cell comes first, and within every cell the primary cap
+    first, so the primary scenario's chunk is always chunk 0. A cell is read
+    (source.cell — a size-cap sweep simulates it here), its curves are cut to
+    the page's axis (_cut_to_axis), every cap of it is visited, and it is
+    dropped before the next is read: only one cell's points are ever alive.
+
+    Args:
+        source (_GridSource): The grid.
+        visitors (list): Callables (band index, k index, cap index,
+            {population: SweepPoint}).
+        axis_end (pd.Timestamp | None): The page's last date.
+
+    Returns:
+        Exception | None: The exception source.cell raised, which stops the
+            walk; None when every cell was visited.
+    """
+    pb, pk, pc = source.primary
+    cells = [(pb, pk)] + [(bi, ki) for bi in range(len(source.bands))
+                          for ki in range(len(source.ks)) if (bi, ki) != (pb, pk)]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    capped = source.cap_sweep
+    every = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+    for done, (bi, ki) in enumerate(cells, 1):
+        try:
+            by_cap = source.cell(source.bands[bi], source.ks[ki])
+        except Exception as exc:
+            return exc
+        by_cap = _cut_to_axis(by_cap, axis_end)
+        for ci in caps:
+            pops = by_cap.get(source.caps[ci])
+            if pops:
+                for visit in visitors:
+                    visit(bi, ki, ci, pops)
+        del by_cap
+        if capped is not None and (done % every == 0 or done == len(cells)):
+            logging.info("Dashboard: %d/%d band x k cells read from the size-cap sweep "
+                         "(%d cap points simulated, %d shared so far)", done, len(cells),
+                         getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    return None
+
+
+def _walk_grid(source: _GridSource, visitors: list,
+               axis_end: pd.Timestamp | None) -> _GridSource:
+    """
+    Walk every scenario of the page once, falling back to the eager grid if a cell cannot be simulated.
+
+    Two layers keep a failure from costing more than the filter bar did
+    before the size cap existed. This one: a size-cap cell that raises while
+    it is simulated costs the cap axis only — ONE WARNING (with the
+    traceback), every visitor reset for the fallback grid, and a second walk
+    over the eager points alone (source.fallback), whose cells are lookups.
+    The other layer is each visitor's own: it catches its own failure and
+    marks itself failed, costing only what it builds.
+
+    Args:
+        source (_GridSource): The grid to walk.
+        visitors (list): The page's visitors; each has a reset(source).
+        axis_end (pd.Timestamp | None): The page's last date.
+
+    Returns:
+        _GridSource: The grid actually walked — the source, or its fallback.
+
+    Raises:
+        Exception: What a cell raised when there is no fallback (an eager
+            grid's lookup, never expected), or the fallback's own failure.
+    """
+    error = _walk_once(source, visitors, axis_end)
+    if error is None:
+        return source
+    if source.fallback is None:
+        raise error
+    logging.warning("The size-cap sweep could not be simulated; the page offers the "
+                    "run's own cap only", exc_info=error)
+    fallback = source.fallback()
+    for visitor in visitors:
+        visitor.reset(fallback)
+    error = _walk_once(fallback, visitors, axis_end)
+    if error is not None:
+        raise error
+    return fallback
+
+
+class _MaxTrades:
+    """
+    The largest trade count of any scenario the page shows.
+
+    The header's stale-cutoff verdict (_corpus_provenance_html) is disproved
+    by ANY simulated trade, and a size-cap sweep simulates scenarios
+    backtester.max_trades_simulated never sees (it reads the eager points):
+    a larger cap can turn an n < 1 skip into a trade.
+
+    Attributes:
+        most (int): The largest len(trades) over every point visited.
+        failed (bool): Whether counting raised (most is then not used).
+    """
+
+    def __init__(self) -> None:
+        """Start at zero."""
+        self.most = 0
+        self.failed = False
+
+    def reset(self, source: _GridSource) -> None:
+        """
+        Start again for another grid (the walk's fallback).
+
+        Args:
+            source (_GridSource): The grid about to be walked.
+        """
+        self.most = 0
+        self.failed = False
+
+    def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Count one scenario's points.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint.
+        """
+        try:
+            for point in pops.values():
+                self.most = max(self.most, len(point.trades))
+        except Exception:
+            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
+            self.failed = True
+
+
+class _ChunkVisitor:
+    """
+    Build one packed data block ("chunk") per distinct (k, trade list) the page shows.
+
+    Each scenario's "all" point is the run the filter bar shows at that
+    band, k and cap: its per-trade arrays and every category / category ·
+    tag view of it (_list_payload), packed on its own
+    (<script id="dash-chunk-N">), so the page's script inflates one only when
+    a reader chooses it. Scenarios whose trade lists are equal at an equal k
+    share one chunk (_list_key) — every cap at or above a cell's peak Kelly
+    fraction trades the same list. The primary scenario's chunk is built from
+    the page's own trades and curve, first, so it is chunk 0 and its views
+    are exactly what the sections render. Trade-table rows are split
+    (_trade_row_head / _trade_row_tail): the heads, which do not depend on a
+    trade's size, go in one table shared by every chunk (heads, shipped in the
+    base block), the tails in the chunk's own strings.
+
+    A failure while building a chunk is caught here: one WARNING, and the
+    visitor marks itself failed and drops what it built — the page is then
+    written without the bar, as when the filter's data cannot be built.
+
+    Attributes:
+        axis (pd.DatetimeIndex): The page's date axis — the page's own curve.
+        categories (list[str]), subcats (list[tuple[str, str]]): The bar's
+            labels (_filter_labels), and cat_index / sub_index into them.
+        heads (_StringTable): The shared row-head table.
+        chunks (list[str]): The packed chunks, by id.
+        grid (list): [band][k][cap] -> chunk id, or None for a scenario
+            never simulated.
+        primary_views (dict | None): The primary chunk's view key -> {"n"},
+            for the bar's option counts.
+        failed (bool): Whether building a chunk raised.
+    """
+
+    def __init__(
+        self,
+        source: _GridSource,
+        trades: list[BacktestTrade],
+        equity_df: pd.DataFrame,
+        k_used: float | None,
+        start_date: date,
+        initial_balance: float,
+        series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+    ) -> None:
+        """
+        Prepare to walk a grid.
+
+        Args:
+            source (_GridSource): The grid.
+            trades (list[BacktestTrade]): The page's trades (the primary
+                scenario's).
+            equity_df (pd.DataFrame): Their curve, whose dates are the page's
+                axis.
+            k_used (float | None): The k the page's trades were sized at —
+                the primary chunk's Kelly scatter is priced at it.
+            start_date (date): The backtest's start date.
+            initial_balance (float): Starting balance in dollars.
+            series_categories (dict | None): The series-category map.
+        """
+        self.trades, self.equity_df, self.k_used = trades, equity_df, k_used
+        self.start_date, self.initial_balance = start_date, initial_balance
+        self.series_categories = series_categories
+        self.axis = pd.DatetimeIndex(pd.to_datetime(list(equity_df["date"])))
+        self.reset(source)
+
+    def reset(self, source: _GridSource) -> None:
+        """
+        Start again for a grid: its labels, an empty grid, no chunk.
+
+        Args:
+            source (_GridSource): The grid about to be walked.
+        """
+        self.source = source
+        self.categories, self.subcats = _filter_labels(source, self.trades,
+                                                       self.series_categories)
+        self.cat_index = {c: i for i, c in enumerate(self.categories)}
+        self.sub_index = {pair: i for i, pair in enumerate(self.subcats)}
+        self.heads = _StringTable()
+        self.chunks: list[str | None] = []
+        self.seen: dict[str, int] = {}
+        self.grid = [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+        self.primary_views: dict | None = None
+        self.failed = False
+        # (band, k) of the cell whose list keys are memoised: a cell's caps
+        # at or above its peak share one trade list, so its key is computed once
+        self._cell: tuple[int, int] | None = None
+        self._keys: dict[tuple[int, float | None], str] = {}
+
+    def _key(self, bi: int, ki: int, k: float | None, listed: list) -> str:
+        """
+        The chunk key of one list, memoised within the cell being walked.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            k (float | None): The k the list is priced at.
+            listed (list): The trade list.
+
+        Returns:
+            str: _list_key(k, listed).
+        """
+        if self._cell != (bi, ki):
+            self._cell, self._keys = (bi, ki), {}
+        # By object: the cell holds its lists alive, and k is one per cell
+        # except at the primary scenario, whose list is the page's own
+        memo = (id(listed), k)
+        if memo not in self._keys:
+            self._keys[memo] = _list_key(k, listed)
+        return self._keys[memo]
+
+    def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Build (or share) the chunk of one scenario's "all" point.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a scenario with no "all"
+                point stays a null grid cell.
+        """
+        point = pops.get(_ALL_VIEW)
+        if point is None or self.failed:
+            return
+        try:
+            primary = (bi, ki, ci) == self.source.primary
+            # The page's own trades and curve at the primary scenario: every
+            # section below renders from those objects, and the chunk must
+            # match them
+            listed, curve = ((self.trades, self.equity_df) if primary
+                             else (point.trades, point.equity_df))
+            k = self.k_used if primary else self.source.ks[ki]
+            key = self._key(bi, ki, k, listed)
+            if key not in self.seen:
+                strings = _StringTable()
+                lst = _list_payload(listed, curve, self.axis, self.start_date,
+                                    self.initial_balance, self.series_categories, k,
+                                    self.cat_index, self.sub_index, strings, heads=self.heads)
+                cid = len(self.chunks)
+                self.chunks.append(_packed_json_script(
+                    f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
+                if primary:
+                    self.primary_views = {view_key: {"n": view["n"]}
+                                          for view_key, view in lst["views"].items()}
+                self.seen[key] = cid
+            self.grid[bi][ki][ci] = self.seen[key]
+        except Exception:
+            logging.warning("A page-wide filter chunk could not be built; the dashboard "
+                            "is written without the bar", exc_info=True)
+            self.failed, self.chunks, self.seen = True, [], {}
+
+
+def _build_filter_grid(
+    source: _GridSource,
+    trades: list[BacktestTrade],
+    equity_df: pd.DataFrame,
+    k_used: float | None,
+    start_date: date,
+    initial_balance: float,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades]:
+    """
+    Walk the page's grid once with the page's visitors.
+
+    Args:
+        source (_GridSource): The grid (_grid_source).
+        trades (list[BacktestTrade]): The page's trades.
+        equity_df (pd.DataFrame): Their curve — the page's axis.
+        k_used (float | None): The k the page's trades were sized at.
+        start_date (date): The backtest's start date.
+        initial_balance (float): Starting balance in dollars.
+        series_categories (dict | None): The series-category map.
+
+    Returns:
+        tuple[_GridSource, _ChunkVisitor, _MaxTrades]: The grid actually
+            walked (the source, or its eager fallback) and the two visitors.
+    """
+    chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
+                           series_categories)
+    most = _MaxTrades()
+    axis_end = chunks.axis[-1] if len(chunks.axis) else None
+    walked = _walk_grid(source, [chunks, most], axis_end)
+    return walked, chunks, most
 
 
 def _sparse_on_axis(dates, values, axis: pd.DatetimeIndex, ndigits: int) -> list[list]:
@@ -3797,6 +4707,9 @@ class _StringTable:
     Deduplicated HTML fragments for the filter payload: each distinct string
     is shipped once and referred to by index (the same trade row appears in
     many views' best/worst tables, and many views share a category table).
+    One table per chunk holds that chunk's fragments; one more, shared by
+    every chunk and shipped in the base block, holds the trade-row heads
+    (_ChunkVisitor).
     """
 
     def __init__(self) -> None:
@@ -3851,8 +4764,10 @@ def _view_payload(
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
         kelly_x (list[float]): The band list's per-trade Kelly fractions.
-        row_of: Callable (trade, which) -> string index of that trade's
-            best ("best") or worst ("worst") table row.
+        row_of: Callable (trade, which) -> [head index, tail index] of that
+            trade's best ("best") or worst ("worst") table row — its
+            _trade_row_head in the shared head table, its _trade_row_tail in
+            `strings` (None for a selection with no trade, which has no rows).
         strings (_StringTable): Where HTML fragments are stored.
 
     Returns:
@@ -3860,7 +4775,9 @@ def _view_payload(
             series "total", "types", "dd", "eq" and "dep", "bench" (the
             benchmark strategy row), and — only with at least one trade —
             "monthly", "cat", "sub", "price" (bar specs: x, y, colours c),
-            "table" (string index), "cal", "best", "worst" and "k11".
+            "table" (string index), "cal", "best" and "worst" ([head, tail]
+            index pairs, joined by the script into _trade_row's exact HTML)
+            and "k11".
     """
     if len(axis):
         # A curve built after the page's own (a slice's, built here) can run
@@ -3925,6 +4842,8 @@ def _list_payload(
     cat_index: dict[str, int],
     sub_index: dict[tuple[str, str], int],
     strings: _StringTable,
+    *,
+    heads: _StringTable,
 ) -> dict:
     """
     Compute one distinct trade list's per-trade arrays and every view of it.
@@ -3948,7 +4867,12 @@ def _list_payload(
             the Kelly scatter (_kelly_points).
         cat_index (dict[str, int]): Category -> its index in the payload.
         sub_index (dict[tuple[str, str], int]): (category, tag) -> its index.
-        strings (_StringTable): Where HTML fragments are stored.
+        strings (_StringTable): Where this list's HTML fragments are stored
+            (its chunk's own table): category tables and trade-row tails.
+        heads (_StringTable): Keyword-only. The table of trade-row heads
+            (_trade_row_head) shared by every chunk of the page: a head does
+            not depend on the trade's size, so every size-cap scenario that
+            trades one pair shares it.
 
     Returns:
         dict: Per-trade arrays "ret" (return in percent), "slip", "hold",
@@ -3958,23 +4882,25 @@ def _list_payload(
     """
     kelly_x, kelly_y = _kelly_points(trades, k)
     position = {id(t): i for i, t in enumerate(trades)}
-    rows: dict[tuple[int, str], int] = {}
+    rows: dict[tuple[int, str], list[int]] = {}
 
-    def row_of(trade: BacktestTrade, which: str) -> int:
+    def row_of(trade: BacktestTrade, which: str) -> list[int]:
         """
-        Store a trade's best- or worst-table row once and return its index.
+        Store a trade's best- or worst-table row once, as its two halves.
 
         Args:
             trade (BacktestTrade): One of this list's trades.
             which (str): "best" or "worst" (the row's background colour).
 
         Returns:
-            int: The row's index in `strings`.
+            list[int]: [the head's index in `heads`, the tail's in
+                `strings`]; head + tail is _trade_row's exact HTML.
         """
         key = (position[id(trade)], which)
         if key not in rows:
             color = _BEST_ROW_COLOR if which == "best" else _WORST_ROW_COLOR
-            rows[key] = strings.add(_trade_row(trade, color))
+            rows[key] = [heads.add(_trade_row_head(trade, color)),
+                         strings.add(_trade_row_tail(trade))]
         return rows[key]
 
     groups: dict[str, list[int]] = {_ALL_VIEW: list(range(len(trades)))}
@@ -4005,105 +4931,83 @@ def _list_payload(
 
 
 def _filter_payload(
-    runs: list[_BandRun],
-    primary_idx: int,
+    source: _GridSource,
+    chunks: _ChunkVisitor,
     start_date: date,
     initial_balance: float,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
-    k: float | None,
-    k_text: str,
 ) -> dict:
     """
-    Build the data block the page's filter bar and script read.
+    Build the base data block the page's filter bar and script read on load.
 
-    Bands whose trade lists are equal share one list (and its views), which is
-    what keeps a band sweep whose bands rarely differ cheap: on a run with no
-    time-series trade every band's list is the same same-title list. The
-    primary band's list is built first, so it keeps the page's own curve.
+    Everything a selection needs except its trade list: the page's axis, the
+    scenario axes (band, k, size cap) and which chunk each scenario's list is
+    in (the grid _ChunkVisitor filled — equal lists at an equal k share one),
+    the labels, the templates, the drawing styles, the shared trade-row heads
+    and the k-hat breakdown per band. The lists themselves are the chunks,
+    each its own packed block the script inflates only when a reader chooses
+    that scenario, so the page's load cost does not grow with the grid.
 
     Args:
-        runs (list[_BandRun]): _band_runs' runs.
-        primary_idx (int): The primary run's index.
+        source (_GridSource): The grid actually walked (_walk_grid's return).
+        chunks (_ChunkVisitor): The chunk visitor that walked it.
         start_date (date): The backtest's start date.
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
-        k (float | None): The interval discount the trades were sized at.
-        k_text (str): How that k reads on the page ("k = 0.75", or "k not
-            recorded"), for each band's summary scenario.
 
     Returns:
-        dict: "dates" (the shared axis, ISO dates), "bands" ([{label, list,
-            scenario, where}] — _band_scenario's and _band_where's phrases),
-            "primary", "categories" (sorted names — every trade's, and every
-            k-hat observation's), "subcats" ([[category index, tag], ...],
-            sorted), "lists" (_list_payload per distinct list), "empty" (the
-            view of a selection with no trade — a flat curve), "strings" (HTML
-            fragments), "text" (the templates: _SUMMARY_TEMPLATES and
-            _KHAT_TEXT), "styles" (the trade-type lines' and the k-hat bars'
-            drawing, and the k-hat chart's height formula), "khat" (_khat_band
-            per band, in band order) and "khat_blank" (the table cells of a
-            group with no k-hat).
+        dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
+            where}] — _band_option's label and _band_where's phrase), "ks"
+            and "caps" ([{label, text, value}]: the select's option, the
+            summary phrase's words and the value itself), "primary" ([band,
+            k, cap] indexes of the page as rendered), "grid" ([band][k][cap]
+            -> chunk id or null), "rows" (the shared trade-row heads),
+            "categories" (sorted names), "subcats" ([[category index, tag],
+            ...], sorted), "empty" (the view of a selection with no trade — a
+            flat curve, referencing no string), "text" (the templates:
+            _SUMMARY_TEMPLATES and _KHAT_TEXT), "styles" (the trade-type
+            lines' and the k-hat bars' drawing, the k-hat chart's height
+            formula and reference line, and the KPI cards' default colour),
+            "khat" (_khat_band per band, in band order) and "khat_blank" (the
+            table cells of a group with no k-hat).
     """
-    axis = pd.DatetimeIndex(pd.to_datetime(list(runs[primary_idx].equity_df["date"])))
-    strings = _StringTable()
-
-    pairs = {_series_labels(t.event_ticker, t.category, series_categories)
-             for run in runs for t in run.trades}
-    # A category or tag seen only in some band's k-hat population is offered
-    # too: the k-hat breakdown shows it even where no trade was made
-    pairs.update(_series_labels(o.event_ticker, o.category, series_categories)
-                 for run in runs if run.calibration is not None
-                 for o in run.calibration.observations)
-    categories = sorted({c for c, _ in pairs})
-    cat_index = {c: i for i, c in enumerate(categories)}
-    subcats = sorted(pairs)
-    sub_index = {pair: i for i, pair in enumerate(subcats)}
-
-    # Distinct lists, the primary's first so it keeps the page's own curve
-    sources: list[tuple[list, pd.DataFrame]] = []
-    band_list = [0] * len(runs)
-    for i in [primary_idx, *(j for j in range(len(runs)) if j != primary_idx)]:
-        for li, (listed, _) in enumerate(sources):
-            if listed == runs[i].trades:
-                band_list[i] = li
-                break
-        else:
-            band_list[i] = len(sources)
-            sources.append((runs[i].trades, runs[i].equity_df))
-
-    lists = [_list_payload(listed, curve, axis, start_date, initial_balance,
-                           series_categories, k, cat_index, sub_index, strings)
-             for listed, curve in sources]
+    axis = chunks.axis
+    pb, pk, pc = source.primary
     # A selection with no trade: the flat curve backtester draws for no trade
     empty = _view_payload([], [], _build_equity_curve([], start_date, initial_balance),
-                          axis, initial_balance, series_categories, [], None, strings)
+                          axis, initial_balance, series_categories, [], None, _StringTable())
     return {
         "dates": [d.date().isoformat() for d in axis],
-        "bands": [{"label": run.label, "list": band_list[i],
-                   "scenario": _band_scenario(run.label, i == primary_idx,
-                                              run.band is not None, k_text),
-                   "where": _band_where(run.label, i == primary_idx, run.band is not None)}
-                  for i, run in enumerate(runs)],
-        "primary": primary_idx,
-        "categories": categories,
-        "subcats": [[cat_index[c], tag] for c, tag in subcats],
-        "lists": lists,
+        "bands": [{"label": _band_option(band),
+                   "where": _band_where(_band_option(band), i == pb, band is not None)}
+                  for i, band in enumerate(source.bands)],
+        "ks": [{"label": _k_option(k), "text": _k_text(k), "value": k} for k in source.ks],
+        "caps": [{"label": _cap_option(cap), "text": _cap_text(cap), "value": cap}
+                 for cap in source.caps],
+        "primary": [pb, pk, pc],
+        "grid": chunks.grid,
+        "rows": chunks.heads.items,
+        "categories": chunks.categories,
+        "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
         "empty": empty,
-        "strings": strings.items,
         "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
                    # The k-hat chart's bars — the grouping's whole population,
-                   # the filter's current choice, every other group — and its
-                   # height formula (_khat_chart_height)
+                   # the filter's current choice, every other group — its
+                   # height formula (_khat_chart_height) and its reference
+                   # line at the selected k (_KHAT_REF_LINE)
                    "khat": {"all": _COLORS["naive"], "selected": _COLORS["sp500"],
                             "bar": _COLORS["strategy"]},
-                   "khat_height": list(_KHAT_HEIGHT)},
+                   "khat_height": list(_KHAT_HEIGHT),
+                   "khat_ref": _KHAT_REF_LINE,
+                   "kpi_default": _KPI_DEFAULT_COLOR},
         # Per band, its k-hat population broken down like its trades
         # (_khat_band), and the cells of a group with none
-        "khat": [_khat_band(run.calibration, series_categories, cat_index, sub_index)
-                 for run in runs],
+        "khat": [_khat_band(source.calibrations.get(band), series_categories,
+                            chunks.cat_index, chunks.sub_index)
+                 for band in source.bands],
         "khat_blank": _khat_cells(None),
     }
 
@@ -4141,21 +5045,24 @@ def _band_where(label: str, primary: bool, recorded: bool) -> str:
     return f"{which} {label}"
 
 
-def _band_scenario(label: str, primary: bool, recorded: bool, k_text: str) -> str:
+def _scenario_phrase(where: str, k_text: str, cap_text: str) -> str:
     """
-    Name the run a spread band choice shows: the band and the run's k.
+    Name the run a scenario choice shows: its band, its k and its size cap.
+
+    Fills _SUMMARY_TEMPLATES["scenario"], the template the page's script
+    fills for every other scenario (D.text.scenario).
 
     Args:
-        label (str): The band's label.
-        primary (bool): Whether it is the run's primary band.
-        recorded (bool): Whether the run recorded a band at all.
-        k_text (str): "k = 0.75", or "k not recorded".
+        where (str): The band's _band_where phrase.
+        k_text (str): The k's _k_text ("k = 0.75", or "k not recorded").
+        cap_text (str): The cap's _cap_text ("20% cap per trade", "no
+            per-trade cap", or "cap not recorded").
 
     Returns:
-        str: _band_where's phrase, then ", " and k_text — e.g. "the primary
-            spread band max(tier,0)-1, k = 0.75".
+        str: e.g. "the primary spread band max(tier,0)-1, k = 0.75, 20% cap
+            per trade".
     """
-    return f"{_band_where(label, primary, recorded)}, {k_text}"
+    return _SUMMARY_TEMPLATES["scenario"].format(where=where, k=k_text, cap=cap_text)
 
 
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
@@ -4164,19 +5071,20 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     Say, under the filter bar, what the page is showing.
 
     Fills the same templates the page's script fills for every other
-    selection (_FILTER_JS's summary(), from D.text); this renders the primary
-    band's unfiltered view, so the page reads correctly before anything is
-    chosen.
+    selection (_FILTER_JS's summary(), from D.text); this renders the
+    primary scenario's unfiltered view, so the page reads correctly before
+    anything is chosen.
 
     Args:
         text (dict): The templates (_SUMMARY_TEMPLATES, as the payload
             carries them).
-        scenario (str): The band's _band_scenario phrase.
-        primary (bool): Whether it is the run's primary band.
+        scenario (str): The scenario's _scenario_phrase.
+        primary (bool): Whether it is the run's primary scenario (band, k
+            and size cap all the run's own).
         selection (str | None): "Sports" or "Sports · Basketball", or None for
-            the whole band.
+            the whole run.
         n (int): Trades in the selection.
-        n_band (int): Trades in the whole band.
+        n_band (int): Trades in the whole run at that scenario.
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
@@ -4184,51 +5092,68 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     if selection is None:
         out = text["all"].format(scenario=scenario, count=_trade_count(n))
         if not primary:
-            out += text["other_band"]
+            out += text["other_scenario"]
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
     return out + text["unfiltered"]
 
 
-def _filter_bar_html(payload: dict) -> str:
+def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: three <select>s and a summary line.
+    Render the sticky filter bar: five <select>s and a summary line.
 
-    Options carry the primary band's trade counts; the script rewrites them on
-    every band change. Tag options list every "Category · Tag" while the
-    category is "All"; choosing one sets the category to match. The selects
-    are rendered DISABLED, and autocomplete="off" so a browser does not
-    restore a stale choice on reload: the script enables them once it has
-    inflated the data, so without it (or without a browser that can inflate
-    it) they cannot promise a view the page will not show.
+    Spread band, k and Size cap choose the scenario — each option one of the
+    grid's axes, the run's own marked " (primary)" — and Category and Tag a
+    slice of it. Category and tag options carry the primary scenario's trade
+    counts; the script rewrites them whenever the scenario changes. Tag
+    options list every "Category · Tag" while the category is "All";
+    choosing one sets the category to match. The selects are rendered
+    DISABLED, and autocomplete="off" so a browser does not restore a stale
+    choice on reload: the script enables them once it has inflated the base
+    block AND the primary scenario's chunk, so without it (or without a
+    browser that can inflate them) they cannot promise a view the page will
+    not show.
 
     Args:
-        payload (dict): _filter_payload's output.
+        payload (dict): _filter_payload's base block.
+        primary_views (dict): The primary chunk's view key -> {"n": trades}
+            (_ChunkVisitor.primary_views).
 
     Returns:
         str: The bar's HTML, every Kalshi-controlled name escaped.
     """
-    primary = payload["primary"]
-    views = payload["lists"][payload["bands"][primary]["list"]]["views"]
+    pb, pk, pc = payload["primary"]
 
     def count(key: str) -> int:
         """
-        Trades in one view of the primary band's list.
+        Trades in one view of the primary scenario's list.
 
         Args:
             key (str): A view key ("all", "c<i>", "s<i>").
 
         Returns:
-            int: The view's trade count; 0 when the band has no such view.
+            int: The view's trade count; 0 when the list has no such view.
         """
-        view = views.get(key)
+        view = primary_views.get(key)
         return view["n"] if view else 0
 
-    band_opts = "".join(
-        f'<option value="{i}"{" selected" if i == primary else ""}>'
-        f'{html.escape(b["label"])}{" (primary)" if i == primary else ""}</option>'
-        for i, b in enumerate(payload["bands"]))
+    def options(entries: list, chosen: int) -> str:
+        """
+        One scenario select's options, the run's own selected and marked.
+
+        Args:
+            entries (list): The axis' [{label, ...}] entries.
+            chosen (int): The primary index on that axis.
+
+        Returns:
+            str: The <option> elements, labels escaped.
+        """
+        return "".join(
+            f'<option value="{i}"{" selected" if i == chosen else ""}>'
+            f'{html.escape(e["label"])}{" (primary)" if i == chosen else ""}</option>'
+            for i, e in enumerate(entries))
+
     cat_opts = '<option value="">All categories</option>' + "".join(
         f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
         for i, c in enumerate(payload["categories"]))
@@ -4236,15 +5161,20 @@ def _filter_bar_html(payload: dict) -> str:
         f'<option value="{i}">{html.escape(payload["categories"][ci] + " · " + tag)} '
         f'({count(f"s{i}")})</option>'
         for i, (ci, tag) in enumerate(payload["subcats"]))
+    scenario = _scenario_phrase(payload["bands"][pb]["where"], payload["ks"][pk]["text"],
+                                payload["caps"][pc]["text"])
     summary = html.escape(_filter_summary_text(
-        payload["text"], payload["bands"][primary]["scenario"], True, None,
-        count(_ALL_VIEW), count(_ALL_VIEW)))
+        payload["text"], scenario, True, None, count(_ALL_VIEW), count(_ALL_VIEW)))
     return (
         '<div id="flt-bar" style="position:sticky; top:0; z-index:1000; background:#FFFFFF;'
         ' border-bottom:1px solid #E0E0E0; padding:10px 0 8px; font-family:sans-serif;'
         ' font-size:14px;">'
         f'<label>Spread band: <select id="flt-band" disabled autocomplete="off">'
-        f'{band_opts}</select></label>&nbsp;&nbsp;'
+        f'{options(payload["bands"], pb)}</select></label>&nbsp;&nbsp;'
+        f'<label>k: <select id="flt-k" disabled autocomplete="off">'
+        f'{options(payload["ks"], pk)}</select></label>&nbsp;&nbsp;'
+        f'<label>Size cap: <select id="flt-cap" disabled autocomplete="off">'
+        f'{options(payload["caps"], pc)}</select></label>&nbsp;&nbsp;'
         f'<label>Category: <select id="flt-cat" disabled autocomplete="off">'
         f'{cat_opts}</select></label>&nbsp;&nbsp;'
         f'<label>Tag: <select id="flt-tag" disabled autocomplete="off">'
@@ -4258,14 +5188,23 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     """
     Embed a payload as gzip-compressed, base64-encoded strict JSON.
 
-    The filter payload holds a view per band x category x tag, and its
-    largest part is HTML the page shows verbatim (each trade's best/worst
-    table row, each view's category table), which compresses many times
-    over: a synthetic 36-band run whose bands each traded a different
-    200-trade list over ~2,460 days (16 series in 8 categories) measured
-    11.5 MB as compact JSON and 2.15 MB packed, a 2.94 MB page. The script
-    inflates it with the browser's own DecompressionStream, so nothing is
-    added to the page but the bytes.
+    The filter's data is one base block and one chunk per distinct scenario
+    trade list, each packed on its own so the script inflates only the
+    scenarios a reader chooses. A chunk holds a view per category x tag of
+    its list, and its largest part is HTML the page shows verbatim (each
+    trade row's tail, each view's category table), which compresses many
+    times over. Measured 2026-09-26 on tests/test_dashboard.py's
+    TestFilterPageSize fixture (36 bands, each a different 40-trade list,
+    8 series in 4 categories): 3.86 MB of compact JSON in 37 blocks (36
+    chunks and the base block) packed to 506 KB of base64, an 811 KB page —
+    against 4.05 MB packed to 448 KB, a 745 KB page, as the single block it
+    was before the chunks: each list compressed alone forgoes what one
+    shared block compressed across lists, and the rows' shared heads win
+    part of it back. A synthetic 36-band x 13-k x 20-cap grid (9,360
+    scenarios) whose cells share 4 trade lists packed 52 chunks and a 35 KB
+    base block into a 938 KB page in 4.6 s. The script inflates each block
+    with the browser's own DecompressionStream, so nothing is added to the
+    page but the bytes.
 
     Non-finite floats become null first (_json_safe) and allow_nan=False
     makes a missed one raise instead of shipping unparseable JSON. The block
@@ -4288,32 +5227,44 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
 
 
 # The page-wide filter's script. A raw string, so every backslash in it (a JS
-# escape or a regular expression) reaches the browser as written. It reads ONE
-# data block (id="dash-data", built by _filter_payload and packed by
-# _packed_json_script) and draws nothing of its own: every figure it shows
-# was computed in Python, every sentence about the data is a Python template
-# it fills (D.text) — its only words of its own are the line it shows when
-# that data cannot be loaded — every trace it draws copies the styling of a
-# trace Python drew
-# (traceOf; the trade-type lines, which a band can hold where the primary
-# holds none, from the styles Python drew them with, D.styles), and it writes
-# only through textContent, the options API and Python-escaped HTML
-# fragments. On load it inflates the block, sets the bar back to the view
-# Python rendered and enables it — it redraws nothing until a <select>
-# changes.
+# escape or a regular expression) reaches the browser as written. It reads a
+# base block (id="dash-data", built by _filter_payload) and, on demand, one
+# chunk per scenario (id="dash-chunk-N", built by _ChunkVisitor), all packed by
+# _packed_json_script, and draws nothing of its own: every figure it shows was
+# computed in Python, every sentence about the data is a Python template it
+# fills (D.text) — its only words of its own are the line it shows when the
+# base block cannot be loaded — every trace it draws copies the styling of a
+# trace Python drew (traceOf; the trade-type lines, which another scenario can
+# hold where the primary holds none, and the k-hat chart's reference line, from
+# the styles Python drew them with, D.styles), and it writes only through
+# textContent, the options API and Python-escaped HTML fragments (a trade row
+# is two of them joined: its head from D.rows, its tail from the chunk). On
+# load it inflates the base block and the primary scenario's chunk, sets the
+# bar back to the view Python rendered and enables it — it redraws nothing
+# until a <select> changes. A chunk is inflated when a scenario needs it and
+# kept while among the last KEEP drawn (the primary's always); a choice made
+# while a chunk is still inflating supersedes it (SEQ), and a chunk that cannot
+# be loaded puts every select back on the scenario still shown (SHOWN).
 _FILTER_JS = r"""
 <script>
 (function() {
   var dataEl = document.getElementById('dash-data');
-  var bandSel = document.getElementById('flt-band');
-  var catSel = document.getElementById('flt-cat');
+  var bandSel = document.getElementById('flt-band'), kSel = document.getElementById('flt-k');
+  var capSel = document.getElementById('flt-cap'), catSel = document.getElementById('flt-cat');
   var tagSel = document.getElementById('flt-tag');
-  if (!dataEl || !bandSel || !catSel || !tagSel) { return; }
-  var SELECTS = [bandSel, catSel, tagSel];
+  if (!dataEl || !bandSel || !kSel || !capSel || !catSel || !tagSel) { return; }
+  var SELECTS = [bandSel, kSel, capSel, catSel, tagSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
-  var D = null, N = 0;
+  // D: the base block. C: the chunk of the scenario on screen (null for one
+  // the run never simulated). CHUNKS: every chunk loaded or loading, by id.
+  // KEPT: the drawn chunks other than the primary's, least recently drawn
+  // first. SEQ numbers the choices, so a chunk arriving after a later choice
+  // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
+  // indexes and the category and tag selects' values.
+  var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
+  var KEEP = 16;                     // drawn chunks kept besides the primary
 
   function byId(id) { return document.getElementById(id); }
   function setText(id, text) { var el = byId(id); if (el) { el.textContent = text; } }
@@ -4331,14 +5282,23 @@ _FILTER_JS = r"""
   function pick(arr, idx) { return idx.map(function(i) { return arr[i]; }); }
 
   function bandIndex() { return parseInt(bandSel.value, 10); }
-  function list() { return D.lists[D.bands[bandIndex()].list]; }
+  function kIndex() { return parseInt(kSel.value, 10); }
+  function capIndex() { return parseInt(capSel.value, 10); }
+  function chunkAt(b, k, c) { return D.grid[b][k][c]; }
+  function cellChunk() { return chunkAt(bandIndex(), kIndex(), capIndex()); }
+  function primaryChunk() { var p = D.primary; return chunkAt(p[0], p[1], p[2]); }
+  function isPrimary() {
+    var p = D.primary;
+    return bandIndex() === p[0] && kIndex() === p[1] && capIndex() === p[2];
+  }
+  function list() { return C ? C.list : null; }
   function viewKey() {
     if (tagSel.value !== '') { return 's' + tagSel.value; }
     if (catSel.value !== '') { return 'c' + catSel.value; }
     return 'all';
   }
-  function count(key) { var v = list().views[key]; return v ? v.n : 0; }
-  function currentView() { return list().views[viewKey()] || D.empty; }
+  function count(key) { var L = list(), v = L && L.views[key]; return v ? v.n : 0; }
+  function currentView() { var L = list(); return (L && L.views[viewKey()]) || D.empty; }
   function subName(i, withCategory) {
     var sc = D.subcats[i];
     return (withCategory ? D.categories[sc[0]] + ' · ' : '') + sc[1];
@@ -4356,15 +5316,23 @@ _FILTER_JS = r"""
       return name in values ? String(values[name]) : field;
     });
   }
+  // A scenario in the summary's words: Python's _scenario_phrase
+  function scenarioAt(b, k, c) {
+    return fill(D.text.scenario, {where: D.bands[b].where, k: D.ks[k].text,
+                                  cap: D.caps[c].text});
+  }
+  function scenario() { return scenarioAt(bandIndex(), kIndex(), capIndex()); }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one
   function summary(v) {
-    var bi = bandIndex(), key = viewKey(), T = D.text, text;
-    if (key === 'all') {
-      text = fill(T.all, {scenario: D.bands[bi].scenario, count: trades(v.n)});
-      if (bi !== D.primary) { text += T.other_band; }
+    var key = viewKey(), T = D.text, text;
+    if (cellChunk() === null) {
+      text = fill(T.missing, {scenario: scenario()});
+    } else if (key === 'all') {
+      text = fill(T.all, {scenario: scenario(), count: trades(v.n)});
+      if (!isPrimary()) { text += T.other_scenario; }
     } else {
-      text = fill(T.slice, {scenario: D.bands[bi].scenario, selection: selectionName(key),
+      text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
                             n: v.n, band_count: trades(count('all'))});
     }
     setText('flt-summary', text + T.unfiltered);
@@ -4435,7 +5403,11 @@ _FILTER_JS = r"""
     if (empty) { empty.style.display = has ? 'none' : ''; }
     if (body) { body.style.display = has ? '' : 'none'; }
   }
-  function rows(ids) { return ids.map(function(i) { return D.strings[i]; }).join(''); }
+  // Trade rows: each [head, tail] pair is _trade_row's HTML, both halves
+  // escaped by Python (the heads shared by every chunk, the tails its own)
+  function rows(pairs) {
+    return pairs.map(function(p) { return D.rows[p[0]] + C.strings[p[1]]; }).join('');
+  }
 
   function renderPerformance(v) {
     Object.keys(v.kpi).forEach(function(k) { setText('kpi-' + k, v.kpi[k]); });
@@ -4454,7 +5426,7 @@ _FILTER_JS = r"""
     sizeTo('dec-sub', v.sub.h);
     bars('dec-sub', v.sub, {height: v.sub.h});
     var table = byId('dec-table');
-    if (table) { table.innerHTML = D.strings[v.table]; }
+    if (table) { table.innerHTML = C.strings[v.table]; }
     bars('dec-price', v.price);
     redraw('dec-hold', [traceOf('dec-hold', 0, {x: pick(L.hold, v.idx)})]);
   }
@@ -4491,16 +5463,26 @@ _FILTER_JS = r"""
     redraw('bench-fig', traces);
   }
 
+  // The k-hat chart describes what is ON SCREEN (SHOWN), never the selects:
+  // while a chosen scenario's chunk is still loading the other sections keep
+  // showing the last one drawn, and a Group-by change meanwhile must draw
+  // that one too — so a chunk that then fails to load leaves nothing behind.
+  // shownKey is viewKey for the category and tag drawn.
+  function shownKey() {
+    if (SHOWN[4] !== '') { return 's' + SHOWN[4]; }
+    if (SHOWN[3] !== '') { return 'c' + SHOWN[3]; }
+    return 'all';
+  }
   // The k-hat chart's rows for a grouping: [{label, st, kind}], kind "all"
-  // (the grouping's whole population), "selected" (the filter's current
-  // choice) or "bar". By category or tag: every group at the selected band
-  // (tags within the selected category); by band: every band for the
-  // selected category or tag. _section_khat renders the same rows for the
-  // default (by category, primary band, no filter), from the same payload.
+  // (the grouping's whole population), "selected" (the filter's choice on
+  // screen) or "bar". By category or tag: every group at the band shown
+  // (tags within the category shown); by band: every band for the category
+  // or tag shown. _section_khat renders the same rows for the default (by
+  // category, primary band, no filter), from the same payload.
   function khatRows(group) {
-    var bi = bandIndex(), cat = catSel.value, tag = tagSel.value, T = D.text, out = [];
+    var bi = SHOWN[0], cat = SHOWN[3], tag = SHOWN[4], T = D.text, out = [];
     if (group === 'band') {
-      var key = viewKey();
+      var key = shownKey();
       D.khat.forEach(function(b, i) {
         out.push({label: D.bands[i].label, st: (b && b.groups[key]) || null,
                   kind: i === bi ? 'selected' : 'bar'});
@@ -4534,12 +5516,21 @@ _FILTER_JS = r"""
   function khatTitle(group) {
     var T = D.text, scope;
     if (group === 'band') {
-      var key = viewKey();
+      var key = shownKey();
       scope = key === 'all' ? T.khat_every_category : selectionName(key);
     } else {
-      scope = D.bands[bandIndex()].where;
+      scope = D.bands[SHOWN[0]].where;
     }
     return fill(T.khat_title, {group: T.khat_group_words[group], scope: scope});
+  }
+  // The dashed line at the k shown, from the line Python drew at the run's
+  // own (D.styles.khat_ref) — none when the k was not recorded
+  function khatRef() {
+    var kk = D.ks[SHOWN[1]], R = D.styles.khat_ref;
+    if (kk.value === null) { return {shapes: [], annotations: []}; }
+    return {shapes: [Object.assign({}, R.shape, {x0: kk.value, x1: kk.value})],
+            annotations: [Object.assign({}, R.annotation, {
+              x: kk.value, text: fill(D.text.khat_sized_at, {k: kk.label})})]};
   }
   // One table row: the group's name and the cells Python formatted
   function khatRow(label, cells) {
@@ -4560,7 +5551,7 @@ _FILTER_JS = r"""
     var has = list_.some(function(r) { return r.st && r.st.n > 0; });
     // "Not recorded" (no calibration behind the rows) is not "none measured"
     var recorded = group === 'band' ? D.khat.some(function(b) { return b !== null; })
-                                    : D.khat[bandIndex()] !== null;
+                                    : D.khat[SHOWN[0]] !== null;
     setText('khat-empty', recorded ? D.text.khat_none : D.text.khat_not_recorded);
     show('khat', has);
     if (!has) { return; }
@@ -4574,7 +5565,7 @@ _FILTER_JS = r"""
       text: list_.map(function(r) { return r.st ? r.st.text : ''; }),
       customdata: list_.map(function(r) { return r.st ? r.st.cells : D.khat_blank; }),
       marker: markerOf('khat-fig', 0, {color: list_.map(function(r) { return colors[r.kind]; })})
-    })], {height: height}, khatTitle(group));
+    })], Object.assign({height: height}, khatRef()), khatTitle(group));
     var body = byId('khat-rows');
     if (body) {
       body.textContent = '';
@@ -4584,8 +5575,8 @@ _FILTER_JS = r"""
     }
   }
 
-  // Option labels carry the selected band's trade counts; the tag list holds
-  // the selected category's tags, or every "Category · Tag" under "All".
+  // Option labels carry the scenario's trade counts; the tag list holds the
+  // selected category's tags, or every "Category · Tag" under "All".
   function refreshOptions() {
     for (var i = 1; i < catSel.options.length; i++) {
       var ci = catSel.options[i].value;
@@ -4618,27 +5609,105 @@ _FILTER_JS = r"""
     renderKhat();
   }
 
-  // The block is gzip-compressed JSON in base64 (_packed_json_script),
-  // inflated once by the browser's own DecompressionStream.
-  function inflate() {
-    var bin = atob(dataEl.textContent.trim());
+  // A block is gzip-compressed JSON in base64 (_packed_json_script),
+  // inflated by the browser's own DecompressionStream.
+  function inflate(el) {
+    var bin = atob(el.textContent.trim());
     var bytes = new Uint8Array(bin.length);
     for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
     var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
     return new Response(stream).text().then(function(text) { return JSON.parse(text); });
   }
-  // The script's one sentence of its own: the data it would fill Python's
-  // templates from could not be loaded
+  // A DRAWN chunk becomes the most recently used; beyond KEEP of them the
+  // least recently drawn is dropped (the primary's is never counted or
+  // dropped). Only drawing counts as use, so the chunk on screen is always
+  // the most recently used and is never the one dropped.
+  function touch(id) {
+    if (id === primaryChunk()) { return; }
+    var at = KEPT.indexOf(id);
+    if (at >= 0) { KEPT.splice(at, 1); }
+    KEPT.push(id);
+    while (KEPT.length > KEEP) { delete CHUNKS[KEPT.shift()]; }
+  }
+  // One chunk, inflated once. Started from a resolved promise, so a
+  // synchronous throw (a damaged block, a missing element) lands in the
+  // rejection handler; a failed entry is dropped, so a later choice can try
+  // again. An inflate that finishes after the reader has chosen another
+  // scenario is handed to nobody: it is dropped rather than kept (it was
+  // never drawn, so it is not in KEPT, which bounds what is kept).
+  function load(id) {
+    var entry = CHUNKS[id];
+    if (!entry) {
+      entry = CHUNKS[id] = {data: null};
+      entry.promise = Promise.resolve().then(function() {
+        return inflate(byId('dash-chunk-' + id));
+      }).then(function(data) {
+        if (id === primaryChunk() || id === cellChunk()) { entry.data = data; }
+        else { delete CHUNKS[id]; }
+        return data;
+      }, function(err) { delete CHUNKS[id]; throw err; });
+    }
+    return entry.promise;
+  }
+  // Draw the scenario the selects name, from C, and record it as SHOWN
+  // (after the tag list is rebuilt, so the tag recorded is the one kept)
+  function draw() {
+    refreshOptions();
+    SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value];
+    render();
+  }
+  // The selects changed: draw their scenario — at once when its chunk is
+  // loaded (or it has none), else once it is; a later choice supersedes it
+  function choose() {
+    var seq = ++SEQ, id = cellChunk();
+    if (id === null) { C = null; draw(); return; }
+    var entry = CHUNKS[id];
+    if (entry && entry.data) { touch(id); C = entry.data; draw(); return; }
+    setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
+    load(id).then(function(chunk) {
+      if (seq !== SEQ) { return; }
+      touch(id);
+      C = chunk;
+      draw();
+    }, function(err) {
+      if (seq !== SEQ) { return; }
+      // The sections still show the last scenario drawn (the k-hat chart
+      // included — it reads SHOWN): every select goes back to it, the
+      // category and tag too, since one chosen while the chunk was loading
+      // was never drawn either — the tag list rebuilt for the category shown
+      // — and the line says which scenario could not be loaded
+      var tried = scenario();
+      bandSel.value = String(SHOWN[0]);
+      kSel.value = String(SHOWN[1]);
+      capSel.value = String(SHOWN[2]);
+      catSel.value = SHOWN[3];
+      refreshOptions();
+      tagSel.value = SHOWN[4];
+      setText('flt-summary', fill(D.text.unavailable, {
+        failed: tried, reason: String(err), scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2])}));
+    });
+  }
+  // The bar cannot work: the base block, or the primary scenario's chunk,
+  // could not be loaded. Every select is disabled. The one sentence the
+  // script words itself is the line for a base block it could not read,
+  // which is where Python's templates are.
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
+    if (D) {
+      var p = D.primary, here = scenarioAt(p[0], p[1], p[2]);
+      setText('flt-summary', fill(D.text.unavailable,
+                                  {failed: here, reason: reason, scenario: here}));
+      return;
+    }
     setText('flt-summary', 'The filter could not load its data (' + reason
       + '); every section shows the primary spread band’s full run.');
   }
   // A browser can restore a <select>'s last choice on a reload, or on going
-  // back; the page as rendered is the primary band's unfiltered view, so the
-  // bar is set back to it. Python renders the selects disabled: they are
-  // enabled once the data is inflated, so no choice can be made (or lost)
-  // before it can be drawn.
+  // back; the page as rendered is the primary scenario's unfiltered view, so
+  // the bar is set back to it. Python renders the selects disabled: they are
+  // enabled once the base block and the primary scenario's chunk are
+  // inflated, so no choice can be made (or lost) before it can be drawn — and
+  // a category or tag change never meets an unloaded chunk.
   SELECTS.forEach(function(s) {
     s.selectedIndex = 0;
     for (var i = 0; i < s.options.length; i++) {
@@ -4649,28 +5718,32 @@ _FILTER_JS = r"""
     unavailable('this browser cannot decompress it');
     return;
   }
-  // Started from a resolved promise, so an error thrown while the inflate is
-  // starting (atob on a damaged block) lands in the same handler as a later one
-  Promise.resolve().then(inflate).then(function(data) {
+  // Base block, then the primary scenario's chunk, then the selects. Started
+  // from a resolved promise, so an error thrown while the inflate is starting
+  // (atob on a damaged block) lands in the same handler as a later one.
+  Promise.resolve().then(function() { return inflate(dataEl); }).then(function(data) {
     D = data;
     N = D.dates.length;
+    return load(primaryChunk());
+  }).then(function(chunk) {
+    if (SEQ === 0) { C = chunk; SHOWN = D.primary.concat([catSel.value, tagSel.value]); }
     SELECTS.forEach(function(s) { s.disabled = false; });
   }, function(err) { unavailable(String(err)); });
 
-  bandSel.addEventListener('change', function() {
-    if (!D) { return; }
-    refreshOptions();
-    render();
+  [bandSel, kSel, capSel].forEach(function(sel) {
+    sel.addEventListener('change', function() {
+      if (!D) { return; }
+      choose();
+    });
   });
   catSel.addEventListener('change', function() {
     if (!D) { return; }
     tagSel.value = '';
-    refreshOptions();
-    render();
+    choose();
   });
   if (khatGroup) {
     khatGroup.addEventListener('change', function() {
-      if (!D) { return; }
+      if (!D || !SHOWN) { return; }
       renderKhat();
     });
   }
@@ -4683,7 +5756,7 @@ _FILTER_JS = r"""
       refreshOptions();
       tagSel.value = t;
     }
-    render();
+    choose();
   });
 })();
 </script>
@@ -4705,31 +5778,40 @@ def generate_dashboard(
     """
     Assemble all nine dashboard sections into a single self-contained HTML file.
 
-    Calls each _section_*() builder in order, concatenates the resulting HTML
+    Calls each _section_*() builder in order and streams the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
-    (_filter_bar_html), the packed data block of every band x category x tag
-    view after the sections (_filter_payload, _packed_json_script), and the
-    script that swaps a selection in (_FILTER_JS). If that data cannot be
-    built, the page is written without the bar and its script, with a notice
-    in the bar's place (and in the k-hat breakdown's, which reads the same
-    data) and a WARNING in the log — then
-    writes the file to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
+    (_filter_bar_html), one packed chunk per distinct scenario trade list and
+    the packed base block after the sections (_ChunkVisitor, _filter_payload,
+    _packed_json_script), and the script that swaps a selection in
+    (_FILTER_JS). The filter's grid — every spread band x k x per-trade size
+    cap the run offers (_grid_source) — is walked ONCE before anything is
+    written (_build_filter_grid), because the header needs its result: a
+    size-cap sweep's cells are simulated during that walk, the busiest of
+    them feeds the header's stale-cutoff test (_MaxTrades), and a size-cap
+    sweep the walk could not use is named on the run-settings line
+    (_run_settings_html's cap_sweep_unused). If that data
+    cannot be built, the page is written without the bar and its script,
+    with a notice in the bar's place (and in the k-hat breakdown's, which
+    reads the same base block) and a WARNING in the log — then the file is
+    written to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
     previous run's page (operator decision, 2026-09-25: one current dashboard
     rather than a timestamped one per run, which TS-18 had made collision-free).
-    The page is written to a temporary file beside it first and then renamed
-    over it (os.replace, atomic on one filesystem), so a browser or a second
-    reader never sees a half-written page and a failed write leaves the
-    previous dashboard intact. Two runs finishing together each write a
+    The page is streamed into a temporary file beside it, one piece at a
+    time through one open handle — never joined into one string or encoded
+    whole, since a size-cap grid's chunks can reach tens of MB — and then
+    renamed over it (os.replace, atomic on one filesystem), so a browser or a
+    second reader never sees a half-written page and a failed write leaves
+    the previous dashboard intact. Two runs finishing together each write a
     complete page and the later rename wins.
 
     The two sweep-related parameters are keyword-only WITH defaults, so the
     existing four-argument positional call still works verbatim. Omit both and
     the interval-discount and scenario-explorer sections each show the same
     kind of short placeholder every other builder emits for empty input, and
-    the header's run-settings line reads "not recorded" for both the spread
-    band and the ladder setting — with no coverage line and no strike-blind
-    notice, since that path has no census to report.
+    the header's run-settings line reads "not recorded" for the spread band,
+    the ladder setting and the size cap — with no coverage line and no
+    strike-blind notice, since that path has no census to report.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
@@ -4737,6 +5819,8 @@ def generate_dashboard(
             empty, in which case all charts show placeholder messages.
         equity_df (pd.DataFrame): Daily equity curve DataFrame with columns
             [date, portfolio_value, daily_return], produced by _build_equity_curve().
+            Its dates are the page's axis: every other scenario's curve is
+            cut to its last date.
         start_date (date): Backtest start date shown in the page title and header.
         initial_balance (float): Starting portfolio value in dollars, used for
             return calculations and benchmark normalization.
@@ -4744,7 +5828,9 @@ def generate_dashboard(
             backtester.run_backtest_sweep(), rendered by the
             interval-discount section and the scenario-explorer section, and
             read by the page-wide filter and the k-hat breakdown (every
-            band's run and calibration, via _band_runs).
+            band x k scenario and every band's calibration, and — when it
+            carries one — the lazy size-cap sweep, whose cells the filter's
+            walk simulates, via _grid_source).
             Passed whole rather than unpacked — it already carries the
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
@@ -4768,7 +5854,8 @@ def generate_dashboard(
             moment — whether it came from an earlier run's cache, and the
             archive cutoff at assembly, with a red banner when the window
             starts at or after it (DR-13, M2), or an amber stale-verdict line
-            when a simulated point traded anyway. "not recorded" when the
+            when a simulated point — an eager one or a size-cap cell the
+            filter's walk simulated — traded anyway. "not recorded" when the
             sweep carries none or there is no sweep.
         interval_discount (float | None): The interval discount `trades` were
             SIZED at, threaded into the Risk section's Kelly scatter and the
@@ -4776,7 +5863,12 @@ def generate_dashboard(
             needs it even on a run that produced no sweep. None (default)
             means "no override": the sweep's primary k when a sweep is passed
             (the k its points were simulated at), else
-            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. With a sweep, pass the
+            sweep's primary k or nothing: the filter bar's k axis is the
+            sweep's own (its primary entry sweep.primary.k), so an override
+            that differs prices the scatter, the primary scenario's chunk and
+            the k-hat line as rendered while the bar's summary names the
+            sweep's k — unsupported, and logged as a WARNING.
         series_categories (dict | None): historical.load_series_categories'
             series ticker -> (category, tags) map, which the Returns
             Decomposition section and the page-wide filter bar file each
@@ -4810,74 +5902,117 @@ def generate_dashboard(
             "</p>"
         )
 
-    # The ladder setting decides which pairs exist and the primary spread band
-    # which of them are ever entered, so both are named in the header above
-    # every section, not only inside the scenario explorer; "not recorded"
-    # when there is no sweep.
-    run_settings = _run_settings_html(sweep)
+    # One k for the page as rendered: the discount these trades were sized at
+    # — the override when one was passed, else the sweep's primary k (the k
+    # its points were simulated at). The Risk section's Kelly scatter, the
+    # primary scenario's chunk and the k-hat chart's line read this one value,
+    # and so does the bar's summary, whose k axis names the sweep's primary k
+    # — the same value whenever the override is the sweep's own k, which is
+    # every production call (backtest.py passes result.primary.k). With
+    # neither it is None: the scatter then prices at
+    # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT and the summary says "k not
+    # recorded". The bar's k select then shows the run at other ks.
+    k_used = (interval_discount if interval_discount is not None
+              else (sweep.primary.k if sweep is not None else None))
+    if sweep is not None and interval_discount is not None \
+            and interval_discount != sweep.primary.k:
+        # Unsupported: the bar's k axis is the sweep's (_grid_source), so the
+        # page would name two ks — say so rather than let it pass silently
+        logging.warning(
+            "interval_discount %s differs from the sweep's primary k %s: the Risk "
+            "section's Kelly scatter, the primary scenario's chunk and the k-hat "
+            "chart's line as rendered are priced at %s, while the filter bar's k "
+            "select and summary line name the sweep's ks", interval_discount,
+            sweep.primary.k, interval_discount)
+
+    # The page-wide filter: every spread band x k x size cap scenario's own
+    # run, and within it every Kalshi category and category · tag, each view
+    # computed here by the same helpers the sections below render with — one
+    # walk over the grid (a size-cap sweep's cells are simulated as they are
+    # read), keeping only packed chunks. It is an extra: a failure to build it
+    # costs the bar and its script, never the page — every section below
+    # renders from its own arguments.
+    filter_data = filter_bar = base_block = None
+    chunks: list = []
+    most_traded = 0
+    walked: _GridSource | None = None
+    try:
+        source = _grid_source(sweep, trades, equity_df, k_used)
+        source, chunker, counter = _build_filter_grid(
+            source, trades, equity_df, k_used, start_date, initial_balance, series_categories)
+        walked = source
+        if not counter.failed:
+            most_traded = counter.most
+        # A chunk that failed to build has already said so and dropped them all
+        if not chunker.failed:
+            pb, pk, pc = source.primary
+            if chunker.grid[pb][pk][pc] is None:
+                # Never expected: the primary scenario is the page's own run
+                raise ValueError("the primary scenario has no trade list to show")
+            filter_data = _filter_payload(source, chunker, start_date, initial_balance,
+                                          series_categories)
+            filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
+            base_block = _packed_json_script("dash-data", filter_data)
+            chunks = chunker.chunks
+    except Exception:
+        logging.warning("The page-wide filter could not be built; the dashboard is "
+                        "written without it", exc_info=True)
+        filter_data = filter_bar = base_block = None
+        chunks = []
+    if filter_bar is None:
+        filter_data, filter_bar, chunks = None, _FILTER_UNAVAILABLE_HTML, []
+
+    # The ladder setting decides which pairs exist, the primary spread band
+    # which of them are ever entered and the per-trade cap how big each is,
+    # so all three are named in the header above every section, not only
+    # inside the scenario explorer; "not recorded" when there is no sweep.
+    # Rendered after the walk, because a size-cap sweep the walk could not use
+    # (the grid it walked has no cap sweep) leaves the bar's Size cap select a
+    # single option, whose reason must be on the page, not only in the log
+    # (DR-66). Only when the bar exists: without it the notice in its place
+    # says what was lost.
+    run_settings = _run_settings_html(
+        sweep, cap_sweep_unused=(filter_data is not None and walked is not None
+                                 and walked.cap_sweep is None))
 
     # Directly under the Period line, which it qualifies: the corpus holds
     # nothing settled after its assembly even though the period runs to today,
     # and a window at or after the archive cutoff could never enter a trade
-    # (unless a simulated point traded, which proves that verdict stale).
-    # Rendered on every run, healthy or not (DR-13, M2; DR-66's rule).
-    corpus_note = _corpus_provenance_html(sweep)
+    # (unless a simulated point traded, which proves that verdict stale — an
+    # eager point, per backtester.max_trades_simulated, or a size-cap cell the
+    # walk above simulated). Rendered on every run, healthy or not (DR-13,
+    # M2; DR-66's rule).
+    traded = (None if sweep is None
+              # The eager points' busiest (the log's closing line reads the same)
+              else max(most_traded, max_trades_simulated(sweep)))
+    corpus_note = _corpus_provenance_html(sweep, traded=traded)
 
-    # One k for the whole page: the discount these trades were sized at — the
-    # override when one was passed, else the sweep's primary k (the k its
-    # points were simulated at). The Risk section's Kelly scatter, the
-    # filter's views of it and the filter bar's summary all read this one
-    # value, so they cannot name two. With neither it is None: the scatter
-    # then prices at config.TIME_SERIES_INTERVAL_PROB_DISCOUNT and the summary
-    # says "k not recorded".
-    k_used = (interval_discount if interval_discount is not None
-              else (sweep.primary.k if sweep is not None else None))
-    k_text = "k not recorded" if k_used is None else _k_label(k_used)
-
-    # The page-wide filter: every spread band's own run at the primary k, and
-    # within it every Kalshi category and category · tag, each view computed
-    # here by the same helpers the sections below render with. It is an
-    # extra: a failure to build it costs the bar and its script, never the
-    # page — every section below renders from its own arguments.
-    try:
-        runs, primary_idx = _band_runs(sweep, trades, equity_df)
-        filter_data = _filter_payload(runs, primary_idx, start_date, initial_balance,
-                                      series_categories, k_used, k_text)
-    except Exception:
-        logging.warning("The page-wide filter could not be built; the dashboard is "
-                        "written without it", exc_info=True)
-        filter_data = None
-    if filter_data is None:
-        filter_bar, filter_block = _FILTER_UNAVAILABLE_HTML, ""
-    else:
-        filter_bar = _filter_bar_html(filter_data)
-        filter_block = _packed_json_script("dash-data", filter_data) + _FILTER_JS
-
-    sections = [
-        _section_performance(equity_df, trades, start_date, initial_balance),
-        _section_decomposition(trades, series_categories),
-        _section_calibration(trades),
+    # Each section is built as it is written, so only one is alive at a time
+    sections = (
+        lambda: _section_performance(equity_df, trades, start_date, initial_balance),
+        lambda: _section_decomposition(trades, series_categories),
+        lambda: _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k)
-        _section_interval_discount(sweep),
+        lambda: _section_interval_discount(sweep),
         # The same k-hat, broken down by category, tag and spread band — read
-        # off the filter payload, so it follows the filter bar like the
-        # trade sections do (None when the payload could not be built)
-        _section_khat(filter_data, k_used),
+        # off the filter's base block, so it follows the filter bar like the
+        # trade sections do (None when the filter could not be built)
+        lambda: _section_khat(filter_data, k_used),
         # Also takes the sweep whole — it reads .scenarios, .same_title_point
         # and .calibrations_by_band, none of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
         # header's run-settings line) drift onto different bands or settings.
-        _section_scenario_explorer(sweep),
-        _section_diagnostics(trades),
+        lambda: _section_scenario_explorer(sweep),
+        lambda: _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
-        _section_risk(trades, equity_df, initial_balance, k=k_used),
-        _section_benchmark(equity_df, start_date, initial_balance),
-    ]
+        lambda: _section_risk(trades, equity_df, initial_balance, k=k_used),
+        lambda: _section_benchmark(equity_df, start_date, initial_balance),
+    )
 
-    # Named page_html (not `html`) so it can't shadow the `html` module used
-    # by the _section_* helpers above (html.escape()).
-    page_html = f"""<!DOCTYPE html>
+    # Named head (not `html`) so it can't shadow the `html` module used by
+    # the _section_* helpers above (html.escape()).
+    head = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -4899,17 +6034,27 @@ def generate_dashboard(
 {run_settings}
 {header_note}
 {filter_bar}
-{''.join(sections)}
-{filter_block}
-</body>
-</html>"""
+"""
 
-    # Written beside the target, then renamed over it: the rename is atomic,
+    # Streamed beside the target, then renamed over it: the rename is atomic,
     # so the previous dashboard is replaced only by a complete page. The
     # temporary name carries the pid so two concurrent runs never share one.
+    # Every chunk precedes the base block, and both precede the script that
+    # reads them. newline="" writes every "\n" as-is on any platform.
     tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
     try:
-        tmp_path.write_bytes(page_html.encode("utf-8"))
+        with tmp_path.open("w", encoding="utf-8", newline="") as page:
+            page.write(head)
+            for build in sections:
+                page.write(build())
+            page.write("\n")
+            if base_block is not None:
+                for i, chunk in enumerate(chunks):
+                    page.write(chunk)
+                    chunks[i] = None      # written: nothing keeps it alive
+                page.write(base_block)
+                page.write(_FILTER_JS)
+            page.write("\n</body>\n</html>")
         os.replace(tmp_path, out_path)
     finally:
         tmp_path.unlink(missing_ok=True)
