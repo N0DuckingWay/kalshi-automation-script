@@ -74,12 +74,17 @@ Dependencies:
     dashboard.py, which also imports the private helpers _exact_label,
     _leg_prices_for, _build_equity_curve — the one definition of an equity
     curve, which its page-wide filter runs over a category's or tag's trades
-    for that slice's curve — and _calibration_bucket; an IntervalCalibration
-    carries the CalibrationObservations its pooled row was reduced from, so a
-    report can regroup that population through _calibration_bucket, the one
-    definition of the k-hat arithmetic, as dashboard.py's k-hat breakdown
-    does by category, tag and spread band) plus run_backtest() and
-    run_backtest_sweep() (called by backtest.py).
+    for that slice's curve — _calibration_bucket, _band_label (the bare
+    "floor-ceiling" its filter bar names a band's tier-floors-off run with,
+    so the page and the log spell that run alike) and _tier_floors_bind (the
+    one test of whether a deadline-gap tier binds at a band, which the filter
+    bar's Tier floors choice reads to decide whether a band absent from the
+    tier-off family may show its tier-on run, or no off view is shown); an
+    IntervalCalibration carries the CalibrationObservations its pooled row
+    was reduced from, so a report can regroup that population through
+    _calibration_bucket, the one definition of the k-hat arithmetic, as
+    dashboard.py's k-hat breakdown does by category, tag and spread band)
+    plus run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -4388,11 +4393,14 @@ def _exact_label(value: float, spec: str) -> str:
 
 def _band_label(band: tuple[float, float]) -> str:
     """
-    Render a resolved spread band as the "floor-ceiling" text every log line uses.
+    Render a resolved spread band as "floor-ceiling" (log lines, the dashboard's tier-off labels).
 
     One definition, so the Phase-1 announcement of a band sweep and the
     completion line of every simulation at that band spell it identically —
-    a reader can match them by text. Each bound is formatted with :g, which
+    a reader can match them by text. dashboard.py labels a band's
+    tier-floors-off view with it too (that run was gated on its floor alone,
+    so the page's own "max(tier,<floor>)" would misname it), so the page and
+    the log name that run alike. Each bound is formatted with :g, which
     drops trailing zeros, so the default band reads "0-1" and the plan's
     30-60% band "0.3-0.6" — unless :g would lose precision, when the bound is
     printed exactly (_exact_label), so a primary band of (0.3000001, 0.6) is
@@ -4420,7 +4428,8 @@ def _tier_floors_bind(band: tuple[float, float]) -> bool:
     tiers at 0, the 0.30 tier alone at the other two). A band whose floor is
     at or above both tiers enters the same pairs on the same Mondays either
     way, so a tier-off sweep simulates only the binding bands again and the
-    dashboard reuses the tier-on run for the rest. Decided through
+    dashboard reuses the tier-on run for the rest (dashboard.py imports this
+    one test to decide which bands may). Decided through
     min_price_diff_for_gap itself, over every gap _find_entry admits, so it
     cannot disagree with the rule it names.
 

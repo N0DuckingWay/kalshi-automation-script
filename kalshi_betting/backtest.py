@@ -93,7 +93,9 @@ Notes:
     --no-band-sweep skips that grid and those
     tier-floors-off runs (band_sweep=False, tier_off_sweep=False): the
     primary scenario still runs, but the dashboard's scenario explorer has no
-    scenarios to show. There is no separate flag for the tier-off runs.
+    scenarios to show, and its filter bar offers the primary band only, with
+    the Tier floors select disabled. There is no separate flag for the
+    tier-off runs.
 """
 import argparse
 import logging
@@ -219,7 +221,8 @@ def main() -> None:
     The other swept discounts and bands exist for the dashboard (its k
     selector, scenario explorer, filter bar and k-hat breakdown), the
     calibration report and max_trades_simulated's post-cutoff check; the
-    tier-floors-off family is read by that check and carried to
+    tier-floors-off family is read by that check and by the dashboard's
+    filter bar and k-hat breakdown (their Tier floors choice), carried to
     generate_dashboard on the sweep.
     """
     parser = argparse.ArgumentParser(
@@ -291,7 +294,9 @@ def main() -> None:
     parser.add_argument(
         "--no-band-sweep", action="store_true",
         help="Skip the spread-band grid (and its tier-floors-off runs); the "
-             "dashboard's scenario explorer is not computed",
+             "dashboard's scenario explorer is not computed, and its filter "
+             "bar offers the primary band only, with the Tier floors select "
+             "disabled",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -471,9 +476,11 @@ def main() -> None:
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points are read by the k selector, the
     # band-sweep payload by the dashboard's scenario explorer, filter bar and
-    # k-hat breakdown, and every kept point — the tier-floors-off family's
-    # included — by max_trades_simulated's post-cutoff check
-    # (_log_corpus_provenance below, and the dashboard's header).
+    # k-hat breakdown, the tier-floors-off family by that filter bar and k-hat
+    # breakdown too (their Tier floors choice), and every kept point — the
+    # tier-floors-off family's included — by max_trades_simulated's
+    # post-cutoff check (_log_corpus_provenance below, and the dashboard's
+    # header).
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
