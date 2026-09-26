@@ -4886,21 +4886,25 @@ class TestCorpusProvenanceIsCarried:
 
     @pytest.mark.parametrize("where, expected", [
         ("none", 0), ("primary", 3), ("points", 5), ("scenarios", 7),
-        ("same_title_point", 2),
+        ("same_title_point", 2), ("tier_off_scenarios", 9),
     ])
     def test_max_trades_simulated_reads_every_point_the_page_can_show(
             self, where, expected):
         # The one test both renderers apply to a carried post-cutoff verdict:
         # a trade at ANY simulated point proves it stale, since the k dropdown
-        # and the scenario explorer put every point on the same page.
+        # and the scenario explorer put every point on the same page — a
+        # tier-floors-off scenario included.
         primary = self._point(3 if where == "primary" else 0)
+        off_point = self._point(9 if where == "tier_off_scenarios" else 0, k=0.9)
+        off_point.tier_floors = False
         sweep = backtester.BacktestSweep(
             primary=primary,
             points=[primary, self._point(5 if where == "points" else 0, k=0.5)],
             calibration=None,
             scenarios=[self._point(7 if where == "scenarios" else 0, k=0.9)],
             same_title_point=(self._point(2) if where == "same_title_point"
-                              else None))
+                              else None),
+            tier_off_scenarios=[off_point])
         assert backtester.max_trades_simulated(sweep) == expected
 
     def test_existing_constructions_default_to_none(self):
@@ -5976,6 +5980,35 @@ class TestRunBacktestTimeSeriesFlow:
         assert t.profit == pytest.approx(-(t.total_cost + t.fees))
         assert t.slippage == pytest.approx(-1619.55 - 594.45)
         assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(10_000.0 - 1619.55)
+
+    def test_a_tier_off_simulation_labels_its_premise_warning(self, monkeypatch, caplog):
+        # The premise check runs inside every simulation, the backtest-only
+        # tier-floors-off family's included: a count from that family says
+        # so, and the tier-on WARNING is exactly the text it always was.
+        candles = {"EA": [_candle(_MONDAY_TS, self._PA, self._NA)],
+                   "EB": [_candle(_MONDAY_TS, self._PB, self._NB)]}
+        markets = self._markets("yes", "no")
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                                 True, None)
+        assert len(entries) == 1
+
+        def premise_lines(**kw):
+            caplog.clear()
+            backtester._simulate_at_discount(entries, date(2026, 1, 1), 10_000.0, **kw)
+            return [r.getMessage() for r in caplog.records
+                    if r.levelname == "WARNING" and "cumulative-deadline premise" in r.getMessage()]
+
+        with caplog.at_level(logging.WARNING):
+            on = premise_lines()
+            off = premise_lines(tier_floors=False)
+        assert len(on) == len(off) == 1
+        assert on[0].startswith("Excluded 1 time-series candidate(s)")
+        assert on[0].endswith("(see the outcome-label coverage line)")
+        assert off[0] == on[0] + " [tier floors off]"
 
     def test_premise_violation_is_excluded_and_warned(self, monkeypatch, caplog):
         # EA yes, EB no cannot happen for a cumulative-deadline pair: the
@@ -8031,7 +8064,8 @@ class TestEntriesForBand:
         # Risk 2 of the plan: a second copy of any of these could disagree
         # with the one extraction and the candle fetch used.
         params = inspect.signature(backtester._entries_for_band).parameters
-        assert list(params) == ["candidates", "spread_band", "pair_types", "_pairs"]
+        assert list(params) == ["candidates", "spread_band", "pair_types", "tier_floors",
+                                "_pairs"]
         assert params["pair_types"].kind is inspect.Parameter.KEYWORD_ONLY
         # PB7's private subset of pairs to scan: keyword-only, defaulting to
         # the full candidates.all_pairs scan
@@ -8053,7 +8087,7 @@ class TestEntriesForBand:
         assert seen == [
             (["ca"], ["cb"], pt, date(2026, 3, 2),
              {"max_horizon_days": 21, "same_event_ladders": ladders,
-              "spread_band": (0.3, 0.6)})
+              "spread_band": (0.3, 0.6), "tier_floors": True})
             for pt in ("time_series", "same_title")
         ]
 
@@ -8391,15 +8425,17 @@ def golden_band_sweep():
             return out
 
         def simulate_spy(raw_entries, start_date, initial_balance, k=None,
-                         spread_band=None, population="all"):
+                         spread_band=None, population="all", *, tier_floors=True):
             # Were the candles and the pair list already released when this
             # simulation ran?
             released = all(not hasattr(c, "candles_by_ticker") and not hasattr(c, "all_pairs")
                            for c in calls["candidates"])
             point = real_simulate(raw_entries, start_date, initial_balance, k=k,
-                                  spread_band=spread_band, population=population)
+                                  spread_band=spread_band, population=population,
+                                  tier_floors=tier_floors)
             calls["simulate"].append({"entries": list(raw_entries), "band": spread_band,
                                       "population": population, "k": k,
+                                      "tier_floors": tier_floors,
                                       "point": point, "released": released})
             return point
 
@@ -8838,6 +8874,18 @@ class TestBandSweepEdges:
         assert res.same_event_ladders is True
         assert res.primary.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
 
+    def test_the_infeasible_window_has_no_tier_off_family_either(self, monkeypatch):
+        # The CLI's own flags (the band sweep AND its tier-floors-off family)
+        # on a window with no Monday checkpoint: the family comes back empty,
+        # like every other band-sweep payload, and nothing was fetched
+        res = TestRunBacktestSweep()._infeasible(monkeypatch, band_sweep=True,
+                                                 tier_off_sweep=True, same_event_ladders=True)
+        assert res.tier_off_scenarios == []
+        assert res.tier_off_calibrations_by_band == {}
+        assert res.scenarios == [] and res.calibrations_by_band == {}
+        assert res.primary.tier_floors is True
+        assert backtester.max_trades_simulated(res) == 0
+
     def test_a_single_band_run_keeps_its_calibration_keyed_by_band(self, monkeypatch):
         res = self._run(monkeypatch, sweep=False)
         assert res.calibrations_by_band == {BACKTEST_DEFAULT_SPREAD_BAND: res.calibration}
@@ -8949,7 +8997,7 @@ class TestSweepHelpers:
         assert ret == pytest.approx(-0.10)
         # ONE re-simulation, of every entry not on E2, at the point's k and band
         assert seen == [(["E1", ""], {"k": 0.6, "spread_band": (0.3, 0.6),
-                                      "population": "all/ex-top"})]
+                                      "population": "all/ex-top", "tier_floors": True})]
 
     def test_ex_top_event_ties_go_to_the_first_ticker_and_losses_count(self, monkeypatch):
         monkeypatch.setattr(
@@ -9073,7 +9121,7 @@ class TestBandSweepSplitAndPopulationWiring:
         sims: list = []
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
-                          spread_band=None, population="all"):
+                          spread_band=None, population="all", *, tier_floors=True):
             point = backtester.SweepPoint(
                 k=TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
                 equity_df=pd.DataFrame({"portfolio_value": [initial_balance]}),
@@ -9276,7 +9324,7 @@ class TestBandSweepPhaseOneSubset:
             return out
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
-                          spread_band=None, population="all"):
+                          spread_band=None, population="all", *, tier_floors=True):
             return backtester.SweepPoint(
                 k=TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
                 equity_df=pd.DataFrame({"portfolio_value": [initial_balance]}),
@@ -9330,10 +9378,77 @@ class TestBandSweepPhaseOneSubset:
         tier_rule = backtester.min_price_diff_for_gap
         with monkeypatch.context() as m:
             m.setattr(backtester, "min_price_diff_for_gap",
-                      lambda gap, spread_min=None: spread_min or tier_rule(gap))
+                      lambda gap, spread_min=None, **_kw: spread_min or tier_rule(gap))
             loosened = real(self._own_candidates(m), (0.20, 1.0),
                             pair_types=("time_series",))
         assert "FOG-A" in [r["entry"]["mA"]["ticker"] for r in loosened]
+
+    def test_the_tier_off_rescan_comes_from_its_own_pre_pass(self, monkeypatch):
+        # FOG is exactly the pair a tier-floors-off family must not lose: the
+        # 0.30 tier refuses its 0.25 spread at every band, so the TIER-ON
+        # pre-pass never enters it, while with the tiers off it clears every
+        # binding floor (0, 0.20, 0.25) and every binding band's sum ceiling
+        # (pA + nB = 0.70 <= 1 - 0.25). A tier-off rescan built from the
+        # tier-on pre-pass would drop it at every tier-off band but (0, 1) —
+        # the golden fixture cannot see that, since the pairs it enters are
+        # the same with the tiers on or off.
+        candidates = self._own_candidates(monkeypatch)
+        real = backtester._entries_for_band
+        passes: list = []
+
+        def spy(c, spread_band=None, *, pair_types=("time_series", "same_title"), **private):
+            out = real(c, spread_band, pair_types=pair_types, **private)
+            if pair_types == ("time_series",):
+                passes.append((spread_band, private.get("tier_floors", True),
+                               private.get("_pairs"), out))
+            return out
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all", *, tier_floors=True):
+            return backtester.SweepPoint(
+                k=TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
+                equity_df=pd.DataFrame({"portfolio_value": [initial_balance]}),
+                spread_band=spread_band, population=population,
+                tier_floors=tier_floors is not False)
+
+        monkeypatch.setattr(backtester, "_entries_for_band", spy)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        backtester._sweep_from_candidates(candidates, 10_000.0, interval_discount=None,
+                                          sweep=False, spread_band=None, band_sweep=True,
+                                          tier_off_sweep=True)
+
+        def tickers(pairs):
+            return [(item[0][0]["ticker"], item[0][1]["ticker"]) for item in pairs]
+
+        on = [p for p in passes if p[1] is True]
+        off = [p for p in passes if p[1] is False]
+        assert len(on) == 36 and len(off) == 18
+        # The tier-on sweep: its one full scan admits ICE alone, and every
+        # tier-on rescan carries just that pair
+        assert on[0][0] == (0.0, 1.0) and on[0][2] is None
+        assert all(tickers(pairs) == [("ICE-LATE", "ICE-EARLY")]
+                   for _band, _tf, pairs, _out in on[1:])
+        # The tier-off family: ONE full scan of its own, at (0, 1), and its 17
+        # other bands rescan what entered THERE — ICE and FOG
+        assert off[0][0] == (0.0, 1.0) and off[0][2] is None
+        assert [band for band, _tf, pairs, _out in off if pairs is None] == [(0.0, 1.0)]
+        assert all(tickers(pairs) == [("ICE-LATE", "ICE-EARLY"), ("FOG-A", "FOG-B")]
+                   for _band, _tf, pairs, _out in off[1:])
+        # Every tier-off pass is a full tier-off scan's entries
+        rows = TestPrepareEntriesGolden._rows
+        for band, _tf, _pairs, out in off:
+            full = real(self._own_candidates(monkeypatch), band, pair_types=("time_series",),
+                        tier_floors=False)
+            assert rows(out) == rows(full), band
+
+        # Not vacuous: FOG-A enters at every tier-off band, and at no tier-on one
+        def fog_bands(group):
+            return sorted(band for band, _tf, _pairs, out in group
+                          if any(r["entry"]["mA"]["ticker"] == "FOG-A" for r in out))
+
+        assert fog_bands(off) == _TIER_BOUND_BANDS
+        assert fog_bands(on) == []
 
 
 @pytest.mark.usefixtures("golden_band_sweep")
@@ -9425,7 +9540,7 @@ class TestTimeSeriesPopulation:
             return list(st) if pair_types == ("same_title",) else list(ts)
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
-                          spread_band=None, population="all"):
+                          spread_band=None, population="all", *, tier_floors=True):
             sims.append((population, list(raw_entries)))
             return backtester.SweepPoint(
                 k=TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
@@ -9497,3 +9612,535 @@ class TestExactLabels:
             assert backtester._exact_label(float(x), "g") == format(x, "g")
         for k in INTERVAL_DISCOUNT_SWEEP:
             assert backtester._exact_label(k, ".3f") == format(k, ".3f")
+
+
+# ─── The tier-floors-off family (backtest only) ─────────────────────────────
+
+# The grid bands a deadline-gap tier floor binds at: every band whose floor
+# sits below a tier — floors 0, 0.20 and 0.25, written out here rather than
+# derived from the helper under test.
+_TIER_BOUND_BANDS = [band for band in _GRID_BANDS if band[0] in (0.0, 0.20, 0.25)]
+
+
+class TestTierFloorsOff:
+    """The backtest-only tier_floors switch under the tier-off family:
+    _tier_floors_bind (which bands a tier binds at), _find_entry with the
+    deadline-gap tier not applied (the band floor alone gates pB - pA and sets
+    the leg-price-sum ceiling, 1 - floor), the completion line and stamp of a
+    tier-off simulation, and a tier-off calibration's labels.
+
+    The literals are hand-derived from TestPrepareEntriesGolden's candles,
+    never from the code under test. Its ladder (RUNG-EARLY/RUNG-LATE, a
+    19-day STATED gap, so the 0.30 tier) quotes pA 0.20 / pB 0.45 / nB 0.55 on
+    Monday 1 — a 0.25 spread at pA + nB = 0.75, below the tier — and pA 0.20 /
+    pB 0.60 / nB 0.40 on Monday 2 (0.40 at 0.60), so with the tiers it waits
+    for Monday 2 at every floor, while with them off a floor of 0, 0.20 or
+    0.25 admits Monday 1 (spread >= floor, pA + nB <= 1 - floor)."""
+
+    _START = TestPrepareEntriesGolden._START
+    _MONDAY_1 = (date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE")
+    _MONDAY_2 = (date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE")
+
+    @staticmethod
+    def _market(ticker):
+        return next(m for m in TestPrepareEntriesGolden._markets() if m["ticker"] == ticker)
+
+    def _entry(self, first, second, pair_type, band, tier_floors):
+        candles = TestPrepareEntriesGolden._CANDLES
+        return _find_entry(candles[first], candles[second], self._market(first),
+                           self._market(second), pair_type, self._START,
+                           same_event_ladders=True, spread_band=band,
+                           tier_floors=tier_floors)
+
+    @staticmethod
+    def _row(entry):
+        return (entry["entry_date"], entry["pA"], entry["pB"], entry["nA"], entry["nB"],
+                entry["gap_days"], entry["mA"]["ticker"], entry["mB"]["ticker"])
+
+    def test_the_tiers_bind_exactly_below_the_long_tier(self):
+        assert {lo: backtester._tier_floors_bind((lo, 1.0)) for lo in SPREAD_BAND_SWEEP_FLOORS} == {
+            0.0: True, 0.2: True, 0.25: True, 0.3: False, 0.35: False, 0.4: False}
+        # The boundary is the 0.30 tier itself, to the float
+        assert backtester._tier_floors_bind((0.2999999, 0.6)) is True
+        assert backtester._tier_floors_bind((0.3000001, 0.6)) is False
+        # The ceiling never enters into it: 18 of the 36 grid bands bind
+        assert [b for b in _GRID_BANDS if backtester._tier_floors_bind(b)] == _TIER_BOUND_BANDS
+        assert len(_TIER_BOUND_BANDS) == 18
+
+    def test_the_ladder_enters_a_week_earlier_with_the_tiers_off(self):
+        # Listed later-rung first, as in the golden fixture: the stated
+        # deadlines order it, either way.
+        for lo in SPREAD_BAND_SWEEP_FLOORS:
+            for hi in SPREAD_BAND_SWEEP_CEILINGS:
+                on = self._entry("RUNG-LATE", "RUNG-EARLY", "time_series", (lo, hi), True)
+                off = self._entry("RUNG-LATE", "RUNG-EARLY", "time_series", (lo, hi), False)
+                assert self._row(on) == self._MONDAY_2, (lo, hi)
+                expected = self._MONDAY_1 if lo in (0.0, 0.20, 0.25) else self._MONDAY_2
+                assert self._row(off) == expected, (lo, hi)
+
+    def test_the_sum_ceiling_follows_the_floor(self):
+        # A cross-event pair 20 days apart (the 0.30 tier) at a 0.25 spread
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-02-21T00:00:00+00:00"}
+
+        def entry(nB, band, tier_floors):
+            return _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)],
+                               [_candle(_MONDAY_TS, 0.55, nB)], mA, mB, "time_series",
+                               self._START, spread_band=band, tier_floors=tier_floors)
+
+        assert 0.30 + 0.55 == pytest.approx(0.85)
+        # Tiers off at floor 0.20: the 0.25 spread clears the floor, but
+        # pA + nB = 0.85 is above its sum ceiling, 1 - 0.20 = 0.80 ...
+        assert entry(0.55, (0.20, 1.0), False) is None
+        # ... and that ceiling is the only reason: at pA + nB = 0.75 it enters
+        kept = entry(0.45, (0.20, 1.0), False)
+        assert kept is not None and (kept["entry_date"], kept["gap_days"]) == (date(2026, 1, 5), 20)
+        # Tiers off at floor 0: a sum ceiling of 1, so 0.85 enters
+        zero = entry(0.55, (0.0, 1.0), False)
+        assert zero is not None and (zero["entry_date"], zero["gap_days"]) == (date(2026, 1, 5), 20)
+        # With the tiers on, the 0.30 tier refuses a 0.25 spread at either floor
+        assert entry(0.55, (0.0, 1.0), True) is None
+        assert entry(0.45, (0.20, 1.0), True) is None
+
+    def test_a_zero_spread_is_refused_with_the_tiers_off(self):
+        # At a floor of 0 with the tiers off the threshold is 0.0, so the gap
+        # test alone would admit pB == pA: a pair with no in-between mass,
+        # which time_series_profit_prob models as riskless (p = 1, Kelly at
+        # the cap). The later leg's candle is CROSSED (pB + nB = 0.80 < 1), so
+        # the pair clears every other price test — the live quotes, the sum
+        # ceiling of 1 and the fee check — and only the refusal of a spread
+        # that is not strictly positive stands between it and an entry.
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-02-10T00:00:00+00:00"}
+
+        def entry(pB, tier_floors=False):
+            return _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)],
+                               [_candle(_MONDAY_TS, pB, 0.50)], mA, mB, "time_series",
+                               self._START, spread_band=(0.0, 1.0), tier_floors=tier_floors)
+
+        assert 1.0 - 0.30 - 0.50 > fee_per_pair_approx(0.30, 0.50)
+        assert entry(0.30) is None
+        # The same candles two cents apart enter, on Monday 1
+        kept = entry(0.32)
+        assert kept is not None
+        assert (kept["entry_date"], kept["pA"], kept["pB"], kept["nB"], kept["gap_days"]) == (
+            date(2026, 1, 5), 0.30, 0.32, 0.50, 9)
+        # Inert with the tiers on: the 0.15 tier (a 9-day gap) refuses both
+        assert entry(0.30, tier_floors=True) is None
+        assert entry(0.32, tier_floors=True) is None
+
+    def test_a_pricier_earlier_contract_never_enters_with_the_tiers_off(self):
+        # FA/FB: pB - pA = -0.10 on both Mondays. Even at a floor of 0 the
+        # direction test still stands: pB must exceed pA.
+        for lo in SPREAD_BAND_SWEEP_FLOORS:
+            for hi in SPREAD_BAND_SWEEP_CEILINGS:
+                assert self._entry("FA", "FB", "time_series", (lo, hi), False) is None
+
+    def test_same_title_enters_identically_either_way(self):
+        default = self._entry("SA", "SB", "same_title", None, True)
+        assert default is not None
+        for band in _GRID_BANDS:
+            for tier_floors in (True, False):
+                assert self._entry("SA", "SB", "same_title", band, tier_floors) == default
+
+    def test_a_tier_off_simulation_is_named_and_stamped_as_one(self, caplog, monkeypatch):
+        with caplog.at_level(logging.INFO):
+            off = backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.75,
+                                                   spread_band=(0.2, 0.6),
+                                                   population="time_series/H1",
+                                                   tier_floors=False)
+            on = backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.75,
+                                                  spread_band=(0.2, 0.6),
+                                                  population="time_series/H1")
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Backtest complete")]
+        assert lines == [
+            "Backtest complete at k=0.750, band 0.2-0.6 with the tier floors off, "
+            "time_series/H1: 0 trades, 0 profitable",
+            "Backtest complete at k=0.750, band 0.2-0.6, time_series/H1: 0 trades, 0 profitable",
+        ]
+        # The suffix holds no colon, and the population is still the last
+        # ", "-separated field of the prefix
+        assert [p.rsplit(", ", 1)[1] for p in _completion_prefixes(lines)] == [
+            "time_series/H1"] * 2
+        assert off.tier_floors is False and on.tier_floors is True
+        # Only an explicit False marks a tier-off point
+        assert backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0,
+                                                tier_floors=None).tier_floors is True
+        # A label: the trades are those of the tier-on simulation of the same entries
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        plain = backtester._simulate_at_discount(entries, golden._START, 10_000.0)
+        labelled = backtester._simulate_at_discount(entries, golden._START, 10_000.0,
+                                                    tier_floors=False)
+        assert [astuple(t) for t in plain.trades] == [astuple(t) for t in labelled.trades]
+        pd.testing.assert_frame_equal(plain.equity_df, labelled.equity_df)
+
+    def test_a_tier_off_calibration_is_labelled_with_the_floor_alone(self):
+        entries = [_cal_entry(3, 0.10, 0.70, "no", "yes"),
+                   _cal_entry(10, 0.10, 0.40, "no", "no"),
+                   _cal_entry(20, 0.10, 0.60, "yes", "yes")]
+        on = _interval_calibration(entries, spread_min=0.2)
+        assert [(b.label, b.tier) for b in on.buckets] == [
+            ("0-7d", 0.2), ("8-15d", 0.2), ("16-30d", 0.30)]
+        off = _interval_calibration(entries, spread_min=0.2, tier_floors=False)
+        assert [(b.label, b.tier) for b in off.buckets] == [
+            ("0-7d", 0.2), ("8-15d", 0.2), ("16-30d", 0.2)]
+        zero = _interval_calibration(entries, spread_min=0.0, tier_floors=False)
+        assert [b.tier for b in zero.buckets] == [0.0, 0.0, 0.0]
+        # Labels only: the measurement itself does not move
+        assert off.pooled == on.pooled == zero.pooled
+        assert off.observations == on.observations == zero.observations
+
+    def test_a_floor_zero_tier_off_bucket_prints_no_floor(self, caplog):
+        # The documented reading of the tier <= 0 sentinel: a tier-off bucket
+        # at floor 0 cleared no floor at all, so it prints "-" like the pooled
+        # row rather than a 0.00 threshold
+        zero = _interval_calibration([_cal_entry(3, 0.10, 0.70, "no", "yes")],
+                                     spread_min=0.0, tier_floors=False)
+        with caplog.at_level(logging.INFO):
+            _log_interval_calibration(zero)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert msgs[2].split()[:2] == ["0-7d", "-"]
+        assert msgs[3].split()[:2] == ["POOLED", "-"]
+
+
+@pytest.fixture(scope="class")
+def golden_tier_off_sweep():
+    """ONE band sweep WITH the tier-floors-off family (36 bands x 13 k, ladders
+    on) over the TestPrepareEntriesGolden fixture, through spies that tolerate
+    any keyword (tier_floors included), plus the same run with
+    tier_off_sweep=False — the oracle for the tier-on payload, which the
+    family must leave exactly as it was. Class-scoped, like golden_band_sweep."""
+    mp = pytest.MonkeyPatch()
+    handler = _LogCapture()
+    root = logging.getLogger()
+    old_level = root.level
+    try:
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        calls: dict = {"entries": [], "simulate": [], "candidates": [], "populations": []}
+        real_prepare = backtester._prepare_candidates
+        real_entries = backtester._entries_for_band
+        real_simulate = backtester._simulate_at_discount
+        real_populations = backtester._band_populations
+
+        def prepare_spy(*a, **kw):
+            c = real_prepare(*a, **kw)
+            calls["candidates"].append(c)
+            return c
+
+        def entries_spy(candidates, spread_band=None, **kw):
+            out = real_entries(candidates, spread_band, **kw)
+            calls["entries"].append({
+                "band": spread_band,
+                "pair_types": kw.get("pair_types", ("time_series", "same_title")),
+                "tier_floors": kw.get("tier_floors", True),
+                "pairs": kw.get("_pairs"), "out": out})
+            return out
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all", **kw):
+            released = all(not hasattr(c, "candles_by_ticker") and not hasattr(c, "all_pairs")
+                           for c in calls["candidates"])
+            point = real_simulate(raw_entries, start_date, initial_balance, k=k,
+                                  spread_band=spread_band, population=population, **kw)
+            calls["simulate"].append({
+                "entries": list(raw_entries), "raw": raw_entries, "band": spread_band,
+                "population": population, "tier_floors": kw.get("tier_floors", True),
+                "point": point, "released": released})
+            return point
+
+        def populations_spy(entries, split_date):
+            # The list object itself (not a copy), so a call can be matched to
+            # the simulations of the same entries by identity
+            calls["populations"].append({"entries": entries, "split_date": split_date})
+            return real_populations(entries, split_date)
+
+        mp.setattr(backtester, "_prepare_candidates", prepare_spy)
+        mp.setattr(backtester, "_entries_for_band", entries_spy)
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+        mp.setattr(backtester, "_band_populations", populations_spy)
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        result = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=golden._START, initial_balance=10_000.0,
+            same_event_ladders=True, band_sweep=True, tier_off_sweep=True,
+        )
+        root.removeHandler(handler)
+        mp.undo()
+
+        # The same run without the family: what the tier-on payload must equal
+        golden._patch(mp)
+        plain = run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=golden._START, initial_balance=10_000.0,
+            same_event_ladders=True, band_sweep=True,
+        )
+        yield SimpleNamespace(result=result, plain=plain, calls=calls,
+                              messages=handler.messages, start=golden._START)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+        mp.undo()
+
+
+@pytest.mark.usefixtures("golden_tier_off_sweep")
+class TestTierOffSweep:
+    """run_backtest_sweep(band_sweep=True, tier_off_sweep=True): every band a
+    deadline-gap tier floor binds at (floors 0, 0.20 and 0.25 — 18 of the 36)
+    entered and simulated again with the tiers off, the band floor alone
+    gating the spread.
+
+    On the golden fixture the ladder is the only pair the tiers hold back
+    (see TestTierFloorsOff): with them off it enters on Monday 1 at every
+    binding band. EA/EB (0.30, 13 days), TA/TB (exactly 0.15, 9 days) and
+    WA/WB (0.98, 9 days) are short-gap pairs whose 0.15 tier binds only at
+    floor 0, where each clears it anyway, and FA/FB (a pricier earlier
+    contract) never enters."""
+
+    _LADDER_OFF = ("time_series", "will spacex launch another starship by ?",
+                   "will spacex launch another starship by ?",
+                   date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE")
+
+    @staticmethod
+    def _same_point(a, b):
+        assert (a.k, a.spread_band, a.population, a.tier_floors) == (
+            b.k, b.spread_band, b.population, b.tier_floors)
+        assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
+        pd.testing.assert_frame_equal(a.equity_df, b.equity_df)
+        assert (a.halves, a.ex_top_event) == (b.halves, b.ex_top_event)
+
+    def test_the_tier_on_payload_does_not_change(self, golden_tier_off_sweep):
+        res, plain = golden_tier_off_sweep.result, golden_tier_off_sweep.plain
+        assert plain.tier_off_scenarios == [] and plain.tier_off_calibrations_by_band == {}
+        self._same_point(res.primary, plain.primary)
+        for mine, theirs in ((res.points, plain.points), (res.scenarios, plain.scenarios)):
+            assert len(mine) == len(theirs)
+            for a, b in zip(mine, theirs, strict=True):
+                self._same_point(a, b)
+        assert res.calibration == plain.calibration
+        assert res.calibrations_by_band == plain.calibrations_by_band
+        self._same_point(res.same_title_point, plain.same_title_point)
+        assert res.split_date == plain.split_date == date(2026, 1, 5)
+        assert res.same_event_ladders is plain.same_event_ladders is True
+
+    def test_only_the_binding_bands_get_a_twin(self, golden_tier_off_sweep):
+        res = golden_tier_off_sweep.result
+        off = res.tier_off_scenarios
+        assert sorted({p.spread_band for p in off}) == _TIER_BOUND_BANDS
+        assert sorted(res.tier_off_calibrations_by_band) == _TIER_BOUND_BANDS
+        assert all(p.tier_floors is False for p in off)
+        assert all(p.tier_floors is True
+                   for p in [res.primary, *res.points, *res.scenarios, res.same_title_point])
+        # Every bound band x k has all four populations (the ladder enters at
+        # every bound band, and EA/EB keeps the cross population non-empty)
+        cells = sorted((b, k) for b in _TIER_BOUND_BANDS for k in INTERVAL_DISCOUNT_SWEEP)
+        for population in ("all", "time_series", "ladder", "cross"):
+            assert sorted((p.spread_band, p.k) for p in off if p.population == population) == cells
+        assert len(off) == 18 * 13 * 4
+        # The checks sit where the tier-on sweep puts them: halves on every
+        # "all" and "time_series" point, ex-top wherever a trade names an
+        # event (every "all" point trades the same-title pair's)
+        for p in off:
+            if p.population in ("all", "time_series"):
+                assert p.halves is not None
+                assert (p.ex_top_event is not None) == any(t.event_ticker for t in p.trades)
+            else:
+                assert p.halves is None and p.ex_top_event is None
+        assert all(p.ex_top_event is not None for p in off if p.population == "all")
+        # Same order as scenarios: band, then k, then population
+        order = {"all": 0, "time_series": 1, "ladder": 2, "cross": 3}
+        keys = [(p.spread_band, p.k, order[p.population]) for p in off]
+        assert keys == sorted(keys)
+
+    def test_the_tier_off_pre_pass_matches_a_full_scan(self, golden_tier_off_sweep, monkeypatch):
+        passes = [c for c in golden_tier_off_sweep.calls["entries"] if c["tier_floors"] is False]
+        assert all(c["pair_types"] == ("time_series",) for c in passes)
+        # One full scan, of (0, 1), first; every other tier-off band rescans
+        # one shared subset — the four pairs that entered there
+        assert passes[0]["band"] == (0.0, 1.0) and passes[0]["pairs"] is None
+        assert [c["band"] for c in passes if c["pairs"] is None] == [(0.0, 1.0)]
+        rescans = [c["pairs"] for c in passes[1:]]
+        assert len(rescans) == 17 and all(pairs is rescans[0] for pairs in rescans)
+        assert [(i[0][0]["ticker"], i[0][1]["ticker"]) for i in rescans[0]] == [
+            ("EA", "EB"), ("RUNG-EARLY", "RUNG-LATE"), ("TA", "TB"), ("WA", "WB")]
+        # Every tier-off band's entries are a full tier-off scan's
+        rows = TestPrepareEntriesGolden._rows
+        by_band = {c["band"]: c["out"] for c in passes}
+        assert sorted(by_band) == _TIER_BOUND_BANDS
+        for band, out in by_band.items():
+            full = backtester._entries_for_band(TestBandSweepPhaseOneSubset._fresh(monkeypatch),
+                                                band, pair_types=("time_series",),
+                                                tier_floors=False)
+            assert rows(out) == rows(full), band
+
+    def test_the_ladder_row_moves_to_monday_1(self, golden_tier_off_sweep):
+        golden, rows = TestPrepareEntriesGolden, TestPrepareEntriesGolden._rows
+        entries = golden_tier_off_sweep.calls["entries"]
+        on = next(c["out"] for c in entries if c["tier_floors"] is True
+                  and c["band"] == (0.0, 1.0) and c["pair_types"] == ("time_series",))
+        off = next(c["out"] for c in entries if c["tier_floors"] is False
+                   and c["band"] == (0.0, 1.0))
+        assert rows(on) == [golden._EA_EB, golden._LADDER, golden._TA_TB, golden._WA_WB]
+        assert rows(off) == [golden._EA_EB, self._LADDER_OFF, golden._TA_TB, golden._WA_WB]
+        assert self._LADDER_OFF != golden._LADDER
+        # ... and the trade moves with it
+        res = golden_tier_off_sweep.result
+        off_point = next(p for p in res.tier_off_scenarios if p.population == "all"
+                         and p.spread_band == (0.0, 1.0)
+                         and p.k == TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+
+        def ladder(point):
+            return next(t for t in point.trades if t.ticker_a == "RUNG-EARLY")
+
+        assert ladder(off_point).entry_date == date(2026, 1, 5)
+        assert ladder(res.primary).entry_date == date(2026, 1, 12)
+
+    def test_every_completion_prefix_is_unique_across_both_families(self, golden_tier_off_sweep):
+        prefixes = _completion_prefixes(golden_tier_off_sweep.messages)
+        assert len(prefixes) == len(set(prefixes))
+        off = [p for p in prefixes if " with the tier floors off" in p]
+        n_off = sum(1 for c in golden_tier_off_sweep.calls["simulate"] if c["tier_floors"] is False)
+        assert len(off) == n_off > 0
+        for p in off:
+            assert re.fullmatch(r"Backtest complete at k=\S+, band \S+ with the tier floors "
+                                r"off, \S+", p), p
+        # rsplit still reads the population, on both families
+        labels = [p.rsplit(", ", 1)[1] for p in prefixes]
+        assert set(labels) <= set(backtester._SIMULATION_LABELS)
+        off_labels = [p.rsplit(", ", 1)[1] for p in off]
+        off_set = set(off)
+        on_labels = [p.rsplit(", ", 1)[1] for p in prefixes if p not in off_set]
+        assert off_labels.count("all") == 18 * 13
+        assert on_labels.count("all") == 468
+
+    def test_every_tier_off_entry_clears_the_floor_alone(self, golden_tier_off_sweep):
+        # The tier-off twin of TestBandSweep's in-band check
+        eps = backtester.PRICE_EPSILON
+        by_point = {id(c["point"]): c for c in golden_tier_off_sweep.calls["simulate"]}
+        below_tier = 0
+        for point in golden_tier_off_sweep.result.tier_off_scenarios:
+            call = by_point[id(point)]
+            assert call["band"] == point.spread_band and call["tier_floors"] is False
+            lo, hi = point.spread_band
+            for rec in call["entries"]:
+                if rec["pair_type"] != "time_series":
+                    continue
+                e = rec["entry"]
+                spread = e["pB"] - e["pA"]
+                assert spread <= hi + eps
+                assert spread >= min_price_diff_for_gap(e["gap_days"], spread_min=lo,
+                                                        tier_floors=False) - eps
+                below_tier += spread < min_price_diff_for_gap(e["gap_days"], spread_min=lo) - eps
+        # Not vacuous: some tier-off entry sits below the tier the tier-on rule
+        # demands (the ladder's 0.25 against its 0.30 tier)
+        assert below_tier > 0
+
+    def test_every_tier_off_check_reads_its_own_entries(self, golden_tier_off_sweep):
+        res = golden_tier_off_sweep.result
+        calls = [c for c in golden_tier_off_sweep.calls["simulate"] if c["tier_floors"] is False]
+        by_point = {id(c["point"]): c for c in calls}
+        by_key: dict = {}
+        for c in calls:
+            key = (c["band"], c["point"].k, c["population"])
+            assert key not in by_key          # one simulation per (band, k, label)
+            by_key[key] = c
+        for p in res.tier_off_scenarios:
+            if p.population not in ("all", "time_series"):
+                continue
+            own = by_point[id(p)]["entries"]
+            # Split at the ONE split date, like every tier-on cell
+            h1 = by_key[(p.spread_band, p.k, f"{p.population}/H1")]
+            h2 = by_key[(p.spread_band, p.k, f"{p.population}/H2")]
+            assert [id(r) for r in h1["entries"]] == [
+                id(r) for r in own if r["entry"]["entry_date"] < res.split_date]
+            assert [id(r) for r in h2["entries"]] == [
+                id(r) for r in own if r["entry"]["entry_date"] >= res.split_date]
+            assert (p.halves.h1_entries, p.halves.h2_entries) == (
+                len(h1["entries"]), len(h2["entries"]))
+            if p.ex_top_event is not None:
+                ex = by_key[(p.spread_band, p.k, f"{p.population}/ex-top")]
+                assert [id(r) for r in ex["entries"]] == [
+                    id(r) for r in own
+                    if r["entry"]["mA"]["event_ticker"] != p.ex_top_event[0]]
+
+    def test_every_band_splits_at_the_one_split_date(self, golden_tier_off_sweep):
+        # The tier-off halves split at the SAME date object as every tier-on
+        # cell's — pinned by identity, not value (see the non-vacuity check
+        # at the end)
+        res, calls = golden_tier_off_sweep.result, golden_tier_off_sweep.calls
+        off_all = [c for c in calls["simulate"]
+                   if c["tier_floors"] is False and c["population"] == "all"]
+        off_calls = [c for c in calls["populations"]
+                     if any(c["entries"] is sim["raw"] for sim in off_all)]
+        # One per binding band, each handed the tier-off entries it simulates
+        assert len(off_calls) == 18
+        assert all(c["split_date"] is res.split_date for c in off_calls)
+        # ... as is every tier-on band's (36 calls, 54 in all)
+        assert len(calls["populations"]) == 36 + 18
+        assert all(c["split_date"] is res.split_date for c in calls["populations"])
+        # Not vacuous: a split date recomputed from the tier-off (0, 1)
+        # entries would EQUAL the one split date (the ladder moves onto
+        # Monday 1 beside the other three) without BEING it, so a value-only
+        # check could not tell the two apart
+        off_primary = next(sim["raw"] for sim in off_all if sim["band"] == (0.0, 1.0))
+        recomputed = backtester._split_date(
+            [rec for rec in off_primary if rec["pair_type"] == "time_series"],
+            golden_tier_off_sweep.start)
+        assert recomputed == res.split_date and recomputed is not res.split_date
+
+    def test_the_candles_are_released_before_any_tier_off_simulation(self, golden_tier_off_sweep):
+        sims = [c for c in golden_tier_off_sweep.calls["simulate"] if c["tier_floors"] is False]
+        assert sims and all(c["released"] for c in sims)
+
+    def test_every_tier_off_calibration_is_labelled_with_the_floor_alone(self, golden_tier_off_sweep):
+        res = golden_tier_off_sweep.result
+        for (lo, _hi), cal in res.tier_off_calibrations_by_band.items():
+            # EA/EB (13 days) and the ladder (19 days) at every bound band;
+            # TA/TB and WA/WB are voided, so never measured
+            assert [(b.label, b.tier) for b in cal.buckets] == [("8-15d", lo), ("16-30d", lo)]
+        # The ladder is measured at its Monday-1 spread with the tiers off
+        off = res.tier_off_calibrations_by_band[(0.0, 1.0)]
+        on = res.calibrations_by_band[(0.0, 1.0)]
+        assert sorted(o.implied for o in off.observations) == pytest.approx([0.25, 0.30])
+        assert sorted(o.implied for o in on.observations) == pytest.approx([0.30, 0.40])
+
+    def test_no_tier_off_line_is_counted_as_a_tier_on_one(self, golden_tier_off_sweep):
+        messages = golden_tier_off_sweep.messages
+        # The two line families other tests count are exactly the tier-on sweep's
+        announced = [m for m in messages if m.startswith("Spread band ")]
+        assert len(announced) == 36 and not any("Tier floors" in m for m in announced)
+        assert [m for m in messages if m.startswith("Split-half check: split date")] == [
+            "Split-half check: split date 2026-01-05 leaves H1 empty; the split-half "
+            "check is not measurable for this window (primary band 0-1: 0 time-series "
+            "entries before it, 4 on or after it)"]
+        tier_off = [m for m in messages if m.startswith("Tier floors off")]
+        assert tier_off[:3] == [
+            "Tier floors off (backtest only): 18 of 36 spread bands have a floor below a "
+            "deadline-gap tier and are entered again without the tiers; the other 18 enter "
+            "the same pairs either way",
+            "Tier floors off: no-band pre-pass: scanning all 5 time-series pairs at 0-1",
+            "Tier floors off: no-band pre-pass: 4 of 5 time-series pairs produced an entry; "
+            "every other tier-off band rescans only those"]
+        assert sum(m.startswith("Tier floors off: spread band ") for m in messages) == 18
+        assert sum(m.startswith("Tier floors off: simulating spread band ") for m in messages) == 18
+
+    def test_the_tier_off_sweep_needs_the_band_sweep(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must not run"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError, match="band_sweep"):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               band_sweep=False, tier_off_sweep=True)
+        assert caplog.records == []
+        # A direct caller of the second half is refused too, before its
+        # candidates are consumed
+        candidates = backtester._Candidates(
+            all_pairs=[], candles_by_ticker={}, label_coverage=None,
+            start_date=date(2026, 1, 1), max_horizon_days=None, same_event_ladders=True)
+        with pytest.raises(ValueError, match="band_sweep"):
+            backtester._sweep_from_candidates(
+                candidates, 1000.0, interval_discount=None, sweep=False,
+                spread_band=None, band_sweep=False, tier_off_sweep=True)
+        assert hasattr(candidates, "all_pairs") and hasattr(candidates, "candles_by_ticker")

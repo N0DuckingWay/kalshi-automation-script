@@ -14,7 +14,9 @@ rejected through parser.error() before logging is configured (TS-20 — both
 the order and the absent kalshi_backtest.log are pinned); the pre-fetch echo
 line names the resolved band and band-sweep setting; a ceiling at or below a
 deadline-gap tier gets a WARNING naming the tier and the primary scenario;
-and --no-band-sweep threads band_sweep=False into run_backtest_sweep().
+and --no-band-sweep threads band_sweep=False — and with it
+tier_off_sweep=False, since the tier-floors-off runs have no flag of their
+own and ride the band sweep — into run_backtest_sweep().
 
 Fully offline: run_backtest_sweep, generate_dashboard and both client builders
 are monkeypatched, so no network call, no credential read and no real backtest
@@ -328,6 +330,18 @@ class TestSpreadBandArguments:
         kwargs = cli["sweep_kwargs"]
         assert kwargs["sweep"] is False
         assert kwargs["band_sweep"] is False
+
+    @pytest.mark.parametrize("argv,expected", [
+        ((), True), (("--no-sweep",), True), (("--no-band-sweep",), False),
+    ])
+    def test_the_tier_floors_off_runs_ride_the_band_sweep(self, cli, monkeypatch, argv,
+                                                        expected):
+        # No flag of their own: the dashboard's tier-floors-off data is on
+        # exactly when the band grid is, and --no-band-sweep skips both
+        _run(monkeypatch, *argv)
+        kwargs = cli["sweep_kwargs"]
+        assert kwargs["tier_off_sweep"] is expected
+        assert kwargs["tier_off_sweep"] is kwargs["band_sweep"]
 
 
 class TestSpreadBandEcho:
