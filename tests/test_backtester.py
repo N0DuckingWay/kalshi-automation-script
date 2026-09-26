@@ -6237,8 +6237,15 @@ class TestRunBacktestSameDateLegOrder:
         assert equity["portfolio_value"].min() == pytest.approx(10_000.0)
 
 
-def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series"):
-    """Build one _prepare_entries record shaped as _interval_calibration reads it."""
+def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series",
+               event_ticker=None):
+    """Build one _prepare_entries record shaped as _interval_calibration reads it.
+
+    event_ticker, when given, is market A's event ticker; by default mA carries
+    no event_ticker key at all, the shape every older fixture here uses."""
+    mA = {"ticker": "A", "result": result_a}
+    if event_ticker is not None:
+        mA["event_ticker"] = event_ticker
     return {
         "pair_type": pair_type,
         "canon": "canon",
@@ -6246,7 +6253,7 @@ def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series"):
         "entry": {
             "entry_date": date(2026, 1, 5),
             "pA": pA, "pB": pB, "nA": 1.0 - pA, "nB": 1.0 - pB,
-            "mA": {"ticker": "A", "result": result_a},
+            "mA": mA,
             "mB": {"ticker": "B", "result": result_b},
             "gap_days": gap_days,
         },
@@ -6369,6 +6376,120 @@ class TestIntervalCalibration:
         assert calib.buckets == []
         assert calib.pooled.n == 1
         assert calib.pooled.empirical_k == pytest.approx(1.0 / 0.60)
+
+
+class TestCalibrationObservationsAreCarried:
+    """IntervalCalibration.observations: the population the pooled row was
+    reduced from, carried out so a report (the dashboard's k-hat by category,
+    tag and spread band) can regroup it through _calibration_bucket rather than
+    re-derive which entries count."""
+
+    def _mixed_entries(self):
+        return [
+            _cal_entry(3, 0.10, 0.70, "no", "yes", event_ticker="KXSPACEX-14"),  # in-between
+            _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title",
+                       event_ticker="KXST-1"),                                     # same-title
+            _cal_entry(5, 0.20, 0.60, "yes", "yes", event_ticker="KXFED-26"),     # by A
+            _cal_entry(3, 0.10, 0.70, "", "yes", event_ticker="KXVOID-1"),         # unsettled
+            _cal_entry(20, 0.25, 0.75, "yes", "no", event_ticker="KXBAD-1"),       # violation
+            _cal_entry(20, 0.30, 0.80, "no", "no", event_ticker="KXFED-27"),      # never by B
+            # No gap: it lands in no gap band but IS part of the pooled row,
+            # so it must be carried too
+            _cal_entry(None, 0.10, 0.70, "no", "yes", event_ticker="KXNOGAP-1"),
+        ]
+
+    def test_observations_are_exactly_the_measured_population_in_order(self):
+        calib = _interval_calibration(self._mixed_entries())
+        # Same-title, unsettled and premise-violating entries never become one
+        assert [o.event_ticker for o in calib.observations] == [
+            "KXSPACEX-14", "KXFED-26", "KXFED-27", "KXNOGAP-1"]
+        assert len(calib.observations) == calib.pooled.n == 4
+        assert calib.excluded_premise_violations == 1
+        assert [(o.gap_days, o.in_between) for o in calib.observations] == [
+            (3, True), (5, False), (20, False), (None, True)]
+        assert [o.implied for o in calib.observations] == pytest.approx(
+            [0.60, 0.40, 0.50, 0.60])
+
+    def test_reducing_the_observations_reproduces_the_pooled_row_exactly(self):
+        # Exact equality, not approx: the same list in the same order through
+        # the same arithmetic, which is what lets a report's "all" group —
+        # reduced from the carried tuple itself, never from its groups put
+        # back together — match the pooled k-hat printed beside it
+        calib = _interval_calibration(self._mixed_entries(), spread_min=0.30)
+        assert backtester._calibration_bucket(
+            calib.pooled.label, 0.0, calib.observations) == calib.pooled
+        # ...and every gap band is a sub-population of it
+        for bucket in calib.buckets:
+            lo, hi = (int(x) for x in bucket.label.rstrip("d").split("-"))
+            members = [o for o in calib.observations
+                       if o.gap_days is not None and lo <= o.gap_days <= hi]
+            assert backtester._calibration_bucket(
+                bucket.label, bucket.tier, members) == bucket
+
+    def test_each_observation_names_its_event_and_ticker_prefix_category(self):
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes", event_ticker="KXBTCMAXY-26DEC31"),
+            _cal_entry(3, 0.10, 0.70, "no", "no"),   # mA carries no event ticker
+        ])
+        named, unnamed = calib.observations
+        assert named.event_ticker == "KXBTCMAXY-26DEC31"
+        # The same fallback label BacktestTrade.category carries
+        assert named.category == historical.infer_category("KXBTCMAXY-26DEC31")
+        assert unnamed.event_ticker == ""
+        assert unnamed.category == historical.infer_category("")
+
+    def test_the_band_floor_labels_but_never_changes_the_population(self):
+        entries = self._mixed_entries()
+        assert (_interval_calibration(entries, spread_min=0.30).observations
+                == _interval_calibration(entries).observations)
+
+    def test_a_violation_only_window_carries_no_observation(self):
+        calib = _interval_calibration([_cal_entry(3, 0.10, 0.70, "yes", "no")])
+        assert calib.observations == ()
+        assert calib.pooled.n == 0
+
+    def test_a_non_string_event_ticker_reads_as_absent(self):
+        # Only a hand-edited cache can carry one; it must not raise out of
+        # infer_category and end the sweep (the parent commit never read it)
+        calib = _interval_calibration([
+            _cal_entry(3, 0.10, 0.70, "no", "yes", event_ticker=12345)])
+        (obs,) = calib.observations
+        assert (obs.event_ticker, obs.category) == ("", historical.infer_category(""))
+
+    def test_an_observation_is_filed_like_the_trade_of_its_entry(self, monkeypatch):
+        # Both read market A of the SAME entry (_find_entry's canonicalized
+        # leg), so a report files a trade and the k-hat observation of its
+        # entry under one series. The golden fixture holds a ladder and a
+        # cross-event time-series entry, both traded.
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        entries, _ = backtester._prepare_entries(
+            MagicMock(), MagicMock(), golden._START, True, None,
+            same_event_ladders=True,
+        )
+        point = backtester._simulate_at_discount(entries, golden._START, 10_000.0)
+        observed = {(o.event_ticker, o.category)
+                    for o in _interval_calibration(entries).observations}
+        ts_trades = [t for t in point.trades if t.pair_type == "time_series"]
+        assert {t.event_ticker for t in ts_trades} == {"EVA", "KXSTARSHIP-14"}
+        for t in ts_trades:
+            assert (t.event_ticker, t.category) in observed
+
+    def test_the_carrier_is_immutable_and_hand_built_calibrations_still_build(self):
+        obs = backtester.CalibrationObservation(3, 0.5, True, "KX-1", "Other")
+        with pytest.raises(AttributeError):
+            obs.implied = 0.1  # frozen
+        # event_ticker and category are required (DR-71's reasoning): a
+        # construction that forgot them must fail, not file under ""
+        with pytest.raises(TypeError):
+            backtester.CalibrationObservation(3, 0.5, True)
+        bucket = backtester.IntervalCalibrationBucket("POOLED", 0.0, 1, 0.0, 0.5, 0.0)
+        # observations is appended with a default, so "not carried" is told
+        # from "no candidate" by len(observations) != pooled.n
+        hand_built = backtester.IntervalCalibration(bucket, [], 0)
+        assert hand_built.observations == ()
+        assert len(hand_built.observations) != hand_built.pooled.n
+        assert isinstance(_interval_calibration(self._mixed_entries()).observations, tuple)
 
 
 class TestLogIntervalCalibration:
