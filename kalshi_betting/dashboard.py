@@ -6,10 +6,12 @@ Last edited by: Zachary Hoffman
 Purpose:
     Generates a self-contained interactive HTML performance dashboard from the
     results of a backtest run. Assembles nine sections — portfolio performance
-    (equity curve, Sharpe, drawdown), returns decomposition (by month, category,
+    (equity curve, Sharpe, drawdown, and the selection's empirical k-hat and
+    k-hat − k), returns decomposition (by month, category,
     entry price), calibration analysis (Brier score, reliability diagram),
-    interval-discount (k) calibration (empirical k-hat plus a native Plotly
-    dropdown that switches the equity curve between the swept k values),
+    interval-discount (k) calibration (the pooled empirical k-hat, and the
+    equity curve and per-k table at the filter bar's k and size cap, at the
+    primary spread band),
     empirical k-hat broken down by Kalshi category, tag and spread band (a bar
     chart and a table with a "Group by" <select> of their own), a
     scenario explorer (a fragility banner, a spread-band x k heatmap and a
@@ -27,8 +29,10 @@ Purpose:
     decomposition, calibration, diagnostics, risk, the benchmark's strategy
     row) to the run at another spread band, interval discount k and per-trade
     size cap, and/or one Kalshi category or category · tag of it, and moves
-    the k-hat breakdown to the same band and selection (and its reference
-    line to the same k). Every figure a selection shows is computed here in
+    the k-hat breakdown and the performance section's k-hat cards to the same
+    band and selection (the breakdown's reference line to the same k), and the
+    interval-discount section to the same k and size cap (at the primary
+    spread band). Every figure a selection shows is computed here in
     Python by the helpers the sections themselves render with, packed into
     gzip + base64 data blocks — one base block (_filter_payload) and one
     chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
@@ -74,19 +78,21 @@ Notes:
     share a factor — at rf = 0 the mismatch is exactly sqrt(365/252) = 1.2035 of
     magnitude.
 
-    The interval-discount section's k selector is a NATIVE Plotly `updatemenus`
-    dropdown over one trace per swept k — no extra dependency and no hand-rolled
-    JavaScript, so it works inside the same self-contained page every other
-    chart renders into. Its scope is deliberately that one section: the
-    scenario-explorer section (below) carries its own independent band/k
-    selectors, and the remaining seven — the six trade-derived sections and
-    the k-hat breakdown — are rendered at the run's primary scenario (the
-    k-hat breakdown is k-independent: the primary k is only its reference
-    line): its primary k (the CLI's --interval-discount, or
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed) AND its
+    Every section but the scenario explorer is rendered at the run's primary
+    scenario — its primary k (the CLI's --interval-discount, or
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed), its
     primary spread band (--spread-min/--spread-max, or
-    config.BACKTEST_DEFAULT_SPREAD_BAND when neither was passed) — until the
-    page-wide filter bar re-scopes them.
+    config.BACKTEST_DEFAULT_SPREAD_BAND when neither was passed) and its own
+    per-trade size cap — until the page-wide filter bar re-scopes it (the
+    k-hat breakdown is k-independent: the k is only its reference line). The
+    interval-discount section has no selector of its own any more (it used
+    to carry a native Plotly `updatemenus` dropdown over one trace per swept
+    k): it draws ONE equity trace (div id "kd-equity") and a per-k table
+    (tbody "kd-rows"), both at the primary spread band, and the filter bar's
+    k and size cap move them (_KdVisitor's data, "kd" in the base block) —
+    its category and tag never do, since the section's k-hat population and
+    per-k runs are the whole primary band's. The scenario-explorer section
+    (below) keeps its own independent band/k selectors.
 
     The page-wide filter bar (_filter_bar_html) is a third, separate set of
     controls, and the only one that reaches beyond its own section. Its
@@ -102,13 +108,20 @@ Notes:
     over the slice) — i.e. its contribution, not a standalone simulation, and
     the bar's summary line says so. The header's trade count follows the
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
-    so every breakdown partitions. It never re-scopes the interval-discount
-    section or the scenario explorer, which keep their own controls; the bar
-    names them. Every view is computed by the same helpers the sections
-    render with (_performance_kpis, _performance_series,
-    _decomposition_aggregates, _category_table, _reliability,
-    _best_and_worst, _kelly_points, _capital_deployed, _strategy_row), so the
-    script only draws what Python computed.
+    so every breakdown partitions. Its k and size cap also move the
+    interval-discount section (at the primary spread band); its band,
+    category and tag never do, and it never reaches the scenario explorer,
+    which keeps its own controls — the bar's summary line says so
+    (_BAR_REACH; _BAR_REACH_STATIC on a page whose interval-discount
+    section cannot follow the bar). The performance section's two k-hat
+    cards (_khat_kpis) follow the bar's band, category or tag and k: they
+    read the k-hat breakdown's own group for the selection, and the card
+    rendered for the primary view comes from the primary calibration itself,
+    so it is there even when the bar cannot be built. Every view is computed
+    by the same helpers the sections render with (_performance_kpis,
+    _performance_series, _decomposition_aggregates, _category_table,
+    _reliability, _best_and_worst, _kelly_points, _capital_deployed,
+    _strategy_row), so the script only draws what Python computed.
 
     The scenarios are one grid (_grid_source: bands x ks x caps, from the
     sweep's eager points, or from its size-cap sweep when it carries one),
@@ -116,8 +129,12 @@ Notes:
     primary cap first — by visitors that keep only what they build: the chunk
     visitor packs one chunk per distinct (k, trade list), sharing it between
     the scenarios that traded equal lists at one k (every cap at or above a
-    cell's peak Kelly fraction does), and a counter records the busiest
-    scenario for the header's stale-cutoff test (_MaxTrades). Only one cell's
+    cell's peak Kelly fraction does), a counter records the busiest
+    scenario for the header's stale-cutoff test (_MaxTrades), and the
+    interval-discount visitor keeps the primary band's per-k table rows and
+    equity curves at every k and cap (_KdVisitor — a visitor that fails
+    costs only that section's k and cap selection, with a notice in the
+    section). Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
     together; the chunks are held as separate packed strings until each is
     written, and the page is streamed to disk piece by piece, never joined
@@ -156,7 +173,7 @@ Notes:
     alone (_khat_band), since there is nothing to break down.
 
     The scenario-explorer section's band x k grid is too large, and its two
-    axes of selection too independent, for the same native-dropdown idiom: a
+    axes of selection too independent, for a native-dropdown idiom: a
     Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE a
     trace's data wholesale from a fixed list baked in at render time, not
     combine two independently-chosen indices into one lookup. It therefore
@@ -808,6 +825,8 @@ def _section_performance(
     trades: list[BacktestTrade],
     start_date: date,
     initial_balance: float,
+    *,
+    extra_kpis: list[tuple[str, str, str, str]] | None = None,
 ) -> str:
     """
     Build the "Portfolio Performance" HTML section.
@@ -826,6 +845,12 @@ def _section_performance(
         trades (list[BacktestTrade]): Completed backtest trades for win rate and avg return.
         start_date (date): Backtest start date for display context.
         initial_balance (float): Starting portfolio value in dollars.
+        extra_kpis (list | None): Keyword-only. More (key, label, value,
+            colour) cards appended after the performance cards, followed by
+            their caption (_KHAT_CARDS_CAPTION) — generate_dashboard's two
+            k-hat cards (_khat_kpis). None (default) renders the section
+            exactly as it was before those cards existed: no card and no
+            caption.
 
     Returns:
         str: Self-contained HTML section string including KPI cards and two Plotly charts.
@@ -833,6 +858,12 @@ def _section_performance(
     # Keyed, so the filter script can rewrite each card for another selection
     kpis = "".join(_kpi(label, value, color, key=key) for key, label, value, color
                    in _performance_kpis(equity_df, trades, initial_balance))
+    if extra_kpis is not None:
+        # Keyed too: the filter script rewrites the k-hat cards for the band,
+        # category or tag and k on screen (renderKhatCards)
+        kpis += "".join(_kpi(label, value, color, key=key)
+                        for key, label, value, color in extra_kpis)
+        kpis += _KHAT_CARDS_CAPTION
     total, type_lines, drawdown = _performance_series(equity_df, trades, initial_balance)
 
     fig = go.Figure()
@@ -1487,13 +1518,348 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
     )
 
 
-def _section_interval_discount(sweep: BacktestSweep | None) -> str:
+# The interval-discount section's words, as templates Python fills for every
+# (k, size cap) the page offers (_kd_assemble) — the page's script draws the
+# titles Python filled and composes none of its own. {k} is a _k_text ("k =
+# 0.75"), {cap} a _cap_text ("20% cap per trade"). "no_bar" and "failed" are
+# the grey lines a section that cannot follow the filter bar shows instead.
+_KD_TEXT = {
+    "title": "Equity Curve at interval discount {k}, {cap}",
+    "missing": "Equity Curve at interval discount {k}, {cap}: not simulated by this run",
+    "no_bar": ("The k and size-cap selection needs the page's filter bar, which could not "
+               "be built for this run."),
+    "failed": ("This section could not follow the filter bar's k and size cap for this run "
+               "(the log names the error): it shows the run's own k and size cap."),
+}
+
+# The k-hat cards' caption, under the Portfolio Performance cards
+# (_section_performance's extra_kpis): what the two figures are, and that
+# they follow the filter bar.
+_KHAT_CARDS_CAPTION = (
+    "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+    "Empirical k&#770; = realised in-between rate ÷ mean market-implied gap (pB − pA), "
+    "over every time-series candidate entry at the spread band shown, in the category or "
+    "tag selected — measured before the Kelly gate, so it depends on neither k nor the "
+    "size cap. k&#770; − k is that figure minus the k shown: positive means the in-between "
+    "outcome landed more often than the sizer assumed, i.e. it sized too big. The Empirical "
+    "k&#770; section below breaks the same figure down by category, tag and spread band. "
+    "Recommendation only: live sizing always reads "
+    "config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>")
+
+
+def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
+    """
+    Format an empirical k-hat against a k, as a KPI card's value and colour.
+
+    The one definition of the "k̂ − k" figure on the page: the
+    interval-discount section's card (_kd_assemble), the performance
+    section's card (_khat_kpis) and every group of the k-hat breakdown the
+    filter script reads it from (_khat_band's "delta") all go through here,
+    so no two can round or colour it differently.
+
+    p = 1 − k·(pB − pA), so a LARGER k is the more conservative belief: a
+    k-hat above k means the in-between cell landed more often than the sizer
+    assumed — it sized too big — which is red; zero or below is green.
+
+    The difference is rounded to the three decimals shown BEFORE its sign
+    and colour are read, so the text and the colour always describe the same
+    number: an unrounded difference a float's width below zero printed
+    "-0.000", and one a hair above it a red "+0.000" (sized too big, for a
+    difference shown as zero).
+
+    Args:
+        khat (float | None): The empirical k-hat; None when not measurable.
+        k (float | None): The interval discount compared with; None when not
+            recorded.
+
+    Returns:
+        tuple[str, str]: ("+0.125", red) / ("-0.150", green) — three decimals,
+            signed, a difference that rounds to zero reading "+0.000" in
+            green — or ("—", the default KPI colour) when either value is
+            unknown.
+    """
+    if khat is None or k is None:
+        return "—", _KPI_DEFAULT_COLOR
+    # round() and "{:.3f}" round the same binary value the same way, so the
+    # text is what the unrounded difference printed, bar the sign of zero:
+    # a -0.0 is folded to 0.0, never printed "-0.000"
+    delta = round(khat - k, 3) or 0.0
+    return f"{delta:+.3f}", ("#F44336" if delta > 0 else "#4CAF50")
+
+
+def _khat_card_color(tainted: bool) -> str:
+    """
+    The colour of a known empirical k-hat on a KPI card.
+
+    Args:
+        tainted (bool): Whether the run's outcome-label census fell below
+            its floor (the carried OutcomeLabelCoverage.below_floor): the
+            k-hat then describes a strike-blind pair population.
+
+    Returns:
+        str: The warning red when tainted, else the strategy blue.
+    """
+    return "#F44336" if tainted else "#2196F3"
+
+
+def _coverage_tainted(sweep: BacktestSweep | None) -> bool:
+    """
+    Whether the run's outcome-label census fell below its floor.
+
+    The carried verdict (OutcomeLabelCoverage.below_floor), never re-derived,
+    so the page's caveats and the backtest log's WARNING fire on one
+    condition.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        bool: True only when the sweep carries a census that is below the
+            floor; False with no sweep or no census.
+    """
+    coverage = None if sweep is None else sweep.label_coverage
+    return coverage is not None and coverage.below_floor
+
+
+def _pooled_k(sweep: BacktestSweep | None) -> float | None:
+    """
+    The pooled empirical k-hat the interval-discount section reports.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        float | None: sweep.calibration's pooled k-hat; None with no sweep,
+            no calibration, or a pooled row whose k-hat is undefined.
+    """
+    if sweep is None or sweep.calibration is None:
+        return None
+    return sweep.calibration.pooled.empirical_k
+
+
+def _kd_k_text(k: float | None) -> str:
+    """
+    The "k selected" card's value for one k.
+
+    Args:
+        k (float | None): A resolved interval discount, or None.
+
+    Returns:
+        str: Three decimals ("0.750"), printed exactly when three decimals
+            would read two different ks alike (backtester._exact_label, the
+            injective formatter the completion lines use); "not recorded"
+            for None.
+    """
+    # backtester's injective formatter: an off-grid override beside a grid
+    # member (0.7501 by 0.750) never reads as that member on the card
+    return "not recorded" if k is None else _exact_label(k, ".3f")
+
+
+def _kd_cells(point: SweepPoint, is_primary: bool) -> list[str]:
+    """
+    One row of the interval-discount section's per-k table, as its cells.
+
+    Computes total return, max drawdown and Sharpe from the point's OWN
+    equity curve, using this module's existing helpers exactly as
+    _section_performance calls them (_max_drawdown needs the date axis and
+    returns a (drawdown, trough_date) pair, not a scalar). The return base
+    is the curve's opening value, which is always the run's initial balance:
+    _build_equity_curve opens every curve one day before start_date, before
+    any trade can have entered.
+
+    The one formatting of these figures: the section's Python table renders
+    these cells (_kd_row_html), and the base block ships them for the page's
+    script, which writes them as they are (textContent), so the two can
+    never round a figure differently.
+
+    Args:
+        point (backtester.SweepPoint): One simulated interval discount at
+            one size cap.
+        is_primary (bool): True for the run's own k — its label is marked
+            " (primary)".
+
+    Returns:
+        list[str]: The k label (_k_label), the trade count, total return,
+            final balance, max drawdown and Sharpe — the last four "—" when
+            the point's equity curve is empty.
+    """
+    eq = point.equity_df
+    label = _k_label(point.k) + (" (primary)" if is_primary else "")
+    trades = str(len(point.trades))
+    if eq is None or eq.empty:
+        # Four unmeasurable cells: return, final balance, drawdown, Sharpe.
+        return [label, trades, "—", "—", "—", "—"]
+    # iloc[0] is the curve's leading pre-start_date row, i.e. the untouched
+    # initial balance — the same base _section_performance divides by — so
+    # this row's total return and the performance card's agree exactly. It
+    # used to be the post-outflow balance whenever a trade entered on
+    # start_date, which reported one run two ways on one page (DR-03).
+    opening = float(eq["portfolio_value"].iloc[0])
+    final = float(eq["portfolio_value"].iloc[-1])
+    total_return = (final - opening) / opening if opening else 0.0
+    # Same call shape as _section_performance: the date axis is what makes
+    # the trough label a calendar date, and the result is a 2-tuple.
+    max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
+    # A one-row curve has no pct_change to speak of; _sharpe returns 0.0 on
+    # a zero standard deviation, so no extra guard is needed here.
+    sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else 0.0
+    return [label, trades, f"{total_return:+.1%}", f"${final:,.2f}", f"{max_dd:.1%}",
+            f"{sharpe:.2f}"]
+
+
+def _kd_row_html(cells: list[str], bold: bool) -> str:
+    """
+    Render one per-k table row from its cells (_kd_cells).
+
+    Args:
+        cells (list[str]): The row's cells.
+        bold (bool): Whether the row is the k shown — its label bold.
+
+    Returns:
+        str: A <tr> whose label cell is bold (700) or not (400) — the row the
+            page's script builds for the same cells (kdRow).
+    """
+    weight = "700" if bold else "400"
+    label, *rest = cells
+    return ("<tr style='border-bottom:1px solid #E0E0E0'>"
+            f"<td style='padding:6px 16px; font-weight:{weight}'>{html.escape(label)}</td>"
+            + "".join(f"<td style='padding:6px 16px;'>{html.escape(c)}</td>" for c in rest)
+            + "</tr>")
+
+
+def _kd_curve(point: SweepPoint, axis: pd.DatetimeIndex) -> list[list]:
+    """
+    One point's equity curve on a date axis, as change points.
+
+    Args:
+        point (backtester.SweepPoint): A simulated point.
+        axis (pd.DatetimeIndex): The axis to place it on.
+
+    Returns:
+        list[list]: _sparse_on_axis's [[axis index, dollars], ...].
+    """
+    eq = point.equity_df
+    return _sparse_on_axis(list(eq["date"]), eq["portfolio_value"], axis, 2)
+
+
+def _expand_sparse(sparse: list[list], n: int) -> list:
+    """
+    A change-point series back onto every date of an n-date axis.
+
+    Python's copy of the filter script's expand(): each value holds until
+    the next change point. The interval-discount section draws its curve
+    through it, so the chart Python draws and the one the script redraws for
+    the same scenario hold the same values.
+
+    Args:
+        sparse (list[list]): [[axis index, value], ...] ascending
+            (_sparse_on_axis).
+        n (int): The axis length.
+
+    Returns:
+        list: n values.
+    """
+    out, j, cur = [], 0, None
+    for i in range(n):
+        while j < len(sparse) and sparse[j][0] <= i:
+            cur = sparse[j][1]
+            j += 1
+        out.append(cur)
+    return out
+
+
+def _kd_assemble(ks: tuple, caps: tuple, primary: tuple[int, int], rows: list,
+                 curves: list, axis: pd.DatetimeIndex, pooled_k: float | None) -> dict:
+    """
+    Assemble the interval-discount section's data for every (k, size cap).
+
+    Built once for the section's own render and, when it comes from the
+    filter's walk (_KdVisitor), shipped in the base block for the page's
+    script (without "dates", which the base block already carries as the
+    page's axis) — so the section Python renders and the one the script
+    redraws for the same k and cap are the same.
+
+    Args:
+        ks (tuple): The interval discounts, by k index.
+        caps (tuple): The per-trade size caps, by cap index (None when not
+            recorded).
+        primary (tuple[int, int]): The run's own (k index, cap index).
+        rows (list): rows[cap][k] -> _kd_cells, or None for a (k, cap) the
+            run never simulated at the primary band.
+        curves (list): curves[k][cap] -> _kd_curve, or None likewise.
+        axis (pd.DatetimeIndex): The dates the curves were placed on.
+        pooled_k (float | None): The pooled empirical k-hat the section
+            compares every k with.
+
+    Returns:
+        dict: "dates" (ISO), "primary" ([k, cap]), "k_text" (_kd_k_text per
+            k), "delta" ([text, colour] per k — _khat_delta of pooled_k),
+            "rows", "curves" and "titles" (titles[cap][k], the chart's title
+            — _KD_TEXT's "title", or its "missing" for a (k, cap) never
+            simulated).
+    """
+    titles = [[(_KD_TEXT["title"] if curves[ki][ci] is not None else _KD_TEXT["missing"])
+               .format(k=_k_text(k), cap=_cap_text(cap))
+               for ki, k in enumerate(ks)] for ci, cap in enumerate(caps)]
+    return {
+        "dates": [d.date().isoformat() for d in axis],
+        "primary": list(primary),
+        "k_text": [_kd_k_text(k) for k in ks],
+        "delta": [list(_khat_delta(pooled_k, k)) for k in ks],
+        "rows": rows,
+        "curves": curves,
+        "titles": titles,
+    }
+
+
+def _kd_from_points(sweep: BacktestSweep) -> dict:
+    """
+    The interval-discount section's data from a sweep's own points alone.
+
+    The section's static form — the golden's direct call, a run whose
+    filter bar could not be built, and one whose section data could not be
+    (_KdVisitor failed) — at the primary point's size cap, one row per point of
+    sweep.points in their order. The primary is matched by identity: points
+    always holds it as the SAME object (BacktestSweep), but a hand-built
+    sweep may hold an equal copy, so it falls back to matching on k, and to
+    the first point if even that fails. Each point's figures are computed
+    once (one _sharpe call per point).
+
+    Args:
+        sweep (BacktestSweep): A sweep with at least one point.
+
+    Returns:
+        dict: _kd_assemble's data over (the points' ks) x (the primary's
+            cap), on the primary point's own dates.
+    """
+    points = sweep.points
+    primary_idx = next(
+        (i for i, pt in enumerate(points)
+         if pt is sweep.primary or pt.k == sweep.primary.k),
+        0,
+    )
+    eq = points[primary_idx].equity_df
+    axis = pd.DatetimeIndex(pd.to_datetime(list(eq["date"]) if eq is not None else []))
+    rows = [[_kd_cells(pt, i == primary_idx) for i, pt in enumerate(points)]]
+    curves = [[_kd_curve(pt, axis)] for pt in points]
+    return _kd_assemble(tuple(pt.k for pt in points), (sweep.primary.size_cap,),
+                        (primary_idx, 0), rows, curves, axis, _pooled_k(sweep))
+
+
+def _section_interval_discount(
+    sweep: BacktestSweep | None,
+    kd: dict | None = None,
+    *,
+    bar: bool = True,
+    kd_failed: bool = False,
+) -> str:
     """
     Build the "Interval Discount (k) Calibration" HTML section.
 
     Reports how the hand-set time-series interval discount k compares with what
-    the replayed history actually did, and lets the reader switch the equity
-    curve between every k the run simulated. Four parts:
+    the replayed history actually did, and shows the run at the primary spread
+    band at the k and per-trade size cap the page-wide filter bar shows. Four
+    parts:
 
       0. The outcome-label coverage of the run's eligible-market corpus — a
          grey line when healthy, and a red banner ABOVE the KPI cards when it
@@ -1505,16 +1871,24 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
          nothing at all. The banner sits with the cards, and the k-hat card is
          recoloured and its label suffixed, so the caveat travels with the
          number even in a screenshot of the cards alone.
-      1. KPI cards — the run's configured (effective) k, the pooled empirical
-         k-hat, and the delta between them.
+      1. KPI cards — the k selected ("k selected", id kpi-kd_k: the run's own
+         as rendered, the filter bar's k once one is chosen), the pooled
+         empirical k-hat (the primary band's; it depends on neither k nor the
+         size cap), and their delta ("k̂ − k (primary band, pooled)", id
+         kpi-kd_delta, _khat_delta).
       2. The calibration table — one row per deadline-gap bucket plus the
          pooled row, showing n, the realised in-between rate, the mean
          market-implied gap, and that bucket's k-hat.
-      3. The k selector — ONE Plotly figure holding an equity trace per swept
-         k, switched by a native `updatemenus` dropdown (no extra dependency,
-         no hand-rolled JS) — followed by a table of each k's trade count,
-         total return, max drawdown and Sharpe, computed from that point's own
-         equity curve with this module's existing _max_drawdown/_sharpe.
+      3. ONE equity curve (div id "kd-equity"), at the k and size cap shown,
+         followed by a table of each k's trade count, total return, final
+         balance, max drawdown and Sharpe at that size cap (tbody "kd-rows",
+         _kd_cells), the k shown in bold and the run's own marked
+         " (primary)". There is no selector here any more: the section used
+         to carry a native Plotly `updatemenus` dropdown over one trace per
+         swept k, and the page-wide filter bar's k select replaces it — the
+         filter script redraws the curve, the table and the two cards for the
+         bar's k and size cap from `kd` (renderKd). The bar's band, category
+         and tag never reach this section.
 
     Deliberately named for the interval discount rather than "calibration"
     alone: _section_calibration already exists and means price calibration
@@ -1525,20 +1899,28 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     separately would create copies that could disagree with each other. That
     is why carrying the census needed no signature change here.
 
-    Scope limit: the dropdown drives THIS section only, and the page-wide
-    filter bar does not reach this section at all: it always reports the
-    primary spread band's calibration and k sweep. Every other section
-    reflects the primary k as the page is rendered (the filter bar's own k
-    select then re-scopes the six trade-derived sections to another k's
-    run), since return / drawdown / trade count is what one actually
-    compares k values on.
-
     Args:
         sweep (BacktestSweep | None): The sweep payload from
             backtester.run_backtest_sweep(). None (or a sweep with no points)
             renders the same short placeholder every other builder emits for
             empty input — the case where the caller ran the plain
             run_backtest() path and has no sweep to show.
+        kd (dict | None): The section's data for every k and size cap the
+            filter bar offers, at the primary band (_KdVisitor.payload, with
+            its "dates", which the section draws its curve on — the base
+            block ships the same data as "kd" without them). None (default)
+            builds it from sweep.points at the primary point's size cap
+            (_kd_from_points) — the golden's call, and generate_dashboard's
+            when the bar or the section's data could not be built.
+        bar (bool): Keyword-only. False when the page's filter bar could not
+            be built: the section then renders the primary scenario from
+            sweep.points, ignoring kd, with one grey line saying the k and
+            size-cap selection needs the bar (_KD_TEXT["no_bar"]).
+        kd_failed (bool): Keyword-only. True when the bar was built but this
+            section's data could not be (_KdVisitor failed): the section
+            renders statically from sweep.points and says so
+            (_KD_TEXT["failed"]), so the bar's k select visibly does not move
+            it rather than silently.
 
     Returns:
         str: Self-contained HTML section string.
@@ -1547,11 +1929,16 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
         return (_SECTION_STYLE.format(title="Interval Discount (k) Calibration")
                 + "<p>No interval-discount sweep for this run.</p>")
 
-    points = sweep.points
-    # The run's effective discount, read off the primary point rather than from
-    # config: on an --interval-discount run it is the override, and it is the k
-    # every OTHER section on this page was rendered at.
-    configured_k = sweep.primary.k
+    notice_style = "font-family:sans-serif;font-size:13px;color:#616161;"
+    notice = ""
+    if not bar:
+        notice = f"<p style='{notice_style}'>{html.escape(_KD_TEXT['no_bar'])}</p>"
+    elif kd_failed:
+        notice = f"<p style='{notice_style}'>{html.escape(_KD_TEXT['failed'])}</p>"
+    if kd is None or not bar:
+        # The static form: the sweep's own points, at the run's own cap
+        kd = _kd_from_points(sweep)
+    pk, pc = kd["primary"]
     cal = sweep.calibration
     # The outcome-label census, carried k-independently on the sweep exactly as
     # the calibration is. None means no census was taken, not healthy coverage.
@@ -1559,33 +1946,30 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
     coverage_html = _label_coverage_html(coverage) + _deadline_phrasing_html(coverage)
     # One verdict, read off the carrier rather than re-derived from the
     # constant, so this page and the backtest log fire on the same condition.
-    tainted = coverage is not None and coverage.below_floor
+    tainted = _coverage_tainted(sweep)
 
     # ── KPI cards ────────────────────────────────────────────────────────────
-    pooled_k = cal.pooled.empirical_k if cal is not None else None
-    # Labelled for the RUN, not for config.py: on an --interval-discount run
-    # this is the override. Calling it "configured" would misattribute the
-    # override to config.py, which this feature never writes.
-    kpi_parts = [_kpi("k used (this run)", f"{configured_k:.3f}", "#2196F3")]
+    pooled_k = _pooled_k(sweep)
+    # The k shown, labelled for the page, not for config.py: the run's own
+    # as rendered (on an --interval-discount run the override, which config.py
+    # never receives), the filter bar's k once one is chosen. Keyed, so the
+    # filter script rewrites it (renderKd).
+    kpi_parts = [_kpi("k selected", kd["k_text"][pk], "#2196F3", key="kd_k")]
     # On a label-less corpus the k-hat is arithmetically correct for the pairs
     # it was handed and those are not the pairs the shipped scanner forms, so
     # the card itself carries the caveat: a reader who screenshots the cards,
     # or who reads only the number, must not see a bare recommendation. The
     # label is SUFFIXED, never replaced — "Pooled empirical k̂" stays intact.
     khat_label = "Pooled empirical k̂" + (" (see caveat above)" if tainted else "")
-    khat_color = "#F44336" if tainted else "#2196F3"
     if pooled_k is None:
         kpi_parts.append(_kpi(khat_label, "—"))
-        kpi_parts.append(_kpi("k̂ − k", "—"))
     else:
-        delta = pooled_k - configured_k
-        # p = 1 - k*(pB - pA), so a LARGER k is the more conservative belief.
-        # k̂ above the configured k means the in-between cell landed more often
-        # than the sizer assumed (it was sizing too big) — flag that red; a
-        # negative delta means the run was conservative.
-        kpi_parts.append(_kpi(khat_label, f"{pooled_k:.3f}", khat_color))
-        kpi_parts.append(_kpi("k̂ − k", f"{delta:+.3f}",
-                              "#F44336" if delta > 0 else "#4CAF50"))
+        kpi_parts.append(_kpi(khat_label, f"{pooled_k:.3f}", _khat_card_color(tainted)))
+    # _khat_delta's text and colour (red when k-hat is above the k shown: the
+    # sizer sized too big), for the k shown — the filter script rewrites both
+    delta_text, delta_color = kd["delta"][pk]
+    kpi_parts.append(_kpi("k̂ − k (primary band, pooled)", delta_text, delta_color,
+                          key="kd_delta"))
     kpis = "".join(kpi_parts)
 
     # ── Calibration table ────────────────────────────────────────────────────
@@ -1652,112 +2036,26 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
         "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
     )
 
-    # ── The k selector: one trace per point, switched by a native dropdown ───
-    # points always contains primary as the SAME object (BacktestSweep), but a
-    # hand-built sweep may hold an equal copy — fall back to matching on k, and
-    # to the first point if even that fails, so the figure always has exactly
-    # one visible trace.
-    primary_idx = next(
-        (i for i, pt in enumerate(points)
-         if pt is sweep.primary or pt.k == sweep.primary.k),
-        0,
-    )
+    # ── The equity curve at the k and cap shown: one trace, no selector ─────
+    # Drawn from the same change points the filter script redraws it from
+    # (kd's curves, expanded here as expand() does there), so the chart Python
+    # renders and the script's redraw of the same scenario hold the same values
+    dates = kd["dates"]
+    curve = kd["curves"][pk][pc]
+    fig = go.Figure(go.Scatter(
+        x=dates if curve is not None else [],
+        y=_expand_sparse(curve, len(dates)) if curve is not None else [],
+        # Named for what it is, not for its k: the script redraws this trace
+        # for every other k, and a k in its name would then be wrong
+        name="Portfolio value",
+        line={"color": _COLORS["strategy"], "width": 2},
+    ))
+    fig.update_layout(title=kd["titles"][pc][pk],
+                      yaxis_title="Portfolio Value ($)", xaxis_title="Date")
 
-    fig = go.Figure()
-    for i, pt in enumerate(points):
-        fig.add_trace(go.Scatter(
-            x=pt.equity_df["date"], y=pt.equity_df["portfolio_value"],
-            name=f"k = {pt.k:.2f}",
-            visible=(i == primary_idx),
-            line={"color": _COLORS["strategy"], "width": 2},
-        ))
-
-    # Plotly's own "update" method rewrites trace visibility and the title
-    # client-side, so the whole selector is static config in the serialized
-    # figure — nothing here needs a script of ours.
-    buttons = [
-        {
-            "label": f"k = {pt.k:.2f}",
-            "method": "update",
-            "args": [
-                {"visible": [j == i for j in range(len(points))]},
-                {"title": f"Equity Curve at interval discount k = {pt.k:.2f}"},
-            ],
-        }
-        for i, pt in enumerate(points)
-    ]
-    fig.update_layout(
-        title=f"Equity Curve at interval discount k = {points[primary_idx].k:.2f}",
-        yaxis_title="Portfolio Value ($)", xaxis_title="Date",
-        # The title is left-aligned, so the selector is anchored to the RIGHT
-        # and the top margin is widened to give both their own room: anchored
-        # left at the default margin, the dropdown rendered on top of the
-        # title text (verified in a browser before this was corrected).
-        margin={"t": 90},
-        updatemenus=[{
-            "type": "dropdown",
-            "buttons": buttons,
-            "active": primary_idx,
-            "direction": "down",
-            "showactive": True,
-            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
-        }],
-    )
-
-    # ── Sweep metrics table ──────────────────────────────────────────────────
-    def _srow(pt, is_primary: bool) -> str:
-        """
-        Render one HTML table row of per-k sweep metrics.
-
-        Computes total return, max drawdown and Sharpe from the point's OWN
-        equity curve, using this module's existing helpers exactly as
-        _section_performance calls them (_max_drawdown needs the date axis and
-        returns a (drawdown, trough_date) pair, not a scalar). The return base
-        is the curve's opening value, which is always the run's initial balance:
-        _build_equity_curve opens every curve one day before start_date, before
-        any trade can have entered.
-
-        Args:
-            pt (backtester.SweepPoint): One simulated interval discount.
-            is_primary (bool): True for the run's effective k — bolded, since
-                every other section on the page reflects that point.
-
-        Returns:
-            str: An HTML <tr>...</tr> string, or a row of "—" placeholders when
-                the point's equity curve is too short to measure.
-        """
-        eq = pt.equity_df
-        weight = "700" if is_primary else "400"
-        label = f"k = {pt.k:.2f}" + (" (primary)" if is_primary else "")
-        if eq.empty:
-            # Four unmeasurable cells: return, final balance, drawdown, Sharpe.
-            cells = "<td style='padding:6px 16px;'>—</td>" * 4
-            return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
-                    f"<td style='padding:6px 16px; font-weight:{weight}'>{label}</td>"
-                    f"<td style='padding:6px 16px;'>{len(pt.trades)}</td>{cells}</tr>")
-        # iloc[0] is the curve's leading pre-start_date row, i.e. the untouched
-        # initial balance — the same base _section_performance divides by — so
-        # this row's total return and the performance card's agree exactly. It
-        # used to be the post-outflow balance whenever a trade entered on
-        # start_date, which reported one run two ways on one page (DR-03).
-        opening = float(eq["portfolio_value"].iloc[0])
-        final = float(eq["portfolio_value"].iloc[-1])
-        total_return = (final - opening) / opening if opening else 0.0
-        # Same call shape as _section_performance: the date axis is what makes
-        # the trough label a calendar date, and the result is a 2-tuple.
-        max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
-        # A one-row curve has no pct_change to speak of; _sharpe returns 0.0 on
-        # a zero standard deviation, so no extra guard is needed here.
-        sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else 0.0
-        return (f"<tr style='border-bottom:1px solid #E0E0E0'>"
-                f"<td style='padding:6px 16px; font-weight:{weight}'>{label}</td>"
-                f"<td style='padding:6px 16px;'>{len(pt.trades)}</td>"
-                f"<td style='padding:6px 16px;'>{total_return:+.1%}</td>"
-                f"<td style='padding:6px 16px;'>${final:,.2f}</td>"
-                f"<td style='padding:6px 16px;'>{max_dd:.1%}</td>"
-                f"<td style='padding:6px 16px;'>{sharpe:.2f}</td>"
-                f"</tr>")
-
+    # ── Sweep metrics table at the cap shown ─────────────────────────────────
+    rows = "".join(_kd_row_html(cells, ki == pk)
+                   for ki, cells in enumerate(kd["rows"][pc]) if cells is not None)
     sweep_table = """
 <table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;
               margin:16px 0; width:auto;">
@@ -1769,15 +2067,16 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
   <th style="padding:8px 16px;">Max Drawdown</th>
   <th style="padding:8px 16px;">Sharpe</th>
 </tr>
-""" + "".join(_srow(pt, i == primary_idx) for i, pt in enumerate(points)) + "</table>"
+<tbody id="kd-rows">""" + rows + "</tbody></table>"
 
     return (
         _SECTION_STYLE.format(title="Interval Discount (k) Calibration")
         # Above the cards, so the caveat is read before the number it qualifies.
         + coverage_html
+        + notice
         + kpis
         + cal_table
-        + _fig_html(fig, height=450)
+        + _fig_html(fig, height=450, div_id="kd-equity")
         + sweep_table
     )
 
@@ -1911,11 +2210,99 @@ def _khat_stat(observations) -> dict:
                          "k": bucket.empirical_k})
 
 
+def _calibration_khat_stat(calibration: IntervalCalibration | None) -> dict | None:
+    """
+    Reduce a band's whole k-hat population to the figures the page shows.
+
+    The one definition of a band's "whole population" group: _khat_band's
+    "all" group, and the k-hat card generate_dashboard renders for the
+    primary view (which reads the primary calibration itself, never the
+    filter's data, so the card is there even when the bar cannot be built)
+    — so the two cannot disagree.
+
+    Args:
+        calibration (IntervalCalibration | None): The band's measurement.
+
+    Returns:
+        dict | None: None without a calibration. Otherwise _khat_stat of
+            the carried observations — the tuple itself, never its groups
+            put back together: only it reproduces the pooled row to the last
+            bit — or, for a calibration that does not carry its population
+            (len(observations) != pooled.n — a hand-built one), its pooled
+            row, with "events" None.
+    """
+    if calibration is None:
+        return None
+    observations = calibration.observations
+    if len(observations) != calibration.pooled.n:
+        pooled = calibration.pooled
+        return _khat_finish({"n": pooled.n, "events": None, "rate": pooled.realised_rate,
+                             "implied": pooled.mean_implied, "k": pooled.empirical_k})
+    return _khat_stat(observations)
+
+
+def _khat_with_deltas(stat: dict, ks) -> dict:
+    """
+    Add a group's k-hat − k, for every k the page offers, to its figures.
+
+    Args:
+        stat (dict): A _khat_stat (its "k" may be None).
+        ks: The interval discounts, by the filter bar's k index (None for
+            one not recorded).
+
+    Returns:
+        dict: The same dict, with "delta": [[text, colour], ...] — one
+            _khat_delta per k, so the page's script reads the k shown's
+            figure and colour by index and computes none.
+    """
+    stat["delta"] = [list(_khat_delta(stat["k"], k)) for k in ks]
+    return stat
+
+
+def _khat_kpis(stat: dict | None, ki: int, tainted: bool) -> list[tuple[str, str, str, str]]:
+    """
+    The Portfolio Performance section's two k-hat cards, formatted.
+
+    "Empirical k̂" is the group's k-hat (its table cell, three decimals) and
+    "k̂ − k (this selection)" its _khat_delta against the k at index ki —
+    the figures the filter script writes into the same cards
+    (renderKhatCards) for every other band, category or tag and k, from the
+    same group of the base block's k-hat breakdown.
+
+    Args:
+        stat (dict | None): A _khat_stat carrying "delta"
+            (_khat_with_deltas), or None when the selection has no k-hat
+            population (no calibration, or no entry in its category or tag).
+        ki (int): The index of the k compared with, in stat["delta"].
+        tainted (bool): Whether the run's outcome-label census fell below
+            its floor (_coverage_tainted): the k-hat card's label is then
+            suffixed " (see caveat in Interval Discount)" — suffixed, never
+            replaced — and its value recoloured, as the interval-discount
+            section's own card is.
+
+    Returns:
+        list[tuple[str, str, str, str]]: (key, label, value, colour) for the
+            cards "khat" and "khat_delta" — "—" in the default colour for a
+            figure that is not known.
+    """
+    suffix = " (see caveat in Interval Discount)" if tainted else ""
+    known = stat is not None and stat["k"] is not None
+    khat_text = stat["cells"][4] if stat is not None else _khat_cells(None)[4]
+    khat_color = _khat_card_color(tainted) if known else _KPI_DEFAULT_COLOR
+    deltas = stat.get("delta") if stat is not None else None
+    delta_text, delta_color = deltas[ki] if deltas else _khat_delta(None, None)
+    return [
+        ("khat", "Empirical k̂" + suffix, khat_text, khat_color),
+        ("khat_delta", "k̂ − k (this selection)", delta_text, delta_color),
+    ]
+
+
 def _khat_band(
     calibration: IntervalCalibration | None,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
     cat_index: dict[str, int],
     sub_index: dict[tuple[str, str], int],
+    ks: tuple = (),
 ) -> dict | None:
     """
     Break one band's k-hat population down by Kalshi category and first tag.
@@ -1930,6 +2317,10 @@ def _khat_band(
         series_categories (dict | None): The series-category map.
         cat_index (dict[str, int]): Category -> its index in the payload.
         sub_index (dict[tuple[str, str], int]): (category, tag) -> its index.
+        ks (tuple): The interval discounts the filter bar offers. When given,
+            every group also carries "delta" (_khat_with_deltas: its k-hat
+            − k per k), which the performance section's k-hat cards read;
+            empty (default) adds nothing.
 
     Returns:
         dict | None: None when the band has no calibration; otherwise
@@ -1942,21 +2333,20 @@ def _khat_band(
     if calibration is None:
         return None
     observations = calibration.observations
-    if len(observations) != calibration.pooled.n:
-        pooled = calibration.pooled
-        return {"carried": False, "groups": {_ALL_VIEW: _khat_finish({
-            "n": pooled.n, "events": None, "rate": pooled.realised_rate,
-            "implied": pooled.mean_implied, "k": pooled.empirical_k})}}
-    groups: dict[str, list] = {}
-    for o in observations:
-        category, tag = _series_labels(o.event_ticker, o.category, series_categories)
-        groups.setdefault(f"c{cat_index[category]}", []).append(o)
-        groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(o)
-    # The carried tuple itself, never its groups put back together: only it
-    # reproduces the pooled row to the last bit
-    stats = {_ALL_VIEW: _khat_stat(observations)}
-    stats.update((key, _khat_stat(members)) for key, members in groups.items())
-    return {"carried": True, "groups": stats}
+    # The whole population: the same group the primary view's k-hat card shows
+    stats = {_ALL_VIEW: _calibration_khat_stat(calibration)}
+    carried = len(observations) == calibration.pooled.n
+    if carried:
+        groups: dict[str, list] = {}
+        for o in observations:
+            category, tag = _series_labels(o.event_ticker, o.category, series_categories)
+            groups.setdefault(f"c{cat_index[category]}", []).append(o)
+            groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(o)
+        stats.update((key, _khat_stat(members)) for key, members in groups.items())
+    if ks:
+        for stat in stats.values():
+            _khat_with_deltas(stat, ks)
+    return {"carried": carried, "groups": stats}
 
 
 def _khat_chart_height(rows: int) -> int:
@@ -2028,7 +2418,15 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
     default (by category, primary band, no filter); the filter script
     redraws it for every other choice from the same payload. The "Group by"
     <select> sits outside the chart's body, so it stays reachable when a
-    selection has nothing to draw.
+    selection has nothing to draw. The Portfolio Performance section's two
+    k-hat cards (_khat_kpis) show the figure of the group the bar selects —
+    the category, or the tag when one is chosen — from the same group of the
+    same payload, with its k-hat − k per k (_khat_band's "delta"), so a card
+    and this chart's highlighted bar are one figure whenever that bar IS the
+    selected group: grouped by tag or by spread band always, and grouped by
+    category whenever no tag is chosen. With a tag chosen, grouping by
+    category highlights the tag's category, whose figure the cards do not
+    show (the table has no row for the tag at all).
 
     Args:
         payload (dict | None): _filter_payload's output — the base block: its
@@ -2051,7 +2449,11 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
         "violations (earlier YES, later NO) are excluded. Follows the filter bar above: "
         "grouping by category shows every category at the selected band, by tag every "
         "tag (within the selected category), by spread band every band for the selected "
-        "category or tag — the selection is highlighted. A bar rests on its entries, but "
+        "category or tag — the selection is highlighted. The dashed line marks the k the "
+        "bar shows. The Portfolio Performance section's k&#770; and k&#770; − k cards "
+        "show the figure of the category or tag selected — the highlighted bar's own, "
+        "except when a tag is selected and this chart is grouped by category, where "
+        "the highlighted bar is the tag's category. A bar rests on its entries, but "
         "entries of one event (a ladder's rungs) settle together, so its event count is "
         "the better measure of how much evidence it holds. Recommendation only: live "
         "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
@@ -2392,9 +2794,10 @@ def _point_kpis(point: SweepPoint) -> dict:
     if eq is None or eq.empty:
         total_return = final_balance = max_dd = sharpe = sortino = None
     else:
-        # Same base as _section_interval_discount's _srow: the curve's OWN
-        # opening row, always the untouched initial balance (DR-03), so this
-        # figure never disagrees with the run's own performance card.
+        # Same base as the interval-discount section's per-k rows
+        # (_kd_cells): the curve's OWN opening row, always the untouched
+        # initial balance (DR-03), so this figure never disagrees with the
+        # run's own performance card.
         opening = float(eq["portfolio_value"].iloc[0])
         final_balance = float(eq["portfolio_value"].iloc[-1])
         total_return = (final_balance - opening) / opening if opening else None
@@ -3805,10 +4208,23 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
 # The view every trade list carries: all of its trades, no category or tag.
 _ALL_VIEW = "all"
 
-# The two sections the filter bar does NOT drive, named once, for the bar's
-# note and its tests: the interval-discount section (its own k dropdown, at
-# the primary band) and the scenario explorer (its own band and k selects).
-_UNFILTERED_SECTIONS = "Interval Discount (k) Calibration and the Scenario Explorer"
+# What the filter bar reaches beyond the seven sections it re-scopes whole,
+# said once, for the bar's summary line and its tests: the interval-discount
+# section follows its k and size cap alone, always at the primary spread band
+# (its k-hat and per-k runs are the whole primary band's), and the scenario
+# explorer keeps its own band and k selects.
+_BAR_REACH = ("The Interval Discount section follows only the bar's k and size cap (at the "
+              "primary spread band); the Scenario Explorer keeps its own selects, and "
+              "category and tag reach neither.")
+
+# The same sentence for a page whose interval-discount section cannot follow
+# the bar — no sweep (it shows its placeholder), or its data could not be
+# built (_KdVisitor failed: it shows the run's own k and cap, and says so) —
+# so the summary line never claims a reach the page does not have. The base
+# block carries whichever of the two applies (_filter_payload), so the line
+# Python renders and the one the script fills say the same.
+_BAR_REACH_STATIC = ("The bar reaches neither the Interval Discount section on this page nor "
+                     "the Scenario Explorer, which keeps its own selects.")
 
 # The filter bar's summary line, as templates: _filter_summary_text fills them
 # for the page as rendered and the page's script fills them (D.text) for every
@@ -3835,7 +4251,11 @@ _SUMMARY_TEMPLATES = {
               "Sortino, the median monthly return, the benchmark's strategy row) is this "
               "selection's contribution: the starting balance plus these trades' P&L as "
               "that run booked it, not a standalone simulation."),
-    "unfiltered": f" Not filtered by this bar: {_UNFILTERED_SECTIONS}.",
+    # Every summary line ends with what the bar reaches beyond the sections
+    # it re-scopes whole (the key keeps its first name, which the script
+    # reads); _filter_payload swaps in _BAR_REACH_STATIC on a page whose
+    # interval-discount section cannot follow the bar
+    "unfiltered": f" {_BAR_REACH}",
 }
 
 # Shown in the bar's place when the filter's data cannot be built (DR-66: the
@@ -3921,6 +4341,29 @@ class _GridSource:
     fallback: Callable[[], "_GridSource"] | None = None
 
 
+def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
+    """
+    The primary spread band's k-hat measurement.
+
+    The one reading of it on the page: the filter's grid files it under the
+    primary band (_band_calibrations, _unbanded_source), and the k-hat card
+    rendered for the primary view reads it directly — so the card and the
+    k-hat breakdown's "all" group for that band are one measurement.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        IntervalCalibration | None: sweep.calibrations_by_band's entry for
+            the primary band, else sweep.calibration (a sweep that ran
+            without a band sweep carries only the latter); None with no
+            sweep.
+    """
+    if sweep is None:
+        return None
+    return sweep.calibrations_by_band.get(sweep.primary.spread_band, sweep.calibration)
+
+
 def _band_calibrations(sweep: BacktestSweep, bands: tuple) -> dict:
     """
     Each band's k-hat measurement, the primary band's falling back to the sweep's.
@@ -3931,13 +4374,13 @@ def _band_calibrations(sweep: BacktestSweep, bands: tuple) -> dict:
 
     Returns:
         dict: Band -> IntervalCalibration | None. The primary band reads
-            sweep.calibrations_by_band, else sweep.calibration (a sweep that
-            ran without a band sweep carries only the latter); every other
-            band reads calibrations_by_band alone.
+            _primary_calibration (sweep.calibrations_by_band, else
+            sweep.calibration); every other band reads calibrations_by_band
+            alone.
     """
     primary_band = sweep.primary.spread_band
-    return {band: (sweep.calibrations_by_band.get(band, sweep.calibration)
-                   if band == primary_band else sweep.calibrations_by_band.get(band))
+    return {band: (_primary_calibration(sweep) if band == primary_band
+                   else sweep.calibrations_by_band.get(band))
             for band in bands}
 
 
@@ -3985,7 +4428,7 @@ def _unbanded_source(
         for point in (sweep.primary, *sweep.points):
             by_k.setdefault(point.k, point)
         cap, primary_k = sweep.primary.size_cap, sweep.primary.k
-        calibration, checks = sweep.calibration, bool(sweep.scenarios)
+        calibration, checks = _primary_calibration(sweep), bool(sweep.scenarios)
     ks = tuple(sorted(by_k)) if len(by_k) > 1 else tuple(by_k)
 
     def cell(band, k) -> dict:
@@ -4479,6 +4922,96 @@ class _MaxTrades:
             self.failed = True
 
 
+class _KdVisitor:
+    """
+    Collect the interval-discount section's per-k rows and curves at the primary band.
+
+    The section shows the run at the PRIMARY spread band for the k and size
+    cap the filter bar shows (its band, category and tag never reach it), so
+    this visitor reads only the primary band's cells, every k and cap of
+    them: each scenario's "all" point becomes one table row (_kd_cells — one
+    _sharpe call) and one equity curve on the page's axis (_kd_curve). It
+    rides the one walk the chunk visitor does (_walk_grid), so a size-cap
+    sweep's cells are simulated once for both.
+
+    A failure is caught here: one WARNING, and the visitor marks itself
+    failed — the section then renders statically at the run's own k and cap
+    and says so, while the bar and every other section are unaffected.
+
+    Attributes:
+        axis (pd.DatetimeIndex): The page's date axis.
+        pooled_k (float | None): The pooled empirical k-hat the section
+            compares every k with (_pooled_k).
+        rows (list): rows[cap][k] -> _kd_cells, or None (never simulated).
+        curves (list): curves[k][cap] -> _kd_curve, or None likewise.
+        failed (bool): Whether building a row or curve raised.
+    """
+
+    def __init__(self, source: _GridSource, axis: pd.DatetimeIndex,
+                 pooled_k: float | None) -> None:
+        """
+        Prepare to walk a grid.
+
+        Args:
+            source (_GridSource): The grid.
+            axis (pd.DatetimeIndex): The page's date axis (the page's own
+                curve's dates — the base block's "dates").
+            pooled_k (float | None): The pooled empirical k-hat.
+        """
+        self.axis = axis
+        self.pooled_k = pooled_k
+        self.reset(source)
+
+    def reset(self, source: _GridSource) -> None:
+        """
+        Start again for a grid: empty rows and curves over its axes.
+
+        Args:
+            source (_GridSource): The grid about to be walked.
+        """
+        self.source = source
+        self.rows = [[None] * len(source.ks) for _ in source.caps]
+        self.curves = [[None] * len(source.caps) for _ in source.ks]
+        self.failed = False
+
+    def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Keep one primary-band scenario's row and curve.
+
+        Args:
+            bi (int): Band index — every band but the primary's is skipped.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a scenario with no "all"
+                point stays a null row and curve.
+        """
+        point = pops.get(_ALL_VIEW)
+        if self.failed or point is None or bi != self.source.primary[0]:
+            return
+        try:
+            # "(primary)" marks the run's own k, at every cap
+            self.rows[ci][ki] = _kd_cells(point, ki == self.source.primary[1])
+            self.curves[ki][ci] = _kd_curve(point, self.axis)
+        except Exception:
+            logging.warning("The Interval Discount section's k and size-cap figures could "
+                            "not be built; it shows the run's own k and size cap",
+                            exc_info=True)
+            self.failed = True
+
+    def payload(self) -> dict | None:
+        """
+        The section's data for every k and cap (_kd_assemble).
+
+        Returns:
+            dict | None: None when the visitor failed.
+        """
+        if self.failed:
+            return None
+        _, pk, pc = self.source.primary
+        return _kd_assemble(self.source.ks, self.source.caps, (pk, pc), self.rows,
+                            self.curves, self.axis, self.pooled_k)
+
+
 class _ChunkVisitor:
     """
     Build one packed data block ("chunk") per distinct (k, trade list) the page shows.
@@ -4639,7 +5172,9 @@ def _build_filter_grid(
     start_date: date,
     initial_balance: float,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
-) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades]:
+    *,
+    pooled_k: float | None = None,
+) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]:
     """
     Walk the page's grid once with the page's visitors.
 
@@ -4651,17 +5186,23 @@ def _build_filter_grid(
         start_date (date): The backtest's start date.
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
+        pooled_k (float | None): Keyword-only. The pooled empirical k-hat the
+            interval-discount section compares every k with (_pooled_k);
+            None (default) leaves that section's k-hat − k "—".
 
     Returns:
-        tuple[_GridSource, _ChunkVisitor, _MaxTrades]: The grid actually
-            walked (the source, or its eager fallback) and the two visitors.
+        tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]: The grid
+            actually walked (the source, or its eager fallback) and the three
+            visitors — one walk, so a size-cap sweep's cells are simulated
+            once for all of them.
     """
     chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
                            series_categories)
     most = _MaxTrades()
+    kd = _KdVisitor(source, chunks.axis, pooled_k)
     axis_end = chunks.axis[-1] if len(chunks.axis) else None
-    walked = _walk_grid(source, [chunks, most], axis_end)
-    return walked, chunks, most
+    walked = _walk_grid(source, [chunks, most, kd], axis_end)
+    return walked, chunks, most, kd
 
 
 def _sparse_on_axis(dates, values, axis: pd.DatetimeIndex, ndigits: int) -> list[list]:
@@ -4936,6 +5477,9 @@ def _filter_payload(
     start_date: date,
     initial_balance: float,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+    *,
+    kd: dict | None = None,
+    tainted: bool = False,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -4944,9 +5488,12 @@ def _filter_payload(
     scenario axes (band, k, size cap) and which chunk each scenario's list is
     in (the grid _ChunkVisitor filled — equal lists at an equal k share one),
     the labels, the templates, the drawing styles, the shared trade-row heads
-    and the k-hat breakdown per band. The lists themselves are the chunks,
-    each its own packed block the script inflates only when a reader chooses
-    that scenario, so the page's load cost does not grow with the grid.
+    and the k-hat breakdown per band (with every group's k-hat − k per k,
+    which the performance section's k-hat cards read), and the
+    interval-discount section's data at every k and cap. The lists themselves
+    are the chunks, each its own packed block the script inflates only when
+    a reader chooses that scenario, so the page's load cost does not grow
+    with the grid.
 
     Args:
         source (_GridSource): The grid actually walked (_walk_grid's return).
@@ -4954,6 +5501,16 @@ def _filter_payload(
         start_date (date): The backtest's start date.
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
+        kd (dict | None): Keyword-only. The interval-discount section's data
+            (_KdVisitor.payload), shipped as "kd" without its "dates" (the
+            block's own "dates" are the same axis); None (default) ships
+            null, the script then leaves that section as Python drew it, and
+            the summary line's closing sentence says the bar does not reach
+            it (_BAR_REACH_STATIC in place of _BAR_REACH).
+        tainted (bool): Keyword-only. Whether the run's outcome-label census
+            fell below its floor (_coverage_tainted): decides the colour of a
+            known k-hat on the performance section's card
+            ("styles.khat_card").
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -4965,11 +5522,13 @@ def _filter_payload(
             "categories" (sorted names), "subcats" ([[category index, tag],
             ...], sorted), "empty" (the view of a selection with no trade — a
             flat curve, referencing no string), "text" (the templates:
-            _SUMMARY_TEMPLATES and _KHAT_TEXT), "styles" (the trade-type
+            _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd —
+            and _KHAT_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
-            formula and reference line, and the KPI cards' default colour),
-            "khat" (_khat_band per band, in band order) and "khat_blank" (the
-            table cells of a group with no k-hat).
+            formula and reference line, the KPI cards' default colour and a
+            known k-hat's card colour), "khat" (_khat_band per band, in band
+            order, every group carrying "delta" per k), "khat_blank" (the
+            table cells of a group with no k-hat) and "kd" (above).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -4990,7 +5549,11 @@ def _filter_payload(
         "categories": chunks.categories,
         "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
         "empty": empty,
-        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT},
+        # The summary line's closing sentence says what the bar reaches on
+        # THIS page: the interval-discount section follows its k and cap only
+        # when that section's data was built (kd); otherwise it is static
+        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT,
+                 "unfiltered": f" {_BAR_REACH if kd is not None else _BAR_REACH_STATIC}"},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -5002,13 +5565,22 @@ def _filter_payload(
                             "bar": _COLORS["strategy"]},
                    "khat_height": list(_KHAT_HEIGHT),
                    "khat_ref": _KHAT_REF_LINE,
-                   "kpi_default": _KPI_DEFAULT_COLOR},
+                   "kpi_default": _KPI_DEFAULT_COLOR,
+                   # A known k-hat on the performance section's card: the
+                   # colour _khat_kpis gives it (red on a tainted corpus)
+                   "khat_card": _khat_card_color(tainted)},
         # Per band, its k-hat population broken down like its trades
-        # (_khat_band), and the cells of a group with none
+        # (_khat_band) — each group with its k-hat − k at every k of the bar,
+        # for the performance section's cards — and the cells of a group
+        # with none
         "khat": [_khat_band(source.calibrations.get(band), series_categories,
-                            chunks.cat_index, chunks.sub_index)
+                            chunks.cat_index, chunks.sub_index, ks=source.ks)
                  for band in source.bands],
         "khat_blank": _khat_cells(None),
+        # The interval-discount section at every k and cap (the page's axis
+        # is "dates" above, so the section's own copy of it is not shipped)
+        "kd": None if kd is None else {key: value for key, value in kd.items()
+                                       if key != "dates"},
     }
 
 
@@ -5195,14 +5767,20 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     trade row's tail, each view's category table), which compresses many
     times over. Measured 2026-09-26 on tests/test_dashboard.py's
     TestFilterPageSize fixture (36 bands, each a different 40-trade list,
-    8 series in 4 categories): 3.86 MB of compact JSON in 37 blocks (36
-    chunks and the base block) packed to 506 KB of base64, an 811 KB page —
-    against 4.05 MB packed to 448 KB, a 745 KB page, as the single block it
-    was before the chunks: each list compressed alone forgoes what one
-    shared block compressed across lists, and the rows' shared heads win
+    8 series in 4 categories), after the k-hat cards and the
+    interval-discount section's data joined the base block: 3.88 MB of
+    compact JSON in 37 blocks (36 chunks and the base block) packed to
+    509 KB of base64, an 819 KB page (3.86 MB, 506 KB and 812 KB before
+    them) — against 4.05 MB packed to 448 KB, a 745 KB page, as the single
+    block it was before the chunks: each list compressed alone forgoes what
+    one shared block compressed across lists, and the rows' shared heads win
     part of it back. A synthetic 36-band x 13-k x 20-cap grid (9,360
-    scenarios) whose cells share 4 trade lists packed 52 chunks and a 35 KB
-    base block into a 938 KB page in 4.6 s. The script inflates each block
+    scenarios) whose cells share 4 trade lists packed 52 chunks and a 56 KB
+    base block (707 KB of JSON inflated: 254 KB the interval-discount
+    section's "kd", 216 KB the k-hat breakdown with its k-hat − k per k)
+    into a 1.23 MB page in 5.0 s — on the same harness a 35 KB base block
+    (320 KB of JSON) and a 1.28 MB page before them, when that section drew
+    a trace per k. The script inflates each block
     with the browser's own DecompressionStream, so nothing is added to the
     page but the bytes.
 
@@ -5238,10 +5816,14 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
 # hold where the primary holds none, and the k-hat chart's reference line, from
 # the styles Python drew them with, D.styles), and it writes only through
 # textContent, the options API and Python-escaped HTML fragments (a trade row
-# is two of them joined: its head from D.rows, its tail from the chunk). On
-# load it inflates the base block and the primary scenario's chunk, sets the
-# bar back to the view Python rendered and enables it — it redraws nothing
-# until a <select> changes. A chunk is inflated when a scenario needs it and
+# is two of them joined: its head from D.rows, its tail from the chunk). It
+# also rewrites the performance section's two k-hat cards (renderKhatCards,
+# from the k-hat breakdown's group for the selection) and the
+# interval-discount section at the bar's k and size cap (renderKd, from
+# D.kd), both for the scenario on screen and both returning at once on a page
+# without them. On load it inflates the base block and the primary scenario's
+# chunk, sets the bar back to the view Python rendered and enables it — it
+# redraws nothing until a <select> changes. A chunk is inflated when a scenario needs it and
 # kept while among the last KEEP drawn (the primary's always); a choice made
 # while a chunk is still inflating supersedes it (SEQ), and a chunk that cannot
 # be loaded puts every select back on the scenario still shown (SHOWN).
@@ -5366,7 +5948,7 @@ _FILTER_JS = r"""
   // would clip the next selection's data.
   var CHARTS = ['perf-cum', 'perf-dd', 'dec-monthly', 'dec-cat', 'dec-sub', 'dec-price',
                 'dec-hold', 'cal-curve', 'diag-ret', 'diag-slip', 'risk-kelly', 'risk-dep',
-                'bench-fig', 'khat-fig'];
+                'bench-fig', 'khat-fig', 'kd-equity'];
   var drawn = {};
   CHARTS.forEach(function(id) {
     var gd = byId(id);
@@ -5575,6 +6157,63 @@ _FILTER_JS = r"""
     }
   }
 
+  // The Portfolio Performance section's k-hat cards, for what is ON SCREEN
+  // (SHOWN, like the k-hat chart): the k-hat breakdown's own group for the
+  // band and the category or tag shown — its table cell — and its k-hat − k
+  // at the k shown, text and colour as Python formatted them (_khat_kpis).
+  // Nothing to show is the blank cell in the default colour. None of it is
+  // on a page without the cards (no sweep): then nothing is done.
+  function renderKhatCards() {
+    var khat = byId('kpi-khat'), delta = byId('kpi-khat_delta');
+    if (!khat || !delta) { return; }
+    var band = D.khat[SHOWN[0]], st = band ? (band.groups[shownKey()] || null) : null;
+    var blank = [D.khat_blank[4], D.styles.kpi_default];
+    var known = st !== null && st.k !== null;
+    khat.textContent = st ? st.cells[4] : blank[0];
+    khat.style.color = known ? D.styles.khat_card : D.styles.kpi_default;
+    var d = (st && st.delta) ? st.delta[SHOWN[1]] : blank;
+    delta.textContent = d[0];
+    delta.style.color = d[1];
+  }
+  // One row of the interval-discount section's per-k table: Python's cells
+  // (_kd_cells), the k shown in bold — the row _kd_row_html renders
+  function kdRow(cells, bold) {
+    var tr = document.createElement('tr');
+    tr.style.borderBottom = '1px solid #E0E0E0';
+    cells.forEach(function(text, i) {
+      var td = document.createElement('td');
+      td.style.padding = '6px 16px';
+      if (i === 0) { td.style.fontWeight = bold ? '700' : '400'; }
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    return tr;
+  }
+  // The interval-discount section, at the primary spread band, for the k and
+  // size cap ON SCREEN (SHOWN): its two cards, its equity curve and title,
+  // and its per-k table at that cap — all from D.kd, which Python built
+  // (_KdVisitor). Its band, category and tag never reach it. A page whose
+  // section is static (no kd: no recorded band, or its data could not be
+  // built) is left as Python drew it.
+  function renderKd() {
+    var K = D.kd;
+    if (!K || !byId('kd-equity')) { return; }
+    var ki = SHOWN[1], ci = SHOWN[2], d = K.delta[ki], curve = K.curves[ki][ci];
+    setText('kpi-kd_k', K.k_text[ki]);
+    var dEl = byId('kpi-kd_delta');
+    if (dEl) { dEl.textContent = d[0]; dEl.style.color = d[1]; }
+    redraw('kd-equity', [traceOf('kd-equity', 0, {x: curve ? D.dates : [],
+                                                  y: curve ? expand(curve) : []})],
+           null, K.titles[ci][ki]);
+    var body = byId('kd-rows');
+    if (body) {
+      body.textContent = '';
+      K.rows[ci].forEach(function(cells, i) {
+        if (cells) { body.appendChild(kdRow(cells, i === ki)); }
+      });
+    }
+  }
+
   // Option labels carry the scenario's trade counts; the tag list holds the
   // selected category's tags, or every "Category · Tag" under "All".
   function refreshOptions() {
@@ -5607,6 +6246,10 @@ _FILTER_JS = r"""
     }
     renderBenchmark(v);
     renderKhat();
+    // Both read SHOWN, which draw() recorded just before this render, and
+    // both return at once on a page that lacks their elements or data
+    renderKhatCards();
+    renderKd();
   }
 
   // A block is gzip-compressed JSON in base64 (_packed_json_script),
@@ -5788,12 +6431,18 @@ def generate_dashboard(
     cap the run offers (_grid_source) — is walked ONCE before anything is
     written (_build_filter_grid), because the header needs its result: a
     size-cap sweep's cells are simulated during that walk, the busiest of
-    them feeds the header's stale-cutoff test (_MaxTrades), and a size-cap
+    them feeds the header's stale-cutoff test (_MaxTrades), a size-cap
     sweep the walk could not use is named on the run-settings line
-    (_run_settings_html's cap_sweep_unused). If that data
+    (_run_settings_html's cap_sweep_unused), and the interval-discount
+    section's rows and curves at every k and cap of the primary band are
+    collected for it and for the script (_KdVisitor, "kd"). If that data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
-    reads the same base block) and a WARNING in the log — then the file is
+    reads the same base block, and in the interval-discount section, which
+    then shows the run's own k and cap only) and a WARNING in the log. The
+    performance section's two k-hat cards (_khat_kpis) are computed from the
+    primary calibration itself, not from that data, so they render either
+    way (with a sweep; without one there is no k-hat and no card) — then the file is
     written to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
     previous run's page (operator decision, 2026-09-25: one current dashboard
     rather than a timestamped one per run, which TS-18 had made collision-free).
@@ -5892,8 +6541,9 @@ def generate_dashboard(
     # knows. Read off the sweep this function already receives — no new
     # parameter — so the four-positional call renders exactly as before.
     header_note = ""
-    if sweep is not None and sweep.label_coverage is not None \
-            and sweep.label_coverage.below_floor:
+    # The carried verdict, the one every caveat on the page branches on
+    tainted = _coverage_tainted(sweep)
+    if tainted:
         header_note = (
             '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
             "Outcome-label coverage for this run is below the floor — the "
@@ -5925,6 +6575,26 @@ def generate_dashboard(
             "select and summary line name the sweep's ks", interval_discount,
             sweep.primary.k, interval_discount)
 
+    # The performance section's k-hat cards as rendered: the primary band's
+    # whole k-hat population against the k the bar shows for the primary
+    # scenario — computed from the primary calibration itself, never from
+    # the filter's data below, so the cards are there even when the bar
+    # cannot be built. The filter script rewrites them for every other
+    # selection from the k-hat breakdown's groups, whose "all" group for
+    # this band is this same stat (_calibration_khat_stat), each carrying
+    # its k-hat − k per k of the bar's axis. That axis names the sweep's
+    # primary k (_grid_source), not k_used, so the card is priced at
+    # sweep.primary.k: on an unsupported override (the WARNING above) the
+    # card as rendered and the script's redraw of the same primary view — and
+    # the interval-discount section's own k-hat − k card — then agree; they
+    # are one and the same value on every production call, where the two ks
+    # are equal. No sweep, no k-hat at all: no cards.
+    khat_cards = None
+    if sweep is not None:
+        stat = _calibration_khat_stat(_primary_calibration(sweep))
+        khat_cards = _khat_kpis(
+            None if stat is None else _khat_with_deltas(stat, (sweep.primary.k,)), 0, tainted)
+
     # The page-wide filter: every spread band x k x size cap scenario's own
     # run, and within it every Kalshi category and category · tag, each view
     # computed here by the same helpers the sections below render with — one
@@ -5936,10 +6606,16 @@ def generate_dashboard(
     chunks: list = []
     most_traded = 0
     walked: _GridSource | None = None
+    # The interval-discount section's data at every k and cap the bar offers,
+    # from the same walk (None: the section renders statically), and whether
+    # it was lost to a failure of its own
+    kd: dict | None = None
+    kd_failed = False
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
-        source, chunker, counter = _build_filter_grid(
-            source, trades, equity_df, k_used, start_date, initial_balance, series_categories)
+        source, chunker, counter, kd_visitor = _build_filter_grid(
+            source, trades, equity_df, k_used, start_date, initial_balance, series_categories,
+            pooled_k=_pooled_k(sweep))
         walked = source
         if not counter.failed:
             most_traded = counter.most
@@ -5949,8 +6625,15 @@ def generate_dashboard(
             if chunker.grid[pb][pk][pc] is None:
                 # Never expected: the primary scenario is the page's own run
                 raise ValueError("the primary scenario has no trade list to show")
+            # Every run with a sweep has a primary band for the section to
+            # follow — a hand-built one that records none has one "not
+            # recorded" band, which is its primary (_unbanded_source). No
+            # sweep, no section to follow: it shows its placeholder
+            if sweep is not None:
+                kd = kd_visitor.payload()
+                kd_failed = kd is None
             filter_data = _filter_payload(source, chunker, start_date, initial_balance,
-                                          series_categories)
+                                          series_categories, kd=kd, tainted=tainted)
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
@@ -5961,6 +6644,8 @@ def generate_dashboard(
         chunks = []
     if filter_bar is None:
         filter_data, filter_bar, chunks = None, _FILTER_UNAVAILABLE_HTML, []
+        # Without the bar the section cannot follow it, whatever was built
+        kd, kd_failed = None, False
 
     # The ladder setting decides which pairs exist, the primary spread band
     # which of them are ever entered and the per-trade cap how big each is,
@@ -5989,11 +6674,16 @@ def generate_dashboard(
 
     # Each section is built as it is written, so only one is alive at a time
     sections = (
-        lambda: _section_performance(equity_df, trades, start_date, initial_balance),
+        # The two k-hat cards ride along (None without a sweep: no cards)
+        lambda: _section_performance(equity_df, trades, start_date, initial_balance,
+                                     extra_kpis=khat_cards),
         lambda: _section_decomposition(trades, series_categories),
         lambda: _section_calibration(trades),
-        # Takes the sweep whole (calibration + every point + the primary k)
-        lambda: _section_interval_discount(sweep),
+        # Takes the sweep whole (calibration + every point + the primary k),
+        # and the walk's data for the bar's k and size cap: static — with a
+        # notice — when the bar could not be built or that data could not be
+        lambda: _section_interval_discount(sweep, kd, bar=filter_data is not None,
+                                           kd_failed=kd_failed),
         # The same k-hat, broken down by category, tag and spread band — read
         # off the filter's base block, so it follows the filter bar like the
         # trade sections do (None when the filter could not be built)

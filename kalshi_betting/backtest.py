@@ -229,8 +229,8 @@ def main() -> None:
     effective interval discount, the primary spread band and the run's own
     per-trade size cap — so a default run's summary block reads exactly as
     the plain run_backtest() path's did. The other swept discounts and bands
-    exist only for the dashboard's k selectors (the Interval Discount
-    section's and the page-wide filter bar's), its scenario explorer and the
+    exist only for the dashboard's page-wide filter bar (whose k select the
+    Interval Discount section follows), its scenario explorer and the
     calibration report, and the lazily simulated size caps
     (result.cap_sweep) only for the dashboard's filter bar, which reads every
     cell as the page is built.
@@ -493,8 +493,8 @@ def main() -> None:
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points and the band-sweep payload are consumed
-    # only by the dashboard's k selectors, its filter bar and its scenario
-    # explorer, and the lazy size-cap sweep (result.cap_sweep, simulated only
+    # only by the dashboard's filter bar (whose k select the Interval Discount
+    # section follows) and its scenario explorer, and the lazy size-cap sweep (result.cap_sweep, simulated only
     # when a cell is read) only by the filter bar's Size cap select, whose
     # cells generate_dashboard reads as the page is built.
     trades, equity_df = result.primary.trades, result.primary.equity_df

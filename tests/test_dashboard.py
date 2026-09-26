@@ -1,7 +1,8 @@
 """Tests for dashboard.py — HTML escaping of Kalshi-controlled titles (BS-20),
 the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
 annualization base and its per-row use in the benchmark table (DR-56), and the
-interval-discount (k) section with its native Plotly k selector.
+interval-discount (k) section, whose curve and per-k table follow the page-wide
+filter bar's k and size cap.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -254,47 +255,60 @@ def _calibration(label: str = "0-7d") -> IntervalCalibration:
 
 
 class TestSectionIntervalDiscount:
-    """The interval-discount section renders the calibration table and a native
-    Plotly updatemenus dropdown with one button per swept k."""
+    """The interval-discount section renders the calibration table, ONE equity
+    trace at the k and size cap shown (div id "kd-equity" — the page-wide
+    filter bar's k select replaced the native Plotly updatemenus dropdown it
+    used to carry) and a per-k table (tbody "kd-rows") with the k shown in
+    bold."""
 
     def test_none_returns_the_placeholder(self):
         out = _section_interval_discount(None)
         assert "Interval Discount (k) Calibration" in out
         assert "No interval-discount sweep for this run." in out
-        # The placeholder must not carry a chart or a selector
-        assert "updatemenus" not in out
+        # The placeholder must not carry a chart or its table
+        assert "Plotly.newPlot" not in out and 'id="kd-rows"' not in out
 
     def test_empty_points_returns_the_placeholder(self):
         point = _sweep_points([0.75])[0]
         sweep = BacktestSweep(primary=point, points=[], calibration=None)
         assert "No interval-discount sweep for this run." in _section_interval_discount(sweep)
 
-    def test_dropdown_has_one_button_per_k_and_defaults_to_primary(self):
+    def test_one_trace_at_the_primary_k_and_no_dropdown(self):
         points = _sweep_points([0.60, 0.75, 0.90])
         sweep = BacktestSweep(primary=points[1], points=points,
                               calibration=_calibration())
         out = _section_interval_discount(sweep)
 
-        # A native Plotly dropdown, not hand-rolled JS
-        assert "updatemenus" in out
-        assert re.findall(r'"label":\s*"(k = [0-9.]+)"', out) == [
-            "k = 0.60", "k = 0.75", "k = 0.90",
-        ]
-        # Trace visibility serializes as scalars (the buttons' own args use
-        # arrays), so these three flags are the traces: only the primary shows.
-        assert re.findall(r'"visible":\s*(true|false)\b', out) == ["false", "true", "false"]
-        # ...and the dropdown itself opens on the primary's entry
-        assert re.findall(r'"active":\s*(\d+)', out) == ["1"]
+        # The bar's k select replaced the dropdown: no updatemenus, one chart,
+        # one trace — the primary's own curve — under a fixed id the filter
+        # script redraws
+        assert "updatemenus" not in out
+        assert out.count("Plotly.newPlot(") == 1 and 'id="kd-equity"' in out
+        data, layout = _nth_figure(out, 0)
+        assert len(data) == 1 and "visible" not in data[0]
+        eq = points[1].equity_df
+        assert data[0]["x"] == [d.isoformat() for d in eq["date"]]
+        assert data[0]["y"] == pytest.approx(list(eq["portfolio_value"]))
+        assert layout["title"]["text"] == (
+            "Equity Curve at interval discount k = 0.75, cap not recorded")
+        # One row per point, the k shown (the primary here) in bold and
+        # marked; the table's rows sit in the body the script rewrites
+        body = re.search(r'<tbody id="kd-rows">(.*?)</tbody>', out, re.S).group(1)
+        labels = re.findall(r"font-weight:(\d+)'>(.*?)</td>", body)
+        assert labels == [("400", "k = 0.60"), ("700", "k = 0.75 (primary)"),
+                          ("400", "k = 0.90")]
 
     def test_primary_matched_by_k_when_points_holds_an_equal_copy(self):
         # BacktestSweep normally shares the object, but a copy must still be
-        # located (by k) rather than silently defaulting to the first trace.
+        # located (by k) rather than silently defaulting to the first point.
         points = _sweep_points([0.60, 0.75, 0.90])
         copy = SweepPoint(k=points[2].k, trades=list(points[2].trades),
                           equity_df=points[2].equity_df.copy())
         sweep = BacktestSweep(primary=copy, points=points, calibration=None)
         out = _section_interval_discount(sweep)
-        assert re.findall(r'"visible":\s*(true|false)\b', out) == ["false", "false", "true"]
+        data, _ = _nth_figure(out, 0)
+        assert data[0]["y"] == pytest.approx(list(points[2].equity_df["portfolio_value"]))
+        assert "font-weight:700'>k = 0.90 (primary)</td>" in out
 
     def test_kpis_and_calibration_table_render(self):
         points = _sweep_points([0.75])
@@ -302,13 +316,18 @@ class TestSectionIntervalDiscount:
                               calibration=_calibration())
         out = _section_interval_discount(sweep)
 
-        # Labelled for the run, not for config.py — on an --interval-discount
-        # run this number is the override, which config.py never receives.
-        assert "k used (this run)" in out and "0.750" in out
-        assert "Configured k" not in out
+        # Labelled for the page, not for config.py — the k shown: the run's
+        # own as rendered (on an --interval-discount run the override, which
+        # config.py never receives), the filter bar's once one is chosen.
+        assert "k selected" in out and "0.750" in out
+        assert "k used (this run)" not in out and "Configured k" not in out
+        assert 'id="kpi-kd_k" style="font-size:26px; font-weight:700; color:#2196F3;">0.750' \
+            in out
         assert "Pooled empirical k̂" in out and "0.600" in out
-        # Delta = 0.600 - 0.750
-        assert "-0.150" in out
+        # Delta = 0.600 - 0.750: the sizer was conservative, so green
+        assert "k̂ − k (primary band, pooled)" in out
+        assert 'id="kpi-kd_delta" style="font-size:26px; font-weight:700; color:#4CAF50;">' \
+               '-0.150' in out
         # Bucket row: label, tier, n, realised, implied; empirical_k of None
         # renders as "-", and the pooled tier of 0.0 does too.
         assert "0-7d" in out and "0.15" in out and "0.1800" in out
@@ -326,9 +345,12 @@ class TestSectionIntervalDiscount:
         # Point 2's curve is 1000 -> 1020 -> 1010: +1.0% total, -1.0% drawdown
         assert "+1.0%" in out
         assert "-1.0%" in out
-        # No calibration to show, but the sweep table and selector still render
+        # No calibration to show, but the sweep table and its chart still render
         assert "No time-series candidate was measurable" in out
-        assert "updatemenus" in out
+        assert 'id="kd-equity"' in out
+        # No k-hat to compare: the delta is a dash in the default colour
+        assert 'id="kpi-kd_delta" style="font-size:26px; font-weight:700; color:#212121;">—' \
+            in out
 
     def test_calibration_label_is_escaped(self):
         points = _sweep_points([0.75])
@@ -416,12 +438,12 @@ class TestOutcomeLabelCoverageIsRendered:
         assert out.index("strike-blind") < out.index("Pooled empirical k̂")
 
     def test_the_section_still_renders_everything_else(self):
-        # The banner is additive: the table, the selector and the sweep table
-        # must all survive it.
+        # The banner is additive: the table, the equity chart, the per-k
+        # table and the k cards must all survive it.
         out = _section_interval_discount(self._sweep(_coverage(2)))
-        assert "updatemenus" in out
+        assert 'id="kd-equity"' in out and 'id="kd-rows"' in out
         assert "POOLED" in out
-        assert "k used (this run)" in out
+        assert "k selected" in out
 
     # ── Healthy: the figure is still rendered, and the caveat is not ─────────
 
@@ -466,7 +488,7 @@ class TestOutcomeLabelCoverageIsRendered:
         # No "None%" — and no bare "None" anywhere in the rendered fragment.
         assert "None" not in out
         # Everything the section rendered before is untouched.
-        assert "updatemenus" in out and "POOLED" in out
+        assert 'id="kd-equity"' in out and "POOLED" in out
         assert "Pooled empirical k̂" in out and "0.600" in out
 
     def test_a_defaulted_sweep_still_renders(self):
@@ -499,7 +521,7 @@ class TestOutcomeLabelCoverageIsRendered:
         out = _section_interval_discount(None)
         assert "No interval-discount sweep for this run." in out
         assert "Outcome-label coverage" not in out
-        assert "updatemenus" not in out
+        assert "Plotly.newPlot" not in out
 
 
 class TestGenerateDashboardHeaderNotice:
@@ -899,7 +921,7 @@ class TestCalendarAnnualizationAtTheUnpinnedCallSites:
         # One Sharpe per swept point, every one of them on the calendar base:
         # each point's equity_df is a _build_equity_curve-shaped calendar-day
         # series, exactly like the performance card's.
-        assert "updatemenus" in out
+        assert "Interval Discount (k) Calibration" in out
         assert sharpe_seen == [config.CALENDAR_DAYS_PER_YEAR] * len(points)
 
 
@@ -1888,7 +1910,7 @@ class TestCorpusProvenanceHeader:
               n_trades=0, other_point_trades=0) -> str:
         # The page's trades and the sweep's primary point agree, as they do in
         # production (backtest.py passes result.primary.trades); a second k
-        # point can carry trades of its own, as the k dropdown can show.
+        # point can carry trades of its own, as the filter bar's k select can show.
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
@@ -1956,7 +1978,7 @@ class TestCorpusProvenanceHeader:
         # moves past start_date, and the run can then trade — a red "no trade
         # could be entered" beside "Trades found: N" would be false on its
         # face. A trade at ANY simulated point (the primary, or another k the
-        # dropdown shows) turns it into a stale-verdict line instead.
+        # filter bar's k select shows) turns it into a stale-verdict line instead.
         page = self._page(monkeypatch, tmp_path,
                           self._prov(post_cutoff=True, from_cache=from_cache),
                           n_trades=n_trades, other_point_trades=other_point_trades)
@@ -2558,12 +2580,16 @@ def _packed_blocks(page: str) -> dict[str, dict]:
     return {element_id: _decode_block(body) for element_id, body in _PACKED.findall(page)}
 
 
-def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES):
+def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES, pooled_k=None):
     """Walk a grid as generate_dashboard does: (the grid walked, the base
-    block, {chunk id: chunk})."""
-    walked, chunker, _ = dashboard._build_filter_grid(
-        source, trades, curve, k_used, _FLT_START, 1000.0, series)
-    base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, series)
+    block, {chunk id: chunk}). The base block carries the interval-discount
+    section's data from the same walk ("kd") when the grid records a band,
+    as the page's does."""
+    walked, chunker, _, kd = dashboard._build_filter_grid(
+        source, trades, curve, k_used, _FLT_START, 1000.0, series, pooled_k=pooled_k)
+    base = dashboard._filter_payload(
+        walked, chunker, _FLT_START, 1000.0, series,
+        kd=kd.payload() if walked.bands != (None,) else None)
     return walked, base, {cid: _unpack(block) for cid, block in enumerate(chunker.chunks)}
 
 
@@ -2573,7 +2599,7 @@ def _flt_payload(sweep=None):
     sweep = sweep or _flt_sweep()
     trades, curve = sweep.primary.trades, sweep.primary.equity_df
     source = dashboard._grid_source(sweep, trades, curve, 0.75)
-    return (sweep, *_flt_walk(source, trades, curve))
+    return (sweep, *_flt_walk(source, trades, curve, pooled_k=dashboard._pooled_k(sweep)))
 
 
 def _expand(sparse: list, n: int) -> list:
@@ -2927,9 +2953,11 @@ class TestFilterPage:
         cats = re.search(r'<select id="flt-cat"[^>]*>(.*?)</select>', page).group(1)
         assert re.findall(r"<option value=\"\d*\">(.*?)</option>", cats) == [
             "All categories", "Commodities (1)", "Other (1)", "Science (0)", "Sports (3)"]
-        assert ("Showing every trade of the run at the primary spread band max(tier,0)-1, "
-                "k = 0.75, 20% cap per trade: 5 trades. Not filtered by this bar: "
-                f"{dashboard._UNFILTERED_SECTIONS}.") in page
+        # The summary is escaped into the page (the bar's reach names "the
+        # bar's k"), and ends with what the bar reaches beyond the sections
+        assert html.escape(
+            "Showing every trade of the run at the primary spread band max(tier,0)-1, "
+            f"k = 0.75, 20% cap per trade: 5 trades. {dashboard._BAR_REACH}") in page
         assert re.search(r'Trades found: <span id="hdr-trades">5</span>', page)
 
     def test_the_selects_wait_for_the_script_and_are_never_restored(
@@ -3084,8 +3112,18 @@ class TestFilterSummary:
         assert where == "the primary spread band max(tier,0)-1, k = 0.75, 20% cap per trade"
         assert dashboard._filter_summary_text(self.T, where, True, None, 5, 5) == (
             "Showing every trade of the run at the primary spread band max(tier,0)-1, "
-            "k = 0.75, 20% cap per trade: 5 trades. Not filtered by this bar: "
-            f"{dashboard._UNFILTERED_SECTIONS}.")
+            f"k = 0.75, 20% cap per trade: 5 trades. {dashboard._BAR_REACH}")
+        # What the bar reaches: the interval-discount section by k and size
+        # cap only, the explorer not at all, category and tag neither
+        assert dashboard._BAR_REACH == (
+            "The Interval Discount section follows only the bar's k and size cap (at the "
+            "primary spread band); the Scenario Explorer keeps its own selects, and "
+            "category and tag reach neither.")
+        # ...and on a page whose interval-discount section cannot follow it
+        # (no sweep, or its data could not be built), the sentence says so
+        assert dashboard._BAR_REACH_STATIC == (
+            "The bar reaches neither the Interval Discount section on this page nor "
+            "the Scenario Explorer, which keeps its own selects.")
         other = dashboard._filter_summary_text(
             self.T, dashboard._scenario_phrase("spread band x", "k = 0.60", "5% cap per trade"),
             False, None, 3, 3)
@@ -3956,6 +3994,11 @@ class TestFilterKAndCap:
         # Nothing is redrawn: the sections still show the unfiltered primary
         assert pending["reacts"] == failed["reacts"] == []
         assert "hdr-trades" not in failed["text"]
+        # ... the k-hat cards and the interval-discount section included: both
+        # still describe the scenario drawn, as Python rendered it
+        for element in ("kpi-khat", "kpi-khat_delta", "kpi-kd_k", "kpi-kd_delta"):
+            assert element not in failed["text"]
+        assert "kd-rows" not in failed["rows"]
         assert failed["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=_phrase(data, 0, 0, 1), reason="Error: damaged block dash-chunk-2",
             scenario=_phrase(data, 0, 1, 1))
@@ -4269,6 +4312,456 @@ class TestKhatBreakdown:
         assert "could not be built for this run" in page and 'id="khat-group"' not in page
 
 
+def _page_kpi(page: str, key: str) -> tuple[str, str]:
+    """(value, colour) of a keyed KPI card as Python rendered it."""
+    m = re.search(rf'<div id="kpi-{key}" style="font-size:26px; font-weight:700; '
+                  rf'color:([^;]+);">(.*?)</div>', page)
+    assert m, key
+    return m.group(2), m.group(1)
+
+
+def _kd_table(page: str) -> tuple[list, list]:
+    """The interval-discount section's per-k table as Python rendered it:
+    (each row's cells, unescaped; each row's label weight)."""
+    body = re.search(r'<tbody id="kd-rows">(.*?)</tbody>', page, re.S).group(1)
+    rows = [[html.unescape(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr)]
+            for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body)]
+    weights = re.findall(r"font-weight:(\d+)'>", body)
+    return rows, weights
+
+
+class TestKhatCards:
+    """The Portfolio Performance section's two k-hat cards: the empirical
+    k-hat of the band and category or tag selected, and it minus the k
+    selected — rendered for the primary view from the primary calibration
+    itself, rewritten by the script from the k-hat breakdown's own groups."""
+
+    def test_the_delta_is_red_when_khat_is_above_k(self):
+        # p = 1 − k·(pB − pA): a k-hat above k means the sizer sized too big
+        assert dashboard._khat_delta(0.9, 0.75) == ("+0.150", "#F44336")
+        assert dashboard._khat_delta(0.6, 0.75) == ("-0.150", "#4CAF50")
+        assert dashboard._khat_delta(0.75, 0.75) == ("+0.000", "#4CAF50")
+        # Rounded to the digits shown BEFORE the sign and colour are read: a
+        # difference a float's width below zero is not "-0.000", and one a
+        # hair above it is not a red zero (sized too big, for a zero shown)
+        assert dashboard._khat_delta(0.7999999999999999, 0.80) == ("+0.000", "#4CAF50")
+        assert dashboard._khat_delta(0.45045, 0.45) == ("+0.000", "#4CAF50")
+        assert dashboard._khat_delta(0.4512, 0.45) == ("+0.001", "#F44336")
+        assert dashboard._khat_delta(0.4488, 0.45) == ("-0.001", "#4CAF50")
+        for khat, k in ((None, 0.75), (0.6, None), (None, None)):
+            assert dashboard._khat_delta(khat, k) == ("—", dashboard._KPI_DEFAULT_COLOR)
+
+    def test_every_group_carries_its_delta_per_k_only_when_asked(self):
+        cal = _flt_calibration(TestKhatBreakdown.FILED)
+        plain = TestKhatBreakdown._band(cal)
+        assert all("delta" not in st for st in plain["groups"].values())
+        ks = (0.6, 0.75, None)
+        band = dashboard._khat_band(cal, _FLT_SERIES, {"Other": 0, "Science": 1, "Sports": 2},
+                                    {("Other", "General"): 0, ("Science", "General"): 1,
+                                     ("Sports", "Hockey"): 2}, ks=ks)
+        assert band["groups"].keys() == plain["groups"].keys()
+        for key, st in band["groups"].items():
+            assert st["delta"] == [list(dashboard._khat_delta(st["k"], k)) for k in ks]
+            assert {f: v for f, v in st.items() if f != "delta"} == plain["groups"][key]
+        # A hand-built calibration's pooled row gains it too
+        pooled = IntervalCalibration(
+            pooled=IntervalCalibrationBucket("POOLED", 0.0, 12, 0.25, 0.5, 0.5),
+            buckets=[], excluded_premise_violations=0)
+        assert dashboard._khat_band(pooled, None, {}, {}, ks=(0.75,))["groups"]["all"][
+            "delta"] == [["-0.250", "#4CAF50"]]
+
+    def test_the_section_gains_the_cards_only_when_given(self):
+        trades, curve = _flt_trades(), _flt_sweep().primary.equity_df
+        plain = dashboard._section_performance(curve, trades, _FLT_START, 1000.0)
+        cards = [("khat", "Empirical k̂", "3.333", "#2196F3"),
+                 ("khat_delta", "k̂ − k (this selection)", "+2.583", "#F44336")]
+        with_cards = dashboard._section_performance(curve, trades, _FLT_START, 1000.0,
+                                                    extra_kpis=cards)
+        added = "".join(dashboard._kpi(label, value, color, key=key)
+                        for key, label, value, color in cards) + dashboard._KHAT_CARDS_CAPTION
+        assert added in with_cards and with_cards.replace(added, "") == plain
+        assert 'id="kpi-khat"' not in plain and "k&#770; − k" not in plain
+
+    def test_the_cards_show_the_primary_band_against_the_page_s_k(self, monkeypatch, tmp_path):
+        sweep = _flt_sweep()
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        stat = dashboard._khat_stat(sweep.calibration.observations)
+        assert _page_kpi(page, "khat") == (stat["cells"][4], "#2196F3")
+        assert _page_kpi(page, "khat_delta") == dashboard._khat_delta(stat["k"], 0.75)
+        assert "Empirical k̂</div>" in page and "k̂ − k (this selection)</div>" in page
+        assert dashboard._KHAT_CARDS_CAPTION in page
+        # The very figure the script shows for the primary view: the k-hat
+        # breakdown's "all" group of the primary band, at the primary k
+        data = TestFilterPage._data(page)
+        pb, pk, _ = data["primary"]
+        whole = data["khat"][pb]["groups"]["all"]
+        assert (whole["cells"][4], *whole["delta"][pk]) == (
+            _page_kpi(page, "khat")[0], *_page_kpi(page, "khat_delta"))
+        assert data["styles"]["khat_card"] == "#2196F3"
+
+    def test_the_cards_render_even_when_the_filter_cannot_be_built(self, monkeypatch, tmp_path):
+        # Read off the primary calibration itself, never the filter's data
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        sweep = _flt_sweep()
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        assert 'id="flt-unavailable"' in page
+        stat = dashboard._khat_stat(sweep.calibration.observations)
+        assert _page_kpi(page, "khat") == (stat["cells"][4], "#2196F3")
+        assert _page_kpi(page, "khat_delta") == dashboard._khat_delta(stat["k"], 0.75)
+
+    def test_a_tainted_corpus_carries_its_caveat_onto_the_card(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_flt_sweep(), label_coverage=_coverage(2))
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        # Suffixed, never replaced; recoloured, as the section's own card is
+        assert "Empirical k̂ (see caveat in Interval Discount)</div>" in page
+        assert _page_kpi(page, "khat")[1] == "#F44336"
+        assert TestFilterPage._data(page)["styles"]["khat_card"] == "#F44336"
+        kpis = dashboard._khat_kpis(None, 0, True)
+        assert kpis == [("khat", "Empirical k̂ (see caveat in Interval Discount)", "—",
+                         dashboard._KPI_DEFAULT_COLOR),
+                        ("khat_delta", "k̂ − k (this selection)", "—",
+                         dashboard._KPI_DEFAULT_COLOR)]
+
+    def test_an_unsupported_override_prices_the_card_at_the_bar_s_k(
+            self, monkeypatch, tmp_path, caplog):
+        # interval_discount 0.62 against the sweep's primary k 0.75 (never in
+        # production): the bar names 0.75 for the primary scenario, so the
+        # card as rendered is priced at 0.75 — the figure the script writes
+        # for that same view, and the interval-discount section's own card
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        sweep = _flt_sweep()
+        with caplog.at_level(logging.WARNING):
+            page = dashboard.generate_dashboard(
+                sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0,
+                sweep=sweep, interval_discount=0.62,
+                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+        assert any("differs from the sweep's primary k" in r.getMessage()
+                   for r in caplog.records)
+        data = TestFilterPage._data(page)
+        pb, pk, _ = data["primary"]
+        stat = dashboard._khat_stat(sweep.calibration.observations)
+        rendered = _page_kpi(page, "khat_delta")
+        assert rendered == dashboard._khat_delta(stat["k"], 0.75) \
+            == tuple(data["khat"][pb]["groups"]["all"]["delta"][pk]) \
+            == _page_kpi(page, "kd_delta")
+        assert rendered != dashboard._khat_delta(stat["k"], 0.62)
+        # Away and back to the primary view: the script writes the same card
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-k", str(pk)], ["fire", "flt-k"], ["settle"], ["snap", "back"]],
+            strict=True)["back"]
+        assert (snap["text"]["kpi-khat_delta"], snap["colors"]["kpi-khat_delta"]) == rendered
+
+    def test_no_calibration_shows_dashes_and_no_sweep_shows_no_cards(
+            self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_flt_sweep(), calibration=None, calibrations_by_band={})
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        assert _page_kpi(page, "khat") == ("—", dashboard._KPI_DEFAULT_COLOR)
+        assert _page_kpi(page, "khat_delta") == ("—", dashboard._KPI_DEFAULT_COLOR)
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        bare = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0) \
+            .read_text(encoding="utf-8")
+        assert 'id="kpi-khat"' not in bare and dashboard._KHAT_CARDS_CAPTION not in bare
+
+    # ─── The script over the cards ───────────────────────────────────────────
+
+    def test_the_cards_follow_the_band_category_and_k(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cat", str(sports)], ["fire", "flt-cat"], ["settle"],
+            ["snap", "cat"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "k"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-cat", ""], ["fire", "flt-cat"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "back"]],
+            strict=True)
+        group = data["khat"][0]["groups"][f"c{sports}"]
+        card = data["styles"]["khat_card"]
+
+        def cards(snap):
+            return ((snap["text"]["kpi-khat"], snap["colors"]["kpi-khat"]),
+                    (snap["text"]["kpi-khat_delta"], snap["colors"]["kpi-khat_delta"]))
+        # The selected category's own k-hat, against the k shown
+        assert cards(snaps["cat"]) == ((group["cells"][4], card), tuple(group["delta"][1]))
+        assert cards(snaps["k"]) == ((group["cells"][4], card), tuple(group["delta"][0]))
+        # A band with no k-hat population: blanks in the default colour
+        blank = (data["khat_blank"][4], data["styles"]["kpi_default"])
+        assert data["khat"][1] is None and cards(snaps["band"]) == (blank, blank)
+        # Back at the primary view: exactly the cards Python rendered
+        assert cards(snaps["back"]) == (_page_kpi(page, "khat"), _page_kpi(page, "khat_delta"))
+
+    def test_the_script_keeps_the_caveat_colour_on_a_tainted_corpus(
+            self, monkeypatch, tmp_path):
+        # DR-66b: on a strike-blind corpus the k-hat card is recoloured, and a
+        # filter change must not turn it back to the healthy blue
+        page = _kc_page(monkeypatch, tmp_path,
+                        dataclasses.replace(_kc_sweep(), label_coverage=_coverage(2)))
+        data = TestFilterPage._data(page)
+        assert data["styles"]["khat_card"] == "#F44336" == _page_kpi(page, "khat")[1]
+        sports = data["categories"].index("Sports")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cat", str(sports)], ["fire", "flt-cat"], ["settle"],
+            ["snap", "cat"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "k"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"]],
+            strict=True)
+        group = data["khat"][0]["groups"][f"c{sports}"]
+        for name in ("cat", "k"):
+            assert (snaps[name]["text"]["kpi-khat"], snaps[name]["colors"]["kpi-khat"]) \
+                == (group["cells"][4], "#F44336")
+        # A band with no k-hat population: the blank, in the default colour
+        assert data["khat"][1] is None
+        assert (snaps["band"]["text"]["kpi-khat"], snaps["band"]["colors"]["kpi-khat"]) \
+            == (data["khat_blank"][4], data["styles"]["kpi_default"])
+
+    def test_a_category_with_no_khat_entry_shows_blanks(self, monkeypatch, tmp_path):
+        # Commodities has trades on the _flt page but no k-hat observation
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        commodities = str(data["categories"].index("Commodities"))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cat", commodities], ["fire", "flt-cat"], ["settle"],
+            ["snap", "s"]])["s"]
+        blank = data["khat_blank"][4]
+        assert snap["text"]["kpi-khat"] == snap["text"]["kpi-khat_delta"] == blank
+        assert snap["colors"]["kpi-khat"] == data["styles"]["kpi_default"]
+
+
+class TestIntervalDiscountFollowsTheBar:
+    """The interval-discount section at the primary spread band, for the k and
+    size cap the page-wide filter bar shows: its data comes from the one walk
+    (_KdVisitor), the page renders it for the primary scenario, and the
+    script redraws it for every other k and cap (renderKd)."""
+
+    def test_the_walk_collects_every_k_and_cap_of_the_primary_band(self):
+        sweep = _kc_sweep()
+        _, source, base, _ = _flt_payload(sweep)
+        kd = base["kd"]
+        points = sweep.cap_sweep.points
+        axis = pd.DatetimeIndex(pd.to_datetime(base["dates"]))
+        # rows[cap][k], curves[k][cap]: every (k, cap) of the primary band
+        for ci, cap in enumerate(source.caps):
+            for ki, k in enumerate(source.ks):
+                point = points[(_KC_B0, k, cap)]
+                assert kd["rows"][ci][ki] == dashboard._kd_cells(point, ki == 1)
+                assert kd["curves"][ki][ci] == dashboard._kd_curve(point, axis)
+        assert kd["rows"][1][1][0] == "k = 0.75 (primary)"
+        assert kd["titles"][0][0] == "Equity Curve at interval discount k = 0.60, 5% cap per trade"
+        assert kd["titles"][2][1] == "Equity Curve at interval discount k = 0.75, no per-trade cap"
+        assert kd["k_text"] == ["0.600", "0.750"]
+        pooled = sweep.calibration.pooled.empirical_k
+        assert kd["delta"] == [list(dashboard._khat_delta(pooled, k)) for k in (0.6, 0.75)]
+        assert kd["primary"] == [1, 1] and "dates" not in kd
+        # The same one walk the chunks came from: every cell read once
+        assert sweep.cap_sweep.reads == [(_KC_B0, 0.75), (_KC_B0, 0.6), (_KC_B1, 0.6),
+                                         (_KC_B1, 0.75)]
+
+    def test_the_page_renders_the_primary_scenario_from_the_walk(self, monkeypatch, tmp_path):
+        sweep = _kc_sweep()
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        kd = TestFilterPage._data(page)["kd"]
+        rows, weights = _kd_table(page)
+        assert rows == kd["rows"][1] and weights == ["400", "700"]
+        assert _page_kpi(page, "kd_k") == ("0.750", "#2196F3")
+        assert _page_kpi(page, "kd_delta") == tuple(kd["delta"][1])
+        section = page[page.index("\nInterval Discount (k) Calibration\n"):]
+        data, layout = _nth_figure(section, 0)
+        assert layout["title"]["text"] == kd["titles"][1][1]
+        assert data[0]["y"] == pytest.approx(
+            _expand(kd["curves"][1][1], len(TestFilterPage._data(page)["dates"])))
+        assert "updatemenus" not in section[:section.index("Empirical k̂ by")]
+        # A section that follows the bar carries neither static notice, and
+        # the summary line says the bar reaches it
+        for text in ("no_bar", "failed"):
+            assert html.escape(dashboard._KD_TEXT[text]) not in page
+        assert html.escape(dashboard._BAR_REACH) in page
+        assert html.escape(dashboard._BAR_REACH_STATIC) not in page
+
+    def test_a_filter_that_cannot_be_built_leaves_the_section_static(
+            self, monkeypatch, tmp_path):
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        sweep = _kc_sweep()
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        assert html.escape(dashboard._KD_TEXT["no_bar"]) in page
+        # The sweep's own points at the run's own cap
+        rows, weights = _kd_table(page)
+        assert rows == [dashboard._kd_cells(p, p is sweep.primary) for p in sweep.points]
+        assert weights == ["700", "400"]
+
+    def test_bar_false_renders_statically_with_its_notice(self):
+        sweep = _kc_sweep()
+        _, _, base, _ = _flt_payload(sweep)
+        kd = dict(base["kd"], dates=base["dates"])
+        live = _section_interval_discount(sweep, kd)
+        static = _section_interval_discount(sweep, kd, bar=False)
+        notice = html.escape(dashboard._KD_TEXT["no_bar"])
+        assert notice in static and notice not in live
+        assert static.replace(f"<p style='font-family:sans-serif;font-size:13px;"
+                              f"color:#616161;'>{notice}</p>", "") \
+            == _section_interval_discount(sweep)
+        # The walk's data is ignored: the static table is the sweep's points
+        assert _kd_table(live)[0] == kd["rows"][1] != _kd_table(static)[0]
+
+    def test_a_run_without_a_band_follows_the_bar_at_its_lone_band(
+            self, monkeypatch, tmp_path):
+        # A hand-built multi-k sweep with no band: its one "not recorded" band
+        # is its primary band, so the section follows the bar's k there as it
+        # does on a banded run — no notice, and a summary that says so
+        trades = _flt_trades()
+        points = [SweepPoint(k=k, trades=trades[:n],
+                             equity_df=backtester._build_equity_curve(trades[:n], _FLT_START,
+                                                                      1000.0))
+                  for k, n in ((0.6, 1), (0.75, 5), (0.9, 3))]
+        sweep = BacktestSweep(primary=points[1], points=points, calibration=None)
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        kd = data["kd"]
+        assert kd is not None and len(data["ks"]) == 3 and kd["primary"] == [1, 0]
+        # As rendered: the sweep's points, the run's own k in bold
+        rows, weights = _kd_table(page)
+        assert rows == kd["rows"][0] == [dashboard._kd_cells(p, i == 1)
+                                         for i, p in enumerate(points)]
+        assert weights == ["400", "700", "400"]
+        for text in ("no_bar", "failed"):
+            assert html.escape(dashboard._KD_TEXT[text]) not in page
+        assert html.escape(dashboard._BAR_REACH) in page
+        # The script moves it to the bar's k
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        assert snap["text"]["kpi-kd_k"] == kd["k_text"][0] == "0.600"
+        assert _last_react(snap, "kd-equity")["layout"]["title"]["text"] == kd["titles"][0][0]
+        assert snap["rows"]["kd-rows"] == kd["rows"][0]
+        assert [w[0] for w in snap["weights"]["kd-rows"]] == ["700", "400", "400"]
+        assert snap["text"]["hdr-trades"] == "1"
+        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH)
+
+    def test_a_section_whose_data_fails_says_so_and_costs_nothing_else(
+            self, monkeypatch, tmp_path, caplog):
+        real, calls = dashboard._kd_curve, []
+
+        def first_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("boom")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(dashboard, "_kd_curve", first_fails)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("Interval Discount section's k and size-cap figures" in m
+                   for m in warned) == 1
+        assert html.escape(dashboard._KD_TEXT["failed"]) in page
+        data = TestFilterPage._data(page)
+        assert data["kd"] is None and 'id="flt-bar"' in page and len(data["caps"]) == 3
+        # The summary line does not claim a reach the section lost — as
+        # rendered, and as the script fills it for another scenario
+        assert data["text"]["unfiltered"] == f" {dashboard._BAR_REACH_STATIC}"
+        assert html.escape(dashboard._BAR_REACH_STATIC) in page
+        assert html.escape(dashboard._BAR_REACH) not in page
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH_STATIC)
+        # ...and the section stays as Python drew it
+        assert "kd-equity" not in {r["id"] for r in snap["reacts"]}
+        assert "kpi-kd_k" not in snap["text"] and "kd-rows" not in snap["rows"]
+
+    def test_a_page_without_a_sweep_does_not_claim_the_section_follows_the_bar(
+            self, monkeypatch, tmp_path):
+        # No sweep: the section is its placeholder, so the summary line says
+        # the bar does not reach it
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        page = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0,
+                                            series_categories=_FLT_SERIES) \
+            .read_text(encoding="utf-8")
+        assert "No interval-discount sweep for this run." in page and 'id="flt-bar"' in page
+        data = TestFilterPage._data(page)
+        assert data["kd"] is None
+        assert data["text"]["unfiltered"] == f" {dashboard._BAR_REACH_STATIC}"
+        assert html.escape(dashboard._BAR_REACH_STATIC) in page
+        assert html.escape(dashboard._BAR_REACH) not in page
+
+    # ─── The script over the section ─────────────────────────────────────────
+
+    def test_the_section_follows_the_k_and_the_cap(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        kd, n = data["kd"], len(data["dates"])
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "k"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "cap"]],
+            strict=True)
+        for name, ki, ci in (("k", 0, 1), ("cap", 0, 0)):
+            snap = snaps[name]
+            assert snap["text"]["kpi-kd_k"] == kd["k_text"][ki]
+            assert [snap["text"]["kpi-kd_delta"], snap["colors"]["kpi-kd_delta"]] \
+                == kd["delta"][ki]
+            react = _last_react(snap, "kd-equity")
+            assert react["layout"]["title"]["text"] == kd["titles"][ci][ki]
+            assert react["data"][0]["x"] == data["dates"]
+            assert react["data"][0]["y"] == pytest.approx(_expand(kd["curves"][ki][ci], n))
+            assert react["data"][0]["name"] == "Portfolio value"
+            # That cap's rows, the k shown in bold
+            assert snap["rows"]["kd-rows"] == kd["rows"][ci]
+            assert [w[0] for w in snap["weights"]["kd-rows"]] == ["700", "400"]
+        # The caps trade different sizes, so the tables differ
+        assert kd["rows"][0] != kd["rows"][1]
+
+    def test_a_band_change_redraws_the_section_as_python_drew_it(self, monkeypatch, tmp_path):
+        # The section follows only the k and cap: another band shows the same
+        # (primary band) scenario, drawn exactly as Python rendered it
+        page = _kc_page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["snap", "band"]], strict=True)["band"]
+        python = _page_elements(page)["charts"]["kd-equity"]
+        react = _last_react(snap, "kd-equity")
+        assert react["layout"] == python["layout"]
+        # Exactly: both expand the same change points (_expand_sparse / expand)
+        assert react["data"][0]["y"] == python["data"][0]["y"]
+        assert react["data"][0]["x"] == python["data"][0]["x"]
+        rows, weights = _kd_table(page)
+        assert snap["rows"]["kd-rows"] == rows
+        assert [w[0] for w in snap["weights"]["kd-rows"]] == weights
+        for key in ("kd_k", "kd_delta"):
+            assert (snap["text"][f"kpi-{key}"], snap["colors"].get(f"kpi-{key}",
+                                                                    "#2196F3")) \
+                == _page_kpi(page, key)
+
+    def test_a_k_the_primary_band_never_simulated_says_so(self, monkeypatch, tmp_path):
+        # The _flt primary band was swept at k 0.60 and 0.75, never 1.00
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        kd = data["kd"]
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "2"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        react = _last_react(snap, "kd-equity")
+        assert kd["curves"][2][0] is None and react["data"][0]["y"] == []
+        assert react["layout"]["title"]["text"] == kd["titles"][0][2] == (
+            "Equity Curve at interval discount k = 1.00, 20% cap per trade: not simulated "
+            "by this run")
+        assert [r[0] for r in snap["rows"]["kd-rows"]] == ["k = 0.60", "k = 0.75 (primary)"]
+        assert [w[0] for w in snap["weights"]["kd-rows"]] == ["400", "400"]
+        assert snap["text"]["kpi-kd_k"] == "1.000"
+
+
 class TestFilterPageSize:
     """A band sweep whose 36 bands each traded a DIFFERENT list — the worst
     case for the filter, which ships a chunk per distinct scenario list and a
@@ -4281,10 +4774,14 @@ class TestFilterPageSize:
     plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6), against 744,946 for the same
     fixture's one-block page before the chunks existed: packing each list on
     its own loses the compression one block shared across lists, and sharing
-    the rows' heads wins back part of it. The budget is the measurement + 20%
+    the rows' heads wins back part of it. The k-hat cards (every k-hat
+    group now carries its k-hat − k per k) and the interval-discount
+    section's data at every k and cap ("kd") add about 7 KB: re-measured
+    819,188 bytes (2026-09-26, same environment), against 812,186 for the
+    page before them on the same day. The budget is the measurement + 20%
     (the curve runs to today, so the page grows by a few bytes a day)."""
 
-    PAGE_BYTES_MEASURED = 810_784
+    PAGE_BYTES_MEASURED = 819_188
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
 
     def test_36_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path):
@@ -4397,7 +4894,13 @@ class TestGoldenSections:
         assert once == dashboard_golden.normalize(risk)
         assert '"template":' not in once
         assert dashboard_golden.normalize(risk.replace("Kelly", "Kellx")) != once
-        # The risk section's charts carry fixed ids now (the page-wide filter
-        # redraws them by id); the k selector's chart still gets Plotly's
-        # random UUID, which the normaliser must still replace.
-        assert "UUID" in dashboard_golden.normalize(sections["interval_discount_healthy"])
+        # Every golden section's charts carry fixed ids now (the page-wide
+        # filter redraws them by id — the interval-discount section's too,
+        # "kd-equity"), so the random UUID the normaliser must still replace
+        # comes from a chart rendered without one, as Plotly renders it.
+        assert all(not re.search(r'id="UUID"', dashboard_golden.normalize(html_))
+                   for html_ in sections.values())
+        unnamed = dashboard._fig_html(dashboard.go.Figure(dashboard.go.Scatter(x=[1], y=[2])))
+        assert dashboard_golden._UUID_RE.search(unnamed)
+        assert "UUID" in dashboard_golden.normalize(unnamed)
+        assert not dashboard_golden._UUID_RE.search(dashboard_golden.normalize(unnamed))

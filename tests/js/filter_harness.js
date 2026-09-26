@@ -165,11 +165,14 @@ function __setup(page) {
 }
 
 // Everything the script has drawn since the last snapshot, and the state of
-// every element it has touched
+// every element it has touched: its text, markup, display, heights and
+// colour, a select's value and options, and a table body's rows (each cell's
+// text, and each cell's font weight where the script set one)
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
-              selects: {}, rows: {}, pending: Object.keys(__PENDING)};
+              colors: {}, selects: {}, rows: {}, weights: {},
+              pending: Object.keys(__PENDING)};
   __reacts = [];
   __updates = [];
   Object.keys(__elements).forEach(function(id) {
@@ -179,6 +182,7 @@ function __snapshot() {
     if (el.style.display !== undefined) { snap.display[id] = el.style.display; }
     if (el.parentElement.style.height) { snap.heights[id] = el.parentElement.style.height; }
     if (el.style.height) { snap.ownHeights[id] = el.style.height; }
+    if (el.style.color) { snap.colors[id] = el.style.color; }
     if (el.tagName === 'select') {
       snap.selects[id] = {value: el.value, disabled: el.disabled,
                           options: el.options.map(function(o) { return [o.value, o.text]; })};
@@ -186,6 +190,9 @@ function __snapshot() {
     if (el.children.length) {
       snap.rows[id] = el.children.map(function(tr) {
         return tr.children.map(function(td) { return td._text; });
+      });
+      snap.weights[id] = el.children.map(function(tr) {
+        return tr.children.map(function(td) { return td.style.fontWeight || ''; });
       });
     }
   });

@@ -4896,8 +4896,9 @@ class TestCorpusProvenanceIsCarried:
     def test_max_trades_simulated_reads_every_point_the_page_can_show(
             self, where, expected):
         # The one test both renderers apply to a carried post-cutoff verdict:
-        # a trade at ANY simulated point proves it stale, since the k dropdown
-        # and the scenario explorer put every point on the same page.
+        # a trade at ANY simulated point proves it stale, since the filter
+        # bar's k select and the scenario explorer put every point on the
+        # same page.
         primary = self._point(3 if where == "primary" else 0)
         sweep = backtester.BacktestSweep(
             primary=primary,
@@ -5291,10 +5292,10 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert without_leading == pytest.approx(-0.741287, abs=1e-6)
 
     def test_sweep_row_and_performance_card_report_one_return(self):
-        # _srow (inside _section_interval_discount) divides by the curve's
-        # iloc[0]; _section_performance divides by initial_balance. With the
-        # leading row those bases are the same number, so the two cells on one
-        # page can no longer disagree.
+        # _kd_cells (the interval-discount section's per-k rows) divides by
+        # the curve's iloc[0]; _section_performance divides by
+        # initial_balance. With the leading row those bases are the same
+        # number, so the two cells on one page can no longer disagree.
         from kalshi_betting import dashboard
 
         eq = self._curve()
