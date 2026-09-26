@@ -30,6 +30,7 @@ import shutil
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -1090,12 +1091,13 @@ def _scn_trade(profit: float = 5.0, event_ticker: str = "") -> BacktestTrade:
 
 
 def _scn_point(band, k, population="all", trades=None, values=None,
-               halves=None, ex_top=None) -> SweepPoint:
-    """One scenario SweepPoint."""
+               halves=None, ex_top=None, *, tier_floors: bool = True) -> SweepPoint:
+    """One scenario SweepPoint (tier_floors=False: a tier-floors-off one)."""
     return SweepPoint(
         k=k, trades=trades if trades is not None else [_scn_trade()],
         equity_df=make_equity(values if values is not None else [1000.0, 1010.0]),
         spread_band=band, population=population, halves=halves, ex_top_event=ex_top,
+        tier_floors=tier_floors,
     )
 
 
@@ -1230,6 +1232,56 @@ class _Grid:
     @classmethod
     def section(cls, **kwargs) -> str:
         return _section_scenario_explorer(cls.sweep(**kwargs))
+
+    # The tier-floors-off family: BANDS[0] (floor 0, below both tiers) is the
+    # one band a tier binds at; BANDS[1] and BANDS[2] (floors 0.3 and 0.35)
+    # sit at or above both, so they were never simulated again. Band 0's
+    # tier-off cells differ from its tier-on ones on every figure, and every
+    # population's count differs from every other's: at k index i, "all"
+    # holds 40 + i trades, "time_series" 30 + i, "ladder" 50 + i and "cross"
+    # 60 + i. Its time-series returns are -5% and +10%.
+    OFF_TS_FINALS = [950.0, 1100.0]
+    OFF_H1 = [0.07, -0.02]
+    OFF_H2 = [0.01, 0.04]
+
+    @classmethod
+    def off_points(cls) -> list[SweepPoint]:
+        band, points = cls.BANDS[0], []
+        for ki, k in enumerate(cls.KS):
+            halves = HalfSplit(cls.OFF_H1[ki], cls.OFF_H2[ki], 1, 1)
+            values = [1000.0, 1000.0 + 7 * (ki + 1), cls.OFF_TS_FINALS[ki]]
+            for population, n in (("all", 40), ("time_series", 30)):
+                points.append(_scn_point(band, k, population,
+                                         [_scn_trade(7.0, "EVT-OFF")] * (n + ki), values,
+                                         halves, ("EVT-OFF", 0.05 + ki), tier_floors=False))
+            points.append(_scn_point(band, k, "ladder", [_scn_trade(3.0)] * (50 + ki),
+                                     [1000.0, 1003.0 + ki], tier_floors=False))
+            points.append(_scn_point(band, k, "cross", [_scn_trade(-3.0)] * (60 + ki),
+                                     [1000.0, 997.0 - ki], tier_floors=False))
+        return points
+
+    @staticmethod
+    def off_calibration() -> IntervalCalibration:
+        """Band 0's tier-off calibration, labelled with its floor alone
+        (backtester._interval_calibration with tier_floors False): at floor 0
+        every bucket's tier is 0.0."""
+        return IntervalCalibration(
+            pooled=IntervalCalibrationBucket(label="POOLED", tier=0.0, n=12,
+                                             realised_rate=0.15, mean_implied=0.30,
+                                             empirical_k=0.50),
+            buckets=[IntervalCalibrationBucket(label="16-30d", tier=0.0, n=7,
+                                               realised_rate=0.20, mean_implied=0.35,
+                                               empirical_k=0.571)],
+            excluded_premise_violations=0,
+        )
+
+    @classmethod
+    def sweep_tiers(cls) -> BacktestSweep:
+        """sweep() plus a tier-floors-off family for BANDS[0] at both k, in
+        all four populations, with its tier-off calibration."""
+        return dataclasses.replace(
+            cls.sweep(), tier_off_scenarios=cls.off_points(),
+            tier_off_calibrations_by_band={cls.BANDS[0]: cls.off_calibration()})
 
 
 class TestScenarioExplorerPayload:
@@ -1419,7 +1471,9 @@ class TestScenarioExplorerControls:
 
 def _nth_figure(section_html: str, n: int) -> tuple[list, dict]:
     """(data, layout) of the n-th (0-based) Plotly.newPlot call in a fragment:
-    0 is the explorer's heatmap, 1 its equity curve."""
+    0 is the explorer's (tier-on) heatmap; then, with a tier-floors-off
+    family, 1 its tier-off heatmap (scn-heat-off) and 2 its equity curve —
+    without one, 1 is the curve."""
     decoder = json.JSONDecoder()
     i = -1
     for _ in range(n + 1):
@@ -1557,7 +1611,8 @@ class TestScenarioExplorerHeadlinePopulation:
             "all": "All (time-series + same-title)",
             "ladder": "Ladders (same-event)",
             "cross": "Cross-event",
-            "same_title": "Same-title (independent of band and k)",
+            # Same-title reads the same under both Tier floors settings
+            "same_title": "Same-title (independent of band, k and the tier floors)",
         }
         # The script builds every KPI row from those labels, the headline
         # population first, and no longer spells a bare 'All'
@@ -1566,11 +1621,11 @@ class TestScenarioExplorerHeadlinePopulation:
         assert "kpiRow('All'" not in js
 
     def test_the_script_reads_the_headline_population(self):
-        # The KPI table's headline row, its sub-row and the restyled curve
-        # exist only in the inline script, which no test executes; on a
-        # corpus with no same-title pair "all" equals "time_series" cell for
-        # cell, so a script reading "all" would look right there. Pin the
-        # reads themselves.
+        # The KPI table's headline row, its sub-row and the redrawn curve
+        # exist only in the inline script (TestScenarioExplorerScript runs
+        # it); on a corpus with no same-title pair "all" equals
+        # "time_series" cell for cell, so a script reading "all" would look
+        # right there. Pin the reads themselves.
         js = dashboard._SCENARIO_EXPLORER_JS
         assert "var ts = cell[P.time_series];" in js
         assert "kpiRow(esc(L.time_series), ts) + extrasRow(ts)" in js
@@ -1977,9 +2032,23 @@ class TestFigHtmlDivId:
 class TestScenarioExplorerPageSize:
     """A full page for the real grid (36 bands x 13 ks) over a V3-length window
     (2,459 days), with realistic float values, every population point, a
-    calibration per band and a top event per cell, stays within 5 MB."""
+    calibration per band and a top event per cell, stays within 5 MB — and so
+    does it with a tier-floors-off family for its 18 binding bands, every one
+    at every k in every population (another 936 points, on a second random
+    walk), whose explorer ships each binding band's cells, a second heatmap
+    and a second k-hat table. Measured 2026-09-26 on this very construction:
+    2,909,152 bytes without the family and 4,122,568 with it (877,432 bytes,
+    17.5%, under the ceiling); the explorer section alone went from 2,341,211
+    to 3,553,776 bytes, 3,333,661 of them its data block. The 5,000,000 bytes
+    are this synthetic's ceiling, not a guarantee for a real page: on the
+    DR-73 calibration corpus's own band sweep the page measured 5,489,336
+    bytes with the family (4,071,051 without it, and 4,290,438 with it before
+    the explorer followed the Tier floors choice), past the ceiling — 1.10
+    MB of the growth the explorer's tier-off cells in its data block, which
+    is not packed (packing it is a follow-up)."""
 
-    def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
+    def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path, family):
         import numpy as np
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
@@ -1998,22 +2067,35 @@ class TestScenarioExplorerPageSize:
         trades = [_scn_trade(profit=float(p), event_ticker=f"KXEVENT-26SEP{i:02d}-ABCDEF")
                   for i, p in enumerate(rng.normal(0.0, 20.0, 88))]
 
-        scenarios = []
-        for band in bands:
-            for k in ks:
-                # PB7: the "all" AND the "time_series" point each carry both
-                # checks, and the time-series one carries the per-cell curve
-                for population in ("all", "time_series"):
-                    scenarios.append(SweepPoint(
-                        k=k, trades=trades, equity_df=shared_equity, spread_band=band,
-                        population=population,
-                        halves=HalfSplit(float(rng.normal()), float(rng.normal()), 40, 48,
-                                         120, 130),
-                        ex_top_event=("KXEVENT-26SEP03-ABCDEF", float(rng.normal()))))
-                for population in ("ladder", "cross"):
-                    scenarios.append(SweepPoint(
-                        k=k, trades=trades[:40], equity_df=shared_equity,
-                        spread_band=band, population=population))
+        def points(band, k, equity, **stamp) -> list[SweepPoint]:
+            # PB7: the "all" AND the "time_series" point each carry both
+            # checks, and the time-series one carries the per-cell curve
+            out = [SweepPoint(k=k, trades=trades, equity_df=equity, spread_band=band,
+                              population=population,
+                              halves=HalfSplit(float(rng.normal()), float(rng.normal()), 40, 48,
+                                               120, 130),
+                              ex_top_event=("KXEVENT-26SEP03-ABCDEF", float(rng.normal())),
+                              **stamp)
+                   for population in ("all", "time_series")]
+            out += [SweepPoint(k=k, trades=trades[:40], equity_df=equity, spread_band=band,
+                               population=population, **stamp)
+                    for population in ("ladder", "cross")]
+            return out
+
+        scenarios = [pt for band in bands for k in ks
+                     for pt in points(band, k, shared_equity)]
+        # Drawn after every tier-on point, so the tier-on half is the same
+        # either way
+        off, off_cals = [], {}
+        if family:
+            walk_off = 10_000.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, 2459))
+            off_equity = make_equity(list(walk_off), start=date(2019, 12, 31))
+            for band in bands:
+                if backtester._tier_floors_bind(band):
+                    off += [pt for k in ks
+                            for pt in points(band, k, off_equity, tier_floors=False)]
+                    off_cals[band] = _scn_calibration("16-30d", 7)
+            assert len(off_cals) == 18 and len(off) == 936
         sweep = BacktestSweep(
             primary=scenarios[0], points=[scenarios[0]], calibration=None,
             label_coverage=_scn_coverage(), scenarios=scenarios,
@@ -2021,10 +2103,14 @@ class TestScenarioExplorerPageSize:
                                         equity_df=shared_equity, population="same_title"),
             calibrations_by_band={b: _scn_calibration() for b in bands},
             same_event_ladders=True, split_date=date(2023, 5, 1),
+            tier_off_scenarios=off, tier_off_calibrations_by_band=off_cals,
         )
 
         out_path = dashboard.generate_dashboard(
             trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
+        page = out_path.read_text(encoding="utf-8")
+        # The family is on the page (its explorer block) only when it exists
+        assert ('id="scn-tier-off"' in page) is family
         size = out_path.stat().st_size
         assert size <= 5_000_000, f"page was {size} bytes"
 
@@ -2397,7 +2483,271 @@ class TestEmpiricalKHatByBand:
         assert cells[2][1:] == ["0", "0.0000", "0.0000", "—"]
 
 
-# ═══ The page-wide filter: spread band x Kalshi category x tag ══════════════
+def _khat_table_rows(section_html: str, title: str) -> list[list[str]]:
+    """The cells of the "Empirical k̂ by spread band" table whose bold title
+    is `title` — each row's band label first."""
+    table = section_html[section_html.index(f"<b>{title}</b>"):]
+    table = table[:table.index("</table>")]
+    return [re.findall(r"<td[^>]*>(.*?)</td>", r)
+            for r in re.findall(r"<tr style='border-bottom[^>]*>(.*?)</tr>", table)]
+
+
+class TestScenarioExplorerTierFloors:
+    """The explorer's tier-floors-off block: drawn, hidden, after the tier-on
+    one only when the run carries a complete tier-off family; every figure in
+    it over the grid with the tier floors off — a binding band's own tier-off
+    points, every other band's tier-on ones — and its data shipped once, in
+    the block the script reads."""
+
+    OFF_TITLE = "Empirical k&#770; by spread band — tier floors off"
+
+    def test_without_a_family_there_is_no_off_view(self):
+        section = _Grid.section()
+        assert '<div id="scn-tier-on">' in section
+        for absent in ('id="scn-tier-off"', 'id="scn-heat-off"', "Tier floors off:",
+                       "tier floors off"):
+            assert absent not in section, absent
+        data = _scn_data(section)
+        for key in ("tier_binds", "cells_off", "calibration_by_band_off", "band_options_off"):
+            assert data[key] is None, key
+        # The band select's texts, exactly as rendered
+        assert data["band_options"] == [text for _, _, text in _options(section,
+                                                                         "scn-band-select")]
+        assert data["band_options"] == [
+            "max(tier,0)-1", "max(tier,0.3)-0.6 (primary)", "max(tier,0.35)-0.8"]
+        # Two charts: the tier-on heatmap (now at a fixed id) and the curve,
+        # whose title the data block carries for the one setting it has
+        charts = _page_elements(section)["charts"]
+        assert list(charts) == ["scn-heat", "scn-equity"]
+        assert data["curve_titles"] == [charts["scn-equity"]["layout"]["title"]["text"], None]
+        assert data["curve_titles"][0] == f"Equity curve — selected band x k — {_TS_LABEL}"
+
+    def test_an_incomplete_family_is_no_off_view(self):
+        # A band the tiers bind at that the family does not name: never shown
+        # as a tier-off view, and never its tier-on cells relabelled as one
+        sweep = dataclasses.replace(_Grid.sweep_tiers(), tier_off_calibrations_by_band={})
+        section = _section_scenario_explorer(sweep)
+        assert 'id="scn-tier-off"' not in section
+        assert _scn_data(section)["cells_off"] is None
+
+    def test_no_off_view_unless_the_page_offers_one(self):
+        # generate_dashboard passes tier_off_view=False when the filter bar
+        # offers no off view (its script follows only that bar): the section
+        # is then byte for byte the one a run without the family renders —
+        # no off block, no tier-off cells, no off title
+        section = _section_scenario_explorer(_Grid.sweep_tiers(), tier_off_view=False)
+        assert section == _Grid.section()
+        # ... and the default (every direct caller) draws it
+        assert 'id="scn-tier-off"' in _section_scenario_explorer(_Grid.sweep_tiers())
+
+    def test_the_off_block_is_drawn_hidden_after_the_tier_on_one(self):
+        section = _section_scenario_explorer(_Grid.sweep_tiers())
+        on_at = section.index('<div id="scn-tier-on">')
+        off_at = section.index('<div id="scn-tier-off" style="display:none">')
+        assert on_at < off_at < section.index("<select id='scn-band-select'>")
+        # Each block holds its own banner, heatmap and k-hat table
+        on_block, off_block = section[on_at:off_at], section[off_at:]
+        assert on_block.count("band x k cells computed") == 1
+        assert 'id="scn-heat"' in on_block and 'id="scn-heat-off"' not in on_block
+        assert off_block.index("Tier floors off:") < off_block.index('id="scn-heat-off"') \
+            < off_block.index(self.OFF_TITLE) < off_block.index("scn-band-select")
+        assert list(_page_elements(section)["charts"]) == ["scn-heat", "scn-heat-off",
+                                                            "scn-equity"]
+        # The tier-on block comes first, so every "first" pin keeps reading it
+        heat, _ = _first_figure(section)
+        assert heat[0]["y"] == [dashboard._row_label(b) for b in _Grid.BANDS]
+
+    def test_the_off_heatmap_reads_the_tier_off_grid(self):
+        charts = _page_elements(_section_scenario_explorer(_Grid.sweep_tiers()))["charts"]
+        on, off = charts["scn-heat"], charts["scn-heat-off"]
+        # With the tiers off the floor is the only floor: the bare labels
+        assert off["data"][0]["y"] == ["0-1", "0.3-0.6", "0.35-0.8"]
+        assert off["data"][0]["x"] == on["data"][0]["x"] == ["k = 0.65", "k = 0.75"]
+        assert off["layout"]["title"]["text"] == (
+            f"Mean per trade (equal stake) by spread band x k — {_TS_LABEL} — tier floors off")
+        on_buttons = on["layout"]["updatemenus"][0]["buttons"]
+        off_buttons = off["layout"]["updatemenus"][0]["buttons"]
+        assert [b["label"] for b in off_buttons] == [b["label"] for b in on_buttons]
+        for a, b in zip(on_buttons, off_buttons, strict=True):
+            assert b["method"] == a["method"] == "update"
+            assert b["args"][1] == {
+                "title.text": f"{b['label']} by spread band x k — {_TS_LABEL} — tier floors off"}
+            assert set(b["args"][0]) == set(a["args"][0])
+            for key in ("colorscale", "zmid", "hovertemplate"):
+                assert b["args"][0][key] == a["args"][0][key], (b["label"], key)
+            # The bands the tiers never bind at are their tier-on rows
+            assert b["args"][0]["z"][0][1:] == a["args"][0]["z"][0][1:], b["label"]
+            assert b["args"][0]["customdata"][0][1:] == a["args"][0]["customdata"][0][1:]
+        z = {b["label"]: b["args"][0]["z"][0] for b in off_buttons}
+        assert z["Trade count"][0] == [30, 31]
+        assert z["Total return"][0] == pytest.approx([-0.05, 0.10])
+        assert z["H1 return"][0] == [0.07, -0.02]
+        assert z["H2 return"][0] == [0.01, 0.04]
+        # Band 0's k-hat is its tier-off calibration's; the rest the tier-on ones
+        assert z["Empirical k̂ (pooled per band)"] == [[0.50, 0.50], [0.60, 0.60],
+                                                       [None, None]]
+        ts_off = [pt for pt in _Grid.off_points() if pt.population == "time_series"]
+        assert z["Mean per trade (equal stake)"][0] == pytest.approx(
+            [dashboard._point_kpis(pt)["mean_per_trade"] for pt in ts_off])
+        assert off["data"][0]["z"] == z["Mean per trade (equal stake)"]
+        # ... and the tier-on heatmap is untouched by the family
+        on_z = {b["label"]: b["args"][0]["z"][0] for b in on_buttons}
+        assert on_z["Trade count"] == [[1, 2], [3, 4], [5, 6]]
+
+    def test_the_off_banner_measures_the_off_grid(self):
+        from scipy.stats import spearmanr
+        section = _section_scenario_explorer(_Grid.sweep_tiers())
+        off_at = section.index('<div id="scn-tier-off"')
+        on_banner = section[section.index('<div id="scn-tier-on">'):off_at]
+        off_banner = section[off_at:]
+        off_banner = off_banner[:off_banner.index("</div>")]
+        assert off_banner.index(dashboard._SCENARIO_TIER_OFF_LEAD) < off_banner.index(
+            "band x k cells computed")
+        # 6 cells: band 0's tier-off points (8, every population at both k)
+        # and bands 1-2's tier-on ones (4 + 4 + 4 + 3, cell 5 has no ladder)
+        assert "<b>6 band x k cells computed</b> (23 scenario points" in off_banner
+        # Time-series returns -5%, +10% (band 0, tiers off), +1%, +2%, +3%, -1%
+        assert "66.7% of the cells with a measurable return" in off_banner
+        h1 = [*_Grid.OFF_H1, *_Grid.H1[2:]]
+        h2 = [*_Grid.OFF_H2, *_Grid.H2[2:]]
+        rho = spearmanr(h1, h2).statistic
+        assert f"{rho:+.3f}" == "-0.580"
+        assert "H1 vs H2: -0.580." in off_banner
+        assert "The best of 6 correlated cells overstates what you should expect." in off_banner
+        # The tier-on banner is today's, and says nothing of the tiers
+        assert "<b>6 band x k cells computed</b> (22 scenario points" in on_banner
+        assert "60.0% of the cells with a measurable return" in on_banner
+        assert "H1 vs H2: -0.116." in on_banner
+        assert "Tier floors off" not in on_banner
+
+    def test_the_off_banner_says_what_off_replaces_and_what_still_applies(self):
+        # Off replaces the entry threshold max(tier, floor) with the floor —
+        # nothing else: the band's ceiling, the gap cap, the positive-spread
+        # rule, the fee check and the Kelly gate all still apply. The tiers
+        # and the gap cap are named from config, never as literals
+        lead = dashboard._SCENARIO_TIER_OFF_LEAD
+        assert ("each band's own floor replaces max(tier, floor) as the time-series entry "
+                f"threshold, without the {dashboard._TIER_FLOORS} deadline-gap tier floors: "
+                "pB − pA of at least the floor, and pA + nB of at most 1 − the floor.") in lead
+        assert (f"The band's ceiling, the {config.MAX_DEADLINE_GAP_DAYS}-day deadline-gap cap, "
+                "the positive-spread rule (pB above pA), the fee check and the Kelly gate "
+                "still apply.") in lead
+        assert dashboard._TIER_FLOORS == (
+            f"{config.MIN_PRICE_DIFF_SHORT_GAP:.2f}/{config.MIN_PRICE_DIFF_LONG_GAP:.2f}")
+        assert "live trading always applies the tier floors" in lead
+
+    def test_the_data_block_ships_each_off_cell_once(self):
+        data = _scn_data(_section_scenario_explorer(_Grid.sweep_tiers()))
+        pop = {name: i for i, name in enumerate(data["populations"])}
+        assert data["tier_binds"] == [True, False, False]
+        # A band the tiers never bind at ships no off cells or calibration:
+        # the script reads its tier-on ones there
+        assert data["cells_off"][1] is None and data["cells_off"][2] is None
+        assert data["calibration_by_band_off"][1:] == [None, None]
+        row = data["cells_off"][0]
+        for name, first in (("all", 40), ("time_series", 30), ("ladder", 50), ("cross", 60)):
+            assert [cell[pop[name]]["trades"] for cell in row] == [first, first + 1], name
+        assert [cell[pop["time_series"]]["total_return"] for cell in row] == pytest.approx(
+            [-0.05, 0.10])
+        assert [cell[pop["time_series"]]["h1_return"] for cell in row] == _Grid.OFF_H1
+        assert row[1][pop["time_series"]]["top_event"] == "EVT-OFF"
+        # The curve travels with the time-series cell, as on the tier-on grid
+        assert len(row[0][pop["time_series"]]["equity"]) == len(data["dates"])
+        assert "equity" not in row[0][pop["all"]]
+        # The tier-on cells are untouched by the family
+        assert data["cells"][0][0][pop["all"]]["trades"] == 1
+        cal = data["calibration_by_band_off"][0]
+        assert [r["label"] for r in cal] == ["16-30d", "POOLED"]
+        assert [r["n"] for r in cal] == [7, 12]
+        # Labelled with the floor alone, a floor-0 calibration's buckets carry
+        # tier 0.0, which ships as null ("—", no floor to print) — like the
+        # pooled row, never 0.00
+        assert [r["tier"] for r in cal] == [None, None]
+        assert data["band_options"] == [
+            "max(tier,0)-1", "max(tier,0.3)-0.6 (primary)", "max(tier,0.35)-0.8"]
+        assert data["band_options_off"] == ["0-1", "0.3-0.6 (primary)", "0.35-0.8"]
+        # The curve's title under each setting: the one Python draws, and
+        # the same naming the setting, as the off heatmap's title does
+        title = f"Equity curve — selected band x k — {_TS_LABEL}"
+        assert data["curve_titles"] == [title, title + " — tier floors off"]
+
+    def test_the_off_khat_table_repeats_the_inert_bands_rows(self):
+        section = _section_scenario_explorer(_Grid.sweep_tiers())
+        on = _khat_table_rows(section, "Empirical k&#770; by spread band")
+        off = _khat_table_rows(section, self.OFF_TITLE)
+        assert [r[0] for r in on] == [dashboard._row_label(b) for b in _Grid.BANDS]
+        assert [r[0] for r in off] == ["0-1", "0.3-0.6", "0.35-0.8"]
+        assert off[0][1:] == ["12", "0.1500", "0.3000", "0.500"]
+        assert on[0][1:] == ["10", "0.1200", "0.2000", "0.600"]
+        assert off[1:] == [["0.3-0.6", *on[1][1:]], ["0.35-0.8", *on[2][1:]]]
+        # The first such table on the page is the tier-on one
+        assert section.index("Empirical k&#770; by spread band</b>") < section.index(
+            self.OFF_TITLE)
+
+    def test_the_script_words_nothing_of_the_off_view(self):
+        # Every word the off view shows is Python's — the banner's lead, the
+        # titles' suffix, the band options and the curve's titles in the data
+        # block — and the script only swaps blocks and writes back the data
+        # block's texts
+        js = dashboard._SCENARIO_EXPLORER_JS
+        for phrase in ("Tier floors off", "tier floors off", "floor alone", "never bind",
+                       "(primary)", "max(tier", "Equity curve"):
+            assert phrase not in js, phrase
+        assert "off ? data.band_options_off : data.band_options;" in js
+        assert "data.curve_titles[off ? 1 : 0]" in js
+
+    def test_a_point_stamped_tier_floors_off_is_never_a_tier_on_cell(self):
+        # Points stamped tier-off among the tier-on scenarios — at a gridded
+        # band and k, listed after that cell's own points (so a grid that
+        # ignored the stamp would overwrite them), at a band no tier-on point
+        # has and at a k no tier-on point has — change nothing
+        sweep = _Grid.sweep()
+        strays = [_scn_point(_Grid.BANDS[1], 0.75, population, [_scn_trade()] * 99,
+                             tier_floors=False)
+                  for population in dashboard._SCENARIO_POPULATIONS]
+        strays += [_scn_point((0.2, 0.6), 0.75, tier_floors=False),
+                   _scn_point(_Grid.BANDS[0], 0.40, tier_floors=False)]
+        mixed = dataclasses.replace(sweep, scenarios=[*sweep.scenarios, *strays])
+        assert _section_scenario_explorer(mixed) == _Grid.section()
+
+    def test_only_a_binding_bands_tier_off_points_fill_the_off_grid(self):
+        # A tier-off point at a band the tiers never bind at (whose off row IS
+        # its tier-on row) must never be written into it, and a point in the
+        # family not stamped tier-off is never read as one — each listed after
+        # the real points, so a grid that ignored either rule would keep it
+        sweep = _Grid.sweep_tiers()
+        strays = [_scn_point(_Grid.BANDS[1], 0.75, "time_series", [_scn_trade()] * 99,
+                             tier_floors=False),
+                  _scn_point(_Grid.BANDS[0], 0.75, "time_series", [_scn_trade()] * 98)]
+        mixed = dataclasses.replace(
+            sweep, tier_off_scenarios=[*sweep.tier_off_scenarios, *strays])
+        assert _section_scenario_explorer(mixed) == _section_scenario_explorer(sweep)
+
+    def test_a_real_floor_0_tier_off_calibration_ships_its_tiers_as_null(self, monkeypatch):
+        # run_backtest_sweep itself, over TestPrepareEntriesGolden's fixture
+        # (each band at the primary k): with the tiers off, the band at floor
+        # 0 labels its buckets 0.0 — shipped as null, like the pooled row —
+        # while a binding band at floor 0.2 labels them 0.2
+        from . import test_backtester as tb
+        golden = tb.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        sweep = backtester.run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(), start_date=golden._START,
+            initial_balance=10_000.0, sweep=False, same_event_ladders=True,
+            band_sweep=True, tier_off_sweep=True)
+        data = _scn_data(_section_scenario_explorer(sweep))
+        bands = [tuple(b) for b in data["bands"]]
+        for band, shipped_tier in (((0.0, 1.0), None), ((0.2, 1.0), 0.2)):
+            cal = sweep.tier_off_calibrations_by_band[band]
+            assert cal is not None and cal.buckets, band
+            assert {b.tier for b in cal.buckets} == {band[0]}, band
+            rows = data["calibration_by_band_off"][bands.index(band)]
+            assert [r["tier"] for r in rows[:-1]] == [shipped_tier] * len(cal.buckets), band
+            assert rows[-1]["tier"] is None                 # the pooled row
+        assert data["tier_binds"] == [backtester._tier_floors_bind(b) for b in bands]
+
+
+# ═══ The page-wide filter: spread band x tier floors x Kalshi category x tag ═
 
 _FLT_START = date(2026, 1, 5)
 _FLT_SERIES = {
@@ -2485,6 +2835,42 @@ def _flt_sweep():
                          calibrations_by_band=cals, same_event_ladders=True)
 
 
+# _FLT_SERIES plus the series only the tier-off run trades
+_FLT_SERIES_TIERS = {**_FLT_SERIES, "KXRAIN": ("Climate", ("Rain",))}
+
+
+def _flt_sweep_tiers():
+    """_flt_sweep() plus a tier-floors-off family for the one band a tier
+    binds at: the primary (0.0, 1.0), whose floor 0 sits below both tiers —
+    the other two bands' 0.3 floor sits at or above both, so they were never
+    simulated again. The family's "all" point at the primary k holds the
+    primary's trades plus one time-series trade the tiers held back
+    (KXRAIN-1, "Climate" under _FLT_SERIES_TIERS); after it come decoys the
+    filter must never read — another k, another population, and an "all"
+    point at the primary k NOT stamped tier-off — each listed later, so a
+    filter that ignored the k, the population or the stamp would keep it.
+    Its tier-off calibration files KXRAIN and KXNHLHART, where the tier-on
+    one files KXNHLHART, KXSPACEX and KXOTHER."""
+    sweep = _flt_sweep()
+    rain = _ftrade("KXRAIN-1", "time_series", date(2026, 1, 12), date(2026, 1, 15), 6.0)
+    trades = sorted([*_flt_trades(), rain], key=lambda t: t.entry_date)
+    curve = backtester._build_equity_curve
+    off = SweepPoint(k=0.75, trades=trades, equity_df=curve(trades, _FLT_START, 1000.0),
+                     spread_band=(0.0, 1.0), population="all", tier_floors=False)
+    one = curve(trades[:1], _FLT_START, 1000.0)
+    decoys = [
+        SweepPoint(k=0.60, trades=trades[:1], equity_df=one, spread_band=(0.0, 1.0),
+                   population="all", tier_floors=False),
+        SweepPoint(k=0.75, trades=trades[:1], equity_df=one, spread_band=(0.0, 1.0),
+                   population="time_series", tier_floors=False),
+        SweepPoint(k=0.75, trades=trades[:1], equity_df=one, spread_band=(0.0, 1.0),
+                   population="all"),
+    ]
+    cal = _flt_calibration([("KXRAIN-1", "Other"), ("KXNHLHART-27", "Other")])
+    return dataclasses.replace(sweep, tier_off_scenarios=[off, *decoys],
+                               tier_off_calibrations_by_band={(0.0, 1.0): cal})
+
+
 def _flt_payload(sweep=None):
     sweep = sweep or _flt_sweep()
     runs, primary_idx = dashboard._band_runs(sweep, sweep.primary.trades,
@@ -2539,6 +2925,22 @@ class TestFilterBandRuns:
         page_trades, page_curve = list(sweep.primary.trades), sweep.primary.equity_df.copy()
         runs, i = dashboard._band_runs(sweep, page_trades, page_curve)
         assert runs[i].trades is page_trades and runs[i].equity_df is page_curve
+
+    def test_a_point_stamped_tier_floors_off_is_never_a_tier_on_run(self):
+        # Tier-off "all" points at the primary k that land among the tier-on
+        # scenarios — one at a band the bar offers, listed after that band's
+        # own point (so a filter that ignored the stamp would keep it), one
+        # at a band no tier-on point has — are never shown as a band's run
+        # with the tier floors on (the mirror of _tier_off_runs' rule)
+        sweep = _flt_sweep()
+        narrow = sweep.scenarios[1]
+        stray = [SweepPoint(k=0.75, trades=narrow.trades[:1], equity_df=narrow.equity_df,
+                            spread_band=band, population="all", tier_floors=False)
+                 for band in ((0.3, 0.6), (0.2, 0.6))]
+        sweep = dataclasses.replace(sweep, scenarios=[*sweep.scenarios, *stray])
+        runs, _ = dashboard._band_runs(sweep, sweep.primary.trades, sweep.primary.equity_df)
+        assert [r.band for r in runs] == [(0.0, 1.0), (0.3, 0.6), (0.3, 1.0)]
+        assert runs[1].trades is narrow.trades
 
     def test_no_sweep_or_no_recorded_band_is_one_unlabelled_run(self):
         trades = _flt_trades()
@@ -2696,6 +3098,245 @@ class TestFilterViews:
         assert dashboard._sparse_on_axis(dates, [1.0] * 4, pd.DatetimeIndex([]), 2) == []
 
 
+def _runs_of(sweep: BacktestSweep) -> list:
+    """_band_runs' runs for a sweep, the page rendering its primary point."""
+    return dashboard._band_runs(sweep, sweep.primary.trades, sweep.primary.equity_df)[0]
+
+
+class TestTierOffRuns:
+    """Which run each band's "Tier floors: off" choice shows (_tier_off_runs):
+    a binding band's own tier-off simulation, a band the tiers never bind at
+    its tier-on run relabelled, and no off view at all unless the family is
+    complete."""
+
+    def test_a_binding_band_shows_its_tier_off_all_point_at_the_primary_k(self):
+        sweep = _flt_sweep_tiers()
+        runs = _runs_of(sweep)
+        assert dashboard._tier_off_binds(sweep, [r.band for r in runs]) == [True, False, False]
+        twins = dashboard._tier_off_runs(sweep, runs)
+        off = sweep.tier_off_scenarios[0]
+        assert [t.band for t in twins] == [r.band for r in runs]
+        # Never a decoy listed after it: another k, another population, or an
+        # "all" point not stamped tier-off
+        assert twins[0].trades is off.trades and twins[0].equity_df is off.equity_df
+        assert (twins[0].label, twins[0].same_as_tier_on) == ("0-1", False)
+        assert twins[0].calibration is sweep.tier_off_calibrations_by_band[(0.0, 1.0)]
+
+    def test_a_band_the_tiers_never_bind_reuses_its_run(self):
+        sweep = _flt_sweep_tiers()
+        runs = _runs_of(sweep)
+        twins = dashboard._tier_off_runs(sweep, runs)
+        for i, label in ((1, "0.3-0.6"), (2, "0.3-1")):
+            assert twins[i].trades is runs[i].trades
+            assert twins[i].equity_df is runs[i].equity_df
+            assert twins[i].calibration is runs[i].calibration
+            assert (twins[i].label, twins[i].same_as_tier_on) == (label, True)
+
+    def test_a_band_the_tiers_never_bind_reuses_its_calibration(self):
+        # The fixture's two non-binding bands carry no calibration, so the
+        # test above cannot tell a reused calibration from a dropped one:
+        # with real ones, each off view regroups its band's own
+        sweep = _flt_sweep_tiers()
+        own = {(0.3, 0.6): _flt_calibration([("KXOTHER-1", "Other")]),
+               (0.3, 1.0): _flt_calibration([("KXSPACEX-14", "Science")])}
+        sweep = dataclasses.replace(
+            sweep, calibrations_by_band={**sweep.calibrations_by_band, **own})
+        runs = _runs_of(sweep)
+        twins = dashboard._tier_off_runs(sweep, runs)
+        for i, band in ((1, (0.3, 0.6)), (2, (0.3, 1.0))):
+            assert twins[i].calibration is own[band] is runs[i].calibration
+        payload = TestFilterPayloadTierOff._payload(sweep)
+        assert payload["khat_off"][1:] == payload["khat"][1:]
+        assert None not in payload["khat_off"][1:]
+
+    def test_a_non_binding_primary_reuses_the_pages_own_run(self):
+        # The primary band's floor (0.3) sits at or above both tiers: its off
+        # view is the very run the page renders, while the binding band
+        # beside it shows its own tier-off simulation
+        sweep = _flt_sweep_tiers()
+        narrow = sweep.scenarios[1]
+        sweep = dataclasses.replace(sweep, primary=narrow, points=[narrow],
+                                    calibration=None)
+        page_trades, page_curve = list(narrow.trades), narrow.equity_df.copy()
+        runs, primary_idx = dashboard._band_runs(sweep, page_trades, page_curve)
+        twins = dashboard._tier_off_runs(sweep, runs)
+        assert runs[primary_idx].band == (0.3, 0.6)
+        assert twins[primary_idx].trades is page_trades
+        assert twins[primary_idx].equity_df is page_curve
+        assert twins[primary_idx].same_as_tier_on
+        assert twins[0].trades is sweep.tier_off_scenarios[0].trades
+
+    def test_no_off_view_unless_the_family_is_complete(self):
+        sweep = _flt_sweep_tiers()
+        runs = _runs_of(sweep)
+        off = sweep.tier_off_scenarios[0]
+        incomplete = {
+            "no sweep": None,
+            "no family": dataclasses.replace(sweep, tier_off_scenarios=[],
+                                             tier_off_calibrations_by_band={}),
+            # A binding band the family does not name: never shown tier-on
+            "binding band missing": dataclasses.replace(sweep,
+                                                        tier_off_calibrations_by_band={}),
+            # Only decoys left: no "all" point at the primary k
+            "no all point at the primary k": dataclasses.replace(
+                sweep, tier_off_scenarios=sweep.tier_off_scenarios[1:]),
+            # An "all" point at the primary k that is not stamped tier-off
+            "not stamped tier-off": dataclasses.replace(
+                sweep, tier_off_scenarios=[dataclasses.replace(off, tier_floors=True)]),
+        }
+        for why, case in incomplete.items():
+            assert dashboard._tier_off_runs(case, runs) is None, why
+        # An unrecorded band has no tier-off run to show either
+        unrecorded = [dashboard._BandRun(None, "not recorded", off.trades, off.equity_df, None)]
+        assert dashboard._tier_off_binds(sweep, [None]) is None
+        assert dashboard._tier_off_runs(sweep, unrecorded) is None
+
+    def test_no_family_means_no_off_view_even_where_no_tier_binds(self):
+        # Every band the run offers sits at or above both tiers, so each one's
+        # off view WOULD be its own tier-on run — yet a run that simulated no
+        # tier-off family has no off view at all
+        sweep = _flt_sweep()
+        narrow = sweep.scenarios[1]            # (0.3, 0.6): no tier binds there
+        sweep = dataclasses.replace(sweep, primary=narrow, points=[narrow], scenarios=[],
+                                    calibration=None)
+        runs, _ = dashboard._band_runs(sweep, narrow.trades, narrow.equity_df)
+        assert [r.band for r in runs] == [(0.3, 0.6)]
+        assert dashboard._tier_off_binds(sweep, [(0.3, 0.6)]) is None
+        assert dashboard._tier_off_runs(sweep, runs) is None
+        # The family check alone decides that: beside a non-empty family that
+        # names no offered band, the same band reads as one the tiers never
+        # bind at
+        family = dataclasses.replace(
+            sweep, tier_off_scenarios=[_flt_sweep_tiers().tier_off_scenarios[0]])
+        assert dashboard._tier_off_binds(family, [(0.3, 0.6)]) == [False]
+
+
+class TestFilterPayloadTierOff:
+    """The payload's tier-off half: every band's tier-off run beside its run,
+    parallel to it, sharing a list wherever the two traded alike."""
+
+    @staticmethod
+    def _payload(sweep=None, off: bool = True) -> dict:
+        sweep = sweep or _flt_sweep_tiers()
+        runs, primary_idx = dashboard._band_runs(sweep, sweep.primary.trades,
+                                                 sweep.primary.equity_df)
+        off_runs = dashboard._tier_off_runs(sweep, runs) if off else None
+        return dashboard._filter_payload(runs, primary_idx, _FLT_START, 1000.0,
+                                         _FLT_SERIES_TIERS, 0.75, "k = 0.75",
+                                         off_runs=off_runs)
+
+    def test_the_tier_floors_are_named_from_config(self):
+        short, long_ = config.MIN_PRICE_DIFF_SHORT_GAP, config.MIN_PRICE_DIFF_LONG_GAP
+        near, cap = config.SHORT_DEADLINE_GAP_DAYS, config.MAX_DEADLINE_GAP_DAYS
+        assert dashboard._TIER_FLOORS == f"{short:.2f}/{long_:.2f}"
+        assert dashboard._TIER_OPTION_ON == f"on ({short:.2f} / {long_:.2f} by deadline gap)"
+        assert dashboard._TIER_SELECT_TITLE == (
+            f"on — a time-series pair needs pB − pA of at least {short:.2f} when its "
+            f"deadlines are up to {near} days apart and {long_:.2f} for {near + 1}–{cap} "
+            "days, and at least the band's floor; off — the band's floor alone (the spread "
+            "must still be positive); a backtest what-if: live trading always applies the "
+            "tier floors.")
+        assert dashboard._KHAT_TEXT["khat_scope_tier_off"] == (
+            f"{{scope}}, with the {short:.2f}/{long_:.2f} tier floors off")
+
+    def test_bands_off_runs_parallel_to_bands(self):
+        payload = self._payload()
+        on, off = payload["bands"], payload["bands_off"]
+        assert [b["label"] for b in off] == ["0-1", "0.3-0.6", "0.3-1"]
+        assert [b["option"] for b in off] == ["0-1 (primary)", "0.3-0.6", "0.3-1"]
+        assert [b["note"] for b in off] == ["other_run", "other_band", "other_band"]
+        # One new list, the binding band's; the others share their band's list
+        assert [b["list"] for b in on] == [0, 1, 1]
+        assert [b["list"] for b in off] == [2, 1, 1]
+        assert len(payload["lists"]) == 3
+        floors = dashboard._TIER_FLOORS
+        never = " (they never bind at this band: its run with them on)"
+        assert [b["where"] for b in off] == [
+            f"the primary spread band 0-1 with the {floors} tier floors off",
+            f"spread band 0.3-0.6 with the {floors} tier floors off{never}",
+            f"spread band 0.3-1 with the {floors} tier floors off{never}"]
+        assert [b["scenario"] for b in off] == [f"{b['where']}, k = 0.75" for b in off]
+
+    def test_khat_off_runs_parallel_too(self):
+        payload = self._payload()
+        sweep = _flt_sweep_tiers()
+        cat_index = {c: i for i, c in enumerate(payload["categories"])}
+        sub_index = {(payload["categories"][ci], tag): i
+                     for i, (ci, tag) in enumerate(payload["subcats"])}
+        cal = sweep.tier_off_calibrations_by_band[(0.0, 1.0)]
+        assert payload["khat_off"] == [
+            dashboard._khat_band(cal, _FLT_SERIES_TIERS, cat_index, sub_index), None, None]
+        assert payload["khat_off"][0] != payload["khat"][0]
+
+    def test_categories_include_the_tier_off_runs(self):
+        payload = self._payload()
+        assert payload["categories"] == ["Climate", "Commodities", "Other", "Science", "Sports"]
+        climate = payload["categories"].index("Climate")
+        assert [climate, "Rain"] in payload["subcats"]
+        # Only the tier-off list trades in it
+        assert payload["lists"][payload["bands_off"][0]["list"]]["views"][f"c{climate}"]["n"] == 1
+        assert f"c{climate}" not in payload["lists"][0]["views"]
+
+    def test_each_half_of_the_category_union(self):
+        # A category only a tier-off run's TRADES carry (Climate: KXRAIN-1)
+        # and one only its k-hat OBSERVATIONS carry (Weather: KXSNOW-1) are
+        # both offered — the fixture's own tier-off calibration files KXRAIN
+        # as well, so the test above cannot tell the two halves apart
+        series = {**_FLT_SERIES_TIERS, "KXSNOW": ("Weather", ("Snow",))}
+        cal = _flt_calibration([("KXSNOW-1", "Other"), ("KXNHLHART-27", "Other")])
+        sweep = dataclasses.replace(_flt_sweep_tiers(),
+                                    tier_off_calibrations_by_band={(0.0, 1.0): cal})
+        runs, primary_idx = dashboard._band_runs(sweep, sweep.primary.trades,
+                                                 sweep.primary.equity_df)
+        payload = dashboard._filter_payload(
+            runs, primary_idx, _FLT_START, 1000.0, series, 0.75, "k = 0.75",
+            off_runs=dashboard._tier_off_runs(sweep, runs))
+        cats = payload["categories"]
+        assert cats == ["Climate", "Commodities", "Other", "Science", "Sports", "Weather"]
+        assert [cats.index("Climate"), "Rain"] in payload["subcats"]
+        assert [cats.index("Weather"), "Snow"] in payload["subcats"]
+
+    def test_every_tier_on_entry_is_unchanged(self):
+        with_off, without = self._payload(), self._payload(off=False)
+        fields = ("label", "option", "list", "scenario", "where", "note")
+        assert [[b[f] for f in fields] for b in with_off["bands"]] == \
+            [[b[f] for f in fields] for b in without["bands"]]
+
+    def test_without_off_runs_there_is_no_off_view(self):
+        _, _, _, payload = _flt_payload()
+        assert payload["bands_off"] is None and payload["khat_off"] is None
+        # Today's option text and today's rule: every band but the primary is
+        # its own simulation
+        assert [b["option"] for b in payload["bands"]] == [
+            "max(tier,0)-1 (primary)", "max(tier,0.3)-0.6", "max(tier,0.3)-1"]
+        assert [b["note"] for b in payload["bands"]] == [None, "other_band", "other_band"]
+
+    def test_the_note_follows_the_primary_not_the_first_band(self):
+        # The primary (0.3-0.6, whose floor the tiers never bind at) sorts
+        # SECOND: its tier-off view is the primary run itself (no note),
+        # while the binding band before it is its own simulation
+        sweep = _flt_sweep_tiers()
+        narrow = sweep.scenarios[1]
+        sweep = dataclasses.replace(sweep, primary=narrow, points=[narrow],
+                                    calibration=None)
+        payload = self._payload(sweep)
+        assert payload["primary"] == 1
+        assert [b["note"] for b in payload["bands"]] == ["other_band", None, "other_band"]
+        assert [b["note"] for b in payload["bands_off"]] == ["other_band", None, "other_band"]
+        assert payload["bands_off"][1]["option"] == "0.3-0.6 (primary)"
+        assert payload["bands_off"][1]["list"] == payload["bands"][1]["list"]
+        assert payload["bands_off"][1]["where"].startswith("the primary spread band 0.3-0.6 ")
+
+    def test_off_runs_must_be_parallel_to_the_runs(self):
+        sweep = _flt_sweep_tiers()
+        runs = _runs_of(sweep)
+        off_runs = dashboard._tier_off_runs(sweep, runs)
+        for bad in (off_runs[:-1], off_runs[::-1]):
+            with pytest.raises(ValueError):
+                dashboard._filter_payload(runs, 0, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
+                                          0.75, "k = 0.75", off_runs=bad)
+
+
 class TestFilterPage:
     """The bar, the data block and the script, on a whole rendered page."""
 
@@ -2733,6 +3374,16 @@ class TestFilterPage:
                 f"{dashboard._UNFILTERED_SECTIONS}.") in page
         assert re.search(r'Trades found: <span id="hdr-trades">5</span>', page)
 
+    def test_the_bar_names_what_it_does_not_filter(self, monkeypatch, tmp_path):
+        # Pinned by literal — every other test reads the constant itself, so
+        # a change to what the bar says of the two sections would pass them
+        assert dashboard._UNFILTERED_SECTIONS == (
+            "Interval Discount (k) Calibration and the Scenario Explorer "
+            "(which follows only the Tier floors choice)")
+        page = self._page(monkeypatch, tmp_path)
+        assert ("Not filtered by this bar: Interval Discount (k) Calibration and the "
+                "Scenario Explorer (which follows only the Tier floors choice).") in page
+
     def test_the_selects_wait_for_the_script_and_are_never_restored(
             self, monkeypatch, tmp_path):
         # Disabled until the script has inflated its data; autocomplete off,
@@ -2740,6 +3391,33 @@ class TestFilterPage:
         page = self._page(monkeypatch, tmp_path)
         for sel in ("flt-band", "flt-cat", "flt-tag"):
             assert f'<select id="{sel}" disabled autocomplete="off">' in page
+
+    @pytest.mark.parametrize("family", [True, False])
+    def test_the_tier_floors_select_offers_on_and_off(self, monkeypatch, tmp_path, family):
+        # Right after the band select, "on" preselected, disabled until the
+        # script has its data; a run with no tier-off view says so beside it
+        sweep, series = ((_flt_sweep_tiers(), _FLT_SERIES_TIERS) if family
+                         else (_flt_sweep(), _FLT_SERIES))
+        page = self._page(monkeypatch, tmp_path, sweep, series)
+        # Its title spells both rules out, escaped whole: nothing in it can
+        # end the attribute (or the tag) early
+        title = html.escape(dashboard._TIER_SELECT_TITLE)
+        assert '"' not in title and ">" not in title
+        assert (f'<select id="flt-tier" disabled autocomplete="off" title="{title}">'
+                in page)
+        assert page.index('id="flt-band"') < page.index('id="flt-tier"') \
+            < page.index('id="flt-cat"')
+        tier = re.search(r'<select id="flt-tier"[^>]*>(.*?)</select>', page).group(1)
+        assert [(value, chosen, html.unescape(text)) for value, chosen, text in re.findall(
+            r'<option value="([^"]*)"( selected)?>(.*?)</option>', tier)] == [
+            ("on", " selected", dashboard._TIER_OPTION_ON),
+            ("off", "", dashboard._TIER_OPTION_OFF)]
+        # The page parser the script tests run on still reads the select
+        parsed = _page_elements(page)["selects"]["flt-tier"]
+        assert parsed["disabled"] and [o["value"] for o in parsed["options"]] == ["on", "off"]
+        assert ('id="flt-tier-note"' in page) is not family
+        assert ("(not simulated for this run)</span>" in page) is not family
+        assert (self._data(page)["bands_off"] is None) is not family
 
     def test_the_block_is_strict_json_and_escapes_kalshi_text(self, monkeypatch, tmp_path):
         trades = [dataclasses.replace(t, title_a="</script><b>x</b>") for t in _flt_trades()]
@@ -2848,6 +3526,24 @@ class TestFilterSummary:
                        "benchmark's strategy row"):
             assert figure in sliced
 
+    def test_a_view_names_its_own_closing_note(self):
+        # The payload's "note" for the view shown, as the script appends it:
+        # the primary band's own tier-off simulation, or no note at all
+        where = ("the primary spread band 0-1 with the "
+                 f"{dashboard._TIER_FLOORS} tier floors off, k = 0.75")
+        assert dashboard._filter_summary_text(self.T, where, True, None, 6, 6,
+                                              note="other_run") == (
+            f"Showing every trade of the run at {where}: 6 trades. This is its own "
+            "simulation, not a slice of the primary run. Not filtered by this bar: "
+            f"{dashboard._UNFILTERED_SECTIONS}.")
+        # No note named: the tier-on rule, unchanged
+        assert dashboard._filter_summary_text(self.T, where, False, None, 6, 6) == \
+            dashboard._filter_summary_text(self.T, where, True, None, 6, 6,
+                                           note="other_band")
+        # A slice never carries one
+        assert "own simulation" not in dashboard._filter_summary_text(
+            self.T, where, True, "Sports", 1, 6, note="other_run")
+
     def test_counts_are_worded(self):
         assert dashboard._trade_count(1) == "1 trade"
         assert dashboard._trade_count(0) == "0 trades"
@@ -2868,8 +3564,11 @@ class TestFilterSummary:
     def test_the_script_fills_the_templates_and_writes_none_of_its_own(self):
         js = dashboard._FILTER_JS
         assert "T.all" in js and "T.slice" in js and "T.unfiltered" in js
-        for phrase in ("Showing", "contribution", "Not filtered", "its own simulation"):
-            assert phrase not in js
+        # Nor the tier-floors-off views' words: Python's scenario, note and
+        # k-hat title templates carry every one of them
+        for phrase in ("Showing", "contribution", "Not filtered", "its own simulation",
+                       "never bind", "not simulated", "floor alone", "tier floors off"):
+            assert phrase not in js, phrase
 
 
 # ─── The filter script itself, run outside a browser ─────────────────────────
@@ -2889,13 +3588,15 @@ def _js_runtime() -> str | None:
 
 def _page_elements(page: str) -> dict:
     """The selects (options, "selected", "disabled") and every chart
-    (data and layout, typed arrays decoded) of a rendered page."""
+    (data and layout, typed arrays decoded) of a rendered page. A select's
+    id may be double-quoted (the filter bar's) or single-quoted (the scenario
+    explorer's)."""
     selects = {}
-    for m in re.finditer(r'<select id="([^"]+)"([^>]*)>(.*?)</select>', page, re.S):
+    for m in re.finditer(r"""<select id=(["'])([^"']+)\1([^>]*)>(.*?)</select>""", page, re.S):
         options = [{"value": value, "text": html.unescape(text), "selected": bool(chosen)}
                    for value, chosen, text in re.findall(
-                       r'<option value="([^"]*)"( selected)?>(.*?)</option>', m.group(3))]
-        selects[m.group(1)] = {"options": options, "disabled": " disabled" in m.group(2)}
+                       r'<option value="([^"]*)"( selected)?>(.*?)</option>', m.group(4))]
+        selects[m.group(2)] = {"options": options, "disabled": " disabled" in m.group(3)}
     charts, decoder = {}, json.JSONDecoder()
     for m in re.finditer(r'Plotly\.newPlot\(\s*"([^"]+)",', page):
         i, args = m.end(), []
@@ -2921,19 +3622,49 @@ def _script_body() -> str:
     return body[:start] + "  function inflate() { return Promise.resolve(__DATA); }\n" + body[end:]
 
 
+def _explorer_body() -> str:
+    """dashboard._SCENARIO_EXPLORER_JS without its <script> tags."""
+    body = dashboard._SCENARIO_EXPLORER_JS.strip()
+    return body[len("<script>"):-len("</script>")]
+
+
+def _scn_data_text(page: str) -> str:
+    """The scn-data block's text exactly as the page carries it (a browser's
+    textContent of the element: its "</" still escaped as "<\\/", which
+    JSON.parse reads back as "</")."""
+    start = page.index('id="scn-data">') + len('id="scn-data">')
+    return page[start:page.index("</script>", start)]
+
+
 def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
-                no_decompression: bool = False) -> dict:
+                no_decompression: bool = False, explorer: bool = False,
+                strict_ids: bool = False, setup_js: str = "") -> dict:
     """
-    Run the filter script over a rendered page under tests/js/filter_harness.js.
+    Run the page's scripts — the filter script, and with explorer=True the
+    scenario explorer's before it — over a rendered page under
+    tests/js/filter_harness.js.
+
+    The filter script runs only when the page carries it (its data block): a
+    page whose filter could not be built is written without the bar and its
+    script, so it runs without them here too.
 
     Args:
         tmp_path (Path): Where the assembled program is written.
         page (str): The rendered page.
         steps (list): The harness's steps (["wait"], ["set", id, value],
-            ["fire", id], ["zoom", id], ["hide", id], ["snap", name]).
-        pre (tuple): (select id, value) pairs set BEFORE the script runs — a
+            ["fire", id], ["zoom", id], ["hide", id], ["select", id],
+            ["menu", id, i], ["snap", name]).
+        pre (tuple): (select id, value) pairs set BEFORE the scripts run — a
             browser restoring a reader's last choice.
         no_decompression (bool): Run as a browser without DecompressionStream.
+        explorer (bool): Also run the scenario explorer's script, with its
+            data block's text, BEFORE the filter script — the page's own
+            order. False (default) runs the filter script alone.
+        strict_ids (bool): The harness's strict mode — getElementById reads
+            null for an id the page does not carry, as a browser's does —
+            instead of creating an element for any id (default False).
+        setup_js (str): JavaScript run after the page is set up and before
+            the scripts — to take something off the page Python drew.
 
     Returns:
         dict: The snapshots the steps took, by name.
@@ -2941,14 +3672,25 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
     runtime = _js_runtime()
     if runtime is None:
         pytest.skip("no JavaScript runtime (node or jsc) to run the filter script with")
+    elements = _page_elements(page)
+    if explorer:
+        assert dashboard._SCENARIO_EXPLORER_JS in page
+        elements["texts"] = {"scn-data": _scn_data_text(page)}
+    if strict_ids:
+        # Every id attribute on the page, double- or single-quoted
+        elements["ids"] = sorted({m.group(2) for m in
+                                  re.finditer(r"""\bid=(["'])([^"']+)\1""", page)})
+    has_filter = 'id="dash-data"' in page
     program = "\n".join([
         _JS_HARNESS.read_text(encoding="utf-8"),
-        f"var __PAGE = {json.dumps(_page_elements(page))};",
-        f"var __DATA = {json.dumps(TestFilterPage._data(page))};",
+        f"var __PAGE = {json.dumps(elements)};",
+        f"var __DATA = {json.dumps(TestFilterPage._data(page) if has_filter else None)};",
         "__setup(__PAGE);",
         *(f"document.getElementById({json.dumps(i)}).value = {json.dumps(v)};" for i, v in pre),
+        setup_js,
         "window.DecompressionStream = undefined;" if no_decompression else "",
-        _script_body(),
+        _explorer_body() if explorer else "",
+        _script_body() if has_filter else "",
         f"__step({json.dumps(steps)}, 0);",
     ])
     path = tmp_path / "filter_run.js"
@@ -2976,20 +3718,25 @@ class TestFilterScript:
     """The page-wide filter script, run over the page Python rendered: what it
     draws, writes and enables for each choice. Skipped without a runtime."""
 
-    def _page(self, monkeypatch, tmp_path, sweep=None) -> str:
-        return TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+    def _page(self, monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> str:
+        return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
 
     def test_on_load_the_bar_is_reset_disabled_and_nothing_is_drawn(
             self, monkeypatch, tmp_path):
-        # A browser restored a reader's last choice (band 1, category 1)
+        # A browser restored a reader's last choice (band 1, category 1,
+        # tier floors off)
         page = self._page(monkeypatch, tmp_path)
         snaps = _run_script(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                            pre=(("flt-band", "1"), ("flt-cat", "1")))
+                            pre=(("flt-band", "1"), ("flt-cat", "1"), ("flt-tier", "off")))
         loaded, ready = snaps["loaded"], snaps["ready"]
         assert {i: loaded["selects"][i]["value"] for i in _FLT_SELECTS} == {
             "flt-band": "0", "flt-cat": "", "flt-tag": ""}
         assert all(loaded["selects"][i]["disabled"] for i in _FLT_SELECTS)
         assert not any(ready["selects"][i]["disabled"] for i in _FLT_SELECTS)
+        # The tier select is set back to "on" too; this run has no tier-off
+        # view, so it stays disabled once the data is in
+        assert loaded["selects"]["flt-tier"]["value"] == "on"
+        assert loaded["selects"]["flt-tier"]["disabled"] and ready["selects"]["flt-tier"]["disabled"]
         assert loaded["reacts"] == ready["reacts"] == []
 
     def test_every_redraw_is_the_chart_python_drew_for_that_view(
@@ -3149,15 +3896,610 @@ class TestFilterScript:
         assert (snap["display"]["khat-body"], snap["display"]["khat-empty"]) == ("none", "")
         assert snap["text"]["khat-empty"] == data["text"]["khat_not_recorded"]
 
-    def test_a_browser_that_cannot_inflate_keeps_the_bar_disabled(
+    def test_tier_floors_off_switches_every_filtered_section_and_back(
             self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, _flt_sweep_tiers(), _FLT_SERIES_TIERS)
+        data = TestFilterPage._data(page)
+        python = _page_elements(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "on"]])
+        ready, off, on = snaps["ready"], snaps["off"], snaps["on"]
+        assert not ready["selects"]["flt-tier"]["disabled"]
+        n = len(data["dates"])
+        off_list = data["lists"][data["bands_off"][0]["list"]]
+        n_off = off_list["views"]["all"]["n"]
+        assert n_off == 6
+        # The primary band's tier-off run: its own simulation, in Python's words
+        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], data["bands_off"][0]["scenario"], True, None, n_off, n_off,
+            note="other_run")
+        assert off["text"]["hdr-trades"] == off["text"]["kpi-trades"] == "6"
+        assert [text for _, text in off["selects"]["flt-band"]["options"]] == [
+            "0-1 (primary)", "0.3-0.6", "0.3-1"]
+        # Category counts come from the tier-off list
+        cats = [text for _, text in off["selects"]["flt-cat"]["options"]]
+        assert cats == ["All categories"] + [
+            f"{c} ({off_list['views'][f'c{i}']['n'] if f'c{i}' in off_list['views'] else 0})"
+            for i, c in enumerate(data["categories"])]
+        assert "Climate (1)" in cats
+        assert _last_react(off, "perf-cum")["data"][0]["y"] == pytest.approx(
+            _expand(off_list["views"]["all"]["total"], n))
+        # Back on: the page exactly as Python rendered it
+        assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], data["bands"][0]["scenario"], True, None, 5, 5)
+        assert html.escape(on["text"]["flt-summary"]) in page
+        assert on["text"]["hdr-trades"] == "5"
+        for sel in ("flt-band", "flt-cat"):
+            assert [text for _, text in on["selects"][sel]["options"]] == [
+                o["text"] for o in python["selects"][sel]["options"]], sel
+        assert _last_react(on, "perf-cum")["data"][0]["y"] == pytest.approx(
+            python["charts"]["perf-cum"]["data"][0]["y"], abs=0.006)
+
+    def test_without_a_family_the_tier_select_stays_shut(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "fired"]])
+        ready, fired = snaps["ready"], snaps["fired"]
+        assert ready["selects"]["flt-tier"]["disabled"]
+        assert not ready["selects"]["flt-band"]["disabled"]
+        # Firing it anyway changes nothing: nothing redrawn, rewritten or relabelled
+        assert fired["reacts"] == [] and fired["text"] == ready["text"]
+        assert fired["selects"]["flt-band"]["options"] == ready["selects"]["flt-band"]["options"]
+
+    def test_the_khat_chart_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, _flt_sweep_tiers(), _FLT_SERIES_TIERS)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "by_category"],
+            ["set", "khat-group", "band"], ["fire", "khat-group"], ["snap", "by_band"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "by_band_on"]])
+        # By category: the primary band's tier-off calibration, named so
+        react = _last_react(snaps["by_category"], "khat-fig")
+        assert react["layout"]["title"]["text"] == (
+            f"Empirical k̂ by category — {data['bands_off'][0]['where']}")
+        assert react["data"][0]["y"] == ["All categories", "Climate", "Sports"]
+        # By band: every band as the tiers-off setting names it, the binding
+        # band's bar from its tier-off calibration
+        react = _last_react(snaps["by_band"], "khat-fig")
+        first = data["khat_off"][0]["groups"]["all"]
+        assert first != data["khat"][0]["groups"]["all"]
+        assert react["data"][0]["y"] == ["0-1", "0.3-0.6", "0.3-1"]
+        assert react["data"][0]["x"][0] == first["k"]
+        assert (react["data"][0]["text"][0], react["data"][0]["customdata"][0]) == (
+            first["text"], first["cells"])
+        assert snaps["by_band"]["rows"]["khat-rows"][0] == ["0-1", *first["cells"]]
+        # ... and its title names the setting, in Python's words — which a
+        # band grouping's scope ("all categories") would not otherwise do
+        T = data["text"]
+        assert react["layout"]["title"]["text"] == T["khat_title"].format(
+            group=T["khat_group_words"]["band"],
+            scope=T["khat_scope_tier_off"].format(scope=T["khat_every_category"]))
+        assert react["layout"]["title"]["text"] == (
+            "Empirical k̂ by spread band — all categories, with the "
+            f"{dashboard._TIER_FLOORS} tier floors off")
+        # Back on, still by band: the title the tier-on bar has always drawn
+        react = _last_react(snaps["by_band_on"], "khat-fig")
+        assert react["layout"]["title"]["text"] == "Empirical k̂ by spread band — all categories"
+        assert react["data"][0]["y"] == [b["label"] for b in data["bands"]]
+
+    def test_with_the_tiers_off_a_slice_and_another_band_read_as_python_words_them(
+            self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, _flt_sweep_tiers(), _FLT_SERIES_TIERS)
+        data = TestFilterPage._data(page)
+        off = data["bands_off"]
+        climate = str(data["categories"].index("Climate"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"],
+            ["set", "flt-cat", climate], ["fire", "flt-cat"], ["snap", "slice"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"],
+            ["set", "flt-cat", ""], ["fire", "flt-cat"], ["snap", "band1"]])
+        # A slice of the primary band's tier-off run: that run's scenario
+        n_off = data["lists"][off[0]["list"]]["views"]["all"]["n"]
+        assert snaps["slice"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], off[0]["scenario"], True, "Climate", 1, n_off)
+        assert snaps["slice"]["text"]["hdr-trades"] == "1"
+        # Another band, one the tiers never bind at: its own run, named as
+        # such, closing on the other-band note its entry carries
+        n1 = data["lists"][off[1]["list"]]["views"]["all"]["n"]
+        assert off[1]["note"] == "other_band"
+        assert snaps["band1"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], off[1]["scenario"], False, None, n1, n1, note="other_band")
+        assert snaps["band1"]["text"]["hdr-trades"] == str(n1)
+
+    def test_the_khat_notice_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
+        # The primary band has a tier-off calibration but no tier-on one: an
+        # empty selection with the tiers off was measured and found nothing
+        # ("none"); with them on the band has no calibration ("not recorded")
+        sweep = _flt_sweep_tiers()
+        sweep = dataclasses.replace(sweep, calibration=None, calibrations_by_band={
+            **sweep.calibrations_by_band, (0.0, 1.0): None})
+        page = self._page(monkeypatch, tmp_path, sweep, _FLT_SERIES_TIERS)
+        data = TestFilterPage._data(page)
+        assert data["khat"][0] is None and data["khat_off"][0] is not None
+        commodities = data["categories"].index("Commodities")
+        assert f"c{commodities}" not in data["khat_off"][0]["groups"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "khat-group", "tag"], ["fire", "khat-group"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"],
+            ["set", "flt-cat", str(commodities)], ["fire", "flt-cat"], ["snap", "off"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "on"]])
+        for name, notice in (("off", "khat_none"), ("on", "khat_not_recorded")):
+            snap = snaps[name]
+            assert (snap["display"]["khat-body"], snap["display"]["khat-empty"]) \
+                == ("none", ""), name
+            assert snap["text"]["khat-empty"] == data["text"][notice], name
+
+    def test_the_off_view_is_the_page_python_draws_for_the_tier_off_run(
+            self, monkeypatch, tmp_path):
+        # The primary band's tier-off view, drawn by the script, against the
+        # page Python renders when that tier-off run IS the run it is given:
+        # every redrawn chart but the k-hat one (which regroups a calibration,
+        # not trades), every card and every table Python writes
+        sweep = _flt_sweep_tiers()
+        page = self._page(monkeypatch, tmp_path, sweep, _FLT_SERIES_TIERS)
+        off = sweep.tier_off_scenarios[0]
+        python_page = dashboard.generate_dashboard(
+            off.trades, off.equity_df, _FLT_START, 1000.0, sweep=sweep,
+            interval_discount=0.75, series_categories=_FLT_SERIES_TIERS,
+        ).read_text(encoding="utf-8")
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"]])["off"]
+        charts = _page_elements(python_page)["charts"]
+        drawn = {r["id"]: r for r in snap["reacts"]}
+        assert set(drawn) == _charts_redrawn()
+        for cid in sorted(_charts_redrawn() - {"khat-fig"}):
+            react = drawn[cid]
+            assert react["layout"] == charts[cid]["layout"], cid
+            for i, trace in enumerate(charts[cid]["data"]):
+                got = react["data"][i]
+                for key in ("x", "y", "text", "name"):
+                    if isinstance(trace.get(key), list) and trace[key] \
+                            and isinstance(trace[key][0], (int, float)):
+                        assert got[key] == pytest.approx(trace[key], abs=0.006), (cid, i, key)
+                    elif key in trace:
+                        assert got[key] == trace[key], (cid, i, key)
+        kpis = dict(re.findall(r'<div id="kpi-([a-z_]+)" style="[^"]*">(.*?)</div>',
+                               python_page))
+        assert {k[4:]: v for k, v in snap["text"].items() if k.startswith("kpi-")} == kpis
+        assert snap["text"]["hdr-trades"] == str(len(off.trades)) == "6"
+        assert f'<div id="dec-table">{snap["html"]["dec-table"]}</div>' in python_page
+        for part in ("diag-best", "diag-worst"):
+            assert f'<tbody id="{part}">{snap["html"][part]}</tbody>' in python_page, part
+
+    def test_a_real_tier_off_sweep_offers_a_different_off_view(self, monkeypatch, tmp_path):
+        # run_backtest_sweep itself, over TestPrepareEntriesGolden's fixture,
+        # each band at the primary k only (sweep=False): with the tiers off
+        # its ladder enters on 2026-01-05 instead of 2026-01-12, so the
+        # primary band's off run trades differently from its on run
+        from . import test_backtester
+        golden = test_backtester.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        sweep = backtester.run_backtest_sweep(
+            hist_client=MagicMock(), live_client=MagicMock(), start_date=golden._START,
+            initial_balance=10_000.0, sweep=False, same_event_ladders=True,
+            band_sweep=True, tier_off_sweep=True)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            sweep.primary.trades, sweep.primary.equity_df, golden._START, 10_000.0,
+            sweep=sweep).read_text(encoding="utf-8")
+        data = TestFilterPage._data(page)
+        bands = len(config.SPREAD_BAND_SWEEP_FLOORS) * len(config.SPREAD_BAND_SWEEP_CEILINGS)
+        assert len(data["bands"]) == len(data["bands_off"]) == bands
+        assert 'id="flt-tier-note"' not in page
+        primary = data["primary"]
+        assert data["bands_off"][primary]["list"] != data["bands"][primary]["list"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"]])
+        assert not snaps["ready"]["selects"]["flt-tier"]["disabled"]
+        on_y = _page_elements(page)["charts"]["perf-cum"]["data"][0]["y"]
+        off_y = _last_react(snaps["off"], "perf-cum")["data"][0]["y"]
+        assert off_y != pytest.approx(on_y, abs=0.006)
+        assert snaps["off"]["text"]["flt-summary"].startswith(
+            "Showing every trade of the run at the primary spread band 0-1 with the "
+            f"{dashboard._TIER_FLOORS} tier floors off, ")
+
+    @pytest.mark.parametrize("family", [False, True])
+    def test_a_browser_that_cannot_inflate_keeps_the_bar_disabled(
+            self, monkeypatch, tmp_path, family):
+        # With a tier-off view in the data or without, nothing is enabled
+        page = (self._page(monkeypatch, tmp_path, _flt_sweep_tiers(), _FLT_SERIES_TIERS)
+                if family else self._page(monkeypatch, tmp_path))
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
-        assert all(snap["selects"][i]["disabled"] for i in (*_FLT_SELECTS, "khat-group"))
+        assert all(snap["selects"][i]["disabled"]
+                   for i in (*_FLT_SELECTS, "flt-tier", "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
         assert snap["reacts"] == []
+
+
+def _kpi_trades(snap: dict) -> list[tuple[str, str]]:
+    """(population label, trade count) of every row of the explorer's KPI
+    table as the script last wrote it (its sub-rows carry no count)."""
+    cell = '<td style="padding:6px 16px;">'
+    return re.findall(rf'<tr style="border-bottom:1px solid #E0E0E0">{cell}([^<]*)</td>'
+                      rf"{cell}([^<]*)</td>", snap["html"]["scn-kpi-body"])
+
+
+def _explorer_calls(snap: dict, fn: str | None = None, chart: str | None = None) -> list[dict]:
+    """The Plotly calls a snapshot recorded on the explorer's charts (its
+    ids start "scn-"), in order — optionally only one function's, and only
+    one chart's."""
+    return [c for c in snap["calls"]
+            if c["id"].startswith("scn-") and (fn is None or c["fn"] == fn)
+            and (chart is None or c["id"] == chart)]
+
+
+def _heatmap_calls(snap: dict) -> list[tuple[str, str]]:
+    """(function, chart) of every Plotly call a snapshot recorded on the
+    explorer's heatmaps — every explorer call but the curve's."""
+    return [(c["fn"], c["id"]) for c in _explorer_calls(snap) if c["id"] != "scn-equity"]
+
+
+class TestScenarioExplorerScript:
+    """The scenario explorer's script, run with the page-wide filter script
+    over the page Python rendered: it follows the bar's Tier floors select —
+    only while the bar has enabled it, and only when the section drew an off
+    view of its own. Skipped without a runtime."""
+
+    TS = _TS_LABEL
+    # A KPI / calibration table cell, as the script writes one
+    TD = '<td style="padding:6px 16px;">'
+
+    @staticmethod
+    def _page(monkeypatch, tmp_path, sweep) -> str:
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        return dashboard.generate_dashboard(
+            sweep.primary.trades, sweep.primary.equity_df, date(2026, 1, 5), 1000.0,
+            sweep=sweep).read_text(encoding="utf-8")
+
+    def _rows(self, ts: str, ladder: str, cross: str, all_: str) -> list[tuple[str, str]]:
+        # Same-title's row is the same under both Tier floors settings
+        return [(self.TS, ts), ("Ladders (same-event)", ladder), ("Cross-event", cross),
+                ("All (time-series + same-title)", all_),
+                ("Same-title (independent of band, k and the tier floors)", "7")]
+
+    @staticmethod
+    def _assert_no_off_view(page: str) -> None:
+        # No off block, no tier-off cells, no off title: an explorer tier-on
+        # whatever the bar's Tier floors select reads
+        assert 'id="scn-tier-off"' not in page and 'id="scn-heat-off"' not in page
+        data = _scn_data(page)
+        for key in ("tier_binds", "cells_off", "calibration_by_band_off", "band_options_off"):
+            assert data[key] is None, key
+        assert data["curve_titles"][1] is None
+
+    def test_the_explorer_follows_the_tier_floors_select_and_back(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        data = _scn_data(page)
+        charts = _page_elements(page)["charts"]
+        ts = data["populations"].index("time_series")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "scn-band-select", "0"], ["fire", "scn-band-select"],
+            ["snap", "on0"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"],
+            ["set", "scn-band-select", "1"], ["fire", "scn-band-select"], ["snap", "off1"],
+            ["set", "scn-band-select", "0"], ["fire", "scn-band-select"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "on"]], explorer=True)
+        on0, off, off1, on = snaps["on0"], snaps["off"], snaps["off1"], snaps["on"]
+        assert not on0["selects"]["flt-tier"]["disabled"]
+        # Band 0 (the one a tier binds at), k 0.75: its tier-on cell ...
+        assert _kpi_trades(on0) == self._rows("2", "11", "21", "2")
+        assert "0-7d" in on0["html"]["scn-cal-body"]
+        # ... then, with the tiers off, the block Python drew for them
+        assert (off["display"]["scn-tier-on"], off["display"]["scn-tier-off"]) == ("none", "")
+        assert [text for _, text in off["selects"]["scn-band-select"]["options"]] == \
+            data["band_options_off"] == ["0-1", "0.3-0.6 (primary)", "0.35-0.8"]
+        assert off["selects"]["scn-band-select"]["value"] == "0"
+        # ... its tier-off cell in the KPI table, calibration and curve
+        assert _kpi_trades(off) == self._rows("31", "51", "61", "41")
+        assert "16-30d" in off["html"]["scn-cal-body"]
+        assert "0-7d" not in off["html"]["scn-cal-body"]
+        curve = _explorer_calls(off, "update", chart="scn-equity")
+        assert curve[-1]["data"]["y"] == [data["cells_off"][0][1][ts]["equity"]]
+        # ... and the heatmap now shown takes the metric the other showed (0),
+        # then is resized, since it was drawn hidden
+        button = charts["scn-heat-off"]["layout"]["updatemenus"][0]["buttons"][0]
+        assert _heatmap_calls(off) == [
+            ("update", "scn-heat-off"), ("relayout", "scn-heat-off"),
+            ("resize", "scn-heat-off")]
+        update = _explorer_calls(off, "update", chart="scn-heat-off")[0]
+        relayout = _explorer_calls(off, "relayout", chart="scn-heat-off")[0]
+        assert (update["data"], update["layout"]) == (button["args"][0], button["args"][1])
+        assert relayout["layout"] == {"updatemenus[0].active": 0}
+        # A band the tiers never bind at reads its tier-on cell and calibration
+        assert _kpi_trades(off1) == self._rows("4", "13", "23", "4")
+        assert "8-15d" in off1["html"]["scn-cal-body"]
+        assert _heatmap_calls(off1) == []
+        # Back on: the page as Python rendered it
+        assert (on["display"]["scn-tier-on"], on["display"]["scn-tier-off"]) == ("", "none")
+        assert [text for _, text in on["selects"]["scn-band-select"]["options"]] == \
+            data["band_options"]
+        assert _kpi_trades(on) == _kpi_trades(on0)
+        assert on["html"]["scn-cal-body"] == on0["html"]["scn-cal-body"]
+        # ... the tier-on heatmap replaying the metric the off one showed (0)
+        # and its menu set back to it — the relayout's effect on the chart,
+        # with no menu step in this round trip — then resized
+        button = charts["scn-heat"]["layout"]["updatemenus"][0]["buttons"][0]
+        assert _heatmap_calls(on) == [
+            ("update", "scn-heat"), ("relayout", "scn-heat"), ("resize", "scn-heat")]
+        update = _explorer_calls(on, "update", chart="scn-heat")[0]
+        assert (update["data"], update["layout"]) == (button["args"][0], button["args"][1])
+        assert _explorer_calls(on, "relayout", chart="scn-heat")[0]["layout"] == {
+            "updatemenus[0].active": 0}
+        heat = on["layouts"]["scn-heat"]
+        assert heat["updatemenus"][0]["active"] == 0
+        assert heat["title"]["text"] == button["args"][1]["title.text"]
+        assert _explorer_calls(on, "update", chart="scn-equity")[-1]["data"]["y"] == [
+            data["cells"][0][1][ts]["equity"]]
+
+    def test_the_metric_carries_across_a_toggle(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        charts = _page_elements(page)["charts"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["menu", "scn-heat", 2],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"],
+            ["menu", "scn-heat-off", 4],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "on"]], explorer=True)
+        for name, chart, i in (("off", "scn-heat-off", 2), ("on", "scn-heat", 4)):
+            button = charts[chart]["layout"]["updatemenus"][0]["buttons"][i]
+            assert _heatmap_calls(snaps[name]) == [
+                ("update", chart), ("relayout", chart), ("resize", chart)], name
+            update = _explorer_calls(snaps[name], "update", chart=chart)
+            assert [(c["data"], c["layout"]) for c in update] == [
+                (button["args"][0], button["args"][1])], name
+            assert _explorer_calls(snaps[name], "relayout", chart=chart)[0]["layout"] == {
+                "updatemenus[0].active": i}, name
+            # ... the chart's own menu now reads that metric, and its title too
+            layout = snaps[name]["layouts"][chart]
+            assert layout["updatemenus"][0]["active"] == i, name
+            assert layout["title"]["text"] == button["args"][1]["title.text"], name
+
+    @pytest.mark.parametrize("family", [True, False], ids=["tier-off-family", "no-family"])
+    def test_a_bar_that_is_not_live_changes_nothing(self, monkeypatch, tmp_path, family):
+        # With the family, a browser that cannot inflate the bar's data never
+        # enables the Tier floors select; without it, the bar keeps it shut.
+        # Either way a change event reaching it moves nothing in the explorer.
+        page = self._page(monkeypatch, tmp_path,
+                          _Grid.sweep_tiers() if family else _Grid.sweep())
+        data = _scn_data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "fired"]],
+            explorer=True, no_decompression=family)
+        ready, fired = snaps["ready"], snaps["fired"]
+        assert ready["selects"]["flt-tier"]["disabled"]
+        # The explorer drew its primary cell on load, with the floors on ...
+        ts = data["populations"].index("time_series")
+        assert _explorer_calls(ready, "update", chart="scn-equity")[0]["data"]["y"] == [
+            data["cells"][1][1][ts]["equity"]]
+        # ... and the event moves nothing: no call, no block shown or hidden,
+        # no option renamed, no table rewritten
+        assert _explorer_calls(fired) == []
+        assert "scn-tier-on" not in fired["display"] and "scn-tier-off" not in fired["display"]
+        assert fired["selects"]["scn-band-select"] == ready["selects"]["scn-band-select"]
+        assert fired["html"]["scn-kpi-body"] == ready["html"]["scn-kpi-body"]
+        assert fired["html"]["scn-cal-body"] == ready["html"]["scn-cal-body"]
+
+    def test_an_explorer_without_a_complete_family_stays_on(self, monkeypatch, tmp_path):
+        # The bar is live with an off view (its bands are the primary k's),
+        # but the explorer's grid holds one more band the tiers bind at — its
+        # only point at another k — that the family does not name: the
+        # explorer has no off view, so it does not follow the bar's choice.
+        # A hand-built shape run_backtest_sweep never builds, and the one in
+        # which the bar's note that the explorer "follows only the Tier
+        # floors choice" overstates (see dashboard._tier_off_binds)
+        sweep = _Grid.sweep_tiers()
+        extra = _scn_point((0.2, 0.6), 0.65, "all")
+        sweep = dataclasses.replace(sweep, scenarios=[*sweep.scenarios, extra])
+        page = self._page(monkeypatch, tmp_path, sweep)
+        assert 'id="scn-tier-off"' not in page and _scn_data(page)["cells_off"] is None
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"]],
+            explorer=True)
+        ready, off = snaps["ready"], snaps["off"]
+        assert not ready["selects"]["flt-tier"]["disabled"]
+        # The bar followed its own choice ...
+        assert off["reacts"]
+        assert "tier floors off" in off["text"]["flt-summary"]
+        # ... and the explorer did not
+        assert _explorer_calls(off) == []
+        assert "scn-tier-on" not in off["display"]
+        assert off["selects"]["scn-band-select"] == ready["selects"]["scn-band-select"]
+        assert off["html"]["scn-kpi-body"] == ready["html"]["scn-kpi-body"]
+
+    def test_a_page_whose_bar_could_not_be_built_draws_no_off_view(self, monkeypatch, tmp_path):
+        # The filter's payload fails: the page is written without the bar and
+        # its script, so no Tier floors select could ever show the explorer's
+        # off block — Python draws none, and ships no tier-off cells
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        assert 'id="flt-unavailable"' in page and 'id="flt-tier"' not in page
+        self._assert_no_off_view(page)
+        # Under strict ids (no flt-tier on this page reads null, as in a
+        # browser) the script loads without an error and draws the primary
+        # cell with the floors on; with no Tier floors select to follow, a
+        # change event on its own band select renders the tier-on cell and
+        # touches no tier block and no heatmap
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "scn-band-select", "0"], ["fire", "scn-band-select"], ["snap", "band0"]],
+            explorer=True, strict_ids=True)
+        ready, band0 = snaps["ready"], snaps["band0"]
+        assert "flt-tier" not in ready["selects"]
+        assert _kpi_trades(ready) == self._rows("4", "13", "23", "4")
+        assert _kpi_trades(band0) == self._rows("2", "11", "21", "2")
+        assert "0-7d" in band0["html"]["scn-cal-body"]
+        assert _heatmap_calls(band0) == []
+        assert "scn-tier-on" not in band0["display"]
+
+    def test_a_bar_with_no_off_view_draws_none_in_the_explorer(self, monkeypatch, tmp_path):
+        # The family lacks band 0's tier-off "all" point at the primary k, so
+        # the bar has no off view (_tier_off_runs) — though the explorer's own
+        # grid names every band the tiers bind at. The explorer follows only
+        # the bar, so it draws no off view either
+        sweep = _Grid.sweep_tiers()
+        sweep = dataclasses.replace(sweep, tier_off_scenarios=[
+            pt for pt in sweep.tier_off_scenarios
+            if not (pt.population == "all" and pt.k == sweep.primary.k)])
+        assert dashboard._tier_off_binds(sweep, _Grid.BANDS) == [True, False, False]
+        page = self._page(monkeypatch, tmp_path, sweep)
+        assert 'id="flt-tier-note"' in page
+        self._assert_no_off_view(page)
+        # Strict ids too: the select stays shut, and a change event reaching
+        # it moves nothing; the explorer's own selects read tier-on cells
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "fired"],
+            ["set", "scn-band-select", "0"], ["fire", "scn-band-select"], ["snap", "band0"]],
+            explorer=True, strict_ids=True)
+        ready, fired, band0 = snaps["ready"], snaps["fired"], snaps["band0"]
+        assert ready["selects"]["flt-tier"]["disabled"]
+        assert _explorer_calls(fired) == []
+        assert fired["html"]["scn-kpi-body"] == ready["html"]["scn-kpi-body"]
+        assert _kpi_trades(band0) == self._rows("2", "11", "21", "2")
+        assert _heatmap_calls(band0) == []
+        assert "scn-tier-on" not in band0["display"]
+
+    def test_a_zoom_never_carries_into_another_view(self, monkeypatch, tmp_path):
+        # A reader zooms the curve, then changes the Tier floors setting, the
+        # band or k: every redraw autoranges both axes (a Plotly.update), so
+        # the next curve is never drawn inside the last one's zoom
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["zoom", "scn-equity"], ["snap", "zoomed"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "tier"],
+            ["zoom", "scn-equity"],
+            ["set", "scn-band-select", "0"], ["fire", "scn-band-select"], ["snap", "band"],
+            ["zoom", "scn-equity"],
+            ["set", "scn-k-select", "0"], ["fire", "scn-k-select"], ["snap", "k"]],
+            explorer=True)
+        # The zoom took: the reader's range, autorange off ...
+        assert snaps["zoomed"]["layouts"]["scn-equity"]["xaxis"]["autorange"] is False
+        # ... and each change redraws the curve with both axes autoranged
+        for name in ("tier", "band", "k"):
+            layout = snaps[name]["layouts"]["scn-equity"]
+            assert layout["xaxis"]["autorange"] is True, name
+            assert layout["yaxis"]["autorange"] is True, name
+            redraw = _explorer_calls(snaps[name], "update", chart="scn-equity")[-1]
+            assert redraw["layout"] == {"xaxis.autorange": True, "yaxis.autorange": True}, name
+        # The curve is never restyled (a restyle would leave the zoom in place)
+        assert not any(_explorer_calls(s, "restyle") for s in snaps.values())
+
+    def test_the_curve_is_titled_for_the_setting_shown(self, monkeypatch, tmp_path):
+        # The off title names the setting, as the off heatmap's does; both
+        # titles are Python's, from the data block — the script words none
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        data = _scn_data(page)
+        rendered = _page_elements(page)["charts"]["scn-equity"]["layout"]["title"]["text"]
+        assert data["curve_titles"] == [rendered, rendered + " — tier floors off"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["snap", "on"]], explorer=True)
+        assert _explorer_calls(snaps["ready"], "relayout", chart="scn-equity") == []
+        assert snaps["ready"]["layouts"]["scn-equity"]["title"]["text"] == rendered
+        for name, title in (("off", data["curve_titles"][1]), ("on", rendered)):
+            assert [c["layout"] for c in _explorer_calls(snaps[name], "relayout",
+                                                         chart="scn-equity")] == [
+                {"title.text": title}], name
+            assert snaps[name]["layouts"]["scn-equity"]["title"]["text"] == title, name
+
+    def test_the_tables_and_curve_read_the_setting_shown(self, monkeypatch, tmp_path):
+        # The Tier floors select changed without its change event (a script
+        # setting it, say): the blocks on the page still show the setting
+        # before, and so must the KPI table, the calibration table and the
+        # curve a band or k change redraws — both ways round
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        data = _scn_data(page)
+        ts = data["populations"].index("time_series")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"],
+            ["set", "scn-band-select", "0"], ["fire", "scn-band-select"], ["snap", "still_on"],
+            ["fire", "flt-tier"], ["snap", "off"],
+            ["set", "flt-tier", "on"],
+            ["set", "scn-k-select", "0"], ["fire", "scn-k-select"], ["snap", "still_off"]],
+            explorer=True)
+        still_on, off, still_off = snaps["still_on"], snaps["off"], snaps["still_off"]
+        # Band 0, k 0.75, the blocks showing the floors on: its tier-on cell
+        assert "scn-tier-on" not in still_on["display"]
+        assert _kpi_trades(still_on) == self._rows("2", "11", "21", "2")
+        assert "0-7d" in still_on["html"]["scn-cal-body"]
+        assert _explorer_calls(still_on, "update", chart="scn-equity")[-1]["data"]["y"] == [
+            data["cells"][0][1][ts]["equity"]]
+        # The change event lands: the off block, and band 0's tier-off cell
+        assert (off["display"]["scn-tier-on"], off["display"]["scn-tier-off"]) == ("none", "")
+        assert _kpi_trades(off) == self._rows("31", "51", "61", "41")
+        # Band 0, k 0.65, the blocks still showing the floors off: its
+        # tier-off cell, calibration and curve, though the select reads on
+        assert (still_off["display"]["scn-tier-on"],
+                still_off["display"]["scn-tier-off"]) == ("none", "")
+        assert _kpi_trades(still_off) == self._rows("30", "50", "60", "40")
+        assert "16-30d" in still_off["html"]["scn-cal-body"]
+        assert _explorer_calls(still_off, "update", chart="scn-equity")[-1]["data"]["y"] == [
+            data["cells_off"][0][0][ts]["equity"]]
+        assert _heatmap_calls(still_off) == []
+
+    def test_a_floor_0_tier_reads_as_a_dash(self, monkeypatch, tmp_path):
+        # A tier-off calibration at a floor of 0 labels its buckets with that
+        # floor alone, 0.0, which the data block ships as null: the table the
+        # script draws prints "—" there, as for the pooled row — never 0.00
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "scn-band-select", "0"], ["fire", "scn-band-select"],
+            ["snap", "on"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"]],
+            explorer=True)
+        td = self.TD
+        on, off = snaps["on"]["html"]["scn-cal-body"], snaps["off"]["html"]["scn-cal-body"]
+        assert f"{td}0-7d</td>{td}0.15</td>{td}6</td>" in on
+        assert f"{td}16-30d</td>{td}—</td>{td}7</td>" in off
+        assert f"{td}POOLED</td>{td}—</td>{td}12</td>" in off
+        assert f"{td}0.00</td>" not in off
+
+    def test_the_top_event_is_escaped(self, monkeypatch, tmp_path):
+        # The top event's ticker is Kalshi-controlled: the script escapes it
+        # (esc) before it reaches the KPI table's HTML
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep(top_event="EVT-</script><b>x"))
+        kpi = _run_script(tmp_path, page, [["wait"], ["snap", "ready"]],
+                          explorer=True)["ready"]["html"]["scn-kpi-body"]
+        assert "Top event: EVT-&lt;/script&gt;&lt;b&gt;x (" in kpi
+        assert "<b>x" not in kpi and "</script>" not in kpi
+
+    @pytest.mark.parametrize("missing", ["scn-heat", "scn-heat-off"])
+    def test_the_heatmap_shown_is_resized_even_without_a_menu_to_read(
+            self, monkeypatch, tmp_path, missing):
+        # One heatmap's layout is gone (its chart never drew): the one shown
+        # is still resized — it was drawn hidden — and replays the metric
+        # Python drew active when the one leaving cannot say which it showed
+        page = self._page(monkeypatch, tmp_path, _Grid.sweep_tiers())
+        charts = _page_elements(page)["charts"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["snap", "off"]],
+            explorer=True, setup_js=f"document.getElementById({json.dumps(missing)}).layout = null;")
+        off = snaps["off"]
+        if missing == "scn-heat":
+            button = charts["scn-heat-off"]["layout"]["updatemenus"][0]["buttons"][0]
+            assert _heatmap_calls(off) == [
+                ("update", "scn-heat-off"), ("relayout", "scn-heat-off"),
+                ("resize", "scn-heat-off")]
+            assert _explorer_calls(off, "update", chart="scn-heat-off")[0]["data"] == \
+                button["args"][0]
+        else:
+            # Nothing to replay on it, but still resized
+            assert _heatmap_calls(off) == [("resize", "scn-heat-off")]
+        # Either way the setting switched: the off block and its cells
+        assert (off["display"]["scn-tier-on"], off["display"]["scn-tier-off"]) == ("none", "")
 
 
 class TestKhatBreakdown:
@@ -3324,20 +4666,30 @@ class TestKhatBreakdown:
 
 
 class TestFilterPageSize:
-    """A band sweep whose 36 bands each traded a DIFFERENT list — the
-    worst case for the filter, which ships a view per band list x category
-    x tag — stays well inside the page budget the scenario explorer set
-    (5 MB), because the payload is gzip-packed (_packed_json_script). Each
-    band also carries a 300-entry k-hat population, which the k-hat
-    breakdown ships per band x category x tag."""
+    """The worst case for the filter, which ships a view per distinct trade
+    list x category x tag, stays under 3 MB on this 40-trade construction,
+    because the payload is gzip-packed (_packed_json_script): a band sweep
+    whose 36 bands each traded a DIFFERENT list — and, with the
+    tier-floors-off family (the worst case now), whose 18 binding bands each
+    traded yet another list, 54 in all (a non-binding band's off view shares
+    its band's list). Each band, and each binding band's tier-off run, also
+    carries a 300-entry k-hat population, which the k-hat breakdown ships
+    per band x category x tag. The 3 MB is this synthetic's budget, not a
+    real page's: on the DR-73 calibration corpus's own band sweep the page
+    measured 5,489,336 bytes with the family (4,071,051 without it), past
+    even the 5,000,000 bytes TestScenarioExplorerPageSize holds its
+    synthetic page to — 0.67 MB of it this packed filter block, and most of
+    the family's growth the scenario explorer's data block, which is not
+    packed."""
 
-    def test_36_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
+    def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         rng = random.Random(3)
-        # 4 categories x 2 tags: 13 views per list, 468 in all
+        # 4 categories x 2 tags: 13 views per list, 468 (702 with the family) in all
         series = [f"KXS{i:02d}" for i in range(8)]
         categories = {s: (f"Cat{i % 4}", (f"Tag{i}",)) for i, s in enumerate(series)}
         start = date(2026, 1, 5)
@@ -3351,30 +4703,51 @@ class TestFilterPageSize:
                              rng.gauss(0, 20)),
                 event_ticker=f"{s}-{i}", ticker_a=f"{s}-{i}A", title_a=f"Question {i}?")
 
+        def point(first: int, band, **stamp) -> SweepPoint:
+            trades = sorted((trade(first + i) for i in range(40)), key=lambda t: t.entry_date)
+            return SweepPoint(k=0.75, trades=trades, spread_band=band,
+                              equity_df=backtester._build_equity_curve(trades, start, 10_000.0),
+                              **stamp)
+
+        def calibration() -> IntervalCalibration:
+            obs = tuple(backtester.CalibrationObservation(
+                rng.randint(1, 30), rng.uniform(0.15, 0.8), rng.random() < 0.4,
+                f"{rng.choice(series)}-{j}", "Other") for j in range(300))
+            return IntervalCalibration(
+                pooled=backtester._calibration_bucket("POOLED", 0.0, obs), buckets=[],
+                excluded_premise_violations=0, observations=obs)
+
         bands = [(lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
                  for hi in config.SPREAD_BAND_SWEEP_CEILINGS]
         scenarios, cals = [], {}
         for band in bands:
-            trades = sorted((trade(i) for i in range(40)), key=lambda t: t.entry_date)
-            scenarios.append(SweepPoint(
-                k=0.75, trades=trades, spread_band=band,
-                equity_df=backtester._build_equity_curve(trades, start, 10_000.0)))
-            obs = tuple(backtester.CalibrationObservation(
-                rng.randint(1, 30), rng.uniform(0.15, 0.8), rng.random() < 0.4,
-                f"{rng.choice(series)}-{j}", "Other") for j in range(300))
-            cals[band] = IntervalCalibration(
-                pooled=backtester._calibration_bucket("POOLED", 0.0, obs), buckets=[],
-                excluded_premise_violations=0, observations=obs)
+            scenarios.append(point(0, band))
+            cals[band] = calibration()
+        # Drawn after every tier-on band, so the tier-on half is the same
+        # either way; one run per band a tier binds at, each a new list
+        off_scenarios, off_cals = [], {}
+        binding = [band for band in bands if backtester._tier_floors_bind(band)] if family else []
+        for band in binding:
+            off_scenarios.append(point(1000, band, tier_floors=False))
+            off_cals[band] = calibration()
         sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]],
                               calibration=cals[bands[0]], label_coverage=_scn_coverage(),
-                              scenarios=scenarios, calibrations_by_band=cals)
+                              scenarios=scenarios, calibrations_by_band=cals,
+                              tier_off_scenarios=off_scenarios,
+                              tier_off_calibrations_by_band=off_cals)
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
         page = out.read_text(encoding="utf-8")
         data = TestFilterPage._data(page)
-        assert len(data["lists"]) == 36          # nothing collapsed: every list is its own
+        # Nothing collapsed: every list is its own
+        assert len(data["lists"]) == (54 if family else 36)
         assert all(band is not None for band in data["khat"])
+        if family:
+            assert len(binding) == 18 and len(data["bands_off"]) == 36
+            assert None not in data["khat_off"]
+        else:
+            assert data["bands_off"] is None and data["khat_off"] is None
         assert out.stat().st_size <= 3_000_000, f"page was {out.stat().st_size} bytes"
 
 

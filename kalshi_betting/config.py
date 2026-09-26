@@ -127,10 +127,11 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 # count; 330 entries at no band, 183 at 0.30-0.60) and ~2-11 ms per
 # simulation over its 330 entries (best of 3; it falls with the trade count,
 # from 94 trades at k = 0.40 to none at k = 1.00). A band sweep pays the full
-# pass ONCE, at the no-band band, and every other band rescans only the pairs
-# that entered there (every band's entries are a subset of the no-band
-# band's — see backtester._sweep_from_candidates): on that corpus 330 of the
-# 10,733 pairs, 0.056-0.073 s per band against 1.02-1.06 s for the full pass.
+# pass ONCE (the tier-floors-off family below pays its own), at the no-band
+# band, and every other band rescans only the pairs that entered there (every
+# band's entries are a subset of the no-band band's — see
+# backtester._sweep_from_candidates): on that corpus 330 of the 10,733 pairs,
+# 0.056-0.073 s per band against 1.02-1.06 s for the full pass.
 # The whole band sweep over that corpus (the production _sweep_from_candidates,
 # measured 2026-09-23 with the pre-pass and the time-series population in
 # place: 468 "all", 468 time-series, 468 ladder and 468 cross-event points,
@@ -142,6 +143,31 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 # same corpus took 52.2 s, 37.7 s of it the entry passes), and kept 1,872 equity
 # frames of ~138 KB each (2,460 daily rows), ~258 MB in all. A floor at or
 # below a pair's tier is inert for it.
+# The tier-floors-off family (run_backtest_sweep(tier_off_sweep=True), which
+# backtest.py turns on together with the band sweep) enters and simulates
+# again, with min_price_diff_for_gap's tier_floors=False, the 18 bands whose
+# floor sits below a deadline-gap tier (floors 0, 0.20 and 0.25): a second
+# full pass of its own at the no-band band, with the tiers off, plus 17
+# rescans on the shipped grid, then 234 more "all" cells (18 bands x 13 k)
+# and up to 234 in each of the other three populations (an empty one is
+# skipped, as on the tier-on grid), with a split-half check on each "all" and
+# "time_series" point and an ex-top re-simulation on each of those that
+# traded an event.
+# Measured 2026-09-26 on the same corpus (the production
+# _sweep_from_candidates, start 2020-01-01, ladders on, zero API calls; all
+# 234 cells of every population non-empty there):
+# about 16 s more (42.8-44.4 s with it against 26.9-28.2 s without, over
+# four runs each), 6.4-6.5 s of it the entry passes against 3.2-3.3 s (55
+# passes against 37), 6,882 simulations against 4,590 — +2,292: 936 points,
+# 936 halves and 420 ex-top re-simulations — and 2,808 kept equity frames
+# against 1,872 (+936), 387.5 MB of frames against 258.3 MB (+129.2 MB of
+# retained equity frames). Peak RSS is not quoted: it varied more between
+# repeat runs of one setting than between the two settings. Every tier-on
+# cell and k point (trade and win counts, final balance, mean return per
+# trade, both halves, the ex-top check) and every band's calibration (the
+# pooled row's n, realised rate, mean implied spread and k-hat; each
+# bucket's label, tier, n and k-hat) came out identical to both the run
+# without it and the code before it existed.
 SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
 SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
 
@@ -325,7 +351,8 @@ TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 # through "take the market at face value" (1.00, where Kelly is <= 0 for every
 # pair and nothing trades — the boundary is informative, so it stays in). Each
 # point costs one extra sizing+selection pass over already-fetched candidates —
-# on a band sweep, one per point per band, plus that band's population,
+# on a band sweep, one per point per band (and again at each band the tier
+# floors bind, on a tier-floors-off sweep), plus that band's population,
 # split-half and ex-top runs (see SPREAD_BAND_SWEEP_FLOORS for the measured
 # total); the market fetch and candlestick fetch happen once regardless.
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
@@ -1182,7 +1209,8 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 
-def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> float:
+def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
+                           tier_floors: bool = True) -> float:
     """
     Return the minimum time-series YES price gap required for a deadline gap.
 
@@ -1214,7 +1242,19 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> fl
     test_ast_live_path_reads_no_band. This helper does not validate
     spread_min: a caller that passes one resolves it through
     time_series_spread_band() first, which does — as backtester._find_entry,
-    the one caller that passes it, does.
+    the one caller that filters on it, does (backtester's other two,
+    _interval_calibration's labels and _tier_floors_bind, are handed bands
+    already resolved that way).
+
+    tier_floors is a second BACKTEST-only switch, and only an explicit False
+    throws it: the deadline-gap tier is then not applied at all and the
+    result is the band floor alone — spread_min, or 0.0 when there is none —
+    the rule the dashboard's "Tier floors: off" view is simulated under
+    (backtester._sweep_from_candidates' tier-off family). Anything but False,
+    the default every live caller gets by omission included, keeps the tier,
+    so a stray value can only fall back to the live rule. No live module can
+    pass it: test_ast_live_path_reads_no_band refuses any keyword argument to
+    this helper outside config, backtester, backtest and dashboard.
 
     Args:
         gap_days (int): Calendar days between the two legs' deadlines —
@@ -1224,14 +1264,22 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None) -> fl
         spread_min (float | None): Backtest-only band floor on pB - pA,
             dollars in [0, 1) — the first element of a band resolved by
             time_series_spread_band(). None (default) means "the tier alone".
+        tier_floors (bool): Keyword-only, BACKTEST-only. False drops the
+            deadline-gap tier and returns the band floor alone; anything else
+            (default True) applies it.
 
     Returns:
         float: The minimum required YES ask price difference (dollars, 0-1)
             by which the later leg must exceed the earlier one (later by
             close_time, or by stated deadline for a DR-73 ladder): the tier
             when spread_min is None, else the larger of the tier and
-            spread_min.
+            spread_min — or, with tier_floors False, spread_min alone (0.0
+            when it is None).
     """
+    if tier_floors is False:
+        # The band floor alone, as a float even when there is no floor: the
+        # tier is not consulted at all (backtest-only; see above)
+        return 0.0 if spread_min is None else spread_min
     tier = (MIN_PRICE_DIFF_SHORT_GAP if gap_days <= SHORT_DEADLINE_GAP_DAYS
             else MIN_PRICE_DIFF_LONG_GAP)
     return tier if spread_min is None else max(tier, spread_min)
@@ -1252,8 +1300,10 @@ def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[fl
     TestTimeSeriesKellyParity::test_ast_live_path_reads_no_band).
 
     Validation is deliberately TIER-AGNOSTIC: it guarantees floor < ceiling,
-    not a non-empty EFFECTIVE band. The effective floor is max(tier, floor),
-    so a ceiling below MIN_PRICE_DIFF_LONG_GAP refuses every 16-30-day pair,
+    not a non-empty EFFECTIVE band. The effective floor is max(tier, floor)
+    (the floor alone in the backtest's tier-floors-off family, where no tier
+    can empty a band), so a ceiling below MIN_PRICE_DIFF_LONG_GAP refuses
+    every 16-30-day pair,
     and one below MIN_PRICE_DIFF_SHORT_GAP refuses every pair — e.g.
     (0.20, 0.25) empties the long tier and (0.0, 0.10) empties both; a
     ceiling exactly ON a tier keeps only spreads sitting on that tier. No

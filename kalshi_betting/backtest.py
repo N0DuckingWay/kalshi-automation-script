@@ -86,9 +86,16 @@ Notes:
     logged after logging is configured. The band sweep is ON by default, so
     a default run also simulates every band of the
     config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS grid (no
-    grid ceiling sits at or below either tier); --no-band-sweep skips that
-    grid (band_sweep=False): the primary scenario still runs, but the
-    dashboard's scenario explorer has no scenarios to show.
+    grid ceiling sits at or below either tier) — and, with it, every band
+    whose floor sits below a deadline-gap tier a second time with the tier
+    floors off (tier_off_sweep=band_sweep: the band's floor alone gates the
+    spread and sets the leg-price-sum ceiling, 1 − floor, backtest only);
+    --no-band-sweep skips that grid and those
+    tier-floors-off runs (band_sweep=False, tier_off_sweep=False): the
+    primary scenario still runs, but the dashboard's scenario explorer has no
+    scenarios to show, and its filter bar offers the primary band only, with
+    the Tier floors select disabled. There is no separate flag for the
+    tier-off runs.
 """
 import argparse
 import logging
@@ -211,8 +218,12 @@ def main() -> None:
     The summary block reports the PRIMARY point of the sweep — the run at the
     effective interval discount and the primary spread band — so a default
     run's summary block reads exactly as the plain run_backtest() path's did.
-    The other swept discounts and bands exist only for the dashboard's k
-    selector, its scenario explorer and the calibration report.
+    The other swept discounts and bands exist for the dashboard (its k
+    selector, scenario explorer, filter bar and k-hat breakdown), the
+    calibration report and max_trades_simulated's post-cutoff check; the
+    tier-floors-off family is read by that check and by the dashboard's
+    filter bar, k-hat breakdown and scenario explorer (their Tier floors
+    choice), carried to generate_dashboard on the sweep.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -282,8 +293,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-band-sweep", action="store_true",
-        help="Skip the spread-band grid; the dashboard's scenario explorer "
-             "is not computed",
+        help="Skip the spread-band grid (and its tier-floors-off runs); the "
+             "dashboard's scenario explorer is not computed, and its filter "
+             "bar offers the primary band only, with the Tier floors select "
+             "disabled",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -455,11 +468,19 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         spread_band=spread_band,
         band_sweep=band_sweep,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) unless --no-band-sweep
+        # The dashboard's "Tier floors: off" view: the band sweep's
+        # tier-bound bands simulated again with the tiers off (needs the grid)
+        tier_off_sweep=band_sweep,
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
-    # existed. The remaining k points are consumed only by the k selector,
-    # and the band-sweep payload only by the dashboard's scenario explorer.
+    # existed. The remaining k points are read by the k selector, the
+    # band-sweep payload by the dashboard's scenario explorer, filter bar and
+    # k-hat breakdown, the tier-floors-off family by that filter bar, k-hat
+    # breakdown and scenario explorer too (their Tier floors choice), and
+    # every kept point — the tier-floors-off family's included — by
+    # max_trades_simulated's post-cutoff check (_log_corpus_provenance below,
+    # and the dashboard's header).
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -490,9 +511,11 @@ def main() -> None:
     # don't duplicate that line here, just point the user at the file.
     #
     # sweep carries the calibration and every swept point for the k selector,
-    # the scenario explorer's band x k payload and the header's run-settings
-    # line; interval_discount is the resolved k these trades were sized at,
-    # which the Risk section's Kelly scatter must price on
+    # the scenario explorer's band x k payload, the filter bar, the k-hat
+    # breakdown, both Tier floors views (the bar's and the explorer's, from
+    # its tier-floors-off family) and the header's run-settings line;
+    # interval_discount is the resolved k these trades were sized at, which
+    # the Risk section's Kelly scatter must price on
     #
     # series_categories files each trade under Kalshi's own series category and
     # tags for the Returns Decomposition breakdown: one cached read-only GET of
