@@ -66,11 +66,14 @@ Dependencies:
     re-implemented inline against the same config.py constants, so a change
     to either sizing formula must be made in both places to keep live/backtest
     parity. Exports BacktestTrade, HalfSplit, SweepPoint,
-    IntervalCalibrationBucket, IntervalCalibration, OutcomeLabelCoverage and
-    BacktestSweep (BacktestTrade, BacktestSweep, OutcomeLabelCoverage and
-    SweepPoint are consumed by dashboard.py, which also imports the private
-    label helper _exact_label) plus run_backtest() and run_backtest_sweep()
-    (called by backtest.py).
+    CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
+    OutcomeLabelCoverage and BacktestSweep (BacktestTrade, BacktestSweep,
+    OutcomeLabelCoverage and SweepPoint are consumed by dashboard.py, which
+    also imports the private helpers _exact_label and _leg_prices_for; an
+    IntervalCalibration carries the CalibrationObservations its pooled row
+    was reduced from, so a report can regroup that population through
+    _calibration_bucket, the one definition of the k-hat arithmetic) plus
+    run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -204,7 +207,7 @@ import statistics
 import sys
 from array import array
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -451,7 +454,7 @@ class BacktestTrade:
     # concept) and for any trade constructed without it (test fixtures).
     # Reporting only — nothing sizes, prices or settles on this field, but
     # _interval_calibration DOES band k-hat on the same quantity via
-    # _TimeSeriesOutcome.gap_days, so a ladder's bands are stated-gap bands.
+    # CalibrationObservation.gap_days, so a ladder's bands are stated-gap bands.
     deadline_gap_days: int | None = None
     # Market A's event ticker ("" when absent) and whether the pair is a
     # same-event ladder (time_series, both legs on one non-empty event
@@ -610,6 +613,55 @@ class SweepPoint:
     ex_top_event: tuple[str, float] | None = None
 
 
+@dataclass(frozen=True)
+class CalibrationObservation:
+    """
+    One time-series candidate entry reduced to what calibration needs.
+
+    Built by _interval_calibration() — one per candidate it measures, so a
+    band's observations ARE the population its pooled row is computed over
+    (premise violations, same-title entries and non-binary settlements never
+    become one) — and carried out on IntervalCalibration.observations, so a
+    report can regroup that population (by category, by tag) without a second
+    definition of which entries count. Reduce any subset of them with
+    _calibration_bucket(), the one definition of the k-hat arithmetic.
+
+    Holds scalars and strings only, never a market record: a band sweep keeps
+    one calibration per band for the whole simulation phase, and a reference
+    to a market dict here would pin it alive long after the entry pass
+    released the candles and the pair list (TS-07's residency rule).
+
+    Attributes:
+        gap_days (int | None): Deadline gap the pair's price tier was selected
+            from, carried out of _find_entry. None only if a time-series entry
+            somehow reached here without one, in which case the observation
+            still counts in the pooled row but lands in no gap band.
+        implied (float): Market-implied in-between mass at entry, pB - pA.
+        in_between (bool): Whether the pair actually settled in-between
+            (earlier NO, later YES) — the time-series bet's only loss cell.
+        event_ticker (str): Market A's event ticker as the entry carries it
+            (_find_entry's canonicalized leg — the same one
+            BacktestTrade.event_ticker records for a traded pair), "" when
+            the record carried none or carried a non-string. The key a report
+            files the observation under: its series names Kalshi's category
+            and tags.
+        category (str): infer_category(event_ticker) — the ticker-prefix label
+            BacktestTrade.category carries, which a report falls back to when
+            the series is missing from Kalshi's category listing.
+
+    event_ticker and category are REQUIRED, with no default, for the reason
+    DR-71 made OutcomeLabelCoverage's phrasing fields required: a construction
+    that forgot them would silently file its observation under "" — not even
+    the "Other" infer_category("") gives a missing ticker — and a report would
+    render that as a real category.
+    """
+    gap_days: int | None
+    implied: float
+    in_between: bool
+    event_ticker: str
+    category: str
+
+
 @dataclass
 class IntervalCalibrationBucket:
     """
@@ -683,10 +735,23 @@ class IntervalCalibration:
             passed the Kelly gate) while this one counts over the whole
             k-independent population, so this is generally the LARGER of the
             two. Neither is a bug in the other — see _interval_calibration().
+        observations (tuple[CalibrationObservation, ...]): Every candidate the
+            pooled row was computed over, in the order they were measured —
+            _calibration_bucket(label, 0.0, observations) on this very tuple
+            reproduces `pooled` exactly (a regrouped, reordered or reassembled
+            copy agrees only to float rounding, since its sums run in another
+            order). Carried so a report can regroup the same population — by
+            category, tag or spread band — through the same arithmetic instead
+            of re-deriving which entries count. Appended with a default of ()
+            so a hand-built instance (a test fixture, the golden fixture) still
+            builds, which leaves "not carried" and "no candidate" looking
+            alike: a consumer must compare len(observations) with pooled.n,
+            never test observations == ().
     """
     pooled: IntervalCalibrationBucket
     buckets: list[IntervalCalibrationBucket]
     excluded_premise_violations: int
+    observations: tuple[CalibrationObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1008,28 +1073,6 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     if sweep.same_title_point is not None:
         points.append(sweep.same_title_point)
     return max(len(point.trades) for point in points)
-
-
-@dataclass
-class _TimeSeriesOutcome:
-    """
-    One time-series candidate reduced to the three numbers calibration needs.
-
-    Internal to _interval_calibration()/_calibration_bucket(); never returned
-    to a caller.
-
-    Attributes:
-        gap_days (int | None): Deadline gap the pair's price tier was selected
-            from, carried out of _find_entry. None only if a time-series entry
-            somehow reached here without one, in which case the observation
-            still counts in the pooled row but lands in no gap band.
-        implied (float): Market-implied in-between mass at entry, pB - pA.
-        in_between (bool): Whether the pair actually settled in-between
-            (earlier NO, later YES) — the time-series bet's only loss cell.
-    """
-    gap_days: int | None
-    implied: float
-    in_between: bool
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -5035,21 +5078,29 @@ def _simulate_at_discount(
 def _calibration_bucket(
     label: str,
     tier: float,
-    observations: list[_TimeSeriesOutcome],
+    observations: Sequence[CalibrationObservation],
 ) -> IntervalCalibrationBucket:
     """
     Reduce a set of time-series observations to one calibration report row.
 
     Computes the realised in-between rate, the mean market-implied in-between
     mass, and their ratio — the empirical interval discount k_hat, i.e. how
-    much of the mass the market priced actually materialized.
+    much of the mass the market priced actually materialized. The one
+    definition of that arithmetic: _interval_calibration builds every row of
+    its report here, and a report that regroups
+    IntervalCalibration.observations (by category, tag or spread band)
+    reduces each group here too. Reducing the carried tuple itself reproduces
+    the pooled row exactly — the same observations in the same order through
+    the same arithmetic — while a group, or a reordered or reassembled copy of
+    the whole, agrees with it only to float rounding.
 
     Args:
         label (str): Row label for the bucket ("0-7d", "POOLED", ...).
         tier (float): Price tier for the bucket, or 0.0 for the pooled row,
             which spans every tier (see IntervalCalibrationBucket.tier).
-        observations (list[_TimeSeriesOutcome]): The bucket's candidates. May
-            be empty, which yields a zeroed row rather than a division error.
+        observations (Sequence[CalibrationObservation]): The bucket's
+            candidates, a list or a tuple. May be empty, which yields a
+            zeroed row rather than a division error.
 
     Returns:
         IntervalCalibrationBucket: The row. empirical_k is None whenever
@@ -5145,7 +5196,9 @@ def _interval_calibration(
             nothing, since the band already acted inside _find_entry.
 
     Returns:
-        IntervalCalibration | None: The report, or None when there is nothing
+        IntervalCalibration | None: The report — carrying, on `observations`,
+            the candidates its pooled row was computed over, so a report can
+            regroup them — or None when there is nothing
             to report — no time-series candidate produced a usable
             observation AND none was excluded as a premise violation (the
             codebase's return-None-on-nothing-to-say convention). Unlike most
@@ -5153,7 +5206,7 @@ def _interval_calibration(
             (DR-72): _log_interval_calibration logs one explanatory line for
             it rather than nothing at all.
     """
-    observations: list[_TimeSeriesOutcome] = []
+    observations: list[CalibrationObservation] = []
     excluded = 0
 
     for rec in raw_entries:
@@ -5181,13 +5234,26 @@ def _interval_calibration(
             excluded += 1
             continue
 
-        observations.append(_TimeSeriesOutcome(
+        # Market A's event ticker as the entry carries it — _find_entry's
+        # canonicalized leg, the one BacktestTrade.event_ticker records for a
+        # traded pair — so a report files an observation under the same
+        # series its trade would be filed under. Read by TYPE: a non-string
+        # (only a hand-edited cache can hold one) reads as absent rather than
+        # raising out of infer_category and ending the whole sweep, the
+        # fail-safe reading scanner.event_series gives the same field.
+        raw_event = mA.get("event_ticker")
+        event_ticker = raw_event if isinstance(raw_event, str) else ""
+        observations.append(CalibrationObservation(
             # Carried out of _find_entry rather than recomputed, so a
             # candidate is always bucketed under the very gap its price tier
             # and the MAX_DEADLINE_GAP_DAYS cutoff were applied on.
             gap_days=entry["gap_days"],
             implied=entry["pB"] - entry["pA"],
             in_between=(outcome_a == "no" and outcome_b == "yes"),
+            event_ticker=event_ticker,
+            # The ticker-prefix label BacktestTrade.category carries, which a
+            # report falls back to when the series has no Kalshi category
+            category=infer_category(event_ticker),
         ))
 
     if not observations and not excluded:
@@ -5222,6 +5288,10 @@ def _interval_calibration(
         pooled=pooled,
         buckets=buckets,
         excluded_premise_violations=excluded,
+        # The very list the pooled row was reduced from, in measurement
+        # order: reducing it again reproduces the pooled row exactly (a
+        # regrouped or reordered copy agrees only to float rounding)
+        observations=tuple(observations),
     )
 
 
