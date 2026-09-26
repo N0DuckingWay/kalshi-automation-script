@@ -68,14 +68,16 @@ Dependencies:
     parity. Exports BacktestTrade, HalfSplit, SweepPoint,
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
     OutcomeLabelCoverage and BacktestSweep (BacktestTrade, BacktestSweep,
-    OutcomeLabelCoverage and SweepPoint are consumed by dashboard.py, which
-    also imports the private helpers _exact_label, _leg_prices_for and
-    _build_equity_curve — the one definition of an equity curve, which its
-    page-wide filter runs over a category's or tag's trades for that slice's
-    curve; an IntervalCalibration carries the CalibrationObservations its
-    pooled row was reduced from, so a report can regroup that population
-    through _calibration_bucket, the one definition of the k-hat arithmetic)
-    plus run_backtest() and run_backtest_sweep() (called by backtest.py).
+    IntervalCalibration, OutcomeLabelCoverage and SweepPoint are consumed by
+    dashboard.py, which also imports the private helpers _exact_label,
+    _leg_prices_for, _build_equity_curve — the one definition of an equity
+    curve, which its page-wide filter runs over a category's or tag's trades
+    for that slice's curve — and _calibration_bucket; an IntervalCalibration
+    carries the CalibrationObservations its pooled row was reduced from, so a
+    report can regroup that population through _calibration_bucket, the one
+    definition of the k-hat arithmetic, as dashboard.py's k-hat breakdown
+    does by category, tag and spread band) plus run_backtest() and
+    run_backtest_sweep() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -5089,12 +5091,13 @@ def _calibration_bucket(
     mass, and their ratio — the empirical interval discount k_hat, i.e. how
     much of the mass the market priced actually materialized. The one
     definition of that arithmetic: _interval_calibration builds every row of
-    its report here, and a report that regroups
-    IntervalCalibration.observations (by category, tag or spread band)
-    reduces each group here too. Reducing the carried tuple itself reproduces
-    the pooled row exactly — the same observations in the same order through
-    the same arithmetic — while a group, or a reordered or reassembled copy of
-    the whole, agrees with it only to float rounding.
+    its report here, and dashboard._khat_band, which regroups
+    IntervalCalibration.observations by category, tag and spread band,
+    reduces each group here too (through dashboard._khat_stat). Reducing the
+    carried tuple itself reproduces the pooled row exactly — the same
+    observations in the same order through the same arithmetic — while a
+    group, or a reordered or reassembled copy of the whole, agrees with it
+    only to float rounding.
 
     Args:
         label (str): Row label for the bucket ("0-7d", "POOLED", ...).

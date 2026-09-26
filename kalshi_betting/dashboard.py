@@ -5,11 +5,13 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Generates a self-contained interactive HTML performance dashboard from the
-    results of a backtest run. Assembles eight sections — portfolio performance
+    results of a backtest run. Assembles nine sections — portfolio performance
     (equity curve, Sharpe, drawdown), returns decomposition (by month, category,
     entry price), calibration analysis (Brier score, reliability diagram),
     interval-discount (k) calibration (empirical k-hat plus a native Plotly
-    dropdown that switches the equity curve between the swept k values), a
+    dropdown that switches the equity curve between the swept k values),
+    empirical k-hat broken down by Kalshi category, tag and spread band (a bar
+    chart and a table with a "Group by" <select> of their own), a
     scenario explorer (a fragility banner, a spread-band x k heatmap and a
     per-population KPI table over BacktestSweep.scenarios, with two <select>s
     and a short inline script driving a Plotly.restyle'd equity curve — a
@@ -24,15 +26,18 @@ Purpose:
     re-scopes every trade-derived section (performance, decomposition,
     calibration, diagnostics, risk, the benchmark's strategy row) to the run
     at another spread band and/or one Kalshi category or category · tag of
-    it. Every figure a selection shows is computed here in Python by the
+    it, and moves the k-hat breakdown to the same band and selection. Every
+    figure a selection shows is computed here in Python by the
     helpers the sections themselves render with (_filter_payload), packed
     into one gzip + base64 data block, and swapped in by a small inline
     script (_FILTER_JS) that draws nothing of its own.
 
 Dependencies:
     Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
-    re-exported by backtester.py), OutcomeLabelCoverage and SweepPoint from
-    backtester.py, plus its _exact_label() — the
+    re-exported by backtester.py), IntervalCalibration, OutcomeLabelCoverage
+    and SweepPoint from backtester.py, plus its _calibration_bucket() (the one
+    definition of the k-hat arithmetic, which the k-hat breakdown runs over
+    each category's, tag's or band's observations), _exact_label() — the
     injective float formatter its completion lines use, reused so no two
     scenario-explorer labels can collide — _build_equity_curve() (the one
     definition of an equity curve, which the page-wide filter runs over a
@@ -68,8 +73,10 @@ Notes:
     JavaScript, so it works inside the same self-contained page every other
     chart renders into. Its scope is deliberately that one section: the
     scenario-explorer section (below) carries its own independent band/k
-    selectors, and the remaining six sections are rendered at the run's
-    primary scenario: its primary k (the CLI's --interval-discount, or
+    selectors, and the remaining seven — the six trade-derived sections and
+    the k-hat breakdown — are rendered at the run's primary scenario (the
+    k-hat breakdown is k-independent: the primary k is only its reference
+    line): its primary k (the CLI's --interval-discount, or
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT when it was not passed) AND its
     primary spread band (--spread-min/--spread-max, or
     config.BACKTEST_DEFAULT_SPREAD_BAND when neither was passed) — until the
@@ -101,6 +108,24 @@ Notes:
     zoom never carries over into another selection. A failure to build the
     payload costs the bar, never the page: the page is written without it,
     with a notice in its place and a WARNING in the log.
+
+    The k-hat breakdown (_section_khat) is the one chart that follows the
+    filter bar without describing trades. It regroups each band's carried
+    k-hat population — IntervalCalibration.observations: every time-series
+    candidate ENTRY at the band, measured before the Kelly gate and
+    independent of k, so it covers entries the run never traded — through
+    backtester._calibration_bucket, the one definition of k-hat, filed on
+    market A's event ticker by _series_labels, the rule trades are filed by,
+    so a category's k-hat and its trades describe the same events. Its own
+    "Group by" <select> picks the axis (category, tag or spread band); the
+    filter bar picks the band and the category or tag, and grouping by one of
+    them shows every value of it with the selection highlighted. Each bar
+    states its entries and the distinct events behind them. Every figure and
+    word it shows comes from Python (_khat_stat's pre-formatted cells, bar
+    labels and hover figures, the _KHAT_TEXT templates), so neither the script
+    nor Plotly's hover can round or word one differently. A band whose calibration does not carry its population
+    (len(observations) != pooled.n — a hand-built one) offers its pooled row
+    alone (_khat_band), since there is nothing to break down.
 
     The scenario-explorer section's band x k grid is too large, and its two
     axes of selection too independent, for the same native-dropdown idiom: a
@@ -157,9 +182,11 @@ from .backtester import (
     BacktestSweep,
     BacktestTrade,
     CorpusProvenance,
+    IntervalCalibration,
     OutcomeLabelCoverage,
     SweepPoint,
     _build_equity_curve,
+    _calibration_bucket,
     _exact_label,
     _leg_prices_for,
     max_trades_simulated,
@@ -831,8 +858,9 @@ def _series_labels(
     Name the Kalshi category and FIRST tag an event's series is filed under.
 
     The one filing rule behind every category and tag on the page — the
-    Returns Decomposition and the page-wide filter — so the two can never
-    file one trade apart. First tag only, so every breakdown PARTITIONS what it breaks down: a
+    Returns Decomposition, the page-wide filter and the k-hat breakdown — so
+    a trade and a k-hat observation of the same event can never be filed
+    apart. First tag only, so every breakdown PARTITIONS what it breaks down: a
     series can carry several tags, and counting it under each would make the
     groups add up to more than the whole.
 
@@ -841,7 +869,7 @@ def _series_labels(
             (_series_ticker).
         fallback_category (str): The label to use when there is no map or the
             series is missing from it — the ticker-prefix category
-            (BacktestTrade.category).
+            (BacktestTrade.category, CalibrationObservation.category).
         series_categories (dict | None): historical.load_series_categories'
             series ticker -> (category, tags), or None when not loaded.
 
@@ -1714,6 +1742,346 @@ def _section_interval_discount(sweep: BacktestSweep | None) -> str:
         + cal_table
         + _fig_html(fig, height=450)
         + sweep_table
+    )
+
+
+# ─── Section 4b: Empirical k-hat by category, tag and spread band ───────────
+
+# The k-hat chart's "Group by" choices, in menu order: (value, label).
+_KHAT_GROUPS = (("category", "Category"), ("tag", "Tag"), ("band", "Spread band"))
+
+# The k-hat chart's words — its title, its "whole population" rows and the
+# notice shown when there is nothing to draw — as templates the page's script
+# fills too (D.text), like the filter bar's summary line, so the chart Python
+# renders and the chart the script redraws for the same view read the same.
+_KHAT_TEXT = {
+    "khat_title": "Empirical k̂ by {group} — {scope}",
+    "khat_group_words": {"category": "category", "tag": "tag", "band": "spread band"},
+    "khat_all_categories": "All categories",
+    "khat_all_tags": "All tags",
+    "khat_all_in": "All {category}",
+    "khat_every_category": "all categories",
+    "khat_none": ("No time-series candidate entry counts toward k̂ for this selection: "
+                  "none was entered at this band, or every one settled in the excluded "
+                  "earlier-YES / later-NO cell. With same-event ladders off, a run can form "
+                  "none at all."),
+    "khat_not_recorded": ("k̂ was not recorded for this spread band: the run carries no "
+                          "calibration for it (a dashboard built without a sweep, or from a "
+                          "hand-built one)."),
+}
+
+# The k-hat chart's height: (minimum, pixels per bar, room for the axes) —
+# read by _khat_chart_height and, through the payload, by the page's script.
+_KHAT_HEIGHT = (300, 26, 120)
+
+
+def _khat_cells(stat: dict | None) -> list[str]:
+    """
+    Format one group's k-hat figures as the table's cells.
+
+    The one formatting of these figures on the page: Python's table uses it,
+    and the payload ships its output for the page's script, so the two can
+    never round one figure differently (JavaScript's toFixed rounds a binary
+    tie away from zero where Python rounds it to even).
+
+    Args:
+        stat (dict | None): A _khat_stat, or None for a group with none.
+
+    Returns:
+        list[str]: Entries, events, realised rate (4 dp), mean implied gap
+            (4 dp) and k-hat (3 dp) — "—" wherever a figure is undefined.
+    """
+    def fmt(value, spec: str) -> str:
+        return "—" if value is None else format(value, spec)
+    st = stat or {}
+    return [fmt(st.get("n"), "d"), fmt(st.get("events"), "d"), fmt(st.get("rate"), ".4f"),
+            fmt(st.get("implied"), ".4f"), fmt(st.get("k"), ".3f")]
+
+
+def _khat_bar_text(stat: dict | None) -> str:
+    """
+    The label on one k-hat bar: its entries and distinct events.
+
+    Args:
+        stat (dict | None): A _khat_stat's figures, or None.
+
+    Returns:
+        str: "n=12 · 3 ev" ("?" events when unknown), or "" for no stat.
+    """
+    if stat is None:
+        return ""
+    events = "?" if stat["events"] is None else stat["events"]
+    return f"n={stat['n']} · {events} ev"
+
+
+def _khat_finish(stat: dict) -> dict:
+    """
+    Add a group's rendered forms — its bar label and table cells — to its figures.
+
+    Args:
+        stat (dict): "n", "events", "rate", "implied" and "k".
+
+    Returns:
+        dict: The same dict, with "text" (_khat_bar_text) and "cells"
+            (_khat_cells) added, so both renderers show Python's strings.
+    """
+    stat["text"] = _khat_bar_text(stat)
+    stat["cells"] = _khat_cells(stat)
+    return stat
+
+
+def _khat_stat(observations) -> dict:
+    """
+    Reduce a group of k-hat observations to the figures the chart shows.
+
+    The arithmetic is backtester._calibration_bucket's — the one definition of
+    k-hat — so a group holding a band's whole carried population, in its
+    carried order, reproduces that band's pooled row exactly.
+
+    Args:
+        observations: backtester.CalibrationObservation records, a list or
+            the carried tuple itself (the "all" group passes the tuple, so its
+            sums run in the pooled row's own order).
+
+    Returns:
+        dict: "n" (entries), "events" (distinct market-A event tickers; a
+            missing ticker counts as one "" event), "rate" (realised
+            in-between rate), "implied" (mean market-implied gap), "k"
+            (k-hat, None when the implied gap is not positive), plus "text"
+            and "cells" (_khat_finish). The event count is a better guide
+            to how much evidence a bar holds than the entry count — the
+            rungs of one ladder share one event and settle together — but it
+            is not a count of independent outcomes: one question listed as
+            several events (Oct, Nov, Dec) still counts each.
+    """
+    bucket = _calibration_bucket("", 0.0, observations)
+    return _khat_finish({"n": bucket.n, "events": len({o.event_ticker for o in observations}),
+                         "rate": bucket.realised_rate, "implied": bucket.mean_implied,
+                         "k": bucket.empirical_k})
+
+
+def _khat_band(
+    calibration: IntervalCalibration | None,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+    cat_index: dict[str, int],
+    sub_index: dict[tuple[str, str], int],
+) -> dict | None:
+    """
+    Break one band's k-hat population down by Kalshi category and first tag.
+
+    Observations are filed by _series_labels — the rule trades are filed by
+    — on market A's event ticker, which is the leg BacktestTrade.event_ticker
+    records, so a category's k-hat and its trades describe the same events.
+    Each group is reduced by _khat_stat.
+
+    Args:
+        calibration (IntervalCalibration | None): The band's measurement.
+        series_categories (dict | None): The series-category map.
+        cat_index (dict[str, int]): Category -> its index in the payload.
+        sub_index (dict[tuple[str, str], int]): (category, tag) -> its index.
+
+    Returns:
+        dict | None: None when the band has no calibration; otherwise
+            "carried" and "groups" (view key -> _khat_stat, keys as the
+            filter's: "all", "c<i>", "s<i>"). A calibration that does not
+            carry its population (len(observations) != pooled.n — a
+            hand-built one) keeps only "all", taken from its pooled row, with
+            "events" None, since there is nothing to break down.
+    """
+    if calibration is None:
+        return None
+    observations = calibration.observations
+    if len(observations) != calibration.pooled.n:
+        pooled = calibration.pooled
+        return {"carried": False, "groups": {_ALL_VIEW: _khat_finish({
+            "n": pooled.n, "events": None, "rate": pooled.realised_rate,
+            "implied": pooled.mean_implied, "k": pooled.empirical_k})}}
+    groups: dict[str, list] = {}
+    for o in observations:
+        category, tag = _series_labels(o.event_ticker, o.category, series_categories)
+        groups.setdefault(f"c{cat_index[category]}", []).append(o)
+        groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(o)
+    # The carried tuple itself, never its groups put back together: only it
+    # reproduces the pooled row to the last bit
+    stats = {_ALL_VIEW: _khat_stat(observations)}
+    stats.update((key, _khat_stat(members)) for key, members in groups.items())
+    return {"carried": True, "groups": stats}
+
+
+def _khat_chart_height(rows: int) -> int:
+    """
+    Height of the k-hat bar chart for a number of bars.
+
+    Args:
+        rows (int): Bars drawn.
+
+    Returns:
+        int: Pixels, from _KHAT_HEIGHT: at least its minimum, and its pixels
+            per bar plus room for the axes.
+    """
+    least, per_row, axes = _KHAT_HEIGHT
+    return max(least, per_row * rows + axes)
+
+
+def _khat_row_html(label: str, stat: dict | None) -> str:
+    """
+    One row of the k-hat table.
+
+    Args:
+        label (str): The group's name (Kalshi-controlled — escaped here).
+        stat (dict | None): Its _khat_stat, or None.
+
+    Returns:
+        str: A <tr> with the group and its _khat_cells.
+    """
+    cells = stat["cells"] if stat else _khat_cells(None)
+    return ("<tr style='border-bottom:1px solid #E0E0E0'>"
+            f"<td style='padding:4px 12px;'>{html.escape(label)}</td>"
+            + "".join(f"<td style='padding:4px 12px;'>{c}</td>" for c in cells)
+            + "</tr>")
+
+
+def _khat_customdata(stat: dict | None) -> list[str]:
+    """
+    One bar's hover figures: the table's own cells, already formatted.
+
+    The hover shows these strings as they are (no Plotly number format), so
+    it can never round a figure differently from the table beside it.
+
+    Args:
+        stat (dict | None): A _khat_stat, or None.
+
+    Returns:
+        list[str]: _khat_cells — entries, events, realised rate, mean
+            implied gap, k-hat.
+    """
+    return stat["cells"] if stat else _khat_cells(None)
+
+
+def _section_khat(payload: dict | None, k_used: float | None) -> str:
+    """
+    Build the "Empirical k̂ by Category, Tag and Spread Band" section.
+
+    k-hat is the realised in-between rate divided by the mean market-implied
+    gap (pB − pA), over every time-series candidate ENTRY at a band — the
+    population backtester._interval_calibration pools (k-independent, before
+    the Kelly gate, premise violations excluded), regrouped here. One chart
+    and one table, driven by the page-wide filter bar and a "Group by"
+    <select>: by Category shows every category at the selected band, by Tag
+    every tag at the selected band (within the selected category, if any),
+    and by Spread band every band for the selected category or tag — the
+    grouping's own filter is ignored and its selected value highlighted. Each
+    bar states the entries it pools and the distinct events behind them, and
+    a dashed line marks the k the run was sized at. Rendered here for the
+    default (by category, primary band, no filter); the filter script
+    redraws it for every other choice from the same payload. The "Group by"
+    <select> sits outside the chart's body, so it stays reachable when a
+    selection has nothing to draw.
+
+    Args:
+        payload (dict | None): _filter_payload's output (its "khat" per
+            band), or None when it could not be built — the section then says
+            so and draws nothing.
+        k_used (float | None): The run's interval discount, drawn as the
+            reference line; None draws none.
+
+    Returns:
+        str: Self-contained HTML section string.
+    """
+    title = _SECTION_STYLE.format(title="Empirical k̂ by Category, Tag and Spread Band")
+    intro = (
+        "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+        "k&#770; = realised in-between rate ÷ mean market-implied gap (pB − pA), over "
+        "every time-series candidate entry at the band — measured before the Kelly gate, "
+        "so it covers entries the run never traded, and independent of k; premise "
+        "violations (earlier YES, later NO) are excluded. Follows the filter bar above: "
+        "grouping by category shows every category at the selected band, by tag every "
+        "tag (within the selected category), by spread band every band for the selected "
+        "category or tag — the selection is highlighted. A bar rests on its entries, but "
+        "entries of one event (a ladder's rungs) settle together, so its event count is "
+        "the better measure of how much evidence it holds. Recommendation only: live "
+        "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
+    )
+    notice_style = "font-family:sans-serif;font-size:14px;color:#616161;"
+    if payload is None:
+        return (title + intro + f'<p style="{notice_style}">This breakdown reads the '
+                "page-wide filter's data, which could not be built for this run (the log "
+                "names the error).</p>")
+
+    primary = payload["primary"]
+    band = payload["khat"][primary]
+    rows = []
+    if band is not None:
+        rows.append((_KHAT_TEXT["khat_all_categories"], band["groups"].get(_ALL_VIEW), "all"))
+        rows += [(name, band["groups"][f"c{ci}"], "bar")
+                 for ci, name in enumerate(payload["categories"])
+                 if f"c{ci}" in band["groups"]]
+    has = any(st is not None and st["n"] > 0 for _, st, _ in rows)
+    colors = payload["styles"]["khat"]
+
+    fig = go.Figure(go.Bar(
+        orientation="h",
+        y=[label for label, _, _ in rows],
+        x=[None if st is None else st["k"] for _, st, _ in rows],
+        text=[_khat_bar_text(st) for _, st, _ in rows],
+        # Outside the bar, and never clipped, so a zero or tiny k-hat still
+        # shows its entries and events
+        textposition="outside",
+        cliponaxis=False,
+        customdata=[_khat_customdata(st) for _, st, _ in rows],
+        # Python's cells, unformatted here: the hover reads as the table does
+        hovertemplate=("%{y}<br>k̂=%{customdata[4]}<br>entries=%{customdata[0]}"
+                       " · events=%{customdata[1]}<br>realised=%{customdata[2]}"
+                       " · implied=%{customdata[3]}<extra></extra>"),
+        marker_color=[colors[kind] for _, _, kind in rows],
+    ))
+    layout = {
+        "title": _KHAT_TEXT["khat_title"].format(
+            group=_KHAT_TEXT["khat_group_words"]["category"],
+            scope=payload["bands"][primary]["where"]),
+        "xaxis_title": "Empirical k̂ (realised in-between rate ÷ mean implied gap)",
+        # The first row (the whole population) on top, like the table below
+        "yaxis": {"autorange": "reversed"},
+    }
+    if k_used is not None:
+        layout["shapes"] = [{"type": "line", "x0": k_used, "x1": k_used, "yref": "paper",
+                             "y0": 0, "y1": 1, "line": {"dash": "dash", "color": "#616161"}}]
+        layout["annotations"] = [{"x": k_used, "y": 1, "yref": "paper", "yanchor": "bottom",
+                                  "text": f"sized at {_k_label(k_used)}", "showarrow": False}]
+    fig.update_layout(**layout)
+
+    group_opts = "".join(f'<option value="{value}">{label}</option>'
+                         for value, label in _KHAT_GROUPS)
+    # Disabled until the page's script has its data, and never restored by
+    # the browser on reload — the same rules as the filter bar's selects
+    group_by = (
+        "<div style='font-family:sans-serif;font-size:14px;margin:12px 0;'>"
+        '<label>Group by: <select id="khat-group" disabled autocomplete="off">'
+        f"{group_opts}</select></label></div>"
+    )
+    body = (
+        _fig_html(fig, height=_khat_chart_height(len(rows)), div_id="khat-fig")
+        + "<table style='font-family:sans-serif;font-size:13px;border-collapse:collapse;"
+          "margin:8px 0 16px;width:auto;'>"
+          "<tr style='background:#E3F2FD;font-weight:bold;'>"
+          "<th style='padding:6px 12px;'>Group</th><th style='padding:6px 12px;'>Entries</th>"
+          "<th style='padding:6px 12px;'>Events</th>"
+          "<th style='padding:6px 12px;'>Realised in-between rate</th>"
+          "<th style='padding:6px 12px;'>Mean implied gap</th>"
+          "<th style='padding:6px 12px;'>k&#770;</th></tr>"
+          '<tbody id="khat-rows">'
+          + "".join(_khat_row_html(label, st) for label, st, _ in rows)
+          + "</tbody></table>"
+    )
+    notice = _KHAT_TEXT["khat_none"] if band is not None else _KHAT_TEXT["khat_not_recorded"]
+    # The body is always rendered — its chart empty when there is nothing to
+    # show — so the filter script can reveal it for a view that has entries
+    empty_style = notice_style + ("display:none;" if has else "")
+    body_style = "" if has else ' style="display:none"'
+    return (
+        title + intro + group_by
+        + f'<p id="khat-empty" style="{empty_style}">{html.escape(notice)}</p>'
+        + f'<div id="khat-body"{body_style}>{body}</div>'
     )
 
 
@@ -3329,11 +3697,14 @@ class _BandRun:
         trades (list[BacktestTrade]): That band's "all"-population trades — for
             the primary band, the very list every section renders by default.
         equity_df (pd.DataFrame): That band's own standalone equity curve.
+        calibration (IntervalCalibration | None): That band's k-hat
+            measurement, whose observations the k-hat breakdown regroups.
     """
     band: tuple[float, float] | None
     label: str
     trades: list
     equity_df: pd.DataFrame
+    calibration: IntervalCalibration | None
 
 
 def _band_runs(
@@ -3364,7 +3735,8 @@ def _band_runs(
             band alone when the band sweep was off.
     """
     if sweep is None or sweep.primary.spread_band is None:
-        return [_BandRun(None, "not recorded", trades, equity_df)], 0
+        calibration = None if sweep is None else sweep.calibration
+        return [_BandRun(None, "not recorded", trades, equity_df, calibration)], 0
     primary_band = sweep.primary.spread_band
     others = {pt.spread_band: pt for pt in sweep.scenarios
               if pt.population == "all" and pt.k == sweep.primary.k
@@ -3373,10 +3745,12 @@ def _band_runs(
     runs = []
     for band in bands:
         if band == primary_band:
-            runs.append(_BandRun(band, _row_label(band), trades, equity_df))
+            runs.append(_BandRun(band, _row_label(band), trades, equity_df,
+                                 sweep.calibrations_by_band.get(band, sweep.calibration)))
         else:
             point = others[band]
-            runs.append(_BandRun(band, _row_label(band), point.trades, point.equity_df))
+            runs.append(_BandRun(band, _row_label(band), point.trades, point.equity_df,
+                                 sweep.calibrations_by_band.get(band)))
     return runs, bands.index(primary_band)
 
 
@@ -3659,18 +4033,27 @@ def _filter_payload(
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label, list,
-            scenario}] — scenario is _band_scenario's phrase), "primary",
-            "categories" (sorted names), "subcats" ([[category index, tag],
-            ...], sorted), "lists" (_list_payload per distinct list), "empty"
-            (the view of a selection with no trade — a flat curve), "strings"
-            (HTML fragments), "text" (the summary line's templates,
-            _SUMMARY_TEMPLATES) and "styles" (the trade-type lines' drawing).
+            scenario, where}] — _band_scenario's and _band_where's phrases),
+            "primary", "categories" (sorted names — every trade's, and every
+            k-hat observation's), "subcats" ([[category index, tag], ...],
+            sorted), "lists" (_list_payload per distinct list), "empty" (the
+            view of a selection with no trade — a flat curve), "strings" (HTML
+            fragments), "text" (the templates: _SUMMARY_TEMPLATES and
+            _KHAT_TEXT), "styles" (the trade-type lines' and the k-hat bars'
+            drawing, and the k-hat chart's height formula), "khat" (_khat_band
+            per band, in band order) and "khat_blank" (the table cells of a
+            group with no k-hat).
     """
     axis = pd.DatetimeIndex(pd.to_datetime(list(runs[primary_idx].equity_df["date"])))
     strings = _StringTable()
 
     pairs = {_series_labels(t.event_ticker, t.category, series_categories)
              for run in runs for t in run.trades}
+    # A category or tag seen only in some band's k-hat population is offered
+    # too: the k-hat breakdown shows it even where no trade was made
+    pairs.update(_series_labels(o.event_ticker, o.category, series_categories)
+                 for run in runs if run.calibration is not None
+                 for o in run.calibration.observations)
     categories = sorted({c for c, _ in pairs})
     cat_index = {c: i for i, c in enumerate(categories)}
     subcats = sorted(pairs)
@@ -3698,7 +4081,8 @@ def _filter_payload(
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": run.label, "list": band_list[i],
                    "scenario": _band_scenario(run.label, i == primary_idx,
-                                              run.band is not None, k_text)}
+                                              run.band is not None, k_text),
+                   "where": _band_where(run.label, i == primary_idx, run.band is not None)}
                   for i, run in enumerate(runs)],
         "primary": primary_idx,
         "categories": categories,
@@ -3706,10 +4090,21 @@ def _filter_payload(
         "lists": lists,
         "empty": empty,
         "strings": strings.items,
-        "text": _SUMMARY_TEMPLATES,
+        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
-                             for label, color in _TRADE_TYPE_LINES}},
+                             for label, color in _TRADE_TYPE_LINES},
+                   # The k-hat chart's bars — the grouping's whole population,
+                   # the filter's current choice, every other group — and its
+                   # height formula (_khat_chart_height)
+                   "khat": {"all": _COLORS["naive"], "selected": _COLORS["sp500"],
+                            "bar": _COLORS["strategy"]},
+                   "khat_height": list(_KHAT_HEIGHT)},
+        # Per band, its k-hat population broken down like its trades
+        # (_khat_band), and the cells of a group with none
+        "khat": [_khat_band(run.calibration, series_categories, cat_index, sub_index)
+                 for run in runs],
+        "khat_blank": _khat_cells(None),
     }
 
 
@@ -3915,6 +4310,9 @@ _FILTER_JS = r"""
   var tagSel = document.getElementById('flt-tag');
   if (!dataEl || !bandSel || !catSel || !tagSel) { return; }
   var SELECTS = [bandSel, catSel, tagSel];
+  // The k-hat chart's own "Group by" select follows the bar's rules
+  var khatGroup = document.getElementById('khat-group');
+  if (khatGroup) { SELECTS.push(khatGroup); }
   var D = null, N = 0;
 
   function byId(id) { return document.getElementById(id); }
@@ -4000,7 +4398,7 @@ _FILTER_JS = r"""
   // would clip the next selection's data.
   var CHARTS = ['perf-cum', 'perf-dd', 'dec-monthly', 'dec-cat', 'dec-sub', 'dec-price',
                 'dec-hold', 'cal-curve', 'diag-ret', 'diag-slip', 'risk-kelly', 'risk-dep',
-                'bench-fig'];
+                'bench-fig', 'khat-fig'];
   var drawn = {};
   CHARTS.forEach(function(id) {
     var gd = byId(id);
@@ -4093,6 +4491,99 @@ _FILTER_JS = r"""
     redraw('bench-fig', traces);
   }
 
+  // The k-hat chart's rows for a grouping: [{label, st, kind}], kind "all"
+  // (the grouping's whole population), "selected" (the filter's current
+  // choice) or "bar". By category or tag: every group at the selected band
+  // (tags within the selected category); by band: every band for the
+  // selected category or tag. _section_khat renders the same rows for the
+  // default (by category, primary band, no filter), from the same payload.
+  function khatRows(group) {
+    var bi = bandIndex(), cat = catSel.value, tag = tagSel.value, T = D.text, out = [];
+    if (group === 'band') {
+      var key = viewKey();
+      D.khat.forEach(function(b, i) {
+        out.push({label: D.bands[i].label, st: (b && b.groups[key]) || null,
+                  kind: i === bi ? 'selected' : 'bar'});
+      });
+      return out;
+    }
+    var band = D.khat[bi];
+    if (!band) { return out; }
+    if (group === 'tag') {
+      out.push({label: cat === '' ? T.khat_all_tags
+                                  : fill(T.khat_all_in, {category: D.categories[parseInt(cat, 10)]}),
+                st: band.groups[cat === '' ? 'all' : 'c' + cat] || null, kind: 'all'});
+      D.subcats.forEach(function(sc, si) {
+        if (cat !== '' && String(sc[0]) !== cat) { return; }
+        var st = band.groups['s' + si];
+        if (st) {
+          out.push({label: subName(si, cat === ''), st: st,
+                    kind: String(si) === tag ? 'selected' : 'bar'});
+        }
+      });
+      return out;
+    }
+    out.push({label: T.khat_all_categories, st: band.groups.all || null, kind: 'all'});
+    D.categories.forEach(function(name, ci) {
+      var st = band.groups['c' + ci];
+      if (st) { out.push({label: name, st: st, kind: String(ci) === cat ? 'selected' : 'bar'}); }
+    });
+    return out;
+  }
+  // The title _section_khat renders for the default, from the same template
+  function khatTitle(group) {
+    var T = D.text, scope;
+    if (group === 'band') {
+      var key = viewKey();
+      scope = key === 'all' ? T.khat_every_category : selectionName(key);
+    } else {
+      scope = D.bands[bandIndex()].where;
+    }
+    return fill(T.khat_title, {group: T.khat_group_words[group], scope: scope});
+  }
+  // One table row: the group's name and the cells Python formatted
+  function khatRow(label, cells) {
+    var tr = document.createElement('tr');
+    tr.style.borderBottom = '1px solid #E0E0E0';
+    [label].concat(cells).forEach(function(text) {
+      var td = document.createElement('td');
+      td.style.padding = '4px 12px';
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    return tr;
+  }
+  function renderKhat() {
+    var groupSel = document.getElementById('khat-group');
+    if (!groupSel || !byId('khat-fig')) { return; }
+    var group = groupSel.value, list_ = khatRows(group);
+    var has = list_.some(function(r) { return r.st && r.st.n > 0; });
+    // "Not recorded" (no calibration behind the rows) is not "none measured"
+    var recorded = group === 'band' ? D.khat.some(function(b) { return b !== null; })
+                                    : D.khat[bandIndex()] !== null;
+    setText('khat-empty', recorded ? D.text.khat_none : D.text.khat_not_recorded);
+    show('khat', has);
+    if (!has) { return; }
+    var colors = D.styles.khat, h = D.styles.khat_height;
+    // _khat_chart_height, from the same constants
+    var height = Math.max(h[0], h[1] * list_.length + h[2]);
+    sizeTo('khat-fig', height);
+    redraw('khat-fig', [traceOf('khat-fig', 0, {
+      y: list_.map(function(r) { return r.label; }),
+      x: list_.map(function(r) { return r.st ? r.st.k : null; }),
+      text: list_.map(function(r) { return r.st ? r.st.text : ''; }),
+      customdata: list_.map(function(r) { return r.st ? r.st.cells : D.khat_blank; }),
+      marker: markerOf('khat-fig', 0, {color: list_.map(function(r) { return colors[r.kind]; })})
+    })], {height: height}, khatTitle(group));
+    var body = byId('khat-rows');
+    if (body) {
+      body.textContent = '';
+      list_.forEach(function(r) {
+        body.appendChild(khatRow(r.label, r.st ? r.st.cells : D.khat_blank));
+      });
+    }
+  }
+
   // Option labels carry the selected band's trade counts; the tag list holds
   // the selected category's tags, or every "Category · Tag" under "All".
   function refreshOptions() {
@@ -4124,6 +4615,7 @@ _FILTER_JS = r"""
       renderRisk(v, L);
     }
     renderBenchmark(v);
+    renderKhat();
   }
 
   // The block is gzip-compressed JSON in base64 (_packed_json_script),
@@ -4176,6 +4668,12 @@ _FILTER_JS = r"""
     refreshOptions();
     render();
   });
+  if (khatGroup) {
+    khatGroup.addEventListener('change', function() {
+      if (!D) { return; }
+      renderKhat();
+    });
+  }
   tagSel.addEventListener('change', function() {
     if (!D) { return; }
     var t = tagSel.value;
@@ -4205,7 +4703,7 @@ def generate_dashboard(
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> Path:
     """
-    Assemble all eight dashboard sections into a single self-contained HTML file.
+    Assemble all nine dashboard sections into a single self-contained HTML file.
 
     Calls each _section_*() builder in order, concatenates the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
@@ -4214,7 +4712,8 @@ def generate_dashboard(
     view after the sections (_filter_payload, _packed_json_script), and the
     script that swaps a selection in (_FILTER_JS). If that data cannot be
     built, the page is written without the bar and its script, with a notice
-    in the bar's place and a WARNING in the log — then
+    in the bar's place (and in the k-hat breakdown's, which reads the same
+    data) and a WARNING in the log — then
     writes the file to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
     previous run's page (operator decision, 2026-09-25: one current dashboard
     rather than a timestamped one per run, which TS-18 had made collision-free).
@@ -4242,22 +4741,25 @@ def generate_dashboard(
         initial_balance (float): Starting portfolio value in dollars, used for
             return calculations and benchmark normalization.
         sweep (BacktestSweep | None): The full sweep payload from
-            backtester.run_backtest_sweep(), rendered by BOTH the
-            interval-discount section and the scenario-explorer section.
+            backtester.run_backtest_sweep(), rendered by the
+            interval-discount section and the scenario-explorer section, and
+            read by the page-wide filter and the k-hat breakdown (every
+            band's run and calibration, via _band_runs).
             Passed whole rather than unpacked — it already carries the
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
             splitting it would create copies that could disagree. It also
             feeds the header's run-settings line (_run_settings_html). None
-            (default) renders both sections' placeholders — and therefore no
-            coverage line either, which is honest: that path shows no k̂ card
+            (default) renders both sections' placeholders and the k-hat
+            breakdown's "not recorded" notice — and therefore no coverage line
+            either, which is honest: that path shows no k̂ card
             to caveat — and the run-settings line says "not recorded" rather
             than guessing.
 
             When its label_coverage is below
             config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION, a one-line notice is
             also emitted under the Period line, because a strike-blind corpus
-            changes which pairs exist and so taints all eight sections, not
+            changes which pairs exist and so taints all nine sections, not
             just the one that renders the census (DR-66b).
 
             Its corpus_provenance is rendered directly under the Period line
@@ -4357,6 +4859,10 @@ def generate_dashboard(
         _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k)
         _section_interval_discount(sweep),
+        # The same k-hat, broken down by category, tag and spread band — read
+        # off the filter payload, so it follows the filter bar like the
+        # trade sections do (None when the payload could not be built)
+        _section_khat(filter_data, k_used),
         # Also takes the sweep whole — it reads .scenarios, .same_title_point
         # and .calibrations_by_band, none of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the

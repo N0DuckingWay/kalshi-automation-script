@@ -2429,12 +2429,33 @@ def _flt_trades() -> list[BacktestTrade]:
     ]
 
 
+# Implied gaps whose float sum depends on the order they are added in: the
+# carried tuple's pooled row cannot be matched by a reordered copy of it
+_FLT_IMPLIED = (0.1, 0.2, 0.3, 0.35)
+
+
+def _flt_observations(filed: list[tuple[str, str]]) -> tuple:
+    """One observation per (event ticker, fallback category)."""
+    return tuple(backtester.CalibrationObservation(
+        5, _FLT_IMPLIED[i % len(_FLT_IMPLIED)], i % 2 == 0, ticker, category)
+        for i, (ticker, category) in enumerate(filed))
+
+
+def _flt_calibration(filed: list[tuple[str, str]]) -> IntervalCalibration:
+    obs = _flt_observations(filed)
+    return IntervalCalibration(pooled=backtester._calibration_bucket("POOLED", 0.0, obs),
+                               buckets=[], excluded_premise_violations=0, observations=obs)
+
+
 def _flt_sweep():
     """Three bands at k 0.75 (the primary, 0-1, holding every trade; 0.3-0.6
     holding only the same-title ones; 0.3-1 an EQUAL copy of 0.3-0.6's list),
     plus decoy points the filter must never read: another k at the primary
     band AND at 0.3-0.6 (listed after that band's own point, so a filter that
-    ignored k would keep it), another population, and a point with no band."""
+    ignored k would keep it), another population, and a point with no band.
+    Only the primary band carries a k-hat population; KXSPACEX has no trade
+    and no map entry, so its observation files under its fallback category,
+    "Science", which no trade carries."""
     trades = _flt_trades()
     st = [t for t in trades if t.pair_type == "same_title"]
     curve = backtester._build_equity_curve
@@ -2454,10 +2475,14 @@ def _flt_sweep():
                    population="time_series"),
         SweepPoint(k=0.75, trades=st[:1], equity_df=one, spread_band=None, population="all"),
     ]
-    return BacktestSweep(primary=primary, points=[primary], calibration=None,
+    cals = {(0.0, 1.0): _flt_calibration([("KXNHLHART-27", "Other"),
+                                          ("KXSPACEX-14", "Science"),
+                                          ("KXOTHER-1", "Other")]),
+            (0.3, 0.6): None, (0.3, 1.0): None}
+    return BacktestSweep(primary=primary, points=[primary], calibration=cals[(0.0, 1.0)],
                          label_coverage=_scn_coverage(),
                          scenarios=[primary, narrow, wide, *decoys],
-                         same_event_ladders=True)
+                         calibrations_by_band=cals, same_event_ladders=True)
 
 
 def _flt_payload(sweep=None):
@@ -2506,6 +2531,8 @@ class TestFilterBandRuns:
         # another population's, or a point with no band
         assert [len(r.trades) for r in runs] == [5, 3, 3]
         assert runs[1].trades is sweep.scenarios[1].trades
+        assert runs[0].calibration is sweep.calibration
+        assert runs[1].calibration is runs[2].calibration is None
 
     def test_the_primary_band_is_what_the_page_renders(self):
         sweep = _flt_sweep()
@@ -2575,11 +2602,11 @@ class TestFilterViews:
     def test_categories_and_tags_partition_the_band(self):
         _, _, _, payload = _flt_payload()
         lst = payload["lists"][0]
-        assert payload["categories"] == ["Commodities", "Other", "Sports"]
-        assert payload["subcats"] == [[0, "Oil & Gas"], [1, "General"],
-                                      [2, "Basketball"], [2, "Hockey"]]
+        assert payload["categories"] == ["Commodities", "Other", "Science", "Sports"]
+        assert payload["subcats"] == [[0, "Oil & Gas"], [1, "General"], [2, "General"],
+                                      [3, "Basketball"], [3, "Hockey"]]
         n_all = lst["views"]["all"]["n"]
-        cats = {ci: lst["views"][f"c{ci}"]["n"] for ci in range(3) if f"c{ci}" in lst["views"]}
+        cats = {ci: lst["views"][f"c{ci}"]["n"] for ci in range(4) if f"c{ci}" in lst["views"]}
         assert sum(cats.values()) == n_all == 5
         for ci, n_cat in cats.items():
             subs = [lst["views"][f"s{si}"]["n"] for si, (c, _) in enumerate(payload["subcats"])
@@ -2623,6 +2650,15 @@ class TestFilterViews:
         assert payload["empty"]["n"] == 0
         n = len(payload["dates"])
         assert set(_expand(payload["empty"]["eq"], n)) == {1000.0}
+
+    def test_a_category_seen_only_in_khat_observations_is_offered(self):
+        _, _, _, payload = _flt_payload()
+        # KXSPACEX has no trade and no map entry: its observation still files
+        # it under its fallback category, which the bar must offer for the
+        # k-hat breakdown (with no trade view behind it — the trade sections
+        # show the empty view)
+        assert "Science" in payload["categories"]
+        assert _key(payload, "Science") not in payload["lists"][0]["views"]
 
     def test_an_empty_view_reports_no_drawdown_date(self):
         # A flat curve never falls, so there is no trough to date
@@ -2691,7 +2727,7 @@ class TestFilterPage:
             ("1", "", "max(tier,0.3)-0.6"), ("2", "", "max(tier,0.3)-1")]
         cats = re.search(r'<select id="flt-cat"[^>]*>(.*?)</select>', page).group(1)
         assert re.findall(r"<option value=\"\d*\">(.*?)</option>", cats) == [
-            "All categories", "Commodities (1)", "Other (1)", "Sports (3)"]
+            "All categories", "Commodities (1)", "Other (1)", "Science (0)", "Sports (3)"]
         assert ("Showing every trade of the run at the primary spread band max(tier,0)-1, "
                 "k = 0.75: 5 trades. Not filtered by this bar: "
                 f"{dashboard._UNFILTERED_SECTIONS}.") in page
@@ -2737,7 +2773,7 @@ class TestFilterPage:
                    if not i.endswith("-")}          # 'kpi-' + key is checked below
         dynamic = {f"kpi-{key}" for key, *_ in dashboard._performance_kpis(
             _flt_sweep().primary.equity_df, _flt_trades(), 1000.0)}
-        dynamic |= {f"{p}-{part}" for p in ("dec", "cal", "diag", "risk")
+        dynamic |= {f"{p}-{part}" for p in ("dec", "cal", "diag", "risk", "khat")
                     for part in ("empty", "body")}
         missing = sorted(i for i in literal | dynamic if f'id="{i}"' not in page)
         assert literal and not missing
@@ -3033,7 +3069,7 @@ class TestFilterScript:
             ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"],
             ["set", "flt-cat", other], ["fire", "flt-cat"], ["snap", "s"]])["s"]
         assert [text for _, text in snap["selects"]["flt-cat"]["options"]] == [
-            "All categories", "Commodities (1)", "Other (0)", "Sports (2)"]
+            "All categories", "Commodities (1)", "Other (0)", "Science (0)", "Sports (2)"]
         for prefix in ("dec", "cal", "diag", "risk"):
             assert (snap["display"][f"{prefix}-empty"], snap["display"][f"{prefix}-body"]) \
                 == ("", "none")
@@ -3041,22 +3077,259 @@ class TestFilterScript:
         assert snap["text"]["kpi-max_drawdown"] == "0.0%"
         assert "This band is its own simulation" not in snap["text"]["flt-summary"]
 
+    def test_the_khat_table_redraws_as_python_rendered_it(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["snap", "back"]])["back"]
+        body = re.search(r'<tbody id="khat-rows">(.*?)</tbody>', page, re.S).group(1)
+        python_rows = [[html.unescape(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr)]
+                       for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body)]
+        assert snap["rows"]["khat-rows"] == python_rows
+        assert snap["display"]["khat-body"] == "" and snap["display"]["khat-empty"] == "none"
+
+    def test_group_by_stays_usable_when_a_selection_has_no_khat(self, monkeypatch, tmp_path):
+        # Commodities has trades but no k-hat entry: grouped by tag it draws
+        # nothing, and the reader must be able to group by category again
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        commodities = str(data["categories"].index("Commodities"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "khat-group", "tag"], ["fire", "khat-group"],
+            ["set", "flt-cat", commodities], ["fire", "flt-cat"], ["snap", "empty"],
+            ["set", "khat-group", "category"], ["fire", "khat-group"], ["snap", "back"]])
+        empty, back = snaps["empty"], snaps["back"]
+        assert (empty["display"]["khat-body"], empty["display"]["khat-empty"]) == ("none", "")
+        assert empty["text"]["khat-empty"] == data["text"]["khat_none"]
+        assert not empty["selects"]["khat-group"]["disabled"]
+        assert back["display"]["khat-body"] == ""
+        react = _last_react(back, "khat-fig")
+        assert react["data"][0]["y"] == ["All categories", "Other", "Science", "Sports"]
+
+    def test_grouping_by_band_highlights_the_selected_band(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = str(data["categories"].index("Sports"))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cat", sports], ["fire", "flt-cat"],
+            ["set", "khat-group", "band"], ["fire", "khat-group"], ["snap", "s"]])["s"]
+        react = _last_react(snap, "khat-fig")
+        colors = data["styles"]["khat"]
+        assert react["data"][0]["y"] == [b["label"] for b in data["bands"]]
+        assert react["data"][0]["marker"]["color"] == [colors["selected"], colors["bar"],
+                                                        colors["bar"]]
+        assert react["layout"]["title"]["text"] == "Empirical k̂ by spread band — Sports"
+        assert react["layout"]["height"] == dashboard._khat_chart_height(3)
+        assert snap["heights"]["khat-fig"] == snap["ownHeights"]["khat-fig"] \
+            == f"{dashboard._khat_chart_height(3)}px"
+        # The two bands with no calibration: a row each, every cell blank
+        assert snap["rows"]["khat-rows"][1:] == [[b["label"], *data["khat_blank"]]
+                                                 for b in data["bands"][1:]]
+
+    def test_grouping_by_tag_lists_the_selected_categorys_tags(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tag", hockey], ["fire", "flt-tag"],
+            ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "s"]])["s"]
+        react = _last_react(snap, "khat-fig")
+        colors = data["styles"]["khat"]
+        assert react["data"][0]["y"] == ["All Sports", "Hockey"]
+        assert react["data"][0]["marker"]["color"] == [colors["all"], colors["selected"]]
+        assert react["layout"]["title"]["text"] == (
+            "Empirical k̂ by tag — the primary spread band max(tier,0)-1")
+
+    def test_a_band_without_a_calibration_says_so(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["snap", "s"]])["s"]
+        assert (snap["display"]["khat-body"], snap["display"]["khat-empty"]) == ("none", "")
+        assert snap["text"]["khat-empty"] == data["text"]["khat_not_recorded"]
+
     def test_a_browser_that_cannot_inflate_keeps_the_bar_disabled(
             self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
-        assert all(snap["selects"][i]["disabled"] for i in _FLT_SELECTS)
+        assert all(snap["selects"][i]["disabled"] for i in (*_FLT_SELECTS, "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
         assert snap["reacts"] == []
+
+
+class TestKhatBreakdown:
+    """The k-hat chart: each band's carried k-hat population, regrouped by
+    category and tag through backtester._calibration_bucket."""
+
+    FILED = [("KXNHLHART-27", "Other"), ("KXSPACEX-14", "Science"),
+             ("KXOTHER-1", "Other"), ("KXNHLHART-27", "Other")]
+
+    @staticmethod
+    def _band(cal):
+        return dashboard._khat_band(cal, _FLT_SERIES, {"Other": 0, "Science": 1, "Sports": 2},
+                                    {("Other", "General"): 0, ("Science", "General"): 1,
+                                     ("Sports", "Hockey"): 2})
+
+    def test_the_all_group_is_the_pooled_row_exactly(self):
+        cal = _flt_calibration(self.FILED)
+        # The fixture has teeth: summed in another order its implied gaps
+        # differ, so only the carried tuple itself matches the pooled row
+        flipped = backtester._calibration_bucket("", 0.0, cal.observations[::-1])
+        assert flipped.mean_implied != cal.pooled.mean_implied
+        band = self._band(cal)
+        assert band["carried"] is True
+        whole = band["groups"]["all"]
+        assert (whole["n"], whole["rate"], whole["implied"], whole["k"]) == (
+            cal.pooled.n, cal.pooled.realised_rate, cal.pooled.mean_implied,
+            cal.pooled.empirical_k)
+        # Two entries of one event count as one event
+        assert whole["events"] == 3
+        # Categories partition the population, each reduced by the one
+        # k-hat definition
+        assert sum(band["groups"][f"c{i}"]["n"] for i in range(3)) == whole["n"]
+        hockey = [o for o in cal.observations if o.event_ticker.startswith("KXNHL")]
+        bucket = backtester._calibration_bucket("", 0.0, hockey)
+        assert band["groups"]["s2"]["k"] == bucket.empirical_k
+        assert band["groups"]["c2"]["n"] == len(hockey) == 2
+        assert whole["text"] == "n=4 · 3 ev" and whole["cells"] == dashboard._khat_cells(whole)
+
+    def test_cells_are_formatted_once_in_python(self):
+        # 1/32 is a binary tie at 4 dp: Python rounds it to even (0.0312)
+        # where a browser's toFixed gives 0.0313 — the script shows these
+        # cells and formats none of its own
+        stat = dashboard._khat_finish({"n": 32, "events": 5, "rate": 1 / 32,
+                                       "implied": 0.5, "k": 0.0625})
+        assert stat["cells"] == ["32", "5", "0.0312", "0.5000", "0.062"]
+        assert stat["text"] == "n=32 · 5 ev"
+        assert dashboard._khat_cells(None) == ["—"] * 5
+
+    def test_a_calibration_without_its_population_keeps_only_the_pooled_row(self):
+        cal = IntervalCalibration(
+            pooled=IntervalCalibrationBucket("POOLED", 0.0, 12, 0.25, 0.5, 0.5),
+            buckets=[], excluded_premise_violations=0)          # hand-built: () carried
+        band = dashboard._khat_band(cal, None, {}, {})
+        assert band == {"carried": False, "groups": {"all": {
+            "n": 12, "events": None, "rate": 0.25, "implied": 0.5, "k": 0.5,
+            "text": "n=12 · ? ev", "cells": ["12", "—", "0.2500", "0.5000", "0.500"]}}}
+        assert dashboard._khat_band(None, None, {}, {}) is None
+
+    def test_the_payload_carries_every_band_in_band_order(self):
+        _, runs, _, payload = _flt_payload()
+        assert len(payload["khat"]) == len(runs) == 3
+        assert payload["khat"][1] is None and payload["khat"][2] is None
+        groups = payload["khat"][0]["groups"]
+        # Science (seen only in an observation) is a group; Commodities (seen
+        # only in trades) is not
+        assert _key(payload, "Science") in groups
+        assert _key(payload, "Commodities") not in groups
+        assert payload["khat_blank"] == ["—"] * 5
+        assert payload["styles"]["khat_height"] == list(dashboard._KHAT_HEIGHT)
+        least, per_row, axes = dashboard._KHAT_HEIGHT
+        assert dashboard._khat_chart_height(9) == max(least, per_row * 9 + axes)
+
+    def test_the_default_render_is_by_category_at_the_primary_band(self):
+        _, _, _, payload = _flt_payload()
+        section = dashboard._section_khat(payload, 0.625)
+        data, layout = _nth_figure(section, 0)
+        groups = payload["khat"][0]["groups"]
+        assert data[0]["y"] == ["All categories", "Other", "Science", "Sports"]
+        assert data[0]["x"] == pytest.approx(
+            [groups["all"]["k"], groups["c1"]["k"], groups["c2"]["k"], groups["c3"]["k"]])
+        assert data[0]["marker"]["color"] == ["#9E9E9E", "#2196F3", "#2196F3", "#2196F3"]
+        assert data[0]["text"][0] == groups["all"]["text"]
+        # The hover shows the table's own cells, with no number format of its own
+        assert data[0]["customdata"][0] == groups["all"]["cells"]
+        assert ":." not in data[0]["hovertemplate"]
+        assert (data[0]["textposition"], data[0]["cliponaxis"]) == ("outside", False)
+        assert layout["title"]["text"] == (
+            "Empirical k̂ by category — the primary spread band max(tier,0)-1")
+        # The line marks the k the run was sized at, printed exactly
+        assert layout["shapes"][0]["x0"] == 0.625
+        assert layout["annotations"][0]["text"] == "sized at k = 0.625"
+        # The table repeats the bars, one row each, with Python's cells
+        assert section.count("<tr style='border-bottom:1px solid #E0E0E0'>") == 4
+        assert "".join(f"<td style='padding:4px 12px;'>{c}</td>"
+                       for c in groups["all"]["cells"]) in section
+
+    def test_group_by_stays_outside_the_body_it_hides(self):
+        # A selection with nothing to draw hides the body; the grouping that
+        # could draw something must stay reachable, so the select sits
+        # before the notice and outside the body — disabled until the
+        # script has its data, and never restored by a reload
+        _, _, _, payload = _flt_payload()
+        section = dashboard._section_khat(payload, 0.75)
+        select = section.index('<select id="khat-group" disabled autocomplete="off">')
+        assert select < section.index('<p id="khat-empty"') < section.index('<div id="khat-body"')
+        assert '<option value="band">' in section
+
+    def test_a_band_without_a_calibration_says_it_was_not_recorded(self):
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        runs = [dashboard._BandRun((0.0, 1.0), "max(tier,0)-1", trades, curve, None)]
+        payload = dashboard._filter_payload(runs, 0, _FLT_START, 1000.0, _FLT_SERIES, 0.75,
+                                            "k = 0.75")
+        section = dashboard._section_khat(payload, None)
+        notice = html.escape(dashboard._KHAT_TEXT["khat_not_recorded"])
+        assert f'color:#616161;">{notice}</p>' in section
+        assert '<div id="khat-body" style="display:none">' in section
+        assert "shapes" not in json.dumps(_nth_figure(section, 0)[1])   # no k to mark
+
+    def test_an_empty_population_is_not_called_unrecorded(self):
+        # Every candidate a premise violation: measured, and nothing counted
+        empty = IntervalCalibration(
+            pooled=backtester._calibration_bucket("POOLED", 0.0, ()), buckets=[],
+            excluded_premise_violations=3, observations=())
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        runs = [dashboard._BandRun((0.0, 1.0), "max(tier,0)-1", trades, curve, empty)]
+        payload = dashboard._filter_payload(runs, 0, _FLT_START, 1000.0, _FLT_SERIES, 0.75,
+                                            "k = 0.75")
+        section = dashboard._section_khat(payload, 0.75)
+        assert html.escape(dashboard._KHAT_TEXT["khat_none"]) in section
+        assert '<div id="khat-body" style="display:none">' in section
+
+    def test_without_the_filter_data_the_section_says_so(self):
+        section = dashboard._section_khat(None, 0.75)
+        assert "could not be built" in section and "khat-group" not in section
+
+    def test_group_names_are_escaped_in_the_table(self):
+        stat = dashboard._khat_finish({"n": 2, "events": 1, "rate": 0.5, "implied": 0.4,
+                                       "k": 1.25})
+        row = dashboard._khat_row_html("<b>Sports</b>", stat)
+        assert "<b>" not in row and "&lt;b&gt;Sports&lt;/b&gt;" in row
+        assert row.count("—") == 0 and "1.250" in row
+        assert dashboard._khat_row_html("x", None).count("—") == 5
+
+    def test_the_section_sits_after_the_interval_discount_section(self, monkeypatch, tmp_path):
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+
+        def heading(title: str) -> int:
+            # Section titles, not the filter bar's summary, which names two of them
+            return page.index(f"\n{title}\n</div>")
+        assert (heading("Interval Discount (k) Calibration")
+                < heading("Empirical k̂ by Category, Tag and Spread Band")
+                < heading("Scenario Explorer"))
+
+    def test_a_filter_that_cannot_be_built_leaves_the_section_a_notice(
+            self, monkeypatch, tmp_path):
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+        assert "Empirical k̂ by Category, Tag and Spread Band" in page
+        assert "could not be built for this run" in page and 'id="khat-group"' not in page
 
 
 class TestFilterPageSize:
     """A band sweep whose 36 bands each traded a DIFFERENT list — the
     worst case for the filter, which ships a view per band list x category
     x tag — stays well inside the page budget the scenario explorer set
-    (5 MB), because the payload is gzip-packed (_packed_json_script)."""
+    (5 MB), because the payload is gzip-packed (_packed_json_script). Each
+    band also carries a 300-entry k-hat population, which the k-hat
+    breakdown ships per band x category x tag."""
 
     def test_36_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path):
         import random
@@ -3080,20 +3353,28 @@ class TestFilterPageSize:
 
         bands = [(lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
                  for hi in config.SPREAD_BAND_SWEEP_CEILINGS]
-        scenarios = []
+        scenarios, cals = [], {}
         for band in bands:
             trades = sorted((trade(i) for i in range(40)), key=lambda t: t.entry_date)
             scenarios.append(SweepPoint(
                 k=0.75, trades=trades, spread_band=band,
                 equity_df=backtester._build_equity_curve(trades, start, 10_000.0)))
-        sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]], calibration=None,
-                              label_coverage=_scn_coverage(), scenarios=scenarios)
+            obs = tuple(backtester.CalibrationObservation(
+                rng.randint(1, 30), rng.uniform(0.15, 0.8), rng.random() < 0.4,
+                f"{rng.choice(series)}-{j}", "Other") for j in range(300))
+            cals[band] = IntervalCalibration(
+                pooled=backtester._calibration_bucket("POOLED", 0.0, obs), buckets=[],
+                excluded_premise_violations=0, observations=obs)
+        sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]],
+                              calibration=cals[bands[0]], label_coverage=_scn_coverage(),
+                              scenarios=scenarios, calibrations_by_band=cals)
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
         page = out.read_text(encoding="utf-8")
         data = TestFilterPage._data(page)
         assert len(data["lists"]) == 36          # nothing collapsed: every list is its own
+        assert all(band is not None for band in data["khat"])
         assert out.stat().st_size <= 3_000_000, f"page was {out.stat().st_size} bytes"
 
 
