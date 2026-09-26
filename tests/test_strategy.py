@@ -830,10 +830,18 @@ class TestTimeSeriesKellyParity:
             and (node.func.id if isinstance(node.func, ast.Name)
                  else getattr(node.func, "attr", None)) == "min_price_diff_for_gap"
         ]
-        # Non-vacuous, and every tier call carries the band's floor
+        # Non-vacuous, and every tier call carries the band's floor AND hands
+        # on the tier-floors switch by name: a call that dropped it would
+        # silently re-apply the tiers inside the tier-floors-off family, and
+        # every behaviour test of a tier-on band would stay green
         assert tier_calls
         for node in tier_calls:
-            assert "spread_min" in {k.arg for k in node.keywords}, node.lineno
+            keywords = {k.arg for k in node.keywords}
+            assert "spread_min" in keywords, node.lineno
+            assert "tier_floors" in keywords, node.lineno
+        # Which bands the tiers bind at is decided THROUGH the helper, asked
+        # both ways, never from a copy of the tier constants
+        assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
 
     def test_ast_live_path_reads_no_band(self):
         # The time-series spread band is a BACKTEST knob. If a band is ever
