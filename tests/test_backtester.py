@@ -6765,6 +6765,10 @@ class TestRunBacktestSweep:
         monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
         result = self._infeasible(monkeypatch, same_event_ladders=passed)
         assert result.same_event_ladders is (configured if passed is None else passed)
+        # The configured switch is recorded on the infeasible path too, so an
+        # infeasible run's header still names a departure rather than a bare
+        # on/off.
+        assert result.config_same_event_ladders is configured
 
 
 class TestSimulationsAreLabelledWithTheirDiscount:
@@ -6867,7 +6871,8 @@ class TestSimulationsAreLabelledWithTheirDiscount:
             )
         assert (f"Same-event deadline ladders (DR-73): {expected} "
                 "(config.TIME_SERIES_SAME_EVENT_LADDERS)") in caplog.text
-        # And an override says so, rather than looking like the configured value
+        # An override the OTHER way departs from this checkout's config, and
+        # the line says so rather than looking like a bare override.
         caplog.clear()
         with caplog.at_level(logging.INFO):
             backtester.run_backtest_sweep(
@@ -6876,7 +6881,18 @@ class TestSimulationsAreLabelledWithTheirDiscount:
             )
         other = "off" if expected == "on" else "on"
         assert (f"Same-event deadline ladders (DR-73): {other} "
-                "(run-level override)") in caplog.text
+                f"(run-level override; config.TIME_SERIES_SAME_EVENT_LADDERS is {expected} "
+                "in this checkout, so this run does not replay its live rule)") in caplog.text
+        # An override the SAME way says so too, rather than looking like the
+        # no-override reading above.
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+                same_event_ladders=configured,
+            )
+        assert (f"Same-event deadline ladders (DR-73): {expected} "
+                "(run-level override, same as this checkout's config)") in caplog.text
 
     @pytest.mark.parametrize("configured", [True, False])
     @pytest.mark.parametrize("passed", [None, True, False])
@@ -6900,6 +6916,9 @@ class TestSimulationsAreLabelledWithTheirDiscount:
             same_event_ladders=passed,
         )
         assert sweep.same_event_ladders is (configured if passed is None else passed)
+        # And the configured switch itself is recorded beside it, whatever the
+        # override — the header reads both to say whether this run replays it.
+        assert sweep.config_same_event_ladders is configured
 
     def test_run_backtest_leaves_the_ladder_flag_to_the_config(self, monkeypatch):
         # run_backtest keeps its exact pre-DR-73 signature, so it must pass no

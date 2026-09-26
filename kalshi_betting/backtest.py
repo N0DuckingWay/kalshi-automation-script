@@ -26,7 +26,7 @@ Dependencies:
     returns-by-category labels) from historical.py. Imports from config.py:
     PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
-    (the pre-fetch echo), the deadline-gap tier constants
+    (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
     MAX_DEADLINE_GAP_DAYS and PRICE_EPSILON (the spread-band tier WARNING),
     and the backtest band helpers time_series_spread_band and
@@ -57,13 +57,20 @@ Notes:
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
     header: dashboard._run_settings_html(sweep) prints "same-event ladders:
-    on / off / not recorded" (BacktestSweep.same_event_ladders) beside the
+    on / off / not recorded" (BacktestSweep.same_event_ladders), a recorded
+    on/off followed by its reading against the configured switch, beside the
     primary spread band, under the "Period:" line, above every section — so a
     ladder-enabled run's dashboard is no longer indistinguishable from a
     switch-off one and needs no hand labelling. Unlike DR-66b's
     subtitle-coverage caveat, this setting is chosen by the operator on the
     command line rather than discovered by the run, which is why it is named
-    rather than banner-flagged.
+    rather than banner-flagged. When a run's resolved setting departs from
+    the switch this checkout's config sets, all three places say so: the
+    echo below appends " (config: on|off)" from this module's binding,
+    run_backtest_sweep's own ladder line names the departure in its source
+    clause from backtester's, and the header reads backtester's binding
+    through BacktestSweep.config_same_event_ladders beside
+    same_event_ladders.
 
     --spread-min/--spread-max set the PRIMARY scenario's backtest-only
     time-series spread band (floor, ceiling) on pB - pA. Once
@@ -257,8 +264,9 @@ def main() -> None:
         "--same-event-ladders", action=argparse.BooleanOptionalAction, default=None,
         help="Pair two dated cumulative rungs of ONE event as a time-series "
              "ladder for this backtest (default: config."
-             "TIME_SERIES_SAME_EVENT_LADDERS). Affects the backtest only — the "
-             "live finder binds that constant at import.",
+             "TIME_SERIES_SAME_EVENT_LADDERS, currently "
+             f"{'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'}). Affects the "
+             "backtest only — the live finder binds that constant at import.",
     )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
@@ -373,6 +381,11 @@ def main() -> None:
     # the wrong way round.
     effective_ladders = (TIME_SERIES_SAME_EVENT_LADDERS if args.same_event_ladders is None
                          else args.same_event_ladders)
+    # Named against the config when the run departs from it, so the line read
+    # before a multi-hour fetch says the run will not replay the live rule.
+    ladders_echo = "on" if effective_ladders else "off"
+    if bool(effective_ladders) != bool(TIME_SERIES_SAME_EVENT_LADDERS):
+        ladders_echo += f" (config: {'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -389,7 +402,7 @@ def main() -> None:
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
-        "on" if effective_ladders else "off", echo_floor, echo_ceiling,
+        ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off",
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's

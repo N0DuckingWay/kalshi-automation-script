@@ -279,7 +279,13 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # dashboard._run_settings_html prints "same-event ladders: on / off / not
 # recorded" in the page header (BacktestSweep.same_event_ladders), alongside
 # the primary spread band, so a ladder-enabled run's dashboard is no longer
-# indistinguishable from a switch-off one.
+# indistinguishable from a switch-off one. A recorded on/off is also read
+# against this switch: "(same as this checkout's config)", or, when the run
+# departs from it, a note that it is not a replay of the live rule. The
+# pre-fetch echo flags a departure too ("ladders=off (config: on)" or the
+# reverse), from backtest.py's binding, and run_backtest_sweep's ladder line
+# names it, from backtester's; the header reads backtester's binding through
+# BacktestSweep.config_same_event_ladders, which the sweep records.
 #
 # scanner.py, backtester.py AND backtest.py each bind this by VALUE at import
 # (the SCANNER_MAX_PAGES idiom), so a test or harness flipping it at runtime

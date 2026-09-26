@@ -221,6 +221,18 @@ class TestSameEventLaddersArgument:
         assert f"ladders={word}" in caplog.text
 
     @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        # The flag's help is built when main() builds its parser, from
+        # backtest's own binding, so it names the value a flagless run uses and
+        # cannot go stale when the shipped value changes. argparse wraps help
+        # lines, so whitespace is collapsed before matching.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        assert f"currently {word})" in " ".join(capsys.readouterr().out.split())
+
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
     def test_the_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch,
                                                              caplog, configured, word):
         # Patched to BOTH values: one row at either value passes an echo
@@ -233,6 +245,40 @@ class TestSameEventLaddersArgument:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert f"ladders={word}" in caplog.text
+
+    @pytest.mark.parametrize("configured, flag, echo", [
+        (True, "--no-same-event-ladders", "ladders=off (config: on) | spread band="),
+        (False, "--same-event-ladders", "ladders=on (config: off) | spread band="),
+    ])
+    def test_the_config_echo_names_a_departure_from_the_configured_switch(
+        self, cli, monkeypatch, caplog, configured, flag, echo,
+    ):
+        # A run overridden the OTHER way measures a strategy this checkout's
+        # live finder does not trade — the echo names the CONFIGURED value
+        # (not just the resolved one) so an operator reading it before a
+        # multi-hour fetch can see the run departs from what the bot trades.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, flag)
+        assert echo in caplog.text
+
+    @pytest.mark.parametrize("configured, flags", [
+        (True, ["--same-event-ladders"]),
+        (False, ["--no-same-event-ladders"]),
+        (True, []),
+        (False, []),
+    ])
+    def test_the_config_echo_names_no_departure_when_the_run_matches(
+        self, cli, monkeypatch, caplog, configured, flags,
+    ):
+        # Whether by an override that agrees with the config or by leaving the
+        # flag to it, a run that replays the configured switch gets the bare
+        # on/off reading, with no "(config: ...)" clause to depart from.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert f"ladders={'on' if configured else 'off'} | spread band=" in caplog.text
+        assert "(config:" not in caplog.text
 
 
 class TestSpreadBandArguments:
