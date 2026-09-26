@@ -2,6 +2,7 @@
 import gc
 import inspect
 import logging
+import math
 import random
 import re
 import statistics
@@ -11,9 +12,12 @@ from array import array
 from collections import defaultdict
 from dataclasses import astuple
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
+from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -45,6 +49,7 @@ from kalshi_betting.config import (
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS,
     MVE_SERIES_FAMILY_PREFIX,
+    SAME_TITLE_CO_RESOLVE_PROB,
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
@@ -4891,8 +4896,9 @@ class TestCorpusProvenanceIsCarried:
     def test_max_trades_simulated_reads_every_point_the_page_can_show(
             self, where, expected):
         # The one test both renderers apply to a carried post-cutoff verdict:
-        # a trade at ANY simulated point proves it stale, since the k dropdown
-        # and the scenario explorer put every point on the same page.
+        # a trade at ANY simulated point proves it stale, since the filter
+        # bar's k select and the scenario explorer put every point on the
+        # same page.
         primary = self._point(3 if where == "primary" else 0)
         sweep = backtester.BacktestSweep(
             primary=primary,
@@ -5286,10 +5292,10 @@ class TestEquityCurveOpensAtTheInitialBalance:
         assert without_leading == pytest.approx(-0.741287, abs=1e-6)
 
     def test_sweep_row_and_performance_card_report_one_return(self):
-        # _srow (inside _section_interval_discount) divides by the curve's
-        # iloc[0]; _section_performance divides by initial_balance. With the
-        # leading row those bases are the same number, so the two cells on one
-        # page can no longer disagree.
+        # _kd_cells (the interval-discount section's per-k rows) divides by
+        # the curve's iloc[0]; _section_performance divides by
+        # initial_balance. With the leading row those bases are the same
+        # number, so the two cells on one page can no longer disagree.
         from kalshi_betting import dashboard
 
         eq = self._curve()
@@ -5816,7 +5822,8 @@ class TestCheckpointOpeningBalanceSizing:
         # (0.2 + 0.2 < 1), so the greedy-skip branch is unreachable. Raise the
         # cap to 0.60 for this test only — backtester imports the constant by
         # value (`from .config import BUDGET_FRACTION`), so patching the module
-        # attribute is what Pass 1's `min(BUDGET_FRACTION, kelly_f)` reads.
+        # attribute is what `_resolve_size_cap(None)` reads at call time, and
+        # Pass 1 sizes at `min(cap, kelly_f)` with that cap.
         monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.60)
         self._patch(monkeypatch)
 
@@ -9497,3 +9504,888 @@ class TestExactLabels:
             assert backtester._exact_label(float(x), "g") == format(x, "g")
         for k in INTERVAL_DISCOUNT_SWEEP:
             assert backtester._exact_label(k, ".3f") == format(k, ".3f")
+
+
+# ─── C1: the per-trade size cap as a parameter, and the lazy cap sweep ───────
+
+def _uncapped_kelly(rec: dict, k: float) -> float | None:
+    """Pass 1b's uncapped Kelly fraction for one prepared entry, rebuilt from
+    the config helpers — the independent oracle for peak_kelly_fraction.
+    None when the net spread leaves nothing to size."""
+    e = rec["entry"]
+    price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
+                                                  e["pB"], e["nB"])
+    fee = fee_per_pair_approx(price_a, price_b)
+    net = (1.0 - price_a - price_b) - fee
+    if net <= 0:
+        return None
+    b = net / (price_a + price_b + fee)
+    p = (time_series_profit_prob(e["pA"], e["pB"], k=k)
+         if rec["pair_type"] == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
+    return p - (1.0 - p) / b
+
+
+def _completion_lines(caplog) -> list[str]:
+    """Every captured "Backtest complete ..." line, in order."""
+    return [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Backtest complete")]
+
+
+class TestSizeCap:
+    """_simulate_at_discount(size_cap=..., quiet=...): the per-trade Kelly cap
+    as a simulation parameter, defaulting to BUDGET_FRACTION so every existing
+    call sizes — and logs — exactly as before."""
+
+    _START = date(2026, 1, 1)
+
+    def _entries(self, monkeypatch, result_a="yes", result_b="yes"):
+        """TestRunBacktestTimeSeriesFlow's pair at its wide-gap candle (later
+        leg 0.85 / 0.15): ONE time-series entry whose uncapped f* is ~0.216,
+        so the 20% cap binds and a larger cap sizes it bigger."""
+        flow = TestRunBacktestTimeSeriesFlow
+        candles = {"EA": [_candle(_MONDAY_TS, flow._PA, flow._NA)],
+                   "EB": [_candle(_MONDAY_TS, 0.85, 0.15)]}
+        markets = flow._markets(result_a, result_b)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), self._START,
+                                                 True, None)
+        assert len(entries) == 1
+        return entries
+
+    def _sim(self, entries, **kw):
+        return backtester._simulate_at_discount(entries, self._START, 10_000.0, **kw)
+
+    def test_the_grid(self):
+        grid = backtester.SIZE_CAP_SWEEP
+        assert len(grid) == 20 and list(grid) == sorted(grid)
+        assert grid[:-1] == tuple(round(0.05 * i, 2) for i in range(1, 20))
+        assert grid[-1] == 1.0
+        # The run's own cap is a member by value, so the eager points are exact
+        # grid members without the union
+        assert BUDGET_FRACTION in grid
+
+    def test_none_sizes_as_before(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        trades, equity = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                                      start_date=self._START, initial_balance=10_000.0)
+        for point in (self._sim(entries), self._sim(entries, size_cap=None),
+                      self._sim(entries, size_cap=BUDGET_FRACTION)):
+            assert [astuple(t) for t in point.trades] == [astuple(t) for t in trades]
+            pd.testing.assert_frame_equal(point.equity_df, equity)
+            assert point.size_cap == BUDGET_FRACTION
+        assert trades[0].kelly_fraction == pytest.approx(BUDGET_FRACTION)
+
+    def test_no_cap_sizes_at_full_kelly(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        uncapped = _uncapped_kelly(entries[0], TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+        assert uncapped == pytest.approx(0.216, abs=1e-3)
+        default, full = self._sim(entries), self._sim(entries, size_cap=1.0)
+        assert full.size_cap == 1.0
+        t = full.trades[0]
+        assert t.kelly_fraction == pytest.approx(uncapped)
+        assert t.n > default.trades[0].n
+        assert t.total_cost + t.fees <= 10_000.0 * uncapped + 1e-9
+
+    def test_a_smaller_cap_sizes_smaller(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        default, small = self._sim(entries), self._sim(entries, size_cap=0.05)
+        assert small.size_cap == 0.05
+        assert small.trades[0].kelly_fraction == pytest.approx(0.05)
+        assert small.trades[0].n < default.trades[0].n
+        assert small.trades[0].total_cost + small.trades[0].fees <= 500.0 + 1e-9
+
+    @pytest.mark.parametrize("cap", [0, 0.0, -0.1, 1.5, 1.0000001, True, False,
+                                     float("nan"), float("inf"), "0.2", np.bool_(True),
+                                     Decimal("0.2"), np.float64(1.5), np.float64("nan")])
+    def test_an_invalid_cap_raises_before_any_entry_is_scored(self, monkeypatch, cap):
+        entries = self._entries(monkeypatch)
+        monkeypatch.setattr(backtester, "time_series_profit_prob",
+                            lambda *a, **k: pytest.fail("an entry was scored"))
+        with pytest.raises(ValueError, match="size_cap"):
+            self._sim(entries, size_cap=cap)
+
+    def test_an_int_cap_is_accepted_as_a_float(self):
+        assert backtester._resolve_size_cap(1) == 1.0
+        assert type(backtester._resolve_size_cap(1)) is float
+
+    @pytest.mark.parametrize("cap,value", [
+        (np.float64(0.35), 0.35), (np.float32(0.25), 0.25), (np.int64(1), 1.0),
+        (Fraction(1, 4), 0.25),
+    ])
+    def test_any_real_number_in_range_is_accepted_as_a_builtin_float(self, cap, value):
+        # numbers.Real, not just int/float: a numpy scalar a report computes
+        # with is a real number in range, never a range error
+        resolved = backtester._resolve_size_cap(cap)
+        assert resolved == value and type(resolved) is float
+
+    def test_a_type_rejection_names_the_type_not_the_range(self):
+        with pytest.raises(ValueError, match=r"real number .*\(str\)"):
+            backtester._resolve_size_cap("0.2")
+        with pytest.raises(ValueError, match=r"real number .*\(Decimal\)"):
+            backtester._resolve_size_cap(Decimal("0.2"))
+        with pytest.raises(ValueError) as out_of_range:
+            backtester._resolve_size_cap(1.5)
+        assert "real number" not in str(out_of_range.value)
+        assert "must be in (0, 1]" in str(out_of_range.value)
+
+    def test_the_peak_is_the_largest_uncapped_f_over_kelly_passing_candidates(
+        self, monkeypatch,
+    ):
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        for k in (0.5, 0.75, 1.0):
+            expected = max(f for f in (_uncapped_kelly(r, k) for r in entries)
+                           if f is not None and f > 0)
+            peaks = {self._sim(entries, k=k, size_cap=cap).peak_kelly_fraction
+                     for cap in (0.05, BUDGET_FRACTION, 1.0)}
+            # ... the same at every cap: Pass 1b scores before any sizing
+            assert len(peaks) == 1
+            assert peaks.pop() == pytest.approx(expected, abs=1e-12)
+        # The same-title pair (f* ~0.77) is the golden peak at k = 0.75
+        st = next(r for r in entries if r["pair_type"] == "same_title")
+        assert self._sim(entries).peak_kelly_fraction == pytest.approx(
+            _uncapped_kelly(st, 0.75), abs=1e-12)
+        assert _uncapped_kelly(st, 0.75) == pytest.approx(0.77, abs=0.01)
+
+    def test_a_candidate_dropped_after_the_kelly_gate_still_counts(self, monkeypatch):
+        # At k = 1.0 the golden time-series peak is TA/TB (~0.106) — voided,
+        # so it never trades — and nothing else passes the Kelly gate.
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        ts = [r for r in entries if r["pair_type"] == "time_series"]
+        point = self._sim(ts, k=1.0)
+        assert point.trades == []
+        ta = next(r for r in ts if r["entry"]["mA"]["ticker"] == "TA")
+        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(ta, 1.0), abs=1e-12)
+        assert point.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
+
+    def test_the_peak_is_zero_when_nothing_passes_the_kelly_gate(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        # k = 1: the market's own in-between mass, so Kelly is negative
+        assert _uncapped_kelly(entries[0], 1.0) < 0
+        point = self._sim(entries, k=1.0)
+        assert point.trades == [] and point.peak_kelly_fraction == 0.0
+        assert self._sim([]).peak_kelly_fraction == 0.0
+
+    def test_the_default_cap_completion_line_is_byte_identical(self, monkeypatch, caplog):
+        entries = self._entries(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            self._sim(entries)
+            self._sim(entries, size_cap=BUDGET_FRACTION)
+        assert _completion_lines(caplog) == [
+            "Backtest complete at k=0.750, band 0-1, all: 1 trades, 1 profitable"] * 2
+
+    def test_other_caps_are_named_before_the_colon_with_unique_prefixes(
+        self, monkeypatch, caplog,
+    ):
+        entries = self._entries(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            for cap in (None, 0.35, 1.0, 0.19999999999999998, 0.05):
+                self._sim(entries, size_cap=cap)
+        lines = _completion_lines(caplog)
+        assert lines[1] == ("Backtest complete at k=0.750, band 0-1, all, cap 35%: "
+                            "1 trades, 1 profitable")
+        assert lines[2] == ("Backtest complete at k=0.750, band 0-1, all, no cap: "
+                            "1 trades, 1 profitable")
+        # A cap that merely ROUNDS to the default still gets its own prefix
+        assert lines[3].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, cap 19.999999999999998%:")
+        prefixes = _completion_prefixes(lines)
+        assert len(prefixes) == len(set(prefixes)) == 5
+
+    def test_quiet_sends_the_line_and_the_premise_warning_to_debug(self, monkeypatch, caplog):
+        # EA yes / EB no: the premise-violation cell, warned once per run
+        entries = self._entries(monkeypatch, "yes", "no")
+
+        def levels(**kw):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                self._sim(entries, **kw)
+            premise = [r.levelno for r in caplog.records
+                       if "cumulative-deadline premise" in r.getMessage()]
+            done = [r.levelno for r in caplog.records
+                    if r.getMessage().startswith("Backtest complete")]
+            return premise, done
+
+        assert levels() == ([logging.WARNING], [logging.INFO])
+        assert levels(size_cap=0.35) == ([logging.WARNING], [logging.INFO])
+        assert levels(quiet=True) == ([logging.DEBUG], [logging.DEBUG])
+        assert levels(size_cap=0.35, quiet=True) == ([logging.DEBUG], [logging.DEBUG])
+        # ... with the text unchanged
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            self._sim(entries, quiet=True)
+            quiet_text = [r.getMessage() for r in caplog.records]
+            caplog.clear()
+            self._sim(entries)
+            loud_text = [r.getMessage() for r in caplog.records]
+        assert quiet_text == loud_text
+
+    def test_a_monkeypatched_budget_fraction_still_binds(self, monkeypatch, caplog):
+        entries = self._entries(monkeypatch)
+        monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.10)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(entries)
+        assert point.size_cap == 0.10
+        assert point.trades[0].kelly_fraction == pytest.approx(0.10)
+        # The patched value IS the default: no suffix, and nothing forwarded
+        assert _completion_lines(caplog) == [
+            "Backtest complete at k=0.750, band 0-1, all: 1 trades, 1 profitable"]
+        assert backtester._sim_options(0.10, False) == {}
+        assert backtester._sim_options(0.20, False) == {"size_cap": 0.20}
+
+    @pytest.mark.parametrize("size_cap,quiet,expected", [
+        (None, False, {}),
+        (BUDGET_FRACTION, False, {}),
+        (None, True, {"quiet": True}),
+        (0.35, False, {"size_cap": 0.35}),
+        (1.0, True, {"size_cap": 1.0, "quiet": True}),
+    ])
+    def test_sim_options_forwards_only_what_differs(self, size_cap, quiet, expected):
+        assert backtester._sim_options(size_cap, quiet) == expected
+
+    def test_sim_options_forwards_an_end_date_only_when_given(self):
+        day = date(2026, 9, 26)
+        assert backtester._sim_options(None, False, end_date=None) == {}
+        assert backtester._sim_options(None, False, end_date=day) == {"end_date": day}
+        assert backtester._sim_options(0.35, True, end_date=day) == {
+            "size_cap": 0.35, "quiet": True, "end_date": day}
+
+    @pytest.mark.parametrize("cap,text", [
+        (0.55, "55"), (0.2, "20"), (0.05, "5"), (1.0, "100"),
+        (0.19999999999999998, "19.999999999999998"),
+        # A float subclass reprs as "np.float64(0.35)"; the builtin value is read
+        (np.float64(0.35), "35"), (np.float64(0.19999999999999998), "19.999999999999998"),
+    ])
+    def test_cap_percent(self, cap, text):
+        assert backtester._cap_percent(cap) == text
+
+    def test_cap_percent_is_injective(self):
+        # Every grid member reads as written ...
+        assert [backtester._cap_percent(c) for c in backtester.SIZE_CAP_SWEEP] == [
+            str(5 * i) for i in range(1, 21)]
+        # ... and no two different caps print alike: each grid member's
+        # neighbouring doubles, plus a pair a float product (repr(cap * 100))
+        # merges — 0.003 and the double below it both give 0.3 there
+        caps = {0.003, 0.0029999999999999996}
+        for c in backtester.SIZE_CAP_SWEEP + (0.003, 0.555):
+            lo = hi = c
+            for _ in range(4):
+                lo, hi = math.nextafter(lo, 0.0), math.nextafter(hi, 2.0)
+                caps.update(x for x in (lo, hi) if 0 < x <= 1)
+            caps.add(c)
+        texts = {backtester._cap_percent(c): c for c in caps}
+        assert len(texts) == len(caps)
+        # ... and each string reads back as exactly its cap
+        assert all(float(Decimal(t) / 100) == c for t, c in texts.items())
+
+    def test_cap_labels(self):
+        assert backtester._cap_label(1.0) == "no cap"
+        assert backtester._cap_label(0.35) == "cap 35%"
+        assert backtester._cap_label(np.float64(0.35)) == "cap 35%"
+        assert backtester._cap_label(0.2) == "cap 20%"
+        assert backtester._cap_label(0.19999999999999998) == "cap 19.999999999999998%"
+
+    def test_half_split_simulates_both_halves_at_the_cap(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        first = [r for r in entries if r["entry"]["entry_date"] < date(2026, 1, 12)]
+        second = [r for r in entries if r["entry"]["entry_date"] >= date(2026, 1, 12)]
+        split = backtester._half_split((first, second), golden._START, 10_000.0, 0.75,
+                                       BACKTEST_DEFAULT_SPREAD_BAND, size_cap=1.0)
+        default = backtester._half_split((first, second), golden._START, 10_000.0, 0.75,
+                                         BACKTEST_DEFAULT_SPREAD_BAND)
+        alone = backtester._simulate_at_discount(first, golden._START, 10_000.0, k=0.75,
+                                                 size_cap=1.0)
+        final = float(alone.equity_df["portfolio_value"].iloc[-1])
+        assert split.h1_return == pytest.approx((final - 10_000.0) / 10_000.0)
+        # Not vacuous: the first half's same-title trade (f* ~0.77) sizes
+        # bigger with no cap, so the two halves' returns differ
+        assert split.h1_return != default.h1_return
+
+    def test_half_split_quiet_sends_both_halves_to_debug(self, monkeypatch, caplog):
+        # EA yes / EB no: the premise-violation cell, in BOTH halves
+        entries = self._entries(monkeypatch, "yes", "no")
+
+        def records(**kw):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                backtester._half_split((entries, entries), self._START, 10_000.0, 0.75,
+                                       BACKTEST_DEFAULT_SPREAD_BAND, **kw)
+            return [(r.levelno, r.getMessage()) for r in caplog.records]
+
+        quiet = records(size_cap=0.35, quiet=True)
+        done = [m for _lvl, m in quiet if m.startswith("Backtest complete")]
+        assert [m.split(":")[0] for m in done] == [
+            "Backtest complete at k=0.750, band 0-1, all/H1, cap 35%",
+            "Backtest complete at k=0.750, band 0-1, all/H2, cap 35%"]
+        assert sum("cumulative-deadline premise" in m for _lvl, m in quiet) == 2
+        assert {lvl for lvl, _m in quiet} == {logging.DEBUG}
+        # ... while the eager (default) call keeps its INFO lines and WARNINGs
+        loud = records(size_cap=0.35)
+        assert {lvl for lvl, m in loud if m.startswith("Backtest complete")} == {logging.INFO}
+        assert {lvl for lvl, m in loud if "cumulative-deadline premise" in m} == {
+            logging.WARNING}
+
+    def test_half_split_and_ex_top_forward_an_end_date(self, monkeypatch):
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append(k.get("end_date"))
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
+                                   trades=[])
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        day = date(2026, 9, 26)
+        backtester._half_split(([], []), date(2026, 1, 1), 100.0, 0.6, (0.3, 0.6),
+                               size_cap=0.35, quiet=True, end_date=day)
+        point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
+                                      trades=[TestSweepHelpers._trade("E1", 5.0)],
+                                      size_cap=0.35)
+        backtester._ex_top_event(point, [{"entry": {"mA": {"event_ticker": "E1"}}}],
+                                 date(2026, 1, 1), 100.0, (0.3, 0.6), quiet=True,
+                                 end_date=day)
+        assert seen == [day, day, day]
+
+    def test_ex_top_event_re_simulates_at_the_point_s_own_cap(self, monkeypatch):
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append(k)
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}))
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        trades = [TestSweepHelpers._trade("E1", 5.0)]
+        entries = [{"entry": {"mA": {"event_ticker": "E1"}}}]
+        for size_cap, quiet in ((0.35, True), (1.0, False), (BUDGET_FRACTION, True),
+                                (None, False)):
+            point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(), trades=trades,
+                                          size_cap=size_cap)
+            backtester._ex_top_event(point, entries, date(2026, 1, 1), 100.0, (0.3, 0.6),
+                                     quiet=quiet)
+        base = {"k": 0.6, "spread_band": (0.3, 0.6), "population": "all/ex-top"}
+        assert seen == [{**base, "size_cap": 0.35, "quiet": True},
+                        {**base, "size_cap": 1.0},
+                        {**base, "quiet": True},
+                        base]
+
+
+def _cap_sweep_subsets(entries: list[dict]) -> dict[str, list[dict]]:
+    """Every population of one band's entries, split WITHOUT
+    backtester._population_subsets — the test's own oracle, empty ones kept."""
+    def ladder(r):
+        ev = r["entry"]["mA"].get("event_ticker") or ""
+        return (r["pair_type"] == "time_series" and bool(ev)
+                and ev == (r["entry"]["mB"].get("event_ticker") or ""))
+    return {
+        "all": list(entries),
+        "time_series": [r for r in entries if r["pair_type"] == "time_series"],
+        "ladder": [r for r in entries if ladder(r)],
+        "cross": [r for r in entries if r["pair_type"] == "time_series" and not ladder(r)],
+    }
+
+
+@pytest.fixture(scope="class")
+def cap_sweep_run():
+    """The golden band sweep with cap_sweep=True on a NARROWED grid — floors
+    (0, 0.35) x ceilings (0.5, 1.0) x k (0.5, 1.0) plus the primary 0.75: 4
+    bands x 3 k = 12 cells, small enough to check every cap of every cell
+    against a fresh simulation. The same run with cap_sweep=False, and a
+    band_sweep=False cap sweep, beside it. Every simulation DURING the runs
+    goes through a FIXED six-parameter spy, so a default-cap call that
+    forwarded size_cap or quiet would raise TypeError; the spy is undone
+    before any cell is read, so the cells run the real function."""
+    mp = pytest.MonkeyPatch()
+    try:
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        sims: list = []
+        real = backtester._simulate_at_discount
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all"):
+            sims.append((spread_band, k, population, len(raw_entries)))
+            return real(raw_entries, start_date, initial_balance, k=k,
+                        spread_band=spread_band, population=population)
+
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+
+        def run(**kw):
+            sims.clear()
+            res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                     start_date=golden._START, initial_balance=10_000.0,
+                                     same_event_ladders=True, **kw)
+            return res, list(sims)
+
+        on, sims_on = run(band_sweep=True, cap_sweep=True)
+        off, sims_off = run(band_sweep=True, cap_sweep=False)
+        single, _ = run(band_sweep=False, cap_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(on=on, off=off, single=single, sims_on=sims_on,
+                              sims_off=sims_off, start=golden._START)
+    finally:
+        mp.undo()
+
+
+@pytest.mark.usefixtures("cap_sweep_run")
+class TestCapSweep:
+    """run_backtest_sweep(cap_sweep=True): every other per-trade size cap of
+    SIZE_CAP_SWEEP, simulated lazily per (band, k) cell and seeded from the
+    eager primary-cap points. Parity with a fresh simulation is the gate."""
+
+    _POPS = ("all", "time_series", "ladder", "cross")
+
+    @staticmethod
+    def _eager(res) -> dict:
+        return {(p.spread_band, p.k, p.population): p for p in res.scenarios}
+
+    @staticmethod
+    def _cells(res):
+        cs = res.cap_sweep
+        for band in cs.bands:
+            for k in cs.ks:
+                yield band, k, cs.cell(band, k)
+
+    def test_off_is_the_default_and_adds_no_simulation(self, cap_sweep_run):
+        assert inspect.signature(run_backtest_sweep).parameters["cap_sweep"].default is False
+        assert inspect.signature(
+            backtester._sweep_from_candidates).parameters["cap_sweep"].default is False
+        assert cap_sweep_run.off.cap_sweep is None
+        # The flag simulates NOTHING during the run: the same simulations, in
+        # the same order, with or without it
+        assert cap_sweep_run.sims_on == cap_sweep_run.sims_off
+        assert len(cap_sweep_run.sims_on) > 100
+
+    def test_the_eager_points_are_unchanged_by_the_flag(self, cap_sweep_run):
+        on, off = cap_sweep_run.on, cap_sweep_run.off
+        assert len(on.scenarios) == len(off.scenarios) > 0
+        for a, b in zip([on.primary, on.same_title_point, *on.scenarios],
+                        [off.primary, off.same_title_point, *off.scenarios], strict=True):
+            assert (a.spread_band, a.k, a.population) == (b.spread_band, b.k, b.population)
+            assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
+            pd.testing.assert_frame_equal(a.equity_df, b.equity_df)
+            assert (a.halves, a.ex_top_event) == (b.halves, b.ex_top_event)
+            assert a.size_cap == b.size_cap == BUDGET_FRACTION
+            assert a.peak_kelly_fraction == b.peak_kelly_fraction
+
+    def test_the_cap_sweep_s_shape(self, cap_sweep_run):
+        on = cap_sweep_run.on
+        cs = on.cap_sweep
+        assert cs.caps == backtester.SIZE_CAP_SWEEP
+        assert cs.primary_cap == BUDGET_FRACTION == on.primary.size_cap
+        assert cs.bands == ((0.0, 0.5), (0.0, 1.0), (0.35, 0.5), (0.35, 1.0))
+        assert cs.ks == (0.5, 0.75, 1.0)
+        assert cs.primary_k == on.primary.k and cs.checks is True
+        assert cs.split_date == on.split_date
+        # The eager seeds are exactly the sweep's scenarios, by identity
+        assert cs.eager.keys() == self._eager(on).keys()
+        assert all(cs.eager[key] is point for key, point in self._eager(on).items())
+        assert cs.same_title_eager is on.same_title_point
+        # Nothing simulated yet — every cap cell is lazy
+        assert (cs.simulated, cs.reused) == (0, 0)
+
+    def test_each_population_s_primary_cap_point_is_the_eager_object(self, cap_sweep_run):
+        on = cap_sweep_run.on
+        eager = self._eager(on)
+        low_peaks = 0
+        for band, k, cell in self._cells(on):
+            at_primary = cell[BUDGET_FRACTION]
+            assert set(at_primary) == {pop for (b, kk, pop) in eager if (b, kk) == (band, k)}
+            for pop, point in at_primary.items():
+                assert point is eager[(band, k, pop)]
+                low_peaks += point.peak_kelly_fraction < BUDGET_FRACTION
+        # Not vacuous: the identity holds where the eager point's peak sits
+        # BELOW the primary cap too (at k = 1.0 the time-series peak is TA/TB's
+        # ~0.106 and the ladder's 0.0), the case the seed branch would copy
+        ts = eager[((0.0, 1.0), 1.0, "time_series")]
+        assert ts.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
+        assert eager[((0.0, 1.0), 1.0, "ladder")].peak_kelly_fraction == 0.0
+        assert low_peaks > 0
+        st = on.cap_sweep.same_title()
+        assert st[BUDGET_FRACTION] is on.same_title_point
+
+    def test_every_cap_equals_a_fresh_simulation(self, cap_sweep_run):
+        on, start = cap_sweep_run.on, cap_sweep_run.start
+        cs = on.cap_sweep
+        checked = 0
+        for band, k, cell in self._cells(on):
+            subsets = _cap_sweep_subsets(cs.entries_by_band[band])
+            for cap in cs.caps:
+                assert set(cell[cap]) == {pop for pop in self._POPS if subsets[pop]}
+                for pop, point in cell[cap].items():
+                    end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                    self._assert_parity(point, subsets[pop], start, k, band, pop, cap,
+                                        on.split_date, checks=True, end_date=end)
+                    checked += 1
+        st_end = backtester._curve_end_date(cs.same_title_eager)
+        for cap, point in cs.same_title().items():
+            self._assert_parity(point, cs.st_entries, start, cs.primary_k, None,
+                                "same_title", cap, on.split_date, checks=True,
+                                end_date=st_end)
+            checked += 1
+        assert checked > 500
+
+    @staticmethod
+    def _assert_parity(point, subset, start, k, band, pop, cap, split_date, *, checks,
+                       end_date):
+        # end_date: the eager point's last day, which every lazy cap is pinned
+        # to — so the class-scoped fixture, built earlier, cannot fail this
+        # spuriously when the suite crosses UTC midnight
+        fresh = backtester._simulate_at_discount(subset, start, 10_000.0, k=k,
+                                                 spread_band=band, population=pop,
+                                                 size_cap=cap, quiet=True, end_date=end_date)
+        assert (point.k, point.spread_band, point.population) == (k, band, pop)
+        assert point.size_cap == cap
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
+            (band, k, pop, cap)
+        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+        assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+        if checks and pop in ("all", "time_series"):
+            halves = ([r for r in subset if r["entry"]["entry_date"] < split_date],
+                      [r for r in subset if r["entry"]["entry_date"] >= split_date])
+            assert point.halves == backtester._half_split(
+                halves, start, 10_000.0, k, band, population=pop, size_cap=cap, quiet=True,
+                end_date=end_date)
+            assert point.ex_top_event == backtester._ex_top_event(
+                fresh, subset, start, 10_000.0, band, population=pop, quiet=True,
+                end_date=end_date)
+        else:
+            assert point.halves is None and point.ex_top_event is None
+
+    def test_caps_at_or_above_the_seed_share_one_simulation(self, cap_sweep_run):
+        on = cap_sweep_run.on
+        seeded = capped = 0
+        for _band, _k, cell in self._cells(on):
+            for pop in cell[BUDGET_FRACTION]:
+                eager = cell[BUDGET_FRACTION][pop]
+                seed = eager.peak_kelly_fraction
+                above = [c for c in on.cap_sweep.caps if c >= seed]
+                points = [cell[c][pop] for c in above]
+                # Distinct stamps, one per cap
+                assert [p.size_cap for p in points] == above
+                if BUDGET_FRACTION >= seed:
+                    # The eager point sizes as every such cap: its objects,
+                    # never a re-simulation
+                    seeded += 1
+                    for p in points:
+                        assert p.trades is eager.trades
+                        assert p.equity_df is eager.equity_df
+                        assert p.halves is eager.halves
+                        assert (p is eager) == (p.size_cap == BUDGET_FRACTION)
+                else:
+                    # A CAPPED eager point sizes differently: the first cap at
+                    # or above the peak is simulated, and the rest share IT
+                    capped += 1
+                    first = points[0]
+                    assert first.trades is not eager.trades
+                    assert all(p.trades is first.trades for p in points)
+                    assert all(p.equity_df is first.equity_df for p in points)
+        # Both regimes occur in the fixture: at k = 0.75 the "all" population's
+        # peak is the same-title f* ~0.77, far above the 20% cap
+        assert seeded > 0 and capped > 0
+
+    def test_the_simulated_count_is_the_caps_below_the_seeds(self, cap_sweep_run):
+        on = cap_sweep_run.on
+        cs = on.cap_sweep
+        expected_sim = expected_reuse = 0
+        eager_points = [*self._eager(on).values(), on.same_title_point]
+        for eager in eager_points:
+            seed = eager.peak_kelly_fraction
+            below = [c for c in cs.caps if c < seed and c != cs.primary_cap]
+            # plus the first cap at or above a seed the primary cap sits below
+            sims = len(below) + (1 if cs.primary_cap < seed else 0)
+            expected_sim += sims
+            expected_reuse += len(cs.caps) - 1 - sims
+        before = (cs.simulated, cs.reused)
+        for _band, _k, _cell in self._cells(on):
+            pass
+        cs.same_title()
+        assert (cs.simulated - before[0], cs.reused - before[1]) == (
+            expected_sim, expected_reuse)
+        assert expected_sim < len(eager_points) * (len(cs.caps) - 1)
+
+    def test_entry_events_cover_every_trade_s_event_and_category(self, cap_sweep_run):
+        on = cap_sweep_run.on
+        events = on.cap_sweep.entry_events()
+        traded = {(t.event_ticker, t.category)
+                  for p in [*on.scenarios, on.same_title_point] for t in p.trades}
+        assert traded and traded <= events
+        assert {ev for ev, _cat in events} == {
+            r["entry"]["mA"]["event_ticker"]
+            for entries in on.cap_sweep.entries_by_band.values() for r in entries}
+
+    def test_a_single_band_cap_sweep_keeps_all_only_cells_with_eager_identity(
+        self, cap_sweep_run,
+    ):
+        single, start = cap_sweep_run.single, cap_sweep_run.start
+        cs = single.cap_sweep
+        assert cs is not None and cs.checks is False
+        assert cs.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and single.scenarios == []
+        assert len(cs.ks) == len(single.points) == 3
+        for k, eager in zip(cs.ks, single.points, strict=True):
+            cell = cs.cell(BACKTEST_DEFAULT_SPREAD_BAND, k)
+            assert all(set(by_pop) == {"all"} for by_pop in cell.values())
+            assert cell[BUDGET_FRACTION]["all"] is eager
+            for cap, by_pop in cell.items():
+                self._assert_parity(by_pop["all"],
+                                    cs.entries_by_band[BACKTEST_DEFAULT_SPREAD_BAND],
+                                    start, k, BACKTEST_DEFAULT_SPREAD_BAND, "all", cap, None,
+                                    checks=False, end_date=backtester._curve_end_date(eager))
+        # No band sweep, no same-title population of its own
+        assert cs.same_title() == {}
+
+    def test_a_checked_cell_s_cap_runs_stay_out_of_the_info_log(self, cap_sweep_run, caplog):
+        # A band-sweep cell: its "all" and "time_series" cap points each run a
+        # split-half pair and an excluding-top-event re-simulation too, and all
+        # of them (and their premise WARNINGs) must stay at DEBUG — a dashboard
+        # reads every cell, and one leaked INFO line per run would flood the
+        # log (TS-02)
+        cs = cap_sweep_run.on.cap_sweep
+        before = cs.simulated
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            for k in (0.75, 1.0):
+                cs.cell((0.0, 1.0), k)
+            cs.same_title()
+        assert cs.simulated > before
+        assert not [(r.levelname, r.getMessage()) for r in caplog.records
+                    if r.levelno >= logging.INFO]
+        # Not vacuous: every kind of cap run happened, at DEBUG
+        done = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Backtest complete")]
+        for run in ("all", "all/H1", "all/H2", "all/ex-top", "time_series",
+                    "time_series/H1", "time_series/H2", "time_series/ex-top", "same_title"):
+            assert any(f", {run}, cap " in m for m in done), run
+        # (The golden fixture settles no premise-violating candidate, so the
+        # premise WARNING's DEBUG level is pinned directly, on _half_split and
+        # _simulate_at_discount, in TestSizeCap.)
+
+
+class TestCapSweepSeeding:
+    """CapSweep._by_cap on hand-built eager points, for the three seeding
+    shapes a real fixture cannot pin exactly: a cap EXACTLY on the seed, an
+    eager point capped below its own peak, and no eager point at all."""
+
+    _BAND = (0.0, 1.0)
+
+    def _sweep(self, monkeypatch, caps, eager_peak, sim_peak):
+        simulated: list = []
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all", *, size_cap=None,
+                          quiet=False):
+            simulated.append((size_cap, quiet))
+            return backtester.SweepPoint(
+                k=k, trades=[], equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
+                spread_band=spread_band, population=population, size_cap=size_cap,
+                peak_kelly_fraction=sim_peak)
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
+        eager = {}
+        if eager_peak is not None:
+            eager[(self._BAND, 0.75, "all")] = backtester.SweepPoint(
+                k=0.75, trades=[], equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
+                spread_band=self._BAND, size_cap=0.2, peak_kelly_fraction=eager_peak)
+        cs = backtester.CapSweep(
+            caps=caps, primary_cap=0.2, bands=(self._BAND,), ks=(0.75,), primary_k=0.75,
+            start_date=date(2026, 1, 1), initial_balance=100.0, split_date=None,
+            checks=False, entries_by_band={self._BAND: []}, st_entries=[], eager=eager)
+        by_cap = {cap: pops["all"] for cap, pops in cs.cell(self._BAND, 0.75).items()}
+        return cs, eager.get((self._BAND, 0.75, "all")), by_cap, simulated
+
+    def test_a_cap_exactly_on_the_seed_shares_the_eager_point(self, monkeypatch):
+        cs, eager, by_cap, simulated = self._sweep(monkeypatch, (0.1, 0.15, 0.2, 1.0),
+                                                   eager_peak=0.15, sim_peak=0.15)
+        # min(0.15, f*) == f* for every f* <= 0.15: the seed cap itself is shared
+        assert simulated == [(0.1, True)]
+        assert by_cap[0.2] is eager
+        for cap in (0.15, 1.0):
+            assert by_cap[cap] is not eager and by_cap[cap].trades is eager.trades
+            assert by_cap[cap].size_cap == cap
+        assert (cs.simulated, cs.reused) == (1, 2)
+
+    def test_a_capped_eager_point_does_not_seed_the_larger_caps(self, monkeypatch):
+        # The eager point was sized at 20% while a candidate reached f* 0.4, so
+        # every cap from 0.4 up sizes DIFFERENTLY from it: the first such cap
+        # is simulated and shared by the rest, never the eager point
+        cs, eager, by_cap, simulated = self._sweep(monkeypatch, (0.1, 0.2, 0.3, 0.5, 1.0),
+                                                   eager_peak=0.4, sim_peak=0.4)
+        assert [cap for cap, _quiet in simulated] == [0.1, 0.3, 0.5]
+        assert by_cap[0.2] is eager
+        assert by_cap[1.0].trades is by_cap[0.5].trades
+        assert by_cap[1.0].trades is not eager.trades
+        assert by_cap[1.0].size_cap == 1.0
+        assert (cs.simulated, cs.reused) == (3, 1)
+
+    def test_the_primary_cap_is_the_eager_object_whatever_came_before(self, monkeypatch):
+        # Stubs whose simulated peak (0.05) sits BELOW the eager one (0.4) —
+        # never true of real points, whose peak is cap-independent — so a
+        # cap below the primary has already produced a point to share. The
+        # primary cap must still return the eager object itself: its identity
+        # branch comes first, unconditionally
+        cs, eager, by_cap, simulated = self._sweep(monkeypatch, (0.1, 0.2, 0.3, 1.0),
+                                                   eager_peak=0.4, sim_peak=0.05)
+        assert [cap for cap, _quiet in simulated] == [0.1]
+        assert by_cap[0.2] is eager
+        assert by_cap[0.3].trades is by_cap[0.1].trades
+
+    def test_without_an_eager_point_the_first_cap_at_its_own_peak_is_shared(
+        self, monkeypatch,
+    ):
+        cs, eager, by_cap, simulated = self._sweep(monkeypatch, (0.05, 0.1, 0.15, 0.2, 1.0),
+                                                   eager_peak=None, sim_peak=0.12)
+        assert eager is None
+        assert [cap for cap, _quiet in simulated] == [0.05, 0.1, 0.15]
+        assert by_cap[0.2].trades is by_cap[0.15].trades
+        assert by_cap[1.0].trades is by_cap[0.15].trades
+        assert [by_cap[c].size_cap for c in (0.2, 1.0)] == [0.2, 1.0]
+        assert (cs.simulated, cs.reused) == (3, 2)
+
+
+class TestCapSweepEndDate:
+    """Every lazy cap simulation of a population ends its equity curve on the
+    day its eager point's curve ended, not on the day (UTC) the cell happens
+    to be read — a dashboard reads every cell long after the run, and a cell
+    read across UTC midnight would otherwise mix curves ending on two days."""
+
+    class _Clock(datetime):
+        moment: datetime
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.moment if tz is None else cls.moment.astimezone(tz)
+
+    def test_a_cell_read_after_utc_midnight_ends_every_cap_on_the_eager_day(
+        self, monkeypatch,
+    ):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (1.0,))
+        clock = type("Clock", (self._Clock,),
+                     {"moment": datetime(2026, 9, 26, 23, 58, tzinfo=UTC)})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True)
+        cs = run.cap_sweep
+        # The report reads the cells four minutes later, on the next UTC day
+        clock.moment = datetime(2026, 9, 27, 0, 2, tzinfo=UTC)
+        before = cs.simulated
+        points = [(cap, pop, point)
+                  for k in cs.ks for cap, by_pop in cs.cell((0.0, 1.0), k).items()
+                  for pop, point in by_pop.items()]
+        points += [(cap, "same_title", point) for cap, point in cs.same_title().items()]
+        # Not vacuous: caps were simulated after midnight, across populations
+        assert cs.simulated > before
+        eager_rows = len(run.primary.equity_df)
+        assert run.primary.equity_df["date"].iloc[-1] == date(2026, 9, 26)
+        for cap, pop, point in points:
+            assert point.equity_df["date"].iloc[-1] == date(2026, 9, 26), (cap, pop)
+            assert len(point.equity_df) == eager_rows, (cap, pop)
+        # ... while the clock really did move: an unpinned simulation now runs
+        # one day further
+        fresh = backtester._simulate_at_discount(cs.entries_by_band[(0.0, 1.0)],
+                                                 golden._START, 10_000.0, k=1.0,
+                                                 size_cap=0.05, quiet=True)
+        assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
+        assert len(fresh.equity_df) == eager_rows + 1
+
+    def test_the_halves_and_the_top_event_check_are_pinned_too(self, monkeypatch):
+        band, day = (0.0, 1.0), date(2026, 9, 26)
+        seen: list = []
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all", *, size_cap=None,
+                          quiet=False, end_date=None):
+            seen.append((population, end_date))
+            return backtester.SweepPoint(
+                k=k, trades=[TestSweepHelpers._trade("E1", 5.0)],
+                equity_df=pd.DataFrame({"date": [day], "portfolio_value": [100.0]}),
+                spread_band=spread_band, population=population, size_cap=size_cap,
+                peak_kelly_fraction=0.4)
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
+        entries = [{"pair_type": "same_title", "entry": {
+            "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
+            "entry_date": date(2026, 1, 5)}}]
+        eager = backtester.SweepPoint(
+            k=0.75, trades=[], equity_df=pd.DataFrame({"date": [day],
+                                                       "portfolio_value": [100.0]}),
+            spread_band=band, size_cap=0.2, peak_kelly_fraction=0.4)
+        cs = backtester.CapSweep(
+            caps=(0.1, 0.2), primary_cap=0.2, bands=(band,), ks=(0.75,), primary_k=0.75,
+            start_date=date(2026, 1, 1), initial_balance=100.0,
+            split_date=date(2026, 1, 1), checks=True, entries_by_band={band: entries},
+            st_entries=[], eager={(band, 0.75, "all"): eager})
+        cs.cell(band, 0.75)
+        # The 10% cap's run, its two halves and its top-event re-simulation
+        assert seen == [("all", day), ("all/H1", day), ("all/H2", day),
+                        ("all/ex-top", day)]
+
+    @pytest.mark.parametrize("frame", [
+        pd.DataFrame({"portfolio_value": [100.0]}),       # no "date" column
+        pd.DataFrame({"date": [], "portfolio_value": []}),  # empty
+        pd.DataFrame({"date": ["2026-09-26"], "portfolio_value": [100.0]}),  # not a date
+    ])
+    def test_an_unreadable_curve_end_is_none(self, frame):
+        point = backtester.SweepPoint(k=0.75, trades=[], equity_df=frame)
+        assert backtester._curve_end_date(point) is None
+
+    def test_the_curve_end_is_read_as_a_date(self):
+        assert backtester._curve_end_date(None) is None
+        day = date(2026, 9, 26)
+        for value in (day, datetime(2026, 9, 26, 23, 58, tzinfo=UTC)):
+            point = backtester.SweepPoint(
+                k=0.75, trades=[],
+                equity_df=pd.DataFrame({"date": [value], "portfolio_value": [100.0]}))
+            got = backtester._curve_end_date(point)
+            assert got == day and type(got) is date
+
+
+class TestCapSweepLogging:
+    """The run names its per-trade cap and whether the cap sweep rides it."""
+
+    def test_the_cap_line_follows_the_band_line_and_the_infeasible_run_has_none(
+        self, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     cap_sweep=True)
+        messages = [r.getMessage() for r in caplog.records]
+        band = next(i for i, m in enumerate(messages)
+                    if m.startswith("Time-series spread band (backtest only)"))
+        cap = messages.index(
+            f"Per-trade size cap (backtest): {backtester._cap_percent(BUDGET_FRACTION)}% "
+            "(config.BUDGET_FRACTION); size-cap sweep on")
+        assert cap == band + 1
+        assert res.cap_sweep is None
+
+    def test_the_cap_sweep_summary_names_every_cap(self, monkeypatch, caplog):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                               sweep=False, cap_sweep=True)
+        summary = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("Size-cap sweep:")]
+        assert summary == [
+            "Size-cap sweep: 20 caps (" + ", ".join(
+                [f"cap {5 * i}%" for i in range(1, 20)] + ["no cap"])
+            + ") x 1 band(s) x 1 k, simulated on demand, one (band, k) cell at a "
+              "time, when a report reads them"]
+        # ... and the size-cap runs themselves stay out of the INFO log
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                     sweep=False, cap_sweep=True)
+            caplog.clear()
+            run.cap_sweep.cell(BACKTEST_DEFAULT_SPREAD_BAND, run.primary.k)
+        assert run.cap_sweep.simulated > 0
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO]

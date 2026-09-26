@@ -16,6 +16,10 @@ line names the resolved band and band-sweep setting; a ceiling at or below a
 deadline-gap tier gets a WARNING naming the tier and the primary scenario;
 and --no-band-sweep threads band_sweep=False into run_backtest_sweep().
 
+And --no-cap-sweep: the per-trade size-cap sweep is on by default
+(cap_sweep=True), the flag threads cap_sweep=False, and the echo line names
+the setting.
+
 Fully offline: run_backtest_sweep, generate_dashboard and both client builders
 are monkeypatched, so no network call, no credential read and no real backtest
 happen. PROJECT_ROOT is redirected at tmp_path and logging.basicConfig is
@@ -358,6 +362,41 @@ class TestSpreadBandEcho:
         assert "k=0.620" in text
         assert "ladders=on" in text
         assert "spread band=0-1" in text
+
+
+class TestCapSweepArgument:
+    """--no-cap-sweep: the per-trade size-cap sweep is ON by default, like the
+    band sweep, and the flag threads cap_sweep=False into run_backtest_sweep."""
+
+    def test_cap_sweep_is_on_by_default(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["cap_sweep"] is True
+
+    def test_no_cap_sweep_turns_it_off(self, cli, monkeypatch):
+        _run(monkeypatch, "--no-cap-sweep")
+        assert cli["sweep_kwargs"]["cap_sweep"] is False
+
+    def test_it_is_independent_of_the_band_and_k_sweeps(self, cli, monkeypatch):
+        _run(monkeypatch, "--no-band-sweep", "--no-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["cap_sweep"], kwargs["band_sweep"], kwargs["sweep"]) == (
+            True, False, False)
+        _run(monkeypatch, "--no-cap-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["cap_sweep"], kwargs["band_sweep"], kwargs["sweep"]) == (
+            False, True, True)
+
+    def test_the_echo_names_the_setting(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "| band sweep=on | cap sweep=on" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-cap-sweep", "--interval-discount", "0.62")
+        text = caplog.text
+        assert "cap sweep=off" in text
+        # The earlier fields other tests and tooling grep for are unchanged
+        assert "k=0.620" in text and "spread band=0-1" in text and "band sweep=on" in text
 
 
 # Tier labels and messages derived from config, exactly as backtest.main
