@@ -3186,9 +3186,10 @@ def find_time_series_pairs(
          (stated_deadline / same_event_ladder) no more than
          MAX_DEADLINE_GAP_DAYS apart — then orders the legs and tiers the
          pair on those STATED deadlines, never on close_time, and carries the
-         gap out on CandidatePair.stated_gap_days. With the switch off (the
-         shipped default) every same-event candidate is skipped and counted,
-         exactly as it always was.
+         gap out on CandidatePair.stated_gap_days. The switch is on by the
+         operator's 2026-09-26 decision (it shipped off). With it off every
+         same-event candidate is skipped and counted, exactly as every version
+         before DR-73 did.
       3. NOT identical wording across two events of one series: when the raw
          (title, subtitle, event title) triple matches on both legs AND the two
          event tickers resolve to one series (_same_series, which collapses
@@ -3286,9 +3287,9 @@ def find_time_series_pairs(
             and states two different cumulative deadlines — the two deadlines
             compared as normalized strings, not parsed calendar dates (see the
             DR-67 Known residuals in CLAUDE.md). A pair formed by the
-            same-event ladder branch (item 2, off by default) additionally
-            carries stated_gap_days, the calendar-day gap between its two
-            STATED deadlines; every other pair carries None there.
+            same-event ladder branch (item 2, on by the 2026-09-26 decision)
+            additionally carries stated_gap_days, the calendar-day gap between
+            its two STATED deadlines; every other pair carries None there.
     """
     if markets is None:
         # Fetch all open markets from the Kalshi API if not supplied by the
@@ -3455,9 +3456,10 @@ def find_time_series_pairs(
                     # Oct 16, 2026?" are both KXSPACEXSTARSHIP-14). Two such
                     # rungs are precisely the time-series premise: the earlier
                     # deadline's event nests inside the later one's. The
-                    # switch ships OFF — see
-                    # config.TIME_SERIES_SAME_EVENT_LADDERS for the nesting
-                    # evidence and for the exposure turning it on would take.
+                    # switch is ON by the operator's 2026-09-26 decision (it
+                    # shipped OFF) —
+                    # see config.TIME_SERIES_SAME_EVENT_LADDERS for the nesting
+                    # evidence and the exposure that decision accepts.
                     if not TIME_SERIES_SAME_EVENT_LADDERS:
                         # Counts the whole same-event candidate POPULATION,
                         # deliberately ahead of every eligibility check below:

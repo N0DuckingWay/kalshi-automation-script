@@ -1068,6 +1068,13 @@ class BacktestSweep:
             label_coverage, so no existing construction breaks; the one
             production construction that has a corpus
             (_sweep_from_candidates) always passes it.
+        config_same_event_ladders (bool | None): The ladder switch as this
+            process's config set it (backtester's binding of
+            config.TIME_SERIES_SAME_EVENT_LADDERS) — the value this
+            checkout's live finder would run with — so a report can say
+            whether the run replays that rule. None = not recorded (a
+            hand-built sweep). DEFAULTED like label_coverage; both
+            production constructions must pass it.
         tier_off_scenarios (list[SweepPoint]): The tier-off family: every
             tier-bound band x k cell (_tier_floors_bind — on the shipped grid
             the bands with a floor below 0.30) simulated again with the
@@ -1099,6 +1106,7 @@ class BacktestSweep:
     same_event_ladders: bool | None = None
     split_date: date | None = None
     corpus_provenance: CorpusProvenance | None = None
+    config_same_event_ladders: bool | None = None
     tier_off_scenarios: list[SweepPoint] = field(default_factory=list)
     tier_off_calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = field(
         default_factory=dict)
@@ -1615,9 +1623,10 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
       a Nov/Dec rung pair whose subtitle "Before November" states no year).
 
     So a ladder-enabled backtest's pair population is NOT a subset of the live
-    one on a subtitle-blank corpus, and the k-hat the flip gate demands is
-    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual list and
-    the plan's own "prove the corpus before spending on it" step).
+    one on a subtitle-blank corpus, and the k-hat of the rule the switch
+    shipped behind (not met — see config.TIME_SERIES_SAME_EVENT_LADDERS) was
+    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual
+    list and the plan's own "prove the corpus before spending on it" step).
 
     Args:
         m (dict): A market dict in the compact historical._market_to_dict form.
@@ -2009,10 +2018,10 @@ def _extract_pairs(
     the measurement is small: on that same 2026-05-01 slice the whole
     615,266-pair sub-pass costs +0.3 to +0.5 s against a ~19 s switch-off call
     (measured 2026-09-23, two runs each way), and it is paid only with the
-    switch on. A per-call aggregate guard is the alternative and is
-    deliberately not built; if the cost ever stops being negligible, sum
-    len(idxs)*(len(idxs)-1)//2 across buckets here and warn past a second
-    threshold.
+    switch on — every default run since the 2026-09-26 decision. A per-call aggregate guard
+    is the alternative and is deliberately not built; if the cost ever stops
+    being negligible, sum len(idxs)*(len(idxs)-1)//2 across buckets here and
+    warn past a second threshold.
 
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
@@ -5654,9 +5663,10 @@ def run_backtest(
     # exact pre-DR-73 signature for every existing caller, and omitting the
     # keyword leaves _prepare_entries' None sentinel to resolve this module's
     # TIME_SERIES_SAME_EVENT_LADDERS (bound from config at import) at call
-    # time — the value live sizing uses. A harness that wants ladders here must
-    # patch backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config
-    # attribute, which this module never reads; the supported lever is
+    # time — the value the live finder uses. A harness that wants ladders on or
+    # off here (they follow the switch, on by the 2026-09-26 decision) must patch
+    # backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config attribute, which
+    # this module never reads; the supported lever is
     # run_backtest_sweep(same_event_ladders=...), which needs no patching.
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
@@ -6140,7 +6150,9 @@ def _sweep_from_candidates(
             calibration (the primary band's), label_coverage (carried from
             candidates), scenarios, same_title_point, calibrations_by_band,
             same_event_ladders (resolved), split_date, corpus_provenance
-            (carried from candidates), tier_off_scenarios and
+            (carried from candidates), config_same_event_ladders (the
+            configured switch, read beside same_event_ladders's
+            resolution), tier_off_scenarios and
             tier_off_calibrations_by_band — see BacktestSweep.
 
     Raises:
@@ -6163,6 +6175,9 @@ def _sweep_from_candidates(
     # candidates (see _Candidates for when those can disagree), for the report.
     ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS if candidates.same_event_ladders is None
                    else candidates.same_event_ladders)
+    # The configured switch this run is judged against — read beside the
+    # resolution above so one pass reads both (see BacktestSweep.config_same_event_ladders).
+    config_ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS)
     if band_sweep:
         # Each grid band through config.time_series_spread_band, so it is
         # validated and normalised exactly like the primary and a grid band
@@ -6465,6 +6480,7 @@ def _sweep_from_candidates(
         # One fact about the one corpus, like label_coverage: the header's
         # corpus line and post-cutoff banner read it (DR-13, M2)
         corpus_provenance=candidates.corpus_provenance,
+        config_same_event_ladders=config_ladders,
         tier_off_scenarios=tier_off_scenarios,
         tier_off_calibrations_by_band=tier_off_calibrations,
     )
@@ -6573,7 +6589,10 @@ def run_backtest_sweep(
             priced, and therefore applies identically to every scenario.
             Like --interval-discount, it never reaches live sizing: nothing
             here writes config.py. Its resolved value is recorded on
-            BacktestSweep.same_event_ladders.
+            BacktestSweep.same_event_ladders, alongside the configured switch
+            itself (BacktestSweep.config_same_event_ladders) — the ladder log
+            line below names whether this run's resolved value replays that
+            switch or departs from it.
         spread_band (tuple[float, float] | None): The primary scenario's
             BACKTEST-only time-series spread band (floor, ceiling) on pB − pA.
             None (default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND —
@@ -6598,8 +6617,9 @@ def run_backtest_sweep(
             outcome-label census, None when the feasibility short-circuit
             skipped the fetch), and the band-sweep payload — scenarios,
             same_title_point, calibrations_by_band, split_date — plus the
-            resolved same_event_ladders, the corpus's provenance, None when
-            not recorded, and the tier-off family, empty unless
+            resolved same_event_ladders, the configured switch it is judged
+            against (config_same_event_ladders), the corpus's provenance,
+            None when not recorded, and the tier-off family, empty unless
             tier_off_sweep (see BacktestSweep).
 
     Raises:
@@ -6621,8 +6641,9 @@ def run_backtest_sweep(
         shape, its resolved k and its band stamp cannot drift from a real
         one), calibration=None, label_coverage=None, scenarios=[],
         calibrations_by_band={}, an empty tier-off family and the resolved
-        same_event_ladders. Callers therefore need no special case for that
-        path.
+        same_event_ladders, with the configured switch
+        (config_same_event_ladders) still recorded. Callers therefore need
+        no special case for that path.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -6645,11 +6666,20 @@ def run_backtest_sweep(
     # so there is exactly one resolution that the run actually depends on.
     ladders = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
                else same_event_ladders)
+    # ... and judged against the switch this checkout's live finder runs with:
+    # an override the other way does not replay that rule, and the line says so.
+    config_ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS)
+    if same_event_ladders is None:
+        source = "config.TIME_SERIES_SAME_EVENT_LADDERS"
+    elif bool(ladders) == config_ladders:
+        source = "run-level override, same as this checkout's config"
+    else:
+        source = ("run-level override; config.TIME_SERIES_SAME_EVENT_LADDERS is "
+                  f"{'on' if config_ladders else 'off'} in this "
+                  "checkout, so this run does not replay its live rule")
     logging.info(
         "Same-event deadline ladders (DR-73): %s (%s)",
-        "on" if ladders else "off",
-        "config.TIME_SERIES_SAME_EVENT_LADDERS" if same_event_ladders is None
-        else "run-level override",
+        "on" if ladders else "off", source,
     )
     # The same idiom for the band: the resolved value and where it came from,
     # so a report can never be read as the default band when it was not.
@@ -6688,7 +6718,8 @@ def run_backtest_sweep(
                              label_coverage=None, scenarios=[],
                              calibrations_by_band={},
                              same_event_ladders=bool(ladders),
-                             corpus_provenance=None)
+                             corpus_provenance=None,
+                             config_same_event_ladders=config_ladders)
 
     # Every entry pass and every simulation. It deletes the candle series and
     # the pair list itself once the last entry pass is done (before any
