@@ -222,8 +222,8 @@ def main() -> None:
     selector, scenario explorer, filter bar and k-hat breakdown), the
     calibration report and max_trades_simulated's post-cutoff check; the
     tier-floors-off family is read by that check and by the dashboard's
-    filter bar and k-hat breakdown (their Tier floors choice), carried to
-    generate_dashboard on the sweep.
+    filter bar, k-hat breakdown and scenario explorer (their Tier floors
+    choice), carried to generate_dashboard on the sweep.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -476,11 +476,11 @@ def main() -> None:
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points are read by the k selector, the
     # band-sweep payload by the dashboard's scenario explorer, filter bar and
-    # k-hat breakdown, the tier-floors-off family by that filter bar and k-hat
-    # breakdown too (their Tier floors choice), and every kept point — the
-    # tier-floors-off family's included — by max_trades_simulated's
-    # post-cutoff check (_log_corpus_provenance below, and the dashboard's
-    # header).
+    # k-hat breakdown, the tier-floors-off family by that filter bar, k-hat
+    # breakdown and scenario explorer too (their Tier floors choice), and
+    # every kept point — the tier-floors-off family's included — by
+    # max_trades_simulated's post-cutoff check (_log_corpus_provenance below,
+    # and the dashboard's header).
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -511,9 +511,11 @@ def main() -> None:
     # don't duplicate that line here, just point the user at the file.
     #
     # sweep carries the calibration and every swept point for the k selector,
-    # the scenario explorer's band x k payload and the header's run-settings
-    # line; interval_discount is the resolved k these trades were sized at,
-    # which the Risk section's Kelly scatter must price on
+    # the scenario explorer's band x k payload, the filter bar, the k-hat
+    # breakdown, both Tier floors views (the bar's and the explorer's, from
+    # its tier-floors-off family) and the header's run-settings line;
+    # interval_discount is the resolved k these trades were sized at, which
+    # the Risk section's Kelly scatter must price on
     #
     # series_categories files each trade under Kalshi's own series category and
     # tags for the Returns Decomposition breakdown: one cached read-only GET of

@@ -14,9 +14,11 @@ Purpose:
     chart and a table with a "Group by" <select> of their own), a
     scenario explorer (a fragility banner, a spread-band x k heatmap and a
     per-population KPI table over BacktestSweep.scenarios, with two <select>s
-    and a short inline script driving a Plotly.restyle'd equity curve — a
-    native updatemenus dropdown cannot express two independent axes of
-    selection), trade-level diagnostics
+    and a short inline script redrawing an equity curve in place — a native
+    updatemenus dropdown cannot express two independent axes of selection —
+    which also follows the filter bar's Tier floors choice onto the band
+    sweep's tier-floors-off cells whenever that bar offers them), trade-level
+    diagnostics
     (distribution, slippage, best/worst trades), risk metrics (Kelly sizing
     scatter, capital deployment), and benchmark comparison (S&P 500 via
     yfinance) — into a single HTML file with embedded Plotly charts. The file
@@ -57,7 +59,8 @@ Dependencies:
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
-    and MAX_DEADLINE_GAP_DAYS (so the filter bar names the tier floors from
+    and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
+    tier-off banner name the tier floors and their deadline-gap bounds from
     config, never as literals), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
@@ -84,7 +87,8 @@ Notes:
     JavaScript, so it works inside the same self-contained page every other
     chart renders into. Its scope is deliberately that one section: the
     scenario-explorer section (below) carries its own independent band/k
-    selectors, and the remaining seven — the six trade-derived sections and
+    selectors (and follows the filter bar's Tier floors choice alone), and
+    the remaining seven — the six trade-derived sections and
     the k-hat breakdown — are rendered at the run's primary scenario (the
     k-hat breakdown is k-independent: the primary k is only its reference
     line): its primary k (the CLI's --interval-discount, or
@@ -118,8 +122,12 @@ Notes:
     contribution, not a standalone simulation, and the bar's summary line
     says so. The header's trade count follows the selection too. A tag is
     Kalshi's FIRST tag of the series (_series_labels), so every breakdown
-    partitions. It never re-scopes the interval-discount section or the
-    scenario explorer, which keep their own controls; the bar names them.
+    partitions. It never re-scopes the interval-discount section, and it
+    reaches the scenario explorer through its Tier floors choice alone —
+    never its band, category or tag, since the explorer keeps its own band
+    and k selects, and only when the bar offers a tier-floors-off view at
+    all (generate_dashboard draws the explorer's off view only then) — and
+    the bar says both (_UNFILTERED_SECTIONS).
     Every view is computed by the same helpers the sections render with
     (_performance_kpis, _performance_series, _decomposition_aggregates,
     _category_table, _reliability, _best_and_worst, _kelly_points,
@@ -159,10 +167,22 @@ Notes:
     Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE a
     trace's data wholesale from a fixed list baked in at render time, not
     combine two independently-chosen indices into one lookup. It therefore
-    carries its own small (~100-line) inline vanilla-JS script that reads one
-    `<script type="application/json">` data block and drives a `Plotly.restyle`
-    call plus two plain HTML table re-renders — no new dependency, and no
-    hand-rolled charting: Plotly still owns every pixel that gets drawn.
+    carries its own small (~175-line) inline vanilla-JS script that reads one
+    `<script type="application/json">` data block and drives a `Plotly.update`
+    of the equity curve (which also autoranges its axes, so a reader's zoom
+    never carries into another cell) plus two plain HTML table re-renders —
+    no new dependency, and no hand-rolled charting: Plotly still owns every
+    pixel that gets drawn. When the run simulated a complete tier-floors-off
+    family and the filter bar offers its off view, Python draws the banner,
+    heatmap and k-hat table twice (the second block hidden, its bands
+    labelled with the bare floor that alone gated them) and the data block
+    carries the tier-off cells; while the filter bar's Tier floors select is
+    enabled and reads "off", the script shows that block instead, relabels
+    its band options and retitles the curve from the data block, gives the
+    heatmap it shows the metric the other was showing (a Plotly update plus
+    relayout, then a resize, since a chart drawn hidden is laid out at
+    Plotly's default width, not its box's) and reads the tier-off cells — a
+    band the tiers never bind at reads its tier-on ones.
 
     Directly under the Period line the header says what settled-market corpus
     the run read (BacktestSweep.corpus_provenance): when it was assembled (a
@@ -691,8 +711,9 @@ def _fig_html(fig: go.Figure, height: int = 400, div_id: str | None = None) -> s
             lets Plotly generate its usual random UUID id — the same behaviour
             every pre-existing caller of this helper still gets. A caller that
             needs to drive the figure from separate client-side JS (the
-            scenario-explorer section's Plotly.restyle calls) passes a fixed
-            id here instead of scraping a random one out of the rendered HTML.
+            scenario-explorer section's Plotly calls on its curve and
+            heatmaps, the page-wide filter's redraws) passes a fixed id here
+            instead of scraping a random one out of the rendered HTML.
 
     Returns:
         str: HTML string fragment (no <html>/<body> wrapper, no Plotly.js script tag).
@@ -1785,8 +1806,9 @@ _KHAT_GROUPS = (("category", "Category"), ("tag", "Tag"), ("band", "Spread band"
 
 # The two deadline-gap tier floors as the page names them ("0.15/0.30"), read
 # from config — never a literal — so the page cannot name a tier the backtest
-# did not apply: the filter bar's tier-floors-off views (_tier_off_where) and
-# the k-hat chart's title for them (_KHAT_TEXT) both read it.
+# did not apply: the filter bar's tier-floors-off views (_tier_off_where), the
+# k-hat chart's title for them (_KHAT_TEXT) and the scenario explorer's
+# tier-off banner (_SCENARIO_TIER_OFF_LEAD) all read it.
 _TIER_FLOORS = (f"{_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')}/"
                 f"{_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')}")
 
@@ -2163,13 +2185,15 @@ _HEADLINE_POPULATION = "time_series"
 
 # Every population's label on the page, spelled once so the KPI rows, the
 # banner, the heatmap title and the curve title can never name one
-# population two ways.
+# population two ways. Same-title is simulated once, and no band, k or
+# deadline-gap tier floor reaches a same-title pair, so its row reads the
+# same under both Tier floors settings — and its label says so.
 _POPULATION_LABELS = {
     "time_series": "Time-series (ladders + cross-event; same-title excluded)",
     "all": "All (time-series + same-title)",
     "ladder": "Ladders (same-event)",
     "cross": "Cross-event",
-    "same_title": "Same-title (independent of band and k)",
+    "same_title": "Same-title (independent of band, k and the tier floors)",
 }
 
 
@@ -2186,7 +2210,8 @@ def _row_label(band: tuple[float, float]) -> str:
     "0.2-0.6" would hide that. A tier-floors-off run
     (BacktestSweep.tier_off_scenarios) is gated on the floor alone, so the
     page labels its bands with backtester._band_label's bare "0.2-0.6"
-    instead (_tier_off_runs), never with this. Each bound goes through
+    instead (the filter bar's _tier_off_runs and the scenario explorer's
+    tier-off block), never with this. Each bound goes through
     backtester._exact_label — the same injective formatter the completion
     lines use — so two DIFFERENT bands can never share a label. That matters
     here more than in a log: the heatmap's y axis is categorical, and Plotly
@@ -2482,15 +2507,81 @@ def _robustness_extras(point: SweepPoint) -> dict:
 
 
 # The inline script the scenario explorer drives its selects with. A raw
-# string, so the — escapes reach the browser as JS escapes. It reads ONE
-# JSON block (id="scn-data") and writes only through textContent-escaped HTML
-# and Plotly.restyle — it draws nothing itself.
+# string, so every backslash in it reaches the browser as written. It reads
+# ONE JSON block (id="scn-data"), the page-wide bar's Tier floors select
+# (id="flt-tier", only while the bar's own script has enabled it) and, to
+# swap heatmaps, the metric menus Python drew on them (which button the
+# heatmap leaving the page has active, and that button on the one arriving,
+# which it replays). It writes only through textContent-escaped HTML, the
+# band select's option texts and the curve's title (the data block's, never
+# its own words), each block's display, and Plotly calls on charts Python
+# drew (update, and a title relayout, on the curve; update, relayout and
+# Plots.resize on the heatmap it shows) — it draws nothing itself.
 _SCENARIO_EXPLORER_JS = r"""
 <script>
 (function() {
   var data = JSON.parse(document.getElementById('scn-data').textContent);
   var bandSel = document.getElementById('scn-band-select');
   var kSel = document.getElementById('scn-k-select');
+  // The page-wide bar's "Tier floors" select — read only while the bar is
+  // live (its script enables it once it has its data), so a page whose bar
+  // could not be built, or has not loaded yet, shows the floors on here too
+  var tierSel = document.getElementById('flt-tier');
+  function tierOff() {
+    return !!(data.cells_off && tierSel && !tierSel.disabled && tierSel.value === 'off');
+  }
+  // The setting the blocks on the page show — the floors on, as rendered —
+  // and the one every cell and calibration is read under, so the tables and
+  // the curve never describe another setting than the blocks around them
+  var shownOff = false;
+  // A band where no tier binds has no tier-off cells of its own (tier_binds)
+  function cellAt(bi, ki) {
+    return (shownOff && data.tier_binds[bi]) ? data.cells_off[bi][ki] : data.cells[bi][ki];
+  }
+  function calAt(bi) {
+    return (shownOff && data.tier_binds[bi]) ? data.calibration_by_band_off[bi]
+                                             : data.calibration_by_band[bi];
+  }
+  // Swap the banner, heatmap and k-hat table Python drew for each setting,
+  // relabel the band select and retitle the curve with the data block's
+  // texts, and give the heatmap now shown the metric the other one was
+  // showing. Does nothing, and says so, when the setting read is the one
+  // already shown.
+  function showTier() {
+    var off = tierOff();
+    if (off === shownOff) { return false; }
+    shownOff = off;
+    var onBox = document.getElementById('scn-tier-on');
+    var offBox = document.getElementById('scn-tier-off');
+    if (onBox) { onBox.style.display = off ? 'none' : ''; }
+    if (offBox) { offBox.style.display = off ? '' : 'none'; }
+    var labels = off ? data.band_options_off : data.band_options;
+    for (var i = 0; i < bandSel.options.length; i++) {
+      bandSel.options[i].text = labels[parseInt(bandSel.options[i].value, 10)];
+    }
+    if (!window.Plotly) { return true; }
+    if (document.getElementById('scn-equity')) {
+      Plotly.relayout('scn-equity', {'title.text': data.curve_titles[off ? 1 : 0]});
+    }
+    var to = document.getElementById(off ? 'scn-heat-off' : 'scn-heat');
+    if (!to) { return true; }
+    // The metric the heatmap leaving the page has active (the one Python
+    // drew active when that cannot be read), replayed from the button Python
+    // drew for it on the heatmap arriving
+    var from = document.getElementById(off ? 'scn-heat' : 'scn-heat-off');
+    var menuFrom = ((from && from.layout && from.layout.updatemenus) || [])[0];
+    var menuTo = ((to.layout && to.layout.updatemenus) || [])[0];
+    var active = (menuFrom && menuFrom.active) || 0;
+    var button = menuTo && menuTo.buttons && menuTo.buttons[active];
+    if (button) {
+      Plotly.update(to, button.args[0], button.args[1]);
+      Plotly.relayout(to, {'updatemenus[0].active': active});
+    }
+    // A chart drawn while hidden is laid out at Plotly's default width, not
+    // its box's, until it is resized — whether or not a metric was replayed
+    Plotly.Plots.resize(to);
+    return true;
+  }
   // Population name -> its index in every cell's array.
   var P = {};
   data.populations.forEach(function(name, i) { P[name] = i; });
@@ -2564,7 +2655,8 @@ _SCENARIO_EXPLORER_JS = r"""
 
   function render() {
     var bi = parseInt(bandSel.value, 10), ki = parseInt(kSel.value, 10);
-    var cell = data.cells[bi][ki];
+    // The selected cell under the Tier floors setting shown
+    var cell = cellAt(bi, ki);
     var L = data.labels;
     // The headline (time-series) population first — the one the heatmap and
     // banner read — then its two parts, then All and Same-title, each row
@@ -2575,19 +2667,29 @@ _SCENARIO_EXPLORER_JS = r"""
       + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
       + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
       + kpiRow(esc(L.same_title), data.same_title);
-    document.getElementById('scn-cal-body').innerHTML = calRows(data.calibration_by_band[bi]);
+    document.getElementById('scn-cal-body').innerHTML = calRows(calAt(bi));
 
     // Every curve is already on the shared date axis (data.dates), so x is
     // the axis itself, never a slice of it. The curve is the headline
-    // population's, like the heatmap.
+    // population's, like the heatmap. An update, not a restyle: both axes
+    // are autoranged on every redraw, so a reader's zoom on one cell's (or
+    // one setting's) curve never carries into another's.
     var values = (ts && ts.equity) ? ts.equity : [];
     if (window.Plotly && document.getElementById('scn-equity')) {
-      Plotly.restyle('scn-equity', {x: [values.length ? data.dates : []], y: [values]});
+      Plotly.update('scn-equity', {x: [values.length ? data.dates : []], y: [values]},
+                    {'xaxis.autorange': true, 'yaxis.autorange': true});
     }
   }
 
   bandSel.addEventListener('change', render);
   kSel.addEventListener('change', render);
+  // Follows the bar's Tier floors choice only when this section has an off
+  // view of its own (Python drew the tier-off block and shipped its cells)
+  if (tierSel && data.cells_off) {
+    tierSel.addEventListener('change', function() {
+      if (showTier()) { render(); }
+    });
+  }
   render();
 })();
 </script>
@@ -2760,14 +2862,38 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     )
 
 
-def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
+# The scenario explorer's tier-floors-off banner opens on this HTML, so none
+# of its figures can be read as the run's own: what "off" replaces (the entry
+# threshold max(tier, floor), and nothing else — backtester._find_entry with
+# tier_floors False), what still applies, where it changes nothing, and that
+# live trading never runs this way — the tiers and the gap cap named from
+# config (_TIER_FLOORS, MAX_DEADLINE_GAP_DAYS), never as literals.
+_SCENARIO_TIER_OFF_LEAD = (
+    "<b>Tier floors off:</b> each band's own floor replaces max(tier, floor) as the "
+    f"time-series entry threshold, without the {_TIER_FLOORS} deadline-gap tier floors: "
+    "pB − pA of at least the floor, and pA + nB of at most 1 − the floor. The band's "
+    f"ceiling, the {MAX_DEADLINE_GAP_DAYS}-day deadline-gap cap, the positive-spread rule "
+    "(pB above pA), the fee check and the Kelly gate still apply. A band whose floor sits "
+    "at or above both tiers was not simulated again, since they never bind there: its "
+    "cells are its run with them on. A backtest what-if: live trading always applies the "
+    "tier floors. ")
+
+# The scenario explorer's tier-floors-off heatmap title (on every metric) and
+# k-hat table title end on this.
+_SCENARIO_TIER_OFF_SUFFIX = " — tier floors off"
+
+
+def _section_scenario_explorer(sweep: BacktestSweep | None, *,
+                               tier_off_view: bool = True) -> str:
     """
     Build the "Scenario Explorer" HTML section.
 
     Renders BacktestSweep.scenarios — every (spread band, k) cell of a band
     sweep, each with standalone "all" / "time_series" / "ladder" / "cross"
     simulations — so that choosing a band and k from a backtest happens with
-    the grid's fragility on screen rather than from one flattering cell.
+    the grid's fragility on screen rather than from one flattering cell. A
+    point stamped tier_floors False (the tier-floors-off family's) is never
+    one of these cells, just as _band_runs never takes one for a band's run.
 
     The heatmap, the banner and the equity curve all read ONE population,
     _HEADLINE_POPULATION — "time_series", every time-series entry (ladders +
@@ -2780,58 +2906,120 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     point and reads "—" everywhere below; nothing falls back to "all". In
     order:
 
-      1. A fragility banner, first: how many band x k cells were computed
-         (and, when some have no time-series entry, how many do), the share
-         of time-series cells with a positive total return, the split-half
-         rank correlation (Spearman) of the
-         time-series cells' H1 vs H2 returns — over the cells whose two
-         halves BOTH had entries, since an empty half's 0.0 is not a return —
-         and the sentence this section exists to put on the page — the best
-         of that many correlated cells overstates what a reader should
-         expect, where "that many" counts the time-series cells the heatmap
-         shows a value in, never the whole grid. It says in words that every
-         figure in it, the heatmap and the curve is the time-series
-         population's, and that the KPI table below labels its own rows.
-      2. A band (row) x k (column) heatmap of the time-series population,
-         titled with it, with a native Plotly `updatemenus` metric toggle:
-         mean per trade (the default), median per trade, total return, H1
-         return, H2 return, trade count and empirical k-hat. Each button is
-         an "update" — it swaps the trace's z, colour scale, hover format and
-         customdata AND the chart title together (a "restyle" button's second
-         argument is read as trace indices, so a title placed there would be
-         silently dropped). Row labels read "max(tier,<floor>)-<ceiling>"
-         (_row_label). A half with no entries reads null (rendered "—") in the
-         H1/H2 views. The k-hat view repeats each band's POOLED k-hat
-         (BacktestSweep.calibrations_by_band) across every k column, because
-         k-hat is measured over the band's entries and cannot depend on k; it
-         is centred on the primary k, its hover shows the entries pooled, and
-         a band with no calibration reads null. The same figures follow as a
-         static one-row-per-band table ("Empirical k-hat by spread band").
+      1. A block (id="scn-tier-on") holding what the run simulated, with the
+         deadline-gap tier floors applied:
+           a. A fragility banner, first: how many band x k cells were
+              computed (and, when some have no time-series entry, how many
+              do), the scenario points stored for them, the share of
+              time-series cells with a positive total return, the
+              split-half rank correlation (Spearman) of the time-series
+              cells' H1 vs H2 returns — over the cells whose two halves BOTH
+              had entries, since an empty half's 0.0 is not a return — and
+              the sentence this section exists to put on the page — the best
+              of that many correlated cells overstates what a reader should
+              expect, where "that many" counts the time-series cells the
+              heatmap shows a value in, never the whole grid. It says in
+              words that every figure in it, the heatmap and the curve is the
+              time-series population's, and that the KPI table below labels
+              its own rows.
+           b. A band (row) x k (column) heatmap of the time-series population
+              (div id "scn-heat"), titled with it, with a native Plotly
+              `updatemenus` metric toggle: mean per trade (the default),
+              median per trade, total return, H1 return, H2 return, trade
+              count and empirical k-hat. Each button is an "update" — it
+              swaps the trace's z, colour scale, hover format and customdata
+              AND the chart title together (a "restyle" button's second
+              argument is read as trace indices, so a title placed there
+              would be silently dropped). Row labels read
+              "max(tier,<floor>)-<ceiling>" (_row_label). A half with no
+              entries reads null (rendered "—") in the H1/H2 views. The k-hat
+              view repeats each band's POOLED k-hat
+              (BacktestSweep.calibrations_by_band) across every k column,
+              because k-hat is measured over the band's entries and cannot
+              depend on k; it is centred on the primary k, its hover shows
+              the entries pooled, and a band with no calibration reads null.
+           c. The same k-hat figures as a static one-row-per-band table
+              ("Empirical k-hat by spread band").
+      2. Only when tier_off_view is True (generate_dashboard's reading of
+         whether the page's filter bar offers a tier-floors-off view) and
+         the run carries a tier-floors-off family that names every band of
+         this grid the tiers bind at (_tier_off_binds is not None — the
+         test the filter bar's _tier_off_runs starts from), a second
+         block (id="scn-tier-off", rendered hidden) holding the same three
+         for the grid with the tier floors off: each band the tiers bind at
+         reads its own tier-off points (BacktestSweep.tier_off_scenarios,
+         only points stamped tier_floors False) and its tier-off calibration
+         (tier_off_calibrations_by_band); a band whose floor sits at or
+         above both tiers reads its tier-on cells and calibration, since
+         they never bind there. Its banner opens on _SCENARIO_TIER_OFF_LEAD
+         and every figure in it — the point count included — is computed
+         over that grid; its heatmap (div id "scn-heat-off") and table
+         titles end on _SCENARIO_TIER_OFF_SUFFIX, and their rows are
+         labelled with backtester._band_label's bare "<floor>-<ceiling>",
+         since the floor alone gated those runs. A cell the family lacks
+         reads "—", as a missing tier-on one does, and so does a
+         calibration it lacks, in the heatmap's k-hat view and the k-hat
+         table — the calibration table below then shows its "No
+         time-series candidate was measurable at this band." line, as it
+         does for a missing tier-on calibration.
       3. Two <select>s (band, k), preselected to the primary scenario and
          marked "(primary)", driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
          its H1/H2 and top-event figures; Ladders; Cross-event; All —
          time-series + same-title, the run's actual result — with its own
-         sub-row; Same-title, which is independent of band and k), the
+         sub-row; Same-title, which is independent of band, k and the tier
+         floors, so it reads the same under both Tier floors settings), the
          selected band's own calibration table, and the time-series equity
          curve (rendered once via _fig_html(div_id="scn-equity") and
-         restyled in place). A native updatemenus dropdown cannot express two
+         redrawn in place by a Plotly.update that also autoranges both
+         axes, so a reader's zoom on one cell's curve never carries into
+         another's). A native updatemenus dropdown cannot express two
          independent axes of selection, which is why this part is scripted.
+         The script also follows the page-wide filter bar's Tier floors
+         select (id "flt-tier") — only while that select is enabled, i.e.
+         only once the bar's own script has its data and the run has an off
+         view there, and only when this section has an off block: set to
+         off, it shows the tier-off block instead of the tier-on one, names
+         the band options and titles the curve as the data block does for
+         that setting, gives the heatmap it shows the metric the other one
+         was showing, and reads the tier-off cells and calibration (a band's
+         tier-on ones where the tiers never bind) into the KPI table, the
+         calibration table and the curve.
 
-    Every number the script reads comes from one
-    `<script type="application/json" id="scn-data">` block: cells are
-    addressed by integer index into the ordered band / k / population arrays
-    it also carries, and its only strings are values that are themselves
-    names (the date axis, a calibration bucket's label, a cell's top event
-    ticker); every value is passed through _json_safe() and the
-    payload serialised with json.dumps(..., allow_nan=False), so a non-finite
-    metric reaches the browser as null (rendered as an em dash) rather than as
-    an invalid NaN token; and every "</" is escaped, because the payload
-    carries each cell's top event ticker (Kalshi-controlled) and an unescaped
-    "</script>" inside a JSON string would end the block early. The run's
-    primary band and ladder setting are not repeated here — they are on the
-    page header (_run_settings_html), since they shape every section.
+    Every figure the script writes into its tables and its curve, and every
+    text it writes (the band options, the curve's title), comes from one
+    `<script type="application/json" id="scn-data">` block — the heatmap
+    swap alone reads the charts instead: it replays the metric buttons
+    Python drew on the heatmap it shows, reading which one the other heatmap
+    has active. In the block, cells are addressed by integer index into the
+    ordered band / k / population arrays it also carries, and its only
+    strings are values that are themselves names (the date axis, the band
+    options, the curve's titles, a calibration bucket's label, a cell's top
+    event ticker); every value is passed through _json_safe() and the
+    payload serialised with json.dumps(..., allow_nan=False), so a
+    non-finite metric reaches the browser as null (rendered as an em dash)
+    rather than as an invalid NaN token; and every "</" is escaped, because
+    the payload carries each cell's top event ticker (Kalshi-controlled) and
+    an unescaped "</script>" inside a JSON string would end the block early.
+    Its keys: "bands", "ks", "populations", "labels", "primary_band_idx",
+    "primary_k_idx", "dates", "cells" (cells[band][k][population]),
+    "same_title", "calibration_by_band", then "tier_binds" (per band, whether
+    the tiers bind there and it has tier-off cells of its own), "cells_off"
+    (per band, like "cells" — null for a band the tiers never bind at, whose
+    tier-on cells the script reads instead, so no cell ships twice),
+    "calibration_by_band_off" (null at those bands too), "band_options" (the
+    band select's texts, " (primary)" included), "band_options_off" (the
+    same with the tier-off labels) and "curve_titles" (the curve's title
+    under each setting, [on, off] — the on one the title Python draws the
+    curve with). The four tier-off keys, and curve_titles' off entry, are
+    null when the section has no off block. A calibration's bucket whose
+    tier is 0 or less ships its tier as null (rendered "—"), which is what
+    the pooled row always carries — and so does every bucket of a tier-off
+    calibration at a floor of 0, which labels its buckets with that floor
+    alone (0.0): no floor to print. The run's primary band and ladder setting are not
+    repeated here — they are on the page header (_run_settings_html), since
+    they shape every section.
 
     Args:
         sweep (BacktestSweep | None): The sweep payload from
@@ -2841,6 +3029,15 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
             "Outcome-label coverage" text, since that caveat belongs to a
             sweep this run never produced. A sweep with no scenarios renders a
             one-line note naming the cause (_scenario_explorer_empty_reason).
+        tier_off_view (bool): Keyword-only. False draws no tier-off block and
+            ships no tier-off cells, whatever the sweep carries: the script
+            follows only the filter bar's Tier floors choice, so
+            generate_dashboard passes False when the page's bar offers no
+            tier-floors-off view (it could not be built, or it has no off
+            view for its bands) — an off block no reader could ever reach
+            would ship its unpacked cells (1.10 MB on the DR-73 calibration
+            corpus) for nothing. True (default, every direct caller) draws
+            it whenever this grid's family is complete.
 
     Returns:
         str: Self-contained HTML section string.
@@ -2854,7 +3051,10 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
                 f"{_scenario_explorer_empty_reason(sweep)}.</p>")
 
     # ── Index the (band, k) grid and bucket every scenario into it ──────────
-    all_points = [pt for pt in sweep.scenarios if pt.population == "all"]
+    # A point stamped tier_floors False belongs to the tier-floors-off family
+    # and is never a tier-on cell (the rule _band_runs and _tier_off_runs keep)
+    on_points = [pt for pt in sweep.scenarios if pt.tier_floors is not False]
+    all_points = [pt for pt in on_points if pt.population == "all"]
     bands = sorted({pt.spread_band for pt in all_points if pt.spread_band is not None})
     ks = sorted({pt.k for pt in all_points})
     band_idx = {b: i for i, b in enumerate(bands)}
@@ -2863,11 +3063,35 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     cell_points: list[list[dict]] = [
         [dict.fromkeys(_SCENARIO_POPULATIONS) for _ in ks] for _ in bands
     ]
-    for pt in sweep.scenarios:
+    for pt in on_points:
         if (pt.spread_band not in band_idx or pt.k not in k_idx
                 or pt.population not in _SCENARIO_POPULATIONS):
             continue
         cell_points[band_idx[pt.spread_band]][k_idx[pt.k]][pt.population] = pt
+
+    # ── The same grid with the tier floors off, when the page's bar offers an
+    # off view (tier_off_view) and the run simulated a family naming every
+    # band of this grid the tiers bind at: per band, True when they bind
+    # there and it was simulated again, False when they never bind.
+    # _tier_off_binds is the test the filter bar's _tier_off_runs starts
+    # from, so the two classify every band alike; each still decides for
+    # itself whether it has an off view (see _tier_off_binds for the
+    # hand-built sweep where only the bar does). None: no off view here. ────
+    tier_binds = _tier_off_binds(sweep, bands) if tier_off_view else None
+    cell_points_off: list[list[dict]] | None = None
+    if tier_binds is not None:
+        # A band the tiers never bind at shares its tier-on row (the same
+        # dicts), so only a binding band's row may be written below
+        cell_points_off = [
+            [dict.fromkeys(_SCENARIO_POPULATIONS) for _ in ks] if binds else cell_points[bi]
+            for bi, binds in enumerate(tier_binds)
+        ]
+        for pt in sweep.tier_off_scenarios:
+            if (pt.tier_floors is not False or pt.spread_band not in band_idx
+                    or pt.k not in k_idx or pt.population not in _SCENARIO_POPULATIONS
+                    or not tier_binds[band_idx[pt.spread_band]]):
+                continue
+            cell_points_off[band_idx[pt.spread_band]][k_idx[pt.k]][pt.population] = pt
 
     # Cached per point, so every metric is computed exactly once however many
     # places (heatmap, banner, data block) read it.
@@ -2884,71 +3108,78 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
 
     # ── Fragility banner — the headline population's cells only ─────────────
-    # n_cells counts the grid (every band x k cell has an "all" point); every
-    # FIGURE below is the time-series population's, and a cell with no
-    # time-series point simply contributes no return — it never falls back
-    # to the "all" point, which is how a same-title result would reach here.
-    # The multiple-comparison count ("the best of N") is n_headline, the
-    # cells the heatmap actually shows a value in, never the grid: a band
-    # where no time-series pair enters has an "all" cell but no time-series
-    # one (the backtester skips an empty population).
-    n_cells = sum(1 for row in cell_points for cp in row if cp["all"] is not None)
-    headline_points = [cp[_HEADLINE_POPULATION] for row in cell_points for cp in row
-                       if cp[_HEADLINE_POPULATION] is not None]
-    n_headline = len(headline_points)
-    finite_returns = [r for r in (kpis(pt)["total_return"] for pt in headline_points)
-                      if r is not None and math.isfinite(r)]
-    positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
-                      if finite_returns else None)
-    checked = [kpis(pt) for pt in headline_points if pt.halves is not None]
-    # A cell whose H1 or H2 had no entries carries None there
-    # (_robustness_extras), and _spearman drops any pair with a None, so the
-    # correlation is over the cells whose two halves both had entries.
-    corr = _spearman([k["h1_return"] for k in checked], [k["h2_return"] for k in checked])
-    n_empty_half = sum(1 for k in checked if k["h1_return"] is None or k["h2_return"] is None)
-    if corr is not None:
-        corr_txt = f"{corr:+.3f}"
-        if n_empty_half:
-            corr_txt += (f" (over the {len(checked) - n_empty_half} of {len(checked)} cells "
-                         "whose two halves both had entries)")
-    elif n_empty_half:
-        corr_txt = ("not measurable — the split date leaves a half without entries in "
-                    f"{n_empty_half} of the {len(checked)} cells")
-    else:
-        corr_txt = "not enough data"
-    share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
-    coverage_txt = ("" if n_headline == n_cells else
-                    f"; {n_headline} of the {n_cells} cells have a time-series entry and "
-                    "the rest are blank on the heatmap")
-    best_txt = (f"The best of {n_headline} correlated cells overstates what you should expect."
-                if n_headline else
-                "No cell has a time-series entry, so nothing on this grid measures the band "
-                "or k.")
-    banner = (
-        "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
-        "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
-        "color:#5D4037;'>"
-        + f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
-        "points across the time-series, all, ladder and cross-event populations"
-        f"{coverage_txt}). Every figure in this banner, the heatmap and the "
-        f"equity curve is the <b>{html.escape(headline_label)}</b> population's; the KPI "
-        f"table below labels each row with its own population. {share_txt} of "
-        "the cells with a measurable return had a positive total return. Split-half "
-        f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. {best_txt}"
-        "</div>"
-    )
+    def banner(grid: list[list[dict]], n_points: int, lead: str = "") -> str:
+        """
+        One grid's fragility banner.
+
+        n_cells counts the grid (every band x k cell has an "all" point);
+        every FIGURE is the time-series population's, and a cell with no
+        time-series point simply contributes no return — it never falls back
+        to the "all" point, which is how a same-title result would reach
+        here. The multiple-comparison count ("the best of N") is n_headline,
+        the cells the heatmap actually shows a value in, never the grid: a
+        band where no time-series pair enters has an "all" cell but no
+        time-series one (the backtester skips an empty population).
+
+        Args:
+            grid (list[list[dict]]): The cells, band x k, each population ->
+                its SweepPoint or None.
+            n_points (int): The scenario points behind the grid, for the
+                banner's "(N scenario points" clause.
+            lead (str): HTML the banner opens on ("" for the tier-on block).
+
+        Returns:
+            str: The banner's <div>.
+        """
+        n_cells = sum(1 for row in grid for cp in row if cp["all"] is not None)
+        headline_points = [cp[_HEADLINE_POPULATION] for row in grid for cp in row
+                           if cp[_HEADLINE_POPULATION] is not None]
+        n_headline = len(headline_points)
+        finite_returns = [r for r in (kpis(pt)["total_return"] for pt in headline_points)
+                          if r is not None and math.isfinite(r)]
+        positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
+                          if finite_returns else None)
+        checked = [kpis(pt) for pt in headline_points if pt.halves is not None]
+        # A cell whose H1 or H2 had no entries carries None there
+        # (_robustness_extras), and _spearman drops any pair with a None, so
+        # the correlation is over the cells whose two halves both had entries.
+        corr = _spearman([k["h1_return"] for k in checked], [k["h2_return"] for k in checked])
+        n_empty_half = sum(1 for k in checked
+                           if k["h1_return"] is None or k["h2_return"] is None)
+        if corr is not None:
+            corr_txt = f"{corr:+.3f}"
+            if n_empty_half:
+                corr_txt += (f" (over the {len(checked) - n_empty_half} of {len(checked)} "
+                             "cells whose two halves both had entries)")
+        elif n_empty_half:
+            corr_txt = ("not measurable — the split date leaves a half without entries in "
+                        f"{n_empty_half} of the {len(checked)} cells")
+        else:
+            corr_txt = "not enough data"
+        share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
+        coverage_txt = ("" if n_headline == n_cells else
+                        f"; {n_headline} of the {n_cells} cells have a time-series entry and "
+                        "the rest are blank on the heatmap")
+        best_txt = (f"The best of {n_headline} correlated cells overstates what you should "
+                    "expect." if n_headline else
+                    "No cell has a time-series entry, so nothing on this grid measures the "
+                    "band or k.")
+        return (
+            "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
+            "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
+            "color:#5D4037;'>"
+            + lead
+            + f"<b>{n_cells} band x k cells computed</b> ({n_points} scenario "
+            "points across the time-series, all, ladder and cross-event populations"
+            f"{coverage_txt}). Every figure in this banner, the heatmap and the "
+            f"equity curve is the <b>{html.escape(headline_label)}</b> population's; the KPI "
+            f"table below labels each row with its own population. {share_txt} of "
+            "the cells with a measurable return had a positive total return. Split-half "
+            f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. {best_txt}"
+            "</div>"
+        )
 
     # ── Heatmap: band rows x k columns, one "update" button per metric ──────
-    def metric_matrix(field: str) -> list[list]:
-        return [
-            [
-                (kpis(cell_points[bi][ki][_HEADLINE_POPULATION])[field]
-                 if cell_points[bi][ki][_HEADLINE_POPULATION] is not None else None)
-                for ki in range(len(ks))
-            ]
-            for bi in range(len(bands))
-        ]
-
     band_labels = [_row_label(b) for b in bands]
     k_labels = [_k_label(k) for k in ks]
     # Colour scales are read back off a trace plotly.py has already coerced,
@@ -2966,13 +3197,19 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     # depend on k — and its row therefore repeats one figure across every k
     # column. Its hover names the entries it pooled, since a k-hat over a
     # handful of entries is not a measurement worth reading.
-    def band_pooled(band: tuple[float, float]):
-        cal = sweep.calibrations_by_band.get(band)
+    def pooled(cal: IntervalCalibration | None):
+        """
+        A band's pooled k-hat row.
+
+        Args:
+            cal (IntervalCalibration | None): The band's calibration, or None.
+
+        Returns:
+            IntervalCalibrationBucket | None: Its pooled row; None without one.
+        """
         return None if cal is None else cal.pooled
 
-    pooled_by_band = [band_pooled(b) for b in bands]
-    khat_matrix = [[None if p is None else p.empirical_k] * len(ks) for p in pooled_by_band]
-    khat_n_matrix = [[None if p is None else p.n] * len(ks) for p in pooled_by_band]
+    pooled_by_band = [pooled(sweep.calibrations_by_band.get(b)) for b in bands]
     khat_hover = ("band=%{y}<br>k̂=%{z:.3f} (the same at every k)"
                   "<br>entries pooled=%{customdata}<extra></extra>")
 
@@ -2992,47 +3229,78 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         ("empirical_k", "Empirical k̂ (pooled per band)", diverging, sweep.primary.k,
          khat_hover, "empirical_k_n"),
     ]
-    # _json_safe here too: the button args are free-form JSON that no Plotly
-    # validator touches, so a NaN cell must already be None when it gets there.
-    matrices = {field: _json_safe(metric_matrix(field))
-                for field, *_ in heatmap_fields if field != "empirical_k"}
-    matrices["empirical_k"] = _json_safe(khat_matrix)
-    matrices["empirical_k_n"] = _json_safe(khat_n_matrix)
 
-    _, default_label, default_scale, default_zmid, default_hover, default_custom = (
-        heatmap_fields[0])
-    hfig = go.Figure()
-    hfig.add_trace(go.Heatmap(
-        z=matrices["mean_per_trade"], x=k_labels, y=band_labels,
-        customdata=matrices[default_custom], colorscale=default_scale, zmid=default_zmid,
-        hovertemplate=default_hover,
-    ))
-    # The title names the population, on every metric (each button re-sets
-    # it), so a screenshot of the heatmap alone still says whose cells these
-    # are.
-    heat_title = f"by spread band x k — {headline_label}"
-    hfig.update_layout(
-        title=f"{default_label} {heat_title}",
-        xaxis_title="k", yaxis_title="Spread band",
-        updatemenus=[{
-            "type": "dropdown", "direction": "down", "active": 0, "showactive": True,
-            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
-            "buttons": [
-                {
-                    "label": label, "method": "update",
-                    "args": [
-                        # customdata travels with every button: k-hat's hover
-                        # reads entry counts, every other metric's trade counts
-                        {"z": [matrices[field]], "colorscale": [scale],
-                         "zmid": [zmid], "hovertemplate": [hover],
-                         "customdata": [matrices[custom]]},
-                        {"title.text": f"{label} {heat_title}"},
-                    ],
-                }
-                for field, label, scale, zmid, hover, custom in heatmap_fields
-            ],
-        }],
-    )
+    def heatmap(grid: list[list[dict]], pooled_rows: list, labels: list[str],
+                div_id: str, suffix: str = "") -> str:
+        """
+        One grid's heatmap, with its metric menu.
+
+        Args:
+            grid (list[list[dict]]): The cells, band x k (as banner reads them).
+            pooled_rows (list): Each band's pooled k-hat row, or None.
+            labels (list[str]): Each band's row label.
+            div_id (str): The chart's fixed id, which the page's script
+                drives it by ("scn-heat", "scn-heat-off").
+            suffix (str): Appended to the title on every metric ("" for the
+                tier-on block).
+
+        Returns:
+            str: The chart's HTML (_fig_html).
+        """
+        def metric_matrix(field: str) -> list[list]:
+            return [
+                [
+                    (kpis(grid[bi][ki][_HEADLINE_POPULATION])[field]
+                     if grid[bi][ki][_HEADLINE_POPULATION] is not None else None)
+                    for ki in range(len(ks))
+                ]
+                for bi in range(len(bands))
+            ]
+
+        khat_matrix = [[None if p is None else p.empirical_k] * len(ks) for p in pooled_rows]
+        khat_n_matrix = [[None if p is None else p.n] * len(ks) for p in pooled_rows]
+        # _json_safe here too: the button args are free-form JSON that no
+        # Plotly validator touches, so a NaN cell must already be None there.
+        matrices = {field: _json_safe(metric_matrix(field))
+                    for field, *_ in heatmap_fields if field != "empirical_k"}
+        matrices["empirical_k"] = _json_safe(khat_matrix)
+        matrices["empirical_k_n"] = _json_safe(khat_n_matrix)
+
+        _, default_label, default_scale, default_zmid, default_hover, default_custom = (
+            heatmap_fields[0])
+        hfig = go.Figure()
+        hfig.add_trace(go.Heatmap(
+            z=matrices["mean_per_trade"], x=k_labels, y=labels,
+            customdata=matrices[default_custom], colorscale=default_scale, zmid=default_zmid,
+            hovertemplate=default_hover,
+        ))
+        # The title names the population, on every metric (each button re-sets
+        # it), so a screenshot of the heatmap alone still says whose cells these
+        # are.
+        heat_title = f"by spread band x k — {headline_label}{suffix}"
+        hfig.update_layout(
+            title=f"{default_label} {heat_title}",
+            xaxis_title="k", yaxis_title="Spread band",
+            updatemenus=[{
+                "type": "dropdown", "direction": "down", "active": 0, "showactive": True,
+                "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
+                "buttons": [
+                    {
+                        "label": label, "method": "update",
+                        "args": [
+                            # customdata travels with every button: k-hat's hover
+                            # reads entry counts, every other metric's trade counts
+                            {"z": [matrices[field]], "colorscale": [scale],
+                             "zmid": [zmid], "hovertemplate": [hover],
+                             "customdata": [matrices[custom]]},
+                            {"title.text": f"{label} {heat_title}"},
+                        ],
+                    }
+                    for field, label, scale, zmid, hover, custom in heatmap_fields
+                ],
+            }],
+        )
+        return _fig_html(hfig, height=450, div_id=div_id)
 
     # ── Empirical k-hat for EVERY band at once (the heatmap's k-hat metric in
     # table form, with the counts behind it). One row per band, pooled over
@@ -3041,30 +3309,75 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     def fmt(value, spec: str) -> str:
         return "—" if value is None or not math.isfinite(value) else format(value, spec)
 
-    td = "<td style='padding:4px 12px;'>"
-    khat_rows = "".join(
-        "<tr style='border-bottom:1px solid #E0E0E0'>"
-        + td + html.escape(label) + "</td>"
-        + td + ("—" if p is None else str(p.n)) + "</td>"
-        + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
-        + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
-        + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
-        for label, p in zip(band_labels, pooled_by_band, strict=True)
+    def khat_table(labels: list[str], pooled_rows: list, suffix: str = "") -> str:
+        """
+        One grid's "Empirical k-hat by spread band" table.
+
+        Args:
+            labels (list[str]): Each band's row label.
+            pooled_rows (list): Each band's pooled k-hat row, or None.
+            suffix (str): Appended to the table's title ("" for the tier-on
+                block).
+
+        Returns:
+            str: The table, in an open <details>.
+        """
+        td = "<td style='padding:4px 12px;'>"
+        khat_rows = "".join(
+            "<tr style='border-bottom:1px solid #E0E0E0'>"
+            + td + html.escape(label) + "</td>"
+            + td + ("—" if p is None else str(p.n)) + "</td>"
+            + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
+            + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
+            + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
+            for label, p in zip(labels, pooled_rows, strict=True)
+        )
+        return (
+            "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+            f"<summary><b>Empirical k&#770; by spread band{html.escape(suffix)}</b> "
+            "(pooled over each band's "
+            f"time-series entries; the same at every k — compare with the primary "
+            f"k = {sweep.primary.k:.3f})</summary>"
+            "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+            "<tr style='background:#E8F5E9;font-weight:bold;'>"
+            "<th style='padding:6px 12px;'>Spread band</th>"
+            "<th style='padding:6px 12px;'>n</th>"
+            "<th style='padding:6px 12px;'>Realised in-between rate</th>"
+            "<th style='padding:6px 12px;'>Mean implied gap</th>"
+            "<th style='padding:6px 12px;'>Pooled k&#770;</th></tr>"
+            + khat_rows + "</table></details>"
+        )
+
+    # ── The tier-on block, and the tier-off one when there is an off view.
+    # The tier-on banner counts the scenario points the run stored (every one
+    # a tier-on cell holds, from the backtester); the off banner counts the
+    # points its own grid holds, a binding band's tier-off ones and every
+    # other band's tier-on ones. ─────────────────────────────────────────────
+    tier_on_block = (
+        '<div id="scn-tier-on">'
+        + banner(cell_points, len(on_points))
+        + heatmap(cell_points, pooled_by_band, band_labels, "scn-heat")
+        + khat_table(band_labels, pooled_by_band)
+        + "</div>"
     )
-    khat_table = (
-        "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
-        f"<summary><b>Empirical k&#770; by spread band</b> (pooled over each band's "
-        f"time-series entries; the same at every k — compare with the primary "
-        f"k = {sweep.primary.k:.3f})</summary>"
-        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
-        "<tr style='background:#E8F5E9;font-weight:bold;'>"
-        "<th style='padding:6px 12px;'>Spread band</th>"
-        "<th style='padding:6px 12px;'>n</th>"
-        "<th style='padding:6px 12px;'>Realised in-between rate</th>"
-        "<th style='padding:6px 12px;'>Mean implied gap</th>"
-        "<th style='padding:6px 12px;'>Pooled k&#770;</th></tr>"
-        + khat_rows + "</table></details>"
-    )
+    # The backtester's own band text for the off view: the floor alone gated
+    # those runs, so _row_label's "max(tier,<floor>)" would misname them
+    labels_off = None if tier_binds is None else [_band_label(b) for b in bands]
+    tier_off_block = ""
+    if tier_binds is not None:
+        pooled_off = [pooled(sweep.tier_off_calibrations_by_band.get(b)) if binds
+                      else pooled_by_band[bi]
+                      for bi, (b, binds) in enumerate(zip(bands, tier_binds, strict=True))]
+        n_off_points = sum(1 for row in cell_points_off for cp in row
+                           for pt in cp.values() if pt is not None)
+        tier_off_block = (
+            '<div id="scn-tier-off" style="display:none">'
+            + banner(cell_points_off, n_off_points, lead=_SCENARIO_TIER_OFF_LEAD)
+            + heatmap(cell_points_off, pooled_off, labels_off, "scn-heat-off",
+                      suffix=_SCENARIO_TIER_OFF_SUFFIX)
+            + khat_table(labels_off, pooled_off, suffix=_SCENARIO_TIER_OFF_SUFFIX)
+            + "</div>"
+        )
 
     # ── The <select>s, preselected to (and marking) the primary scenario ─────
     primary_band_idx = band_idx.get(sweep.primary.spread_band, 0)
@@ -3076,6 +3389,21 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
             f'{html.escape(lbl)}{" (primary)" if i == primary else ""}</option>'
             for i, lbl in enumerate(labels)
         )
+
+    def option_texts(labels: list[str]) -> list[str]:
+        """
+        The band select's option texts, as the script writes them back.
+
+        Args:
+            labels (list[str]): Each band's label under one tier setting.
+
+        Returns:
+            list[str]: The labels, " (primary)" on the primary band — the
+                text options() renders, unescaped (the script sets an
+                option's text, which the browser escapes itself).
+        """
+        return [lbl + (" (primary)" if i == primary_band_idx else "")
+                for i, lbl in enumerate(labels)]
 
     selects = (
         "<div style='font-family:sans-serif;font-size:14px;margin:16px 0;'>"
@@ -3108,7 +3436,8 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 """
 
     # ── The headline population's equity curve: rendered once for the
-    # primary cell, then restyled in place by the inline script. The axis is
+    # primary cell, then redrawn in place by the inline script (a
+    # Plotly.update that also autoranges its axes). The axis is
     # decided once, from the primary (every scenario of one run spans the same
     # calendar), and every cell's curve is placed on it by date. Only the
     # headline population ships a curve per cell: the curves are the page's
@@ -3119,13 +3448,19 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     primary_headline = primary_cell.get(_HEADLINE_POPULATION)
     primary_values = (_curve_on_axis(primary_headline.equity_df, axis)
                       if primary_headline is not None else [])
+    # The curve's title under each Tier floors setting — the off one names
+    # the setting, as the off heatmap's does — shipped in the data block for
+    # the script to retitle the curve with (it words nothing of its own)
+    curve_title = f"Equity curve — selected band x k — {headline_label}"
+    curve_title_off = (None if tier_binds is None
+                       else curve_title + _SCENARIO_TIER_OFF_SUFFIX)
     efig = go.Figure()
     efig.add_trace(go.Scatter(
         x=axis_dates if primary_values else [], y=primary_values,
         name=headline_label,
         line={"color": _COLORS["strategy"], "width": 2},
     ))
-    efig.update_layout(title=f"Equity curve — selected band x k — {headline_label}",
+    efig.update_layout(title=curve_title,
                        yaxis_title="Portfolio Value ($)", xaxis_title="Date")
 
     # ── The data block every select, table and chart above reads from ────────
@@ -3137,8 +3472,37 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
             d["equity"] = _curve_on_axis(pt.equity_df, axis)
         return d
 
-    def cal_json(band: tuple[float, float]) -> list[dict] | None:
-        cal = sweep.calibrations_by_band.get(band)
+    def grid_json(grid: list[list[dict]], bi: int) -> list[list]:
+        """
+        One band's row of a grid, as the data block ships it.
+
+        Args:
+            grid (list[list[dict]]): The cells, band x k.
+            bi (int): The band's index.
+
+        Returns:
+            list[list]: Per k, per population (_SCENARIO_POPULATIONS order),
+                cell_entry's dict or None.
+        """
+        return [[cell_entry(grid[bi][ki][pop], pop) for pop in _SCENARIO_POPULATIONS]
+                for ki in range(len(ks))]
+
+    def cal_json(cal: IntervalCalibration | None) -> list[dict] | None:
+        """
+        One band's calibration table rows, as the data block ships them.
+
+        A bucket's tier of 0 or less ships as null (rendered "—"): the
+        pooled row's tier is always 0.0 (no floor to print), and so is every
+        bucket of a tier-off calibration at a floor of 0, which labels its
+        buckets with that floor alone.
+
+        Args:
+            cal (IntervalCalibration | None): The band's calibration.
+
+        Returns:
+            list[dict] | None: One dict per gap bucket, then the pooled row;
+                None without a calibration.
+        """
         if cal is None:
             return None
         return [
@@ -3159,16 +3523,27 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         "primary_k_idx": primary_k_idx,
         "dates": axis_dates,
         # cells[band index][k index][population index]
-        "cells": [
-            [
-                [cell_entry(cell_points[bi][ki][pop], pop) for pop in _SCENARIO_POPULATIONS]
-                for ki in range(len(ks))
-            ]
-            for bi in range(len(bands))
-        ],
+        "cells": [grid_json(cell_points, bi) for bi in range(len(bands))],
         "same_title": (kpis(sweep.same_title_point)
                        if sweep.same_title_point is not None else None),
-        "calibration_by_band": [cal_json(b) for b in bands],
+        "calibration_by_band": [cal_json(sweep.calibrations_by_band.get(b)) for b in bands],
+        # The tier-floors-off view, or null throughout without one. A band
+        # the tiers never bind at ships null in cells_off and
+        # calibration_by_band_off: the script reads its tier-on ones there
+        # (tier_binds), so no cell or calibration ships twice.
+        "tier_binds": tier_binds,
+        "cells_off": (None if tier_binds is None else
+                      [grid_json(cell_points_off, bi) if binds else None
+                       for bi, binds in enumerate(tier_binds)]),
+        "calibration_by_band_off": (
+            None if tier_binds is None else
+            [cal_json(sweep.tier_off_calibrations_by_band.get(b)) if binds else None
+             for b, binds in zip(bands, tier_binds, strict=True)]),
+        # The band select's texts under each setting, as the script relabels it
+        "band_options": option_texts(band_labels),
+        "band_options_off": None if labels_off is None else option_texts(labels_off),
+        # The curve's title under each setting, as the script retitles it
+        "curve_titles": [curve_title, curve_title_off],
     }
     # _json_safe() has already replaced every non-finite float, so
     # allow_nan=False never fires in practice — it is the backstop that makes
@@ -3180,9 +3555,8 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 
     return (
         title
-        + banner
-        + _fig_html(hfig, height=450)
-        + khat_table
+        + tier_on_block
+        + tier_off_block
         + selects
         + kpi_table
         + _fig_html(efig, height=400, div_id="scn-equity")
@@ -3710,10 +4084,16 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
 # The view every trade list carries: all of its trades, no category or tag.
 _ALL_VIEW = "all"
 
-# The two sections the filter bar does NOT drive, named once, for the bar's
+# The two sections the filter bar does NOT filter, named once, for the bar's
 # note and its tests: the interval-discount section (its own k dropdown, at
-# the primary band) and the scenario explorer (its own band and k selects).
-_UNFILTERED_SECTIONS = "Interval Discount (k) Calibration and the Scenario Explorer"
+# the primary band) and the scenario explorer (its own band and k selects),
+# which follows the bar's Tier floors choice and nothing else of it — never
+# its band, category or tag — and says so here. That clause holds on every
+# sweep run_backtest_sweep builds; on a hand-built one whose explorer grid
+# holds a binding band the tier-off family does not name, the explorer has
+# no off view to follow with (_tier_off_binds) and the clause overstates.
+_UNFILTERED_SECTIONS = ("Interval Discount (k) Calibration and the Scenario Explorer "
+                        "(which follows only the Tier floors choice)")
 
 # The filter bar's "Tier floors" options: each band's run as simulated (the
 # tiers applied, config.min_price_diff_for_gap's rule) or its run with them
@@ -3870,10 +4250,29 @@ def _tier_off_binds(sweep: BacktestSweep | None, bands: list) -> list[bool] | No
     guessed: a view the run did not simulate is never shown as if it had
     been.
 
+    Both Tier floors views read it — the filter bar's (_tier_off_runs, over
+    the bar's bands) and the scenario explorer's (its tier-off block, over
+    its grid's rows) — so the two classify every band alike: simulated again,
+    its tier-on run standing in, or cause to withhold the whole off view.
+    Each still decides for itself whether it HAS an off view, since they
+    read different bands (the bar's: the primary band and every band with an
+    "all" point at the primary k; the explorer's: every band with an "all"
+    point at any k) and the bar also needs each binding band's tier-off
+    "all" point at the primary k. generate_dashboard draws the explorer's
+    off view only when the bar offers one too, so the explorer shows one
+    only when the bar does AND its own grid is complete. On a hand-built
+    sweep whose explorer grid holds a binding band the family does not name,
+    the bar can therefore offer an off view while the explorer stays on the
+    tier-on grid — and the bar's note that the explorer "follows only the
+    Tier floors choice" (_UNFILTERED_SECTIONS) overstates there. That is
+    unreachable from run_backtest_sweep, whose family names every binding
+    band of the grid (the primary band's included) at every k.
+
     Args:
         sweep (BacktestSweep | None): The run's sweep, or None.
         bands (list): Each offered band's resolved (floor, ceiling), in the
-            filter bar's order — None for an unrecorded band.
+            caller's order (the filter bar's bands, or the scenario
+            explorer's rows) — None for an unrecorded band.
 
     Returns:
         list[bool] | None: Per band, True when the run simulated it again with
@@ -4599,18 +4998,25 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     trade list — a band's tier-floors-off run adds one only where it traded
     differently), and its largest part is HTML the page shows verbatim (each
     trade's best/worst table row, each view's category table), which
-    compresses many times over. Measured 2026-09-26 on a synthetic 36-band
-    run whose bands each traded a different 200-trade list over ~2,460 days
-    (16 series in 8 categories, a 300-entry k-hat population per band): 11.7
-    MB as compact JSON and 2.19 MB packed (the base64 block), a 3.02 MB page;
-    with a tier-floors-off family whose 18 binding bands each traded yet
-    another such list (54 lists in all, each binding band with its own
-    300-entry population) — the worst case now — 17.6 MB, 3.30 MB packed and
-    a 4.13 MB page. On the DR-73 calibration corpus's own band sweep (start
-    2020-01-01, ladders on) the family took the block from 0.45 MB to 0.67
-    MB and the page from 4.07 MB to 4.29 MB. The script inflates it with the
-    browser's own DecompressionStream, so nothing is added to the page but
-    the bytes.
+    compresses many times over; the script inflates it with the browser's
+    own DecompressionStream, so nothing is added to the page but the bytes.
+    Measured 2026-09-26 on a synthetic 36-band run whose bands each traded a
+    different 200-trade list over ~2,460 days (16 series in 8 categories, a
+    300-entry k-hat population per band): 11.7 MB as compact JSON and 2.19
+    MB packed (the base64 block), a 3.02 MB page; with a tier-floors-off
+    family whose 18 binding bands each traded yet another such list (54
+    lists in all, each binding band with its own 300-entry population) — the
+    worst case now — 17.6 MB, 3.30 MB packed and a 4.18 MB page. On the
+    DR-73 calibration corpus's own band sweep (start 2020-01-01, ladders on)
+    the family took this block from 0.45 MB to 0.67 MB and the page from
+    4.07 MB to 5.49 MB (4,071,051 to 5,489,336 bytes) — 1.19 MB of that the
+    scenario explorer's tier-off view: 1.10 MB of tier-off cells in its data
+    block, which is NOT packed and ships a curve per binding band x k
+    (_section_scenario_explorer), and 0.10 MB its hidden tier-off block.
+    That real page is past the 5,000,000 bytes TestScenarioExplorerPageSize
+    holds its synthetic page to: that is the test's ceiling, not a guarantee
+    for a real page, and packing the explorer's data block too is a
+    follow-up.
 
     Non-finite floats become null first (_json_safe) and allow_nan=False
     makes a missed one raise instead of shipping unparseable JSON. The block
@@ -5124,7 +5530,9 @@ def generate_dashboard(
             return calculations and benchmark normalization.
         sweep (BacktestSweep | None): The full sweep payload from
             backtester.run_backtest_sweep(), rendered by the
-            interval-discount section and the scenario-explorer section, and
+            interval-discount section and the scenario-explorer section (with
+            its tier-floors-off block when it carries that family and the
+            filter bar offers a tier-floors-off view to follow), and
             read by the page-wide filter and the k-hat breakdown (every
             band's run and calibration, via _band_runs, and — when it carries
             the tier-floors-off family — every band's tier-off run, via
@@ -5252,10 +5660,17 @@ def generate_dashboard(
         # trade sections do (None when the payload could not be built)
         _section_khat(filter_data, k_used),
         # Also takes the sweep whole — it reads .scenarios, .same_title_point
-        # and .calibrations_by_band, none of which _section_interval_discount
-        # renders, and passing pieces could let the two sections (and the
-        # header's run-settings line) drift onto different bands or settings.
-        _section_scenario_explorer(sweep),
+        # and .calibrations_by_band (and the tier-floors-off family,
+        # .tier_off_scenarios and .tier_off_calibrations_by_band, which its
+        # script shows when the filter bar's Tier floors select reads off),
+        # none of which _section_interval_discount renders, and passing
+        # pieces could let the two sections (and the header's run-settings
+        # line) drift onto different bands or settings. Its off view is drawn
+        # only when the bar offers one: its script follows only that bar's
+        # choice, so without it the off block could never be shown
+        _section_scenario_explorer(
+            sweep, tier_off_view=(filter_data is not None
+                                  and filter_data["bands_off"] is not None)),
         _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades

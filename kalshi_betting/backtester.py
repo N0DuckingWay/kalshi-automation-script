@@ -75,10 +75,11 @@ Dependencies:
     _leg_prices_for, _build_equity_curve — the one definition of an equity
     curve, which its page-wide filter runs over a category's or tag's trades
     for that slice's curve — _calibration_bucket, _band_label (the bare
-    "floor-ceiling" its filter bar names a band's tier-floors-off run with,
-    so the page and the log spell that run alike) and _tier_floors_bind (the
-    one test of whether a deadline-gap tier binds at a band, which the filter
-    bar's Tier floors choice reads to decide whether a band absent from the
+    "floor-ceiling" its filter bar and scenario explorer name a band's
+    tier-floors-off run with, so the page and the log spell that run alike)
+    and _tier_floors_bind (the one test of whether a deadline-gap tier binds
+    at a band, which the page's Tier floors views — the filter bar's and the
+    scenario explorer's — read to decide whether a band absent from the
     tier-off family may show its tier-on run, or no off view is shown); an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
@@ -1120,12 +1121,14 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     every point the run keeps — the primary, each swept k, each band-sweep
     scenario, each tier-off scenario (BacktestSweep.tier_off_scenarios) and
     the same-title point; the split-half and ex-top re-simulations are not
-    kept as points (only their figures are) and are not counted. The tier-on
-    points are the ones the k dropdown and the scenario explorer put on the
-    same page; a tier-off point is counted too, because a trade there proves
-    just as well that the window's markets had candlesticks, i.e. that the
-    window could trade. Zero proves nothing either way: an entry that Kelly
-    then rejected at every k also shows the window could trade.
+    kept as points (only their figures are) and are not counted. Every point
+    it counts can reach the same page: the tier-on ones through the k
+    dropdown, the filter bar and the scenario explorer, the tier-off ones
+    through the Tier floors choice's off view in the filter bar and the
+    scenario explorer — and a trade at a tier-off point proves just as well
+    that the window's markets had candlesticks, i.e. that the window could
+    trade. Zero proves nothing either way: an entry that Kelly then rejected
+    at every k also shows the window could trade.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
