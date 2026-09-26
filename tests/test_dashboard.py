@@ -33,6 +33,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1149,13 +1150,30 @@ def _fail_on_constant(token):  # pragma: no cover - only runs on a failure
     pytest.fail(f"JSON payload contained a non-finite constant token: {token}")
 
 
+def _scn_blocks(section_html: str) -> dict[str, dict]:
+    """Every packed block of the scenario explorer ("scn-data" and each
+    "scn-cap-<i>"), inflated as its script unpacks them (base64, then gzip)
+    and parsed strictly (a NaN/Infinity token fails the test), by id."""
+    return {element_id: _decode_block(body)
+            for element_id, body in _PACKED.findall(section_html)
+            if element_id.startswith("scn-")}
+
+
 def _scn_data(section_html: str) -> dict:
-    """The scn-data payload, cut at the FIRST "</script>" after the block's
-    opening tag — exactly where a browser's HTML parser ends the block — and
-    parsed strictly (a NaN/Infinity token fails the test)."""
-    start = section_html.index('id="scn-data">') + len('id="scn-data">')
-    end = section_html.index("</script>", start)
-    return json.loads(section_html[start:end], parse_constant=_fail_on_constant)
+    """The explorer's base block (id="scn-data"): axes, labels, populations,
+    dates, each band's calibration, the metrics and the cap-independent
+    matrices, and the primary [band, k, cap] indexes."""
+    return _scn_blocks(section_html)["scn-data"]
+
+
+def _scn_cap(section_html: str, ci: int | None = None) -> dict:
+    """One size cap's block (id="scn-cap-<ci>"): its cells, same-title row,
+    banner, cap-dependent matrices and titles — the primary cap's when ci is
+    None."""
+    blocks = _scn_blocks(section_html)
+    if ci is None:
+        ci = blocks["scn-data"]["primary"][2]
+    return blocks[f"scn-cap-{ci}"]
 
 
 def _first_figure(section_html: str) -> tuple[list, dict]:
@@ -1174,8 +1192,9 @@ def _first_figure(section_html: str) -> tuple[list, dict]:
 
 
 def _options(section_html: str, select_id: str) -> list[tuple[str, bool, str]]:
-    """(value, selected, text) of every <option> of one <select>."""
-    body = re.search(rf"<select id='{select_id}'>(.*?)</select>", section_html).group(1)
+    """(value, selected, text) of every <option> of one <select> — double-quoted
+    id, and whatever attributes follow it (disabled, autocomplete)."""
+    body = re.search(rf'<select id="{select_id}"[^>]*>(.*?)</select>', section_html).group(1)
     return [(v, bool(sel), txt) for v, sel, txt in
             re.findall(r'<option value="(\d+)"( selected)?>(.*?)</option>', body)]
 
@@ -1259,21 +1278,25 @@ class _Grid:
 
 
 class TestScenarioExplorerPayload:
-    """The data block the inline script reads: its indexing, its per-population
-    rows and its values, all pinned by value on a non-square grid."""
+    """The data blocks the inline script reads: their indexing, their
+    per-population rows and their values, all pinned by value on a
+    non-square grid. The direct call renders the sweep's own eager points,
+    at the run's own (here unrecorded) size cap: one cap block."""
 
     def test_the_grid_is_band_major_and_not_transposed(self):
-        data = _scn_data(_Grid.section())
+        section = _Grid.section()
+        data, cap = _scn_data(section), _scn_cap(section)
         assert data["bands"] == [[0.0, 1.0], [0.3, 0.6], [0.35, 0.8]]
         assert data["ks"] == [0.65, 0.75]
+        assert data["caps"] == [None] and data["cap_labels"] == ["not recorded"]
         assert data["populations"] == ["all", "ladder", "cross", "time_series"]
         pop = {name: i for i, name in enumerate(data["populations"])}
-        assert len(data["cells"]) == 3
-        assert all(len(row) == 2 for row in data["cells"])
+        assert len(cap["cells"]) == 3
+        assert all(len(row) == 2 for row in cap["cells"])
         for bi in range(3):
             for ki in range(2):
                 c = bi * 2 + ki
-                cell = data["cells"][bi][ki]
+                cell = cap["cells"][bi][ki]
                 assert cell[pop["all"]]["trades"] == c + 1
                 # Each population row is its OWN point's figures, never the
                 # All point's — 10 + c and 20 + c trades, not c + 1.
@@ -1288,8 +1311,7 @@ class TestScenarioExplorerPayload:
 
     def test_the_primary_cell_kpis_by_value(self):
         sweep = _Grid.sweep()
-        data = _scn_data(_section_scenario_explorer(sweep))
-        all_row = data["cells"][1][1][0]
+        all_row = _scn_cap(_section_scenario_explorer(sweep))["cells"][1][1][0]
         trades = _Grid.all_trades(3)
         assert all_row["trades"] == 4
         # profit > 0 strictly: the zero-profit trade is not a win.
@@ -1312,13 +1334,14 @@ class TestScenarioExplorerPayload:
         assert all_row["ex_top_return"] == pytest.approx(-0.015)
 
     def test_population_rows_are_their_own_simulations(self):
-        data = _scn_data(_Grid.section())
-        ladder, cross = data["cells"][1][1][1], data["cells"][1][1][2]
+        cap = _scn_cap(_Grid.section())
+        ladder, cross = cap["cells"][1][1][1], cap["cells"][1][1][2]
         assert ladder["total_return"] == pytest.approx(0.006)   # 1000 -> 1006
         assert ladder["final_balance"] == pytest.approx(1006.0)
         assert cross["total_return"] == pytest.approx(-0.004)   # 1000 -> 996
         assert "h1_return" not in ladder and "equity" not in ladder
-        same_title = data["same_title"]
+        # The same-title row is its cap's own (one cap here: the run's own)
+        same_title = cap["same_title"]
         assert same_title["trades"] == 7
         assert same_title["total_return"] == pytest.approx(0.002)
 
@@ -1333,33 +1356,75 @@ class TestScenarioExplorerPayload:
 
     def test_json_is_strict_and_carries_no_non_finite_value(self):
         section = _Grid.section()
-        data = _scn_data(section)
-        assert data["cells"][0][0][0]["total_return"] is None
-        # PB7: the per-cell curve is the headline (time-series) population's
-        assert data["cells"][0][0][3]["equity"][2] is None
-        assert "NaN" not in section and "Infinity" not in section
+        # Every packed block decodes strictly (_decode_block: a NaN or
+        # Infinity token fails the test) — a grep for "NaN" would read the
+        # base64 alphabet, which can spell it by chance
+        blocks = _scn_blocks(section)
+        assert set(blocks) == {"scn-data", "scn-cap-0"}
+        cap, n = blocks["scn-cap-0"], len(blocks["scn-data"]["dates"])
+        assert cap["cells"][0][0][0]["total_return"] is None
+        # The per-cell curve is the headline (time-series) population's, as
+        # change points: the NaN final value is a gap, never a number
+        assert _expand(cap["cells"][0][0][3]["equity"], n)[2] is None
+        assert cap["matrices"]["total_return"][0][0] is None
+        # ... and outside the blocks — the heatmap's and the curve's figure
+        # JSON Python rendered — no non-finite token either (the blocks'
+        # bodies stripped first, since base64 can spell "NaN")
+        stripped = re.sub(r'(data-encoding="gzip\+base64">)[^<]*', r"\1", section)
+        assert stripped.count('data-encoding="gzip+base64">') == 2
+        assert "NaN" not in stripped and "Infinity" not in stripped
+
+    def test_python_s_curve_is_the_one_the_script_expands(self, monkeypatch):
+        # 18783.345 sits a hair above a half cent: Python's round() reads it
+        # 18783.35 and numpy's 18783.34. The primary curve Python draws and
+        # the one the script expands from the primary cap's block when a
+        # reader returns to it must be one rounding, not a cent apart
+        values = [1000.0, 18783.345, 999.995, 1001.005]
+        assert round(values[1], 2) != float(np.round(values[1], 2))   # the case is real
+        monkeypatch.setattr(_Grid, "PRIMARY_VALUES", values)
+        section = _Grid.section()
+        drawn, _ = _nth_figure(section, 1)
+        data, cap = _scn_data(section), _scn_cap(section)
+        ts = data["populations"].index("time_series")
+        shipped = _expand(cap["cells"][1][1][ts]["equity"], len(data["dates"]))
+        assert drawn[0]["y"] == shipped
+        assert shipped[1] == float(np.round(values[1], 2))
 
     def test_a_script_closing_ticker_cannot_end_the_data_block(self):
         hostile = "EVT-</script><b>x"
         section = _Grid.section(top_event=hostile)
-        assert hostile not in section
-        assert "EVT-<\\/script>" in section
-        assert _scn_data(section)["cells"][1][1][0]["top_event"] == hostile
+        assert hostile not in section and "<b>x" not in section
+        # Base64 has no "<", so nothing inside a block can close it early:
+        # each block ends exactly where its encoded bytes end
+        ids = re.findall(r'id="(scn-[a-z0-9-]+)" data-encoding="gzip\+base64">', section)
+        assert ids == ["scn-data", "scn-cap-0"]
+        for element_id in ids:
+            opening = f'id="{element_id}" data-encoding="gzip+base64">'
+            body = section[section.index(opening) + len(opening):]
+            assert re.fullmatch(r"[A-Za-z0-9+/=]+", body[:body.index("</script>")])
+        assert _scn_cap(section)["cells"][1][1][0]["top_event"] == hostile
 
     def test_every_curve_is_on_the_shared_axis(self):
         sweep = _Grid.sweep()
-        data = _scn_data(_section_scenario_explorer(sweep))
+        section = _section_scenario_explorer(sweep)
+        data, cap = _scn_data(section), _scn_cap(section)
         assert data["dates"] == [d.isoformat() for d in sweep.primary.equity_df["date"]]
-        for row in data["cells"]:
-            for cell in row:
-                # PB7: the per-cell curve is the headline (time-series)
-                # population's; the "all" entry no longer ships one
-                assert len(cell[3]["equity"]) == len(data["dates"])
+        axis = dashboard._equity_axis(sweep.primary.equity_df)
+        points = {(p.spread_band, p.k): p for p in sweep.scenarios
+                  if p.population == "time_series"}
+        for bi, row in enumerate(cap["cells"]):
+            for ki, cell in enumerate(row):
+                # The per-cell curve is the headline (time-series)
+                # population's, change points on the shared axis, expanded by
+                # the script; the "all" entry ships none
+                curve = _expand(cell[3]["equity"], len(data["dates"]))
+                point = points[(_Grid.BANDS[bi], _Grid.KS[ki])]
+                assert curve == dashboard._curve_on_axis(point.equity_df, axis)
                 assert "equity" not in cell[0]
 
 
 class TestScenarioExplorerControls:
-    """The selects, the heatmap's metric toggle and the fragility banner."""
+    """The selects, the heatmap's metric select and the fragility banner."""
 
     def test_selects_are_labelled_and_preselect_only_the_primary(self):
         section = _Grid.section()
@@ -1372,8 +1437,18 @@ class TestScenarioExplorerControls:
             ("0", False, "k = 0.65"),
             ("1", True, "k = 0.75 (primary)"),
         ]
+        # The run's own cap alone (the direct call walks the eager points);
+        # _Grid's points record none
+        assert _options(section, "scn-cap-select") == [("0", True, "not recorded (primary)")]
         data = _scn_data(section)
-        assert (data["primary_band_idx"], data["primary_k_idx"]) == (1, 1)
+        assert data["primary"] == [1, 1, 0]
+        # The labels the filter bar's calls are matched against: the bar's own
+        assert data["band_labels"] == [dashboard._band_option(b) for b in _Grid.BANDS]
+        assert data["k_labels"] == [dashboard._k_option(k) for k in _Grid.KS]
+        # Rendered disabled (the script enables them once its data is
+        # unpacked), and never restored by a browser
+        for sid in ("scn-band-select", "scn-k-select", "scn-cap-select", "scn-metric"):
+            assert f'<select id="{sid}" disabled autocomplete="off">' in section
 
     def test_labels_stay_distinct_for_off_grid_values(self):
         # An off-grid --interval-discount within a rounding of a grid member,
@@ -1389,36 +1464,43 @@ class TestScenarioExplorerControls:
         assert heat[0]["x"] == ["k = 0.65", "k = 0.651", "k = 0.70"]
         assert heat[0]["y"] == ["max(tier,0.3)-0.6", "max(tier,0.3000001)-0.6"]
 
-    def test_heatmap_buttons_update_z_and_title_together(self):
-        heat, layout = _first_figure(_Grid.section())
-        # PB7: the title names the population the cells are
+    def test_the_heatmap_metrics_carry_z_scale_and_title_together(self):
+        section = _Grid.section()
+        heat, layout = _first_figure(section)
+        data, cap = _scn_data(section), _scn_cap(section)
+        # PB7: the title names the population the cells are; C4: and the cap
         pop = "Time-series (ladders + cross-event; same-title excluded)"
-        assert layout["title"]["text"] == (
-            f"Mean per trade (equal stake) by spread band x k — {pop}")
-        buttons = layout["updatemenus"][0]["buttons"]
-        assert [b["label"] for b in buttons] == [
-            "Mean per trade (equal stake)", "Median per trade (equal stake)",
-            "Total return", "H1 return", "H2 return", "Trade count",
-            "Empirical k̂ (pooled per band)"]
-        for b in buttons:
-            # "restyle" would read the second argument as trace indices and
-            # drop the title silently; "update" relayouts it.
-            assert b["method"] == "update"
-            assert b["args"][1] == {
-                "title.text": f"{b['label']} by spread band x k — {pop}"}
-        z = {b["label"]: b["args"][0]["z"][0] for b in buttons}
+        assert layout["title"]["text"] == cap["titles"][0] == (
+            f"Mean per trade (equal stake) by spread band x k, cap not recorded — {pop}")
+        # A scripted select replaced the native dropdown: one figure, no
+        # updatemenus (it could not follow the size cap)
+        assert "updatemenus" not in layout
+        metrics = data["metrics"]
+        assert [m["label"] for m in metrics] == [html.unescape(o[2]) for o in
+                                                 _options(section, "scn-metric")]
+        labels = [m["label"] for m in metrics]
+        for m, t in zip(metrics, cap["titles"], strict=True):
+            # A figure of the trades names the cap; k-hat does not depend on it
+            if m["key"] in ("empirical_k", "khat_minus_k"):
+                assert t == f"{m['label']} by spread band x k — {pop}"
+            else:
+                assert t == f"{m['label']} by spread band x k, cap not recorded — {pop}"
+        z = {label: (cap["matrices"] | data["matrices"])[m["key"]]
+             for label, m in zip(labels, metrics, strict=True)}
         assert z["Trade count"] == [[1, 2], [3, 4], [5, 6]]
         assert z["Total return"][0][0] is None
         assert z["Total return"][1] == pytest.approx([0.01, 0.02])
         assert z["H1 return"] == [[0.01, 0.02], [0.03, 0.04], [0.05, 0.06]]
         assert z["H2 return"] == [[0.03, -0.01], [0.05, 0.0], [0.02, 0.02]]
+        # The figure as rendered: the default metric's z
         assert heat[0]["z"] == z["Mean per trade (equal stake)"]
         # A count is never negative: its own colour scale, auto-ranged.
-        count = buttons[5]["args"][0]
-        assert count["zmid"] == [None]
-        assert count["colorscale"] != buttons[0]["args"][0]["colorscale"]
-        assert buttons[0]["args"][0]["zmid"] == [0]
-        assert heat[0]["colorscale"] == buttons[0]["args"][0]["colorscale"][0]
+        count = metrics[labels.index("Trade count")]
+        assert count["zmid"] is None
+        assert count["colorscale"] != metrics[0]["colorscale"]
+        assert metrics[0]["zmid"] == 0
+        assert heat[0]["colorscale"] == metrics[0]["colorscale"]
+        assert heat[0]["customdata"] == cap["matrices"]["trades"]
 
     def test_banner_is_first_and_carries_this_runs_figures(self):
         from scipy.stats import spearmanr
@@ -1507,20 +1589,22 @@ class TestScenarioExplorerHeadlinePopulation:
             same_event_ladders=True, split_date=date(2026, 1, 6))
 
     def test_the_heatmap_reads_time_series_and_never_falls_back(self):
-        heat, layout = _first_figure(_section_scenario_explorer(self.sweep()))
-        buttons = {b["label"]: b["args"][0]["z"][0]
-                   for b in layout["updatemenus"][0]["buttons"]}
+        section = _section_scenario_explorer(self.sweep())
+        heat, layout = _first_figure(section)
+        matrices = _scn_cap(section)["matrices"]
         expected = [(f - 1000.0) / 1000.0 for f in self.TS_FINALS]
-        assert buttons["Total return"][0] == pytest.approx(expected[:2])
-        assert buttons["Total return"][1][0] == pytest.approx(expected[2])
+        assert matrices["total_return"][0] == pytest.approx(expected[:2])
+        assert matrices["total_return"][1][0] == pytest.approx(expected[2])
         # Cell 3 has no time-series point: null, never the "all" cell's +50%
-        assert buttons["Total return"][1][1] is None
-        assert buttons["Trade count"] == [[1, 1], [1, None]]
-        assert buttons["H1 return"] == [[-0.10, -0.30], [-0.20, None]]
+        assert matrices["total_return"][1][1] is None
+        assert matrices["trades"] == [[1, 1], [1, None]]
+        assert matrices["h1_return"] == [[-0.10, -0.30], [-0.20, None]]
+        # The figure as rendered: the default metric's, from the same cells
+        assert heat[0]["z"] == matrices["mean_per_trade"]
+        assert heat[0]["z"][1][1] is None
         # The title names the population on every metric
         assert layout["title"]["text"].endswith(f"— {_TS_LABEL}")
-        assert all(_TS_LABEL in b["args"][1]["title.text"]
-                   for b in layout["updatemenus"][0]["buttons"])
+        assert all(title.endswith(f"— {_TS_LABEL}") for title in _scn_cap(section)["titles"])
 
     def test_same_title_dilution_cannot_reach_the_banner(self):
         from scipy.stats import spearmanr
@@ -1566,18 +1650,20 @@ class TestScenarioExplorerHeadlinePopulation:
         # The primary cell's TIME-SERIES curve, not its "all" curve
         assert curve[0]["y"] == [1000.0, 950.0, 900.0]
         assert _TS_LABEL in layout["title"]["text"]
-        data = _scn_data(section)
+        data, cap = _scn_data(section), _scn_cap(section)
         pop = {name: i for i, name in enumerate(data["populations"])}
-        cell = data["cells"][0][0]
-        assert cell[pop["time_series"]]["equity"] == [1000.0, 950.0, 900.0]
+        cell = cap["cells"][0][0]
+        # Shipped as change points, expanded by the script onto the axis
+        assert _expand(cell[pop["time_series"]]["equity"], len(data["dates"])) \
+            == [1000.0, 950.0, 900.0]
         assert "equity" not in cell[pop["all"]]
         # ... and both checked populations carry their own extras
         assert cell[pop["time_series"]]["top_event"] == "EVT-TS"
         assert cell[pop["all"]]["top_event"] == "EVT-ST"
-        assert data["cells"][1][1][pop["time_series"]] is None
+        assert cap["cells"][1][1][pop["time_series"]] is None
 
     def test_every_population_is_labelled(self):
-        data = _scn_data(_section_scenario_explorer(self.sweep()))
+        data = _scn_data(_section_scenario_explorer(self.sweep()))  # the base block
         assert data["labels"] == {
             "time_series": _TS_LABEL,
             "all": "All (time-series + same-title)",
@@ -1600,14 +1686,16 @@ class TestScenarioExplorerHeadlinePopulation:
         js = dashboard._SCENARIO_EXPLORER_JS
         assert "var ts = cell[P.time_series];" in js
         assert "kpiRow(esc(L.time_series), ts) + extrasRow(ts)" in js
-        assert "var values = (ts && ts.equity) ? ts.equity : [];" in js
+        assert ("var values = (ts && ts.equity && ts.equity.length) ? expand(ts.equity) : [];"
+                in js)
         assert "kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])" in js
         # ... and the population is resolved through the payload's names, so
         # the index the script reads is the time-series point's
-        data = _scn_data(_section_scenario_explorer(self.sweep()))
+        section = _section_scenario_explorer(self.sweep())
+        data, cap = _scn_data(section), _scn_cap(section)
         ts_idx = data["populations"].index("time_series")
-        cell = data["cells"][0][0]
-        assert cell[ts_idx]["equity"] == [1000.0, 950.0, 900.0]
+        cell = cap["cells"][0][0]
+        assert _expand(cell[ts_idx]["equity"], len(data["dates"])) == [1000.0, 950.0, 900.0]
         assert cell[ts_idx]["final_balance"] == pytest.approx(900.0)
 
 
@@ -1640,15 +1728,17 @@ class TestSplitHalfDegeneracy:
         assert f"{measured:+.3f}" != f"{with_zero:+.3f}"
         assert f"H1 vs H2: {measured:+.3f} (over the 4 of 5 cells whose two halves both " \
                "had entries)." in section
-        _, layout = _first_figure(section)
-        z = {b["label"]: b["args"][0]["z"][0] for b in layout["updatemenus"][0]["buttons"]}
-        assert [row[0] for row in z["H1 return"]] == [*h1, None]
+        heat, _ = _first_figure(section)
+        data, cap = _scn_data(section), _scn_cap(section)
+        z = cap["matrices"]
+        assert [row[0] for row in z["h1_return"]] == [*h1, None]
         # ... while H2 of that cell, which had entries, is still a measurement
-        assert [row[0] for row in z["H2 return"]] == [*h2, 0.10]
-        data = _scn_data(section)
+        assert [row[0] for row in z["h2_return"]] == [*h2, 0.10]
+        # The figure as rendered: the default metric's z
+        assert heat[0]["z"] == z["mean_per_trade"]
         pop = {name: i for i, name in enumerate(data["populations"])}
-        assert data["cells"][4][0][pop["time_series"]]["h1_return"] is None
-        assert data["cells"][4][0][pop["all"]]["h1_return"] is None
+        assert cap["cells"][4][0][pop["time_series"]]["h1_return"] is None
+        assert cap["cells"][4][0][pop["all"]]["h1_return"] is None
 
     def test_every_half_empty_says_not_measurable(self):
         halves = [HalfSplit(0.0, r, 0, 1, 0, 2) for r in (0.1, 0.2, 0.3)]
@@ -1679,9 +1769,9 @@ class TestSplitHalfDegeneracy:
         assert all(p.halves.h1_entries == 0 for p in sweep.scenarios
                    if p.population in ("all", "time_series"))
         section = _section_scenario_explorer(sweep)
-        data = _scn_data(section)
+        data, cap = _scn_data(section), _scn_cap(section)
         pop = {name: i for i, name in enumerate(data["populations"])}
-        for row in data["cells"]:
+        for row in cap["cells"]:
             for cell in row:
                 for name in ("all", "time_series"):
                     assert cell[pop[name]]["h1_return"] is None
@@ -1772,12 +1862,23 @@ class TestEquityAxis:
         axis = dashboard._equity_axis(primary)
         values = dashboard._curve_on_axis(later, axis)
         assert len(values) == 400
-        assert values == [round(v, 2) for v in later["portfolio_value"].iloc[:400]]
+        # In cents, rounded as every shipped curve is (_sparse_on_axis)
+        assert values == [float(np.round(v, 2)) for v in later["portfolio_value"].iloc[:400]]
 
     def test_values_are_cents_and_non_finite_is_none(self):
         eq = make_equity([1000.123456, float("nan"), 1001.5])
         values = dashboard._curve_on_axis(eq, dashboard._equity_axis(eq))
         assert values == [1000.12, None, 1001.5]
+
+    def test_the_curve_is_the_change_points_every_scenario_ships(self):
+        # One rounding for the curve Python draws and the change points the
+        # script expands (_sparse_on_axis), even a hair above a half cent,
+        # where Python's round() and numpy's disagree
+        eq = make_equity([10000.0, 18783.345, 9999.995, 10001.005])
+        axis = dashboard._equity_axis(eq)
+        sparse = dashboard._sparse_on_axis(list(eq["date"]), eq["portfolio_value"], axis, 2)
+        assert dashboard._curve_on_axis(eq, axis) == _expand(sparse, len(axis))
+        assert dashboard._curve_on_axis(eq, axis)[1] == float(np.round(18783.345, 2))
 
     def test_missing_curves_and_dates_are_empty_or_none(self):
         axis = dashboard._equity_axis(self._curve(5))
@@ -2044,7 +2145,20 @@ class TestFigHtmlDivId:
 class TestScenarioExplorerPageSize:
     """A full page for the real grid (36 bands x 13 ks) over a V3-length window
     (2,459 days), with realistic float values, every population point, a
-    calibration per band and a top event per cell, stays within 5 MB."""
+    calibration per band and a top event per cell. Every cell trades ONE list,
+    so the filter bar packs one chunk per k: 13. The scenario explorer ships
+    its base block and one block per size cap (one here: no size-cap sweep),
+    gzip-packed, each cell's curve as change points on its weekly axis.
+    Measured 2026-09-26 (plotly 6.9.0, pandas 3.0.3, numpy 2.4.6): a
+    1,724,773-byte page, the explorer's two blocks 95,920 bytes of base64 —
+    against 3,902,183 bytes for the same fixture before the explorer's
+    blocks were packed (C3), when its data was one JSON block with every
+    curve dense. The budget is the measurement + 20% (the curve runs to
+    today, so the page grows by a few bytes a day) — well inside the 5 MB
+    the explorer first set."""
+
+    PAGE_BYTES_MEASURED = 1_724_773
+    BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
 
     def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path):
         import numpy as np
@@ -2092,8 +2206,11 @@ class TestScenarioExplorerPageSize:
 
         out_path = dashboard.generate_dashboard(
             trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
+        page = out_path.read_text(encoding="utf-8")
+        assert len(TestFilterPage._chunks(page)) == 13
+        assert list(_scn_blocks(page)) == ["scn-data", "scn-cap-0"]
         size = out_path.stat().st_size
-        assert size <= 5_000_000, f"page was {size} bytes"
+        assert size <= self.BUDGET, f"page was {size} bytes"
 
 
 class TestMedianReturns:
@@ -2163,15 +2280,16 @@ class TestMedianReturns:
         assert "<th style=\"padding:8px 16px;\">Median/Trade</th>" in section
         assert "fmtPct(k.median_per_trade)" in section
         # The primary cell (band 1, k index 1) is cell 3, whose trades differ
-        data = _scn_data(section)
-        ts = data["cells"][1][1][data["populations"].index("time_series")]
+        data, cap = _scn_data(section), _scn_cap(section)
+        ts = cap["cells"][1][1][data["populations"].index("time_series")]
         ratios = sorted(t.profit_ratio for t in _Grid.all_trades(3))
         assert ts["median_per_trade"] == pytest.approx((ratios[1] + ratios[2]) / 2)
-        _, layout = _first_figure(section)
-        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
-        median = buttons["Median per trade (equal stake)"]
-        assert median["z"][0][1][1] == pytest.approx(ts["median_per_trade"])
-        assert median["zmid"] == [0]
+        metric = next(m for m in data["metrics"] if m["label"] == "Median per trade (equal stake)")
+        assert cap["matrices"][metric["key"]][1][1] == pytest.approx(ts["median_per_trade"])
+        assert metric["zmid"] == 0
+        # The figure as rendered: the default metric (the mean), not the median
+        heat, _ = _first_figure(section)
+        assert heat[0]["z"] == cap["matrices"]["mean_per_trade"]
 
 
 def _typed_trade(pair_type: str, ladder: bool, entry: date, exit_: date,
@@ -2409,6 +2527,7 @@ class TestEmpiricalKHatByBand:
     depend on k), with the entries behind it, plus the same figures as a table."""
 
     KHAT = "Empirical k̂ (pooled per band)"
+    DELTA = "k̂ − k (pooled per band, minus the column's k)"
 
     @staticmethod
     def _sweep() -> BacktestSweep:
@@ -2421,33 +2540,56 @@ class TestEmpiricalKHatByBand:
         return dataclasses.replace(sweep, calibrations_by_band={
             _Grid.BANDS[0]: base, _Grid.BANDS[1]: wide, _Grid.BANDS[2]: undefined})
 
+    @staticmethod
+    def _metrics(section: str) -> dict[str, dict]:
+        """Each heatmap metric's spec, by label, with its z and customdata
+        matrices resolved as the script resolves them (the cap's block, else
+        the base block)."""
+        data, cap = _scn_data(section), _scn_cap(section)
+        matrices = cap["matrices"] | data["matrices"]
+        return {m["label"]: dict(m, z=matrices[m["key"]], customdata=matrices[m["custom"]])
+                for m in data["metrics"]}
+
     def test_each_band_row_repeats_its_pooled_khat(self):
-        _, layout = _first_figure(_section_scenario_explorer(self._sweep()))
-        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
-        khat = buttons[self.KHAT]
-        assert khat["z"][0] == [[0.60, 0.60], [0.90, 0.90], [None, None]]
+        section = _section_scenario_explorer(self._sweep())
+        khat = self._metrics(section)[self.KHAT]
+        assert khat["z"] == [[0.60, 0.60], [0.90, 0.90], [None, None]]
         # Its hover reads the entries pooled, not the trade count
-        assert khat["customdata"][0] == [[10, 10], [4, 4], [0, 0]]
+        assert khat["customdata"] == [[10, 10], [4, 4], [0, 0]]
         # Centred on the run's primary k (the primary cell sits at k = 0.75)
-        assert khat["zmid"] == [0.75]
-        assert "entries pooled" in khat["hovertemplate"][0]
+        assert khat["zmid"] == 0.75
+        assert "entries pooled" in khat["hover"]
+        # k-hat is measured before the Kelly gate: it ships once, not per cap
+        assert "empirical_k" in _scn_data(section)["matrices"]
+        assert "empirical_k" not in _scn_cap(section)["matrices"]
+        # The figure as rendered: the default metric's z, not k-hat's
+        heat, _ = _first_figure(section)
+        assert heat[0]["z"] == _scn_cap(section)["matrices"]["mean_per_trade"]
 
     def test_every_other_metric_restores_the_trade_counts(self):
-        # customdata travels with every button, so switching back from k-hat
+        # customdata travels with every update, so switching back from k-hat
         # must put the trade counts back under the other metrics' hovers
-        _, layout = _first_figure(_section_scenario_explorer(self._sweep()))
-        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
-        trades = buttons["Trade count"]["z"][0]
-        for label, args in buttons.items():
-            if label != self.KHAT:
-                assert args["customdata"][0] == trades, label
+        section = _section_scenario_explorer(self._sweep())
+        metrics = self._metrics(section)
+        trades = metrics["Trade count"]["z"]
+        for label, spec in metrics.items():
+            if label in (self.KHAT, self.DELTA):
+                assert spec["custom"] == "empirical_k_n", label
+            else:
+                assert spec["customdata"] == trades, label
+        heat, _ = _first_figure(section)
+        assert heat[0]["customdata"] == trades
 
     def test_a_band_without_a_calibration_is_blank(self):
         sweep = dataclasses.replace(self._sweep(), calibrations_by_band={
             _Grid.BANDS[0]: _scn_calibration()})
-        _, layout = _first_figure(_section_scenario_explorer(sweep))
-        buttons = {b["label"]: b["args"][0] for b in layout["updatemenus"][0]["buttons"]}
-        assert buttons[self.KHAT]["z"][0] == [[0.60, 0.60], [None, None], [None, None]]
+        section = _section_scenario_explorer(sweep)
+        metrics = self._metrics(section)
+        assert metrics[self.KHAT]["z"] == [[0.60, 0.60], [None, None], [None, None]]
+        # ... and so is its k-hat − k
+        assert metrics[self.DELTA]["z"] == [[-0.05, -0.15], [None, None], [None, None]]
+        heat, _ = _first_figure(section)
+        assert heat[0]["z"] == _scn_cap(section)["matrices"]["mean_per_trade"]
 
     def test_the_table_lists_every_band(self):
         section = _section_scenario_explorer(self._sweep())
@@ -3114,16 +3256,46 @@ class TestFilterSummary:
             "Showing every trade of the run at the primary spread band max(tier,0)-1, "
             f"k = 0.75, 20% cap per trade: 5 trades. {dashboard._BAR_REACH}")
         # What the bar reaches: the interval-discount section by k and size
-        # cap only, the explorer not at all, category and tag neither
+        # cap only, the scenario explorer's selects by band, k and size cap,
+        # category and tag neither
         assert dashboard._BAR_REACH == (
             "The Interval Discount section follows only the bar's k and size cap (at the "
-            "primary spread band); the Scenario Explorer keeps its own selects, and "
-            "category and tag reach neither.")
-        # ...and on a page whose interval-discount section cannot follow it
-        # (no sweep, or its data could not be built), the sentence says so
+            "primary spread band), and the Scenario Explorer's selects follow its band, k "
+            "and size cap; category and tag reach neither.")
+        # ...and on a page that lacks either — the interval-discount section
+        # cannot follow the bar (no sweep, or its data could not be built),
+        # or there is no explorer grid (no band sweep, or its data could not
+        # be built) — the sentence says so
+        assert dashboard._BAR_REACH_NO_EXPLORER == (
+            "The Interval Discount section follows only the bar's k and size cap (at the "
+            "primary spread band), not its category or tag; this page has no Scenario "
+            "Explorer grid for the bar to reach.")
+        assert dashboard._BAR_REACH_EXPLORER_ONLY == (
+            "The Scenario Explorer's selects follow the bar's band, k and size cap (not its "
+            "category or tag); the bar does not reach the Interval Discount section on this "
+            "page.")
         assert dashboard._BAR_REACH_STATIC == (
-            "The bar reaches neither the Interval Discount section on this page nor "
-            "the Scenario Explorer, which keeps its own selects.")
+            "The bar reaches neither the Interval Discount section on this page nor a "
+            "Scenario Explorer grid.")
+        # An explorer whose cap axis is not the bar's (rebuilt at the run's
+        # own cap) follows the bar's band and k only, and the line says so
+        assert dashboard._BAR_REACH_OWN_CAP == (
+            "The Interval Discount section follows only the bar's k and size cap (at the "
+            "primary spread band), and the Scenario Explorer's selects follow its band and k "
+            "but not its size cap — the explorer shows the run's own size cap only on this "
+            "page; category and tag reach neither.")
+        assert dashboard._BAR_REACH_EXPLORER_ONLY_OWN_CAP == (
+            "The Scenario Explorer's selects follow the bar's band and k (not its size cap — "
+            "the explorer shows the run's own size cap only on this page — nor its category "
+            "or tag); the bar does not reach the Interval Discount section on this page.")
+        assert [dashboard._bar_reach(kd, explorer) for kd, explorer in
+                ((True, True), (True, False), (False, True), (False, False))] == [
+            dashboard._BAR_REACH, dashboard._BAR_REACH_NO_EXPLORER,
+            dashboard._BAR_REACH_EXPLORER_ONLY, dashboard._BAR_REACH_STATIC]
+        assert [dashboard._bar_reach(kd, explorer, explorer_caps=False) for kd, explorer in
+                ((True, True), (True, False), (False, True), (False, False))] == [
+            dashboard._BAR_REACH_OWN_CAP, dashboard._BAR_REACH_NO_EXPLORER,
+            dashboard._BAR_REACH_EXPLORER_ONLY_OWN_CAP, dashboard._BAR_REACH_STATIC]
         other = dashboard._filter_summary_text(
             self.T, dashboard._scenario_phrase("spread band x", "k = 0.60", "5% cap per trade"),
             False, None, 3, 3)
@@ -3228,19 +3400,33 @@ def _script_body() -> str:
     return body[:start] + "  function inflate(el) { return __inflate(el); }\n" + body[end:]
 
 
+def _explorer_body() -> str:
+    """dashboard._SCENARIO_EXPLORER_JS without its <script> tags, its
+    unpack(el) handing back the already-inflated block of that element (the
+    harness's __inflate, as for the filter's inflate)."""
+    body = dashboard._SCENARIO_EXPLORER_JS.strip()
+    body = body[len("<script>"):-len("</script>")]
+    start = body.index("  function unpack(el) {")
+    end = body.index("\n  }\n", start) + len("\n  }\n")
+    return body[:start] + "  function unpack(el) { return __inflate(el); }\n" + body[end:]
+
+
 def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
                 no_decompression: bool = False, *, strict: bool = False,
                 damaged: tuple = (), keep: int | None = None,
-                deferred: tuple = ()) -> dict:
+                deferred: tuple = (), explorer: bool = False) -> dict:
     """
-    Run the filter script over a rendered page under tests/js/filter_harness.js.
+    Run the filter script — and, with explorer=True, the scenario explorer's
+    before it — over a rendered page under tests/js/filter_harness.js.
 
     Args:
         tmp_path (Path): Where the assembled program is written.
         page (str): The rendered page.
         steps (list): The harness's steps (["wait"], ["settle"], ["set", id,
             value], ["fire", id], ["zoom", id], ["hide", id], ["select", id],
-            ["repair", id], ["resolve", id], ["reject", id], ["snap", name]).
+            ["repair", id], ["resolve", id], ["reject", id], ["call", name,
+            args] — a page script's window function called with args, as
+            another script would call it — and ["snap", name]).
         pre (tuple): (select id, value) pairs set BEFORE the script runs — a
             browser restoring a reader's last choice.
         no_decompression (bool): Run as a browser without DecompressionStream.
@@ -3254,6 +3440,12 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         deferred (tuple): Keyword-only. Block ids whose inflate waits for a
             ["resolve", id] or ["reject", id] step, so a test can choose the
             order in which chunks arrive.
+        explorer (bool): Keyword-only. Also run the scenario explorer's
+            script, before the filter's, as the page orders them — when the
+            page carries it (a page without the band sweep does not, and
+            then only the filter's runs, as in a browser); "wait" then also
+            waits for the explorer's selects. False (default) runs the
+            filter's alone.
 
     Returns:
         dict: The snapshots the steps took, by name.
@@ -3267,6 +3459,7 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
     if keep is not None:
         assert body.count("var KEEP = 16;") == 1
         body = body.replace("var KEEP = 16;", f"var KEEP = {int(keep)};")
+    with_explorer = explorer and "function unpack(el)" in page
     program = "\n".join([
         _JS_HARNESS.read_text(encoding="utf-8"),
         f"var __PAGE = {json.dumps(elements)};",
@@ -3274,8 +3467,10 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         *(f"__DAMAGED[{json.dumps(i)}] = true;" for i in damaged),
         *(f"__DEFERRED[{json.dumps(i)}] = true;" for i in deferred),
         "__setup(__PAGE);",
+        "__WAIT_EXPLORER = true;" if with_explorer else "",
         *(f"document.getElementById({json.dumps(i)}).value = {json.dumps(v)};" for i, v in pre),
         "window.DecompressionStream = undefined;" if no_decompression else "",
+        _explorer_body() if with_explorer else "",
         body,
         f"__step({json.dumps(steps)}, 0);",
     ])
@@ -3843,6 +4038,9 @@ class TestFilterKAndCap:
         assert data["primary"] == [0, 0, caps.index(0.2)]
         band = (0.0, 1.0)
         end = run.primary.equity_df["date"].iloc[-1]
+        # The scenario explorer rides the same walk: a block per cap
+        explorer = _scn_blocks(page)
+        assert len(explorer) == 1 + len(caps)
         for ci, cap in enumerate(caps):
             fresh = backtester._simulate_at_discount(
                 run.cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=0.75,
@@ -3850,6 +4048,11 @@ class TestFilterKAndCap:
             view = _view(data, chunks, 0, 0, ci, "all")
             kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades, 10_000.0)
             assert view["kpi"] == {key: value for key, _, value, _ in kpis}, cap
+            # ... and its "all" row there is that cap's own simulation too
+            row = explorer[f"scn-cap-{ci}"]["cells"][0][0][0]
+            assert row["trades"] == len(fresh.trades), cap
+            assert row["final_balance"] == pytest.approx(
+                float(fresh.equity_df["portfolio_value"].iloc[-1])), cap
         # Not vacuous: the caps below the fixture's peak size differently
         assert len({c for c in data["grid"][0][0] if c is not None}) > 1
 
@@ -4580,11 +4783,14 @@ class TestIntervalDiscountFollowsTheBar:
             _expand(kd["curves"][1][1], len(TestFilterPage._data(page)["dates"])))
         assert "updatemenus" not in section[:section.index("Empirical k̂ by")]
         # A section that follows the bar carries neither static notice, and
-        # the summary line says the bar reaches it
+        # the summary line says the bar reaches it — and, the _kc size-cap
+        # sweep having run without the band sweep, that there is no explorer
+        # grid for it to reach
         for text in ("no_bar", "failed"):
             assert html.escape(dashboard._KD_TEXT[text]) not in page
-        assert html.escape(dashboard._BAR_REACH) in page
+        assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
         assert html.escape(dashboard._BAR_REACH_STATIC) not in page
+        assert html.escape(dashboard._BAR_REACH) not in page
 
     def test_a_filter_that_cannot_be_built_leaves_the_section_static(
             self, monkeypatch, tmp_path):
@@ -4635,7 +4841,8 @@ class TestIntervalDiscountFollowsTheBar:
         assert weights == ["400", "700", "400"]
         for text in ("no_bar", "failed"):
             assert html.escape(dashboard._KD_TEXT[text]) not in page
-        assert html.escape(dashboard._BAR_REACH) in page
+        # No scenarios: no explorer grid for the bar to reach
+        assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
         # The script moves it to the bar's k
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
@@ -4645,7 +4852,7 @@ class TestIntervalDiscountFollowsTheBar:
         assert snap["rows"]["kd-rows"] == kd["rows"][0]
         assert [w[0] for w in snap["weights"]["kd-rows"]] == ["700", "400", "400"]
         assert snap["text"]["hdr-trades"] == "1"
-        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH)
+        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH_NO_EXPLORER)
 
     def test_a_section_whose_data_fails_says_so_and_costs_nothing_else(
             self, monkeypatch, tmp_path, caplog):
@@ -4762,6 +4969,784 @@ class TestIntervalDiscountFollowsTheBar:
         assert snap["text"]["kpi-kd_k"] == "1.000"
 
 
+# ─── The scenario explorer: size-cap axis, Sharpe and k-hat − k, bar sync ────
+
+_EX_CAPS = (0.05, 0.2, 1.0)
+_EX_METRIC_LABELS = [
+    "Mean per trade (equal stake)", "Median per trade (equal stake)", "Total return",
+    "Sharpe ratio (365-day base)", "H1 return", "H2 return", "Trade count",
+    "Empirical k̂ (pooled per band)", "k̂ − k (pooled per band, minus the column's k)"]
+
+
+class _ExplorerCapSweep(_FakeCapSweep):
+    """
+    _FakeCapSweep with the band sweep's checks, as a production CapSweep has
+    them whenever the band sweep ran: every scenario carries the "all" and
+    "time_series" populations (the primary band's also "ladder"), and the
+    same-title population has a point per cap. `points` maps (band, k, cap)
+    -> {population: SweepPoint}; `same_title` maps cap -> SweepPoint.
+    """
+
+    checks = True
+
+    def __init__(self, points: dict, *, same_title: dict | None = None, **kwargs):
+        super().__init__(points, **kwargs)
+        self._same_title = same_title or {}
+
+    def cell(self, band, k):
+        self.reads.append((band, k))
+        if (band, k) == self.raise_on:
+            raise RuntimeError("the cap simulation failed")
+        return {cap: dict(self.points[(band, k, cap)]) for cap in self.caps
+                if (band, k, cap) in self.points}
+
+    def same_title(self):
+        return dict(self._same_title)
+
+    def entry_events(self):
+        return {(t.event_ticker, t.category) for pops in self.points.values()
+                for p in pops.values() for t in p.trades}
+
+
+def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSweep:
+    """
+    A band sweep with a size-cap sweep over 2 bands x 2 ks x 3 caps (5%, 20%
+    — the run's own — and no cap), primary (0-1, k 0.75, 20%).
+
+    The primary band loses at 5% (a losing list) and wins at 20% and no cap
+    (the full list); at no cap and k 0.75 the full list shares its TRADES
+    with 20% but not its curve (booked on a 1,100 balance), so a row cached
+    on the trades alone would be the 20% row. Band 0.3-0.6 traded nothing at
+    k 0.60 (a flat curve: Sharpe 0.0, which the heatmap must not show) and
+    the same winning list at every cap at k 0.75. Same-title: one trade at
+    5%, two at 20% and no cap. `st_trades` / `cell_trades` replace the
+    same-title lists / every cell's list (the stale-cutoff test's fixture).
+    """
+    def resized(t, n):
+        return _kc_resized(t, n)
+
+    full = _kc_trades(5)                               # +8, +4, -3
+    losing = [resized(_ftrade("KXNHLHART-27", "time_series", date(2026, 1, 12),
+                              date(2026, 1, 20), -8.0, ladder=True), 5),
+              resized(_ftrade("KXOTHER-1", "time_series", date(2026, 1, 13),
+                              date(2026, 1, 16), -4.0), 5)]
+    other = _kc_trades(5, count=2)                     # +8, +4
+    empty: list = []
+    curves, halves = {}, {id(full): HalfSplit(0.02, 0.03, 1, 2),
+                          id(losing): HalfSplit(-0.01, -0.02, 1, 1),
+                          id(other): HalfSplit(0.01, 0.0, 1, 1),
+                          id(empty): HalfSplit(0.0, 0.0, 0, 0)}
+
+    def curve(trades):
+        if id(trades) not in curves:
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        return curves[id(trades)]
+
+    def pops(band, k, cap, trades, eq=None, ladder=False):
+        if cell_trades is not None:
+            trades = cell_trades
+        point = SweepPoint(k=k, trades=trades, equity_df=curve(trades) if eq is None else eq,
+                           spread_band=band, size_cap=cap, halves=halves.get(id(trades)),
+                           ex_top_event=("KXNHLHART-27", 0.01) if trades else None)
+        out = {"all": point, "time_series": dataclasses.replace(point, population="time_series")}
+        if ladder:
+            out["ladder"] = dataclasses.replace(point, population="ladder", halves=None,
+                                                ex_top_event=None)
+        return out
+
+    rich = backtester._build_equity_curve(full, _FLT_START, 1100.0)
+    points = {}
+    for k in (0.6, 0.75):
+        points[(_KC_B0, k, 0.05)] = pops(_KC_B0, k, 0.05, losing, ladder=True)
+        points[(_KC_B0, k, 0.2)] = pops(_KC_B0, k, 0.2, full, ladder=True)
+        points[(_KC_B0, k, 1.0)] = pops(_KC_B0, k, 1.0, full, ladder=True,
+                                        eq=rich if k == 0.75 else None)
+        for cap in _EX_CAPS:
+            points[(_KC_B1, k, cap)] = pops(_KC_B1, k, cap, empty if k == 0.6 else other)
+    st_lists = st_trades or {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2],
+                             1.0: _flt_trades()[:2]}
+    st = {cap: SweepPoint(k=0.75, trades=listed, equity_df=curve(listed),
+                          population="same_title", size_cap=cap)
+          for cap, listed in st_lists.items()}
+    eager = [p for (_, _, cap), by_pop in points.items() if cap == 0.2 for p in by_pop.values()]
+    primary = points[(_KC_B0, 0.75, 0.2)]["all"]
+    cal = _flt_calibration([("KXNHLHART-27", "Other"), ("KXOTHER-1", "Other")])
+    return BacktestSweep(
+        primary=primary, points=[points[(_KC_B0, k, 0.2)]["all"] for k in (0.6, 0.75)],
+        calibration=cal, label_coverage=_scn_coverage(), scenarios=eager,
+        same_title_point=st[0.2], calibrations_by_band={_KC_B0: cal, _KC_B1: None},
+        same_event_ladders=True, split_date=date(2026, 1, 13),
+        cap_sweep=_ExplorerCapSweep(points, same_title=st, raise_on=raise_on, caps=_EX_CAPS))
+
+
+def _ex_section(page: str) -> str:
+    """The rendered page's Scenario Explorer section (to the next section)."""
+    start = page.index("\nScenario Explorer\n")
+    return page[start:page.index("Trade-Level Diagnostics", start)]
+
+
+_SCN_SELECTS = ("scn-band-select", "scn-k-select", "scn-cap-select")
+
+
+def _scn_values(snap: dict) -> list[str]:
+    """The explorer's band, k and size-cap selects' values in a snapshot."""
+    return [snap["selects"][s]["value"] for s in _SCN_SELECTS]
+
+
+class TestExplorerCapAndMetrics:
+    """The scenario explorer walks the page's grid — every band x k x size cap
+    — beside the filter bar (one walk), ships a block per cap, and gains the
+    Sharpe and k-hat − k metrics."""
+
+    def test_the_explorer_rides_the_page_s_one_walk(self, monkeypatch, tmp_path):
+        sweep = _ex_sweep()
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        section = _ex_section(page)
+        blocks = _scn_blocks(section)
+        # Every cap's block, the base block first; every cell read once for
+        # the whole page (chunks, interval-discount section and explorer)
+        assert list(blocks) == ["scn-data", "scn-cap-0", "scn-cap-1", "scn-cap-2"]
+        assert sweep.cap_sweep.reads == [(_KC_B0, 0.75), (_KC_B0, 0.6), (_KC_B1, 0.6),
+                                         (_KC_B1, 0.75)]
+        data = blocks["scn-data"]
+        assert data["caps"] == list(_EX_CAPS) and data["primary"] == [0, 1, 1]
+        # The bar's own labels, so its calls match
+        bar = TestFilterPage._data(page)
+        assert data["band_labels"] == [b["label"] for b in bar["bands"]]
+        assert data["k_labels"] == [k["label"] for k in bar["ks"]]
+        assert data["cap_labels"] == [c["label"] for c in bar["caps"]]
+        assert _options(section, "scn-cap-select") == [
+            ("0", False, "5%"), ("1", True, "20% (primary)"), ("2", False, "off (full Kelly)")]
+        # Each cap's own simulation: the primary cell trades 2 contracts' worth
+        # of losers at 5%, the full list at 20% and no cap
+        ts = data["populations"].index("time_series")
+        rows = [blocks[f"scn-cap-{ci}"]["cells"][0][1][ts] for ci in range(3)]
+        assert [r["trades"] for r in rows] == [2, 3, 3]
+        assert rows[0]["total_return"] < 0 < rows[1]["total_return"]
+        # A curve shared with no other cap: its own row (a cache on the
+        # trades alone would repeat the 20% row here)
+        assert rows[2]["final_balance"] == pytest.approx(rows[1]["final_balance"] + 100.0)
+        assert rows[2]["total_return"] != pytest.approx(rows[1]["total_return"])
+        matrices = [blocks[f"scn-cap-{ci}"]["matrices"] for ci in range(3)]
+        assert matrices[2]["total_return"][0][1] == pytest.approx(rows[2]["total_return"])
+        assert matrices[1]["total_return"][0][1] == pytest.approx(rows[1]["total_return"])
+        # ... and the population is part of what a row is: the headline row
+        # carries its curve, the "all" row sharing its trades does not
+        assert "equity" in rows[1] and "equity" not in blocks["scn-cap-1"]["cells"][0][1][0]
+        # The page as rendered shows the primary cap
+        heat, layout = _first_figure(section)
+        assert heat[0]["z"] == matrices[1]["mean_per_trade"]
+        assert layout["title"]["text"] == blocks["scn-cap-1"]["titles"][0]
+
+    def test_nine_metrics_in_order_each_on_its_block(self, monkeypatch, tmp_path):
+        section = _ex_section(_kc_page(monkeypatch, tmp_path, _ex_sweep()))
+        data, cap = _scn_data(section), _scn_cap(section)
+        assert [m["label"] for m in data["metrics"]] == _EX_METRIC_LABELS
+        assert [html.unescape(o[2]) for o in _options(section, "scn-metric")] \
+            == _EX_METRIC_LABELS
+        keys = [m["key"] for m in data["metrics"]]
+        # The figures of the trades ship per cap, k-hat once
+        assert set(cap["matrices"]) == set(keys[:7])
+        assert set(data["matrices"]) == {"empirical_k", "khat_minus_k", "empirical_k_n"}
+        assert len(cap["titles"]) == 9
+        assert cap["titles"][3] == ("Sharpe ratio (365-day base) by spread band x k, 20% cap "
+                                    f"per trade — {_TS_LABEL}")
+        assert cap["titles"][8] == ("k̂ − k (pooled per band, minus the column's k) by spread "
+                                    f"band x k — {_TS_LABEL}")
+        assert "updatemenus" not in _first_figure(section)[1]
+
+    def test_sharpe_is_blank_on_a_cell_with_no_trade(self, monkeypatch, tmp_path):
+        section = _ex_section(_kc_page(monkeypatch, tmp_path, _ex_sweep()))
+        data, cap = _scn_data(section), _scn_cap(section)
+        ts = data["populations"].index("time_series")
+        sharpe = cap["matrices"]["sharpe"]
+        # Band 0.3-0.6 at k 0.60 traded nothing: its flat curve's 0.0 is not
+        # a Sharpe ratio — the matrix blanks it ...
+        assert cap["matrices"]["trades"][1][0] == 0 and sharpe[1][0] is None
+        # ... while the KPI row keeps _point_kpis' own figure
+        assert cap["cells"][1][0][ts]["sharpe"] == 0.0
+        # A cell that traded shows its own curve's Sharpe
+        assert sharpe[0][1] == pytest.approx(cap["cells"][0][1][ts]["sharpe"])
+        assert sharpe[0][1] not in (None, 0.0)
+        spec = data["metrics"][3]
+        assert (spec["key"], spec["zmid"], spec["custom"]) == ("sharpe", 0, "trades")
+        assert "Sharpe=%{z:.2f}" in spec["hover"]
+
+    def test_khat_minus_k_is_the_cards_figure_and_red_when_positive(
+            self, monkeypatch, tmp_path):
+        sweep = _ex_sweep()
+        section = _ex_section(_kc_page(monkeypatch, tmp_path, sweep))
+        data = _scn_data(section)
+        khat = sweep.calibration.pooled.empirical_k
+        delta = data["matrices"]["khat_minus_k"]
+        # Pooled k-hat of the band minus the column's k, rounded as the cards
+        # round it: its text is the card's
+        assert delta[0] == [dashboard._khat_delta_value(khat, k) for k in (0.6, 0.75)]
+        assert [f"{v:+.3f}" for v in delta[0]] == [dashboard._khat_delta(khat, k)[0]
+                                                   for k in (0.6, 0.75)]
+        # A band without a calibration has none
+        assert delta[1] == [None, None]
+        assert data["matrices"]["empirical_k_n"][0] == [sweep.calibration.pooled.n] * 2
+        spec = data["metrics"][8]
+        assert (spec["key"], spec["zmid"], spec["custom"]) == ("khat_minus_k", 0,
+                                                               "empirical_k_n")
+        # Positive (the sizer sized too big) is the red end, as on the cards;
+        # the return metrics put the blue end on top
+        import plotly.graph_objects as go
+        assert spec["colorscale"] == [list(c) for c in go.Heatmap(colorscale="RdBu_r").colorscale]
+        red, blue = "rgb(103,0,31)", "rgb(5,48,97)"
+        assert spec["colorscale"][-1][1] == red and spec["colorscale"][0][1] == blue
+        assert data["metrics"][0]["colorscale"][-1][1] == blue
+        assert "k̂ − k=%{z:+.3f}" in spec["hover"]
+        # The k-hat view shows the same fact (k-hat above the run's k) on the
+        # same scale, centred on that k: one cell, one colour, in both views
+        khat_spec = data["metrics"][7]
+        assert (khat_spec["key"], khat_spec["zmid"]) == ("empirical_k", sweep.primary.k)
+        assert khat_spec["colorscale"] == spec["colorscale"]
+        # (the primary cell: k-hat above k, so above both centres — the red end)
+        cell_khat, cell_delta = data["matrices"]["empirical_k"][0][1], delta[0][1]
+        assert cell_khat > khat_spec["zmid"] and cell_delta > spec["zmid"]
+
+    def test_the_banner_and_same_title_row_are_each_cap_s_own(self, monkeypatch, tmp_path):
+        section = _ex_section(_kc_page(monkeypatch, tmp_path, _ex_sweep()))
+        blocks = _scn_blocks(section)
+        caps = [blocks[f"scn-cap-{ci}"] for ci in range(3)]
+        # 5%: the primary band lost at both ks, 0.3-0.6 traded nothing at
+        # 0.60 and won at 0.75 — 1 of 4 positive; 20% and no cap: 3 of 4
+        for cap, label, share in zip(caps, ("5%", "20%", "off (full Kelly)"),
+                                     ("25.0%", "75.0%", "75.0%"), strict=True):
+            assert f"at size cap {label}" in cap["banner"]
+            assert "<b>4 band x k cells computed</b>" in cap["banner"]
+            assert f"{share} of the cells with a measurable return" in cap["banner"]
+        # 4 cells x 2 populations + the primary band's 2 ladder points
+        assert "(10 scenario points" in caps[0]["banner"]
+        # The page renders the primary cap's banner
+        assert f'<div id="scn-banner">{caps[1]["banner"]}</div>' in section
+        assert [cap["same_title"]["trades"] for cap in caps] == [1, 2, 2]
+
+    def test_without_the_band_sweep_the_explorer_is_its_placeholder(
+            self, monkeypatch, tmp_path):
+        # The _kc size-cap sweep ran without the band sweep (checks False):
+        # whatever the walk read, the explorer is today's placeholder, with
+        # no grid, blocks or script — and the bar does not claim to reach it
+        page = _kc_page(monkeypatch, tmp_path)
+        section = _ex_section(page)
+        assert ("No scenarios were computed: band sweep off (--no-band-sweep / "
+                "band_sweep=False).") in section
+        assert 'id="scn-data"' not in page and "function unpack(el)" not in page
+        assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
+
+    def test_an_explorer_that_cannot_be_built_from_the_walk_uses_the_eager_points(
+            self, monkeypatch, tmp_path, caplog):
+        real, calls = dashboard._explorer_curve, []
+
+        def first_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("boom")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(dashboard, "_explorer_curve", first_fails)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, _ex_sweep())
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("Scenario Explorer's figures could not be built" in m for m in warned) == 1
+        section = _ex_section(page)
+        # The sweep's own points at the run's own cap; the bar keeps every cap
+        assert _options(section, "scn-cap-select") == [("0", True, "20% (primary)")]
+        assert list(_scn_blocks(section)) == ["scn-data", "scn-cap-0"]
+        assert len(TestFilterPage._data(page)["caps"]) == 3
+        # ... so the page says the explorer follows the bar's band and k but
+        # not its size cap — in the bar's summary and in the section itself
+        assert html.escape(dashboard._BAR_REACH_OWN_CAP) in page
+        assert html.escape(dashboard._BAR_REACH) not in page
+        assert dashboard._EXPLORER_OWN_CAP_HTML in section
+        assert section.index('id="scn-own-cap"') < section.index('id="scn-banner"')
+        # The script agrees: the bar at 5% names the explorer's reach so,
+        # and the explorer keeps the one cap it has
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "s"]],
+            strict=True, explorer=True)["s"]
+        assert "5% cap per trade" in snap["text"]["flt-summary"]
+        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH_OWN_CAP)
+        assert snap["selects"]["scn-cap-select"]["value"] == "0"
+
+    def test_an_explorer_rebuilt_without_a_size_cap_sweep_claims_its_whole_reach(
+            self, monkeypatch, tmp_path, caplog):
+        # With no size-cap sweep the rebuilt explorer's one cap IS the bar's
+        # one cap: nothing was lost, and nothing is said to have been
+        real, calls = dashboard._explorer_curve, []
+
+        def first_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("boom")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(dashboard, "_explorer_curve", first_fails)
+        sweep = dataclasses.replace(_ex_sweep(), cap_sweep=None)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        assert len(calls) > 1                  # the walk's visitor failed, then rebuilt
+        section = _ex_section(page)
+        assert _options(section, "scn-cap-select") == [("0", True, "20% (primary)")]
+        assert [c["label"] for c in TestFilterPage._data(page)["caps"]] == ["20%"]
+        assert html.escape(dashboard._BAR_REACH) in page
+        assert 'id="scn-own-cap"' not in page
+
+    def test_an_explorer_that_cannot_be_built_at_all_is_a_notice(
+            self, monkeypatch, tmp_path, caplog):
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_explorer_curve", broken)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, _ex_sweep())
+        assert 'id="scn-unavailable"' in page and 'id="scn-data"' not in page
+        assert any("could not be built for this run" in r.getMessage()
+                   for r in caplog.records)
+        # The page is written, the bar intact, and it does not claim the
+        # explorer follows it
+        for piece in ('id="flt-bar"', "Portfolio Performance", "Benchmark Comparison"):
+            assert piece in page
+        assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
+
+    def test_a_same_title_cap_point_counts_toward_the_stale_cutoff_verdict(
+            self, monkeypatch, tmp_path):
+        # No cell traded and the run's own same-title point did not either;
+        # only the no-cap same-title point did — which the explorer shows
+        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
+                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
+                                post_cutoff=True)
+        sweep = dataclasses.replace(
+            _ex_sweep(cell_trades=[], st_trades={0.05: [], 0.2: [], 1.0: _flt_trades()[:2]}),
+            corpus_provenance=prov)
+        assert backtester.max_trades_simulated(sweep) == 0
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        assert ("this run entered trades (up to 2 in one simulated scenario), so that "
+                "verdict is stale") in page
+
+    def test_a_same_title_simulation_failure_costs_only_the_same_title_rows(
+            self, monkeypatch, tmp_path, caplog):
+        # The size-cap sweep's same-title population cannot be simulated,
+        # while every cell can: the bar and the explorer keep their cap axis,
+        # and the explorer's same-title row is the run's own, at its own cap
+        sweep = _ex_sweep()
+
+        def broken():
+            raise RuntimeError("same-title cap simulation failed")
+        sweep.cap_sweep.same_title = broken
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "same-title" in r.getMessage()]
+        assert [r.getMessage() for r in warned] == [
+            "The same-title population could not be simulated at every size cap; the "
+            "Scenario Explorer shows it at the run's own cap only"]
+        assert warned[0].exc_info is not None
+        assert not any("size-cap sweep could not be simulated" in r.getMessage()
+                       for r in caplog.records)
+        assert [c["label"] for c in TestFilterPage._data(page)["caps"]] == [
+            "5%", "20%", "off (full Kelly)"]
+        assert sweep.cap_sweep.reads == [(_KC_B0, 0.75), (_KC_B0, 0.6), (_KC_B1, 0.6),
+                                         (_KC_B1, 0.75)]
+        section = _ex_section(page)
+        blocks = _scn_blocks(section)
+        assert [blocks[f"scn-cap-{ci}"]["same_title"] for ci in (0, 2)] == [None, None]
+        assert blocks["scn-cap-1"]["same_title"]["trades"] == len(
+            sweep.same_title_point.trades)
+        assert html.escape(dashboard._BAR_REACH) in page and 'id="scn-own-cap"' not in page
+
+    def test_a_late_cell_is_shown_over_the_page_s_span_as_the_bar_shows_it(
+            self, monkeypatch):
+        # A cell simulated after UTC midnight carries one flat row past the
+        # page's last date. The explorer reads it through the walk, cut to the
+        # page's span: its Sharpe is the cut curve's — the filter bar's figure
+        # for the same scenario — and not the over-long curve's
+        class Clock(datetime):
+            moment = datetime(2026, 3, 1, 23, 58, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.moment if tz is None else cls.moment.astimezone(tz)
+        monkeypatch.setattr(backtester, "datetime", Clock)
+        trades = _kc_trades(5)
+        page_curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        Clock.moment = datetime(2026, 3, 2, 0, 2, tzinfo=UTC)
+        late_curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        assert len(late_curve) == len(page_curve) + 1
+
+        def pops(k, curve):
+            point = SweepPoint(k=k, trades=trades, equity_df=curve, spread_band=_KC_B0,
+                               size_cap=0.2)
+            return {"all": point, "time_series": dataclasses.replace(point,
+                                                                     population="time_series")}
+        cells = {0.6: {0.2: pops(0.6, late_curve)}, 0.75: {0.2: pops(0.75, page_curve)}}
+        source = dashboard._GridSource(bands=(_KC_B0,), ks=(0.6, 0.75), caps=(0.2,),
+                                       primary=(0, 1, 0), cell=lambda b, k: cells[k],
+                                       calibrations={_KC_B0: None}, checks=True)
+        primary = cells[0.75][0.2]["all"]
+        sweep = BacktestSweep(primary=primary, points=[primary], calibration=None,
+                              label_coverage=_scn_coverage(),
+                              scenarios=list(cells[0.75][0.2].values()))
+        explorer = dashboard._ExplorerVisitor(source, sweep)
+        _, chunker, _, _ = dashboard._build_filter_grid(
+            source, trades, page_curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES,
+            explorer=explorer)
+        row = _unpack(explorer.payload().blocks[0])["cells"][0][0][0]     # the late "all"
+        cut = dashboard._sharpe(page_curve["daily_return"])
+        assert row["sharpe"] == pytest.approx(cut)
+        assert row["sharpe"] != pytest.approx(dashboard._sharpe(late_curve["daily_return"]))
+        chunk = _unpack(chunker.chunks[chunker.grid[0][0][0]])
+        assert chunk["list"]["views"]["all"]["kpi"]["sharpe"] == f"{row['sharpe']:.2f}"
+
+    # ─── The script: the explorer and the filter bar in one program ───────────
+
+    @staticmethod
+    def _page(monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _ex_sweep())
+        section = _ex_section(page)
+        return page, _scn_data(section), _scn_blocks(section)
+
+    @staticmethod
+    def _heat_updates(snap):
+        return [u for u in snap["updates"] if u["id"] == "scn-heatmap"]
+
+    def test_a_metric_change_updates_the_heatmap_as_python_built_it(
+            self, monkeypatch, tmp_path):
+        page, data, blocks = self._page(monkeypatch, tmp_path)
+        cap = blocks["scn-cap-1"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "scn-metric", "3"], ["fire", "scn-metric"], ["snap", "sharpe"],
+            ["set", "scn-metric", "8"], ["fire", "scn-metric"], ["snap", "delta"]],
+            strict=True, explorer=True)
+        ready = snaps["ready"]
+        assert not any(ready["selects"][s]["disabled"] for s in
+                       ("scn-band-select", "scn-k-select", "scn-cap-select", "scn-metric"))
+        # Loaded: the base block and the primary cap's, nothing else
+        assert {i for i in ready["inflated"] if i.startswith("scn-")} == {"scn-data",
+                                                                         "scn-cap-1"}
+        assert self._heat_updates(ready) == []
+        for name, mi, z, custom in (
+                ("sharpe", 3, cap["matrices"]["sharpe"], cap["matrices"]["trades"]),
+                ("delta", 8, data["matrices"]["khat_minus_k"],
+                 data["matrices"]["empirical_k_n"])):
+            (update,) = self._heat_updates(snaps[name])
+            spec = data["metrics"][mi]
+            assert update["data"] == {"z": [z], "colorscale": [spec["colorscale"]],
+                                      "zmid": [spec["zmid"]], "hovertemplate": [spec["hover"]],
+                                      "customdata": [custom]}
+            assert update["layout"] == {"title.text": cap["titles"][mi]}
+
+    def test_a_cap_change_loads_that_cap_s_block_and_redraws(self, monkeypatch, tmp_path):
+        page, data, blocks = self._page(monkeypatch, tmp_path)
+        small = blocks["scn-cap-0"]
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "scn-metric", "2"], ["fire", "scn-metric"],
+            ["set", "scn-cap-select", "0"], ["fire", "scn-cap-select"], ["snap", "loading"],
+            ["settle"], ["snap", "cap"]], strict=True, explorer=True)
+        assert snap["loading"]["text"]["scn-status"] == "Loading 5% cap per trade…"
+        cap = snap["cap"]
+        assert "scn-cap-0" in cap["inflated"] and "scn-cap-2" not in cap["inflated"]
+        # The metric chosen, at the cap chosen, with its title and banner
+        update = self._heat_updates(cap)[-1]
+        assert update["data"]["z"] == [small["matrices"]["total_return"]]
+        assert update["layout"] == {"title.text": small["titles"][2]}
+        assert cap["html"]["scn-banner"] == small["banner"]
+        assert cap["text"].get("scn-status", "") == ""          # cleared once drawn
+        # The KPI table and the curve: the primary cell at 5%
+        ts = data["populations"].index("time_series")
+        cell = small["cells"][0][1]
+        first = re.findall(r"<td[^>]*>(.*?)</td>", cap["html"]["scn-kpi-body"])
+        assert first[0] == html.escape(_TS_LABEL) and first[1] == str(cell[ts]["trades"])
+        restyle = [u for u in cap["updates"] if u["id"] == "scn-equity"][-1]
+        assert restyle["data"]["y"] == [_expand(cell[ts]["equity"], len(data["dates"]))]
+        assert restyle["data"]["x"] == [data["dates"]]
+
+    def test_the_explorer_follows_the_bar_even_before_its_data_is_unpacked(
+            self, monkeypatch, tmp_path):
+        page, data, blocks = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # The bar moves to 5% before the explorer's base block is unpacked
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "before"],
+            ["resolve", "scn-data"], ["settle"], ["snap", "after"],
+            # ... then to another band and k: the explorer follows at once
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "moved"]],
+            strict=True, explorer=True, deferred=("scn-data",))
+        before, after, moved = snaps["before"], snaps["after"], snaps["moved"]
+        assert before["selects"]["scn-cap-select"]["value"] == "1"
+        assert before["selects"]["scn-cap-select"]["disabled"]
+        # Applied once the explorer's data is there, and drawn
+        assert after["selects"]["scn-cap-select"]["value"] == "0"
+        assert not after["selects"]["scn-cap-select"]["disabled"]
+        assert "scn-cap-0" in after["inflated"]
+        assert self._heat_updates(after)[-1]["data"]["z"] == [
+            blocks["scn-cap-0"]["matrices"]["mean_per_trade"]]
+        assert after["html"]["scn-banner"] == blocks["scn-cap-0"]["banner"]
+        assert [moved["selects"][s]["value"] for s in
+                ("scn-band-select", "scn-k-select", "scn-cap-select")] == ["1", "0", "0"]
+        # The band's own calibration table (0.3-0.6 has none)
+        assert "No time-series candidate was measurable" in moved["html"]["scn-cal-body"]
+
+    def test_an_unknown_label_leaves_its_select_as_it_is(self, monkeypatch, tmp_path):
+        page, data, _ = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["call", "dashScenarioSelect", ["no such band", data["k_labels"][0], "no such cap"]],
+            ["settle"], ["snap", "k"],
+            ["call", "dashScenarioSelect", ["no such band", "no such k", "no such cap"]],
+            ["settle"], ["snap", "none"]], strict=True, explorer=True)
+        ready, k, none = snaps["ready"], snaps["k"], snaps["none"]
+        # On load the explorer drew its tables and the primary curve only
+        assert [u["id"] for u in ready["updates"]] == ["scn-equity"]
+        assert [k["selects"][s]["value"] for s in
+                ("scn-band-select", "scn-k-select", "scn-cap-select")] == ["0", "0", "1"]
+        assert [u["id"] for u in k["updates"]] == ["scn-equity"]
+        # Nothing it names exists: nothing moves and nothing is drawn
+        assert none["updates"] == []
+        assert [none["selects"][s]["value"] for s in
+                ("scn-band-select", "scn-k-select", "scn-cap-select")] == ["0", "0", "1"]
+
+    def test_a_category_change_leaves_the_explorer_s_own_choice(self, monkeypatch, tmp_path):
+        page, _, _ = self._page(monkeypatch, tmp_path)
+        other = str(TestFilterPage._data(page)["categories"].index("Other"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # The reader moves the explorer on its own ...
+            ["set", "scn-band-select", "1"], ["fire", "scn-band-select"], ["settle"],
+            ["set", "scn-k-select", "0"], ["fire", "scn-k-select"], ["settle"],
+            ["snap", "own"],
+            # ... then filters the page by a category: the bar's band, k and
+            # cap did not change, so neither does the explorer
+            ["set", "flt-cat", other], ["fire", "flt-cat"], ["settle"], ["snap", "cat"]],
+            strict=True, explorer=True)
+        own, cat = snaps["own"], snaps["cat"]
+        assert _scn_values(own) == ["1", "0", "1"]
+        assert cat["text"]["flt-summary"].startswith("Showing Other within the run at ")
+        assert _scn_values(cat) == ["1", "0", "1"]
+        assert [u for u in cat["updates"] if u["id"].startswith("scn-")] == []
+
+    def test_a_bar_change_moves_only_the_explorer_s_axis_that_changed(
+            self, monkeypatch, tmp_path):
+        page, _, blocks = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # The reader picks k 0.60 and the 5% cap in the explorer itself
+            ["set", "scn-k-select", "0"], ["fire", "scn-k-select"], ["settle"],
+            ["set", "scn-cap-select", "0"], ["fire", "scn-cap-select"], ["settle"],
+            ["snap", "own"],
+            # The bar moves to the other band: the explorer's band follows,
+            # its k and cap stay the reader's
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"],
+            # The bar's cap then moves: the explorer's cap alone follows
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "cap"]],
+            strict=True, explorer=True)
+        assert _scn_values(snaps["own"]) == ["0", "0", "0"]
+        assert _scn_values(snaps["band"]) == ["1", "0", "0"]
+        assert _scn_values(snaps["cap"]) == ["1", "0", "2"]
+        assert snaps["cap"]["html"]["scn-banner"] == blocks["scn-cap-2"]["banner"]
+
+    def test_a_bar_change_while_an_explorer_cap_loads_keeps_the_reader_s_cap(
+            self, monkeypatch, tmp_path):
+        page, _, blocks = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # The reader picks 5% in the explorer; its block is still unpacking
+            ["set", "scn-cap-select", "0"], ["fire", "scn-cap-select"], ["snap", "loading"],
+            # ... when the bar moves to the other band alone
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "bar"],
+            ["resolve", "scn-cap-0"], ["snap", "arrived"]],
+            strict=True, explorer=True, deferred=("scn-cap-0",))
+        assert snaps["loading"]["text"]["scn-status"] == "Loading 5% cap per trade…"
+        assert _scn_values(snaps["bar"]) == ["1", "1", "0"]
+        arrived = snaps["arrived"]
+        # The reader's cap, at the bar's band, drawn once its block is there
+        assert _scn_values(arrived) == ["1", "1", "0"]
+        assert arrived["html"]["scn-banner"] == blocks["scn-cap-0"]["banner"]
+        assert arrived["text"].get("scn-status", "") == ""
+
+    def test_a_superseded_cap_load_is_never_drawn(self, monkeypatch, tmp_path):
+        page, _, blocks = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # Two caps chosen while neither block has arrived
+            ["set", "scn-cap-select", "0"], ["fire", "scn-cap-select"],
+            ["set", "scn-cap-select", "2"], ["fire", "scn-cap-select"], ["settle"],
+            # The first arrives: the reader has moved past it, so it is not drawn
+            ["resolve", "scn-cap-0"], ["snap", "first"],
+            # A metric change meanwhile redraws the cap still on screen
+            ["set", "scn-metric", "2"], ["fire", "scn-metric"], ["snap", "metric"],
+            ["resolve", "scn-cap-2"], ["snap", "second"]],
+            strict=True, explorer=True, deferred=("scn-cap-0", "scn-cap-2"))
+        first, metric, second = snaps["first"], snaps["metric"], snaps["second"]
+        assert first["text"]["scn-status"] == "Loading no per-trade cap…"
+        assert self._heat_updates(first) == [] and "scn-banner" not in first["html"]
+        (update,) = self._heat_updates(metric)
+        assert update["layout"] == {"title.text": blocks["scn-cap-1"]["titles"][2]}
+        assert update["data"]["z"] == [blocks["scn-cap-1"]["matrices"]["total_return"]]
+        # The second is the one drawn, at the metric chosen while it loaded
+        assert _scn_values(second) == ["0", "1", "2"]
+        assert second["html"]["scn-banner"] == blocks["scn-cap-2"]["banner"]
+        assert self._heat_updates(second)[-1]["data"]["z"] == [
+            blocks["scn-cap-2"]["matrices"]["total_return"]]
+        assert second["text"].get("scn-status", "") == ""
+
+    def test_a_cap_block_that_cannot_be_unpacked_is_named_and_can_be_retried(
+            self, monkeypatch, tmp_path):
+        page, _, blocks = self._page(monkeypatch, tmp_path)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            # A band and the 5% cap chosen, whose block cannot be unpacked
+            ["set", "scn-band-select", "1"], ["set", "scn-cap-select", "0"],
+            ["fire", "scn-cap-select"], ["settle"], ["snap", "failed"],
+            # Once it reads, choosing it again loads and draws it
+            ["repair", "scn-cap-0"],
+            ["set", "scn-cap-select", "0"], ["fire", "scn-cap-select"], ["settle"],
+            ["snap", "retried"]],
+            strict=True, explorer=True, damaged=("scn-cap-0",))
+        failed, retried = snaps["failed"], snaps["retried"]
+        # Every select back on the scenario still shown, and the line says why
+        assert _scn_values(failed) == ["0", "1", "1"]
+        status = failed["text"]["scn-status"]
+        assert status.startswith("The explorer could not load 5% cap per trade (")
+        assert status.endswith("); it still shows 20% cap per trade.")
+        assert self._heat_updates(failed) == []
+        assert _scn_values(retried) == ["0", "1", "0"]
+        assert retried["html"]["scn-banner"] == blocks["scn-cap-0"]["banner"]
+        assert retried["text"].get("scn-status", "") == ""
+
+    def test_explorer_data_that_cannot_be_unpacked_says_so(self, monkeypatch, tmp_path):
+        page, _, _ = self._page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "s"]],
+            strict=True, explorer=True, damaged=("scn-data",))["s"]
+        assert all(snap["selects"][s]["disabled"] for s in
+                   ("scn-band-select", "scn-k-select", "scn-cap-select", "scn-metric"))
+        assert "The Scenario Explorer could not load its data" in snap["html"]["scn-kpi-body"]
+        # The bar is unaffected, and its call reaches no half-built explorer
+        assert not any(snap["selects"][i]["disabled"] for i in _FLT_SELECTS)
+        assert "5% cap per trade" in snap["text"]["flt-summary"]
+        assert self._heat_updates(snap) == []
+
+    def test_a_page_without_the_explorer_s_grid_still_redraws_on_k_and_cap(
+            self, monkeypatch, tmp_path):
+        # No band sweep: no explorer script, so no dashScenarioSelect — the
+        # bar redraws every section on k and cap, and reaches no missing element
+        page = _kc_page(monkeypatch, tmp_path)
+        assert "function unpack(el)" not in page
+        data = TestFilterPage._data(page)
+        other = str(data["categories"].index("Other"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "s"],
+            # From a chunk already loaded the redraw is synchronous, inside
+            # the change event itself: a call to a function the page does
+            # not define would throw out of it and end the run
+            ["set", "flt-cat", other], ["fire", "flt-cat"], ["snap", "cat"]],
+            strict=True, explorer=True)
+        snap, cat = snaps["s"], snaps["cat"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        assert "k = 0.60, 5% cap per trade" in snap["text"]["flt-summary"]
+        assert snap["text"]["flt-summary"].endswith(dashboard._BAR_REACH_NO_EXPLORER)
+        assert cat["text"]["flt-summary"].startswith("Showing Other within the run at ")
+        assert {r["id"] for r in cat["reacts"]} >= {"perf-cum", "kd-equity"}
+
+    def test_every_element_the_explorer_script_reaches_exists(self, monkeypatch, tmp_path):
+        page, data, _ = self._page(monkeypatch, tmp_path)
+        js = dashboard._SCENARIO_EXPLORER_JS
+        literal = {i for i in re.findall(r"(?:byId|getElementById|restyle|update)\('"
+                                         r"([a-z][a-z0-9_-]*)'", js) if not i.endswith("-")}
+        dynamic = {f"scn-cap-{ci}" for ci in range(len(data["caps"]))}
+        missing = sorted(i for i in literal | dynamic if f'id="{i}"' not in page
+                         and f"id='{i}'" not in page)
+        assert literal >= {"scn-data", "scn-kpi-body", "scn-heatmap", "scn-equity",
+                           "scn-banner", "scn-status"} and not missing
+        assert "'scn-cap-' + ci" in js
+        # Every block precedes the script that unpacks it
+        section = _ex_section(page)
+        script = section.index("function unpack(el)")
+        assert all(section.index(f'id="{i}"') < script for i in ("scn-data", *dynamic))
+
+
+class TestExplorerFullGrid:
+    """
+    A full size-cap grid — 36 bands x 13 ks x 20 caps (9,360 scenarios, the
+    CLI's default grid) — whose cells share 4 trade lists and 4 curves
+    through a fake CapSweep, each scenario carrying the "all" and
+    "time_series" populations: the page's one walk packs 52 filter chunks (13
+    ks x 4 lists) and 20 explorer cap blocks. Measured 2026-09-26 (plotly
+    6.9.0, pandas 3.0.3, numpy 2.4.6, one run of the test body in a fresh
+    process): the explorer's 21 blocks total 249,128 bytes of base64 (the
+    base block 2,996, each cap block about 12.3 KB — four lists compress
+    far better than a real grid's distinct cells will), in a 1.21 MB page
+    built in 6.7 s, the process peaking at 348 MiB RSS (imports included).
+    The budget is the plan's 8 MB for the explorer's blocks. Slow by the
+    suite's standards; never run against a mutant.
+    """
+
+    BUDGET = 8_000_000
+
+    def test_the_explorer_blocks_of_a_full_grid_stay_under_8_mb(self, monkeypatch, tmp_path):
+        import random
+        rng = random.Random(3)
+        series = [f"KXS{i:02d}" for i in range(8)]
+        categories = {s: (f"Cat{i % 4}", (f"Tag{i}",)) for i, s in enumerate(series)}
+        start = date(2026, 1, 5)
+
+        def trade(i: int) -> BacktestTrade:
+            s = rng.choice(series)
+            entry = start + timedelta(days=rng.randint(0, 150))
+            return dataclasses.replace(
+                _typed_trade("time_series", rng.random() < 0.5, entry,
+                             entry + timedelta(days=rng.randint(1, 30)), rng.gauss(0, 20)),
+                event_ticker=f"{s}-{i}", ticker_a=f"{s}-{i}A", title_a=f"Question {i}?")
+
+        bands = tuple((lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
+                      for hi in config.SPREAD_BAND_SWEEP_CEILINGS)
+        ks = tuple(config.INTERVAL_DISCOUNT_SWEEP)
+        caps = backtester.SIZE_CAP_SWEEP
+        assert (len(bands), len(ks), len(caps)) == (36, 13, 20) and 0.2 in caps
+        lists = []
+        for j in range(4):
+            trades = sorted((trade(100 * j + i) for i in range(40)), key=lambda t: t.entry_date)
+            lists.append((trades, backtester._build_equity_curve(trades, start, 10_000.0),
+                           HalfSplit(rng.gauss(0, 0.05), rng.gauss(0, 0.05), 20, 20)))
+        points = {}
+        for bi, band in enumerate(bands):
+            for ki, k in enumerate(ks):
+                for ci, cap in enumerate(caps):
+                    trades, curve, halves = lists[(bi + ki + ci) % 4]
+                    point = SweepPoint(k=k, trades=trades, equity_df=curve, spread_band=band,
+                                       size_cap=cap, halves=halves)
+                    points[(band, k, cap)] = {
+                        "all": point,
+                        "time_series": dataclasses.replace(point, population="time_series")}
+        obs = tuple(backtester.CalibrationObservation(
+            rng.randint(1, 30), rng.uniform(0.15, 0.8), rng.random() < 0.4,
+            f"{rng.choice(series)}-{j}", "Other") for j in range(300))
+        cal = IntervalCalibration(pooled=backtester._calibration_bucket("POOLED", 0.0, obs),
+                                  buckets=[], excluded_premise_violations=0, observations=obs)
+        primary = points[(bands[0], 0.75, 0.2)]["all"]
+        sweep = BacktestSweep(
+            primary=primary, points=[points[(bands[0], k, 0.2)]["all"] for k in ks],
+            calibration=cal, label_coverage=_scn_coverage(),
+            scenarios=[p for (_, _, cap), by_pop in points.items() if cap == 0.2
+                       for p in by_pop.values()],
+            calibrations_by_band=dict.fromkeys(bands, cal), same_event_ladders=True,
+            cap_sweep=_ExplorerCapSweep(points, bands=bands, ks=ks, caps=caps))
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            primary.trades, primary.equity_df, start, 10_000.0, sweep=sweep,
+            interval_discount=0.75, series_categories=categories).read_text(encoding="utf-8")
+        assert len(TestFilterPage._chunks(page)) == 52
+        explorer = [(i, body) for i, body in _PACKED.findall(page) if i.startswith("scn-")]
+        assert [i for i, _ in explorer] == ["scn-data"] + [f"scn-cap-{ci}" for ci in range(20)]
+        size = sum(len(body) for _, body in explorer)
+        assert size <= self.BUDGET, f"the explorer's blocks were {size} bytes"
+
+
 class TestFilterPageSize:
     """A band sweep whose 36 bands each traded a DIFFERENT list — the worst
     case for the filter, which ships a chunk per distinct scenario list and a
@@ -4778,10 +5763,15 @@ class TestFilterPageSize:
     group now carries its k-hat − k per k) and the interval-discount
     section's data at every k and cap ("kd") add about 7 KB: re-measured
     819,188 bytes (2026-09-26, same environment), against 812,186 for the
-    page before them on the same day. The budget is the measurement + 20%
-    (the curve runs to today, so the page grows by a few bytes a day)."""
+    page before them on the same day. Packing the scenario explorer's data
+    (C4: a base block and a block per size cap in place of one JSON block;
+    this fixture's 36 bands carry "all" points only) takes about 15 KB off:
+    re-measured 804,179 bytes (2026-09-26, same environment), against
+    819,347 for the page before it on the same day. The budget is the
+    measurement + 20% (the curve runs to today, so the page grows by a few
+    bytes a day)."""
 
-    PAGE_BYTES_MEASURED = 819_188
+    PAGE_BYTES_MEASURED = 804_179
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
 
     def test_36_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path):

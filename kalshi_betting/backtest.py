@@ -97,7 +97,8 @@ Notes:
     them — the run itself simulates nothing extra, and every point it returns,
     the summary block included, is sized at the run's own cap,
     config.BUDGET_FRACTION. The dashboard reads every cell as it is built,
-    for its filter bar's Size cap select. --no-cap-sweep returns
+    for its filter bar's Size cap select, the Interval Discount section and
+    the scenario explorer's cap axis. --no-cap-sweep returns
     cap_sweep=None, and the dashboard then offers the run's own cap only — a
     far smaller page, built far faster. Like the band and k sweeps it is
     backtest-only: live sizing reads config.BUDGET_FRACTION and nothing here
@@ -232,8 +233,9 @@ def main() -> None:
     exist only for the dashboard's page-wide filter bar (whose k select the
     Interval Discount section follows), its scenario explorer and the
     calibration report, and the lazily simulated size caps
-    (result.cap_sweep) only for the dashboard's filter bar, which reads every
-    cell as the page is built.
+    (result.cap_sweep) only for the dashboard, which reads every cell as the
+    page is built (its filter bar, Interval Discount section and scenario
+    explorer).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -494,9 +496,10 @@ def main() -> None:
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points and the band-sweep payload are consumed
     # only by the dashboard's filter bar (whose k select the Interval Discount
-    # section follows) and its scenario explorer, and the lazy size-cap sweep (result.cap_sweep, simulated only
-    # when a cell is read) only by the filter bar's Size cap select, whose
-    # cells generate_dashboard reads as the page is built.
+    # section follows) and its scenario explorer, and the lazy size-cap sweep
+    # (result.cap_sweep, simulated only when a cell is read) only by the
+    # dashboard, whose one grid walk reads every cell as the page is built
+    # (filter bar, Interval Discount section and scenario explorer).
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -529,7 +532,7 @@ def main() -> None:
     # sweep carries the calibration and every swept point for the k
     # selectors, the scenario explorer's band x k payload, the lazy size-cap
     # sweep (cap_sweep, None under --no-cap-sweep — every cell of it is
-    # simulated here, as the filter bar's Size cap select is built) and the
+    # simulated here, in the page's one grid walk) and the
     # header's run-settings line; interval_discount is the resolved k these
     # trades were sized at, which the Risk section's Kelly scatter must price on
     #

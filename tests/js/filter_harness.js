@@ -1,13 +1,15 @@
 // A stand-in for the browser, just large enough to run the dashboard's
-// page-wide filter script (dashboard._FILTER_JS) under a plain JavaScript
-// runtime: node (CI) or JavaScriptCore's jsc (macOS). Driven by
-// tests/test_dashboard.py's _run_script, which appends the page's elements,
-// every packed data block of the page (already inflated: the script's own
-// inflate is replaced by __inflate below), the script itself and a list of
-// steps. It checks the script's own logic — what it draws, writes, loads and
-// enables for each choice — not a browser's rendering or layout
-// (Plotly.Plots.resize does nothing here). ES5 plus Promise and
-// Object.assign, which both runtimes have.
+// page-wide filter script (dashboard._FILTER_JS) — and, when a test asks for
+// it and the page carries it, the scenario explorer's script
+// (dashboard._SCENARIO_EXPLORER_JS) before it, as the page orders them —
+// under a plain JavaScript runtime: node (CI) or JavaScriptCore's jsc
+// (macOS). Driven by tests/test_dashboard.py's _run_script, which appends the
+// page's elements, every packed data block of the page (already inflated:
+// each script's own inflate / unpack is replaced by __inflate below), the
+// scripts themselves and a list of steps. It checks the scripts' own logic —
+// what they draw, write, load and enable for each choice — not a browser's
+// rendering or layout (Plotly.Plots.resize does nothing here). ES5 plus
+// Promise and Object.assign, which both runtimes have.
 //
 // Strict mode (page.strict): getElementById returns null for an id the page
 // does not hold, as a browser's does, so a script that dereferences a missing
@@ -201,14 +203,23 @@ function __snapshot() {
 
 // The filter bar's selects: "wait" lasts until every one of them is enabled
 // (which the script does only once the base block and the primary scenario's
-// chunk are loaded), or a bounded number of ticks
+// chunk are loaded), or a bounded number of ticks — and, when the explorer's
+// script runs too (__WAIT_EXPLORER), until the explorer's selects the page
+// holds are enabled as well (once its base block and primary cap's block are
+// unpacked)
 var __BAR = ['flt-band', 'flt-k', 'flt-cap', 'flt-cat', 'flt-tag'];
+var __EXPLORER = ['scn-band-select', 'scn-k-select', 'scn-cap-select', 'scn-metric'];
+var __WAIT_EXPLORER = false;
 
 function __barEnabled() {
-  return __BAR.every(function(id) {
+  var bar = __BAR.every(function(id) {
     var el = document.getElementById(id);
     return !el || !el.disabled;
   });
+  return bar && (!__WAIT_EXPLORER || __EXPLORER.every(function(id) {
+    var el = __elements[id];
+    return !el || !el.disabled;
+  }));
 }
 
 // Let every pending promise run (a bounded number of microtask ticks), then
@@ -232,7 +243,9 @@ function __spin(ticks, next) {
 // id] (a damaged block reads again), ["resolve", id] / ["reject", id] (a
 // deferred block's waiting inflates finish, or fail as a damaged block's
 // would — after a settle, so every load already started has reached its
-// inflate, and followed by one; nothing waiting is an error), ["snap",
+// inflate, and followed by one; nothing waiting is an error), ["call", name,
+// args] (a page script's window function, called as another script would —
+// the filter's window.dashScenarioSelect call, with any labels), ["snap",
 // name]. Emits every snapshot, as JSON, once the steps are done.
 function __step(steps, i) {
   if (i >= steps.length) {
@@ -282,6 +295,8 @@ function __step(steps, i) {
     document.getElementById(s[1]).data[0].selectedpoints = [0, 1];
   } else if (s[0] === 'repair') {
     delete __DAMAGED[s[1]];
+  } else if (s[0] === 'call') {
+    window[s[1]].apply(null, s[2]);
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }

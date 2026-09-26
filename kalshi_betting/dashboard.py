@@ -14,11 +14,12 @@ Purpose:
     primary spread band),
     empirical k-hat broken down by Kalshi category, tag and spread band (a bar
     chart and a table with a "Group by" <select> of their own), a
-    scenario explorer (a fragility banner, a spread-band x k heatmap and a
-    per-population KPI table over BacktestSweep.scenarios, with two <select>s
-    and a short inline script driving a Plotly.restyle'd equity curve — a
-    native updatemenus dropdown cannot express two independent axes of
-    selection), trade-level diagnostics
+    scenario explorer (a fragility banner, a spread-band x k heatmap with a
+    nine-metric <select> — Sharpe and k-hat − k among them — and a
+    per-population KPI table over every band x k x per-trade size cap
+    scenario, with band, k and size-cap <select>s and a short inline script
+    driving Plotly.update / Plotly.restyle — a native updatemenus dropdown
+    cannot express independent axes of selection), trade-level diagnostics
     (distribution, slippage, best/worst trades), risk metrics (Kelly sizing
     scatter, capital deployment), and benchmark comparison (S&P 500 via
     yfinance) — into a single HTML file with embedded Plotly charts. The file
@@ -30,9 +31,11 @@ Purpose:
     row) to the run at another spread band, interval discount k and per-trade
     size cap, and/or one Kalshi category or category · tag of it, and moves
     the k-hat breakdown and the performance section's k-hat cards to the same
-    band and selection (the breakdown's reference line to the same k), and the
+    band and selection (the breakdown's reference line to the same k), the
     interval-discount section to the same k and size cap (at the primary
-    spread band). Every figure a selection shows is computed here in
+    spread band), and the scenario explorer's band, k and size-cap selects to
+    the same scenario (they stay usable on their own). Every figure a
+    selection shows is computed here in
     Python by the helpers the sections themselves render with, packed into
     gzip + base64 data blocks — one base block (_filter_payload) and one
     chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
@@ -92,7 +95,8 @@ Notes:
     k and size cap move them (_KdVisitor's data, "kd" in the base block) —
     its category and tag never do, since the section's k-hat population and
     per-k runs are the whole primary band's. The scenario-explorer section
-    (below) keeps its own independent band/k selectors.
+    (below) has band, k and size-cap selectors of its own, which the bar
+    moves but which never move the bar.
 
     The page-wide filter bar (_filter_bar_html) is a third, separate set of
     controls, and the only one that reaches beyond its own section. Its
@@ -110,10 +114,16 @@ Notes:
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
     so every breakdown partitions. Its k and size cap also move the
     interval-discount section (at the primary spread band); its band,
-    category and tag never do, and it never reaches the scenario explorer,
-    which keeps its own controls — the bar's summary line says so
-    (_BAR_REACH; _BAR_REACH_STATIC on a page whose interval-discount
-    section cannot follow the bar). The performance section's two k-hat
+    category and tag never do. Its band, k and size cap move the scenario
+    explorer's selects (window.dashScenarioSelect, which the explorer's own
+    script defines and the bar's calls after every redraw, matched by option
+    label) — each axis only when the bar's label on it changes, so a choice
+    made in the explorer survives a bar change on another axis; its category
+    and tag never do. The bar's summary line says what it reaches on THIS
+    page (_bar_reach: _BAR_REACH when both follow it, a band-and-k variant
+    when the explorer shows the run's own size cap only, and other sentences
+    when the interval-discount section cannot follow the bar or the page has
+    no explorer grid). The performance section's two k-hat
     cards (_khat_kpis) follow the bar's band, category or tag and k: they
     read the k-hat breakdown's own group for the selection, and the card
     rendered for the primary view comes from the primary calibration itself,
@@ -134,7 +144,13 @@ Notes:
     interval-discount visitor keeps the primary band's per-k table rows and
     equity curves at every k and cap (_KdVisitor — a visitor that fails
     costs only that section's k and cap selection, with a notice in the
-    section). Only one cell's
+    section), and the scenario explorer's visitor keeps every scenario's
+    per-population figures and headline curve as JSON text and packs a
+    block per size cap (_ExplorerVisitor — one that fails costs only the
+    explorer's cap axis: it is rebuilt from the sweep's own eager points,
+    and a notice replaces it only if even that fails). The walk also reads
+    the same-title population once, at every cap, for the visitors that show
+    or count it. Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
     together; the chunks are held as separate packed strings until each is
     written, and the page is streamed to disk piece by piece, never joined
@@ -172,15 +188,19 @@ Notes:
     (len(observations) != pooled.n — a hand-built one) offers its pooled row
     alone (_khat_band), since there is nothing to break down.
 
-    The scenario-explorer section's band x k grid is too large, and its two
-    axes of selection too independent, for a native-dropdown idiom: a
-    Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE a
-    trace's data wholesale from a fixed list baked in at render time, not
-    combine two independently-chosen indices into one lookup. It therefore
-    carries its own small (~100-line) inline vanilla-JS script that reads one
-    `<script type="application/json">` data block and drives a `Plotly.restyle`
-    call plus two plain HTML table re-renders — no new dependency, and no
-    hand-rolled charting: Plotly still owns every pixel that gets drawn.
+    The scenario-explorer section's band x k x size-cap grid is too large,
+    and its axes of selection too independent, for a native-dropdown idiom:
+    a Plotly `updatemenus` button can only toggle trace VISIBILITY or REPLACE
+    a trace's data wholesale from a fixed list baked in at render time, not
+    combine independently-chosen indices into one lookup — nor follow a size
+    cap its matrices were never baked for. It therefore carries its own
+    small inline vanilla-JS script (_SCENARIO_EXPLORER_JS) that unpacks
+    gzip-packed data blocks — a base block ("scn-data") and, only when that
+    cap is chosen, one block per size cap ("scn-cap-<i>") — and drives
+    Plotly.update (the heatmap: metric, matrix, colour scale, title),
+    Plotly.restyle (the equity curve) and plain HTML table re-renders — no
+    new dependency, and no hand-rolled charting: Plotly still owns every
+    pixel that gets drawn.
 
     Directly under the Period line the header says what settled-market corpus
     the run read (BacktestSweep.corpus_provenance): when it was assembled (a
@@ -219,7 +239,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -1547,6 +1567,33 @@ _KHAT_CARDS_CAPTION = (
     "config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>")
 
 
+def _khat_delta_value(khat: float | None, k: float | None) -> float | None:
+    """
+    The "k̂ − k" figure as a number, rounded to the three decimals shown.
+
+    The one arithmetic behind every k-hat − k on the page: _khat_delta formats
+    it for the KPI cards and the k-hat breakdown, and the scenario explorer's
+    "k̂ − k" heatmap metric shows it as a cell value (its hover prints the same
+    three decimals), so a card and a heatmap cell of one band and k can never
+    differ by a rounding.
+
+    Args:
+        khat (float | None): The empirical k-hat; None when not measurable.
+        k (float | None): The interval discount compared with; None when not
+            recorded.
+
+    Returns:
+        float | None: round(khat - k, 3), a rounded -0.0 folded to 0.0; None
+            when either value is unknown.
+    """
+    if khat is None or k is None:
+        return None
+    # round() and "{:.3f}" round the same binary value the same way, so the
+    # figure is what the unrounded difference printed, bar the sign of zero:
+    # a -0.0 is folded to 0.0, never printed "-0.000"
+    return round(khat - k, 3) or 0.0
+
+
 def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     """
     Format an empirical k-hat against a k, as a KPI card's value and colour.
@@ -1555,7 +1602,8 @@ def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     interval-discount section's card (_kd_assemble), the performance
     section's card (_khat_kpis) and every group of the k-hat breakdown the
     filter script reads it from (_khat_band's "delta") all go through here,
-    so no two can round or colour it differently.
+    and its number is _khat_delta_value's — the scenario explorer's k-hat − k
+    heatmap cells' too — so no two can round or colour it differently.
 
     p = 1 − k·(pB − pA), so a LARGER k is the more conservative belief: a
     k-hat above k means the in-between cell landed more often than the sizer
@@ -1578,12 +1626,9 @@ def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
             green — or ("—", the default KPI colour) when either value is
             unknown.
     """
-    if khat is None or k is None:
+    delta = _khat_delta_value(khat, k)
+    if delta is None:
         return "—", _KPI_DEFAULT_COLOR
-    # round() and "{:.3f}" round the same binary value the same way, so the
-    # text is what the unrounded difference printed, bar the sign of zero:
-    # a -0.0 is folded to 0.0, never printed "-0.000"
-    delta = round(khat - k, 3) or 0.0
     return f"{delta:+.3f}", ("#F44336" if delta > 0 else "#4CAF50")
 
 
@@ -2549,9 +2594,10 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
 # ─── Section 5: Scenario Explorer ────────────────────────────────────────────
 
 # Above this many rows, a scenario's equity curve is embedded at one point per
-# calendar week instead of one per day (see _equity_axis). A band sweep embeds
-# one curve per band x k cell, so on a multi-year window the curves, not the
-# metrics, are what decides the page size.
+# calendar week instead of one per day (see _equity_axis). The scenario
+# explorer embeds one curve per band x k x size-cap scenario (as change
+# points, _explorer_curve), so on a multi-year window the curves, not the
+# metrics, are what decides its blocks' size.
 _EQUITY_DAILY_MAX_ROWS = 400
 
 # The standalone populations one band x k cell can carry, in the ORDER the
@@ -2580,6 +2626,65 @@ _POPULATION_LABELS = {
     "cross": "Cross-event",
     "same_title": "Same-title (independent of band and k)",
 }
+
+# The scenario explorer's heatmap hovers, one per kind of figure. A percent
+# and a Sharpe cell name the trades behind them (customdata: the "trades"
+# matrix); a k-hat cell names the entries its band's calibration pooled
+# (customdata: "empirical_k_n"). "k̂ − k" is printed to the three decimals its
+# cell value was rounded to (_khat_delta_value), so the hover reads exactly
+# what the k-hat cards print for that band and k.
+_EXPLORER_PCT_HOVER = ("band=%{y}<br>%{x}<br>value=%{z:.2%}<br>trades=%{customdata}"
+                       "<extra></extra>")
+_EXPLORER_SHARPE_HOVER = ("band=%{y}<br>%{x}<br>Sharpe=%{z:.2f}<br>trades=%{customdata}"
+                          "<extra></extra>")
+_EXPLORER_COUNT_HOVER = "band=%{y}<br>%{x}<br>trades=%{z}<extra></extra>"
+_EXPLORER_KHAT_HOVER = ("band=%{y}<br>k̂=%{z:.3f} (the same at every k)"
+                        "<br>entries pooled=%{customdata}<extra></extra>")
+_EXPLORER_KHAT_DELTA_HOVER = ("band=%{y}<br>%{x}<br>k̂ − k=%{z:+.3f}"
+                              "<br>entries pooled=%{customdata}<extra></extra>")
+
+# The scenario explorer's heatmap metrics, in the order its "Heatmap metric"
+# <select> offers them: (matrix key, label, colour scale NAME, centre, hover,
+# customdata matrix key). A centre of None lets the scale auto-range (a trade
+# count is never negative, so centring it on zero would spend half the scale
+# on values that cannot occur); "primary k" centres the k-hat metric on the
+# run's own k, so the colour says which side of the discount the sizing
+# assumed each band's evidence falls on. Every scale is shipped as the list
+# plotly.py coerces the NAME to (_explorer_metric_specs), never as the name:
+# plotly.py and plotly.js define "RdBu" in OPPOSITE directions, so a named
+# scale switched in the browser would flip the colours. In plotly.py "RdBu"
+# runs red (low) to blue (high), which the return metrics use (a loss red);
+# "k̂ − k" uses "RdBu_r", so a POSITIVE difference — the in-between cell
+# landed more often than the sizer assumed, it sized too big — is red, as on
+# the k-hat − k cards (_khat_delta), and "Empirical k̂" uses "RdBu_r" too,
+# centred on the run's k, so the one fact both views show (k-hat above k) is
+# red in both rather than red in one and blue in the other. The heatmap's
+# negative side is blue where a card is green. The
+# first seven depend on the trades, so each size cap ships its own matrix
+# (the "scn-cap-<i>" blocks); the two k-hat metrics are measured before the
+# Kelly gate, per band, and ship once (the "scn-data" block). Sharpe is None
+# on a cell with no trade, where _point_kpis' 0.0 of a flat curve is not a
+# measurement (the matrix only: the KPI table keeps _point_kpis' figure).
+_EXPLORER_METRICS = (
+    ("mean_per_trade", "Mean per trade (equal stake)", "RdBu", 0, _EXPLORER_PCT_HOVER,
+     "trades"),
+    ("median_per_trade", "Median per trade (equal stake)", "RdBu", 0, _EXPLORER_PCT_HOVER,
+     "trades"),
+    ("total_return", "Total return", "RdBu", 0, _EXPLORER_PCT_HOVER, "trades"),
+    ("sharpe", "Sharpe ratio (365-day base)", "RdBu", 0, _EXPLORER_SHARPE_HOVER, "trades"),
+    ("h1_return", "H1 return", "RdBu", 0, _EXPLORER_PCT_HOVER, "trades"),
+    ("h2_return", "H2 return", "RdBu", 0, _EXPLORER_PCT_HOVER, "trades"),
+    ("trades", "Trade count", "Blues", None, _EXPLORER_COUNT_HOVER, "trades"),
+    ("empirical_k", "Empirical k̂ (pooled per band)", "RdBu_r", "primary k",
+     _EXPLORER_KHAT_HOVER, "empirical_k_n"),
+    ("khat_minus_k", "k̂ − k (pooled per band, minus the column's k)", "RdBu_r", 0,
+     _EXPLORER_KHAT_DELTA_HOVER, "empirical_k_n"),
+)
+
+# The metrics whose matrix depends on the trades, hence on the size cap: the
+# ones each "scn-cap-<i>" block carries (the rest ship in "scn-data")
+_EXPLORER_CAP_METRICS = ("mean_per_trade", "median_per_trade", "total_return", "sharpe",
+                         "h1_return", "h2_return", "trades")
 
 
 def _row_label(band: tuple[float, float]) -> str:
@@ -2695,13 +2800,16 @@ def _equity_axis(eq: pd.DataFrame | None) -> pd.DatetimeIndex:
     """
     Decide, ONCE, the date axis every scenario's curve is embedded on.
 
-    Called on the primary scenario's curve. Every scenario of one run spans
+    Called on the primary scenario's curve — the scenario explorer's axis
+    (_ExplorerVisitor). Every scenario of one run spans
     the same calendar (backtester._build_equity_curve always runs from
     start_date - 1 to "today"), so one axis serves them all and the page ships
     one shared date array — but "today" is read per simulation, so a band
     sweep that crosses 00:00 UTC hands later scenarios one more row than the
     primary. Deciding the axis here, and placing every curve on it by DATE
-    (_curve_on_axis), is what keeps such a cell from being drawn against the
+    (_curve_on_axis for the primary curve Python draws, _explorer_curve's
+    change points for every scenario the script draws), is what keeps such a
+    cell from being drawn against the
     wrong dates — including across the downsampling threshold, where a
     per-curve decision would put a weekly curve on a daily axis.
 
@@ -2740,6 +2848,14 @@ def _curve_on_axis(eq: pd.DataFrame | None, axis: pd.DatetimeIndex) -> list[floa
     None (a gap in the line, JS null), never a neighbour's value shifted into
     its slot.
 
+    Built as the change points every scenario's curve ships as
+    (_sparse_on_axis, the rounding _explorer_curve uses) expanded back onto
+    every date (_expand_sparse, Python's copy of the script's expand()): the
+    curve Python draws for the primary scenario and the one the explorer's
+    script draws when a reader returns to it are one rounding, never a cent
+    apart on a value that sits a hair above a half cent (Python's round()
+    and numpy's disagree there).
+
     Args:
         eq (pd.DataFrame | None): One scenario's equity curve, or None / empty.
         axis (pd.DatetimeIndex): The shared axis from _equity_axis.
@@ -2750,11 +2866,8 @@ def _curve_on_axis(eq: pd.DataFrame | None, axis: pd.DatetimeIndex) -> list[floa
     """
     if eq is None or eq.empty or len(axis) == 0:
         return []
-    s = pd.Series(eq["portfolio_value"].to_numpy(dtype=float),
-                  index=pd.DatetimeIndex(pd.to_datetime(eq["date"])))
-    s = s[~s.index.duplicated(keep="last")]
-    return [round(float(v), 2) if math.isfinite(v) else None
-            for v in s.reindex(axis).to_numpy(dtype=float)]
+    return _expand_sparse(_sparse_on_axis(list(eq["date"]), eq["portfolio_value"], axis, 2),
+                          len(axis))
 
 
 def _point_kpis(point: SweepPoint) -> dict:
@@ -2887,19 +3000,51 @@ def _robustness_extras(point: SweepPoint) -> dict:
 
 
 # The inline script the scenario explorer drives its selects with. A raw
-# string, so the — escapes reach the browser as JS escapes. It reads ONE
-# JSON block (id="scn-data") and writes only through textContent-escaped HTML
-# and Plotly.restyle — it draws nothing itself.
+# string, so the — escapes reach the browser as JS escapes. It reads a base
+# block (id="scn-data": the axes and their labels, the calibration per band,
+# the heatmap metrics and their size-cap-independent matrices) and, when a
+# size cap is chosen, that cap's block (id="scn-cap-<i>": every cell's
+# figures, the same-title row, the banner, the cap's matrices and the heatmap
+# titles), all packed by _packed_json_script and unpacked here by unpack(el)
+# — the primary cap's as the page loads, any other only when chosen. It draws
+# nothing of its own: it writes only through textContent-escaped HTML,
+# Python's own escaped fragments (the banner), Plotly.update (the heatmap, at
+# the metric and cap chosen) and Plotly.restyle (the equity curve). The blocks
+# are packed by _packed_json_script (the base block) and _packed_text_script
+# (each cap's, built as text) — one encoding. It also
+# defines window.dashScenarioSelect(band, k, cap), which the page-wide filter
+# bar's script calls after every redraw with the option labels of the
+# scenario it shows (Python's _band_option, _k_option and _cap_option name
+# both grids), so the explorer's selects follow the bar: an axis moves only
+# when the bar's label on it CHANGED since the bar's last call (the first
+# call is measured against the run's primary scenario, which the bar shows on
+# load), so a redraw for a category or tag — or a bar change on another axis —
+# never throws away a choice the reader made in the explorer itself. A label
+# this grid does not carry leaves that select as it is, and a call made
+# before the explorer's data is unpacked is applied once it is.
 _SCENARIO_EXPLORER_JS = r"""
 <script>
 (function() {
-  var data = JSON.parse(document.getElementById('scn-data').textContent);
+  var dataEl = document.getElementById('scn-data');
   var bandSel = document.getElementById('scn-band-select');
   var kSel = document.getElementById('scn-k-select');
-  // Population name -> its index in every cell's array.
-  var P = {};
-  data.populations.forEach(function(name, i) { P[name] = i; });
+  var capSel = document.getElementById('scn-cap-select');
+  var metricSel = document.getElementById('scn-metric');
+  if (!dataEl || !bandSel || !kSel || !capSel || !metricSel) { return; }
+  var SELECTS = [bandSel, kSel, capSel, metricSel];
+  // D: the base block. P: population name -> its index in every cell's
+  // array. CAPS: each size cap's block, by cap index, unpacked or unpacking.
+  // SHOWN: the [band, k, cap] indexes on screen. SEQ numbers the choices, so
+  // a block arriving after a later choice is never drawn over it. READY: the
+  // base block and the primary cap's block are unpacked and the selects
+  // enabled. WANTED: the filter bar's last call made before that. LAST: the
+  // [band, k, cap] labels of the bar's last call — the run's primary
+  // scenario's until it first calls (the bar shows that scenario on load) —
+  // so a call moves only the axes whose label changed.
+  var D = null, P = {}, CAPS = {}, SHOWN = null, SEQ = 0, READY = false, WANTED = null;
+  var LAST = null;
 
+  function byId(id) { return document.getElementById(id); }
   function isNum(x) { return typeof x === 'number' && isFinite(x); }
   function fmtPct(x) { return isNum(x) ? (x * 100).toFixed(1) + '%' : '—'; }
   function fmtFixed(x, d) { return isNum(x) ? x.toFixed(d) : '—'; }
@@ -2967,33 +3112,190 @@ _SCENARIO_EXPLORER_JS = r"""
     return t + '</table>';
   }
 
-  function render() {
-    var bi = parseInt(bandSel.value, 10), ki = parseInt(kSel.value, 10);
-    var cell = data.cells[bi][ki];
-    var L = data.labels;
-    // The headline (time-series) population first — the one the heatmap and
-    // banner read — then its two parts, then All and Same-title, each row
-    // named by its own label so no two populations can be mistaken.
+  // A sparse curve ([[axis index, dollars], ...], one point wherever the
+  // value changes, always from index 0 — _sparse_on_axis) back onto every
+  // date of the explorer's axis.
+  function expand(sparse) {
+    var n = D.dates.length, out = new Array(n), j = 0, cur = null;
+    for (var i = 0; i < n; i++) {
+      while (j < sparse.length && sparse[j][0] <= i) { cur = sparse[j][1]; j++; }
+      out[i] = cur;
+    }
+    return out;
+  }
+  function bandIndex() { return parseInt(bandSel.value, 10); }
+  function kIndex() { return parseInt(kSel.value, 10); }
+  function capIndex() { return parseInt(capSel.value, 10); }
+  function block() { return CAPS[SHOWN[2]].data; }
+  function setStatus(text) { var el = byId('scn-status'); if (el) { el.textContent = text; } }
+
+  // The KPI table, the band's calibration table and the curve, for the band,
+  // k and cap ON SCREEN. The headline (time-series) population first — the
+  // one the heatmap and banner read — then its two parts, then All and
+  // Same-title, each row named by its own label so no two populations can
+  // be mistaken. A cell the run never simulated at this cap reads "—".
+  function renderTables() {
+    var row = block().cells[SHOWN[0]], cell = (row && row[SHOWN[1]]) || [];
+    var L = D.labels;
     var ts = cell[P.time_series];
-    document.getElementById('scn-kpi-body').innerHTML =
+    byId('scn-kpi-body').innerHTML =
       kpiRow(esc(L.time_series), ts) + extrasRow(ts)
       + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
       + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
-      + kpiRow(esc(L.same_title), data.same_title);
-    document.getElementById('scn-cal-body').innerHTML = calRows(data.calibration_by_band[bi]);
-
-    // Every curve is already on the shared date axis (data.dates), so x is
-    // the axis itself, never a slice of it. The curve is the headline
-    // population's, like the heatmap.
-    var values = (ts && ts.equity) ? ts.equity : [];
-    if (window.Plotly && document.getElementById('scn-equity')) {
-      Plotly.restyle('scn-equity', {x: [values.length ? data.dates : []], y: [values]});
+      + kpiRow(esc(L.same_title), block().same_title);
+    byId('scn-cal-body').innerHTML = calRows(D.calibration_by_band[SHOWN[0]]);
+    // The headline population's curve, like the heatmap, on the explorer's
+    // own date axis (D.dates)
+    var values = (ts && ts.equity && ts.equity.length) ? expand(ts.equity) : [];
+    if (window.Plotly && byId('scn-equity')) {
+      Plotly.restyle('scn-equity', {x: [values.length ? D.dates : []], y: [values]});
     }
   }
+  // A metric's matrix: the cap's own (a figure of the trades) or the base
+  // block's (k-hat, measured before the Kelly gate, the same at every cap)
+  function matrix(name) {
+    var M = block().matrices;
+    return (name in M) ? M[name] : D.matrices[name];
+  }
+  // The heatmap at the metric chosen and the cap on screen: its matrix,
+  // colour scale, centre, hover, hover data and title, all Python's
+  function renderHeatmap() {
+    if (!window.Plotly || !byId('scn-heatmap')) { return; }
+    var mi = parseInt(metricSel.value, 10), m = D.metrics[mi];
+    Plotly.update('scn-heatmap',
+                  {z: [matrix(m.key)], colorscale: [m.colorscale], zmid: [m.zmid],
+                   hovertemplate: [m.hover], customdata: [matrix(m.custom)]},
+                  {'title.text': block().titles[mi]});
+  }
+  // The banner is the cap's own, as Python wrote (and escaped) it
+  function renderBanner() {
+    var el = byId('scn-banner');
+    if (el) { el.innerHTML = block().banner; }
+  }
+  // Draw what the selects name: the banner and the heatmap only when the cap
+  // changed (they do not depend on the band or k), the tables always
+  function draw() {
+    var capChanged = SHOWN[2] !== capIndex();
+    SHOWN = [bandIndex(), kIndex(), capIndex()];
+    setStatus('');
+    if (capChanged) { renderBanner(); renderHeatmap(); }
+    renderTables();
+  }
 
-  bandSel.addEventListener('change', render);
-  kSel.addEventListener('change', render);
-  render();
+  // A block is gzip-compressed JSON in base64 (_packed_json_script /
+  // _packed_text_script), unpacked by the browser's own DecompressionStream.
+  function unpack(el) {
+    var bin = atob(el.textContent.trim());
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+    var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new Response(stream).text().then(function(text) { return JSON.parse(text); });
+  }
+  // One size cap's block, unpacked once and kept (a page has one per cap).
+  // Started from a resolved promise, so a synchronous throw (a damaged block,
+  // a missing element) lands in the rejection handler; a failed entry is
+  // dropped, so a later choice can try again.
+  function capBlock(ci) {
+    var entry = CAPS[ci];
+    if (!entry) {
+      entry = CAPS[ci] = {data: null};
+      entry.promise = Promise.resolve().then(function() {
+        return unpack(byId('scn-cap-' + ci));
+      }).then(function(data) {
+        entry.data = data;
+        return data;
+      }, function(err) { delete CAPS[ci]; throw err; });
+    }
+    return entry.promise;
+  }
+  // The band, k or cap changed: draw it — at once when its cap's block is
+  // unpacked, else once it is; a later choice supersedes it, and a block that
+  // cannot be unpacked puts every select back on the scenario still shown
+  function choose() {
+    var seq = ++SEQ, ci = capIndex(), entry = CAPS[ci];
+    if (entry && entry.data) { draw(); return; }
+    setStatus('Loading ' + D.cap_text[ci] + '…');
+    capBlock(ci).then(function() {
+      if (seq === SEQ) { draw(); }
+    }, function(err) {
+      if (seq !== SEQ) { return; }
+      bandSel.value = String(SHOWN[0]);
+      kSel.value = String(SHOWN[1]);
+      capSel.value = String(SHOWN[2]);
+      setStatus('The explorer could not load ' + D.cap_text[ci] + ' (' + err
+        + '); it still shows ' + D.cap_text[SHOWN[2]] + '.');
+    });
+  }
+  function labelIndex(labels, label) {
+    for (var i = 0; i < labels.length; i++) { if (labels[i] === label) { return i; } }
+    return -1;
+  }
+  // The filter bar's scenario, by its option labels: a select moves only when
+  // the bar's label on its axis changed since the bar's last call (LAST), so a
+  // redraw that kept the bar's band, k and cap — a category or tag change —
+  // moves nothing, and a band change moves the band alone, leaving a k or cap
+  // the reader chose here as it is; a label this grid does not carry leaves
+  // that select as it is. Drawn only when something moved.
+  function follow(band, k, cap) {
+    var moved = false, labels = [band, k, cap];
+    [[bandSel, D.band_labels], [kSel, D.k_labels], [capSel, D.cap_labels]]
+      .forEach(function(t, axis) {
+        if (labels[axis] === LAST[axis]) { return; }
+        var i = labelIndex(t[1], labels[axis]);
+        if (i >= 0 && t[0].value !== String(i)) { t[0].value = String(i); moved = true; }
+      });
+    LAST = labels;
+    if (moved) { choose(); }
+  }
+  // The explorer cannot work: its base block, or the primary cap's, could
+  // not be unpacked. Its selects stay disabled and its table says why; the
+  // heatmap, the banner and the curve stay as Python drew them.
+  function unavailable(reason) {
+    SELECTS.forEach(function(s) { s.disabled = true; });
+    byId('scn-kpi-body').innerHTML = '<tr><td colspan="9" style="padding:6px 16px;'
+      + 'color:#B71C1C;">' + esc('The Scenario Explorer could not load its data ('
+      + reason + '); the heatmap, the banner and the equity curve show the run\'s '
+      + 'primary scenario only, and its selects are disabled.') + '</td></tr>';
+  }
+
+  // A browser can restore a <select>'s last choice on a reload; the page as
+  // rendered is the primary scenario at the first metric, so every select is
+  // set back to it. Python renders them disabled: they are enabled once the
+  // base block and the primary cap's block are unpacked.
+  SELECTS.forEach(function(s) {
+    s.selectedIndex = 0;
+    for (var i = 0; i < s.options.length; i++) {
+      if (s.options[i].defaultSelected) { s.selectedIndex = i; }
+    }
+  });
+  if (!window.DecompressionStream || !window.Response || !window.Blob) {
+    unavailable('this browser cannot decompress it');
+    return;
+  }
+  window.dashScenarioSelect = function(band, k, cap) {
+    if (!READY) { WANTED = [band, k, cap]; return; }
+    follow(band, k, cap);
+  };
+  Promise.resolve().then(function() { return unpack(dataEl); }).then(function(data) {
+    D = data;
+    D.populations.forEach(function(name, i) { P[name] = i; });
+    // What the bar shows on load: the run's primary scenario, which both
+    // grids name by the same option labels
+    LAST = [D.band_labels[D.primary[0]], D.k_labels[D.primary[1]],
+            D.cap_labels[D.primary[2]]];
+    return capBlock(D.primary[2]);
+  }).then(function() {
+    SHOWN = D.primary.slice();
+    renderTables();
+    SELECTS.forEach(function(s) { s.disabled = false; });
+    READY = true;
+    if (WANTED) { var w = WANTED; WANTED = null; follow(w[0], w[1], w[2]); }
+  }, function(err) { unavailable(String(err)); });
+
+  [bandSel, kSel, capSel].forEach(function(sel) {
+    sel.addEventListener('change', function() { if (READY) { choose(); } });
+  });
+  metricSel.addEventListener('change', function() { if (READY) { renderHeatmap(); } });
 })();
 </script>
 """
@@ -3210,14 +3512,119 @@ def _corpus_provenance_html(sweep: BacktestSweep | None, *,
     )
 
 
-def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
+# Shown in the explorer's place when neither the page's walk nor the sweep's
+# own eager points could build its data (DR-66: a lost section says so)
+_EXPLORER_UNAVAILABLE_HTML = (
+    '<p id="scn-unavailable" style="color:#B71C1C; font-size:14px; font-family:sans-serif;">'
+    "The Scenario Explorer could not be built for this run (the log names the error); "
+    "every other section is unaffected.</p>")
+
+# Shown above the explorer's banner when its data had to be rebuilt from the
+# sweep's own eager points (its visitor failed, or the walk never reached it)
+# although the run carried a size-cap sweep: the section then offers the
+# run's own cap alone, and says so on the page as well as in the log (DR-66)
+_EXPLORER_OWN_CAP_HTML = (
+    '<p id="scn-own-cap" style="font-family:sans-serif;font-size:13px;color:#616161;">'
+    "The Scenario Explorer's figures at the other per-trade size caps could not be built "
+    "(the log names the error): it shows the run's own size cap only.</p>")
+
+
+def _explorer_banner(n_cells: int, n_points: int, returns: list, halves: list,
+                     cap: float | None) -> str:
+    """
+    Build the scenario explorer's fragility banner for one size cap.
+
+    Every figure is the headline (time-series) population's at that cap: the
+    share of its cells with a positive total return, and the split-half rank
+    correlation (Spearman) of its checked cells' H1 vs H2 returns — over the
+    cells whose two halves BOTH had entries, since an empty half's 0.0 is not
+    a return — and the sentence this section exists to put on the page: the
+    best of that many correlated cells overstates what a reader should
+    expect, where "that many" counts the cells the heatmap shows a value in
+    at this cap, never the whole grid.
+
+    Args:
+        n_cells (int): Cells of the grid with an "all" point at this cap.
+        n_points (int): Scenario points at this cap across the four
+            populations (_SCENARIO_POPULATIONS).
+        returns (list): The total return (None when undefined) of every cell
+            with a headline point, row-major — its length is the cell count
+            the heatmap shows a value in.
+        halves (list): (h1, h2) of every such cell whose point carries a
+            split-half check, row-major; a half is None when it had no entries.
+        cap (float | None): The size cap (named as its select names it,
+            _cap_option).
+
+    Returns:
+        str: The banner's <div>, every name escaped.
+    """
+    n_headline = len(returns)
+    finite_returns = [r for r in returns if r is not None and math.isfinite(r)]
+    positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
+                      if finite_returns else None)
+    # _spearman drops any pair with a None, so the correlation is over the
+    # cells whose two halves both had entries
+    corr = _spearman([h1 for h1, _ in halves], [h2 for _, h2 in halves])
+    n_empty_half = sum(1 for h1, h2 in halves if h1 is None or h2 is None)
+    if corr is not None:
+        corr_txt = f"{corr:+.3f}"
+        if n_empty_half:
+            corr_txt += (f" (over the {len(halves) - n_empty_half} of {len(halves)} cells "
+                         "whose two halves both had entries)")
+    elif n_empty_half:
+        corr_txt = ("not measurable — the split date leaves a half without entries in "
+                    f"{n_empty_half} of the {len(halves)} cells")
+    else:
+        corr_txt = "not enough data"
+    share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
+    coverage_txt = ("" if n_headline == n_cells else
+                    f"; {n_headline} of the {n_cells} cells have a time-series entry and "
+                    "the rest are blank on the heatmap")
+    best_txt = (f"The best of {n_headline} correlated cells overstates what you should expect."
+                if n_headline else
+                "No cell has a time-series entry, so nothing on this grid measures the band "
+                "or k.")
+    headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
+    return (
+        "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
+        "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
+        "color:#5D4037;'>"
+        + f"<b>{n_cells} band x k cells computed</b> ({n_points} scenario "
+        "points across the time-series, all, ladder and cross-event populations, at "
+        f"size cap {html.escape(_cap_option(cap))}{coverage_txt}). Every figure in this banner, the "
+        f"heatmap and the equity curve is the <b>{html.escape(headline_label)}</b> "
+        "population's; the KPI table below labels each row with its own population. "
+        f"{share_txt} of the cells with a measurable return had a positive total return. "
+        f"Split-half rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. "
+        f"{best_txt}</div>"
+    )
+
+
+def _section_scenario_explorer(
+    sweep: BacktestSweep | None,
+    explorer: "_ExplorerData | None" = None,
+    *,
+    unavailable: bool = False,
+    own_cap_only: bool = False,
+) -> str:
     """
     Build the "Scenario Explorer" HTML section.
 
-    Renders BacktestSweep.scenarios — every (spread band, k) cell of a band
-    sweep, each with standalone "all" / "time_series" / "ladder" / "cross"
-    simulations — so that choosing a band and k from a backtest happens with
-    the grid's fragility on screen rather than from one flattering cell.
+    Renders every (spread band, k, per-trade size cap) scenario of a band
+    sweep — each cell with standalone "all" / "time_series" / "ladder" /
+    "cross" simulations — so that choosing a band, k and cap from a backtest
+    happens with the grid's fragility on screen rather than from one
+    flattering cell. Its data (_ExplorerData) comes from the page's ONE walk
+    over the grid (_ExplorerVisitor, beside the filter bar's visitors), so a
+    size-cap sweep's cells are simulated once for the whole page; built
+    without one — the direct call, or a walk whose explorer visitor failed —
+    it walks the sweep's own eager points at the run's own cap instead
+    (_explorer_from_sweep). Either way every figure is computed on curves
+    cut to the page's last date (_walk_grid's _cut_to_axis): a cell
+    simulated on a later UTC day than the primary (a band sweep crossing
+    00:00 UTC) carries one flat row more, which would move its Sharpe and
+    Sortino, so the explorer shows each cell over the same span as the filter
+    bar shows it — its figures there and here are one computation.
 
     The heatmap, the banner and the equity curve all read ONE population,
     _HEADLINE_POPULATION — "time_series", every time-series entry (ladders +
@@ -3230,58 +3637,74 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     point and reads "—" everywhere below; nothing falls back to "all". In
     order:
 
-      1. A fragility banner, first: how many band x k cells were computed
-         (and, when some have no time-series entry, how many do), the share
-         of time-series cells with a positive total return, the split-half
-         rank correlation (Spearman) of the
-         time-series cells' H1 vs H2 returns — over the cells whose two
-         halves BOTH had entries, since an empty half's 0.0 is not a return —
-         and the sentence this section exists to put on the page — the best
-         of that many correlated cells overstates what a reader should
-         expect, where "that many" counts the time-series cells the heatmap
-         shows a value in, never the whole grid. It says in words that every
-         figure in it, the heatmap and the curve is the time-series
-         population's, and that the KPI table below labels its own rows.
-      2. A band (row) x k (column) heatmap of the time-series population,
-         titled with it, with a native Plotly `updatemenus` metric toggle:
-         mean per trade (the default), median per trade, total return, H1
-         return, H2 return, trade count and empirical k-hat. Each button is
-         an "update" — it swaps the trace's z, colour scale, hover format and
-         customdata AND the chart title together (a "restyle" button's second
-         argument is read as trace indices, so a title placed there would be
-         silently dropped). Row labels read "max(tier,<floor>)-<ceiling>"
-         (_row_label). A half with no entries reads null (rendered "—") in the
-         H1/H2 views. The k-hat view repeats each band's POOLED k-hat
+      1. A fragility banner for the size cap shown (_explorer_banner): how
+         many band x k cells were computed at that cap (and, when some have
+         no time-series entry, how many do), the share of time-series cells
+         with a positive total return, the split-half rank correlation of
+         their H1 vs H2 returns, and the sentence this section exists to put
+         on the page — the best of that many correlated cells overstates
+         what a reader should expect.
+      2. A band (row) x k (column) heatmap of the time-series population
+         (div id "scn-heatmap"), titled with it and with the size cap, and a
+         scripted "Heatmap metric" <select> (id "scn-metric") over nine
+         metrics (_EXPLORER_METRICS): mean per trade (the default), median
+         per trade, total return, Sharpe ratio (365-day base; blank on a cell
+         with no trade), H1 return, H2 return, trade count, empirical k-hat
+         and k-hat − k. Each change is one Plotly.update of the trace's z,
+         colour scale, centre, hover and hover data AND the title together,
+         read from the packed blocks — a native `updatemenus` dropdown bakes
+         one matrix per metric into the figure and could not follow the size
+         cap. Row labels read "max(tier,<floor>)-<ceiling>" (_row_label). A
+         half with no entries reads null ("—") in the H1/H2 views. The
+         k-hat view repeats each band's POOLED k-hat
          (BacktestSweep.calibrations_by_band) across every k column, because
-         k-hat is measured over the band's entries and cannot depend on k; it
-         is centred on the primary k, its hover shows the entries pooled, and
-         a band with no calibration reads null. The same figures follow as a
-         static one-row-per-band table ("Empirical k-hat by spread band").
-      3. Two <select>s (band, k), preselected to the primary scenario and
-         marked "(primary)", driving — through the small inline script
+         k-hat is measured over the band's entries and cannot depend on k
+         (or on the cap); it is centred on the primary k and its hover shows
+         the entries pooled. The k-hat − k view is that pooled k-hat minus
+         the column's k, rounded as the k-hat cards round it
+         (_khat_delta_value) and coloured as they are — positive, the sizer
+         sized too big, red ("RdBu_r"); the k-hat view uses the same scale,
+         so a band whose k-hat sits above the run's k is red in both views
+         (the heatmap's negative side is blue where a card is green). A band
+         with no calibration reads null in both. The same pooled figures follow as a static one-row-per-band
+         table ("Empirical k-hat by spread band").
+      3. Three <select>s (band, k, size cap — ids "scn-band-select",
+         "scn-k-select", "scn-cap-select"), preselected to the primary
+         scenario and marked "(primary)", rendered disabled until the script
+         has unpacked its data, driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
          its H1/H2 and top-event figures; Ladders; Cross-event; All —
          time-series + same-title, the run's actual result — with its own
-         sub-row; Same-title, which is independent of band and k), the
-         selected band's own calibration table, and the time-series equity
-         curve (rendered once via _fig_html(div_id="scn-equity") and
-         restyled in place). A native updatemenus dropdown cannot express two
-         independent axes of selection, which is why this part is scripted.
+         sub-row; Same-title, which is independent of band and k but not of
+         the cap), the selected band's own calibration table, and the
+         time-series equity curve (rendered once for the primary scenario via
+         _fig_html(div_id="scn-equity") and restyled in place). The page-wide
+         filter bar's script moves these three selects to the scenario it
+         shows (window.dashScenarioSelect, matched by option label) — each
+         only when the bar's label on its axis changes, so a choice made
+         here survives a category or tag change and a bar change on another
+         axis; they stay usable on their own. A native updatemenus dropdown cannot
+         express independent axes of selection, which is why this part is
+         scripted.
 
-    Every number the script reads comes from one
-    `<script type="application/json" id="scn-data">` block: cells are
-    addressed by integer index into the ordered band / k / population arrays
-    it also carries, and its only strings are values that are themselves
-    names (the date axis, a calibration bucket's label, a cell's top event
-    ticker); every value is passed through _json_safe() and the
-    payload serialised with json.dumps(..., allow_nan=False), so a non-finite
-    metric reaches the browser as null (rendered as an em dash) rather than as
-    an invalid NaN token; and every "</" is escaped, because the payload
-    carries each cell's top event ticker (Kalshi-controlled) and an unescaped
-    "</script>" inside a JSON string would end the block early. The run's
-    primary band and ladder setting are not repeated here — they are on the
-    page header (_run_settings_html), since they shape every section.
+    Every number the script reads comes from packed blocks
+    (_packed_json_script for the base block, _packed_text_script for each
+    cap's, which is assembled as text — one encoding: gzip + base64, whose
+    alphabet has no "<", so no
+    Kalshi-controlled ticker in them can close the <script> element early;
+    strict JSON, a non-finite value shipped as null and rendered "—"): one
+    base block (id "scn-data": the axes, their labels, the populations, the
+    date axis, each band's calibration rows, the metric specs and the two
+    cap-independent k-hat matrices, the primary [band, k, cap] indexes) and
+    one block per size cap (id "scn-cap-<i>": every cell's per-population
+    figures — the headline one with its curve as change points on the
+    explorer's axis (_equity_axis) — the same-title row, the banner, the
+    cap's seven matrices and the nine heatmap titles). Only the base block
+    and the primary cap's are unpacked as the page loads; another cap's
+    when it is chosen. The run's primary band and ladder setting are not
+    repeated here — they are on the page header (_run_settings_html), since
+    they shape every section.
 
     Args:
         sweep (BacktestSweep | None): The sweep payload from
@@ -3289,8 +3712,23 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
             run." — the same shape _section_interval_discount's None branch
             takes, and deliberately free of any "strike-blind" /
             "Outcome-label coverage" text, since that caveat belongs to a
-            sweep this run never produced. A sweep with no scenarios renders a
+            sweep this run never produced. A sweep with no scenarios — or
+            whose data says the band sweep did not run (a size-cap sweep
+            without its checks), whatever the walk produced — renders a
             one-line note naming the cause (_scenario_explorer_empty_reason).
+        explorer (_ExplorerData | None): The data the page's walk built
+            (_ExplorerVisitor.payload). None (default) builds it from the
+            sweep's own eager points (_explorer_from_sweep), which raises
+            what that build raises.
+        unavailable (bool): Keyword-only. Neither the walk nor the eager
+            fallback could build the data (generate_dashboard logged why):
+            the section is a notice (_EXPLORER_UNAVAILABLE_HTML), and the
+            page is still written.
+        own_cap_only (bool): Keyword-only. The data is the sweep's own eager
+            points standing in for a size-cap sweep the walk could not build
+            it from (generate_dashboard logged why): a grey line above the
+            banner says the section shows the run's own size cap only
+            (_EXPLORER_OWN_CAP_HTML). False (default) adds nothing.
 
     Returns:
         str: Self-contained HTML section string.
@@ -3299,189 +3737,55 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 
     if sweep is None:
         return title + "<p>No sweep for this run.</p>"
+    empty = ("<p>No scenarios were computed: "
+             f"{_scenario_explorer_empty_reason(sweep)}.</p>")
     if not sweep.scenarios:
-        return (title + "<p>No scenarios were computed: "
-                f"{_scenario_explorer_empty_reason(sweep)}.</p>")
-
-    # ── Index the (band, k) grid and bucket every scenario into it ──────────
-    all_points = [pt for pt in sweep.scenarios if pt.population == "all"]
-    bands = sorted({pt.spread_band for pt in all_points if pt.spread_band is not None})
-    ks = sorted({pt.k for pt in all_points})
-    band_idx = {b: i for i, b in enumerate(bands)}
-    k_idx = {k: i for i, k in enumerate(ks)}
-
-    cell_points: list[list[dict]] = [
-        [dict.fromkeys(_SCENARIO_POPULATIONS) for _ in ks] for _ in bands
-    ]
-    for pt in sweep.scenarios:
-        if (pt.spread_band not in band_idx or pt.k not in k_idx
-                or pt.population not in _SCENARIO_POPULATIONS):
-            continue
-        cell_points[band_idx[pt.spread_band]][k_idx[pt.k]][pt.population] = pt
-
-    # Cached per point, so every metric is computed exactly once however many
-    # places (heatmap, banner, data block) read it.
-    kpi_cache: dict[int, dict] = {}
-
-    def kpis(pt: SweepPoint) -> dict:
-        key = id(pt)
-        if key not in kpi_cache:
-            kpi_cache[key] = _point_kpis(pt)
-            if pt.population in ("all", _HEADLINE_POPULATION):
-                kpi_cache[key].update(_robustness_extras(pt))
-        return kpi_cache[key]
-
+        return title + empty
+    if unavailable:
+        return title + _EXPLORER_UNAVAILABLE_HTML
+    # The walk's data, or the sweep's own eager points at the run's own cap
+    data = explorer if explorer is not None else _explorer_from_sweep(sweep)
+    if not data.checks:
+        # The band sweep did not run for the grid walked: no populations to
+        # compare, whatever the walk produced
+        return title + empty
+    base = data.base
+    pb, pk, pc = base["primary"]
     headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
 
-    # ── Fragility banner — the headline population's cells only ─────────────
-    # n_cells counts the grid (every band x k cell has an "all" point); every
-    # FIGURE below is the time-series population's, and a cell with no
-    # time-series point simply contributes no return — it never falls back
-    # to the "all" point, which is how a same-title result would reach here.
-    # The multiple-comparison count ("the best of N") is n_headline, the
-    # cells the heatmap actually shows a value in, never the grid: a band
-    # where no time-series pair enters has an "all" cell but no time-series
-    # one (the backtester skips an empty population).
-    n_cells = sum(1 for row in cell_points for cp in row if cp["all"] is not None)
-    headline_points = [cp[_HEADLINE_POPULATION] for row in cell_points for cp in row
-                       if cp[_HEADLINE_POPULATION] is not None]
-    n_headline = len(headline_points)
-    finite_returns = [r for r in (kpis(pt)["total_return"] for pt in headline_points)
-                      if r is not None and math.isfinite(r)]
-    positive_share = (sum(1 for r in finite_returns if r > 0) / len(finite_returns)
-                      if finite_returns else None)
-    checked = [kpis(pt) for pt in headline_points if pt.halves is not None]
-    # A cell whose H1 or H2 had no entries carries None there
-    # (_robustness_extras), and _spearman drops any pair with a None, so the
-    # correlation is over the cells whose two halves both had entries.
-    corr = _spearman([k["h1_return"] for k in checked], [k["h2_return"] for k in checked])
-    n_empty_half = sum(1 for k in checked if k["h1_return"] is None or k["h2_return"] is None)
-    if corr is not None:
-        corr_txt = f"{corr:+.3f}"
-        if n_empty_half:
-            corr_txt += (f" (over the {len(checked) - n_empty_half} of {len(checked)} cells "
-                         "whose two halves both had entries)")
-    elif n_empty_half:
-        corr_txt = ("not measurable — the split date leaves a half without entries in "
-                    f"{n_empty_half} of the {len(checked)} cells")
-    else:
-        corr_txt = "not enough data"
-    share_txt = f"{positive_share:.1%}" if positive_share is not None else "—"
-    coverage_txt = ("" if n_headline == n_cells else
-                    f"; {n_headline} of the {n_cells} cells have a time-series entry and "
-                    "the rest are blank on the heatmap")
-    best_txt = (f"The best of {n_headline} correlated cells overstates what you should expect."
-                if n_headline else
-                "No cell has a time-series entry, so nothing on this grid measures the band "
-                "or k.")
-    banner = (
-        "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
-        "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
-        "color:#5D4037;'>"
-        + f"<b>{n_cells} band x k cells computed</b> ({len(sweep.scenarios)} scenario "
-        "points across the time-series, all, ladder and cross-event populations"
-        f"{coverage_txt}). Every figure in this banner, the heatmap and the "
-        f"equity curve is the <b>{html.escape(headline_label)}</b> population's; the KPI "
-        f"table below labels each row with its own population. {share_txt} of "
-        "the cells with a measurable return had a positive total return. Split-half "
-        f"rank correlation (Spearman) of cell returns, H1 vs H2: {corr_txt}. {best_txt}"
-        "</div>"
-    )
+    # ── Heatmap: band rows x k columns at the primary cap and the first
+    # metric; the script swaps in every other (Plotly.update) ────────────────
+    first = base["metrics"][0]
 
-    # ── Heatmap: band rows x k columns, one "update" button per metric ──────
-    def metric_matrix(field: str) -> list[list]:
-        return [
-            [
-                (kpis(cell_points[bi][ki][_HEADLINE_POPULATION])[field]
-                 if cell_points[bi][ki][_HEADLINE_POPULATION] is not None else None)
-                for ki in range(len(ks))
-            ]
-            for bi in range(len(bands))
-        ]
+    def matrix(name: str) -> list:
+        """
+        One of the primary cap's heatmap matrices, or a cap-independent one.
 
-    band_labels = [_row_label(b) for b in bands]
-    k_labels = [_k_label(k) for k in ks]
-    # Colour scales are read back off a trace plotly.py has already coerced,
-    # never passed to the browser by name: plotly.py and plotly.js define
-    # "RdBu" in OPPOSITE directions, so a named scale in a button would flip
-    # the colours the first time a metric is switched.
-    diverging = go.Heatmap(colorscale="RdBu").colorscale
-    sequential = go.Heatmap(colorscale="Blues").colorscale
-    pct_hover = ("band=%{y}<br>%{x}<br>value=%{z:.2%}<br>trades=%{customdata}"
-                 "<extra></extra>")
-    count_hover = "band=%{y}<br>%{x}<br>trades=%{z}<extra></extra>"
-    # Empirical k-hat is measured ONCE per spread band — over that band's
-    # time-series entries, read off the prepared entries rather than any
-    # k-sized simulation (backtester._interval_calibration), so it cannot
-    # depend on k — and its row therefore repeats one figure across every k
-    # column. Its hover names the entries it pooled, since a k-hat over a
-    # handful of entries is not a measurement worth reading.
-    def band_pooled(band: tuple[float, float]):
-        cal = sweep.calibrations_by_band.get(band)
-        return None if cal is None else cal.pooled
+        Args:
+            name (str): A matrix key.
 
-    pooled_by_band = [band_pooled(b) for b in bands]
-    khat_matrix = [[None if p is None else p.empirical_k] * len(ks) for p in pooled_by_band]
-    khat_n_matrix = [[None if p is None else p.n] * len(ks) for p in pooled_by_band]
-    khat_hover = ("band=%{y}<br>k̂=%{z:.3f} (the same at every k)"
-                  "<br>entries pooled=%{customdata}<extra></extra>")
+        Returns:
+            list: matrix[band][k].
+        """
+        return data.matrices[name] if name in data.matrices else base["matrices"][name]
 
-    # (field, label, colour scale, zmid, hover, customdata field). zmid None
-    # lets the scale auto-range: a trade count is never negative, so centring
-    # it on zero would spend half the colour scale on values that cannot
-    # occur. k-hat is centred on the run's primary k, so the colour says which
-    # side of the discount the sizing assumed each band's evidence falls on.
-    heatmap_fields = [
-        ("mean_per_trade", "Mean per trade (equal stake)", diverging, 0, pct_hover, "trades"),
-        ("median_per_trade", "Median per trade (equal stake)", diverging, 0, pct_hover,
-         "trades"),
-        ("total_return", "Total return", diverging, 0, pct_hover, "trades"),
-        ("h1_return", "H1 return", diverging, 0, pct_hover, "trades"),
-        ("h2_return", "H2 return", diverging, 0, pct_hover, "trades"),
-        ("trades", "Trade count", sequential, None, count_hover, "trades"),
-        ("empirical_k", "Empirical k̂ (pooled per band)", diverging, sweep.primary.k,
-         khat_hover, "empirical_k_n"),
-    ]
-    # _json_safe here too: the button args are free-form JSON that no Plotly
-    # validator touches, so a NaN cell must already be None when it gets there.
-    matrices = {field: _json_safe(metric_matrix(field))
-                for field, *_ in heatmap_fields if field != "empirical_k"}
-    matrices["empirical_k"] = _json_safe(khat_matrix)
-    matrices["empirical_k_n"] = _json_safe(khat_n_matrix)
-
-    _, default_label, default_scale, default_zmid, default_hover, default_custom = (
-        heatmap_fields[0])
     hfig = go.Figure()
     hfig.add_trace(go.Heatmap(
-        z=matrices["mean_per_trade"], x=k_labels, y=band_labels,
-        customdata=matrices[default_custom], colorscale=default_scale, zmid=default_zmid,
-        hovertemplate=default_hover,
+        z=matrix(first["key"]), x=base["k_labels"], y=base["band_labels"],
+        customdata=matrix(first["custom"]), colorscale=first["colorscale"],
+        zmid=first["zmid"], hovertemplate=first["hover"],
     ))
-    # The title names the population, on every metric (each button re-sets
-    # it), so a screenshot of the heatmap alone still says whose cells these
-    # are.
-    heat_title = f"by spread band x k — {headline_label}"
-    hfig.update_layout(
-        title=f"{default_label} {heat_title}",
-        xaxis_title="k", yaxis_title="Spread band",
-        updatemenus=[{
-            "type": "dropdown", "direction": "down", "active": 0, "showactive": True,
-            "x": 1.0, "xanchor": "right", "y": 1.16, "yanchor": "top",
-            "buttons": [
-                {
-                    "label": label, "method": "update",
-                    "args": [
-                        # customdata travels with every button: k-hat's hover
-                        # reads entry counts, every other metric's trade counts
-                        {"z": [matrices[field]], "colorscale": [scale],
-                         "zmid": [zmid], "hovertemplate": [hover],
-                         "customdata": [matrices[custom]]},
-                        {"title.text": f"{label} {heat_title}"},
-                    ],
-                }
-                for field, label, scale, zmid, hover, custom in heatmap_fields
-            ],
-        }],
+    # The title names the population and the cap, on every metric (each
+    # redraw re-sets it), so a screenshot of the heatmap alone still says
+    # whose cells these are
+    hfig.update_layout(title=data.titles[0], xaxis_title="k", yaxis_title="Spread band")
+    metric_select = (
+        "<div style='font-family:sans-serif;font-size:14px;margin:8px 0;'>"
+        '<label>Heatmap metric: <select id="scn-metric" disabled autocomplete="off">'
+        + "".join(f'<option value="{i}"{" selected" if i == 0 else ""}>'
+                  f'{html.escape(m["label"])}</option>'
+                  for i, m in enumerate(base["metrics"]))
+        + "</select></label></div>"
     )
 
     # ── Empirical k-hat for EVERY band at once (the heatmap's k-hat metric in
@@ -3489,6 +3793,16 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     # that band's time-series entries; the per-gap-bucket breakdown of the
     # SELECTED band stays in the calibration table the selects drive. ───────
     def fmt(value, spec: str) -> str:
+        """
+        Format one figure of the k-hat table.
+
+        Args:
+            value (float | None): The figure.
+            spec (str): A format spec.
+
+        Returns:
+            str: The figure, or "—" when undefined.
+        """
         return "—" if value is None or not math.isfinite(value) else format(value, spec)
 
     td = "<td style='padding:4px 12px;'>"
@@ -3499,13 +3813,13 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
         + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
         + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
         + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
-        for label, p in zip(band_labels, pooled_by_band, strict=True)
+        for label, p in zip(base["band_labels"], data.pooled, strict=True)
     )
     khat_table = (
         "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
         f"<summary><b>Empirical k&#770; by spread band</b> (pooled over each band's "
-        f"time-series entries; the same at every k — compare with the primary "
-        f"k = {sweep.primary.k:.3f})</summary>"
+        f"time-series entries; the same at every k and size cap — compare with the "
+        f"primary k = {sweep.primary.k:.3f})</summary>"
         "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
         "<tr style='background:#E8F5E9;font-weight:bold;'>"
         "<th style='padding:6px 12px;'>Spread band</th>"
@@ -3517,10 +3831,17 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
     )
 
     # ── The <select>s, preselected to (and marking) the primary scenario ─────
-    primary_band_idx = band_idx.get(sweep.primary.spread_band, 0)
-    primary_k_idx = k_idx.get(sweep.primary.k, 0)
-
     def options(labels: list[str], primary: int) -> str:
+        """
+        One select's options, the run's own selected and marked.
+
+        Args:
+            labels (list[str]): The axis' option labels.
+            primary (int): The primary index on that axis.
+
+        Returns:
+            str: The <option> elements, labels escaped.
+        """
         return "".join(
             f'<option value="{i}"{" selected" if i == primary else ""}>'
             f'{html.escape(lbl)}{" (primary)" if i == primary else ""}</option>'
@@ -3529,12 +3850,18 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 
     selects = (
         "<div style='font-family:sans-serif;font-size:14px;margin:16px 0;'>"
-        "<label>Spread band: <select id='scn-band-select'>"
-        + options(band_labels, primary_band_idx) + "</select></label>"
+        '<label>Spread band: <select id="scn-band-select" disabled autocomplete="off">'
+        + options(base["band_labels"], pb) + "</select></label>"
         "&nbsp;&nbsp;"
-        "<label>k: <select id='scn-k-select'>"
-        + options(k_labels, primary_k_idx) + "</select></label>"
+        '<label>k: <select id="scn-k-select" disabled autocomplete="off">'
+        + options(base["k_labels"], pk) + "</select></label>"
+        "&nbsp;&nbsp;"
+        '<label>Size cap: <select id="scn-cap-select" disabled autocomplete="off">'
+        + options(base["cap_labels"], pc) + "</select></label>"
         "</div>"
+        # A cap's block loading, or one that could not be (the script's words)
+        "<div id='scn-status' style='font-family:sans-serif;font-size:13px;"
+        "color:#616161;'></div>"
     )
 
     # ── KPI table skeleton (filled by the inline script) ─────────────────────
@@ -3558,85 +3885,35 @@ def _section_scenario_explorer(sweep: BacktestSweep | None) -> str:
 """
 
     # ── The headline population's equity curve: rendered once for the
-    # primary cell, then restyled in place by the inline script. The axis is
-    # decided once, from the primary (every scenario of one run spans the same
-    # calendar), and every cell's curve is placed on it by date. Only the
-    # headline population ships a curve per cell: the curves are the page's
-    # dominant term, and a second population's would roughly double it. ─────
-    axis = _equity_axis(sweep.primary.equity_df)
-    axis_dates = [d.date().isoformat() for d in axis]
-    primary_cell = cell_points[primary_band_idx][primary_k_idx] if bands and ks else {}
-    primary_headline = primary_cell.get(_HEADLINE_POPULATION)
-    primary_values = (_curve_on_axis(primary_headline.equity_df, axis)
-                      if primary_headline is not None else [])
+    # primary scenario, then restyled in place by the inline script. Every
+    # curve is on the explorer's axis, decided once from the primary
+    # (_equity_axis); only the headline population ships a curve per cell:
+    # the curves are the dominant term, and a second population's would
+    # roughly double it. ──────────────────────────────────────────────────────
     efig = go.Figure()
     efig.add_trace(go.Scatter(
-        x=axis_dates if primary_values else [], y=primary_values,
+        x=base["dates"] if data.primary_curve else [], y=data.primary_curve,
         name=headline_label,
         line={"color": _COLORS["strategy"], "width": 2},
     ))
-    efig.update_layout(title=f"Equity curve — selected band x k — {headline_label}",
+    efig.update_layout(title=f"Equity curve — selected band, k and size cap — {headline_label}",
                        yaxis_title="Portfolio Value ($)", xaxis_title="Date")
-
-    # ── The data block every select, table and chart above reads from ────────
-    def cell_entry(pt: SweepPoint | None, population: str) -> dict | None:
-        if pt is None:
-            return None
-        d = dict(kpis(pt))
-        if population == _HEADLINE_POPULATION:
-            d["equity"] = _curve_on_axis(pt.equity_df, axis)
-        return d
-
-    def cal_json(band: tuple[float, float]) -> list[dict] | None:
-        cal = sweep.calibrations_by_band.get(band)
-        if cal is None:
-            return None
-        return [
-            {"label": b.label, "tier": (None if b.tier <= 0 else b.tier), "n": b.n,
-             "realised_rate": b.realised_rate, "mean_implied": b.mean_implied,
-             "empirical_k": b.empirical_k}
-            for b in [*cal.buckets, cal.pooled]
-        ]
-
-    payload = {
-        "bands": [[lo, hi] for lo, hi in bands],
-        "ks": list(ks),
-        "populations": list(_SCENARIO_POPULATIONS),
-        # Every row's label, spelled once (_POPULATION_LABELS); the script
-        # escapes each before it reaches innerHTML.
-        "labels": dict(_POPULATION_LABELS),
-        "primary_band_idx": primary_band_idx,
-        "primary_k_idx": primary_k_idx,
-        "dates": axis_dates,
-        # cells[band index][k index][population index]
-        "cells": [
-            [
-                [cell_entry(cell_points[bi][ki][pop], pop) for pop in _SCENARIO_POPULATIONS]
-                for ki in range(len(ks))
-            ]
-            for bi in range(len(bands))
-        ],
-        "same_title": (kpis(sweep.same_title_point)
-                       if sweep.same_title_point is not None else None),
-        "calibration_by_band": [cal_json(b) for b in bands],
-    }
-    # _json_safe() has already replaced every non-finite float, so
-    # allow_nan=False never fires in practice — it is the backstop that makes
-    # a missed one raise here instead of shipping unparseable JSON. "</" is
-    # escaped so a Kalshi-controlled top-event ticker can never close this
-    # <script> block early.
-    json_text = json.dumps(_json_safe(payload), allow_nan=False).replace("</", "<\\/")
-    data_block = f'<script type="application/json" id="scn-data">{json_text}</script>'
 
     return (
         title
-        + banner
-        + _fig_html(hfig, height=450)
+        # The lost cap axis is said on the page, not only in the log (DR-66)
+        + (_EXPLORER_OWN_CAP_HTML if own_cap_only else "")
+        + f'<div id="scn-banner">{data.banner}</div>'
+        + metric_select
+        + _fig_html(hfig, height=450, div_id="scn-heatmap")
         + khat_table
         + selects
         + kpi_table
         + _fig_html(efig, height=400, div_id="scn-equity")
-        + data_block
+        # The base block, then every cap's block, before the script that
+        # unpacks them: an element a script reaches exists when it runs
+        + _packed_json_script("scn-data", base)
+        + "".join(data.blocks)
         + _SCENARIO_EXPLORER_JS
     )
 
@@ -4212,19 +4489,71 @@ _ALL_VIEW = "all"
 # said once, for the bar's summary line and its tests: the interval-discount
 # section follows its k and size cap alone, always at the primary spread band
 # (its k-hat and per-k runs are the whole primary band's), and the scenario
-# explorer keeps its own band and k selects.
+# explorer's band, k and size-cap selects follow the bar's scenario (the
+# explorer's script defines window.dashScenarioSelect, which the bar's calls
+# after every redraw; an axis moves when the bar's label on it changes) while
+# staying usable on their own. Category and tag reach neither: the explorer
+# compares whole runs, and the interval-discount section's population is the
+# whole primary band.
 _BAR_REACH = ("The Interval Discount section follows only the bar's k and size cap (at the "
-              "primary spread band); the Scenario Explorer keeps its own selects, and "
-              "category and tag reach neither.")
+              "primary spread band), and the Scenario Explorer's selects follow its band, k "
+              "and size cap; category and tag reach neither.")
 
-# The same sentence for a page whose interval-discount section cannot follow
-# the bar — no sweep (it shows its placeholder), or its data could not be
-# built (_KdVisitor failed: it shows the run's own k and cap, and says so) —
-# so the summary line never claims a reach the page does not have. The base
-# block carries whichever of the two applies (_filter_payload), so the line
+# The same sentence for each page that lacks one of the two: the summary line
+# never claims a reach the page does not have. The interval-discount section
+# cannot follow the bar when there is no sweep (it shows its placeholder) or
+# its data could not be built (_KdVisitor failed: it shows the run's own k and
+# cap, and says so); the scenario explorer has no grid — hence no script, and
+# nothing for the bar to move — without the band sweep, or when its data could
+# not be built at all; and it follows the bar's band and k but not its size
+# cap when its data had to be rebuilt from the sweep's own eager points (its
+# visitor failed) while the bar offers more caps — it then has the run's own
+# cap alone, so the bar's other caps name nothing in it. The base block
+# carries whichever applies (_filter_payload, through _bar_reach), so the line
 # Python renders and the one the script fills say the same.
+_BAR_REACH_NO_EXPLORER = ("The Interval Discount section follows only the bar's k and size "
+                          "cap (at the primary spread band), not its category or tag; this "
+                          "page has no Scenario Explorer grid for the bar to reach.")
+_BAR_REACH_OWN_CAP = ("The Interval Discount section follows only the bar's k and size cap "
+                      "(at the primary spread band), and the Scenario Explorer's selects "
+                      "follow its band and k but not its size cap — the explorer shows the "
+                      "run's own size cap only on this page; category and tag reach neither.")
+_BAR_REACH_EXPLORER_ONLY = ("The Scenario Explorer's selects follow the bar's band, k and size "
+                            "cap (not its category or tag); the bar does not reach the "
+                            "Interval Discount section on this page.")
+_BAR_REACH_EXPLORER_ONLY_OWN_CAP = (
+    "The Scenario Explorer's selects follow the bar's band and k (not its size cap — the "
+    "explorer shows the run's own size cap only on this page — nor its category or tag); "
+    "the bar does not reach the Interval Discount section on this page.")
 _BAR_REACH_STATIC = ("The bar reaches neither the Interval Discount section on this page nor "
-                     "the Scenario Explorer, which keeps its own selects.")
+                     "a Scenario Explorer grid.")
+
+
+def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool = True) -> str:
+    """
+    Say what the filter bar reaches beyond the sections it re-scopes whole.
+
+    Args:
+        kd_follows (bool): Whether the interval-discount section follows the
+            bar's k and size cap (its data, "kd", was built).
+        explorer_follows (bool): Whether the page carries the scenario
+            explorer's grid and script, whose selects follow the bar.
+        explorer_caps (bool): Keyword-only. Whether the explorer's size-cap
+            axis is the bar's, so its cap select follows the bar's too. False
+            when the explorer shows the run's own cap only while the bar
+            offers more (its data rebuilt from the sweep's own eager points);
+            ignored when explorer_follows is False. True (default).
+
+    Returns:
+        str: _BAR_REACH, _BAR_REACH_OWN_CAP, _BAR_REACH_NO_EXPLORER,
+            _BAR_REACH_EXPLORER_ONLY, _BAR_REACH_EXPLORER_ONLY_OWN_CAP or
+            _BAR_REACH_STATIC.
+    """
+    if not explorer_follows:
+        return _BAR_REACH_NO_EXPLORER if kd_follows else _BAR_REACH_STATIC
+    if kd_follows:
+        return _BAR_REACH if explorer_caps else _BAR_REACH_OWN_CAP
+    return _BAR_REACH_EXPLORER_ONLY if explorer_caps else _BAR_REACH_EXPLORER_ONLY_OWN_CAP
 
 # The filter bar's summary line, as templates: _filter_summary_text fills them
 # for the page as rendered and the page's script fills them (D.text) for every
@@ -4253,8 +4582,9 @@ _SUMMARY_TEMPLATES = {
               "that run booked it, not a standalone simulation."),
     # Every summary line ends with what the bar reaches beyond the sections
     # it re-scopes whole (the key keeps its first name, which the script
-    # reads); _filter_payload swaps in _BAR_REACH_STATIC on a page whose
-    # interval-discount section cannot follow the bar
+    # reads); _filter_payload swaps in _bar_reach's sentence for the page —
+    # this default is a page whose interval-discount section and scenario
+    # explorer both follow the bar
     "unfiltered": f" {_BAR_REACH}",
 }
 
@@ -4788,6 +5118,44 @@ def _cut_to_axis(by_cap: dict, axis_end: pd.Timestamp | None) -> dict:
             for cap, pops in by_cap.items()}
 
 
+def _same_title_points(source: _GridSource) -> dict:
+    """
+    Read a grid's same-title population at every cap, never raising.
+
+    A size-cap sweep simulates the population at every cap here
+    (CapSweep.same_title). If that raises, the failure costs the same-title
+    rows at the other caps only — ONE WARNING (with the traceback) — and the
+    run's own same-title point at the run's own cap stands in, read from the
+    eager grid (source.fallback, whose same_title is a lookup), so the
+    scenario explorer still shows it and the header's stale-cutoff count
+    still sees it (backtester.max_trades_simulated counts it too). The cells
+    already walked, and the filter bar's cap axis, are untouched: unlike a
+    cell, this population feeds only the explorer's same-title row and that
+    count.
+
+    Args:
+        source (_GridSource): The grid being walked.
+
+    Returns:
+        dict: {cap: SweepPoint}; the run's own point alone after a failure,
+            or {} when the grid has no eager fallback (or it has no
+            same-title point).
+    """
+    try:
+        return source.same_title()
+    except Exception as exc:
+        error = exc
+    try:
+        # The eager grid's lookup: nothing is simulated here
+        own = source.fallback().same_title() if source.fallback is not None else {}
+    except Exception:
+        own = {}
+    logging.warning("The same-title population could not be simulated at every size cap; "
+                    "the Scenario Explorer shows %s", "it at the run's own cap only" if own
+                    else "no same-title row", exc_info=error)
+    return own
+
+
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> Exception | None:
     """
@@ -4798,11 +5166,19 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     (source.cell — a size-cap sweep simulates it here), its curves are cut to
     the page's axis (_cut_to_axis), every cap of it is visited, and it is
     dropped before the next is read: only one cell's points are ever alive.
+    Then, when some visitor shows it (one with a same_title method), the
+    band- and k-independent same-title population is read once
+    (_same_title_points: source.same_title — a size-cap sweep simulates it
+    here too — or, if that raises, the run's own same-title point alone),
+    cut the same way, and handed to those visitors as {cap: point}. A
+    same-title failure costs only the same-title rows at the other caps,
+    never the cells already walked: it does not stop the walk.
 
     Args:
         source (_GridSource): The grid.
         visitors (list): Callables (band index, k index, cap index,
-            {population: SweepPoint}).
+            {population: SweepPoint}); one may also have a
+            same_title({cap: SweepPoint}) method.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -4831,6 +5207,15 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             logging.info("Dashboard: %d/%d band x k cells read from the size-cap sweep "
                          "(%d cap points simulated, %d shared so far)", done, len(cells),
                          getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    takers = [visit for visit in visitors if hasattr(visit, "same_title")]
+    if takers:
+        # Never raises: a failure falls back to the run's own point
+        by_cap = _same_title_points(source)
+        # Cut to the page's axis like any cell's point, then shown
+        cut = _cut_to_axis({cap: {"same_title": point} for cap, point in by_cap.items()},
+                           axis_end)
+        for visit in takers:
+            visit.same_title({cap: pops["same_title"] for cap, pops in cut.items()})
     return None
 
 
@@ -4844,8 +5229,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     it is simulated costs the cap axis only — ONE WARNING (with the
     traceback), every visitor reset for the fallback grid, and a second walk
     over the eager points alone (source.fallback), whose cells are lookups.
-    The other layer is each visitor's own: it catches its own failure and
-    marks itself failed, costing only what it builds.
+    (The size-cap sweep's same-title population costs less still: only the
+    same-title rows at the other caps — _same_title_points.) The other layer
+    is each visitor's own: it catches its own failure and marks itself
+    failed, costing only what it builds.
 
     Args:
         source (_GridSource): The grid to walk.
@@ -4882,7 +5269,12 @@ class _MaxTrades:
     The header's stale-cutoff verdict (_corpus_provenance_html) is disproved
     by ANY simulated trade, and a size-cap sweep simulates scenarios
     backtester.max_trades_simulated never sees (it reads the eager points):
-    a larger cap can turn an n < 1 skip into a trade.
+    a larger cap can turn an n < 1 skip into a trade. That includes the
+    same-title population at every cap, which the scenario explorer shows
+    and the walk therefore reads (same_title) — or, when that population
+    could not be simulated (_same_title_points), the run's own point alone,
+    which is all the page then shows of it: the count covers what the page
+    shows, so it is not marked failed for that.
 
     Attributes:
         most (int): The largest len(trades) over every point visited.
@@ -4916,6 +5308,20 @@ class _MaxTrades:
         """
         try:
             for point in pops.values():
+                self.most = max(self.most, len(point.trades))
+        except Exception:
+            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
+            self.failed = True
+
+    def same_title(self, by_cap: dict) -> None:
+        """
+        Count the same-title population's points, one per size cap.
+
+        Args:
+            by_cap (dict): Cap -> the same-title SweepPoint at that cap.
+        """
+        try:
+            for point in by_cap.values():
                 self.most = max(self.most, len(point.trades))
         except Exception:
             logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
@@ -5010,6 +5416,401 @@ class _KdVisitor:
         _, pk, pc = self.source.primary
         return _kd_assemble(self.source.ks, self.source.caps, (pk, pc), self.rows,
                             self.curves, self.axis, self.pooled_k)
+
+
+def _explorer_curve(point: SweepPoint, axis: pd.DatetimeIndex) -> list[list]:
+    """
+    One point's equity curve on the scenario explorer's axis, as change points.
+
+    Args:
+        point (SweepPoint): A headline-population point.
+        axis (pd.DatetimeIndex): The explorer's axis (_equity_axis of the
+            primary curve: every date up to _EQUITY_DAILY_MAX_ROWS rows, one
+            per week beyond).
+
+    Returns:
+        list[list]: _sparse_on_axis's [[axis index, dollars], ...]; [] for a
+            point with no curve, which the explorer's script draws as no line.
+    """
+    eq = point.equity_df
+    if eq is None or eq.empty:
+        return []
+    return _sparse_on_axis(list(eq["date"]), eq["portfolio_value"], axis, 2)
+
+
+@dataclass(frozen=True)
+class _ExplorerData:
+    """
+    Everything the scenario explorer section renders, built by _ExplorerVisitor.
+
+    Attributes:
+        checks (bool): Whether the band sweep ran for the grid walked (its
+            cells carry the "time_series", "ladder" and "cross" populations).
+            Without it the section is its "band sweep off" placeholder, and
+            nothing below is filled.
+        base (dict): The "scn-data" block, unpacked: "bands" ([floor,
+            ceiling] or null), "ks", "caps" (values), "band_labels",
+            "k_labels", "cap_labels" (the option labels — _band_option,
+            _k_option, _cap_option, the filter bar's own, so the bar's calls
+            can match them), "cap_text" (_cap_text per cap), "populations"
+            (_SCENARIO_POPULATIONS: every cell's array index), "labels"
+            (_POPULATION_LABELS), "primary" ([band, k, cap] indexes), "dates"
+            (the explorer's axis, ISO), "calibration_by_band" (each band's
+            bucket rows and pooled row, or null), "metrics" ({key, label,
+            colorscale, zmid, hover, custom} per _EXPLORER_METRICS entry, the
+            colour scale as plotly.py coerced it) and "matrices" (the
+            cap-independent "empirical_k", "khat_minus_k" and
+            "empirical_k_n", [band][k]).
+        blocks (tuple[str, ...]): Each size cap's packed "scn-cap-<i>" block,
+            by cap index: "cells" ([band][k] -> one entry per population, or
+            null for a scenario never simulated), "same_title", "banner",
+            "matrices" (the seven cap-dependent ones, [band][k]) and "titles"
+            (one per metric).
+        banner (str): The primary cap's banner (_explorer_banner).
+        matrices (dict): The primary cap's seven cap-dependent matrices.
+        titles (tuple[str, ...]): The primary cap's nine heatmap titles.
+        primary_curve (list): The primary scenario's headline curve, one value
+            per axis date (_curve_on_axis); [] when it has none.
+        pooled (tuple): Each band's pooled IntervalCalibrationBucket (or
+            None), for the static k-hat table.
+    """
+    checks: bool
+    base: dict = field(default_factory=dict)
+    blocks: tuple = ()
+    banner: str = ""
+    matrices: dict = field(default_factory=dict)
+    titles: tuple = ()
+    primary_curve: list = field(default_factory=list)
+    pooled: tuple = ()
+
+
+class _ExplorerVisitor:
+    """
+    Collect the scenario explorer's figures for every band x k x size cap scenario.
+
+    Rides the page's one walk (_walk_grid) beside the filter bar's visitors,
+    so a size-cap sweep's cells are simulated once for the whole page. For
+    every scenario it keeps each population's KPI row (_point_kpis, plus
+    _robustness_extras on the "all" and "time_series" points) and the
+    headline population's curve as change points on the explorer's own axis
+    (_explorer_curve), as compact strict JSON text — the only per-scenario
+    thing it keeps across cells, besides the headline population's seven
+    numbers the heatmap's cap-dependent matrices are made of. Within a cell,
+    the points of the caps at or above its peak Kelly fraction share their
+    trades, curve, split halves and top-event check (backtester.CapSweep),
+    so each row is computed once per distinct (trades, curve, halves, top
+    event, population) — keyed by the objects' identities, which the cell
+    holds alive while it is walked, and forgotten with it (an identity may
+    be reused by a later cell's objects) — and caps whose rows are all
+    shared keep ONE joined text. Across cells that text is what stays
+    resident until the blocks are packed (_assemble): a few KB per distinct
+    scenario — tens of MB at most on a 36 x 13 x 20 grid of distinct cells,
+    against the gigabytes the points themselves would hold.
+
+    Every point it reads comes through the walk, whose curves are cut to the
+    page's last date (_cut_to_axis): a cell simulated on a later UTC day
+    than the primary carries one flat row more, and its Sharpe, Sortino and
+    (were a trade to settle on that day) return are computed over the page's
+    span — the figures the filter bar shows for the same scenario, from the
+    same cut curve. Before the size-cap axis the explorer read
+    sweep.scenarios uncut, so such a cell's Sharpe and Sortino could differ
+    slightly from today's; in production the extra row repeats the day
+    before (no market settles after the corpus was assembled), so only those
+    two ratios ever moved.
+
+    Without the band sweep (the grid's cells carry "all" only) it collects
+    nothing: the section is then its placeholder, whatever the walk produced.
+
+    A failure is caught here: one WARNING, and the visitor marks itself
+    failed — the section is then built from the sweep's own eager points at
+    the run's own cap (_explorer_from_sweep), while the filter bar and every
+    other section are unaffected.
+
+    Attributes:
+        axis (pd.DatetimeIndex): The explorer's date axis.
+        primary_k (float): The run's own k — the k-hat metric's centre.
+        calibrations (dict): Band -> IntervalCalibration or None
+            (BacktestSweep.calibrations_by_band, read as the explorer always
+            has: a band without an entry has no k-hat).
+        failed (bool): Whether building a figure raised.
+    """
+
+    def __init__(self, source: _GridSource, sweep: BacktestSweep) -> None:
+        """
+        Prepare to walk a grid.
+
+        Args:
+            source (_GridSource): The grid.
+            sweep (BacktestSweep): The run's sweep: its primary curve decides
+                the explorer's axis, its primary k centres the k-hat metric,
+                and its calibrations_by_band give each band's k-hat.
+        """
+        self.axis = _equity_axis(sweep.primary.equity_df)
+        self.primary_k = sweep.primary.k
+        self.calibrations = dict(sweep.calibrations_by_band)
+        self._data: _ExplorerData | None = None
+        self.reset(source)
+
+    def reset(self, source: _GridSource) -> None:
+        """
+        Start again for a grid: empty cells and matrices over its axes.
+
+        Args:
+            source (_GridSource): The grid about to be walked.
+        """
+        self.source = source
+        nb, nk, nc = len(source.bands), len(source.ks), len(source.caps)
+        # cells[cap][band][k]: the scenario's JSON text, or None
+        self.cells = [[[None] * nk for _ in range(nb)] for _ in range(nc)]
+        self.matrices = [{key: [[None] * nk for _ in range(nb)] for key in _EXPLORER_CAP_METRICS}
+                         for _ in range(nc)]
+        # Which cells have an "all" point, and which headline points carry a
+        # split-half check, per cap — the banner's counts
+        self.has_all = [[[False] * nk for _ in range(nb)] for _ in range(nc)]
+        self.checked = [[[False] * nk for _ in range(nb)] for _ in range(nc)]
+        self.n_points = [0] * nc
+        self.same_titles: list[str | None] = [None] * nc
+        self.primary_curve: list = []
+        self.failed = False
+        self._data = None
+        self._cell: tuple[int, int] | None = None
+        self._cache: dict = {}
+        self._joined: dict = {}
+
+    def _entry(self, point: SweepPoint, population: str) -> tuple[dict, str]:
+        """
+        One population's figures in the cell being walked, computed once.
+
+        Args:
+            point (SweepPoint): The point.
+            population (str): Its population ("all", "ladder", "cross",
+                "time_series").
+
+        Returns:
+            tuple[dict, str]: Its KPI row (_point_kpis, with
+                _robustness_extras on the "all" and headline points) and the
+                row as JSON text — the headline point's with its curve
+                ("equity", change points on the explorer's axis).
+        """
+        # Every input of the row: the trades and the curve (_point_kpis), the
+        # halves and the top-event check (_robustness_extras) and the
+        # population (which extras and whether a curve). Copies sharing all
+        # four objects — the caps at or above a cell's peak — share the row
+        key = (id(point.trades), id(point.equity_df), id(point.halves), point.ex_top_event,
+               population)
+        hit = self._cache.get(key)
+        if hit is None:
+            kpis = _point_kpis(point)
+            if population in (_ALL_VIEW, _HEADLINE_POPULATION):
+                kpis.update(_robustness_extras(point))
+            row = dict(kpis)
+            if population == _HEADLINE_POPULATION:
+                row["equity"] = _explorer_curve(point, self.axis)
+            hit = self._cache[key] = (kpis, _strict_json(row))
+        return hit
+
+    def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Keep one scenario's figures.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a population the cell does
+                not carry is null in its row.
+        """
+        if self.failed or not self.source.checks:
+            return
+        try:
+            if self._cell != (bi, ki):
+                self._cell, self._cache, self._joined = (bi, ki), {}, {}
+            parts = []
+            for population in _SCENARIO_POPULATIONS:
+                point = pops.get(population)
+                if point is None:
+                    parts.append("null")
+                    continue
+                kpis, text = self._entry(point, population)
+                parts.append(text)
+                self.n_points[ci] += 1
+                if population == _ALL_VIEW:
+                    self.has_all[ci][bi][ki] = True
+                if population == _HEADLINE_POPULATION:
+                    matrices = self.matrices[ci]
+                    for key in _EXPLORER_CAP_METRICS:
+                        matrices[key][bi][ki] = kpis[key]
+                    # A flat curve's Sharpe of 0.0 is not a measurement: a
+                    # cell with no trade is blank in the Sharpe view
+                    if not kpis["trades"]:
+                        matrices["sharpe"][bi][ki] = None
+                    self.checked[ci][bi][ki] = point.halves is not None
+                    if (bi, ki, ci) == self.source.primary:
+                        # Python draws the primary scenario's curve itself
+                        self.primary_curve = _curve_on_axis(point.equity_df, self.axis)
+            # Caps whose rows are the same texts (every cap at or above the
+            # cell's peak) share one joined text: what is kept across cells
+            joined = tuple(id(part) for part in parts)
+            if joined not in self._joined:
+                self._joined[joined] = "[" + ",".join(parts) + "]"
+            self.cells[ci][bi][ki] = self._joined[joined]
+        except Exception:
+            logging.warning("The Scenario Explorer's figures could not be built from the "
+                            "page's grid; it shows the run's own size cap only",
+                            exc_info=True)
+            self.failed = True
+
+    def same_title(self, by_cap: dict) -> None:
+        """
+        Keep the same-title population's KPI row at every cap.
+
+        Args:
+            by_cap (dict): Cap -> the same-title SweepPoint at that cap (the
+                walk's; {} when the run has none, and the run's own cap
+                alone when it could not be simulated at every cap — a cap
+                without a point shows a null row, "—").
+        """
+        if self.failed or not self.source.checks:
+            return
+        try:
+            for ci, cap in enumerate(self.source.caps):
+                point = by_cap.get(cap)
+                self.same_titles[ci] = None if point is None else _strict_json(
+                    _point_kpis(point))
+        except Exception:
+            logging.warning("The Scenario Explorer's same-title figures could not be built; "
+                            "it shows the run's own size cap only", exc_info=True)
+            self.failed = True
+
+    def payload(self) -> _ExplorerData | None:
+        """
+        Assemble and pack the section's data, once.
+
+        Each size cap's block is packed as soon as it is assembled and its
+        cells' texts are dropped, so the packed strings are all that is kept.
+
+        Returns:
+            _ExplorerData | None: The data (checks=False, and nothing else,
+                without the band sweep); None when the visitor failed, or
+                when assembling raised (logged as a failure too).
+        """
+        if self.failed:
+            return None
+        if self._data is None:
+            try:
+                self._data = self._assemble()
+            except Exception:
+                logging.warning("The Scenario Explorer's figures could not be assembled; "
+                                "it shows the run's own size cap only", exc_info=True)
+                self.failed = True
+                return None
+        return self._data
+
+    def _assemble(self) -> _ExplorerData:
+        """
+        Build the base block, every cap's packed block and the primary cap's render data.
+
+        Returns:
+            _ExplorerData: The section's data.
+        """
+        source = self.source
+        if not source.checks:
+            return _ExplorerData(checks=False)
+        bands, ks, caps = source.bands, source.ks, source.caps
+        pb, pk, pc = source.primary
+        headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
+        pooled = tuple(None if self.calibrations.get(band) is None
+                       else self.calibrations[band].pooled for band in bands)
+        khat = [None if p is None else p.empirical_k for p in pooled]
+
+        def cal_rows(band) -> list[dict] | None:
+            """
+            One band's calibration table rows (its buckets, then its pooled row).
+
+            Args:
+                band: The band.
+
+            Returns:
+                list[dict] | None: The rows; None without a calibration.
+            """
+            cal = self.calibrations.get(band)
+            if cal is None:
+                return None
+            return [
+                {"label": b.label, "tier": (None if b.tier <= 0 else b.tier), "n": b.n,
+                 "realised_rate": b.realised_rate, "mean_implied": b.mean_implied,
+                 "empirical_k": b.empirical_k}
+                for b in [*cal.buckets, cal.pooled]
+            ]
+
+        metrics = [
+            {"key": key, "label": label,
+             # plotly.py's own coercion of the name (see _EXPLORER_METRICS)
+             "colorscale": go.Heatmap(colorscale=scale).colorscale,
+             "zmid": self.primary_k if zmid == "primary k" else zmid,
+             "hover": hover, "custom": custom}
+            for key, label, scale, zmid, hover, custom in _EXPLORER_METRICS
+        ]
+        base = {
+            "bands": [None if band is None else [band[0], band[1]] for band in bands],
+            "ks": list(ks),
+            "caps": list(caps),
+            "band_labels": [_band_option(band) for band in bands],
+            "k_labels": [_k_option(k) for k in ks],
+            "cap_labels": [_cap_option(cap) for cap in caps],
+            "cap_text": [_cap_text(cap) for cap in caps],
+            "populations": list(_SCENARIO_POPULATIONS),
+            # Every row's label, spelled once (_POPULATION_LABELS); the script
+            # escapes each before it reaches innerHTML
+            "labels": dict(_POPULATION_LABELS),
+            "primary": [pb, pk, pc],
+            "dates": [d.date().isoformat() for d in self.axis],
+            "calibration_by_band": [cal_rows(band) for band in bands],
+            "metrics": metrics,
+            # k-hat is measured per band, before the Kelly gate: the same at
+            # every k and every cap. k-hat − k is rounded as the cards round it
+            "matrices": _json_safe({
+                "empirical_k": [[value] * len(ks) for value in khat],
+                "khat_minus_k": [[_khat_delta_value(value, k) for k in ks] for value in khat],
+                "empirical_k_n": [[None if p is None else p.n] * len(ks) for p in pooled],
+            }),
+        }
+        blocks: list[str] = []
+        primary: tuple = ("", {}, ())
+        for ci, cap in enumerate(caps):
+            matrices = _json_safe(self.matrices[ci])
+            trades = matrices["trades"]
+            # The headline cells, row-major: those the heatmap shows a value in
+            headline = [(bi, ki) for bi in range(len(bands)) for ki in range(len(ks))
+                        if trades[bi][ki] is not None]
+            banner = _explorer_banner(
+                sum(row.count(True) for row in self.has_all[ci]), self.n_points[ci],
+                [matrices["total_return"][bi][ki] for bi, ki in headline],
+                [(matrices["h1_return"][bi][ki], matrices["h2_return"][bi][ki])
+                 for bi, ki in headline if self.checked[ci][bi][ki]],
+                cap)
+            # A cap-dependent figure names its cap; k-hat does not depend on it
+            titles = tuple(
+                f"{label} by spread band x k, {_cap_text(cap)} — {headline_label}"
+                if key in _EXPLORER_CAP_METRICS
+                else f"{label} by spread band x k — {headline_label}"
+                for key, label, *_ in _EXPLORER_METRICS)
+            cells = "[" + ",".join("[" + ",".join(text or "null" for text in row) + "]"
+                                   for row in self.cells[ci]) + "]"
+            raw = ('{"cells":' + cells
+                   + ',"same_title":' + (self.same_titles[ci] or "null")
+                   + ',"banner":' + _strict_json(banner)
+                   + ',"matrices":' + _strict_json(matrices)
+                   + ',"titles":' + _strict_json(list(titles)) + "}")
+            blocks.append(_packed_text_script(f"scn-cap-{ci}", raw))
+            # Packed: the texts are not needed again
+            self.cells[ci] = None
+            if ci == pc:
+                primary = (banner, matrices, titles)
+        banner, matrices, titles = primary
+        return _ExplorerData(checks=True, base=base, blocks=tuple(blocks), banner=banner,
+                             matrices=matrices, titles=titles,
+                             primary_curve=self.primary_curve, pooled=pooled)
 
 
 class _ChunkVisitor:
@@ -5174,6 +5975,7 @@ def _build_filter_grid(
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
     *,
     pooled_k: float | None = None,
+    explorer: _ExplorerVisitor | None = None,
 ) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]:
     """
     Walk the page's grid once with the page's visitors.
@@ -5189,20 +5991,102 @@ def _build_filter_grid(
         pooled_k (float | None): Keyword-only. The pooled empirical k-hat the
             interval-discount section compares every k with (_pooled_k);
             None (default) leaves that section's k-hat − k "—".
+        explorer (_ExplorerVisitor | None): Keyword-only. The scenario
+            explorer's visitor, walked with the others (its data is read off
+            it afterwards, _ExplorerVisitor.payload); None (default) walks
+            without one.
 
     Returns:
         tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]: The grid
             actually walked (the source, or its eager fallback) and the three
-            visitors — one walk, so a size-cap sweep's cells are simulated
-            once for all of them.
+            filter visitors — one walk, so a size-cap sweep's cells are
+            simulated once for all of them and for the explorer's.
     """
     chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
                            series_categories)
     most = _MaxTrades()
     kd = _KdVisitor(source, chunks.axis, pooled_k)
     axis_end = chunks.axis[-1] if len(chunks.axis) else None
-    walked = _walk_grid(source, [chunks, most, kd], axis_end)
+    visitors = [chunks, most, kd] + ([] if explorer is None else [explorer])
+    walked = _walk_grid(source, visitors, axis_end)
     return walked, chunks, most, kd
+
+
+def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep) -> _ExplorerVisitor | None:
+    """
+    The scenario explorer's visitor for the page's walk, or None if it cannot be made.
+
+    Args:
+        source (_GridSource): The grid about to be walked.
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        _ExplorerVisitor | None: The visitor; None (with a WARNING) when
+            preparing it raised — the explorer is then built from the sweep's
+            own points, and the filter bar is unaffected.
+    """
+    try:
+        return _ExplorerVisitor(source, sweep)
+    except Exception:
+        logging.warning("The Scenario Explorer's figures could not be prepared from the "
+                        "page's grid; it shows the run's own size cap only", exc_info=True)
+        return None
+
+
+def _explorer_fallback(sweep: BacktestSweep) -> tuple[_ExplorerData | None, bool]:
+    """
+    Build the scenario explorer's data from the sweep's own points, never raising.
+
+    Args:
+        sweep (BacktestSweep): A sweep with scenarios.
+
+    Returns:
+        tuple[_ExplorerData | None, bool]: (_explorer_from_sweep's data, False),
+            or (None, True) with a WARNING when that raised — the section is
+            then a notice, and the page is still written.
+    """
+    try:
+        return _explorer_from_sweep(sweep), False
+    except Exception:
+        logging.warning("The Scenario Explorer could not be built for this run; the page "
+                        "is written with a notice in its place", exc_info=True)
+        return None, True
+
+
+def _explorer_from_sweep(sweep: BacktestSweep) -> _ExplorerData:
+    """
+    Build the scenario explorer's data from the sweep's own eager points.
+
+    The section's own path when the page's walk did not build its data — the
+    direct call, a walk whose explorer visitor failed, or a filter whose grid
+    could not be read at all: the eager grid (_grid_source without the
+    size-cap sweep: every band x k the run simulated, at the run's own cap)
+    walked with an explorer visitor alone, curves ending on the primary
+    curve's last date.
+
+    Args:
+        sweep (BacktestSweep): A sweep with scenarios.
+
+    Returns:
+        _ExplorerData: The data.
+
+    Raises:
+        RuntimeError: If the visitor failed (it logged why).
+    """
+    primary = sweep.primary
+    # The eager points alone: nothing here simulates
+    source = _grid_source(sweep, primary.trades, primary.equity_df, primary.k,
+                          use_cap_sweep=False)
+    visitor = _ExplorerVisitor(source, sweep)
+    eq = primary.equity_df
+    axis_end = (pd.Timestamp(pd.to_datetime(eq["date"].iloc[-1]))
+                if eq is not None and len(eq) else None)
+    _walk_grid(source, [visitor], axis_end)
+    data = visitor.payload()
+    if data is None:
+        raise RuntimeError("the Scenario Explorer's data could not be built from the "
+                           "sweep's own points (the log names the error)")
+    return data
 
 
 def _sparse_on_axis(dates, values, axis: pd.DatetimeIndex, ndigits: int) -> list[list]:
@@ -5480,6 +6364,8 @@ def _filter_payload(
     *,
     kd: dict | None = None,
     tainted: bool = False,
+    explorer: bool = False,
+    explorer_caps: bool = True,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -5506,11 +6392,20 @@ def _filter_payload(
             block's own "dates" are the same axis); None (default) ships
             null, the script then leaves that section as Python drew it, and
             the summary line's closing sentence says the bar does not reach
-            it (_BAR_REACH_STATIC in place of _BAR_REACH).
+            it (_bar_reach).
         tainted (bool): Keyword-only. Whether the run's outcome-label census
             fell below its floor (_coverage_tainted): decides the colour of a
             known k-hat on the performance section's card
             ("styles.khat_card").
+        explorer (bool): Keyword-only. Whether the page carries the scenario
+            explorer's grid and script, whose selects follow the bar's
+            scenario (the page's script calls window.dashScenarioSelect
+            whenever it is defined). False (default) says the bar reaches no
+            explorer grid (_bar_reach).
+        explorer_caps (bool): Keyword-only. Whether the explorer's size-cap
+            axis is this grid's, so its cap select follows the bar's too;
+            False says the explorer follows the bar's band and k only (its
+            data was rebuilt at the run's own cap). True (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -5522,8 +6417,8 @@ def _filter_payload(
             "categories" (sorted names), "subcats" ([[category index, tag],
             ...], sorted), "empty" (the view of a selection with no trade — a
             flat curve, referencing no string), "text" (the templates:
-            _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd —
-            and _KHAT_TEXT), "styles" (the trade-type
+            _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
+            explorer and explorer_caps (_bar_reach) — and _KHAT_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
             known k-hat's card colour), "khat" (_khat_band per band, in band
@@ -5551,9 +6446,12 @@ def _filter_payload(
         "empty": empty,
         # The summary line's closing sentence says what the bar reaches on
         # THIS page: the interval-discount section follows its k and cap only
-        # when that section's data was built (kd); otherwise it is static
+        # when that section's data was built (kd), and the scenario explorer's
+        # selects only when the page carries its grid (explorer) — its cap
+        # select only when its cap axis is this grid's (explorer_caps)
         "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT,
-                 "unfiltered": f" {_BAR_REACH if kd is not None else _BAR_REACH_STATIC}"},
+                 "unfiltered": " " + _bar_reach(kd is not None, explorer,
+                                                explorer_caps=explorer_caps)},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -5780,7 +6678,14 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     section's "kd", 216 KB the k-hat breakdown with its k-hat − k per k)
     into a 1.23 MB page in 5.0 s — on the same harness a 35 KB base block
     (320 KB of JSON) and a 1.28 MB page before them, when that section drew
-    a trace per k. The script inflates each block
+    a trace per k. Re-measured 2026-09-26 once the scenario explorer's data
+    came from the same walk as packed blocks of its own (C4): the
+    TestFilterPageSize page is 804 KB (819 KB the same day before it), and
+    TestExplorerFullGrid's 36 x 13 x 20 grid of 4 shared lists, whose cells
+    carry the band sweep's populations so the explorer ships its 21 blocks
+    (249 KB of base64) as well, is a 1.21 MB page built in about 6.7 s — the
+    1.23 MB / 5.0 s above were measured before, without the explorer's
+    blocks or its walk. The script inflates each block
     with the browser's own DecompressionStream, so nothing is added to the
     page but the bytes.
 
@@ -5798,7 +6703,44 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     Returns:
         str: The <script type="text/plain" data-encoding="gzip+base64"> element.
     """
-    raw = json.dumps(_json_safe(payload), allow_nan=False, separators=(",", ":"))
+    return _packed_text_script(element_id, _strict_json(payload))
+
+
+def _strict_json(payload) -> str:
+    """
+    Serialise a payload as compact, strict JSON — the text every packed block holds.
+
+    Non-finite floats become null first (_json_safe), and allow_nan=False
+    makes a missed one raise instead of emitting a NaN token no browser can
+    parse. The scenario explorer serialises each cell's figures with it as it
+    walks the grid (_ExplorerVisitor), so a size cap's block is joined from
+    texts that are each strict JSON.
+
+    Args:
+        payload: A JSON-serialisable structure.
+
+    Returns:
+        str: The JSON text, with no whitespace between tokens.
+    """
+    return json.dumps(_json_safe(payload), allow_nan=False, separators=(",", ":"))
+
+
+def _packed_text_script(element_id: str, raw: str) -> str:
+    """
+    Pack a JSON text as _packed_json_script packs a payload.
+
+    The scenario explorer's per-cap blocks ("scn-cap-<i>") are packed here:
+    _ExplorerVisitor assembles each from texts it serialised cell by cell,
+    so there is no payload object to hand _packed_json_script.
+
+    Args:
+        element_id (str): The block's id.
+        raw (str): Strict JSON text (_strict_json's, or a join of such texts).
+
+    Returns:
+        str: The <script type="text/plain" data-encoding="gzip+base64"> element,
+            gzip's mtime pinned to 0 so the same text always packs alike.
+    """
     packed = base64.b64encode(gzip.compress(raw.encode("utf-8"), mtime=0)).decode("ascii")
     return (f'<script type="text/plain" id="{element_id}" data-encoding="gzip+base64">'
             f"{packed}</script>")
@@ -5821,7 +6763,11 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
 # from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
 # D.kd), both for the scenario on screen and both returning at once on a page
-# without them. On load it inflates the base block and the primary scenario's
+# without them, and after each redraw hands the scenario on screen to the
+# scenario explorer (window.dashScenarioSelect, by option label — defined by
+# the explorer's own script, _SCENARIO_EXPLORER_JS, only on a page carrying
+# its grid, and called only when it is; the explorer moves only the axes whose
+# label changed). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a scenario needs it and
 # kept while among the last KEEP drawn (the primary's always); a choice made
@@ -6250,6 +7196,16 @@ _FILTER_JS = r"""
     // both return at once on a page that lacks their elements or data
     renderKhatCards();
     renderKd();
+    // The Scenario Explorer's selects follow the scenario ON SCREEN (SHOWN),
+    // named by its option labels (Python's _band_option, _k_option and
+    // _cap_option name both grids); the explorer moves an axis only when the
+    // label on it changed since the last call, so this call after a category
+    // or tag redraw moves nothing. A page without the explorer's grid has no
+    // such function, and nothing is called
+    if (typeof window.dashScenarioSelect === 'function') {
+      window.dashScenarioSelect(D.bands[SHOWN[0]].label, D.ks[SHOWN[1]].label,
+                                D.caps[SHOWN[2]].label);
+    }
   }
 
   // A block is gzip-compressed JSON in base64 (_packed_json_script),
@@ -6433,9 +7389,17 @@ def generate_dashboard(
     size-cap sweep's cells are simulated during that walk, the busiest of
     them feeds the header's stale-cutoff test (_MaxTrades), a size-cap
     sweep the walk could not use is named on the run-settings line
-    (_run_settings_html's cap_sweep_unused), and the interval-discount
+    (_run_settings_html's cap_sweep_unused), the interval-discount
     section's rows and curves at every k and cap of the primary band are
-    collected for it and for the script (_KdVisitor, "kd"). If that data
+    collected for it and for the script (_KdVisitor, "kd"), and so are the
+    scenario explorer's figures at every band x k x cap (_ExplorerVisitor,
+    whose blocks the explorer section writes; built from the sweep's own
+    eager points instead when that visitor fails or the walk cannot run —
+    at the run's own cap, which a grey line in the section says when the run
+    carried a size-cap sweep (_EXPLORER_OWN_CAP_HTML), and the bar's summary
+    sentence when the bar offers more caps (_bar_reach) — and a notice in
+    the section's place only if even that fails — the page is
+    always written). If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
@@ -6611,12 +7575,29 @@ def generate_dashboard(
     # it was lost to a failure of its own
     kd: dict | None = None
     kd_failed = False
+    # The scenario explorer's data, from the same walk (its visitor rides it,
+    # so a size-cap sweep's cells are simulated once for the whole page) —
+    # or, when its visitor failed or the walk could not run, from the sweep's
+    # own eager points at the run's own cap; explorer_failed when even that
+    # failed (the section is then a notice, and the page is still written),
+    # explorer_rebuilt when that rebuild is what the section shows.
+    # Only a band sweep has scenarios to explore.
+    explores = sweep is not None and bool(sweep.scenarios)
+    explorer_data: _ExplorerData | None = None
+    explorer_failed = explorer_rebuilt = False
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
+        explorer_visitor = _new_explorer_visitor(source, sweep) if explores else None
         source, chunker, counter, kd_visitor = _build_filter_grid(
             source, trades, equity_df, k_used, start_date, initial_balance, series_categories,
-            pooled_k=_pooled_k(sweep))
+            pooled_k=_pooled_k(sweep), explorer=explorer_visitor)
         walked = source
+        if explores:
+            explorer_data = None if explorer_visitor is None else explorer_visitor.payload()
+            if explorer_data is None:
+                # Its visitor failed (and said so): the sweep's own points
+                explorer_data, explorer_failed = _explorer_fallback(sweep)
+                explorer_rebuilt = not explorer_failed
         if not counter.failed:
             most_traded = counter.most
         # A chunk that failed to build has already said so and dropped them all
@@ -6632,8 +7613,17 @@ def generate_dashboard(
             if sweep is not None:
                 kd = kd_visitor.payload()
                 kd_failed = kd is None
-            filter_data = _filter_payload(source, chunker, start_date, initial_balance,
-                                          series_categories, kd=kd, tainted=tainted)
+            # The summary's closing sentence claims the explorer follows the
+            # bar only when the page carries its grid (and so its script), and
+            # follows its size cap only when the explorer's cap axis is the
+            # bar's — an explorer rebuilt from the eager points has the run's
+            # own cap alone, while the bar may offer every cap
+            explorer_grid = explorer_data is not None and explorer_data.checks
+            filter_data = _filter_payload(
+                source, chunker, start_date, initial_balance, series_categories, kd=kd,
+                tainted=tainted, explorer=explorer_grid,
+                explorer_caps=explorer_grid and explorer_data.base["cap_labels"]
+                == [_cap_option(cap) for cap in source.caps])
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
@@ -6646,6 +7636,10 @@ def generate_dashboard(
         filter_data, filter_bar, chunks = None, _FILTER_UNAVAILABLE_HTML, []
         # Without the bar the section cannot follow it, whatever was built
         kd, kd_failed = None, False
+    if explores and explorer_data is None and not explorer_failed:
+        # The walk never got as far as the explorer: its own eager points
+        explorer_data, explorer_failed = _explorer_fallback(sweep)
+        explorer_rebuilt = not explorer_failed
 
     # The ladder setting decides which pairs exist, the primary spread band
     # which of them are ever entered and the per-trade cap how big each is,
@@ -6691,8 +7685,13 @@ def generate_dashboard(
         # Also takes the sweep whole — it reads .scenarios, .same_title_point
         # and .calibrations_by_band, none of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
-        # header's run-settings line) drift onto different bands or settings.
-        lambda: _section_scenario_explorer(sweep),
+        # header's run-settings line) drift onto different bands or settings —
+        # and the walk's data for every band x k x size cap (or a notice when
+        # neither the walk nor the sweep's own points could build it, and a
+        # grey line when the sweep's own points stand in for a size-cap sweep)
+        lambda: _section_scenario_explorer(
+            sweep, explorer_data, unavailable=explorer_failed,
+            own_cap_only=explorer_rebuilt and sweep.cap_sweep is not None),
         lambda: _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
