@@ -2870,7 +2870,9 @@ class TestCheckpointPrefilterIsResultNeutral:
         # checkpoint enters AT that checkpoint, and every market that opened
         # AT a checkpoint and closes before the next Monday is admissible is
         # dropped — the two sides of the boundary, both present in the corpus.
-        markets, _req, new = self._candidates(monkeypatch, 0, old=False)
+        # Ladders pinned off, the setting this row was written and measured
+        # under, so the shipped switch cannot change which pairs it inspects.
+        markets, _req, new = self._candidates(monkeypatch, 0, old=False, ladders=False)
         by_ticker = {m["ticker"]: m for m in markets}
         entered_at_the_edge = False
         for key, e in self._every_entry(new).items():
@@ -2963,12 +2965,16 @@ class TestCheckpointPrefilterIsResultNeutral:
         assert sorted(map(astuple, trades_new)) == sorted(map(astuple, trades_old))
         pd.testing.assert_frame_equal(eq_new, eq_old)
 
+    @pytest.mark.parametrize("ladders", [False, True])
     @pytest.mark.parametrize("seed", [0, 1])
-    def test_run_backtest_is_unchanged(self, monkeypatch, seed):
+    def test_run_backtest_is_unchanged(self, monkeypatch, seed, ladders):
         results = {}
         for old in (True, False):
             with monkeypatch.context() as mp:
                 self._patch(mp, seed, old)
+                # run_backtest takes no ladder argument, so backtester's own
+                # binding is its seam; both states are covered whichever ships.
+                mp.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", ladders)
                 results[old] = run_backtest(
                     hist_client=MagicMock(), live_client=MagicMock(),
                     start_date=_P5_START, initial_balance=10_000.0)
@@ -3146,6 +3152,10 @@ class TestExtractPairsWindowedEquivalence:
     afterwards, so a few boundary candidates one day past the true limit are
     harmless to include here and are proven out separately in
     TestFindEntryTieredThreshold.test_over_max_gap_rejected_regardless_of_price).
+
+    Every switch-off row passes same_event_ladders=False explicitly: the naive
+    oracle's default is the switch-off rule, and a row that left the flag to
+    the shipped switch would change meaning the day it flips.
     """
 
     def _build_synthetic_group(self) -> list[dict]:
@@ -3187,7 +3197,7 @@ class TestExtractPairsWindowedEquivalence:
         members = self._build_synthetic_group()
         groups = {"synthetic": members}
 
-        windowed = _extract_pairs(groups)
+        windowed = _extract_pairs(groups, same_event_ladders=False)
         windowed_set = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
 
         margin_days = MAX_DEADLINE_GAP_DAYS + 1
@@ -3200,7 +3210,7 @@ class TestExtractPairsWindowedEquivalence:
     def test_boundary_probes_land_exactly_where_expected(self):
         members = self._build_synthetic_group()
         groups = {"synthetic": members}
-        windowed = _extract_pairs(groups)
+        windowed = _extract_pairs(groups, same_event_ladders=False)
         pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
 
         assert frozenset(["REF", "PLUS30"]) in pair_tickers
@@ -3209,7 +3219,7 @@ class TestExtractPairsWindowedEquivalence:
 
     def test_cross_cluster_pairs_never_appear(self):
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members})
+        windowed = _extract_pairs({"synthetic": members}, same_event_ladders=False)
         for a, b, _, _ in windowed:
             assert not (a["ticker"].startswith("A") and b["ticker"].startswith("B"))
             assert not (a["ticker"].startswith("B") and b["ticker"].startswith("A"))
@@ -3220,7 +3230,7 @@ class TestExtractPairsWindowedEquivalence:
         # is effective rather than vacuous — the row below admits exactly this
         # pair with the switch on, which is what proves it.
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members})
+        windowed = _extract_pairs({"synthetic": members}, same_event_ladders=False)
         pair_tickers = {frozenset([a["ticker"], b["ticker"]]) for a, b, _, _ in windowed}
         assert frozenset(["SAMEEVT-1", "SAMEEVT-2"]) not in pair_tickers
 
@@ -3237,12 +3247,13 @@ class TestExtractPairsWindowedEquivalence:
         # The switch-on set is exactly the switch-off set plus the one ladder,
         # so this row cannot pass by both sides being wrong the same way.
         off_set = {frozenset([a["ticker"], b["ticker"]])
-                   for a, b, _, _ in _extract_pairs({"synthetic": members})}
+                   for a, b, _, _ in _extract_pairs({"synthetic": members},
+                                                    same_event_ladders=False)}
         assert windowed_set - off_set == {frozenset(["SAMEEVT-1", "SAMEEVT-2"])}
 
     def test_missing_close_time_member_produces_no_pairs(self):
         members = self._build_synthetic_group()
-        windowed = _extract_pairs({"synthetic": members})
+        windowed = _extract_pairs({"synthetic": members}, same_event_ladders=False)
         for a, b, _, _ in windowed:
             assert a["ticker"] != "NOCLOSE"
             assert b["ticker"] != "NOCLOSE"
@@ -3843,9 +3854,10 @@ class TestExtractPairsPerformanceSmoke:
     whole change exists to fix, so it's the meaningful unit to time here.
 
     Every member gets its own event_ticker, so this guards the CROSS-EVENT
-    sweep only — the DR-73 same-event sub-pass is not exercised here at all
-    (every bucket holds one member, so it does no pairwise work). Its cost is
-    bounded by the measurement recorded in _extract_pairs' docstring instead.
+    sweep only. The DR-73 same-event sub-pass runs (the call pins ladders on,
+    so its bucketing is timed too) but does no pairwise work here: every
+    bucket holds one member. Its cost at scale is bounded by the measurement
+    recorded in _extract_pairs' docstring instead.
     """
 
     def test_50k_member_group_completes_in_seconds(self):
@@ -3862,7 +3874,8 @@ class TestExtractPairsPerformanceSmoke:
         groups = {"synthetic-ladder": members}
 
         t0 = time.perf_counter()
-        pairs = _extract_pairs(groups)
+        # Pinned ON whatever the switch ships as (see the class docstring).
+        pairs = _extract_pairs(groups, same_event_ladders=True)
         elapsed = time.perf_counter() - t0
 
         assert elapsed < 30, f"windowed _extract_pairs took {elapsed:.1f}s for {n} members"
@@ -6741,6 +6754,18 @@ class TestRunBacktestSweep:
         assert result.primary.k == 0.62
         assert result.points == [result.primary]
 
+    @pytest.mark.parametrize("configured", [True, False])
+    @pytest.mark.parametrize("passed", [None, True, False])
+    def test_feasibility_short_circuit_records_the_ladder_setting(
+        self, monkeypatch, passed, configured,
+    ):
+        # The infeasible branch resolves the flag for its report itself.
+        # Crossed against both bindings: a row whose override agrees with the
+        # constant passes a branch that records the wrong one of the two.
+        monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        result = self._infeasible(monkeypatch, same_event_ladders=passed)
+        assert result.same_event_ladders is (configured if passed is None else passed)
+
 
 class TestSimulationsAreLabelledWithTheirDiscount:
     """
@@ -6852,6 +6877,29 @@ class TestSimulationsAreLabelledWithTheirDiscount:
         other = "off" if expected == "on" else "on"
         assert (f"Same-event deadline ladders (DR-73): {other} "
                 "(run-level override)") in caplog.text
+
+    @pytest.mark.parametrize("configured", [True, False])
+    @pytest.mark.parametrize("passed", [None, True, False])
+    def test_the_sweep_records_the_ladder_setting_it_ran_under(
+        self, monkeypatch, passed, configured,
+    ):
+        # BacktestSweep.same_event_ladders feeds the dashboard header, so it
+        # must be the setting the pairs were extracted under. Crossed against
+        # both bindings: a row whose override agrees with the constant passes a
+        # sweep that records the constant instead of the override.
+        monkeypatch.setattr(backtester, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None,
+                                same_event_ladders=k.get("same_event_ladders")))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            same_event_ladders=passed,
+        )
+        assert sweep.same_event_ladders is (configured if passed is None else passed)
 
     def test_run_backtest_leaves_the_ladder_flag_to_the_config(self, monkeypatch):
         # run_backtest keeps its exact pre-DR-73 signature, so it must pass no

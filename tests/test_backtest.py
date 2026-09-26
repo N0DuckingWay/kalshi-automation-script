@@ -204,26 +204,35 @@ class TestSameEventLaddersArgument:
         assert kwargs["interval_discount"] == pytest.approx(0.4)
         assert kwargs["sweep"] is False
 
-    def test_the_config_echo_names_the_effective_setting(self, cli, monkeypatch, caplog):
+    @pytest.mark.parametrize("flag, configured, word", [
+        ("--same-event-ladders", False, "on"),
+        ("--no-same-event-ladders", True, "off"),
+    ])
+    def test_the_config_echo_names_the_effective_setting(self, cli, monkeypatch, caplog,
+                                                         flag, configured, word):
         # Echoed BEFORE the fetch, beside k, so an operator can abort a
-        # multi-hour run configured the wrong way round.
+        # multi-hour run configured the wrong way round. Each flag is run
+        # against the OPPOSITE configured value, so the echo can only print
+        # `word` by honouring the flag: a flag that agreed with the constant
+        # would pass an echo that ignores the flag entirely.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--same-event-ladders")
-        assert "ladders=on" in caplog.text
+            _run(monkeypatch, flag)
+        assert f"ladders={word}" in caplog.text
 
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
     def test_the_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch,
-                                                             caplog):
-        # Patched to the NON-shipped value on purpose: with the constant set
-        # to its own default (False) this row passes for any implementation
-        # that ignores it entirely, including `bool(args.same_event_ladders)`
-        # — and would then print "off" on a genuinely ON run the moment the
-        # switch is flipped, which is exactly what this echo exists to catch.
-        # The module attribute is the seam, not config's: backtest.py binds
-        # the constant by value at import.
-        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+                                                             caplog, configured, word):
+        # Patched to BOTH values: one row at either value passes an echo
+        # hard-coded to that value (`bool(args.same_event_ladders)` prints
+        # "off" on a genuinely ON run, a literal "on" prints "on" on an OFF
+        # one) — the misreport this pre-fetch echo exists to catch before a
+        # multi-hour fetch. The module attribute is the seam, not config's:
+        # backtest.py binds the constant by value at import.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", configured)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert "ladders=on" in caplog.text
+        assert f"ladders={word}" in caplog.text
 
 
 class TestSpreadBandArguments:
@@ -352,6 +361,9 @@ class TestSpreadBandEcho:
     def test_echo_keeps_the_k_and_ladders_substrings(self, cli, monkeypatch, caplog):
         # The existing "k=..."/"ladders=..." substrings other tests and
         # tooling grep for must survive the appended band fields verbatim.
+        # The switch is pinned off, the setting this row was written under,
+        # so its "ladders=on" comes from the flag and not from the constant.
+        monkeypatch.setattr(backtest, "TIME_SERIES_SAME_EVENT_LADDERS", False)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--interval-discount", "0.62", "--same-event-ladders")
         text = caplog.text
