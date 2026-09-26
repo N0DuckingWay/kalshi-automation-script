@@ -7,8 +7,8 @@ Purpose:
     Command-line entry point for the Kalshi backtester. Parses CLI
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
-    --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep),
-    configures logging to kalshi_backtest.log, constructs the necessary API
+    --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
+    --no-cap-sweep), configures logging to kalshi_backtest.log, constructs the necessary API
     clients, delegates the full backtest simulation to
     backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report.
@@ -89,6 +89,15 @@ Notes:
     grid ceiling sits at or below either tier); --no-band-sweep skips that
     grid (band_sweep=False): the primary scenario still runs, but the
     dashboard's scenario explorer has no scenarios to show.
+
+    The per-trade size-cap sweep is ON by default too (cap_sweep=True): the
+    result carries a lazy backtester.CapSweep over backtester.SIZE_CAP_SWEEP
+    (5%..95% and no cap), whose cells are simulated only when a report reads
+    them — the run itself simulates nothing extra, and every point it returns,
+    the summary block included, is sized at the run's own cap,
+    config.BUDGET_FRACTION. --no-cap-sweep returns cap_sweep=None. Like the
+    band and k sweeps it is backtest-only: live sizing reads
+    config.BUDGET_FRACTION and nothing here writes config.py.
 """
 import argparse
 import logging
@@ -201,7 +210,7 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep), configures logging, constructs
+    --spread-max, --no-band-sweep, --no-cap-sweep), configures logging, constructs
     historical and live Kalshi API clients, runs the full backtest
     simulation via run_backtest_sweep(), and generates an interactive HTML
     dashboard via generate_dashboard(). Logs a summary table of key metrics to
@@ -209,10 +218,12 @@ def main() -> None:
     RotatingFileHandler, no console handler, so nothing reaches stdout).
 
     The summary block reports the PRIMARY point of the sweep — the run at the
-    effective interval discount and the primary spread band — so a default
-    run's summary block reads exactly as the plain run_backtest() path's did.
-    The other swept discounts and bands exist only for the dashboard's k
-    selector, its scenario explorer and the calibration report.
+    effective interval discount, the primary spread band and the run's own
+    per-trade size cap — so a default run's summary block reads exactly as
+    the plain run_backtest() path's did. The other swept discounts and bands
+    exist only for the dashboard's k selector, its scenario explorer and the
+    calibration report, and the lazily simulated size caps
+    (result.cap_sweep) only for a report that reads its cells.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -284,6 +295,13 @@ def main() -> None:
         "--no-band-sweep", action="store_true",
         help="Skip the spread-band grid; the dashboard's scenario explorer "
              "is not computed",
+    )
+    parser.add_argument(
+        "--no-cap-sweep", action="store_true",
+        help="Skip the per-trade size-cap sweep (the result's cap_sweep is "
+             "None): only the run's own cap, config.BUDGET_FRACTION, is left "
+             "for a report to show. Backtest only — live sizing always reads "
+             "config.BUDGET_FRACTION",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -384,13 +402,18 @@ def main() -> None:
     # before any fetch, renders the resolved band exactly.
     echo_floor, echo_ceiling = time_series_spread_band(spread_band)
     band_sweep = not args.no_band_sweep
+    # ON by default, like the band sweep: it simulates nothing during the run
+    # (each cell is simulated lazily, only when a report reads it), so the
+    # opt-out saves nothing in the run itself — only the time and size of
+    # whatever report reads the cells, and the entries kept alive for it
+    cap_sweep = not args.no_cap_sweep
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
-        "| spread band=%g-%g | band sweep=%s",
+        "| spread band=%g-%g | band sweep=%s | cap sweep=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
         "on" if effective_ladders else "off", echo_floor, echo_ceiling,
-        "on" if band_sweep else "off",
+        "on" if band_sweep else "off", "on" if cap_sweep else "off",
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -455,11 +478,14 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         spread_band=spread_band,
         band_sweep=band_sweep,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) unless --no-band-sweep
+        cap_sweep=cap_sweep,
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweep (cap_sweep) unless --no-cap-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
-    # existed. The remaining k points are consumed only by the k selector,
-    # and the band-sweep payload only by the dashboard's scenario explorer.
+    # existed. The remaining k points and the band-sweep payload are consumed
+    # only by the dashboard's k selector and scenario explorer, and the lazy
+    # size-cap sweep (result.cap_sweep, simulated only when a cell is read)
+    # only by a report that reads its cells.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -490,7 +516,8 @@ def main() -> None:
     # don't duplicate that line here, just point the user at the file.
     #
     # sweep carries the calibration and every swept point for the k selector,
-    # the scenario explorer's band x k payload and the header's run-settings
+    # the scenario explorer's band x k payload, the lazy size-cap sweep
+    # (cap_sweep, None under --no-cap-sweep) and the header's run-settings
     # line; interval_discount is the resolved k these trades were sized at,
     # which the Risk section's Kelly scatter must price on
     #

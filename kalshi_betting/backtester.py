@@ -47,7 +47,8 @@ Dependencies:
     grid _candle_window_open floors a market's open onto),
     LARGE_GROUP_WARN_THRESHOLD,
     INTERVAL_DISCOUNT_SWEEP and the band grid SPREAD_BAND_SWEEP_FLOORS /
-    SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates),
+    SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates;
+    the size-cap grid SIZE_CAP_SWEEP is defined HERE instead, see Notes),
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
     SETTLED_PREFILTER_CACHE_TAG, SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS from
@@ -67,7 +68,8 @@ Dependencies:
     to either sizing formula must be made in both places to keep live/backtest
     parity. Exports BacktestTrade, HalfSplit, SweepPoint,
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
-    OutcomeLabelCoverage and BacktestSweep (BacktestTrade, BacktestSweep,
+    OutcomeLabelCoverage, CapSweep, SIZE_CAP_SWEEP and BacktestSweep
+    (BacktestTrade, BacktestSweep,
     IntervalCalibration, OutcomeLabelCoverage and SweepPoint are consumed by
     dashboard.py, which also imports the private helpers _exact_label,
     _leg_prices_for, _build_equity_curve — the one definition of an equity
@@ -138,6 +140,19 @@ Notes:
     run_backtest() is untouched by it — same signature, same two-tuple — so
     every existing caller keeps working.
 
+    The per-trade Kelly size cap is a simulation parameter too:
+    _simulate_at_discount(..., size_cap=None) sizes every candidate at
+    min(cap, f*), where None resolves this module's BUDGET_FRACTION at call
+    time — the live sizer's cap, so every existing call sizes exactly as
+    before. With cap_sweep, run_backtest_sweep also returns a CapSweep: every
+    other cap of SIZE_CAP_SWEEP (5%..95% and no cap — a grid that lives here,
+    not in config.py, by the operator's instruction for this change),
+    simulated LAZILY, one (band, k) cell at a time, when a reader asks —
+    keeping every band x k x cap x population point would hold gigabytes.
+    Each cell is seeded from the eager point: every cap at or above a point's
+    (cap-independent) peak_kelly_fraction sizes identically, so those caps
+    share one simulation. Live sizing never reads any of it.
+
     Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
     Monday-09:00-UTC checkpoint on/after start_date, and requires both legs to
@@ -206,6 +221,7 @@ Notes:
     watching.
 """
 import logging
+import numbers
 import resource
 import statistics
 import sys
@@ -213,8 +229,9 @@ from array import array
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import numpy as np
@@ -313,6 +330,141 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
     f"{population}/{run}" for population in _CHECKED_POPULATIONS
     for run in ("H1", "H2", "ex-top"))
 
+# The per-trade size caps a size-cap sweep offers the dashboard: 5% steps to
+# 95%, then 1.0 — NO cap. Kelly's f* = p - q/b <= p <= 1 (time_series_profit_prob
+# is 1 - k*max(0, pB-pA) with k in [0, 1]; same-title prices at the fixed
+# SAME_TITLE_CO_RESOLVE_PROB), so min(1.0, f*) is f* itself and "100%" and
+# "off" are one run. BACKTEST-ONLY: live sizing reads config.BUDGET_FRACTION
+# and strategy.py never imports this module. Rounded to two decimals, so 0.2
+# is a member by value; the run's own cap is unioned in anyway (CapSweep), as
+# the k grid unions its primary. Lives here rather than in config.py beside
+# INTERVAL_DISCOUNT_SWEEP by the operator's instruction for this change (only
+# the dashboard and backtest code may move) — the one named exception in
+# CLAUDE.md's constants rule. Read only by _sweep_from_candidates.
+SIZE_CAP_SWEEP: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20)) + (1.0,)
+
+
+def _resolve_size_cap(size_cap: float | None) -> float:
+    """
+    Resolve and validate the per-trade Kelly size cap one simulation sizes under.
+
+    None is the "no override" sentinel and resolves to this module's
+    BUDGET_FRACTION, read at CALL time — never bound as a default at def time —
+    so a test that monkeypatches backtester.BUDGET_FRACTION (e.g.
+    TestCheckpointOpeningBalanceSizing::test_greedy_fit_skips_rather_than_shrinks)
+    still sizes at the patched value. Any real number is accepted — a
+    numbers.Real, so numpy's float64/float32/int64 and a Fraction as well as
+    int and float — and returned as a builtin float. A cap outside (0, 1] is
+    refused: 0 sizes nothing, and above 1 means nothing because Kelly's f*
+    never exceeds 1 for k in [0, 1] (see SIZE_CAP_SWEEP); NaN fails that
+    range test too (every comparison is False). A bool (or numpy bool) is
+    refused although Python counts it as an int (True would silently read as
+    "no cap"), and so is anything that is not a numbers.Real, e.g. the string
+    "0.2" or a Decimal — each with a message naming the type rather than the
+    range, so a type bug is not reported as an out-of-range value.
+
+    Args:
+        size_cap (float | None): The cap as a fraction of the checkpoint's
+            opening balance, in (0, 1]; None for config.BUDGET_FRACTION.
+
+    Returns:
+        float: The resolved cap, as a builtin float.
+
+    Raises:
+        ValueError: If the resolved cap is a bool, not a numbers.Real, NaN,
+            or outside (0, 1] — a caller bug, raised before any entry is
+            scored.
+    """
+    cap = BUDGET_FRACTION if size_cap is None else size_cap
+    if isinstance(cap, (bool, np.bool_)) or not isinstance(cap, numbers.Real):
+        raise ValueError(
+            f"size_cap must be a real number in (0, 1], got {size_cap!r} "
+            f"({type(size_cap).__name__})")
+    value = float(cap)
+    if not 0.0 < value <= 1.0:
+        raise ValueError(f"size_cap must be in (0, 1], got {size_cap!r}")
+    return value
+
+
+def _cap_percent(cap: float) -> str:
+    """
+    Render a size cap as a percentage, injectively.
+
+    The cap's shortest round-trip decimal (repr) shifted two places, in plain
+    notation with trailing zeros dropped: every SIZE_CAP_SWEEP member reads as
+    it is written ("5", "20", "55", "100"), while an off-grid cap keeps every
+    digit that tells it apart (0.19999999999999998 -> "19.999999999999998",
+    never "20"). The shift is exact decimal arithmetic, so two different caps
+    can never print alike — the property a completion-line prefix needs
+    (TS-21). A float product such as repr(cap * 100) is NOT injective: cap *
+    100 rounds, and neighbouring doubles (0.003 and 0.0029999999999999996)
+    land on one product.
+
+    Args:
+        cap (float): A cap in (0, 1] — a builtin float or any float
+            subclass (numpy's float64 included), rendered by the shortest
+            round-trip digits of its builtin float value.
+
+    Returns:
+        str: The percentage, without the "%" sign.
+    """
+    # repr of the BUILTIN float: a float subclass such as numpy's float64
+    # reprs as "np.float64(0.35)", which Decimal cannot parse
+    return format((Decimal(repr(float(cap))) * 100).normalize(), "f")
+
+
+def _cap_label(cap: float) -> str:
+    """
+    Name a resolved size cap for a completion line or a log summary.
+
+    Args:
+        cap (float): A resolved cap in (0, 1].
+
+    Returns:
+        str: "no cap" for 1.0 (sizing at full Kelly — see SIZE_CAP_SWEEP),
+            else "cap <percent>%" through _cap_percent, so two caps never
+            share a label.
+    """
+    return "no cap" if cap >= 1.0 else f"cap {_cap_percent(cap)}%"
+
+
+def _sim_options(size_cap: float | None, quiet: bool, *,
+                 end_date: date | None = None) -> dict:
+    """
+    Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
+
+    ONLY the options that differ from _simulate_at_discount's defaults are
+    included, so every default-cap call is made with exactly the keywords it
+    carried before the size cap existed — the test stand-ins with fixed
+    six-parameter signatures (tests/test_backtester.py's golden_band_sweep
+    simulate_spy and three fake_simulate functions) and the verbatim kwargs
+    assertion in TestSweepHelpers::test_ex_top_event_picks_the_largest_summed_profit
+    keep working. A cap equal to this module's BUDGET_FRACTION (read at call
+    time) means the same as None and is dropped too.
+
+    Args:
+        size_cap (float | None): The cap the caller simulates under; None or
+            BUDGET_FRACTION for the default.
+        quiet (bool): Whether the simulation's completion line and
+            premise-violation WARNING go to DEBUG.
+        end_date (date | None): Keyword-only. The day the simulation's
+            equity curve must end on (a lazy size-cap run pins its eager
+            point's); None (default) leaves _build_equity_curve reading
+            today (UTC) and is not forwarded.
+
+    Returns:
+        dict: {} on a default call; otherwise "size_cap", "quiet" and/or
+            "end_date".
+    """
+    out: dict = {}
+    if size_cap is not None and size_cap != BUDGET_FRACTION:
+        out["size_cap"] = size_cap
+    if quiet:
+        out["quiet"] = True
+    if end_date is not None:
+        out["end_date"] = end_date
+    return out
+
 # ─── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -372,7 +524,9 @@ class BacktestTrade:
         monthly_profit_ratio (float): Realized profit_ratio scaled to 30 days:
             profit_ratio * 30 / holding_days. Reporting only — trade selection
             uses the entry-time expected ratio to avoid look-ahead bias.
-        kelly_fraction (float): Capped Kelly fraction used for sizing, <= BUDGET_FRACTION.
+        kelly_fraction (float): Capped Kelly fraction used for sizing, <= the
+            size cap it was simulated under — config.BUDGET_FRACTION unless a
+            size-cap sweep (CapSweep) simulated another.
         expected_payoff (float): NET profit in a win scenario after exact fees:
             n * (1 − price_a − price_b) − fees on the leg prices above. For
             same_title this is the guaranteed floor (every co-resolution
@@ -446,7 +600,7 @@ class BacktestTrade:
     profit: float
     profit_ratio: float
     monthly_profit_ratio: float  # realized profit_ratio * 30 / holding_days (reporting only)
-    kelly_fraction: float        # capped Kelly fraction used for sizing
+    kelly_fraction: float        # capped Kelly fraction used for sizing (<= the run's size cap)
     expected_payoff: float  # n * (1 - price_a - price_b) minus fees — same_title floor / time_series win-cell profit
     slippage: float         # profit - expected_payoff
     holding_days: int
@@ -607,6 +761,21 @@ class SweepPoint:
             below by −100%. Set only on the "all" and "time_series" points of
             a band sweep, and None there too when no trade names an event
             (there is no event to drop).
+        size_cap (float | None): The RESOLVED per-trade Kelly size cap this
+            point was sized under — config.BUDGET_FRACTION unless a size-cap
+            sweep simulated another; 1.0 means no cap (full Kelly). None only
+            on a hand-built point, which a report labels "not recorded".
+            Appended with a default, like the two fields below it, so no
+            existing construction moves.
+        peak_kelly_fraction (float | None): The largest UNCAPPED Kelly
+            fraction f* any candidate reached after the Kelly gate — counted
+            before the settlement-outcome and premise checks, so a candidate
+            those later drop still counts — and 0.0 when none passed. It does
+            not depend on the cap (Pass 1b scores every entry before any
+            sizing), and every cap at or above it sizes this point's entries
+            identically, since min(cap, f*) == f* for every candidate; a
+            size-cap sweep reuses one simulation for all such caps
+            (CapSweep). None only on a hand-built point.
     """
     k: float
     trades: list[BacktestTrade]
@@ -615,6 +784,8 @@ class SweepPoint:
     population: str = "all"
     halves: HalfSplit | None = None
     ex_top_event: tuple[str, float] | None = None
+    size_cap: float | None = None
+    peak_kelly_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -936,6 +1107,292 @@ class _Candidates:
     corpus_provenance: CorpusProvenance | None = None
 
 
+def _curve_end_date(point: SweepPoint | None) -> date | None:
+    """
+    Read the last day of a point's equity curve, when it can be read.
+
+    CapSweep pins every lazy size-cap simulation of a population to this day,
+    so a cell read after UTC midnight still ends every cap's curve where the
+    eager point's ended (see CapSweep). Read BY TYPE, never by truthiness:
+    a hand-built point whose frame has no "date" column, an empty frame or a
+    non-date value yields None, and the caller then leaves the simulation
+    reading today (UTC) as before.
+
+    Args:
+        point (SweepPoint | None): The eager point, or None when there is none.
+
+    Returns:
+        date | None: The curve's last "date" (a datetime reduced to its date),
+            or None when point is None or its curve carries no readable date.
+    """
+    if point is None:
+        return None
+    df = point.equity_df
+    if not isinstance(df, pd.DataFrame) or "date" not in df.columns or df.empty:
+        return None
+    last = df["date"].iloc[-1]
+    if isinstance(last, datetime):
+        return last.date()
+    return last if isinstance(last, date) else None
+
+
+@dataclass
+class CapSweep:
+    """
+    Every per-trade size cap of one sweep, simulated ON DEMAND, one (band, k) cell at a time.
+
+    run_backtest_sweep simulates every band x k scenario eagerly at the run's
+    own cap (config.BUDGET_FRACTION), exactly as it did before the size cap
+    existed. The other caps of SIZE_CAP_SWEEP are simulated only here, when a
+    reader asks for a cell: keeping every band x k x cap x population point
+    would hold gigabytes of trades and curves (an estimated 2.5-5 GB; one
+    BacktestTrade retains ~2.3 KB and one equity curve ~27 KB at 370 rows,
+    ~114 KB at 2,463 rows, measured 2026-09-26 with tracemalloc on synthetic
+    records). The reader — the dashboard — is meant
+    to summarise each cell and drop it; nothing here is memoised, so asking
+    for a cell twice simulates it twice.
+
+    Seeded from the eager point. A point's peak_kelly_fraction does not depend
+    on the cap, and every cap at or above it sizes the point's entries
+    identically (min(cap, f*) == f* for every candidate). So:
+      * the primary cap always returns the eager object ITSELF;
+      * when the primary cap is itself at or above the eager point's peak,
+        every other cap at or above that peak returns a
+        dataclasses.replace(eager, size_cap=cap) copy sharing its trades,
+        curve, halves and top-event check;
+      * when the primary cap is BELOW the peak (the eager point was capped),
+        the eager point does NOT size as the larger caps do — the first cap
+        at or above the peak is simulated, and every larger cap shares THAT
+        point's objects instead;
+      * every other cap below the peak is simulated.
+    Sharing is exact, not approximate: the halves and the excluding-top-event
+    re-simulation run over subsets of the point's entries, whose own peaks are
+    no higher, so they too size identically at every cap at or above the
+    point's peak. A simulated cap runs quiet — its completion line and its
+    premise-violation WARNING go to DEBUG, since the primary-cap run already
+    reported the same count and ~10 repeats per cell would flood the log
+    (TS-02) — and it is pinned to the eager point's end date
+    (_curve_end_date): _build_equity_curve otherwise runs every curve to
+    today (UTC) as read at simulation time, so a cell read after UTC
+    midnight (a dashboard walks every cell long after the run) would give
+    its simulated caps one more row than the eager point and the copies
+    sharing its curve, and neighbouring caps' Sharpe/Sortino would cover
+    different spans. The eager points themselves still read the clock as
+    they are simulated, exactly as before the cap sweep, so an eager phase
+    that straddles UTC midnight can end two cells' (or two populations')
+    curves on different days; every cap of ONE population ends on the same
+    day. A population with no eager point (a hand-built CapSweep) reads the
+    clock at simulation time.
+
+    Retention (TS-07's residency rule, declared): the sweep keeps
+    entries_by_band alive for the reader: one small entry dict per band per
+    entry, and every entered pair's two market dicts. Every band's entered
+    PAIRS are a subset of the no-band band's (see the pre-pass comment in
+    _sweep_from_candidates), so the market dicts are bounded by the no-band
+    band's entries: 405 (399 time-series + 6 same-title; 60-405 across the
+    36 bands) on the 2026-09-26 01:22 365-day run's log, hence at most ~810
+    distinct market dicts — a few MB. Nothing else from the corpus is kept;
+    the eager points it references are the ones BacktestSweep already
+    holds.
+
+    BACKTEST-ONLY, like the band and k sweeps: live sizing reads
+    config.BUDGET_FRACTION and never this module.
+
+    Attributes:
+        caps (tuple[float, ...]): Ascending: SIZE_CAP_SWEEP with the primary
+            cap unioned in (1.0 = no cap).
+        primary_cap (float): The run's own resolved cap — every eager point's
+            size_cap.
+        bands (tuple[tuple[float, float], ...]): The resolved bands the sweep
+            simulated, ascending.
+        ks (tuple[float, ...]): The k grid every band was simulated on,
+            ascending, the primary k included.
+        primary_k (float): The resolved primary k — the nominal k of the
+            same-title population, as on BacktestSweep.same_title_point.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance every simulation starts from, in
+            dollars.
+        split_date (date | None): BacktestSweep.split_date — the date the
+            split-half checks split at; None without a band sweep.
+        checks (bool): Whether the band sweep ran: cells then carry the
+            "time_series"/"ladder"/"cross" populations and the "all" and
+            "time_series" points their halves and top-event checks, and
+            same_title() has a population to return.
+        entries_by_band (dict): Band -> that band's entries (time-series
+            then same-title), exactly as the eager loop simulated them. Not in
+            repr.
+        st_entries (list): The same-title entries (band-independent). Not in
+            repr.
+        eager (dict): (band, k, population) -> the eager primary-cap point
+            of that cell, recorded by _sweep_from_candidates. Not in repr.
+        same_title_eager (SweepPoint | None): BacktestSweep.same_title_point.
+            Not in repr.
+        simulated (int): Simulations this object has run (each cap point
+            counts once; its halves and top-event re-simulations are not
+            counted separately).
+        reused (int): Cap points returned as a copy of another point rather
+            than simulated. The primary-cap identity is counted in neither.
+    """
+    caps: tuple[float, ...]
+    primary_cap: float
+    bands: tuple[tuple[float, float], ...]
+    ks: tuple[float, ...]
+    primary_k: float
+    start_date: date
+    initial_balance: float
+    split_date: date | None
+    checks: bool
+    entries_by_band: dict = field(repr=False)
+    st_entries: list = field(repr=False)
+    eager: dict = field(repr=False)               # (band, k, population) -> primary-cap point
+    same_title_eager: SweepPoint | None = field(default=None, repr=False)
+    simulated: int = 0
+    reused: int = 0
+
+    def _by_cap(
+        self,
+        subset: list[dict],
+        band: tuple[float, float] | None,
+        k: float,
+        population: str,
+        eager_point: SweepPoint | None,
+    ) -> dict[float, SweepPoint]:
+        """
+        Simulate (or share) one population of one cell at every cap.
+
+        The eager branch comes FIRST, so the primary cap always returns the
+        eager object itself; then the eager seed (only when the primary cap
+        is at or above the eager point's peak — see the class docstring);
+        then a point this call simulated at a cap at or above its own peak;
+        else a quiet simulation, pinned to the eager point's end date, with
+        the split-half and top-event checks when the band sweep ran and the
+        population carries them.
+
+        Args:
+            subset (list[dict]): The population's entries.
+            band (tuple[float, float] | None): The resolved band (None for
+                the same-title population, as on its eager point).
+            k (float): The resolved interval discount.
+            population (str): The population label.
+            eager_point (SweepPoint | None): The eager primary-cap point of
+                this (band, k, population), or None when the sweep recorded
+                none (a hand-built CapSweep — never a production one).
+
+        Returns:
+            dict[float, SweepPoint]: cap -> point, one per self.caps entry,
+                each stamped with its own size_cap.
+        """
+        out: dict[float, SweepPoint] = {}
+        # The peak is cap-independent, so the eager point's is this subset's
+        seed = eager_point.peak_kelly_fraction if eager_point is not None else None
+        # Every simulated cap ends its curve where the eager point's ended, not
+        # on whatever day (UTC) this cell happens to be read
+        end_date = _curve_end_date(eager_point)
+        pin = {} if end_date is None else {"end_date": end_date}
+        # The eager point sizes as every cap at or above the seed ONLY if its
+        # own cap is at or above it too — a capped eager point does not
+        eager_seeds = seed is not None and self.primary_cap >= seed
+        reuse: SweepPoint | None = None
+        for cap in self.caps:
+            if eager_point is not None and cap == self.primary_cap:
+                point = eager_point                              # identity, always
+            elif eager_seeds and cap >= seed:
+                out[cap] = replace(eager_point, size_cap=cap)   # sizes as the eager point
+                self.reused += 1
+                continue
+            elif reuse is not None:
+                out[cap] = replace(reuse, size_cap=cap)
+                self.reused += 1
+                continue
+            else:
+                point = _simulate_at_discount(
+                    subset, self.start_date, self.initial_balance, k=k, spread_band=band,
+                    population=population, size_cap=cap, quiet=True, **pin)
+                self.simulated += 1
+                if self.checks and population in _CHECKED_POPULATIONS:
+                    point.halves = _half_split(
+                        _split_halves(subset, self.split_date), self.start_date,
+                        self.initial_balance, k, band, population=population,
+                        size_cap=cap, quiet=True, end_date=end_date)
+                    point.ex_top_event = _ex_top_event(
+                        point, subset, self.start_date, self.initial_balance, band,
+                        population=population, quiet=True, end_date=end_date)
+                # The first simulated point whose cap reaches its own peak
+                # sizes as every larger cap (never set while the eager point
+                # seeds, whose peak every simulated cap here sits below)
+                if (reuse is None and point.peak_kelly_fraction is not None
+                        and cap >= point.peak_kelly_fraction):
+                    reuse = point
+            out[cap] = point
+        return out
+
+    def cell(self, band: tuple[float, float], k: float) -> dict[float, dict[str, SweepPoint]]:
+        """
+        Every cap's points for one (band, k) cell.
+
+        Args:
+            band (tuple[float, float]): One of self.bands.
+            k (float): One of self.ks.
+
+        Returns:
+            dict[float, dict[str, SweepPoint]]: cap -> population -> point.
+                "all" always; with checks, also "time_series", "ladder" and
+                "cross", each only when non-empty at this band — the eager
+                loop's rule, through the same _population_subsets. The
+                primary cap's points are the eager objects themselves.
+
+        Raises:
+            KeyError: If band is not one of self.bands.
+        """
+        entries = self.entries_by_band[band]
+        subsets = [("all", entries)]
+        if self.checks:
+            subsets += [(label, sub) for label, sub in _population_subsets(entries) if sub]
+        out: dict[float, dict[str, SweepPoint]] = {cap: {} for cap in self.caps}
+        for population, subset in subsets:
+            points = self._by_cap(subset, band, k, population,
+                                  self.eager.get((band, k, population)))
+            for cap, point in points.items():
+                out[cap][population] = point
+        return out
+
+    def same_title(self) -> dict[float, SweepPoint]:
+        """
+        The same-title entries simulated alone, at every cap.
+
+        Band- and k-independent like BacktestSweep.same_title_point (simulated
+        at the primary k, with no band), which is the primary cap's point.
+
+        Returns:
+            dict[float, SweepPoint]: cap -> point; {} without checks (no band
+                sweep) or without same-title entries, when the eager sweep
+                had no same-title population either.
+        """
+        if not (self.checks and self.st_entries):
+            return {}
+        return self._by_cap(self.st_entries, None, self.primary_k, "same_title",
+                            self.same_title_eager)
+
+    def entry_events(self) -> set[tuple[str, str]]:
+        """
+        Every (event ticker, fallback category) any cell's trades could carry.
+
+        Built exactly as _simulate_at_discount builds BacktestTrade.event_ticker
+        and .category — market A's event ticker as _find_entry canonicalized it,
+        and infer_category of it — over every band's entries, so a reader can
+        list every category and tag before any cell is simulated.
+
+        Returns:
+            set[tuple[str, str]]: (event ticker, category) pairs; the ticker
+                is "" for an entry that carries none.
+        """
+        return {(rec["entry"]["mA"].get("event_ticker") or "",
+                 # infer_category maps the event-ticker prefix to the fallback
+                 # label BacktestTrade.category carries (e.g. "Crypto")
+                 infer_category(rec["entry"]["mA"].get("event_ticker", "")))
+                for entries in self.entries_by_band.values() for rec in entries}
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -1031,6 +1488,14 @@ class BacktestSweep:
             label_coverage, so no existing construction breaks; the one
             production construction that has a corpus
             (_sweep_from_candidates) always passes it.
+        cap_sweep (CapSweep | None): Every other per-trade size cap of
+            SIZE_CAP_SWEEP, simulated lazily, one (band, k) cell at a time,
+            by whoever reads it (see CapSweep). None when the size-cap sweep
+            was off — run_backtest_sweep's default, and the infeasible
+            window. Every point above is the run's own cap
+            (config.BUDGET_FRACTION) whether or not this is set; setting it
+            simulates nothing during the run itself. Appended with a
+            default, so no construction moves.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -1043,6 +1508,7 @@ class BacktestSweep:
     same_event_ladders: bool | None = None
     split_date: date | None = None
     corpus_provenance: CorpusProvenance | None = None
+    cap_sweep: CapSweep | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -1064,6 +1530,12 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     and the scenario explorer put all of them on the same page. Zero proves
     nothing either way: an entry that Kelly then rejected at every k also
     shows the window could trade.
+
+    It counts the EAGER points only — every point simulated at the run's own
+    size cap. A size-cap sweep (sweep.cap_sweep) simulates its other caps only
+    when a reader asks for a cell, never here, and a larger cap can turn an
+    n < 1 skip into a trade; a reader that simulates cap cells and shows them
+    beside the verdict must add their trade counts itself.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -4342,6 +4814,39 @@ def _is_ladder_pair(pair_type: str, mA: dict, mB: dict) -> bool:
             and event_a == (mB.get("event_ticker") or ""))
 
 
+def _population_subsets(entries: list[dict]) -> list[tuple[str, list[dict]]]:
+    """
+    Split one band's entries into the band sweep's standalone time-series populations.
+
+    The ONE definition of those subsets, read by both _sweep_from_candidates'
+    eager loop and CapSweep.cell, so a size-cap cell simulates exactly the
+    populations the eager scenarios did. Split on _is_ladder_pair — the rule
+    each trade's same_event_ladder label follows — so a trade and the
+    population it was simulated in always agree. "time_series" is ladders and
+    cross-event together, same-title excluded: the population the band and k
+    act on alone.
+
+    Args:
+        entries (list[dict]): One band's entries (time-series then
+            same-title), as entries_by_band holds them.
+
+    Returns:
+        list[tuple[str, list[dict]]]: ("time_series", ...), ("ladder", ...),
+            ("cross", ...), in that order, each subset in entry order; any
+            may be empty — a caller skips an empty one rather than simulating
+            an empty scenario.
+    """
+    ladder_flags = [_is_ladder_pair(rec["pair_type"], rec["entry"]["mA"], rec["entry"]["mB"])
+                    for rec in entries]
+    return [
+        ("time_series", [rec for rec in entries if rec["pair_type"] == "time_series"]),
+        ("ladder", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
+                    if is_ladder]),
+        ("cross", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
+                   if rec["pair_type"] == "time_series" and not is_ladder]),
+    ]
+
+
 def _entries_for_band(
     candidates: _Candidates,
     spread_band: tuple[float, float] | None = None,
@@ -4577,6 +5082,10 @@ def _simulate_at_discount(
     k: float | None = None,
     spread_band: tuple[float, float] | None = None,
     population: str = "all",
+    *,
+    size_cap: float | None = None,
+    quiet: bool = False,
+    end_date: date | None = None,
 ) -> SweepPoint:
     """
     Size, select and settle prepared entries at one interval discount.
@@ -4606,6 +5115,16 @@ def _simulate_at_discount(
     completion line — so each of a band sweep's thousands of simulations is
     distinguishable in the log (TS-21) — and stamp the returned point.
 
+    size_cap DOES change the simulation: it is the per-trade Kelly cap, the
+    `min(cap, kelly_f)` every candidate is sized under — config.BUDGET_FRACTION
+    (this module's binding, read at call time) unless a size-cap sweep asks
+    for another. Pass 1b scores every entry before any sizing, so the cap
+    never moves which candidates pass the Kelly gate, the premise count or
+    the returned peak_kelly_fraction — only how large each admitted trade is
+    (and, through cash and n < 1 skips, which ones fit). quiet only moves the
+    completion line and the premise-violation WARNING to DEBUG, for the lazy
+    size-cap runs, whose premise count repeats the primary-cap run's.
+
     Args:
         raw_entries (list[dict]): Prepared entries — _prepare_entries()
             output, or (inside a sweep) one band's _entries_for_band() output
@@ -4629,18 +5148,36 @@ def _simulate_at_discount(
             "all/ex-top", "time_series/H1", "time_series/H2" and
             "time_series/ex-top" a band sweep gives its split-half and
             excluding-top-event runs.
+        size_cap (float | None): Keyword-only. The per-trade Kelly size cap,
+            in (0, 1]; 1.0 sizes at full Kelly (no cap). None (default)
+            resolves this module's BUDGET_FRACTION at call time — the live
+            sizer's cap — so every existing call sizes exactly as before.
+            Any cap other than BUDGET_FRACTION is named on the completion
+            line (", cap 35%" / ", no cap" before the colon); the default
+            cap's line is byte-identical to the pre-cap one.
+        quiet (bool): Keyword-only. When True, the completion line and the
+            premise-violation WARNING are logged at DEBUG instead of INFO /
+            WARNING, text unchanged. Default False.
+        end_date (date | None): Keyword-only. Handed to _build_equity_curve:
+            the last day of the equity curve. None (default) reads today
+            (UTC) at call time, as every eager simulation does; a lazy
+            size-cap run passes the day its eager point's curve ended, so
+            the caps of one population share one span even when a cell is
+            read after UTC midnight (CapSweep).
 
     Returns:
         SweepPoint: The trades (in entry-date order, empty if none entered) and
             the daily equity curve produced at this discount, stamped with the
             RESOLVED k — never None — the resolved spread_band (None when None
-            was passed) and the population.
+            was passed), the population, the resolved size_cap and the
+            peak_kelly_fraction (0.0 when no candidate passed the Kelly gate).
 
     Raises:
         ValueError: If population is not one of the labels above (a typo would
-            otherwise mislabel a scenario silently), or, from
-            config.time_series_spread_band, if spread_band is not a valid
-            band. Both are caller bugs, checked before any entry is scored.
+            otherwise mislabel a scenario silently), from
+            config.time_series_spread_band if spread_band is not a valid
+            band, or from _resolve_size_cap if size_cap is not a number in
+            (0, 1]. All are caller bugs, checked before any entry is scored.
         TypeError: From config.time_series_spread_band, for a band that is not
             a pair of numbers.
     """
@@ -4655,6 +5192,9 @@ def _simulate_at_discount(
     # The discount actually in force, recorded on the result so no caller has
     # to re-derive it from the None sentinel.
     effective_k = TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k
+    # The per-trade cap in force — config.BUDGET_FRACTION unless a size-cap
+    # sweep asks for another — resolved and validated before any entry.
+    cap = _resolve_size_cap(size_cap)
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
@@ -4668,6 +5208,9 @@ def _simulate_at_discount(
     # this function was extracted (a test pins the resulting count in the
     # WARNING) — do not reorder the two.
     premise_violations = 0
+    # The largest uncapped Kelly fraction any candidate reaches — every cap at or
+    # above it sizes identically (SweepPoint.peak_kelly_fraction).
+    peak_kelly = 0.0
 
     for rec in raw_entries:
         # Group identity and the _find_entry result, exactly as recorded by
@@ -4724,8 +5267,10 @@ def _simulate_at_discount(
         if kelly_f <= 0:
             # Kelly fraction is non-positive — the pair has no positive expected value
             continue
-        # Cap at BUDGET_FRACTION (20%) to avoid over-concentration
-        kelly_f_capped = min(BUDGET_FRACTION, kelly_f)
+        peak_kelly = max(peak_kelly, kelly_f)
+        # Cap at the run's per-trade size cap (config.BUDGET_FRACTION, 20%,
+        # unless a size-cap sweep simulates another) to avoid over-concentration
+        kelly_f_capped = min(cap, kelly_f)
 
         # Skip pairs where the settlement result is missing or non-binary
         outcome_a = mA.get("result", "")
@@ -4825,7 +5370,11 @@ def _simulate_at_discount(
         # DR-72 widens the named CAUSES beyond the single "mixed snapshot
         # family" guess this line used to make — see the cause list below,
         # and CLAUDE.md's strategy-change gotcha for what each one means.
-        logging.warning(
+        # The count is cap-independent (taken after the Kelly gate, before any
+        # sizing), so a quiet size-cap re-run only repeats what the
+        # primary-cap run already warned: it goes to DEBUG, text unchanged.
+        logging.log(
+            logging.DEBUG if quiet else logging.WARNING,
             "Excluded %d time-series candidate(s) whose settlement violated the "
             "cumulative-deadline premise (earlier YES, later NO) — the "
             "pair passed the wording screen in _extract_pairs but still settled "
@@ -5057,23 +5606,31 @@ def _simulate_at_discount(
     # one sweep — k and band are printed through _exact_label, so an off-grid
     # value that rounds onto a grid member still prints distinctly.
     # effective_k and the resolved band, never the arguments, so the None
-    # sentinels are never printed.
-    logging.info(
-        "Backtest complete at k=%s, band %s, %s: %d trades, %d profitable",
+    # sentinels are never printed. A cap other than BUDGET_FRACTION is named
+    # BEFORE the colon (", cap 35%" / ", no cap" — injective, so the prefix
+    # stays unique across caps too); the default cap adds nothing, so every
+    # pre-cap line is byte-identical. The lazy size-cap runs are quiet (DEBUG).
+    logging.log(
+        logging.DEBUG if quiet else logging.INFO,
+        "Backtest complete at k=%s, band %s, %s%s: %d trades, %d profitable",
         _exact_label(effective_k, ".3f"),
         _band_label((band_lo, band_hi)),
         population,
+        "" if cap == BUDGET_FRACTION else f", {_cap_label(cap)}",
         len(trades),
         sum(1 for t in trades if t.profit > 0),
     )
 
-    equity_df = _build_equity_curve(trades, start_date, initial_balance)
+    # end_date is None on every eager call (today, UTC); a lazy size-cap run
+    # pins its eager point's last day so neighbouring caps share one span
+    equity_df = _build_equity_curve(trades, start_date, initial_balance, end_date=end_date)
     return SweepPoint(
         k=effective_k, trades=trades, equity_df=equity_df,
         # The resolved tuple when a band was given, so (0, 1) and (0.0, 1.0)
         # stamp the same scenario; None stays None ("given no band").
         spread_band=None if spread_band is None else (band_lo, band_hi),
         population=population,
+        size_cap=cap, peak_kelly_fraction=peak_kelly,
     )
 
 
@@ -5572,9 +6129,18 @@ def _half_split(
     k: float,
     band: tuple[float, float],
     population: str = "all",
+    *,
+    size_cap: float | None = None,
+    quiet: bool = False,
+    end_date: date | None = None,
 ) -> HalfSplit:
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
+
+    Both halves are simulated at the scenario's own size cap, forwarded
+    through _sim_options — which forwards NOTHING on a default call, so the
+    eager band sweep calls _simulate_at_discount with exactly the keywords it
+    always did.
 
     Args:
         halves (tuple[list[dict], list[dict]]): The scenario's entries split
@@ -5589,6 +6155,13 @@ def _half_split(
             "all" (default) or "time_series" — which names the two runs
             "<population>/H1" and "<population>/H2" on their completion lines,
             so the two populations' split-half runs never share a prefix.
+        size_cap (float | None): Keyword-only. The scenario's per-trade size
+            cap; None (default) or BUDGET_FRACTION for the run's own.
+        quiet (bool): Keyword-only. Log both halves' completion lines (and
+            any premise WARNING) at DEBUG — the lazy size-cap runs.
+        end_date (date | None): Keyword-only. The day both halves' equity
+            curves end on (a lazy size-cap run pins its eager point's); None
+            (default) for today (UTC), forwarded only when given.
 
     Returns:
         HalfSplit: Each half's total return, trade count and entry count. The
@@ -5596,10 +6169,13 @@ def _half_split(
             half whose 0.0 return is not a measurement.
     """
     first, second = halves
+    # Only the options that differ from the defaults, so a default call is
+    # byte-for-byte the call it always was
+    options = _sim_options(size_cap, quiet, end_date=end_date)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
-                               spread_band=band, population=f"{population}/H1")
+                               spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
-                               spread_band=band, population=f"{population}/H2")
+                               spread_band=band, population=f"{population}/H2", **options)
     return HalfSplit(
         h1_return=_total_return(h1, initial_balance),
         h2_return=_total_return(h2, initial_balance),
@@ -5617,6 +6193,9 @@ def _ex_top_event(
     initial_balance: float,
     band: tuple[float, float],
     population: str = "all",
+    *,
+    quiet: bool = False,
+    end_date: date | None = None,
 ) -> tuple[str, float] | None:
     """
     Measure how much of one scenario's result a single event carried.
@@ -5635,6 +6214,10 @@ def _ex_top_event(
     +157.3%): without its top event the subtraction reads +2.5% and the
     re-simulation +14.3%.
 
+    The re-simulation runs at the point's own size cap (point.size_cap),
+    forwarded through _sim_options — nothing extra on the run's own cap, so
+    the eager band sweep's call is unchanged.
+
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
         entries (list[dict]): The entries that point was simulated from.
@@ -5644,6 +6227,12 @@ def _ex_top_event(
         population (str): The point's population — "all" (default) or
             "time_series" — naming the re-simulation "<population>/ex-top" on
             its completion line.
+        quiet (bool): Keyword-only. Log the re-simulation's completion line
+            (and any premise WARNING) at DEBUG — the lazy size-cap runs.
+        end_date (date | None): Keyword-only. The day the re-simulation's
+            equity curve ends on (a lazy size-cap run pins its eager
+            point's); None (default) for today (UTC), forwarded only when
+            given.
 
     Returns:
         tuple[str, float] | None: (event ticker, total return without it).
@@ -5665,7 +6254,9 @@ def _ex_top_event(
     rest = [rec for rec in entries
             if (rec["entry"]["mA"].get("event_ticker") or "") != top]
     without = _simulate_at_discount(rest, start_date, initial_balance, k=point.k,
-                                    spread_band=band, population=f"{population}/ex-top")
+                                    spread_band=band, population=f"{population}/ex-top",
+                                    **_sim_options(point.size_cap, quiet,
+                                                   end_date=end_date))
     return top, _total_return(without, initial_balance)
 
 
@@ -5677,6 +6268,7 @@ def _sweep_from_candidates(
     sweep: bool,
     spread_band: tuple[float, float] | None,
     band_sweep: bool,
+    cap_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -5728,6 +6320,14 @@ def _sweep_from_candidates(
     the band-source line), with the band and population on each completion
     line.
 
+    With cap_sweep, every point above is recorded as the eager seed of its
+    (band, k, population) as it is simulated — the "all" point before the
+    band-sweep-only work, so a single-band run records its points too — and
+    a CapSweep over the same entries is returned on BacktestSweep.cap_sweep.
+    It simulates NOTHING here: every other size cap is simulated only when a
+    reader asks for a cell, so this function's cost and every point it
+    returns are unchanged by the flag.
+
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
             candles_by_ticker and all_pairs attributes are deleted after
@@ -5750,13 +6350,20 @@ def _sweep_from_candidates(
             (unioned with the primary band) and compute the population,
             split-half and concentration scenarios; when False, the primary
             band alone and none of those.
+        cap_sweep (bool): When True, return a lazy CapSweep over
+            SIZE_CAP_SWEEP (unioned with the run's own cap) on
+            BacktestSweep.cap_sweep, seeded from every point simulated here
+            and keeping entries_by_band alive for it; its cells carry the
+            populations and checks this run computed (all four populations
+            and the checks with band_sweep, "all" alone without). False
+            (default) returns cap_sweep=None.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
             calibration (the primary band's), label_coverage (carried from
             candidates), scenarios, same_title_point, calibrations_by_band,
-            same_event_ladders (resolved), split_date and corpus_provenance
-            (carried from candidates) — see BacktestSweep.
+            same_event_ladders (resolved), split_date, corpus_provenance
+            (carried from candidates) and cap_sweep — see BacktestSweep.
 
     Raises:
         ValueError: From config.time_series_spread_band, if spread_band is not
@@ -5948,6 +6555,10 @@ def _sweep_from_candidates(
     points: list[SweepPoint] = []
     scenarios: list[SweepPoint] = []
     calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = {}
+    # (band, k, population) -> the point simulated here at the run's own cap —
+    # the seed a size-cap sweep reuses (CapSweep). Filled only with cap_sweep;
+    # it holds references to points already kept above, never a copy.
+    eager: dict[tuple, SweepPoint] = {}
     for bi, band in enumerate(bands, start=1):
         entries = entries_by_band[band]
         # The primary's is the object already measured and logged above.
@@ -5965,17 +6576,10 @@ def _sweep_from_candidates(
             # dashboard's heatmap and fragility banner read, so a same-title
             # result (band- and k-independent) can never dilute them. A
             # population with no entry at this band is skipped rather than
-            # simulated as an empty scenario.
-            ladder_flags = [_is_ladder_pair(rec["pair_type"], rec["entry"]["mA"],
-                                            rec["entry"]["mB"]) for rec in entries]
-            ts_only = [rec for rec in entries if rec["pair_type"] == "time_series"]
-            populations = [
-                ("time_series", ts_only),
-                ("ladder", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
-                            if is_ladder]),
-                ("cross", [rec for rec, is_ladder in zip(entries, ladder_flags, strict=True)
-                           if rec["pair_type"] == "time_series" and not is_ladder]),
-            ]
+            # simulated as an empty scenario. _population_subsets is the one
+            # definition, shared with CapSweep.cell.
+            populations = _population_subsets(entries)
+            ts_only = populations[0][1]
 
             # Both checked populations' halves, at the ONE split date.
             halves_by_population = {"all": _split_halves(entries, split_date),
@@ -6003,6 +6607,10 @@ def _sweep_from_candidates(
                 )
             if band == primary_band:
                 points.append(point)
+            if cap_sweep:
+                # Recorded BEFORE the band-sweep-only work below, so a
+                # single-band run (band_sweep False) still seeds its cells
+                eager[(band, point_k, "all")] = point
             if not band_sweep:
                 continue
 
@@ -6030,6 +6638,8 @@ def _sweep_from_candidates(
                         pop_point, subset, start_date, initial_balance, band,
                         population=label)
                 scenarios.append(pop_point)
+                if cap_sweep:
+                    eager[(band, point_k, label)] = pop_point
 
     same_title_point = None
     if band_sweep and st_entries:
@@ -6042,6 +6652,24 @@ def _sweep_from_candidates(
             spread_band=None, population="same_title",
         )
 
+    capped = None
+    if cap_sweep:
+        # Every other cap, simulated only when a reader asks for a cell. The
+        # run's own cap (every point above carries it, resolved at simulation
+        # time) is unioned in, as the k grid unions its primary, so the eager
+        # points are always exact members.
+        caps = tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
+        capped = CapSweep(caps=caps, primary_cap=primary.size_cap, bands=tuple(bands),
+                          ks=tuple(grid), primary_k=effective_k, start_date=start_date,
+                          initial_balance=initial_balance, split_date=split_date,
+                          checks=band_sweep, entries_by_band=entries_by_band,
+                          st_entries=st_entries, eager=eager,
+                          same_title_eager=same_title_point)
+        logging.info("Size-cap sweep: %d caps (%s) x %d band(s) x %d k, simulated on "
+                     "demand, one (band, k) cell at a time, when a report reads them",
+                     len(caps),
+                     ", ".join(_cap_label(c) for c in caps), len(bands), len(grid))
+
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
         label_coverage=candidates.label_coverage,
@@ -6053,6 +6681,7 @@ def _sweep_from_candidates(
         # One fact about the one corpus, like label_coverage: the header's
         # corpus line and post-cutoff banner read it (DR-13, M2)
         corpus_provenance=candidates.corpus_provenance,
+        cap_sweep=capped,
     )
 
 
@@ -6068,6 +6697,7 @@ def run_backtest_sweep(
     same_event_ladders: bool | None = None,
     spread_band: tuple[float, float] | None = None,
     band_sweep: bool = False,
+    cap_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -6155,6 +6785,14 @@ def run_backtest_sweep(
             grid and compute BacktestSweep.scenarios, same_title_point,
             split_date and every band's calibration. False (default) keeps
             this the single-band k sweep it always was.
+        cap_sweep (bool): When True, also return BacktestSweep.cap_sweep — a
+            lazy CapSweep over SIZE_CAP_SWEEP (the per-trade Kelly size caps
+            5%..95% and no cap) that simulates each other cap only when a
+            reader asks for a (band, k) cell. Every point this function
+            returns is still sized at the run's own cap
+            (config.BUDGET_FRACTION), and the flag adds no simulation to the
+            run itself. False (default) returns cap_sweep=None, as does the
+            infeasible window. Backtest-only: live sizing never reads it.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -6164,8 +6802,9 @@ def run_backtest_sweep(
             outcome-label census, None when the feasibility short-circuit
             skipped the fetch), and the band-sweep payload — scenarios,
             same_title_point, calibrations_by_band, split_date — plus the
-            resolved same_event_ladders and the corpus's provenance, None when
-            not recorded (see BacktestSweep).
+            resolved same_event_ladders, the corpus's provenance, None when
+            not recorded, and the lazy cap_sweep, None unless cap_sweep (see
+            BacktestSweep).
 
     Raises:
         ValueError: From config.time_series_spread_band, before any fetch, if
@@ -6218,6 +6857,15 @@ def run_backtest_sweep(
         else "run-level override",
         "on" if band_sweep else "off",
     )
+    # And for the per-trade size cap: the cap every point below is sized
+    # under (this module's BUDGET_FRACTION, resolved at call time, so a
+    # monkeypatched value is the one printed), and whether the lazy size-cap
+    # sweep rides the result. Logged after the band line, before any fetch.
+    logging.info(
+        "Per-trade size cap (backtest): %s%% (config.BUDGET_FRACTION); size-cap sweep %s",
+        _cap_percent(_resolve_size_cap(None)),
+        "on" if cap_sweep else "off",
+    )
 
     # The band- and k-independent half — one fetch, one pairing, one candle
     # fetch, reused by every band and every point below. None means the
@@ -6254,7 +6902,7 @@ def run_backtest_sweep(
     return _sweep_from_candidates(
         candidates, initial_balance,
         interval_discount=interval_discount, sweep=sweep,
-        spread_band=primary_band, band_sweep=band_sweep,
+        spread_band=primary_band, band_sweep=band_sweep, cap_sweep=cap_sweep,
     )
 
 
@@ -6264,6 +6912,8 @@ def _build_equity_curve(
     trades: list[BacktestTrade],
     start_date: date,
     initial_balance: float,
+    *,
+    end_date: date | None = None,
 ) -> pd.DataFrame:
     """
     Construct a daily equity curve DataFrame from the list of backtest trades.
@@ -6332,12 +6982,19 @@ def _build_equity_curve(
             one row earlier, on start_date - 1 day, at the untouched initial
             balance.
         initial_balance (float): Starting portfolio value in dollars.
+        end_date (date | None): Keyword-only. The day the curve runs to in
+            place of today (UTC). None (default) reads today at call time.
+            CapSweep passes the last day of the eager point a lazy size-cap
+            run belongs to, which is today (UTC) as it stood when that eager
+            point was simulated, or start_date itself for a future window —
+            either way the same axis the eager curve has.
 
     Returns:
         pd.DataFrame: DataFrame with one leading row for start_date - 1 day at
             the initial balance, followed by one row per calendar day from
-            start_date to today (UTC) — and, when start_date is itself in the
-            future, exactly those two rows — with columns:
+            start_date to today (UTC), or to end_date when one is given — and,
+            when start_date is itself after that day, exactly those two rows —
+            with columns:
             - "date" (date): Calendar date.
             - "portfolio_value" (float): Cash plus open positions at cost, in
               dollars (see above).
@@ -6348,8 +7005,10 @@ def _build_equity_curve(
     """
     # entry_date and exit_date come from UTC-derived timestamps, so use UTC today
     # here as well — otherwise `date.today()` in a non-UTC timezone can drop or add
-    # a day around the boundary and misalign the equity curve.
-    today = datetime.now(UTC).date()
+    # a day around the boundary and misalign the equity curve. A caller may pin
+    # the day instead (CapSweep's lazy runs pin their eager point's), so a
+    # simulation that runs after UTC midnight ends where its sibling did.
+    today = datetime.now(UTC).date() if end_date is None else end_date
     # Floored at 1: a start_date after today (reachable through run_backtest /
     # run_backtest_sweep, whose Monday-feasibility short-circuit builds an empty
     # curve for whatever window it was handed) makes the raw span zero or
