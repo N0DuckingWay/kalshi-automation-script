@@ -510,7 +510,12 @@ _KPI_TEMPLATE = """
 """
 
 
-def _kpi(label: str, value: str, color: str = "#212121") -> str:
+# The default colour of a KPI card's value, spelled once: _kpi's default, and
+# what a card list names for the cards that take it, so both render alike.
+_KPI_DEFAULT_COLOR = "#212121"
+
+
+def _kpi(label: str, value: str, color: str = _KPI_DEFAULT_COLOR) -> str:
     """
     Render a single KPI card as an HTML snippet using the _KPI_TEMPLATE.
 
@@ -563,32 +568,32 @@ def _fig_html(fig: go.Figure, height: int = 400, div_id: str | None = None) -> s
 
 # ─── Section 1: Portfolio Performance ────────────────────────────────────────
 
-def _section_performance(
+def _performance_kpis(
     equity_df: pd.DataFrame,
     trades: list[BacktestTrade],
-    start_date: date,
     initial_balance: float,
-) -> str:
+) -> list[tuple[str, str, str, str]]:
     """
-    Build the "Portfolio Performance" HTML section.
+    Compute the Portfolio Performance KPI cards, formatted, in render order.
 
-    Computes summary KPIs (total return, Sharpe, Sortino, max drawdown, win
-    rate, mean and median return per trade, median monthly return) and renders
-    two charts: cumulative return as a series of lines — the total plus one per
-    trade type (_return_by_trade_type, which sum to the total) — and a
-    drawdown percentage plot. The median per
-    trade sits beside the mean because a few large wins or total losses can
-    carry the mean on their own; the two disagreeing is the signal.
+    The one definition of every figure on those cards, read both by
+    _section_performance and by any other view of the same page that shows
+    them for a different set of trades — so no second copy of a metric or of
+    its formatting can drift from this one.
 
     Args:
-        equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value,
-            daily_return] as produced by _build_equity_curve().
-        trades (list[BacktestTrade]): Completed backtest trades for win rate and avg return.
-        start_date (date): Backtest start date for display context.
-        initial_balance (float): Starting portfolio value in dollars.
+        equity_df (pd.DataFrame): Daily equity curve with columns [date,
+            portfolio_value, daily_return] as produced by _build_equity_curve().
+        trades (list[BacktestTrade]): The trades the win rate and the per-trade
+            returns are taken over.
+        initial_balance (float): Starting portfolio value in dollars, the base
+            of the total return.
 
     Returns:
-        str: Self-contained HTML section string including KPI cards and two Plotly charts.
+        list[tuple[str, str, str, str]]: (key, label, value, colour) per card:
+            total return, Sharpe, Sortino, max drawdown (with its trough date),
+            win rate, mean and median return per trade, median monthly return
+            and the trade count. The key is a stable identifier for the card.
     """
     final_value  = float(equity_df["portfolio_value"].iloc[-1])
     total_return = (final_value - initial_balance) / initial_balance
@@ -609,28 +614,85 @@ def _section_performance(
     dd_str = f"({dd_when})" if dd_when else ""
     med_month_str = "—" if med_month is None else f"{med_month:+.1%}"
 
-    kpis = "".join([
-        _kpi("Total Return",  f"{total_return:+.1%}", "#2196F3"),
-        _kpi("Sharpe Ratio",  f"{sharpe:.2f}"),
-        _kpi("Sortino Ratio", f"{sortino:.2f}"),
-        _kpi("Max Drawdown",  f"{max_dd:.1%} {dd_str}", "#F44336"),
-        _kpi("Win Rate",      f"{win_rate:.1%}", "#4CAF50"),
-        _kpi("Avg Return/Trade", f"{avg_ret:.1%}"),
-        _kpi("Median Return/Trade", f"{med_ret:.1%}"),
-        _kpi("Median Monthly Return", med_month_str),
-        _kpi("Total Trades",  str(len(trades))),
-    ])
+    return [
+        ("total_return", "Total Return", f"{total_return:+.1%}", "#2196F3"),
+        ("sharpe", "Sharpe Ratio", f"{sharpe:.2f}", _KPI_DEFAULT_COLOR),
+        ("sortino", "Sortino Ratio", f"{sortino:.2f}", _KPI_DEFAULT_COLOR),
+        ("max_drawdown", "Max Drawdown", f"{max_dd:.1%} {dd_str}", "#F44336"),
+        ("win_rate", "Win Rate", f"{win_rate:.1%}", "#4CAF50"),
+        ("avg_return", "Avg Return/Trade", f"{avg_ret:.1%}", _KPI_DEFAULT_COLOR),
+        ("median_return", "Median Return/Trade", f"{med_ret:.1%}", _KPI_DEFAULT_COLOR),
+        ("median_monthly", "Median Monthly Return", med_month_str, _KPI_DEFAULT_COLOR),
+        ("trades", "Total Trades", str(len(trades)), _KPI_DEFAULT_COLOR),
+    ]
 
+
+def _performance_series(
+    equity_df: pd.DataFrame,
+    trades: list[BacktestTrade],
+    initial_balance: float,
+) -> tuple[pd.Series, list[tuple[str, str, list[float]]], pd.Series]:
+    """
+    Compute the Portfolio Performance charts' series, on equity_df's rows.
+
+    Args:
+        equity_df (pd.DataFrame): Daily equity curve (_build_equity_curve).
+        trades (list[BacktestTrade]): The trades the per-type lines attribute.
+        initial_balance (float): Starting balance the percentages divide by.
+
+    Returns:
+        tuple: (total, type_lines, drawdown) — the cumulative return in percent
+            of the starting balance, the per-trade-type lines
+            (_return_by_trade_type: label, colour, percent series; they sum to
+            the total), and the drawdown from the running peak, in percent.
+    """
     # Cumulative return, total and per trade type: one line each, in percent of
     # the starting balance. The per-type lines attribute each trade exactly as
     # _build_equity_curve books it, so they add up to the total line.
+    total = (equity_df["portfolio_value"] / initial_balance - 1.0) * 100
+    type_lines = _return_by_trade_type(trades, equity_df, initial_balance)
+    rolling_max = equity_df["portfolio_value"].cummax()
+    drawdown = (equity_df["portfolio_value"] - rolling_max) / rolling_max * 100
+    return total, type_lines, drawdown
+
+
+def _section_performance(
+    equity_df: pd.DataFrame,
+    trades: list[BacktestTrade],
+    start_date: date,
+    initial_balance: float,
+) -> str:
+    """
+    Build the "Portfolio Performance" HTML section.
+
+    Renders the summary KPIs (_performance_kpis: total return, Sharpe,
+    Sortino, max drawdown, win rate, mean and median return per trade, median
+    monthly return) and two charts (_performance_series): cumulative return as
+    a series of lines — the total plus one per trade type (which sum to the
+    total) — and a drawdown percentage plot. The median per
+    trade sits beside the mean because a few large wins or total losses can
+    carry the mean on their own; the two disagreeing is the signal.
+
+    Args:
+        equity_df (pd.DataFrame): Daily equity curve with columns [date, portfolio_value,
+            daily_return] as produced by _build_equity_curve().
+        trades (list[BacktestTrade]): Completed backtest trades for win rate and avg return.
+        start_date (date): Backtest start date for display context.
+        initial_balance (float): Starting portfolio value in dollars.
+
+    Returns:
+        str: Self-contained HTML section string including KPI cards and two Plotly charts.
+    """
+    kpis = "".join(_kpi(label, value, color) for _, label, value, color
+                   in _performance_kpis(equity_df, trades, initial_balance))
+    total, type_lines, drawdown = _performance_series(equity_df, trades, initial_balance)
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=equity_df["date"],
-        y=(equity_df["portfolio_value"] / initial_balance - 1.0) * 100,
+        x=equity_df["date"], y=total,
         name="Total return", line={"color": _COLORS["strategy"], "width": 3},
     ))
-    for label, color, series in _return_by_trade_type(trades, equity_df, initial_balance):
+    for label, color, series in type_lines:
         fig.add_trace(go.Scatter(
             x=equity_df["date"], y=series, name=label,
             line={"color": color, "width": 1.5, "dash": "dot"},
@@ -640,10 +702,8 @@ def _section_performance(
                       legend={"orientation": "h", "y": -0.2})
 
     # Drawdown chart
-    rolling_max = equity_df["portfolio_value"].cummax()
-    dd_series   = (equity_df["portfolio_value"] - rolling_max) / rolling_max
     fig2 = go.Figure(go.Scatter(
-        x=equity_df["date"], y=dd_series * 100,
+        x=equity_df["date"], y=drawdown,
         fill="tozeroy", name="Drawdown %",
         line={"color": _COLORS["dd"]}, fillcolor="rgba(244,67,54,0.2)",
     ))
@@ -755,6 +815,102 @@ def _category_table(df: pd.DataFrame) -> str:
     )
 
 
+# Entry-price buckets of the decomposition's price chart: right-closed bins
+# over market A's YES ask at entry, and the label each one renders under.
+_PRICE_BUCKET_BINS = [0, 0.20, 0.40, 0.60, 0.80, 1.01]
+_PRICE_BUCKET_LABELS = ["<20¢", "20–40¢", "40–60¢", "60–80¢", ">80¢"]
+
+
+def _pnl_colors(values) -> list[str]:
+    """
+    Colour each P&L bar by its sign: profit colour at or above zero, loss below.
+
+    Args:
+        values: An iterable of dollar amounts, one per bar.
+
+    Returns:
+        list[str]: One CSS colour per value.
+    """
+    return [_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in values]
+
+
+def _subcategory_chart_height(rows: int) -> int:
+    """
+    Height of the "P&L by Category · Tag" chart for a given number of bars.
+
+    Args:
+        rows (int): Bars (category · tag groups) the chart draws.
+
+    Returns:
+        int: Pixels — at least 350, and 28 per bar plus room for the axes.
+    """
+    return max(350, 28 * rows + 120)
+
+
+def _decomposition_frame(
+    trades: list[BacktestTrade],
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+) -> pd.DataFrame:
+    """
+    Build the Returns Decomposition's one-row-per-trade frame.
+
+    Args:
+        trades (list[BacktestTrade]): The trades to decompose; must not be
+            empty (the section renders a placeholder for none).
+        series_categories (dict | None): historical.load_series_categories'
+            map, handed to _trade_category; None files each trade under its
+            ticker-prefix category.
+
+    Returns:
+        pd.DataFrame: Columns entry_date, exit_date, profit_ratio, profit,
+            category, subcategory ("category · tag"), holding_days, entry_pA,
+            n, pair_type and month (the entry date's "YYYY-MM").
+    """
+    df = pd.DataFrame([{
+        "entry_date":    t.entry_date,
+        "exit_date":     t.exit_date,
+        "profit_ratio":  t.profit_ratio,
+        "profit":        t.profit,
+        "category":      _trade_category(t, series_categories)[0],
+        "subcategory":   _trade_category(t, series_categories)[1],
+        "holding_days":  t.holding_days,
+        "entry_pA":      t.entry_pA,
+        "n":             t.n,
+        "pair_type":     t.pair_type,
+    } for t in trades])
+
+    df["month"] = pd.to_datetime(df["entry_date"]).dt.to_period("M").astype(str)
+    return df
+
+
+def _decomposition_aggregates(df: pd.DataFrame) -> dict:
+    """
+    Sum the decomposition frame's P&L four ways, for the section's bar charts.
+
+    Entry price buckets read entry_pA, which is market A's YES ask at entry for
+    both pair types, but its meaning differs: for a time_series row it is the
+    price actually PAID for the YES leg on the earlier contract, while for a
+    same_title row it is the pricier side's quote (the NO leg costs nA).
+
+    Args:
+        df (pd.DataFrame): _decomposition_frame's output. Not modified.
+
+    Returns:
+        dict: "monthly" — a frame of [month, profit] by entry month, in month
+            order; "category" and "subcategory" — P&L per Kalshi category and
+            per category · tag, ascending; "price" — P&L per entry-price
+            bucket (_PRICE_BUCKET_LABELS), buckets with no trade omitted.
+    """
+    buckets = pd.cut(df["entry_pA"], bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS)
+    return {
+        "monthly": df.groupby("month")["profit"].sum().reset_index(),
+        "category": df.groupby("category")["profit"].sum().sort_values(),
+        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(),
+        "price": (df.assign(price_bucket=buckets)
+                  .groupby("price_bucket", observed=True)["profit"].sum()),
+    }
+
+
 def _section_decomposition(
     trades: list[BacktestTrade],
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
@@ -780,56 +936,39 @@ def _section_decomposition(
     if not trades:
         return _SECTION_STYLE.format(title="Returns Decomposition") + "<p>No trades.</p>"
 
-    df = pd.DataFrame([{
-        "entry_date":    t.entry_date,
-        "exit_date":     t.exit_date,
-        "profit_ratio":  t.profit_ratio,
-        "profit":        t.profit,
-        "category":      _trade_category(t, series_categories)[0],
-        "subcategory":   _trade_category(t, series_categories)[1],
-        "holding_days":  t.holding_days,
-        "entry_pA":      t.entry_pA,
-        "n":             t.n,
-        "pair_type":     t.pair_type,
-    } for t in trades])
-
-    df["month"] = pd.to_datetime(df["entry_date"]).dt.to_period("M").astype(str)
+    df = _decomposition_frame(trades, series_categories)
+    agg = _decomposition_aggregates(df)
 
     # Monthly returns bar chart
-    monthly = df.groupby("month")["profit"].sum().reset_index()
+    monthly = agg["monthly"]
     fig_monthly = go.Figure(go.Bar(
         x=monthly["month"], y=monthly["profit"],
-        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in monthly["profit"]],
+        marker_color=_pnl_colors(monthly["profit"]),
     ))
     fig_monthly.update_layout(title="Monthly P&L ($)", xaxis_title="Month", yaxis_title="P&L ($)")
 
     # Category breakdown
-    cat = df.groupby("category")["profit"].sum().sort_values()
+    cat = agg["category"]
     fig_cat = go.Figure(go.Bar(
         y=cat.index, x=cat.values, orientation="h",
-        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in cat.values],
+        marker_color=_pnl_colors(cat.values),
     ))
     fig_cat.update_layout(title="P&L by Category ($)", xaxis_title="P&L ($)")
 
     # The finer breakdown: category · tag, same colouring
-    sub = df.groupby("subcategory")["profit"].sum().sort_values()
+    sub = agg["subcategory"]
     fig_sub = go.Figure(go.Bar(
         y=sub.index, x=sub.values, orientation="h",
-        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in sub.values],
+        marker_color=_pnl_colors(sub.values),
     ))
     fig_sub.update_layout(title="P&L by Category · Tag ($)", xaxis_title="P&L ($)")
 
-    # Entry price bucket. entry_pA is market A's YES ask at entry for both pair
-    # types, but its meaning differs: for a time_series row it is the price
-    # actually PAID for the YES leg on the earlier contract, while for a
-    # same_title row it is the pricier side's quote (the NO leg costs nA).
-    bins   = [0, 0.20, 0.40, 0.60, 0.80, 1.01]
-    labels = ["<20¢", "20–40¢", "40–60¢", "60–80¢", ">80¢"]
-    df["price_bucket"] = pd.cut(df["entry_pA"], bins=bins, labels=labels)
-    price_grp = df.groupby("price_bucket", observed=True)["profit"].sum()
+    # Entry price bucket (see _decomposition_aggregates for what entry_pA means
+    # for each pair type)
+    price_grp = agg["price"]
     fig_price = go.Figure(go.Bar(
         x=price_grp.index.astype(str), y=price_grp.values,
-        marker_color=[_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in price_grp.values],
+        marker_color=_pnl_colors(price_grp.values),
     ))
     fig_price.update_layout(title="P&L by Entry Price Bucket", xaxis_title="Price Bucket",
                             yaxis_title="P&L ($)")
@@ -846,7 +985,7 @@ def _section_decomposition(
         _SECTION_STYLE.format(title="Returns Decomposition")
         + _fig_html(fig_monthly)
         + _fig_html(fig_cat, height=350)
-        + _fig_html(fig_sub, height=max(350, 28 * len(sub) + 120))
+        + _fig_html(fig_sub, height=_subcategory_chart_height(len(sub)))
         + _category_table(df)
         + _fig_html(fig_price)
         + _fig_html(fig_dur)
@@ -854,6 +993,68 @@ def _section_decomposition(
 
 
 # ─── Section 3: Calibration Analysis ─────────────────────────────────────────
+
+def _reliability(trades: list[BacktestTrade]) -> dict:
+    """
+    Compute the price-calibration figures: Brier score, log loss and the
+    reliability diagram's points.
+
+    Each trade contributes two predictions — market A's and market B's YES ask
+    at entry — against the side each market settled on. The diagram bins them
+    into 10 equal-width probability bins and keeps the non-empty ones.
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades; may be empty.
+
+    Returns:
+        dict: "brier" and "log_loss" (_brier_score / _log_loss, 0.0 with no
+            trades), and per non-empty bin, in ascending order: "mean_pred"
+            (mean predicted probability), "mean_act" (share that resolved YES),
+            "counts" (predictions in the bin) and "labels" ("0.3–0.4").
+    """
+    # Collect (predicted_prob, actual_outcome) pairs
+    probs, actuals = [], []
+    for t in trades:
+        probs.append(t.entry_pA)
+        actuals.append(1 if t.outcome_a == "yes" else 0)
+        probs.append(t.entry_pB)
+        actuals.append(1 if t.outcome_b == "yes" else 0)
+
+    # Reliability diagram — 10 equal-width bins
+    bins   = np.linspace(0, 1, 11)
+    labels = []
+    mean_pred, mean_act = [], []
+    counts = []
+    for i in range(len(bins) - 1):
+        mask = [(bins[i] <= p < bins[i + 1]) for p in probs]
+        if sum(mask) == 0:
+            continue
+        bin_probs = [p for p, m in zip(probs, mask, strict=True) if m]
+        bin_acts  = [a for a, m in zip(actuals, mask, strict=True) if m]
+        mean_pred.append(np.mean(bin_probs))
+        mean_act.append(np.mean(bin_acts))
+        counts.append(len(bin_probs))
+        labels.append(f"{bins[i]:.1f}–{bins[i+1]:.1f}")
+
+    return {
+        "brier": _brier_score(trades), "log_loss": _log_loss(trades),
+        "mean_pred": mean_pred, "mean_act": mean_act, "counts": counts, "labels": labels,
+    }
+
+
+def _calibration_title(brier: float, log_loss: float) -> str:
+    """
+    Title of the reliability diagram, which states the two scores.
+
+    Args:
+        brier (float): The Brier score.
+        log_loss (float): The log loss.
+
+    Returns:
+        str: "Calibration Curve (Brier=0.1234, LogLoss=0.5678)".
+    """
+    return f"Calibration Curve (Brier={brier:.4f}, LogLoss={log_loss:.4f})"
+
 
 def _section_calibration(trades: list[BacktestTrade]) -> str:
     """
@@ -873,44 +1074,20 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     if not trades:
         return _SECTION_STYLE.format(title="Calibration Analysis") + "<p>No trades.</p>"
 
-    # Collect (predicted_prob, actual_outcome) pairs
-    probs, actuals = [], []
-    for t in trades:
-        probs.append(t.entry_pA)
-        actuals.append(1 if t.outcome_a == "yes" else 0)
-        probs.append(t.entry_pB)
-        actuals.append(1 if t.outcome_b == "yes" else 0)
-
-    brier = _brier_score(trades)
-    ll    = _log_loss(trades)
-
-    # Reliability diagram — 10 equal-width bins
-    bins   = np.linspace(0, 1, 11)
-    labels = []
-    mean_pred, mean_act = [], []
-    counts = []
-    for i in range(len(bins) - 1):
-        mask = [(bins[i] <= p < bins[i + 1]) for p in probs]
-        if sum(mask) == 0:
-            continue
-        bin_probs = [p for p, m in zip(probs, mask, strict=True) if m]
-        bin_acts  = [a for a, m in zip(actuals, mask, strict=True) if m]
-        mean_pred.append(np.mean(bin_probs))
-        mean_act.append(np.mean(bin_acts))
-        counts.append(len(bin_probs))
-        labels.append(f"{bins[i]:.1f}–{bins[i+1]:.1f}")
+    rel = _reliability(trades)
+    brier, ll = rel["brier"], rel["log_loss"]
 
     fig_cal = go.Figure()
     fig_cal.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect calibration",
                                  line={"dash": "dash", "color": "#9E9E9E"}))
     fig_cal.add_trace(go.Scatter(
-        x=mean_pred, y=mean_act, mode="lines+markers",
+        x=rel["mean_pred"], y=rel["mean_act"], mode="lines+markers",
         name="Actual", line={"color": _COLORS["strategy"]},
-        marker={"size": [max(6, c // 2) for c in counts]},
-        text=[f"n={c}" for c in counts], hoverinfo="text+x+y",
+        marker={"size": [max(6, c // 2) for c in rel["counts"]]},
+        text=[f"n={c}" for c in rel["counts"]], hoverinfo="text+x+y",
     ))
     fig_cal.update_layout(
-        title=f"Calibration Curve (Brier={brier:.4f}, LogLoss={ll:.4f})",
+        title=_calibration_title(brier, ll),
         xaxis_title="Predicted probability",
         yaxis_title="Actual resolution rate",
         xaxis={"range": [0, 1]}, yaxis={"range": [0, 1]},
@@ -2554,6 +2731,25 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
             f"</tr>")
 
 
+def _best_and_worst(trades: list[BacktestTrade]) -> tuple[list, list]:
+    """
+    Pick the five most and five least profitable trades.
+
+    A stable sort by dollar profit, descending, so trades tied on profit keep
+    their order; the two slices overlap below 11 trades (see
+    _section_diagnostics for why that is accepted).
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades; may be empty.
+
+    Returns:
+        tuple[list, list]: (best five, most profitable first; worst five, in
+            the same descending order — the last one is the biggest loss).
+    """
+    sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
+    return sorted_trades[:5], sorted_trades[-5:]
+
+
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     """
     Build the "Trade-Level Diagnostics" HTML section.
@@ -2601,9 +2797,7 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     # the overlap is accepted, and a reader of a 5-trade dashboard is looking
     # at every trade either way. Do not "fix" it into a single merged table
     # without asking; the sweep raised it as TS-29 and it was declined.
-    sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
-    best  = sorted_trades[:5]
-    worst = sorted_trades[-5:]
+    best, worst = _best_and_worst(trades)
 
     header = ("<th>Entry</th><th>Type</th><th>YES paid</th><th>NO paid</th>"
               "<th>Trade details</th><th>Outcome</th><th>n</th>"
@@ -2634,6 +2828,87 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 
 # ─── Section 7: Risk Metrics ──────────────────────────────────────────────────
 
+def _kelly_points(trades: list[BacktestTrade],
+                  k: float | None) -> tuple[list[float], list[float]]:
+    """
+    Compute the Kelly-vs-actual scatter's two coordinates, one pair per trade.
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades; may be empty.
+        k (float | None): The interval discount the trades were SIZED at,
+            handed to _kelly_fraction (None resolves to the config constant).
+
+    Returns:
+        tuple[list[float], list[float]]: (uncapped Kelly fraction, fraction of
+            the entry-date balance actually committed — fee-inclusive cost over
+            BacktestTrade.balance_at_entry, 0.0 when that balance is not
+            positive), each in trade order.
+    """
+    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair
+    # type — plus the run's interval discount, so an --interval-discount run
+    # plots the Kelly its trades were actually sized at rather than the config one
+    kelly_fracs = [
+        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type, k=k)
+        for t in trades
+    ]
+    # The actual fraction uses the simulated balance at each trade's entry (the
+    # base its Kelly budget was computed from) — dividing by the initial
+    # balance would distort as equity drifts.
+    actual_fracs = [
+        (t.total_cost + t.fees) / t.balance_at_entry if t.balance_at_entry > 0 else 0.0
+        for t in trades
+    ]
+    return kelly_fracs, actual_fracs
+
+
+def _one_to_one_extent(kelly_fracs: list[float]) -> float:
+    """
+    How far the Kelly scatter's dashed 1:1 reference line runs.
+
+    Args:
+        kelly_fracs (list[float]): The scatter's x values; may be empty.
+
+    Returns:
+        float: 10% past the largest Kelly fraction, and never less than 0.011
+            (the line is drawn even when every fraction is 0).
+    """
+    return max(kelly_fracs + [0.01]) * 1.1
+
+
+def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> list[float]:
+    """
+    Compute the capital tied up in open trades on each row of the equity curve.
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades; may be empty.
+        equity_df (pd.DataFrame): The equity curve whose "date" column is the
+            axis — datetime.date values, as _build_equity_curve writes them.
+
+    Returns:
+        list[float]: One value per equity_df row — the running sum of every
+            trade's fee-inclusive cost from its entry date until its exit date,
+            floored at 0.
+    """
+    entry_by_date: dict[date, float] = {}
+    exit_by_date: dict[date, float] = {}
+    for t in trades:
+        # Fee-inclusive: fees are cash out the door at entry, so they are part
+        # of the capital deployed. The Kelly-vs-actual scatter
+        # (_kelly_points) already uses (total_cost + fees); this used not to,
+        # so the two charts on one dashboard disagreed by the fee rate (TS-12).
+        cost = t.total_cost + t.fees
+        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + cost
+        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + cost
+
+    invested_by_date: list[float] = []
+    running_invested = 0.0
+    for _, row in equity_df.iterrows():
+        d = row["date"] if isinstance(row["date"], date) else row["date"].date()
+        running_invested += entry_by_date.get(d, 0.0) - exit_by_date.get(d, 0.0)
+        invested_by_date.append(max(0.0, running_invested))
+    return invested_by_date
+
+
 def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
                   initial_balance: float, k: float | None = None) -> str:
     """
@@ -2660,20 +2935,8 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
     if not trades:
         return _SECTION_STYLE.format(title="Risk Metrics") + "<p>No trades.</p>"
 
-    # Kelly vs actual sizing scatter. The actual fraction uses the simulated
-    # balance at each trade's entry (the base its Kelly budget was computed
-    # from) — dividing by the initial balance would distort as equity drifts.
-    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair
-    # type — plus the run's interval discount, so an --interval-discount run
-    # plots the Kelly its trades were actually sized at rather than the config one
-    kelly_fracs = [
-        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type, k=k)
-        for t in trades
-    ]
-    actual_fracs = [
-        (t.total_cost + t.fees) / t.balance_at_entry if t.balance_at_entry > 0 else 0.0
-        for t in trades
-    ]
+    # Kelly vs actual sizing scatter, at the discount the trades were sized at
+    kelly_fracs, actual_fracs = _kelly_points(trades, k)
 
     fig_kelly = go.Figure(go.Scatter(
         x=kelly_fracs, y=actual_fracs, mode="markers",
@@ -2682,9 +2945,9 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
         # subset — escape it the same as the table row above (_trow).
         text=[html.escape(t.title_a[:40]) for t in trades],
     ))
+    extent = _one_to_one_extent(kelly_fracs)
     fig_kelly.add_trace(go.Scatter(
-        x=[0, max(kelly_fracs + [0.01]) * 1.1],
-        y=[0, max(kelly_fracs + [0.01]) * 1.1],
+        x=[0, extent], y=[0, extent],
         name="1:1 line", line={"dash": "dash", "color": "#9E9E9E"},
     ))
     fig_kelly.update_layout(
@@ -2694,23 +2957,7 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 
     # Capital deployment over time: net running position size (cost still tied up
     # in unsettled trades). Positive on entry days, back down to zero on exit days.
-    entry_by_date: dict[date, float] = {}
-    exit_by_date: dict[date, float] = {}
-    for t in trades:
-        # Fee-inclusive: fees are cash out the door at entry, so they are part
-        # of the capital deployed. The Kelly-vs-actual scatter twenty-six lines
-        # above already uses (total_cost + fees); this used not to, so the two
-        # charts on one dashboard disagreed by the fee rate (TS-12).
-        cost = t.total_cost + t.fees
-        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + cost
-        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + cost
-
-    invested_by_date: list[float] = []
-    running_invested = 0.0
-    for _, row in equity_df.iterrows():
-        d = row["date"] if isinstance(row["date"], date) else row["date"].date()
-        running_invested += entry_by_date.get(d, 0.0) - exit_by_date.get(d, 0.0)
-        invested_by_date.append(max(0.0, running_invested))
+    invested_by_date = _capital_deployed(trades, equity_df)
 
     fig_dep = make_subplots()
     fig_dep.add_trace(go.Scatter(
@@ -2730,6 +2977,32 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 
 
 # ─── Section 8: Benchmark Comparison ─────────────────────────────────────────
+
+def _strategy_row(equity_df: pd.DataFrame, initial_balance: float) -> dict[str, str]:
+    """
+    Compute the benchmark table's strategy row, formatted.
+
+    Args:
+        equity_df (pd.DataFrame): The strategy's equity curve
+            (_build_equity_curve: one row per CALENDAR day).
+        initial_balance (float): Starting balance the return divides by.
+
+    Returns:
+        dict[str, str]: "return" (total return), "sharpe" (annualised on the
+            calendar base) and "max_dd" (max drawdown), each formatted.
+    """
+    strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
+    # Calendar-daily by construction (_build_equity_curve emits one row per
+    # calendar day), so this takes _sharpe's CALENDAR_DAYS_PER_YEAR default
+    # while the ^GSPC row overrides it to the trading-day base.
+    strat_sharpe = _sharpe(equity_df["daily_return"])
+    strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
+    return {
+        "return": f"{strat_ret:+.1%}",
+        "sharpe": f"{strat_sharpe:.2f}",
+        "max_dd": f"{strat_dd:.1%}",
+    }
+
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
                         initial_balance: float) -> str:
@@ -2819,24 +3092,13 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
         except Exception as e:
             logging.warning("Benchmark computation failed: %s — omitting S&P 500", e)
 
-    strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
-    # Calendar-daily by construction (_build_equity_curve emits one row per
-    # calendar day), so this takes _sharpe's CALENDAR_DAYS_PER_YEAR default
-    # while the ^GSPC row above overrides it to the trading-day base.
-    strat_sharpe = _sharpe(equity_df["daily_return"])
-    strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
-
     # "Kalshi Arbitrage Strategy" / "Kalshi Arbitrage Backtest" (here, the
     # bold-row match below, and the page <title>/<h1>) are the PRODUCT NAME,
     # kept deliberately after the 2026-09 time-series inversion — the row name
     # here is string-matched by the table renderer below, so both must agree.
     # They are not a claim that the time-series leg is an arbitrage.
-    bench_rows.insert(0, {
-        "name":   "Kalshi Arbitrage Strategy",
-        "return": f"{strat_ret:+.1%}",
-        "sharpe": f"{strat_sharpe:.2f}",
-        "max_dd": f"{strat_dd:.1%}",
-    })
+    bench_rows.insert(0, {"name": "Kalshi Arbitrage Strategy",
+                          **_strategy_row(equity_df, initial_balance)})
 
     fig.update_layout(title="Strategy vs Benchmarks", yaxis_title="Portfolio Value ($)",
                       xaxis_title="Date")

@@ -2140,6 +2140,56 @@ class TestReturnByTradeType:
         assert layout["title"]["text"].startswith("Cumulative Return by Trade Type")
 
 
+class TestSectionDataHelpers:
+    """The per-section data helpers every trade-derived section renders from:
+    the one definition of each figure, which a filtered view of the page reads
+    too, so they must describe exactly what the section shows."""
+
+    def _trades(self):
+        return [
+            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
+            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
+            _typed_trade("time_series", False, date(2026, 2, 7), date(2026, 2, 9), 5.0),
+        ]
+
+    def test_every_performance_card_renders_its_label_and_value(self):
+        trades = self._trades()
+        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
+        kpis = dashboard._performance_kpis(curve, trades, 1000.0)
+        keys = [key for key, *_ in kpis]
+        assert len(keys) == len(set(keys)) == 9
+        section = dashboard._section_performance(curve, trades, date(2026, 1, 5), 1000.0)
+        for _, label, value, color in kpis:
+            assert dashboard._kpi(label, value, color) in section
+
+    def test_the_decomposition_aggregates_leave_the_frame_untouched(self):
+        df = dashboard._decomposition_frame(self._trades(), None)
+        columns = list(df.columns)
+        agg = dashboard._decomposition_aggregates(df)
+        assert list(df.columns) == columns          # no price_bucket column added
+        assert list(agg["monthly"]["month"]) == ["2026-01", "2026-02"]
+        assert agg["monthly"]["profit"].sum() == pytest.approx(23.0)
+        assert agg["price"].sum() == pytest.approx(23.0)
+
+    def test_best_and_worst_keep_tied_trades_in_their_order(self):
+        tied = [dataclasses.replace(make_trade(profit=1.0), ticker_a=f"T{i}") for i in range(7)]
+        best, worst = dashboard._best_and_worst(tied)
+        assert [t.ticker_a for t in best] == ["T0", "T1", "T2", "T3", "T4"]
+        assert [t.ticker_a for t in worst] == ["T2", "T3", "T4", "T5", "T6"]
+
+    def test_the_risk_helpers_match_the_scatter_and_the_deployment_trace(self):
+        trades = self._trades()
+        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
+        kelly, actual = dashboard._kelly_points(trades, 0.75)
+        section = dashboard._section_risk(trades, curve, 1000.0, k=0.75)
+        data, _ = _nth_figure(section, 0)
+        assert data[0]["x"] == pytest.approx(kelly)
+        assert data[0]["y"] == pytest.approx(actual)
+        assert data[1]["x"] == pytest.approx([0, dashboard._one_to_one_extent(kelly)])
+        deployed, _ = _nth_figure(section, 1)
+        assert deployed[0]["y"] == pytest.approx(dashboard._capital_deployed(trades, curve))
+
+
 class TestBestWorstTradeRows:
     """Each best/worst row spells out both legs: the YES and NO prices paid,
     what each leg bought and when its market closed, and how each settled."""
