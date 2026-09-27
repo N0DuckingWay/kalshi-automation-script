@@ -331,11 +331,8 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   time-series band x k cells, 20.3% are positive (22.5% of the 423 that
 #   traded), and the split-half Spearman of their returns is -0.519. The same
 #   window with the switch off: 3 trades, all same-title, +4.8%.
-#   Every figure in this paragraph was measured under the first-Monday rule.
-#   Since DR-75 (CLAUDE.md) a pair enters on its earliest Kelly-passing
-#   Monday: the same entries re-simulated give 61 trades, 49.2% won, +117.08%,
-#   and -90.05% without the top event. The split-half, drawdown, 468-cell and
-#   switch-off figures were not re-measured.
+#   All measured before DR-75; under it the same entries give 61 trades,
+#   49.2% won, +117.08%, and -90.05% without the top event.
 #
 # BOTH PATHS IMPLEMENT THIS since DR-73c: backtester._extract_pairs forms the
 # same pairs from a per-event sub-pass and _find_entry orders and gaps them on

@@ -873,24 +873,18 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
 
     def test_ast_later_mondays_have_one_reader(self):
-        # DR-75: backtester._find_entry records a pair's every qualifying
-        # Monday after the first under "later", and _entry_mondays — (entry,
-        # *entry.get("later", ())) — is the one reader. Its .get default is
-        # load-bearing (hand-built entries, several in these tests, carry no
-        # "later"), and the readers that must see only the FIRST Monday — the
-        # interval calibration and the split date, where a later Monday chosen
-        # per k would make k-hat, or the split date, depend on k — must never
-        # reach the rest. So the key may be SPELLED — as a string ({"later":
-        # ...}, e["later"], e.get("later")) or as a keyword argument (dict(e,
-        # later=...), the shape a writer that rewrites the key would take) —
-        # only in the writer, the reader and the one TRUNCATING writer,
-        # _split_halves (which cuts an H1 pair's later Mondays at the split,
-        # building a new entry dict), anywhere in the package (deny-by-default,
-        # like the band walk below). The accepted cost of scanning the whole
-        # package: an unrelated "later" key or keyword in any module fails this
-        # pin too — if one is ever needed, widen the allowed homes
-        # deliberately, naming it. A spelling built at run time ("lat" + "er",
-        # an f-string) is out of this pin's scope.
+        # DR-75: backtester._find_entry records every qualifying Monday after
+        # the first under "later", and _entry_mondays is the one reader (its
+        # .get default is load-bearing: hand-built entries carry no "later").
+        # The key may be spelled — as a string or as a keyword argument
+        # (dict(e, later=...)) — only in the writer, the reader and the
+        # truncating writer _split_halves, anywhere in the package
+        # (deny-by-default, like the band walk below); with the last two
+        # asserts, the first-Monday readers (the calibration and the split
+        # date) cannot reach the rest.
+        # An unrelated "later" in any module fails this too; widen the allowed
+        # homes deliberately if one is needed. A spelling built at run time is
+        # out of scope.
         import importlib
         import pkgutil
 
@@ -914,10 +908,8 @@ class TestTimeSeriesKellyParity:
         # Not vacuous: the writer spells it (a renamed key would otherwise
         # leave nothing to check), and so do the one reader and the truncator
         assert writer in found and reader in found and truncator in found
-        # ... the count line, the Kelly gate (which enters a pair on its
-        # earliest passing Monday), the excluding-top-event check and the
-        # cap sweep's event census (market A's event on ANY Monday) read the
-        # Mondays through that reader ...
+        # ... the count line, the Kelly gate, the excluding-top-event check and
+        # the cap sweep's event census read the Mondays through that reader ...
         for function in ("_log_qualifying_mondays", "_simulate_at_discount",
                          "_ex_top_event", "entry_events"):
             assert _function_calls(backtester, function, "_entry_mondays"), function

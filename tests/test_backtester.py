@@ -7076,27 +7076,30 @@ class TestPrepareEntriesGolden:
     The expected rows below are LITERALS captured by running main's
     _prepare_entries (fe0a758, before the split existed) over this fixture —
     not re-derived from the code under test, which would make the check
-    tautological. Each row's last field, the later qualifying Mondays' dates
-    (DR-75), is a literal from an equally independent oracle: the pre-DR-75
-    scan restarted the day after each hit. The fixture is the
-    TestRunBacktestSweep EA/EB time-series pair; a same-event ladder whose
-    rungs close at one instant (so the stated gap, not close_time, orders the
-    legs and picks the 0.30 tier — Monday 1's 0.25 spread would clear the 0.15
-    tier a close gap of 0 picks, so the ladder entering on Monday 2 is what
-    proves the stated gap was used), with the later rung listed first; a
-    same-title pair whose B leg is the pricier one (canonicalized by price); a
-    cross-event time-series pair that never qualifies (a pricier earlier
-    contract on both Mondays); and two short-gap cross-event pairs at the two
-    extremes a band can act on — TA/TB at a spread of exactly the 0.15 short
-    tier and WA/WB at 0.98, the widest two live [0.01, 0.99] YES asks can make.
-    Those two are what let the capture SEE a band: without them every grid band
-    with floor <= 0.30 and ceiling >= 0.40 reproduced the rows, so
-    _prepare_entries could have silently started banding with the golden still
-    green. With them, any floor above the short tier or ceiling below 0.98
-    moves the rows — i.e. every band that could change an entry on any data
-    (the band tests below pin both directions). Both are voided (result ""), so
-    they never trade. It is run with ladders on AND off. The fetch and candle
-    seams are mocked exactly as TestRunBacktestSweep mocks them.
+    tautological. The fixture is the TestRunBacktestSweep EA/EB time-series
+    pair; a same-event ladder whose rungs close at one instant (so the stated
+    gap, not close_time, orders the legs and picks the 0.30 tier — Monday 1's
+    0.25 spread would clear the 0.15 tier a close gap of 0 picks, so the
+    ladder entering on Monday 2 is what proves the stated gap was used), with
+    the later rung listed first; a same-title pair whose B leg is the pricier
+    one (canonicalized by price); a cross-event time-series pair that never
+    qualifies (a pricier earlier contract on both Mondays); and two short-gap
+    cross-event pairs at the two extremes a band can act on — TA/TB at a
+    spread of exactly the 0.15 short tier and WA/WB at 0.98, the widest two
+    live [0.01, 0.99] YES asks can make. Those two are what let the capture
+    SEE a band: without them every grid band with floor <= 0.30 and ceiling
+    >= 0.40 reproduced the rows, so _prepare_entries could have silently
+    started banding with the golden still green. With them, any floor above
+    the short tier or ceiling below 0.98 moves the rows — i.e. every band
+    that could change an entry on any data (the band tests below pin both
+    directions). Both are voided (result ""), so they never trade. It is run
+    with ladders
+    on AND off. The fetch and candle seams are mocked exactly as
+    TestRunBacktestSweep mocks them.
+
+    Each row's last field, the later qualifying Mondays' dates (DR-75), comes
+    from an equally independent oracle: the pre-DR-75 scan restarted the day
+    after each hit.
     """
 
     _START = date(2026, 1, 1)
@@ -7148,11 +7151,10 @@ class TestPrepareEntriesGolden:
 
     # (pair_type, canon, group_key, entry_date, pA, pB, nA, nB, gap_days,
     #  ticker_a, ticker_b, later_dates) — every field but the last captured
-    #  on main @ fe0a758. later_dates (DR-75) holds the dates of the later
-    #  qualifying Mondays, from restarting the pre-DR-75 scan after each hit,
-    #  2026-09-27: each pair's candles hold still after its last candle, so a
-    #  pair keeps qualifying every Monday up to the day before its earlier
-    #  leg closes.
+    #  on main @ fe0a758; later_dates from restarting the pre-DR-75 scan after
+    #  each hit. Each pair's candles hold still after its last candle, so from
+    #  its first qualifying Monday it qualifies every Monday up to the day
+    #  before its earlier leg closes.
     # EA/EB, TA/TB, WA/WB and SB/SA (first Monday 1/5, earlier close 2/1):
     _LATER_WEEKS = (date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26))
     # The ladder with the tier floors on (first Monday 1/12, both rungs close 3/20):
@@ -7475,24 +7477,16 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
 
 
 class TestFindEntryRecordsEveryQualifyingMonday:
-    """_find_entry used to return at the FIRST Monday that passed its price,
-    deadline and band filters. It now scans to scan_end and returns that
-    Monday's dict — the same eight keys and values — plus "later": one dict
-    per LATER qualifying Monday, earliest first, each carrying that Monday's
-    own date, quotes and legs (DR-75). _entry_mondays is the one reader.
+    """_find_entry scans to scan_end and returns the first qualifying Monday's
+    dict plus "later": one dict per later qualifying Monday, earliest first,
+    each with that Monday's own date, quotes and legs (DR-75).
 
-    The chain oracle restarts _find_entry ITSELF the day after each Monday it
-    returns, taking each restart's first hit. That makes it independent of how
-    one pass now COLLECTS the Mondays (the scan running on past a hit, the
-    "later" list), but not of what both sides share: the per-Monday filters
-    and the candle lookup (TestCandlesAtOrBefore pins the lookup to
-    _candle_at_or_before). The independent anchors for those are
-    TestPrepareEntriesGolden's later dates, computed by restarting the
-    PRE-change code, and the critics' cross-version checks: the pre-change
-    code, restarted, agreed with the new "later" on all 7,940 later Mondays of
-    four seeded random corpora and on 54,132 real calls (each entered pair,
-    passed both ways round) across the 365-day window's 54 band passes
-    (measured 2026-09-27)."""
+    The chain oracle restarts _find_entry itself the day after each Monday it
+    returns, taking each restart's first hit. It is independent of how one
+    pass collects the Mondays, but not of the per-Monday filters and the
+    candle lookup both share (TestCandlesAtOrBefore pins the lookup);
+    TestPrepareEntriesGolden's later dates, from the pre-DR-75 code, are the
+    independent anchor for those."""
 
     _KEYS = ("entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days")
 
@@ -7585,9 +7579,9 @@ class TestFindEntryRecordsEveryQualifyingMonday:
             stepped_past += any((b - a).days > 7
                                 for a, b in zip(dates[:-1], dates[1:], strict=True))
             flipped += len({m["mA"]["ticker"] for m in mondays}) > 1
-        # Not vacuous. This seed gives 269, 234, 150 and 78 (measured
-        # 2026-09-27); bounds rather than pins, since random's integer draws
-        # are not promised to repeat across Python versions
+        # Not vacuous. This seed gives 269, 234, 150 and 78; bounds rather
+        # than pins, since random's integer draws are not promised to repeat
+        # across Python versions
         assert entered >= 200 and multi >= 150 and stepped_past >= 100 and flipped >= 50
 
     def test_each_later_monday_carries_its_own_same_title_legs(self):
@@ -7750,12 +7744,9 @@ class TestFindEntryRecordsEveryQualifyingMonday:
 
 
 class TestCandlesAtOrBefore:
-    """_find_entry reads each leg's candle at every Monday of its window
-    through _candles_at_or_before: _candle_at_or_before — the reference rule,
-    unchanged — applied to all the Mondays in one forward pass, since DR-75's
-    scan to scan_end made a per-Monday rescan from the first candle
-    O(Mondays x candles). These pin the pass to the reference answer by
-    answer, and pin its cost."""
+    """_candles_at_or_before applies the reference rule, _candle_at_or_before,
+    to all of a window's Mondays in one forward pass. These pin it to the
+    reference answer by answer, and pin its cost."""
 
     @staticmethod
     def _candles(rng: random.Random, shape: str) -> list[dict]:
@@ -7794,11 +7785,10 @@ class TestCandlesAtOrBefore:
     def test_the_pass_reads_each_candle_about_once(self):
         # A long-lived pair qualifying on every Monday of its one-year window
         # (the scan's cap), over two years of hourly candles per leg: each
-        # leg's "ts" must be read O(candles + Mondays) times. Looking each
-        # Monday up with _candle_at_or_before instead rescans from the first
-        # candle every time: 680,108 reads per leg here, about 19x the bound
-        # below (a per-Monday lookup over the whole scan, measured
-        # 2026-09-27; the one pass reads 17,414).
+        # leg's "ts" must be read O(candles + Mondays) times. A per-Monday
+        # _candle_at_or_before lookup rescans from the first candle every
+        # time: 680,108 reads per leg here, about 19x the bound below (the one
+        # pass reads 17,414).
         reads = {"A": 0, "B": 0}
 
         def counting(leg: str) -> type:
@@ -7832,8 +7822,8 @@ class TestCandlesAtOrBefore:
 
 
 def _without_later(rec: dict) -> dict:
-    """The same record with its later Mondays stripped — the pair as it was
-    simulated before DR-75, on its first qualifying Monday alone."""
+    """The same record with its later Mondays stripped: the pair on its first
+    qualifying Monday alone."""
     return {**rec, "entry": {k: v for k, v in rec["entry"].items() if k != "later"}}
 
 
@@ -7955,8 +7945,7 @@ class TestKellyPicksTheEarliestPassingMonday:
         assert t.kelly_fraction == pytest.approx(f2, abs=1e-12)
         assert t.total_cost == t.n * (0.20 + 0.40)
         assert point.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
-        # CONTROL: its first Monday alone — the pre-DR-75 simulation — never
-        # enters at this k
+        # CONTROL: on its first Monday alone it never enters at this k
         assert self._sim([_without_later(rec)], k=0.90).trades == []
 
     def test_at_a_k_the_first_monday_passes_it_is_the_entry(self):
@@ -8049,7 +8038,7 @@ class TestKellyPicksTheEarliestPassingMonday:
         (line,) = premise_lines(0.90, [rec])    # rescued on Monday 2, then excluded
         assert line.startswith("Excluded 1 time-series candidate(s)")
         assert premise_lines(0.95, [rec]) == []  # no Monday passes: never reaches it
-        # Before DR-75 its first Monday failed at 0.90, so it was never counted
+        # CONTROL: on its first Monday alone (which fails at 0.90) it is never counted
         assert premise_lines(0.90, [_without_later(rec)]) == []
 
     def test_holding_days_and_ranking_use_the_chosen_monday(self):
@@ -8123,12 +8112,11 @@ class TestKellyPicksTheEarliestPassingMonday:
 
 
 class TestSplitHalvesKeepEachHalfOnItsSide:
-    """_split_halves under DR-75: a pair stays in the half of its FIRST
-    qualifying Monday — so each half's entry count is what it always was —
-    but an H1 pair keeps only its Mondays BEFORE the split, so the Kelly gate
-    can never enter it in H1 on a Monday of the second period. It is not
-    re-listed in H2. An H1 record is rebuilt when a Monday is cut, never edited
-    in place (entry records are shared by every population, band and
+    """_split_halves: a pair stays in the half of its first qualifying Monday,
+    but an H1 pair keeps only its Mondays before the split, so the Kelly gate
+    can never enter it in H1 on a Monday of the second period (DR-75). It is
+    not re-listed in H2. An H1 record is rebuilt when a Monday is cut, never
+    edited in place (entry records are shared by every population, band and
     CapSweep holding them)."""
 
     _SPLIT = date(2026, 1, 19)
@@ -8180,7 +8168,7 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
         recs = self._records()
         for split in (*self._W, date(2026, 2, 2), date(2025, 12, 29)):
             h1, h2 = backtester._split_halves(recs, split)
-            # Exactly the pre-DR-75 split by first Monday, record for record
+            # Exactly the split by first Monday, record for record
             assert [r["entry"]["mA"]["ticker"] for r in h1] == [
                 r["entry"]["mA"]["ticker"] for r in recs if r["entry"]["entry_date"] < split]
             assert h2 == [r for r in recs if r["entry"]["entry_date"] >= split]
@@ -8370,8 +8358,8 @@ class TestCapSweepEntryEventsReadEveryMonday:
 
 
 class TestCalibrationReadsTheFirstMonday:
-    """What stays on each pair's FIRST qualifying Monday under DR-75, whatever
-    its later Mondays hold: the interval calibration (reading a k-dependent
+    """What stays on each pair's first qualifying Monday, whatever its later
+    Mondays hold (DR-75): the interval calibration (reading a k-dependent
     traded Monday would make k-hat circular), the split date (every band x k
     cell must split at one date) and the populations."""
 
@@ -10506,7 +10494,7 @@ class TestBandSweepPhaseOneSubset:
         subset = [candidates.all_pairs[3], candidates.all_pairs[0]]
         narrowed = backtester._entries_for_band(candidates, pair_types=("time_series",),
                                                 _pairs=subset)
-        # r[9] is ticker_a (its position from the front; DR-75 appended a column)
+        # r[9] is ticker_a (counted from the front: later_dates is the last column)
         assert [r[9] for r in rows(narrowed)] == ["TA", "EA"]
         assert set(rows(narrowed)) <= set(rows(full))
         assert candidates.all_pairs == before
@@ -10871,14 +10859,12 @@ class TestExactLabels:
 # ─── C1: the per-trade size cap as a parameter, and the lazy cap sweep ───────
 
 def _uncapped_kelly(rec: dict, k: float) -> float | None:
-    """Pass 1b's uncapped Kelly fraction at one prepared entry's FIRST
+    """Pass 1b's uncapped Kelly fraction at one prepared entry's first
     qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
     that Monday), rebuilt from the config helpers — the oracle for
     peak_kelly_fraction wherever each candidate enters on its first Monday
     (TestPrepareEntriesGolden's tier-on entries, whose later Mondays repeat
-    the first's quotes); since DR-75 the peak is read at each candidate's
-    earliest Kelly-passing Monday. None when the net spread leaves nothing
-    to size."""
+    the first's quotes). None when the net spread leaves nothing to size."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -12132,9 +12118,9 @@ class TestTierOffSweep:
     floor 0, where each clears it anyway, and FA/FB (a pricier earlier
     contract) never enters."""
 
-    # Its later qualifying Mondays (DR-75) are Monday 2 and every one the
-    # tier-on ladder qualifies on after it — from restarting the pre-DR-75
-    # scan after each hit, 2026-09-27 (see TestPrepareEntriesGolden's rows)
+    # Its later qualifying Mondays are Monday 2 and every one the tier-on
+    # ladder qualifies on after it (the restarted-scan oracle that gives
+    # TestPrepareEntriesGolden its later dates)
     _LADDER_OFF = ("time_series", "will spacex launch another starship by ?",
                    "will spacex launch another starship by ?",
                    date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE",
@@ -12237,12 +12223,11 @@ class TestTierOffSweep:
     def test_at_k_0_90_the_ladder_enters_on_its_first_kelly_passing_monday(
         self, golden_tier_off_sweep,
     ):
-        # DR-75. With the tiers off the ladder first qualifies on Monday 1 (pA
-        # 0.20 / pB 0.45 / nB 0.55, Kelly -0.016 at k = 0.90 and +0.041 at
-        # 0.85), then on Monday 2 and after (pB 0.60 / nB 0.40, +0.032 at
-        # 0.90, -0.022 at 0.95). At 0.90 it used to be dropped for good; it now
-        # enters on Monday 2 — at every binding band — and loses (RUNG-EARLY
-        # settled NO, RUNG-LATE YES: the in-between cell).
+        # With the tiers off the ladder first qualifies on Monday 1 (pA 0.20 /
+        # pB 0.45 / nB 0.55, Kelly -0.016 at k = 0.90 and +0.041 at 0.85), then
+        # on Monday 2 and after (pB 0.60 / nB 0.40, +0.032 at 0.90, -0.022 at
+        # 0.95). At 0.90 it enters on Monday 2 at every binding band (DR-75)
+        # and loses (RUNG-EARLY settled NO, RUNG-LATE YES: the in-between cell).
         res = golden_tier_off_sweep.result
 
         def ladder_trades(points, k):
@@ -12265,7 +12250,7 @@ class TestTierOffSweep:
         assert sorted(at_95) == _TIER_BOUND_BANDS
         assert all(trades == [] for trades in at_95.values())
         # CONTROL: with the tiers on the ladder first qualifies on Monday 2,
-        # which passes at 0.90 — it trades there, its first Monday, as before
+        # which passes at 0.90 — it trades there, on its first Monday
         on = ladder_trades(res.scenarios, 0.90)
         assert sorted(on) == _GRID_BANDS
         assert all([t.entry_date for t in trades] == [date(2026, 1, 12)]
