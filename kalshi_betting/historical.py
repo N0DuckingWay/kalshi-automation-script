@@ -5361,8 +5361,9 @@ def _merge_candle_pages(candles: list[dict]) -> list[dict]:
     so a candle in an overlap can come back from both; the first copy in
     timestamp order is kept (the sort is stable, so that is the earlier
     request's). Sorting is what makes the result safe for
-    backtester._candle_at_or_before, which assumes an ascending series and
-    stops at the first candle past its target.
+    backtester._candles_at_or_before (and its reference,
+    _candle_at_or_before), which stop at the first candle past each moment
+    and so need an ascending series.
 
     Only called when a window took more than one request: a single response
     is returned exactly as the endpoint ordered it, as it always was.

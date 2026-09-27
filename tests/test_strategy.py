@@ -420,14 +420,14 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
 
 
 def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
-    """Where `key` is spelled in `tree` as a string or as a keyword argument:
-    every string ast.Constant EQUAL to it (a dict literal's key, a subscript,
-    a .get) and every ast.keyword NAMED it (dict(entry, later=...)), each as
-    the outermost enclosing function's name ("Class.method" for a method) and
-    the line, or None outside any function. Equality, not substring, so a
-    docstring that merely mentions the word — its own Constant — never
-    matches. A spelling built at run time ("lat" + "er", an f-string) is not
-    found."""
+    """Every place `key` is written in `tree`, as a string or as a keyword
+    argument: each string constant EQUAL to it (a dict key, a subscript, a
+    .get) and each keyword argument NAMED it (dict(entry, later=...)). Each
+    place is returned as (owner, line): owner is the outermost function
+    around it ("Class.method" for a method), or None at module or class
+    level. Equality, not substring, so a docstring that merely mentions the
+    word never matches. A key built at run time ("lat" + "er", an f-string)
+    is not found."""
     homes: list[tuple[str | None, int]] = []
 
     def visit(node: ast.AST, owner: str | None, scope: str) -> None:
@@ -873,18 +873,17 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
 
     def test_ast_later_mondays_have_one_reader(self):
-        # DR-75: backtester._find_entry records every qualifying Monday after
-        # the first under "later", and _entry_mondays is the one reader (its
-        # .get default is load-bearing: hand-built entries carry no "later").
-        # The key may be spelled — as a string or as a keyword argument
-        # (dict(e, later=...)) — only in the writer, the reader and the
-        # truncating writer _split_halves, anywhere in the package
-        # (deny-by-default, like the band walk below); with the last two
-        # asserts, the first-Monday readers (the calibration and the split
-        # date) cannot reach the rest.
-        # An unrelated "later" in any module fails this too; widen the allowed
-        # homes deliberately if one is needed. A spelling built at run time is
-        # out of scope.
+        # backtester._find_entry stores every qualifying Monday after the
+        # first under "later", and _entry_mondays is the one function the
+        # rest of the code reads them through (DR-75; its .get default
+        # matters, since hand-built entries have no "later"). This checks that
+        # the key is written — as a string or as a keyword argument,
+        # dict(e, later=...) — only in those two and in _split_halves, which
+        # trims the list, anywhere in the package; and, with the last two
+        # asserts, that the calibration and the split date, which must use
+        # only the first Monday, never read the rest. An unrelated "later"
+        # anywhere in the package fails this too: add it to the allowed places
+        # on purpose if one is ever needed.
         import importlib
         import pkgutil
 

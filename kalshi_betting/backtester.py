@@ -99,9 +99,9 @@ Notes:
     co-resolve) is simpler than the directional time-series bet, whose edge
     rests on the operator-tuned interval discount behind
     config.time_series_profit_prob. Pass 2 walks
-    entries in chronological order (priority-ordered within a date using the
-    ENTRY-TIME expected return, which reads no settlement outcome but measures
-    its horizon to the legs' realized closes), maintains a running cash
+    entries in chronological order (within one date, ordered by the expected
+    return at entry; that never reads how the markets settled, though its
+    horizon ends at whichever leg actually closed last), maintains a running cash
     balance — sizing every candidate of an entry date against that checkpoint's
     opening balance, admitting them greedily against the running cash (mirroring
     main._run_prod + strategy.select_portfolio) and releasing settlement receipts
@@ -111,8 +111,12 @@ Notes:
     live bot's Kelly sizing against one per-run balance snapshot and its
     one-active-position-per-ticker rule: get_held_tickers() reads positions with
     count_filter="position", so a settled ticker leaves the blocked set live too.
-    Pass 1's Kelly gate enters each pair on its earliest qualifying Monday that
-    passes (DR-75).
+    A pair can pass the entry checks on several Mondays (its qualifying
+    Mondays). Pass 1 dates it on the first of them whose Kelly fraction (the
+    share of the balance the Kelly formula would bet, positive only when the
+    model expects a profit) is positive at the simulated interval discount
+    k — the first Monday the weekly live bot could have traded it — and
+    Pass 2 trades it on that Monday if it can (DR-75).
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -547,10 +551,10 @@ class BacktestTrade:
         title_b (str): Display title of market B.
         category (str): Human-readable market category inferred from event_ticker prefix
             (e.g. "Crypto", "Sports", "Politics").
-        entry_date (date): The Monday the trade was entered and sized: the
-            pair's earliest qualifying Monday that passed the Kelly gate at
-            the run's k (DR-75). entry_pA..entry_nB, ticker_a/ticker_b and
-            event_ticker are that Monday's.
+        entry_date (date): The Monday the trade was entered: the first of the
+            pair's qualifying Mondays whose Kelly fraction was positive at the
+            run's k. The entry prices (entry_pA..entry_nB), the tickers and
+            event_ticker all come from that Monday.
         exit_date (date): The date the later-settling market resolved; marks when cash returned.
         entry_pA (float): YES ask price of market A at entry. Range: [0.01, 0.99].
             The traded price of the market-A leg for time_series; for same_title
@@ -583,9 +587,10 @@ class BacktestTrade:
         profit_ratio (float): profit / (total_cost + fees). Return on the cash
             actually invested.
         monthly_profit_ratio (float): Realized profit_ratio scaled to 30 days:
-            profit_ratio * 30 / holding_days. Reporting only — trade selection
-            ranks on the entry-time expected ratio, which reads no settlement
-            outcome (its horizon does read the legs' realized closes).
+            profit_ratio * 30 / holding_days. Reporting only — trades are
+            ranked on an expected ratio computed at entry, which never reads
+            how the markets settled (though its horizon ends at whichever
+            leg actually closed last).
         kelly_fraction (float): Capped Kelly fraction used for sizing, <= the
             size cap it was simulated under — config.BUDGET_FRACTION unless a
             size-cap sweep (CapSweep) simulated another.
@@ -706,9 +711,9 @@ class HalfSplit:
     The scenario's entries are split at BacktestSweep.split_date and each half
     is simulated ALONE from the run's initial balance, at the scenario's own
     band and k — so a band x k cell that only looks good because of one
-    stretch of history shows it as two very different numbers. Each pair
-    falls in the half of its first qualifying Monday, and H1 uses only its
-    pairs' Mondays before the split (_split_halves, DR-75). Only the two
+    stretch of history shows it as two very different numbers. A pair is in
+    the half its first qualifying Monday falls in, and a first-half pair is
+    only ever entered before the split (see _split_halves). Only the two
     final-balance returns and trade counts are kept; neither half's equity
     curve is (a band sweep would otherwise hold two extra frames per
     scenario).
@@ -734,13 +739,13 @@ class HalfSplit:
     WARNING names those, but the dashboard blanks every empty half alike.
 
     Attributes:
-        h1_return (float): Total return of the entries whose first qualifying
-            Monday is STRICTLY BEFORE split_date, simulated alone on their
+        h1_return (float): Total return of the pairs that first qualified
+            STRICTLY BEFORE split_date, simulated alone and only on their
             Mondays before it: (final portfolio value − initial balance) /
             initial balance. 0.0 when that half is empty — read h1_entries
             before trusting it.
-        h2_return (float): The same for the entries whose first qualifying
-            Monday is ON or after split_date.
+        h2_return (float): The same for the pairs that first qualified ON or
+            after split_date.
         h1_trades (int): Trades the first half's simulation entered.
         h2_trades (int): Trades the second half's simulation entered.
         h1_entries (int | None): Entries the first half's simulation was
@@ -819,8 +824,8 @@ class SweepPoint:
             largest summed profit on this point (by BacktestTrade.event_ticker,
             ignoring trades with no event ticker, ties to the alphabetically
             first) and the return of ONE re-simulation of this point's entries
-            without those whose market-A event ticker is that event on any of
-            their qualifying Mondays (DR-75; see _ex_top_event). A
+            without every pair whose market A belongs to that event on any of
+            its qualifying Mondays (see _ex_top_event). A
             re-simulation, never a subtraction of that event's P&L from this
             point's return: the survivors are re-sized against the cash the
             removed trades no longer consume, and a subtraction is not bounded
@@ -840,15 +845,16 @@ class SweepPoint:
             Appended with a default, like the two fields below it, so no
             existing construction moves.
         peak_kelly_fraction (float | None): The largest UNCAPPED Kelly
-            fraction f* any candidate reached after the Kelly gate, each at
-            the Monday the gate chose for it (DR-75) — counted before the
-            settlement-outcome and premise checks, so a candidate those later
-            drop still counts — and 0.0 when none passed. It does not depend
-            on the cap (Pass 1b scores every entry, and picks its Monday,
-            before any sizing), and every cap at or above it sizes this
-            point's entries identically, since min(cap, f*) == f* for every
-            candidate; a size-cap sweep reuses one simulation for all such
-            caps (CapSweep). None only on a hand-built point.
+            fraction f* among the candidates that passed the Kelly gate, each
+            read on the Monday the gate picked for it, and 0.0 when none
+            passed. It is taken right after the gate, so a candidate a later
+            step drops (the settlement-outcome or premise check, the
+            one-pair-per-group rule, Pass 2) still counts. It does not depend
+            on the cap (the gate picks every candidate's Monday before any
+            sizing), and every cap at or above it sizes this point's entries
+            identically, since min(cap, f*) == f* for every candidate; a
+            size-cap sweep reuses one simulation for all such caps
+            (CapSweep). None only on a hand-built point.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1247,9 +1253,10 @@ class CapSweep:
     Sharing is exact, not approximate: the halves and the excluding-top-event
     re-simulation run over subsets of the point's entries, whose own peaks are
     no higher, so they too size identically at every cap at or above the
-    point's peak. That holds with later Mondays too (DR-75): the Monday a
-    pair enters on depends on k, never on the cap, and _split_halves leaves
-    each half's candidates on the Monday the full run chose, or absent.
+    point's peak. That holds when a pair enters on a later Monday too: the
+    Monday the Kelly gate picks depends on k, never on the cap, and in each
+    half the gate can pick only the full run's Monday for a pair, or none
+    (_split_halves).
     A simulated cap runs quiet — its completion line and its
     premise-violation WARNING go to DEBUG, since the primary-cap run already
     reported the same count and ~10 repeats per cell would flood the log
@@ -1275,9 +1282,9 @@ class CapSweep:
     36 bands) on the 2026-09-26 01:22 365-day run's log, hence at most ~810
     distinct market dicts — a few MB. Nothing else from the corpus is kept;
     the eager points it references are the ones BacktestSweep already
-    holds. Each entry also carries one small dict per later qualifying Monday
-    (DR-75), which references the pair's own two market dicts, so no market
-    dict is added.
+    holds. Each entry also carries one small dict per later qualifying
+    Monday; those point at the pair's own two market dicts, so they add no
+    market dicts.
 
     One Tier floors setting per CapSweep (tier_floors). The tier-on one
     (BacktestSweep.cap_sweep, tier_floors True) holds the tier-on
@@ -1320,7 +1327,7 @@ class CapSweep:
     new dicts (derived, not measured) beside at most 660 for its 330 tier-on
     no-band entries, a few MB. The ~810 tier-on figure above is a different
     corpus's (the 365-day run's), whose tier-off-only count was not measured.
-    Its entries' later-Monday dicts add no market dict either (DR-75).
+    The later-Monday dicts of its entries add no market dicts either.
 
     BACKTEST-ONLY, like the band and k sweeps: live sizing reads
     config.BUDGET_FRACTION and never this module.
@@ -1520,13 +1527,13 @@ class CapSweep:
         """
         Every (event ticker, fallback category) any cell's trades could carry.
 
-        Built exactly as _simulate_at_discount builds BacktestTrade.event_ticker
-        and .category — market A's event ticker as _find_entry canonicalized it,
-        on each of the pair's qualifying Mondays (DR-75), and infer_category of
-        it — over every band's entries, so a reader can list every category and
-        tag before any cell is simulated. A superset of the events the cells'
-        trades carry: it includes entries no cell trades, and every Monday's
-        event of a same-title entry whose market A changes between Mondays.
+        Built the way _simulate_at_discount fills BacktestTrade.event_ticker and
+        .category (market A's event ticker, and infer_category of it), but for
+        every qualifying Monday of every band's entries, so the dashboard can
+        list every category and tag before any cell is simulated. It is a
+        superset of the events the trades carry: it includes pairs no cell
+        trades, and both events of a same-title pair whose market A changes
+        between Mondays.
 
         Returns:
             set[tuple[str, str]]: (event ticker, category) pairs; the ticker
@@ -1614,8 +1621,8 @@ class BacktestSweep:
             None means not recorded (a hand-built sweep).
         split_date (date | None): The date the split-half check (SweepPoint.
             halves) splits entries at — the median_low of the primary band's
-            TIME-SERIES entries' first qualifying Mondays, which no k moves
-            (same-title entries are left out, so they cannot move the split
+            TIME-SERIES entries' first qualifying Mondays, which do not depend
+            on k (same-title entries are left out, so they cannot move the split
             the time-series checks are read at), or the window's midpoint when
             that band has none. One date for every scenario and both checked
             populations, so every cell's halves cover the same two stretches
@@ -1908,10 +1915,11 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
 
     _find_entry() only opens a trade at a Monday checkpoint — 09:00 UTC,
     _checkpoint_datetime — whose DATE lies in
-    [start_date, min(close_a, close_b) - 1 day], and only when
-    _candle_at_or_before finds a candle at or before that checkpoint for
-    BOTH legs. A candle's "ts" is its period END (historical.fetch_candlesticks
-    stores end_period_ts there), and a market has no candle ending at or
+    [start_date, min(close_a, close_b) - 1 day], and only when BOTH legs
+    have a candle at or before that checkpoint (_find_entry looks them up
+    through _candles_at_or_before). A candle's "ts" is its period END
+    (historical.fetch_candlesticks stores end_period_ts there), and a market
+    has no candle ending at or
     before the start of the hour it opened in — the measurement recorded in
     _candle_window_open's docstring, re-measured for this predicate (M8 of the
     2026-09-24 review, P5): 0 of 952,519 cached hourly candles across 3,542
@@ -3280,10 +3288,10 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     derived from the API's end_period_ts when the candle is fetched — see
     historical.fetch_candlesticks — so this is equivalently "at or before the
     candle's period end", just read off the dict's own key rather than the
-    wire field name.) It is the reference rule for the closing price on or
-    before a Monday snapshot and has no caller in the pipeline: _find_entry
-    reads every Monday through _candles_at_or_before, which tests pin to this
-    function's answer at each (TestCandlesAtOrBefore).
+    wire field name.) Nothing in the pipeline calls it: _find_entry looks up
+    all of a pair's Mondays at once through _candles_at_or_before, which
+    gives the same answers in one pass. It is kept as the plain version the
+    tests check that function against (TestCandlesAtOrBefore).
 
     Args:
         candles (list[dict]): List of candle dicts with a "ts" key (unix timestamp).
@@ -3306,26 +3314,38 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
 
 def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[dict | None]:
     """
-    _candle_at_or_before's answer for each of several timestamps, in one forward pass.
+    For each of several moments, find a market's latest candle at or before it.
 
-    Each target resumes where the previous one stopped: every candle before
-    one target's stop is at or before that target, hence at or before any
-    larger target too. That holds for an unsorted list as well, since the
-    reference also stops at the first candle past its target. A target below
-    its predecessor restarts at the first candle, so any sequence of targets
-    gets the reference's answers; a non-decreasing one takes a single
-    O(candles + targets) pass.
+    A faster way to do what _candle_at_or_before does, for many moments at
+    once; _find_entry is its only caller. _find_entry checks a pair at 09:00
+    UTC on every Monday of the pair's window and records each Monday on
+    which the pair passes its entry checks, so that the simulation can later
+    pick the first of them whose Kelly fraction is positive (DR-75). To
+    check a Monday it needs each market's prices as of 09:00 that day: the
+    market's latest candle at or before that moment. A candle is one hour of
+    a market's price history: the hour's end time ("ts") and the YES and NO
+    ask prices at the end of that hour (the NO ask estimated as 1 − the YES
+    bid).
+
+    Calling _candle_at_or_before once per Monday would re-read the candle
+    list from the start every time. The Mondays come in date order, so here
+    each lookup carries on from where the previous one stopped, and one walk
+    through the list answers them all. The answers are exactly
+    _candle_at_or_before's, even for candles out of order, and a moment
+    earlier than the previous one restarts from the first candle
+    (TestCandlesAtOrBefore checks both).
 
     Args:
-        candles (list[dict]): Candle dicts with a "ts" key (unix timestamp),
-            in the order the reference would scan them.
-        timestamps (list[int]): The target Unix timestamps; non-decreasing
-            for the single pass (_monday_timestamps returns them ascending).
+        candles (list[dict]): One market's candles, each a dict with a "ts"
+            key (Unix seconds), normally in time order.
+        timestamps (list[int]): The moments to look up, in Unix seconds;
+            _find_entry passes its Mondays at 09:00 UTC, in date order.
 
     Returns:
-        list[dict | None]: _candle_at_or_before(candles, ts) for each
-            timestamp, in order — the candle dict itself (never a copy), or
-            None.
+        list[dict | None]: For each moment, in order, _candle_at_or_before's
+            answer — for time-ordered candles, the latest candle at or before
+            that moment (the dict itself, not a copy) — or None when there is
+            none.
     """
     found: list[dict | None] = []
     i = 0
@@ -3333,9 +3353,9 @@ def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[di
     previous: int | None = None
     for ts in timestamps:
         if previous is not None and ts < previous:
-            # A target below its predecessor: restart from the first candle
+            # Earlier than the previous moment: start again from the first candle
             i = 0
-        # Advance to the first candle past this target (or the list's end)
+        # Step forward to the first candle after this moment; the one just before it is the answer
         while i < n and candles[i]["ts"] <= ts:
             i += 1
         found.append(candles[i - 1] if i else None)
@@ -3365,13 +3385,15 @@ def _find_entry(
     one-year figure bounds how far back the window can reach, it does not
     describe where the window ends. At each Monday, reads the candlestick
     prices, applies the price gap, price-sum, and fee filters from the live
-    trading logic, and returns the first qualifying week's entry data with
-    every LATER qualifying week under "later". It holds no probability model,
-    so one entry pass per band serves every k and size cap; the Kelly gate in
-    _simulate_at_discount picks, per k, the earliest of these Mondays that
-    passes (DR-75). Each leg's candles are read in one forward pass
-    (_candles_at_or_before) through the first candle past the window's last
-    Monday, so a malformed candle among those can raise (KeyError, TypeError).
+    trading logic, and returns the first qualifying Monday's entry data with
+    every later qualifying Monday listed under "later". It uses only price
+    and date rules — no probability model — so it knows nothing about k or
+    the size cap, and one pass per spread band (and tier setting) serves
+    every k and cap; the simulation (_simulate_at_discount) then picks, per
+    k, the first of these Mondays whose Kelly fraction is positive (DR-75).
+    Each leg's candles are read in one pass (_candles_at_or_before) up to
+    just past the window's last Monday, so a malformed candle in that
+    stretch can raise (KeyError, TypeError).
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract —
@@ -3452,8 +3474,13 @@ def _find_entry(
     the first market closes, the pair is no longer open for entry.
 
     Args:
-        candles_a (list[dict]): Hourly candlestick dicts for market A (sorted by ts).
-        candles_b (list[dict]): Hourly candlestick dicts for market B (sorted by ts).
+        candles_a (list[dict]): Market A's hourly price history, oldest first:
+            one dict per hour of data with "ts" (the hour's end, Unix seconds)
+            and the YES ask and NO ask at its close ("yes_ask_close",
+            "no_ask_close"; the NO ask estimated as 1 − the YES bid).
+            _entries_for_band passes the candles _fetch_candles_parallel
+            fetched for mA's ticker.
+        candles_b (list[dict]): The same for market B.
         mA (dict): Market A metadata dict (with "close_time", "result", etc.).
         mB (dict): Market B metadata dict (with "close_time", "result", etc.).
         pair_type (str): "time_series" or "same_title" — controls price gap threshold
@@ -3503,10 +3530,11 @@ def _find_entry(
             concept.
             "later" holds one dict per later qualifying Monday, earliest
             first, with every key above but "later": that Monday's date,
-            quotes and mA/mB (a same-title pair's A is re-decided each
-            Monday; the market dicts are the same objects, never copies) and
-            the same gap_days. () when the pair qualified on one Monday only.
-            Read them through _entry_mondays().
+            prices and mA/mB (for a same-title pair, which market is A is
+            decided afresh each Monday, so the two can swap; the market dicts
+            are the same objects, not copies) and the same gap_days. () when
+            the pair qualified on one Monday only. Read them through
+            _entry_mondays().
             Returns None if no qualifying Monday was found in the scan window, or
             if either leg's close_time is missing or unparseable (no scan window
             can be derived, so the pair is simply not enterable).
@@ -3673,9 +3701,14 @@ def _find_entry(
 
     # Every qualifying Monday, earliest first (see Returns)
     mondays: list[dict] = []
+    # The Mondays to test, each at 09:00 UTC
     checkpoints = _monday_timestamps(scan_start, scan_end)
-    # Each leg's candle at or before every checkpoint, in one forward pass per
-    # leg (after the time-series swap above, so each list is its own leg's)
+    # candles_a is market A's hourly price history and candles_b market B's
+    # (see Args). If the time-series branch above swapped the two markets so
+    # that A is the earlier contract, it swapped these lists too. For each
+    # Monday, candles_at_a and candles_at_b hold that market's latest candle
+    # at or before 09:00 UTC (its prices at that moment), or None if it had
+    # no candle yet.
     candles_at_a = _candles_at_or_before(candles_a, checkpoints)
     candles_at_b = _candles_at_or_before(candles_b, checkpoints)
     for ts, ca, cb in zip(checkpoints, candles_at_a, candles_at_b, strict=True):
@@ -3793,7 +3826,7 @@ def _find_entry(
         mondays.append({
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA, "nB": nB,
-            # This Monday's legs: a same-title pair is canonicalized per Monday
+            # This Monday's legs (for a same-title pair, A is chosen afresh each Monday)
             "mA": mA_i, "mB": mB_i,
             # The gap the tier above was selected from, carried out so the
             # calibration report buckets each pair under exactly the gap it
@@ -3804,8 +3837,8 @@ def _find_entry(
 
     if not mondays:
         return None
-    # The first Monday is the entry itself (what the calibration and the split
-    # date read); the rest go under "later"
+    # The first qualifying Monday is the entry itself (the calibration and the
+    # split date read only this one); the rest go under "later"
     entry = mondays[0]
     entry["later"] = tuple(mondays[1:])
     return entry
@@ -3815,10 +3848,12 @@ def _entry_mondays(entry: dict) -> tuple[dict, ...]:
     """
     Every qualifying Monday of one _find_entry() result, earliest first.
 
-    The entry itself is the first and "later" holds the rest (DR-75). An
-    entry without "later" (tests build some by hand) is one Monday. Only
-    _find_entry, this function and _split_halves spell the key (an AST test
-    in tests/test_strategy.py pins that).
+    The entry itself is the first Monday and its "later" list holds the rest
+    (DR-75). An entry with no "later" key (tests build some by hand) counts
+    as one Monday. _simulate_at_discount's Kelly gate, _ex_top_event,
+    CapSweep.entry_events and _log_qualifying_mondays read the Mondays
+    through this function; an AST test in tests/test_strategy.py checks that
+    only _find_entry, this function and _split_halves use the "later" key.
 
     Args:
         entry (dict): A _find_entry() result — a record's "entry".
@@ -3836,9 +3871,12 @@ def _log_qualifying_mondays(entries: list[dict], band: tuple[float, float] | Non
     """
     Log how many qualifying Mondays one entry pass recorded (DR-75).
 
-    Logged on every pass, zero included (DR-66). Its wording shares no prefix
-    with the lines tests filter on ("Prepared ", "Spread band ",
-    "Tier floors off", "Split-half check").
+    Called by _prepare_entries after its entry pass, and by
+    _sweep_from_candidates once per band (tier floors on and off), right
+    after that band's prepared-entries line. It logs even at zero, so the log
+    always shows whether any pair qualified on more than one Monday (DR-66).
+    The line starts differently from the log lines tests count ("Prepared ",
+    "Spread band ", "Tier floors off", "Split-half check").
 
     Args:
         entries (list[dict]): One _entries_for_band() output (or a band's
@@ -3855,8 +3893,8 @@ def _log_qualifying_mondays(entries: list[dict], band: tuple[float, float] | Non
     counts = [len(_entry_mondays(rec["entry"])) for rec in entries]
     logging.info("Qualifying Mondays at band %s%s: %d over %d entries (%d qualify on more "
                  "than one)",
-                 # config resolves None to the default band; named as the
-                 # completion lines name it
+                 # None means the default band; label it the way the
+                 # completion lines do
                  _band_label(time_series_spread_band(band)),
                  " with the tier floors off" if tier_floors is False else "",
                  sum(counts), len(counts), sum(1 for n in counts if n > 1))
@@ -5512,10 +5550,12 @@ def _simulate_at_discount(
     makes that count itself k-dependent. Likewise the one-pair-per-group dedup
     runs after the Kelly gate, so a different k can change which candidate wins
     its group. Both are intended; do not reorder or hoist them. The gate
-    walks each pair's qualifying Mondays in date order and enters it on the
-    first that passes (DR-75); every later step reads that Monday's quotes,
-    date and legs. A pair Pass 2 skips (cash, n < 1, a ticker still open,
-    the exact-fee check) is not retried on a later Monday.
+    tries each pair's qualifying Mondays in date order and picks the first
+    with a positive Kelly fraction (DR-75); every later step uses that
+    Monday's prices, date and legs. If Pass 2 then cannot take the trade
+    (not enough cash, not one contract affordable, a ticker still in an open
+    trade, or exact fees eating the profit), the pair is not tried again on a
+    later Monday, although the live bot would try again the next week.
 
     spread_band, population and tier_floors change NOTHING about the
     simulation: the band and the tier floors have already acted by the time
@@ -5642,10 +5682,11 @@ def _simulate_at_discount(
         group_key = rec["group_key"]
         entry     = rec["entry"]
 
-        # Enter on the earliest qualifying Monday whose Kelly fraction is
-        # positive at this k (DR-75). Everything after the loop reads that
-        # Monday's values (a same-title pair's legs can differ between
-        # Mondays); only gap_days, the same on every Monday, comes off entry.
+        # Try the pair's qualifying Mondays in date order and stop at the
+        # first with a positive Kelly fraction at this k (DR-75). Everything
+        # after the loop uses that Monday's values, not the first Monday's (a
+        # same-title pair's legs can swap between Mondays); only gap_days,
+        # which is the same on every Monday, is read from entry.
         for monday in _entry_mondays(entry):
             # Unpack this Monday — mA/mB may have been swapped inside _find_entry to canonicalize
             mA = monday["mA"]
@@ -5691,12 +5732,14 @@ def _simulate_at_discount(
             # value once the fee is counted on the losing side too (DR-62)
             kelly_f = (p - q / kelly_b_entry) if kelly_b_entry > 0 else -1.0
             if kelly_f > 0:
-                # The earliest passing Monday wins, even over a larger later one
+                # Stop at the first passing Monday, even if a later one scores
+                # higher: it is the first week the live bot could have traded
+                # the pair
                 break
         if kelly_f <= 0:
             # No qualifying Monday has positive expected value at this k
             continue
-        # The chosen Monday's fraction: the one this candidate is sized at
+        # The uncapped fraction on the Monday the gate picked (capped just below)
         peak_kelly = max(peak_kelly, kelly_f)
         # Cap at the run's per-trade size cap (config.BUDGET_FRACTION, 20%,
         # unless a size-cap sweep simulates another) to avoid over-concentration
@@ -5736,13 +5779,13 @@ def _simulate_at_discount(
 
         holding_days = max(1, (exit_date - entry_date).days)
 
-        # Entry-time priority metric: the expected return at the chosen
-        # Monday's prices, normalized to 30 days over the horizon from that
-        # Monday to the later of the two legs' closes. It reads no settlement
-        # outcome, but a settled market's close_time is its REALIZED close, so
-        # for a market that resolved early the horizon (and this ratio, the
-        # group contest below and Pass 2's order within a date) reflects when
-        # it actually closed.
+        # Ranking metric: the expected return at the chosen Monday's prices,
+        # scaled to 30 days by the time from that Monday to the later of the
+        # two legs' close dates. It never reads how the markets settled, but a
+        # settled market's close_time is when it actually closed, which can be
+        # earlier than scheduled when the event was decided early — so this
+        # ratio, and the group contest and Pass 2 order that use it, can
+        # reflect something not known at entry (look-ahead).
         # Belt-and-braces again: _find_entry already required a parseable
         # close_time on both legs to derive its scan window, so neither guard
         # can fire in practice — but a bare [...] index plus an unguarded
@@ -5839,9 +5882,10 @@ def _simulate_at_discount(
     # groups), not the display-only canon — two unrelated events sharing an
     # option label (e.g. "Trump" in two different events) have the same canon
     # but distinct group_keys, and must remain two separate candidates.
-    # A group's candidates can be dated on different Mondays, so its winner
-    # can be dated after a group-mate that passed the gate on an earlier
-    # Monday (look-ahead; see CLAUDE.md's DR-75 paragraph).
+    # A group's candidates can be dated on different Mondays, so the winner
+    # can be dated after a group-mate that passed the Kelly gate earlier — a
+    # choice the live bot could not have made at the time (look-ahead; see
+    # DR-75 in CLAUDE.md).
     best_by_group: dict = {}
     for c in candidates:
         key = (c["pair_type"], c["group_key"])
@@ -6170,9 +6214,9 @@ def _interval_calibration(
     valid for every k at one band, which is why BacktestSweep holds one of
     these per band rather than each SweepPoint holding its own. It is not
     band-independent: a band decides which pairs enter at all. It prices each
-    pair at its first qualifying Monday, never at the Monday a simulation
-    traded it on, which depends on k (DR-75) and would reintroduce that
-    circularity.
+    pair at its first qualifying Monday, never at the Monday the Kelly gate
+    picks for it: that Monday depends on k, so using it would bring back the
+    circularity described above (DR-75).
 
     Two properties of the population to keep in mind when reading the number:
 
@@ -6544,9 +6588,10 @@ def _split_date(entries: list[dict], start_date: date) -> date:
     """
     Choose the date a band sweep's split-half check splits entries at.
 
-    The dates are each pair's first qualifying Monday (entry_date), never the
-    Monday a simulation traded it on, which depends on k (DR-75): every
-    band x k cell must split at the same date.
+    It uses each pair's first qualifying Monday (entry_date), never the
+    Monday the Kelly gate picks for it: that one depends on k, and every
+    (spread band, k) scenario of the sweep must be split at the same date
+    (DR-75).
 
     statistics.median_low of the entry dates, never statistics.median: median
     AVERAGES the two middle values of an even-length list, which raises
@@ -6583,19 +6628,21 @@ def _split_halves(entries: list[dict], split_date: date) -> tuple[list[dict], li
     """
     Split entries at a band sweep's one split date, keeping their order.
 
-    Each pair goes to the half its first qualifying Monday falls in. An H1
-    pair keeps only its Mondays before the split (DR-75), so the Kelly gate
-    cannot enter it on a second-period Monday, and it is not re-listed in H2.
-    Each half's candidates are therefore a subset of the full run's, each on
-    the Monday the full run chose or absent, so neither half's peak Kelly
-    fraction can exceed the full run's, which keeps CapSweep's shared halves
-    exact; an H1 pair whose only Kelly-passing Mondays fall on or after the
-    split trades in neither half.
+    Each pair goes to the half its first qualifying Monday falls in. A
+    first-half (H1) pair keeps only its Mondays before the split, so the H1
+    simulation cannot enter it on a Monday from the second period, and it is
+    not copied into the second half (H2) (DR-75). So in each half the Kelly
+    gate can pick for a pair only the Monday it picks in the full run, or
+    none: a half's Kelly-passing candidates are a subset of the full run's,
+    on the same Mondays, and its largest Kelly fraction is never above the
+    full run's — which lets CapSweep reuse the halves at every size cap at
+    or above that fraction. The cost: an H1 pair whose only Kelly-passing
+    Mondays fall on or after the split trades in neither half.
 
-    A cut builds a new record and entry dict, since entry records are
-    shared: a band's populations, checks and CapSweep hold the same objects,
-    and each same-title record is held at every band of both tier settings.
-    An H2 record, or an H1 record that loses nothing, is returned as is.
+    Trimming a pair's Mondays builds a new record rather than editing the
+    old one, because records are shared (by a band's populations, checks and
+    CapSweep, and each same-title record by every band of both tier
+    settings). Records that lose nothing are returned unchanged.
 
     Args:
         entries (list[dict]): Prepared entry records (each with
@@ -6647,9 +6694,10 @@ def _half_split(
     with exactly the keywords it always did.
 
     Args:
-        halves (tuple[list[dict], list[dict]]): The scenario's entries split
-            at BacktestSweep.split_date by _split_halves — (before it, on or
-            after it), each H1 pair's later Mondays cut at the split (DR-75).
+        halves (tuple[list[dict], list[dict]]): The scenario's entries as
+            _split_halves splits them at BacktestSweep.split_date — (before
+            it, on or after it), with each first-half pair's later Mondays
+            cut at the split.
         start_date (date): The backtest's start date.
         initial_balance (float): The balance EACH half starts from, in dollars
             — the halves are two independent runs, never one run's two parts.
@@ -6714,20 +6762,21 @@ def _ex_top_event(
     (by BacktestTrade.event_ticker — market A's event as traded — ignoring
     trades with no event ticker, since an unknown event cannot be shown to be
     one event; ties go to the alphabetically first ticker so the choice is
-    deterministic), then RE-SIMULATES the point's entries without every entry
-    whose market-A event ticker is that event on any of its qualifying Mondays
-    (a trade carries the market A of the Monday the gate chose, and a
-    same-title pair's A can differ between Mondays — DR-75), from the same
+    deterministic), then RE-SIMULATES the point's entries without every pair
+    whose market A belongs to that event on any of its qualifying Mondays (a
+    trade records market A of the Monday it entered on, and for a same-title
+    pair that can differ from Monday to Monday — DR-75), from the same
     initial balance at the same k and band. A re-simulation rather than a
     subtraction of that event's P&L: the remaining trades are re-sized against
     the cash the removed ones no longer tie up, and a subtraction is not even
     bounded below by −100%.
 
-    The any-Monday rule is wider than the trades: it also drops a same-title
-    entry that traded under another event at point.k but names this one on a
-    different Monday, which can move the returned figure either way. The
-    re-simulated entries are still a subset of the point's, so CapSweep's
-    reuse rule holds.
+    Checking every Monday can drop more than that event's trades: a
+    same-title pair that traded under another event but names this one on a
+    different Monday is dropped too, which can move the result either way.
+    The pairs left are still a subset of the point's, so CapSweep can still
+    reuse the result at every size cap at or above the point's peak Kelly
+    fraction.
 
     The re-simulation runs at the point's own size cap (point.size_cap) and
     the caller's tier_floors, forwarded through _sim_options — nothing extra
