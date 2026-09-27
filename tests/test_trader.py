@@ -2482,7 +2482,10 @@ class TestPreExecutionCheckLogging:
         keep = make_spec(title="keep me")
         drop = make_spec(title="drop me")
 
-        def fake_validate(client, spec):
+        def fake_validate(client, spec, *, settings):
+            # The run's settings are always handed on, by keyword: with none
+            # given, config.py's, resolved once by pre_execution_check
+            assert isinstance(settings, config.LiveSettings)
             if spec.pair.canonical_title == "drop me":
                 logging.warning(
                     "Pre-execution check failed for '%s' — gap no longer qualifies; dropping",
@@ -2513,7 +2516,8 @@ class TestPreExecutionCheckLogging:
         keep = make_spec(title="keep me")
         drop = make_spec(title="drop me")
 
-        def fake_validate(client, spec):
+        def fake_validate(client, spec, *, settings):
+            assert isinstance(settings, config.LiveSettings)
             if spec.pair.canonical_title == "drop me":
                 raise RuntimeError("boom")
             return True
@@ -2537,6 +2541,59 @@ class TestPreExecutionCheckLogging:
             if r.getMessage() == "Pre-execution check: 1 of 2 pair(s) still qualify"
         ]
         assert len(summary) == 1
+
+
+class TestPreExecutionCheckSettings:
+    """pre_execution_check re-checks every selected spec under ONE rule: the
+    run's LiveSettings, handed to every validate_pair_price it submits to the
+    pool. A run's override must never apply to one spec's re-check while
+    another's reads config.py."""
+
+    @staticmethod
+    def _specs(n=4):
+        return [make_spec(title=f"spec {i}") for i in range(n)]
+
+    def test_one_settings_object_reaches_every_call(self, monkeypatch):
+        explicit = config.LiveSettings(
+            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=1.0,
+        )
+        seen = []
+
+        def fake_validate(client, spec, *, settings):
+            seen.append(settings)
+            return True
+
+        def no_config(*a, **kw):
+            raise AssertionError("pre_execution_check read config.py despite explicit settings")
+
+        monkeypatch.setattr(trader, "validate_pair_price", fake_validate)
+        monkeypatch.setattr(trader, "live_settings", no_config)
+        specs = self._specs()
+        # Specs come back in completion order, so compare them as a set
+        result = pre_execution_check(MagicMock(), specs, settings=explicit)
+        assert {id(s) for s in result} == {id(s) for s in specs}
+        assert len(seen) == len(specs)
+        assert all(s is explicit for s in seen)
+
+    def test_no_settings_resolves_config_once_for_every_call(self, monkeypatch):
+        seen = []
+        resolved = []
+
+        def fake_validate(client, spec, *, settings):
+            seen.append(settings)
+            return True
+
+        def counting_live_settings():
+            resolved.append(config.live_settings())
+            return resolved[-1]
+
+        monkeypatch.setattr(trader, "validate_pair_price", fake_validate)
+        monkeypatch.setattr(trader, "live_settings", counting_live_settings)
+        specs = self._specs()
+        pre_execution_check(MagicMock(), specs)
+        assert len(resolved) == 1
+        assert len(seen) == len(specs)
+        assert all(s is resolved[0] for s in seen)
 
 
 class TestSameTitleWireIdentity:

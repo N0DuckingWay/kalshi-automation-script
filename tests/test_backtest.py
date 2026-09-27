@@ -47,7 +47,6 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_SHORT_GAP,
     PRICE_EPSILON,
     SHORT_DEADLINE_GAP_DAYS,
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     min_price_diff_for_gap,
     time_series_spread_too_wide,
 )
@@ -64,14 +63,16 @@ def _equity(final_value: float = 10_691.38) -> pd.DataFrame:
     return df
 
 
-def _sweep(k: float = TIME_SERIES_INTERVAL_PROB_DISCOUNT, n_trades: int = 0) -> BacktestSweep:
+def _sweep(k: float | None = None, n_trades: int = 0) -> BacktestSweep:
     """A BacktestSweep whose primary point carries n_trades profitable trades.
 
     main() reads only `.profit` off each trade (the win-rate count), so a plain
     SimpleNamespace stands in for BacktestTrade without duplicating its fixture.
+    k None reads backtest's binding of TIME_SERIES_INTERVAL_PROB_DISCOUNT at call
+    time, as a run given no --interval-discount does, so a patched value holds.
     """
     point = SweepPoint(
-        k=k,
+        k=backtest.TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k,
         trades=[SimpleNamespace(profit=5.0) for _ in range(n_trades)],
         equity_df=_equity(),
     )
@@ -478,6 +479,61 @@ class TestCapSweepArgument:
         assert "k=0.620" in text and "spread band=0-1" in text and "band sweep=on" in text
 
 
+class TestLiveRuleEcho:
+    """The pre-fetch echo's "| live rule=..." clause names config.py's OWN
+    live time-series rule — never a backtest scenario, and never main.py's
+    per-run overrides (a separate CLI this module cannot see)."""
+
+    def test_the_echo_names_the_configured_rule(self, cli, monkeypatch, caplog):
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.6))
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        rule = config.describe_time_series_rule(False, (0.1, 0.6))
+        assert f"| live rule={rule}" in caplog.text
+        # With no category/tag filter set, the clause is the rule alone
+        assert "category/tag filter" not in caplog.text
+
+    def test_the_echo_names_a_set_filter(self, cli, monkeypatch, caplog):
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
+        monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics", "Sports"))
+        monkeypatch.setattr(config, "TRADE_TAGS", ("Fed",))
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        settings = config.live_settings()
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        assert (f"| live rule={rule}; category/tag filter "
+                f"({config.describe_trade_filter(settings)})") in caplog.text
+        assert "categories Economics, Sports; tags Fed" in caplog.text
+
+    def test_a_cli_argument_never_moves_it(self, cli, monkeypatch, caplog):
+        # --spread-min/--spread-max/--interval-discount name a BACKTEST
+        # scenario; the live rule clause reads config.py alone
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--spread-min", "0.3", "--spread-max", "0.6",
+                 "--interval-discount", "0.62")
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        text = caplog.text
+        assert f"| live rule={rule}" in text
+        # The scenario clauses moved as usual, right beside the unmoved rule
+        assert "k=0.620" in text and "spread band=0.3-0.6" in text
+
+    def test_it_fails_soft_on_an_invalid_config(self, cli, monkeypatch, caplog):
+        # A floor above the ceiling makes live_settings() raise: a reporting
+        # clause fails soft, while an invalid --spread-min/--spread-max pair exits
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        text = caplog.text
+        assert "live rule=not recorded" in text
+        assert "config.py's live toggles do not validate" in text
+        # The run still went ahead
+        assert "sweep_kwargs" in cli
+
+
 # Tier labels and messages derived from config, exactly as backtest.main
 # derives them — never a literal "16-30".
 _SHORT_TIER_DAYS = f"0-{SHORT_DEADLINE_GAP_DAYS}-day"
@@ -751,7 +807,7 @@ class TestSummaryBlock:
     def test_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
+        assert f"k={config.TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
 
 
 class TestCorpusProvenanceLine:

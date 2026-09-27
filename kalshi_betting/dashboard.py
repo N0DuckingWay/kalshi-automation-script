@@ -70,7 +70,9 @@ Dependencies:
     for a band ABSENT from the tier-off family it decides whether that
     band's tier-on run may stand in for its tier-floors-off view, or the
     whole off view is withheld — the family's calibration keys, never this
-    test, decide which bands were simulated again) — and reads
+    test, decide which bands were simulated again), _live_rule_view() with
+    its _LIVE_RULE_* verdicts, _live_rule_ladder_note() and _live_filter_text()
+    (the live-rule line's pieces, shared with the run's log line) — and reads
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
@@ -78,12 +80,14 @@ Dependencies:
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
     and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
     tier-off banner name the tier floors and their deadline-gap bounds from
-    config, never as literals), fee_per_pair_approx() and
+    config, never as literals), describe_time_series_rule(), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
-    live sizer computes. Imports RiskFreeRates, SOURCE_CACHE and day_numbers
-    from treasury.py. Uses plotly, numpy, pandas, and yfinance (all external).
+    live sizer computes. Imports historical.series_labels (as _series_labels),
+    the one category/tag filing rule, shared with main.py's live filter,
+    scanner.leg_sides, and RiskFreeRates, SOURCE_CACHE and day_numbers from
+    treasury.py. Uses plotly, numpy, pandas, and yfinance (all external).
     Called by backtest.py after run_backtest_sweep() completes.
 
 Notes:
@@ -340,6 +344,8 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import (
+    _LIVE_RULE_NOT_SIMULATED,
+    _LIVE_RULE_PRIMARY,
     BacktestSweep,
     BacktestTrade,
     CorpusProvenance,
@@ -352,6 +358,9 @@ from .backtester import (
     _cap_percent,
     _exact_label,
     _leg_prices_for,
+    _live_filter_text,
+    _live_rule_ladder_note,
+    _live_rule_view,
     _tier_floors_bind,
     max_trades_simulated,
 )
@@ -368,9 +377,11 @@ from .config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
     TRADING_DAYS_PER_YEAR,
+    describe_time_series_rule,
     fee_per_pair_approx,
     time_series_profit_prob,
 )
+from .historical import series_labels as _series_labels
 from .scanner import leg_sides
 from .treasury import SOURCE_CACHE, RiskFreeRates, day_numbers
 
@@ -918,7 +929,7 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
     Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
     shows the same theoretical Kelly the live sizer would compute (before the
-    BUDGET_FRACTION cap) — including the fee-inclusive Kelly denominator
+    per-pair cap, config.pair_size_cap) — including the fee-inclusive Kelly denominator
     b = net_spread / (price_a + price_b + fee), since the losing cell loses the
     fee too (DR-62). The legs are mapped exactly like scanner.leg_prices:
     a same_title pair costs nA + pB (NO on A, YES on B) and is priced on the
@@ -950,7 +961,8 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
             config.time_series_profit_prob. None (default) means "no override",
             which that helper resolves at call time to
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value live sizing
-            reads. Ignored for same_title, which prices on a fixed prior.
+            reads on a run without main.py's --interval-discount. Ignored for
+            same_title, which prices on a fixed prior.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
@@ -1278,58 +1290,6 @@ def _section_performance(
 
 
 # ─── Section 2: Returns Decomposition ────────────────────────────────────────
-
-def _series_ticker(event_ticker: str) -> str:
-    """
-    The series part of an event ticker (everything before its first hyphen).
-
-    Deliberately NOT scanner.event_series, which collapses every KXMVE* combo
-    series onto one family for the one-series pairing rule: Kalshi files each
-    literal series under its own category, and that is what is looked up here.
-
-    Args:
-        event_ticker (str): An event ticker, e.g. "KXNCAAMBGAME-26JAN13WIUEIU".
-
-    Returns:
-        str: The series ticker ("KXNCAAMBGAME"), or "" for an empty ticker.
-    """
-    return (event_ticker or "").split("-", 1)[0]
-
-
-def _series_labels(
-    event_ticker: str,
-    fallback_category: str,
-    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
-) -> tuple[str, str]:
-    """
-    Name the Kalshi category and FIRST tag an event's series is filed under.
-
-    The one filing rule behind every category and tag on the page — the
-    Returns Decomposition, the page-wide filter and the k-hat breakdown — so
-    a trade and a k-hat observation of the same event can never be filed
-    apart. First tag only, so every breakdown PARTITIONS what it breaks down: a
-    series can carry several tags, and counting it under each would make the
-    groups add up to more than the whole.
-
-    Args:
-        event_ticker (str): The event ticker whose series is looked up
-            (_series_ticker).
-        fallback_category (str): The label to use when there is no map or the
-            series is missing from it — the ticker-prefix category
-            (BacktestTrade.category, CalibrationObservation.category).
-        series_categories (dict | None): historical.load_series_categories'
-            series ticker -> (category, tags), or None when not loaded.
-
-    Returns:
-        tuple[str, str]: (category, tag). The tag reads "General" when the
-            series has none (or is not in the map); the category
-            "Uncategorised" when Kalshi gives it none.
-    """
-    entry = (series_categories or {}).get(_series_ticker(event_ticker))
-    if entry is None:
-        return fallback_category, "General"
-    return entry[0] or "Uncategorised", entry[1][0] if entry[1] else "General"
-
 
 def _trade_category(
     trade: BacktestTrade,
@@ -1938,8 +1898,9 @@ _KHAT_CARDS_CAPTION = (
     "size cap. k&#770; − k is that figure minus the k shown: positive means the in-between "
     "outcome landed more often than the sizer assumed, i.e. it sized too big. The Empirical "
     "k&#770; section below breaks the same figure down by category, tag and spread band. "
-    "Recommendation only: live sizing always reads "
-    "config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>")
+    "Recommendation only: live sizing reads "
+    "config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py --interval-discount "
+    "overrides it for one run.</p>")
 
 
 def _khat_delta_value(khat: float | None, k: float | None) -> float | None:
@@ -2468,7 +2429,8 @@ def _section_interval_discount(
     cal_table += (
         "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
         "Recommendation only — the backtester never writes config.py, and live "
-        "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
+        "sizing reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py "
+        "--interval-discount overrides it for one run.</p>"
     )
 
     # ── The equity curve at the k and cap shown: one trace, no selector ─────
@@ -2912,7 +2874,8 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
         "the highlighted bar is the tag's category. A bar rests on its entries, but "
         "entries of one event (a ladder's rungs) settle together, so its event count is "
         "the better measure of how much evidence it holds. Recommendation only: live "
-        "sizing always reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.</p>"
+        "sizing reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py "
+        "--interval-discount overrides it for one run.</p>"
     )
     notice_style = "font-family:sans-serif;font-size:14px;color:#616161;"
     if payload is None:
@@ -3979,6 +3942,116 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     )
 
 
+def _live_filter_options(categories: tuple[str, ...] | None,
+                         tags: tuple[str, ...] | None, bar: dict) -> list[str]:
+    """
+    Name the filter bar's Category or Tag options a live category/tag filter covers.
+
+    Matched as main._filter_by_category matches a pair (case-insensitive, AND across
+    the axes); with a tag set, the matching "Category · Tag" options.
+
+    Args:
+        categories (tuple[str, ...] | None): BacktestSweep.live_categories; None = any.
+        tags (tuple[str, ...] | None): BacktestSweep.live_tags; None = any.
+        bar (dict): _filter_payload's base block ("categories", "subcats").
+
+    Returns:
+        list[str]: "Category <c>" or "Tag <c> · <t>" per option, in the bar's order.
+    """
+    names = bar["categories"]
+    wanted = None if categories is None else {c.casefold() for c in categories}
+    if tags is None:
+        return [f"Category {c}" for c in names if wanted is None or c.casefold() in wanted]
+    tagged = {t.casefold() for t in tags}
+    return [f"Tag {names[ci]} · {tag}" for ci, tag in bar["subcats"]
+            if (wanted is None or names[ci].casefold() in wanted) and tag.casefold() in tagged]
+
+
+def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
+    """
+    Render the page-header line naming config.py's LIVE rule, and where this page shows it.
+
+    Its own <p> under _run_settings_html's, never appended to it (tests pin that
+    line's "</p>" suffix). It reads the BacktestSweep.live_* fields the run recorded
+    before its fetch, never main.py's per-run overrides, and takes where the grid
+    holds the rule from backtester._live_rule_view, as the run's log line does.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+        bar (dict | None): Keyword-only, required. _filter_payload's base block, whose
+            option texts the line names; None when the page has no filter bar.
+
+    Returns:
+        str: One <p>, its text escaped: the rule, any live filter, the same-title cap
+            and where (or whether) the page shows the rule, plus any ladder-departure
+            note; "Live rule (config.py): not recorded" when sweep is None or records
+            no live rule.
+    """
+    style = '<p style="color:#616161; font-size:14px;">'
+    view = None if sweep is None else _live_rule_view(sweep)
+    if view is None:
+        return style + "Live rule (config.py): not recorded</p>"
+    rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
+    categories, tags = sweep.live_categories, sweep.live_tags
+    filtered = categories is not None or tags is not None
+    if filtered:
+        rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
+    run_cap, st_cap = sweep.primary.size_cap, sweep.same_title_size_cap
+    if run_cap is None or st_cap is None:
+        cap_clause = "same-title cap not recorded"
+    else:
+        own = f"{_cap_percent(min(run_cap, st_cap))}% at this run's own cap"
+        cap_clause = ("same-title trades capped at the size cap shown, like every pair "
+                      f"({own})" if st_cap >= 1.0 else
+                      "same-title trades capped at the lower of the size cap shown and "
+                      f"{_cap_percent(st_cap)}% ({own})")
+
+    # A live filter's one covered option is chosen with the band and tier (one_slice);
+    # several, none or no bar are said instead (slices)
+    options = ([] if not filtered or bar is None
+               else _live_filter_options(categories, tags, bar))
+    one_slice = options[0] if len(options) == 1 else None
+    if not filtered or one_slice is not None:
+        slices = ""
+    elif bar is None:
+        slices = ("; this page's filter bar could not be built, so no Category/Tag slice "
+                  "of it is shown")
+    elif not options:
+        slices = "; no scenario of this run has a pair filed under the live category/tag filter"
+    else:
+        slices = (f"; the live category/tag filter covers {', '.join(options)} — the filter "
+                  "bar shows one of them at a time, never their union")
+    # Tier floors off at a band no tier binds at: the tier-on cell holds it
+    never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
+                   " (no tier floor binds at this band, so off and on are one rule)")
+    ladders = _live_rule_ladder_note(sweep)
+    if view.where == _LIVE_RULE_NOT_SIMULATED:
+        tail = "not simulated by this run"
+    elif view.where == _LIVE_RULE_PRIMARY:
+        chosen = "" if one_slice is None else f", with {one_slice} chosen in the filter bar"
+        tail = f"this run's primary{never_binds}{chosen}{slices}{ladders}"
+    elif bar is None:
+        tail = "not shown: this page's filter bar could not be built"
+    else:
+        # The bar relabels its bands when the tier floors go off (bands_off), so off is
+        # named first
+        band = sweep.live_spread_band
+        label = _band_option(band) if view.tier_floors else _band_label(band)
+        entries = bar["bands"] if view.tier_floors else (bar.get("bands_off") or [])
+        option = next((e["option"] for e in entries if e["label"] == label), None)
+        if option is None:
+            tail = "not shown: this page's filter bar does not offer that scenario"
+        else:
+            choices = ([f"Spread band {option}", f"Tier floors on{never_binds}"]
+                       if view.tier_floors else ["Tier floors off", f"Spread band {option}"])
+            if one_slice is not None:
+                choices.append(one_slice)
+            tail = (f"choose {', '.join(choices[:-1])} and {choices[-1]} in the filter bar"
+                    f"{slices}{ladders}")
+    text = f"Live rule (config.py): {rule}; {cap_clause} — {tail}"
+    return f"{style}{html.escape(text, quote=False)}</p>"
+
+
 def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) -> str:
     """
     Render the page-header line naming the risk-free rate every Sharpe and Sortino subtracts.
@@ -4178,8 +4251,8 @@ def _corpus_provenance_html(sweep: BacktestSweep | None, *,
 # The scenario explorer's tier-floors-off banner opens on this HTML, so none
 # of its figures can be read as the run's own: what "off" replaces (the entry
 # threshold max(tier, floor), and nothing else — backtester._find_entry with
-# tier_floors False), what still applies, where it changes nothing, and that
-# live trading never runs this way — the tiers and the gap cap named from
+# tier_floors False), what still applies, where it changes nothing, and which
+# toggle live trading follows — the tiers and the gap cap named from
 # config (_TIER_FLOORS, MAX_DEADLINE_GAP_DAYS), never as literals.
 _SCENARIO_TIER_OFF_LEAD = (
     "<b>Tier floors off:</b> each band's own floor replaces max(tier, floor) as the "
@@ -4188,8 +4261,9 @@ _SCENARIO_TIER_OFF_LEAD = (
     f"ceiling, the {MAX_DEADLINE_GAP_DAYS}-day deadline-gap cap, the positive-spread rule "
     "(pB above pA), the fee check and the Kelly gate still apply. A band whose floor sits "
     "at or above both tiers was not simulated again, since they never bind there: its "
-    "cells are its run with them on. A backtest what-if: live trading always applies the "
-    "tier floors. ")
+    "cells are its run with them on. Live trading follows "
+    "config.TIME_SERIES_TIER_FLOORS (main.py --tier-floors / --no-tier-floors for "
+    "one run). ")
 
 # The scenario explorer's tier-floors-off heatmap title (on every metric) and
 # k-hat table title end on this.
@@ -5309,15 +5383,16 @@ _TIER_OPTION_ON = (f"on ({_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} / "
 _TIER_OPTION_OFF = "off (each band's own floor alone)"
 
 # The Tier floors select's tooltip (its title attribute, escaped where the bar
-# renders it): what each setting admits, and that the choice is a backtest
-# what-if — every number in it read from config.
+# renders it): what each setting admits, and which toggle live trading
+# follows — every number in it read from config.
 _TIER_SELECT_TITLE = (
     "on — a time-series pair needs pB − pA of at least "
     f"{_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} when its deadlines are up to "
     f"{SHORT_DEADLINE_GAP_DAYS} days apart and {_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')} "
     f"for {SHORT_DEADLINE_GAP_DAYS + 1}–{MAX_DEADLINE_GAP_DAYS} days, and at least the "
-    "band's floor; off — the band's floor alone (the spread must still be positive); a "
-    "backtest what-if: live trading always applies the tier floors.")
+    "band's floor; off — the band's floor alone (the spread must still be positive); "
+    "live trading follows config.TIME_SERIES_TIER_FLOORS (main.py --tier-floors / "
+    "--no-tier-floors for one run).")
 
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
@@ -6132,7 +6207,8 @@ def _cap_option(cap: float | None) -> str:
 
     Returns:
         str: "20%", "off (full Kelly)" for 1.0 (Kelly's f* never exceeds 1,
-            so a 100% cap is no cap), or "not recorded".
+            so a 100% cap is no per-trade cap; same-title pairs keep
+            BacktestSweep.same_title_size_cap), or "not recorded".
     """
     if cap is None:
         return "not recorded"
@@ -9315,7 +9391,7 @@ def generate_dashboard(
     header's stale-cutoff test (_MaxTrades), a size-cap sweep the walk could
     not use is named on the run-settings line (_run_settings_html's
     cap_sweep_unused, and tier_off_cap_sweep_unused for the tier-floors-off
-    one alone), the interval-discount
+    one alone), _live_rule_html names the bar's own options, the interval-discount
     section's rows and curves at every k and cap of the primary band are
     collected for it and for the script (_KdVisitor, "kd"), and so are the
     scenario explorer's figures at every band x k x cap (_ExplorerVisitor,
@@ -9379,7 +9455,8 @@ def generate_dashboard(
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
             splitting it would create copies that could disagree. It also
-            feeds the header's run-settings line (_run_settings_html). None
+            feeds the header's run-settings line (_run_settings_html) and
+            the live-rule line under it (_live_rule_html). None
             (default) renders both sections' placeholders and the k-hat
             breakdown's "not recorded" notice — and therefore no coverage line
             either, which is honest: that path shows no k̂ card
@@ -9602,6 +9679,8 @@ def generate_dashboard(
                                    and walked.cap_sweep is not None
                                    and walked.tier_binds is not None
                                    and walked.off_cap_sweep is None))
+    # Built after the bar, whose option texts it names (filter_data None: no bar)
+    live_rule = _live_rule_html(sweep, bar=filter_data)
 
     # Directly under the Period line, which it qualifies: the corpus holds
     # nothing settled after its assembly even though the period runs to today,
@@ -9675,6 +9754,7 @@ def generate_dashboard(
 </p>
 {corpus_note}
 {run_settings}
+{live_rule}
 {rf_note}
 {header_note}
 {filter_bar}

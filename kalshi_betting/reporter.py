@@ -43,6 +43,11 @@ Notes:
     ("[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=0.xxxx]] ") is what tells a
     reader which side each count bought and, for a time-series row, the traded
     NO-leg price — the retained "nA (NO ask)" column is reporting-only there.
+
+    append_to_prod_log's keyword-only run_note goes on the run's separator
+    banner, never in a column; main._run_prod passes the run's live toggles
+    (config.describe_live_settings), with "(config: X)" after each toggle a
+    flag moved.
 """
 import fcntl
 import logging
@@ -293,13 +298,15 @@ def _apply_number_formats(ws, row_idx: int) -> None:
 
 
 def _write_separator_row(
-    ws, run_ts: datetime, balance_before: float, balance_after: float, n_results: int
+    ws, run_ts: datetime, balance_before: float, balance_after: float, n_results: int,
+    *, run_note: str = "",
 ) -> None:
     """
     Append a styled run-separator row summarizing this run's balance change.
 
     Shared by the normal prod-log append path and the lock-timeout fallback path
-    so both files carry the same run-summary banner.
+    so both files carry the same run-summary banner; a non-empty run_note
+    follows one more "  |  " separator.
 
     Args:
         ws: The openpyxl Worksheet to append to.
@@ -307,13 +314,15 @@ def _write_separator_row(
         balance_before (float): Account balance in dollars before this run's trades.
         balance_after (float): Account balance in dollars after this run's trades.
         n_results (int): Number of trade results in this run, shown in the banner.
+        run_note (str): Keyword-only banner text; empty (default) adds nothing.
     """
     sep_row = ws.max_row + 1
     sep_cell = ws.cell(row=sep_row, column=1,
                        value=f"── Run: {run_ts.strftime('%Y-%m-%d %H:%M')}  |  "
                              f"Balance before: ${balance_before:.2f}  →  "
                              f"after: ${balance_after:.2f}  |  "
-                             f"{n_results} trade(s)")
+                             f"{n_results} trade(s)"
+                             + (f"  |  {run_note}" if run_note else ""))
     sep_cell.font = Font(italic=True, color="595959", size=9)
     sep_cell.fill = PatternFill("solid", fgColor="F2F2F2")
     ws.merge_cells(
@@ -405,7 +414,8 @@ def _release_lock(lock_fh) -> None:
         lock_fh.close()
 
 
-def _append_locked(results: list, balance_before: float, balance_after: float) -> Path:
+def _append_locked(results: list, balance_before: float, balance_after: float, *,
+                   run_note: str = "") -> Path:
     """
     Load, append, and atomically save PROD_LOG_PATH. Must only be called while
     holding the sidecar lock (see append_to_prod_log).
@@ -414,6 +424,7 @@ def _append_locked(results: list, balance_before: float, balance_after: float) -
         results (list): List of TradeResult objects from this run.
         balance_before (float): Account balance in dollars before this run's trades.
         balance_after (float): Account balance in dollars after this run's trades.
+        run_note (str): Keyword-only separator-row note; empty adds nothing.
 
     Returns:
         Path: Absolute path to the trade log file (PROD_LOG_PATH).
@@ -430,7 +441,8 @@ def _append_locked(results: list, balance_before: float, balance_after: float) -
 
     # Use local time for the separator row so timestamps are human-readable
     run_ts = datetime.now(UTC).astimezone()
-    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results))
+    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results),
+                         run_note=run_note)
     _write_trade_rows(ws, results, run_ts)
 
     # Atomic save: openpyxl's wb.save() writes directly to the target path,
@@ -445,7 +457,8 @@ def _append_locked(results: list, balance_before: float, balance_after: float) -
     return PROD_LOG_PATH
 
 
-def _write_fallback_log(results: list, balance_before: float, balance_after: float) -> Path:
+def _write_fallback_log(results: list, balance_before: float, balance_after: float, *,
+                        run_note: str = "") -> Path:
     """
     Write this run's trade rows to a standalone timestamped file instead of the
     shared trade_log.xlsx.
@@ -459,6 +472,7 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
         results (list): List of TradeResult objects from this run.
         balance_before (float): Account balance in dollars before this run's trades.
         balance_after (float): Account balance in dollars after this run's trades.
+        run_note (str): Keyword-only separator-row note, as the shared log's.
 
     Returns:
         Path: Absolute path to the fallback file actually created
@@ -479,7 +493,8 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
     ws = wb.active
     ws.title = "Trade Log"
     _apply_header_row(ws, _HEADER_FILL_PROD)
-    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results))
+    _write_separator_row(ws, run_ts, balance_before, balance_after, len(results),
+                         run_note=run_note)
     _write_trade_rows(ws, results, run_ts)
 
     fallback_path, fh = create_new_output(fallback_path)
@@ -493,14 +508,15 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
 # Public API
 # ─────────────────────────────────────────────
 
-def append_to_prod_log(results: list, balance_before: float, balance_after: float) -> Path:
+def append_to_prod_log(results: list, balance_before: float, balance_after: float, *,
+                       run_note: str = "") -> Path:
     """
     Append executed trade results to the persistent production trade log Excel file.
 
     If the file does not yet exist, creates it with a styled dark-blue header row.
-    Each call appends a run-separator row (showing timestamp and balance change)
-    followed by one data row per trade result, color-coded by status. The file is
-    designed to accumulate all runs over the life of the bot.
+    Each call appends a run-separator row (timestamp, balance change and any
+    run_note) followed by one data row per trade result, color-coded by
+    status. The file is designed to accumulate all runs over the life of the bot.
 
     Concurrent callers (e.g. the scheduler and a manual run racing) are
     coordinated via a sidecar advisory lock (PROD_LOG_PATH + ".lock") so a
@@ -515,6 +531,7 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
             May be empty if no trades were executed this run.
         balance_before (float): Account balance in dollars before this run's trades.
         balance_after (float): Account balance in dollars after this run's trades.
+        run_note (str): Keyword-only separator-row note, on either path; "" adds nothing.
 
     Returns:
         Path: Absolute path to the file actually written — either PROD_LOG_PATH
@@ -529,10 +546,10 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
             "to a standalone fallback file instead of the shared trade log",
             _LOCK_PATH, _LOCK_TIMEOUT_SECONDS,
         )
-        return _write_fallback_log(results, balance_before, balance_after)
+        return _write_fallback_log(results, balance_before, balance_after, run_note=run_note)
 
     try:
-        return _append_locked(results, balance_before, balance_after)
+        return _append_locked(results, balance_before, balance_after, run_note=run_note)
     finally:
         _release_lock(lock_fh)
 

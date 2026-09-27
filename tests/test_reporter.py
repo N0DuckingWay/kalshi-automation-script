@@ -1,5 +1,6 @@
 """Tests for reporter.py — sidecar locking, atomic save, and lock-timeout
-fallback around append_to_prod_log() (BS-18), plus the row/Notes/candidates
+fallback around append_to_prod_log() (BS-18), the run note (main._run_prod's
+live toggles) it appends to the separator row on both paths, plus the row/Notes/candidates
 sheet layout after the 2026-09 strategy change (side-neutral x/y headers, the
 "[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]] " Notes prefix, and the "nB (NO
 ask)" candidates column). All tests run offline against tmp_path; no real
@@ -280,6 +281,73 @@ class TestExistingWorkbookHeaderRow:
         headers = [ws.cell(row=1, column=c).value for c in range(1, 19)]
         assert headers == [h for h, _ in reporter._TRADE_COLUMNS]
         assert headers[11] == "x — A leg"
+
+
+def _separator_rows(path) -> list:
+    """Every run-separator banner in a saved log, in order: the column-1
+    values beginning "── Run:" (a banner populates column 1 only)."""
+    ws = openpyxl.load_workbook(path).active
+    return [row[0] for row in ws.iter_rows(min_row=2, values_only=True)
+            if isinstance(row[0], str) and row[0].startswith("── Run:")]
+
+
+class TestSeparatorRunNote:
+    """append_to_prod_log's run_note (main._run_prod passes the run's live
+    toggles) is appended to the separator banner on BOTH paths — the shared
+    log and the lock-timeout fallback file — never as a column; with no note
+    the banner ends at its trade count."""
+
+    _NOTE = "settings: tier floors off | spread band 0-0.5 | k 0.8"
+    _BANNER = re.compile(
+        r"^── Run: \d{4}-\d{2}-\d{2} \d{2}:\d{2}  \|  Balance before: \$100\.00  →  "
+        r"after: \$95\.00  \|  1 trade\(s\)$")
+
+    def test_the_shared_log_carries_the_note(self, reporter_paths):
+        log_path, _ = reporter_paths
+        reporter.append_to_prod_log([make_result("1")], 100.0, 95.0, run_note=self._NOTE)
+        (banner,) = _separator_rows(log_path)
+        assert banner.endswith(f"1 trade(s)  |  {self._NOTE}")
+        assert self._BANNER.match(banner.removesuffix(f"  |  {self._NOTE}"))
+
+    def test_no_note_leaves_the_banner_as_it_was(self, reporter_paths):
+        log_path, _ = reporter_paths
+        reporter.append_to_prod_log([make_result("1")], 100.0, 95.0)
+        reporter.append_to_prod_log([make_result("2")], 100.0, 95.0, run_note="")
+        banners = _separator_rows(log_path)
+        assert len(banners) == 2
+        assert all(self._BANNER.match(b) for b in banners), banners
+
+    def test_the_note_adds_no_column(self, reporter_paths):
+        log_path, _ = reporter_paths
+        reporter.append_to_prod_log([make_result("1")], 100.0, 95.0, run_note=self._NOTE)
+        ws = openpyxl.load_workbook(log_path).active
+        assert ws.max_column == len(reporter._TRADE_COLUMNS)
+        assert _count_data_rows(log_path) == 1
+
+    def test_the_fallback_file_carries_the_note(self, reporter_paths):
+        path = reporter._write_fallback_log([make_result("1")], 100.0, 95.0, run_note=self._NOTE)
+        (banner,) = _separator_rows(path)
+        assert banner.endswith(f"1 trade(s)  |  {self._NOTE}")
+        path = reporter._write_fallback_log([make_result("2")], 100.0, 95.0)
+        (banner,) = _separator_rows(path)
+        assert self._BANNER.match(banner)
+
+    def test_a_lock_timeout_hands_the_note_to_the_fallback(self, reporter_paths, monkeypatch):
+        # The path append_to_prod_log takes when another process holds the log
+        _, lock_path = reporter_paths
+        monkeypatch.setattr(reporter, "_LOCK_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(reporter, "_LOCK_POLL_SECONDS", 0.05)
+        lock_path.touch()
+        held_fh = open(lock_path, "r+")
+        fcntl.flock(held_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            path = reporter.append_to_prod_log([make_result("x")], 100.0, 95.0,
+                                               run_note=self._NOTE)
+        finally:
+            fcntl.flock(held_fh.fileno(), fcntl.LOCK_UN)
+            held_fh.close()
+        (banner,) = _separator_rows(path)
+        assert banner.endswith(f"  |  {self._NOTE}")
 
 
 class TestWriteDevSimulationCandidatesSheet:

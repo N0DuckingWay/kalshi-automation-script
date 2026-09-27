@@ -422,8 +422,10 @@ class TestAnnualOn:
         assert list(unavailable.annual_on_days(treasury.day_numbers(days))) == [0.0] * 4
 
 
+# historical is live too: main.py imports it for the live category/tag filter
 _PIPELINE_MODULES = [
     "main", "scanner", "strategy", "trader", "reporter", "scheduler", "auth", "v2_probe",
+    "historical",
 ]
 
 

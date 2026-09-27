@@ -771,8 +771,8 @@ class TestOneEventSeriesIsTwoFixtures:
         # The prices are deliberately chosen so that NOTHING ELSE rejects the
         # pair: the YES asks diverge 0.25 (>= SAME_TITLE_MIN_PRICE_DIFF for the
         # same-title finder) and, with the earlier leg the cheaper one, give
-        # pB - pA = 0.25 at a zero-day gap (>= the 15% short-tier threshold,
-        # and pA + nB = 0.75 <= the 0.85 ceiling) for the time-series finder.
+        # pB - pA = 0.25 at a zero-day gap (pA + nB = 0.75) for the time-series
+        # finder, which both the tier-on rule and config.py's admit.
         close = datetime(2026, 9, 15, 20, tzinfo=UTC)
         earlier = _mock_market(
             ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
@@ -2502,6 +2502,7 @@ class TestSameEventDeadlineLadders:
         assert len(pairs) == 1
         assert pairs[0].stated_gap_days == 19
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_stated_gap_chooses_the_tier_a_zero_close_gap_would_not(self, monkeypatch):
         # control for the row above, and the reason the stated gap must travel
         # with the pair: a 0.20 spread clears the SHORT tier (0.15) that a
@@ -2697,7 +2698,9 @@ class TestSameEventDeadlineLadders:
                           close_time=datetime(2026, 3, 15, tzinfo=UTC))
         return m1, m2, m3
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_wider_ladder_wins_the_groups_one_best_slot(self, monkeypatch):
+        # (pre_toggle_defaults: the shipped 0.5 ceiling would refuse the 0.75 ladder)
         pairs = self._scan(list(self._mixed_group()), monkeypatch)
         assert len(pairs) == 1
         # M1 x M3 (one event, spread 0.75) beats the cross-event M1 x M2
@@ -2752,12 +2755,15 @@ class TestPairGapDays:
         # ladder — the same fail-safe-by-type rule leg_sides follows.
         assert scanner.pair_gap_days(self._pair(bad, close_gap=9)) == 9
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_ceiling_is_tiered_on_the_stated_gap(self):
         # _pair_max_sum is the downstream re-derivation that matters: a ladder
         # whose rungs closed at one instant must keep the LONG tier its stated
         # gap chose, not drop to the short one a 0-day close gap implies.
-        assert scanner._pair_max_sum(self._pair(19, close_gap=0)) == pytest.approx(0.70)
-        assert scanner._pair_max_sum(self._pair(None, close_gap=0)) == pytest.approx(0.85)
+        # config.py's settings, tier floors on (pre_toggle_defaults).
+        settings = config.live_settings()
+        assert scanner._pair_max_sum(self._pair(19, close_gap=0), settings) == pytest.approx(0.70)
+        assert scanner._pair_max_sum(self._pair(None, close_gap=0), settings) == pytest.approx(0.85)
 
 
 class TestDeadlineGuardFinders:
@@ -3461,6 +3467,14 @@ class TestPhrasingSkipCounts:
             )
         assert len(pairs) == 1
         assert self._refusal_lines(caplog) == []
+        # ... nor the spread rule's four count lines, which a mutant dropping
+        # their `if ...:` guards logs at 0
+        spread_lines = [
+            r.getMessage() for r in caplog.records
+            if "refused below the entry floor" in r.getMessage()
+            or "refused above the spread band's" in r.getMessage()
+        ]
+        assert spread_lines == []
 
 
 class TestGapCapSkipLine:
@@ -3727,11 +3741,13 @@ def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = 
     return mA, mB
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestTimeSeriesTieredThreshold:
     """The minimum price gap (later YES ask minus earlier YES ask) is tiered
     by deadline gap: 15% for gaps <= 15 days, 30% for 16-30 days, and gaps
     > 30 days are never candidates. Every fixture has the LATER contract
-    pricier (pB > pA) except the direction test."""
+    pricier (pB > pA) except the direction test. The finder reads config.py's
+    toggles, pinned by pre_toggle_defaults to tier floors on, no band."""
 
     def _scan(self, gap_days, pA, pB):
         mA, mB = _ts_pair_markets(gap_days=gap_days, pA=pA, pB=pB)
@@ -3935,9 +3951,9 @@ def _ts_orderbook_client(
     pB_ref, when given, additionally rests a NO bid of (1 - pB_ref) on LATE so
     LATE's best YES ask is exactly pB_ref — the reference quote
     _reference_yes_ask reads. It is NOT a leg side for this pair type, so it
-    changes no fill price; setting it above 1 - (1 - nB_fill), i.e. crossing
-    LATE's book, is the only way to drive the post-enrichment direction guard.
-    Left None, LATE's NO side stays empty and the pair keeps its scan-time pB.
+    changes no fill price. Below LATE's YES bid (1 - nB_fill) the book is
+    CROSSED; left None, a time-series pair has no fresh reference and fails
+    closed, so a test that keeps its pair tradeable passes an uncrossed pB_ref.
     """
     def fake_orderbook(ticker):
         if ticker == "EARLY":  # market A — NO bids become YES ask levels
@@ -3991,7 +4007,7 @@ def _st_orderbook_client(
     return client
 
 
-def _ts_multilevel_client(levels: list[tuple[float, float, int]]):
+def _ts_multilevel_client(levels: list[tuple[float, float, int]], *, pB_ref: float = 0.62):
     """Mock KalshiClient serving TIME-SERIES depth at SEVERAL price levels.
 
     levels is [(pA_fill, nB_fill, qty), ...]. Same side mapping as
@@ -4003,6 +4019,9 @@ def _ts_multilevel_client(levels: list[tuple[float, float, int]]):
     two-pointer sweep, so each column must ascend on its own for the rungs here
     to pair up 1:1 with the slices that sweep emits — a column that dips gets
     re-sorted by _bids_to_ask_levels and the quantities no longer line up.
+
+    LATE's YES ask (the reference quote) is pB_ref; the default 0.62 sits above
+    every LATE YES bid of the fixtures relying on it, so their books are uncrossed.
     """
     def fake_orderbook(ticker):
         if ticker == "EARLY":
@@ -4012,7 +4031,7 @@ def _ts_multilevel_client(levels: list[tuple[float, float, int]]):
         else:
             ob = {"yes_dollars": [[str(round(1.0 - nb, 4)), str(q)]
                                   for _, nb, q in levels],
-                  "no_dollars": []}
+                  "no_dollars": [[str(round(1.0 - pB_ref, 4)), "1000"]]}
         return _raw_book_response(ob)
 
     client = MagicMock()
@@ -4127,6 +4146,7 @@ def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> Candi
     )
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestEnrichmentBoundsDepthByAffordability:
     """Enrichment must average only the depth this balance could actually buy.
 
@@ -4134,6 +4154,9 @@ class TestEnrichmentBoundsDepthByAffordability:
     market's full book priced every pair against levels no single trade can
     reach — inflating the fill price and killing pairs at the profitability gate
     on contracts we would never have bought.
+
+    Worked under pre_toggle_defaults (tier floors on, a 20% cap); the shipped
+    rule is pinned by test_config.py's TestShippedLiveToggles.
     """
 
     # Each column ascends on its own (see _ts_multilevel_client), so the sweep
@@ -4228,7 +4251,7 @@ class TestEnrichmentStoresOrientedDepthLevels:
 
     def test_time_series_levels_are_pA_then_nB(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
-        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40)
+        client = _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, qty=40, pB_ref=0.62)
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         [level] = enriched.depth_levels
         assert level == pytest.approx((0.32, 0.42, 40.0))
@@ -4249,7 +4272,7 @@ class TestEnrichmentStoresOrientedDepthLevels:
         # belongs to market_a and [1] to market_b, whichever side each buys.
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
         [ts_e] = enrich_with_orderbook_prices(
-            _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42), [ts], _AMPLE_BALANCE_CENTS,
+            _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, pB_ref=0.62), [ts], _AMPLE_BALANCE_CENTS,
         )
         st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
         [st_e] = enrich_with_orderbook_prices(
@@ -4264,10 +4287,12 @@ class TestEnrichmentStoresOrientedDepthLevels:
         assert pair.depth_levels == ()
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestOrderbookCeilingTieredByDeadlineGap:
     """enrich_with_orderbook_prices and validate_pair_price must apply the
     deadline-gap-tiered LEG-price-sum ceiling (0.85 for gaps <= 15 days, 0.70
-    for 16-30 days), not the old flat 1 - 15% = 0.85.
+    for 16-30 days), not the old flat 1 - 15% = 0.85, with the tier floors on
+    (pre_toggle_defaults; off, the ceiling is 1 - the band floor alone).
 
     The fixtures use a deliberately WIDE later book: with a tight nB = 1 - pB
     the leg sum is exactly 1 - (pB - pA), which is always <= the ceiling once
@@ -4277,7 +4302,7 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         # 20-day gap → ceiling 0.70. Leg depth priced at pA 0.30 + nB 0.45 =
         # 0.75 would have passed the old flat 0.85 ceiling but must disqualify.
         pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.45)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45, pB_ref=0.65)
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
@@ -4303,14 +4328,14 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         # pair whose remaining leg depth sums to 0.80 no longer qualifies.
         pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
         assert validate_pair_price(client, spec) is False
 
     def test_validate_pair_price_accepts_short_gap_at_same_depth(self):
         # Identical depth passes for a 10-day-gap pair (ceiling 0.85)
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.60)
         assert validate_pair_price(client, spec) is True
 
     def test_validate_pair_price_logs_gap_rejection_at_warning(self, caplog):
@@ -4321,7 +4346,7 @@ class TestOrderbookCeilingTieredByDeadlineGap:
         # the one log line for the drop; pre_execution_check must not log a second.
         pair = _ts_candidate(gap_days=20, pA=0.30, pB=0.65, nB=0.50)
         spec = SimpleNamespace(pair=pair, x=10)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
         with caplog.at_level(logging.INFO):
             assert validate_pair_price(client, spec) is False
 
@@ -4400,7 +4425,7 @@ class TestTimeSeriesEnrichmentSides:
 
     def test_depth_short_of_spec_count_fails_validate(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, qty=9)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, qty=9, pB_ref=0.60)
         assert validate_pair_price(client, SimpleNamespace(pair=pair, x=10)) is False
         assert validate_pair_price(client, SimpleNamespace(pair=pair, x=9)) is True
 
@@ -4469,8 +4494,8 @@ class TestSameTitleEnrichmentByteIdentity:
 class TestEnrichmentRefreshesReferenceQuote:
     """enrich_with_orderbook_prices must refresh the pair's REFERENCE YES ask —
     the non-leg market's YES ask (pB for time_series, pA for same_title) — from
-    the book it already fetched, and drop any pair whose refreshed reference is
-    not above the YES leg's fill.
+    the book it already fetched, and drop a time-series pair with no fresh
+    reference (fail closed), a crossed later book or a refused spread.
 
     Left stale, that quote is compared against a depth-weighted fill by
     strategy._kelly_p, and config.time_series_profit_prob's max(0, pB - pA)
@@ -4519,12 +4544,12 @@ class TestEnrichmentRefreshesReferenceQuote:
 
         LATE's book is deliberately CROSSED (YES bid 0.70 with a NO bid of
         0.55, summing to 1.25): once the reference is refreshed from the same
-        snapshot, the qualifying ceiling avg_yes + avg_no <= 1 - tier makes the
+        snapshot, the qualifying ceiling avg_yes + avg_no <= 1 - floor makes the
         inversion arithmetically impossible on an uncrossed book, so a crossed
-        book is the only shape that can still reach the guard.
+        book is the only shape that can still produce it; the crossed-book guard drops it.
 
         Leg fills: pA 0.54 (EARLY NO bid 0.46) + nB 0.30 (LATE YES bid 0.70) =
-        0.84, inside the 10-day-gap ceiling of 0.85 and profitable after fees.
+        0.84, inside config.py's price-sum ceiling of 1.0 and profitable after fees.
         The refreshed reference is LATE's YES ask of 0.45 — below the 0.54 fill.
         """
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.50, nB=0.30)
@@ -4538,12 +4563,15 @@ class TestEnrichmentRefreshesReferenceQuote:
 
         assert enriched.tradeable is False
 
+        # The WARNING names a crossed book (YES ask 0.45 under its bid 0.70), not a spread
         direction_drops = [
             r for r in caplog.records
-            if "no longer prices above the YES leg fill" in r.getMessage()
+            if "sits below its own YES bid" in r.getMessage()
         ]
         assert len(direction_drops) == 1
         assert direction_drops[0].levelno == logging.WARNING
+        assert "0.4500" in direction_drops[0].getMessage()
+        assert "0.7000" in direction_drops[0].getMessage()
 
         # The pair IS profitable at those fills — it must not also be reported
         # as unprofitable, which would misattribute the drop
@@ -4563,65 +4591,74 @@ class TestEnrichmentRefreshesReferenceQuote:
         # scan-time 0.50. time_series_profit_prob clamps the negative gap to
         # zero and the pair models as RISKLESS.
         stale_shape = dataclasses.replace(pair, pA=0.54)
-        assert _kelly_p(stale_shape) == 1.0
+        assert _kelly_p(stale_shape, config.live_settings()) == 1.0
 
         # The fixed enrichment never produces such a pair: the refreshed
-        # reference fails the direction guard, so it is not tradeable and
-        # compute_trade returns None before _kelly_p is ever consulted.
+        # reference sits below the later book's own YES bid, so the
+        # crossed-book guard drops it before _kelly_p is ever consulted.
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is False
 
-    def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self):
-        # LATE has no resting NO bids, so no reference ask can be derived —
-        # pB keeps its scan-time value and the guard evaluates against that
+    def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self, caplog):
+        # The fallback is SAME-TITLE only: a time-series pair with no later YES
+        # ask fails closed, its scan-time pB left as it was (never None).
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is True
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
+        assert enriched.tradeable is False
         assert enriched.pB == pair.pB
         assert enriched.pA == pytest.approx(0.30)
+        drops = [r for r in caplog.records
+                 if "the later contract has no YES ask on its book" in r.getMessage()]
+        assert len(drops) == 1
+        assert drops[0].levelno == logging.WARNING
 
-    def test_fallback_tier_is_the_stated_gap_for_a_ladder(self, caplog):
+        # A same-title pair with A's NO side empty keeps its scan-time pA: its
+        # model is the fixed prior, so pA is a reporting-only reference.
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [st_e] = enrich_with_orderbook_prices(
+            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
+        )
+        assert st_e.tradeable is True
+        assert st_e.pA == st.pA
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_ceiling_tier_is_the_stated_gap_for_a_ladder(self, caplog):
         # DR-73, pinned BY VALUE because the AST pin beside it cannot see
         # this: test_ast_pair_ceiling_reads_the_pair_gap only asserts that a
         # pair_gap_days call is present and a deadline_gap_days call absent,
-        # which a shadowing `tier = min_price_diff_for_gap(abs((close_b -
-        # close_a).days))` after the real assignment satisfies too.
+        # which a shadowing close_time gap after the real one also satisfies.
         #
         # A ladder whose rungs close at ONE instant (the shape a settled or
         # single-instant event produces) with a STATED gap of 19 days must be
-        # held to the 0.30 long tier here, not the 0.15 one a 0-day close gap
-        # implies. The reference side is empty, so the fallback runs; the leg
-        # fills are pA 0.30 + nB 0.35 = 0.65, inside the stated tier's 0.70
-        # ceiling, and pB - avg_yes is 0.20 — between the two tiers, so the
-        # two readings disagree about this pair and only this value test says
-        # which one is right.
+        # held to the 0.30 long tier's price-sum ceiling (0.70), not the 0.85 a
+        # 0-day close gap implies. Its uncrossed book fills pA 0.30 + nB 0.45 =
+        # 0.75, between the two, so only the stated gap drops it.
         ladder = dataclasses.replace(
-            _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35),
+            _ts_candidate(gap_days=0, pA=0.30, pB=0.60, nB=0.45),
             stated_gap_days=19,
         )
-        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45, pB_ref=0.60)
         with caplog.at_level(logging.INFO):
             [enriched] = enrich_with_orderbook_prices(client, [ladder], _AMPLE_BALANCE_CENTS)
 
         assert enriched.tradeable is False
         drops = [
             r for r in caplog.records
-            if "no longer prices above the YES leg fill" in r.getMessage()
+            if "No qualifying contract pairs" in r.getMessage()
         ]
         assert len(drops) == 1
-        # The rendered tier is the assertion: a close_time-derived tier says
-        # "0.15 tier" here and keeps the pair.
-        assert "clear the 0.30 tier" in drops[0].getMessage()
 
         # Control: the SAME book and prices with no stated gap — the pair is a
-        # cross-event one closing 0 days apart, so the 0.15 tier applies and
-        # the 0.20 gap clears it. Proves the drop above comes from the stated
+        # cross-event one closing 0 days apart, so the 0.85 ceiling applies and
+        # the 0.75 level qualifies. Proves the drop above comes from the stated
         # gap, not from the fixture's prices.
-        plain = _ts_candidate(gap_days=0, pA=0.30, pB=0.50, nB=0.35)
+        plain = _ts_candidate(gap_days=0, pA=0.30, pB=0.60, nB=0.45)
         assert plain.stated_gap_days is None
         [kept] = enrich_with_orderbook_prices(
-            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.35), [plain], _AMPLE_BALANCE_CENTS,
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.45, pB_ref=0.60), [plain],
+            _AMPLE_BALANCE_CENTS,
         )
         assert kept.tradeable is True
 
@@ -4639,8 +4676,490 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert client_two.get_market_orderbook_without_preload_content.call_count == 2
 
 
+def _live(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20):
+    """An explicit LiveSettings of its four required fields (the rest default)."""
+    return config.LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
+                               interval_discount=interval_discount, size_cap=size_cap)
+
+
+# Tier floors off, band 0-0.5: pB - pA strictly positive and at most 0.5
+_TIERS_OFF_HALF = _live(tier_floors=False, spread_band=(0.0, 0.5))
+
+
+class TestLiveSpreadRule:
+    """find_time_series_pairs applies config.time_series_spread_refusal: the
+    entry floor, and the band's ceiling BEFORE the group's one-best contest."""
+
+    @staticmethod
+    def _scan(markets, settings, caplog=None):
+        return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets,
+                                      settings=settings)
+
+    @staticmethod
+    def _lines(caplog, text):
+        return [r.getMessage() for r in caplog.records if text in r.getMessage()]
+
+    def test_tiers_off_admits_a_spread_under_the_tier(self):
+        # 0.10 at 10 days: under the 0.15 tier, admitted only with the tiers off
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.40)
+        assert self._scan([mA, mB], _live()) == []
+        [pair] = self._scan([mA, mB], _TIERS_OFF_HALF)
+        assert pair.pB - pair.pA == pytest.approx(0.10)
+        assert pair.tradeable is True
+
+    def test_a_spread_above_the_ceiling_is_refused_and_counted(self, caplog):
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.85)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], _TIERS_OFF_HALF) == []
+        [line] = self._lines(caplog, "refused above the spread band's")
+        assert line == ("Time-series candidates refused above the spread band's 0.5 ceiling "
+                        "(pB - pA; before the one-best-per-group contest): 1")
+        # control: no band, same pair
+        assert len(self._scan([mA, mB], _live(tier_floors=False))) == 1
+
+    def test_an_equal_price_pair_is_refused_and_not_counted(self, caplog):
+        # pB == pA: refused by the direction filter, which counts nothing
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.40, pB=0.40)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], _TIERS_OFF_HALF) == []
+        assert self._lines(caplog, "entry floor") == []
+        assert self._lines(caplog, "spread band's") == []
+
+    def test_a_spread_under_the_floor_is_counted(self, caplog):
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.40)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], _live()) == []
+        [line] = self._lines(caplog, "refused below the entry floor")
+        assert line.startswith("Time-series candidates refused below the entry floor "
+                               "(tier floors on (")
+        assert line.endswith("no spread band): 1")
+
+    def test_the_ceiling_acts_before_the_one_best_contest(self):
+        # The widest spread, EARLY->LATE (0.60), is over the 0.5 ceiling, so the
+        # in-band runner-up EARLY->MID (0.40) represents the group
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        early = _mock_market(ticker="EARLY", event_ticker="EVA-1",
+                             title="Will BTC exceed $80k by March 01, 2026",
+                             yes_ask=0.20, no_ask=0.80, close_time=close)
+        mid = _mock_market(ticker="MID", event_ticker="EVM-1",
+                           title="Will BTC exceed $80k by March 06, 2026",
+                           yes_ask=0.60, no_ask=0.40, close_time=close + timedelta(days=5))
+        late = _mock_market(ticker="LATE", event_ticker="EVB-1",
+                            title="Will BTC exceed $80k by March 11, 2026",
+                            yes_ask=0.80, no_ask=0.20, close_time=close + timedelta(days=10))
+        [pair] = self._scan([early, mid, late], _TIERS_OFF_HALF)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("EARLY", "MID")
+        assert pair.pB - pair.pA == pytest.approx(0.40)
+        # control: with no band the widest spread wins
+        [widest] = self._scan([early, mid, late], _live(tier_floors=False))
+        assert (widest.market_a.ticker, widest.market_b.ticker) == ("EARLY", "LATE")
+
+    def test_the_price_sum_guard_still_counts_a_pair_refused_by_both(self, caplog):
+        # Over $1 AND over the ceiling: the $1 guard runs first and alone counts it
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.90, nB=0.75)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mA, mB], _TIERS_OFF_HALF) == []
+        assert len(self._lines(caplog, "leg price sum at or above $1: 1")) == 1
+        assert self._lines(caplog, "spread band's") == []
+
+    def test_ladder_refusals_are_counted_apart(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        early_close = datetime(2026, 3, 1, tzinfo=UTC)
+        late_close = datetime(2026, 3, 20, tzinfo=UTC)
+        # Above the band's ceiling: 0.55 against 0.5
+        wide = [_ladder_rung("W-EARLY", "by March 1, 2026", event="KXWIDE-1",
+                             yes_ask=0.20, no_ask=0.80, close=early_close),
+                _ladder_rung("W-LATE", "by March 20, 2026", event="KXWIDE-1",
+                             yes_ask=0.75, no_ask=0.25, close=late_close)]
+        _assert_one_ladder_group(*wide)
+        with caplog.at_level(logging.INFO):
+            assert self._scan(wide, _TIERS_OFF_HALF) == []
+        assert self._lines(caplog, "Same-event ladder candidates refused above the "
+                                   "spread band's 0.5 ceiling: 1")
+        assert self._lines(caplog, "Time-series candidates refused above") == []
+        caplog.clear()
+        # Under the 0.30 tier its 19-day STATED gap chooses: 0.20
+        narrow = [_ladder_rung("N-EARLY", "by March 1, 2026", event="KXNARROW-1",
+                               yes_ask=0.20, no_ask=0.80, close=early_close),
+                  _ladder_rung("N-LATE", "by March 20, 2026", event="KXNARROW-1",
+                               yes_ask=0.40, no_ask=0.60, close=late_close)]
+        with caplog.at_level(logging.INFO):
+            assert self._scan(narrow, _live()) == []
+        [line] = self._lines(caplog, "Same-event ladder candidates refused below the entry floor")
+        assert line.endswith(": 1")
+        assert self._lines(caplog, "Time-series candidates refused below") == []
+
+    def test_the_rule_is_always_logged(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._scan([], _TIERS_OFF_HALF)
+        [line] = self._lines(caplog, "Time-series entry rule:")
+        assert line == ("Time-series entry rule: tier floors off (pB - pA must still be "
+                        "positive), spread band 0-0.5 on pB - pA")
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._scan([], _live())
+        [line] = self._lines(caplog, "Time-series entry rule:")
+        assert line == ("Time-series entry rule: tier floors on (≥15% up to 15 days apart, "
+                        "≥30% for 16-30), no spread band")
+
+    def test_no_settings_reads_config_once(self, monkeypatch):
+        calls = []
+
+        def counting():
+            calls.append(1)
+            return config.live_settings()
+
+        monkeypatch.setattr(scanner, "live_settings", counting)
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.50)
+        find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
+        assert calls == [1]
+        # ... and never when handed settings
+        find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB],
+                               settings=_live())
+        assert calls == [1]
+
+
+class TestEnrichmentSpreadRule:
+    """enrich_with_orderbook_prices on the fresh book: fail closed with no later
+    YES ask, the crossed-book guard, the top-of-book ceiling, the fee cut, and
+    the config.max_kelly_fraction bound."""
+
+    @staticmethod
+    def _lines(caplog, text):
+        return [r for r in caplog.records if text in r.getMessage()]
+
+    def test_no_reference_fails_closed_for_time_series_only(self, caplog):
+        ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        with caplog.at_level(logging.INFO):
+            [ts_e] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50), [ts], _AMPLE_BALANCE_CENTS,
+                settings=_live())
+        assert ts_e.tradeable is False
+        [line] = self._lines(caplog, "no YES ask on its book (no resting NO bids)")
+        assert line.levelno == logging.WARNING
+        # same-title still falls back to its scan-time reference
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [st_e] = enrich_with_orderbook_prices(
+            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
+            settings=_live())
+        assert st_e.tradeable is True and st_e.pA == st.pA
+
+    def test_a_crossed_later_book_is_dropped(self, caplog):
+        # LATE: YES bid 0.60, YES ask 0.55 — crossed; the 0.25 spread clears
+        # the 0.15 tier, so only the guard can drop it
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, pB_ref=0.55), [pair],
+                _AMPLE_BALANCE_CENTS, settings=_live())
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "sits below its own YES bid")
+        assert line.levelno == logging.WARNING
+        assert "0.5500" in line.getMessage() and "0.6000" in line.getMessage()
+
+    def test_the_guard_reads_the_later_books_best_yes_bid(self, caplog):
+        # LATE rests YES bids 0.60 and 0.55 and a YES ask of 0.58: crossed only at the
+        # TOP (0.60 > 0.58), so a guard reading any level but the best one passes it.
+        # The spread and price-sum ceiling pass too, so only the guard drops it
+        pair = _ts_candidate(gap_days=10, pA=0.20, pB=0.58, nB=0.40)
+        levels = [(0.20, 0.40, 10), (0.21, 0.45, 10)]
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_multilevel_client(levels, pB_ref=0.58), [pair], _AMPLE_BALANCE_CENTS,
+                settings=_live())
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "sits below its own YES bid")
+        assert line.levelno == logging.WARNING
+        assert "0.5800" in line.getMessage() and "0.6000" in line.getMessage()
+        # control: the same book with its YES ask AT the best YES bid is kept
+        [kept] = enrich_with_orderbook_prices(
+            _ts_multilevel_client(levels, pB_ref=0.60), [pair], _AMPLE_BALANCE_CENTS,
+            settings=_live())
+        assert kept.tradeable is True
+
+    def test_the_guard_is_silent_on_an_uncrossed_book(self, caplog):
+        # The YES ask exactly AT the YES bid (0.60 + 0.40 = 1.0) is uncrossed
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, pB_ref=0.60), [pair],
+                _AMPLE_BALANCE_CENTS, settings=_live())
+        assert enriched.tradeable is True
+        assert self._lines(caplog, "sits below its own YES bid") == []
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize("pB_ref", [0.0199, 0.01])
+    def test_the_guard_drops_a_book_crossed_by_one_tick(self, caplog, pB_ref):
+        # A sub-cent book at the shipped rule, LATE's YES bid 0.02: a reference
+        # one tick (0.0001) or a cent under it is crossed and must drop — the
+        # guard tolerates PRICE_EPSILON, never a tick
+        settings = _live(tier_floors=False, spread_band=(0.0, 0.5),
+                         interval_discount=0.80, size_cap=1.0)
+        pair = _ts_candidate(gap_days=5, pA=0.005, pB=0.02, nB=0.98)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.005, nB_fill=0.98, pB_ref=pB_ref), [pair],
+                _AMPLE_BALANCE_CENTS, settings=settings)
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "sits below its own YES bid")
+        assert line.levelno == logging.WARNING
+
+    def test_a_reference_at_the_yes_bid_on_a_sub_cent_book_is_kept_under_one_minus_k(self):
+        # Control for the rows above: a YES ask AT the 0.02 bid is uncrossed, is
+        # kept, and sizes under 1 - k = 0.20 with no per-trade cap
+        from kalshi_betting.strategy import compute_trade
+
+        settings = _live(tier_floors=False, spread_band=(0.0, 0.5),
+                         interval_discount=0.80, size_cap=1.0)
+        pair = _ts_candidate(gap_days=5, pA=0.005, pB=0.02, nB=0.98)
+        [kept] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.005, nB_fill=0.98, pB_ref=0.02), [pair],
+            _AMPLE_BALANCE_CENTS, settings=settings)
+        assert kept.tradeable is True
+        spec = compute_trade(kept, _AMPLE_BALANCE_CENTS, settings=settings)
+        assert spec is not None
+        assert 0.0 < spec.kelly_fraction < 0.20
+
+    def test_the_ceiling_is_tested_on_the_top_of_the_book(self, caplog):
+        # YES fills 0.20 x10 / 0.30 x90, reference 0.72 (uncrossed): the average
+        # fill's 0.43 spread is inside the 0.5 ceiling, the TOP's 0.52 is not
+        pair = _ts_candidate(gap_days=10, pA=0.20, pB=0.72, nB=0.28)
+        client = _ts_multilevel_client([(0.20, 0.28, 10), (0.30, 0.28, 90)], pB_ref=0.72)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                client, [pair], _AMPLE_BALANCE_CENTS, settings=_TIERS_OFF_HALF)
+        assert enriched.pA == pytest.approx(0.29)
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "at the top of the book exceeds the spread band's 0.5")
+        assert line.levelno == logging.WARNING
+        assert "0.5200" in line.getMessage()
+        # control: no band, same book
+        [kept] = enrich_with_orderbook_prices(
+            _ts_multilevel_client([(0.20, 0.28, 10), (0.30, 0.28, 90)], pB_ref=0.72),
+            [pair], _AMPLE_BALANCE_CENTS, settings=_live(tier_floors=False))
+        assert kept.tradeable is True
+
+    @staticmethod
+    def _adversary_client():
+        # A YES asks 0.30 x100 / 0.53 x2000; B NO ask 0.45 x2100 and YES ask
+        # 0.56 (above its 0.55 bid: uncrossed)
+        def fake_orderbook(ticker):
+            if ticker == "EARLY":
+                ob = {"yes_dollars": [], "no_dollars": [["0.70", "100"], ["0.47", "2000"]]}
+            else:
+                ob = {"yes_dollars": [["0.55", "2100"]], "no_dollars": [["0.44", "1000"]]}
+            return _raw_book_response(ob)
+
+        client = MagicMock()
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=fake_orderbook)
+        return client
+
+    def test_levels_are_cut_at_the_first_with_no_edge_after_the_fee(self, caplog):
+        # Tiers off (1.0 ceiling): the second level (0.98, a 0.02 edge under its
+        # ~0.035 fee) qualifies; averaged in, it drops the pair (#51); cut, the
+        # sizer buys exactly the 100 contracts with a 0.25 edge
+        from kalshi_betting.strategy import compute_trade
+
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.56, nB=0.45)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                self._adversary_client(), [pair], 1_000_000,
+                settings=_live(tier_floors=False))
+        assert enriched.tradeable is True
+        assert enriched.depth_levels == (pytest.approx((0.30, 0.45, 100.0)),)
+        assert enriched.max_contracts == 100
+        assert (enriched.pA, enriched.nB, enriched.pB) == pytest.approx((0.30, 0.45, 0.56))
+        assert self._lines(caplog, "unprofitable after depth adjustment") == []
+        spec = compute_trade(enriched, 1_000_000)
+        assert spec is not None and spec.x == 100
+
+    def test_the_cut_is_inert_at_a_floor_of_015(self):
+        # Tiers on: the 0.85 ceiling leaves every level more edge than any fee,
+        # so the level right on it (0.36 + 0.49) is kept
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client([(0.30, 0.45, 10), (0.36, 0.49, 90), (0.45, 0.52, 500)])
+        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS,
+                                                  settings=_live())
+        assert len(enriched.depth_levels) == 2
+        assert enriched.max_contracts == 100
+
+    def test_a_book_with_no_edge_after_the_fee_is_named(self, caplog):
+        # One level, 0.53 + 0.45 = 0.98: inside the 1.0 ceiling, its edge under the fee
+        pair = _ts_candidate(gap_days=10, pA=0.53, pB=0.56, nB=0.45)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.53, nB_fill=0.45, pB_ref=0.56), [pair],
+                _AMPLE_BALANCE_CENTS, settings=_live(tier_floors=False))
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "keeps an edge after the fee")
+        assert line.getMessage() == (
+            f"No contract pair for '{pair.canonical_title}' keeps an edge after the fee "
+            "— skipping")
+        assert self._lines(caplog, "No qualifying contract pairs") == []
+
+    def test_k_of_one_names_the_zero_bound(self, caplog):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.62), [pair],
+                _AMPLE_BALANCE_CENTS, settings=_live(interval_discount=1.0, size_cap=1.0))
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "No affordable contract pairs")
+        assert ("the budget affords 0; the per-trade bound is 0 (k = 1.00: time-series "
+                "Kelly cannot be positive); skipping") in line.getMessage()
+        # control: a same-title pair under the same settings is not bounded at 0
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [st_e] = enrich_with_orderbook_prices(
+            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60), [st],
+            _AMPLE_BALANCE_CENTS, settings=_live(interval_discount=1.0, size_cap=1.0))
+        assert st_e.tradeable is True
+
+    def test_the_bound_is_max_kelly_fraction_exactly(self):
+        # $10,000 at a best level of 0.80: 0.20 affords 2500 pairs, the unrounded
+        # 1 - 0.8 (0.19999999999999996) only 2499
+        ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
+        [ts_e] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
+            1_000_000, settings=_live(interval_discount=0.8, size_cap=1.0))
+        assert ts_e.max_contracts == 2500
+        # Same-title at no cap: the 0.95 co-resolution prior, over 0.75
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [st_e] = enrich_with_orderbook_prices(
+            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=20000, pA_ref=0.60), [st],
+            1_000_000, settings=_live(size_cap=1.0))
+        assert st_e.max_contracts == int(10_000 * 0.95 / 0.75)
+        # _live()'s 20% cap bounds it at 0.20 too
+        [ts_t] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
+            1_000_000, settings=_live())
+        assert ts_t.max_contracts == 2500
+
+    def test_no_settings_reads_config_once(self, monkeypatch):
+        calls = []
+
+        def counting():
+            calls.append(1)
+            return config.live_settings()
+
+        monkeypatch.setattr(scanner, "live_settings", counting)
+        pairs = [_ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50) for _ in range(3)]
+        enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.62), pairs,
+            _AMPLE_BALANCE_CENTS)
+        assert calls == [1]
+
+
+class TestValidatePairPriceSpreadRule:
+    """validate_pair_price on a FRESH book: fail closed with no later YES ask,
+    the top-of-book ceiling, and the fee cut before any depth is counted."""
+
+    def test_a_fresh_spread_over_the_ceiling_is_dropped(self, caplog):
+        # Fill 0.30, fresh reference 0.85: 0.55 at the top of the book, over 0.5
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.30)
+        spec = SimpleNamespace(pair=pair, x=10)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.30, pB_ref=0.85)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(client, spec, settings=_TIERS_OFF_HALF) is False
+        [line] = [r for r in caplog.records if "exceeds the spread band's 0.5 ceiling" in
+                  r.getMessage()]
+        assert line.levelno == logging.WARNING
+        assert "0.5500" in line.getMessage()
+        # Nothing changes at a 1.0 ceiling: same book, no band
+        assert validate_pair_price(client, spec, settings=_live(tier_floors=False)) is True
+        assert validate_pair_price(client, spec, settings=_live()) is True
+
+    def test_the_ceiling_is_tested_on_the_fresh_top_of_the_book(self, caplog):
+        # Sized at a YES fill of 0.35; the fresh book's top (0.20 under a 0.75
+        # reference) spreads 0.55, over 0.5, while the spec's fill and the
+        # deeper level spread 0.40. The fresh top decides.
+        pair = _ts_candidate(gap_days=10, pA=0.35, pB=0.75, nB=0.31)
+        spec = SimpleNamespace(pair=pair, x=10)
+        levels = [(0.20, 0.30, 10), (0.35, 0.31, 90)]
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.75), spec,
+                                       settings=_TIERS_OFF_HALF) is False
+        [line] = [r for r in caplog.records if "exceeds the spread band's 0.5 ceiling" in
+                  r.getMessage()]
+        assert line.levelno == logging.WARNING
+        assert "0.5500" in line.getMessage()
+        # control: the same fresh book passes at a 1.0 ceiling
+        assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.75), spec,
+                                   settings=_live(tier_floors=False)) is True
+
+    def test_no_later_yes_ask_fails_closed(self, caplog):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        spec = SimpleNamespace(pair=pair, x=10)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(client, spec, settings=_live()) is False
+        [line] = [r for r in caplog.records if "has no YES ask on its book now" in
+                  r.getMessage()]
+        assert line.levelno == logging.WARNING
+        # control: the same book with a reference passes
+        assert validate_pair_price(
+            _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, pB_ref=0.60), spec,
+            settings=_live()) is True
+
+    def test_a_fresh_book_with_no_edge_after_the_fee_is_dropped(self, caplog):
+        # A thin-edge spec sized at 0.01 / 0.97, tiers off; the book moves a tick
+        # to 0.02 / 0.98, inside the 1.0 ceiling and both FoK caps, so only the
+        # fee cut drops it (filled there, every settlement cell loses)
+        pair = _ts_candidate(gap_days=10, pA=0.01, pB=0.03, nB=0.97)
+        spec = SimpleNamespace(pair=pair, x=748)
+        moved = _ts_orderbook_client(pA_fill=0.02, nB_fill=0.98, qty=5000, pB_ref=0.03)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(moved, spec, settings=_TIERS_OFF_HALF) is False
+        [line] = [r for r in caplog.records if "keeps an edge after the fee" in r.getMessage()]
+        assert line.levelno == logging.WARNING
+        assert line.getMessage() == (
+            f"Pre-execution check failed for '{pair.canonical_title}' — no contract pair "
+            "on the book now keeps an edge after the fee; dropping")
+        assert [r for r in caplog.records if "gap no longer qualifies" in r.getMessage()] == []
+        # control: the book it was sized on (a 0.02 edge, ~0.003 fee) passes
+        unmoved = _ts_orderbook_client(pA_fill=0.01, nB_fill=0.97, qty=5000, pB_ref=0.03)
+        assert validate_pair_price(unmoved, spec, settings=_TIERS_OFF_HALF) is True
+        # control: with the tiers on the 0.85 ceiling refuses the moved book itself
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(moved, spec, settings=_live()) is False
+        assert [r for r in caplog.records if "gap no longer qualifies" in r.getMessage()]
+
+    def test_depth_is_counted_only_over_levels_with_an_edge(self, caplog):
+        # 100 contracts at 0.30 + 0.45 and 900 no-edge ones at 0.53 + 0.46 (0.99,
+        # inside the 1.0 ceiling): a spec of 150 needs the no-edge ones and drops
+        pair = _ts_candidate(gap_days=10, pA=0.52, pB=0.60, nB=0.45)
+        levels = [(0.30, 0.45, 100), (0.53, 0.46, 900)]
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.60),
+                                       SimpleNamespace(pair=pair, x=150),
+                                       settings=_live(tier_floors=False)) is False
+        [line] = [r for r in caplog.records if "reachable at the FoK limit" in r.getMessage()]
+        assert "only 100.0 contracts" in line.getMessage()
+        assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.60),
+                                   SimpleNamespace(pair=pair, x=100),
+                                   settings=_live(tier_floors=False)) is True
+
+    def test_the_cut_is_inert_under_a_tier_on_ceiling(self):
+        # Tiers on: every level under the 0.85 ceiling keeps more edge than any
+        # fee, so a spec reaching the one on it (0.36 + 0.49) counts all 100
+        pair = _ts_candidate(gap_days=10, pA=0.35, pB=0.62, nB=0.48)
+        levels = [(0.30, 0.45, 10), (0.36, 0.49, 90)]
+        assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.62),
+                                   SimpleNamespace(pair=pair, x=100), settings=_live()) is True
+
+    def test_same_title_reads_no_reference(self):
+        # Same-title reads no reference: with A's NO side empty it still passes
+        pair = _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
+        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
+        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=100),
+                                   settings=_TIERS_OFF_HALF) is True
+
+
 class TestTimeSeriesBestPairPerGroup:
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_group_of_three_keeps_largest_later_minus_earlier_gap(self):
+        # (pre_toggle_defaults: with the tier floors off MID -> LATE qualifies too)
         # Three contracts on one normalized title, all within the short tier:
         # EARLY→MID gap 0.20 and EARLY→LATE gap 0.30 both qualify, MID→LATE
         # (0.10) does not. One pair per group survives — the largest pB - pA.
@@ -4751,13 +5270,15 @@ class TestLegHelpers:
         m = SimpleNamespace(close_time=datetime(2026, 3, 1, tzinfo=UTC))
         assert deadline_gap_days(m, m) == 0
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_scanner_and_ceiling_share_the_gap(self):
         # _pair_max_sum tiers off the same order-independent gap the finder
         # used, so a 16-day pair gets the long-tier ceiling from either side
         pair = _ts_candidate(gap_days=16, pA=0.30, pB=0.65, nB=0.40)
-        assert scanner._pair_max_sum(pair) == pytest.approx(0.70)
+        settings = config.live_settings()
+        assert scanner._pair_max_sum(pair, settings) == pytest.approx(0.70)
         swapped = dataclasses.replace(pair, market_a=pair.market_b, market_b=pair.market_a)
-        assert scanner._pair_max_sum(swapped) == pytest.approx(0.70)
+        assert scanner._pair_max_sum(swapped, settings) == pytest.approx(0.70)
 
 
 def _orderbook_payload_client(payload: dict):
@@ -6667,13 +7188,15 @@ class TestBidsToAskLevelsSubCent:
         assert scanner._MAX_ACTIVE_PRICE == 0.99
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestPriceEpsilonThresholds:
     """
     TS-09: prices are floats parsed from cent-quantized dollar strings, so a
     pair sitting EXACTLY on a documented threshold can evaluate a hair under it
     and be rejected for representation noise rather than for its price.
     Measured over live books: the same-title 5c test rejected 50 of 94
-    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69.
+    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69. The tiers
+    bind only with the tier floors on (pre_toggle_defaults).
     """
 
     def test_the_float_noise_this_exists_for_is_real(self):

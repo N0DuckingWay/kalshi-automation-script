@@ -20,10 +20,21 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
+    The live toggles are config.py's, each overridable for one run by a flag
+    of the "live trading toggles" group. _resolve_live_settings builds the
+    run's one config.LiveSettings before logging is configured (a bad value
+    exits 2); each run mode logs it (_log_live_settings) and hands it to
+    every live site. The scheduler passes no toggle flag. Two pair-list
+    filters run between the finders and enrichment: _dedup_pairs and
+    _filter_by_category.
+
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, price-gap thresholds, the
-    same-title close-gap bound the no-pairs message names, and file paths),
+    (balance threshold, exit-code contract, the same-title threshold and
+    close-gap bound, file paths, and the live toggles: LiveSettings,
+    live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
+    historical.py (load_series_categories, series_labels, infer_category —
+    the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
     leg_sides — the only source of truth for which side each leg buys — and
     close_gap_bound_text, which renders that close-gap bound in the same
@@ -59,6 +70,8 @@ import logging
 import logging.handlers
 import pathlib
 import sys
+from collections import Counter
+from dataclasses import replace as dc_replace
 
 from tabulate import tabulate
 
@@ -69,12 +82,18 @@ from .config import (
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TRADES_NEED_ATTENTION,
     MIN_BALANCE_CENTS,
-    MIN_PRICE_DIFF_LONG_GAP,
-    MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SIZE_CAP_STEP,
+    LiveSettings,
+    describe_live_settings,
+    describe_time_series_rule,
+    describe_trade_filter,
+    live_rule_warnings,
+    live_settings,
 )
+from .historical import infer_category, load_series_categories, series_labels
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
     check_shard_coverage,
@@ -127,7 +146,9 @@ def _format_deadline(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "?"
 
 
-def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
+def _compute_trade_specs(
+    candidate_pairs: list, balance_cents: int, settings: LiveSettings,
+) -> dict:
     """
     Compute trade specifications for all qualifying candidate pairs.
 
@@ -135,6 +156,8 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
         candidate_pairs (list): List of CandidatePair objects to evaluate.
         balance_cents (int): Current account balance in cents, used to size
             each trade via Kelly criterion in compute_trade().
+        settings (LiveSettings): The run's toggles — the object enrichment
+            bounded the depth with (strategy.compute_trade).
 
     Returns:
         dict: Mapping of id(pair) -> TradeSpec for each pair that produced
@@ -143,7 +166,8 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
     """
     specs: dict = {}
     for pair in candidate_pairs:
-        spec = compute_trade(pair, balance_cents)  # returns TradeSpec (Kelly-sized trade with cost/payoff/fractions) or None if pair is unprofitable
+        # Kelly-size under the run's k and caps; None when the pair does not qualify
+        spec = compute_trade(pair, balance_cents, settings=settings)
         if spec is not None:
             specs[id(pair)] = spec
     return specs
@@ -194,41 +218,50 @@ def _print_portfolio(portfolio: list, label: str) -> None:
         )
 
 
-def _no_pairs_msg(sandbox: bool = False) -> str:
+def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -> str:
     """
-    Build the "no qualifying pairs found" log message with live threshold values.
+    Build the "no qualifying pairs found" log message with the run's live rule.
 
-    Formats the deadline-gap-tiered time-series thresholds and the same-title
-    threshold straight from config.py so this message can never drift out of
-    sync with the values `min_price_diff_for_gap()` and the pair-finders
-    actually enforce. Names the cumulative-deadline requirement too: since
-    that rule landed, price is no longer the only reason a time-series
-    candidate can be absent, and an operator reading this line would otherwise
-    go looking at the thresholds for a result the WORDING decided. Names the
+    Words the time-series rule as the finder's "Time-series entry rule" line
+    does, and names the cumulative-deadline requirement so a reader does not
+    blame the price rule for what the wording decided. Names the
     same-title pairing rules for the same reason: a same-title pair also needs
     two different event series whose markets close within
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-02/DR-54, DR-74), with
     the bound read from that constant and rendered by
-    scanner.close_gap_bound_text.
+    scanner.close_gap_bound_text. A set category/tag filter is named too,
+    since it can empty the list on its own.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
             ("... found in sandbox ..."), False for a production run.
             Defaults to False.
+        settings (LiveSettings | None): The run's toggles; None reads config.py's.
 
     Returns:
         str: The fully formatted log message, ready to pass to logging.info().
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
+    # The run's toggles, or config.py's for a caller that hands none
+    settings = live_settings() if settings is None else settings
     thresholds = (
         "time-series: both legs worded as cumulative deadlines "
-        "(“by <date>”, two different ones) with the later leg priced "
-        f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}/{MIN_PRICE_DIFF_LONG_GAP:.0%} above the "
-        "earlier (deadline-gap-tiered), or same-title: "
+        "(“by <date>”, two different ones) with the later leg's YES ask above "
+        "the earlier's by the run's entry rule — "
+        # In the finder's own rule-line words, so the two cannot disagree
+        f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
+        " — or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
-        # This module's own binding, like every threshold above; the scanner
+        # This module's own binding, like the same-title threshold above; the scanner
         # helper only renders it, in the words the refusal lines use.
         f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
     )
+    if settings.categories is not None or settings.tags is not None:
+        # The run's category/tag filter, in the "Live settings:" line's words
+        thresholds += (f" — among pairs filed under the run's category/tag filter "
+                       f"({describe_trade_filter(settings)})")
     if sandbox:
         return f"No qualifying pairs found in sandbox ({thresholds})."
     return f"No qualifying pairs found ({thresholds})."
@@ -277,6 +310,90 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
             seen.add(key)
             result.append(pair)
     return result
+
+
+def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> list:
+    """
+    Keep only the pairs filed under the run's categories and tags.
+
+    Files each pair by MARKET A's series through historical.series_labels,
+    the dashboard's filing rule. Matching is case-insensitive, the two axes
+    combine by AND (None = any), and a tag matches under EVERY category, unlike
+    the dashboard's category-scoped Tag options. Fails CLOSED: with no
+    listing nothing is kept, rather than filing nearly every KX ticker as "Other",
+    and its WARNING is the one line saying why, since the run exits EXIT_OK.
+    A name matching no listed label and no pair draws a typo WARNING.
+
+    Args:
+        pairs (list): CandidatePairs after dedup, before enrichment.
+        settings (LiveSettings): The run's toggles.
+        listing_client: A production KalshiClient, or None to read the cached
+            /series listing only (dev: the sandbox key never signs a prod request).
+
+    Returns:
+        list: The kept pairs, in their original order — the input list itself,
+            with no request, when no filter is set; [] when there is no listing.
+    """
+    if settings.categories is None and settings.tags is None:
+        return pairs
+    # Kalshi's category and tags per series, the map the dashboard files by
+    series_categories = load_series_categories(listing_client)
+    # The filter in the "Live settings:" line's own words
+    wanted = describe_trade_filter(settings)
+    if not series_categories:
+        where = ("no cached copy exists (a dev run reads the cached copy only — a "
+                 "production run or a backtest fetches it)" if listing_client is None
+                 else "Kalshi's /series listing could not be read and no cached copy exists")
+        logging.warning(
+            "Category/tag filter (%s) is set but %s — no pair can be filed, so this "
+            "run trades none", wanted, where)
+        return []
+    cats = None if settings.categories is None else {c.casefold() for c in settings.categories}
+    tags = None if settings.tags is None else {t.casefold() for t in settings.tags}
+    kept: list = []
+    dropped: Counter = Counter()
+    filed_cats: set = set()
+    filed_tags: set = set()
+    for pair in pairs:
+        event = pair.market_a.event_ticker
+        # Filed exactly as the dashboard files a trade of this event
+        category, tag = series_labels(event, infer_category(event), series_categories)
+        filed_cats.add(category.casefold())
+        filed_tags.add(tag.casefold())
+        if ((cats is None or category.casefold() in cats)
+                and (tags is None or tag.casefold() in tags)):
+            kept.append(pair)
+        else:
+            dropped[f"{category} · {tag}"] += 1
+    logging.info(
+        "Category/tag filter (%s): kept %d of %d candidate pairs%s", wanted,
+        len(kept), len(pairs),
+        "" if not dropped else " — dropped " + ", ".join(
+            f"{name} {n}" for name, n in dropped.most_common()))
+    # A name matching no listed label and no pair is almost certainly a typo
+    known_cats = filed_cats | {(c or "Uncategorised").casefold()
+                               for c, _ in series_categories.values()}
+    known_tags = filed_tags | {(t[0] if t else "General").casefold()
+                               for _, t in series_categories.values()}
+    for name in settings.categories or ():
+        if name.casefold() not in known_cats:
+            logging.warning(
+                "Category %r names no category in Kalshi's listing of %d series, nor "
+                "any this run's pairs were filed under — check the spelling; it "
+                "matches nothing", name, len(series_categories))
+    for name in settings.tags or ():
+        if name.casefold() not in known_tags:
+            hint = ""
+            if " · " in name:
+                # The dashboard's Tag select names "category · tag"
+                category, _, tag = name.partition(" · ")
+                hint = (f" (the dashboard's Tag option {name!r} is --category "
+                        f"{category!r} --tag {tag!r})")
+            logging.warning(
+                "Tag %r is no series' first tag in Kalshi's listing of %d series, nor "
+                "any this run's pairs were filed under — check the spelling; it "
+                "matches nothing%s", name, len(series_categories), hint)
+    return kept
 
 
 def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
@@ -492,7 +609,124 @@ def _blind_run_reason(markets: list, shard_statuses, inactive_shards: set) -> st
     return None
 
 
-def _run_dev(client, args) -> int:
+# argparse destination -> the flag an operator types, for the usage error
+_LIVE_FLAGS = (
+    ("tier_floors", "--tier-floors/--no-tier-floors"),
+    ("spread_min", "--spread-min"),
+    ("spread_max", "--spread-max"),
+    ("interval_discount", "--interval-discount"),
+    ("size_cap", "--size-cap"),
+    ("same_title_size_cap", "--same-title-size-cap"),
+    ("category", "--category"),
+    ("any_category", "--any-category"),
+    ("tag", "--tag"),
+    ("any_tag", "--any-tag"),
+)
+
+# The cap flags, which take a whole percent where LiveSettings holds a fraction
+_LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
+
+
+def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
+    """
+    Resolve this run's LiveSettings, and config.py's to compare it against.
+
+    The run's settings are config.py's (read at call time) with each GIVEN
+    toggle flag replacing its field; LiveSettings validates the result
+    (dataclasses.replace re-runs __post_init__), so a flag meets config.py's
+    rule. Called before logging is configured (TS-20); the one live function
+    that calls config.live_settings() unconditionally (the AST pin
+    test_ast_live_path_reads_toggles_only_through_live_settings).
+
+    Args:
+        args (argparse.Namespace): The parsed flags; a missing attribute reads
+            as not given.
+        parser (argparse.ArgumentParser): Used to report an invalid value.
+
+    Returns:
+        tuple[LiveSettings, LiveSettings]: (this run's settings, config.py's),
+            equal when no toggle flag was given.
+
+    Raises:
+        SystemExit: Status 2 (parser.error) on an invalid config.py value or flag.
+    """
+    try:
+        # config.py's toggles: the reference, and the base the flags lay over
+        reference = live_settings()
+    except ValueError as exc:
+        parser.error(f"config.py's live settings are invalid: {exc}")
+    overrides: dict = {}
+    if getattr(args, "tier_floors", None) is not None:
+        overrides["tier_floors"] = args.tier_floors
+    lo, hi = getattr(args, "spread_min", None), getattr(args, "spread_max", None)
+    if lo is not None or hi is not None:
+        overrides["spread_band"] = (reference.spread_band[0] if lo is None else lo,
+                                    reference.spread_band[1] if hi is None else hi)
+    if getattr(args, "interval_discount", None) is not None:
+        overrides["interval_discount"] = args.interval_discount
+    if getattr(args, "size_cap", None) is not None:
+        overrides["size_cap"] = args.size_cap / 100
+    if getattr(args, "same_title_size_cap", None) is not None:
+        overrides["same_title_size_cap"] = args.same_title_size_cap / 100
+    # --category / --tag (repeatable) set the filter; --any-category / --any-tag
+    # clear config.py's (argparse keeps each pair mutually exclusive)
+    if getattr(args, "category", None) is not None:
+        overrides["categories"] = tuple(args.category)
+    elif getattr(args, "any_category", None):
+        overrides["categories"] = None
+    if getattr(args, "tag", None) is not None:
+        overrides["tags"] = tuple(args.tag)
+    elif getattr(args, "any_tag", None):
+        overrides["tags"] = None
+    try:
+        # replace re-validates every field (LiveSettings.__post_init__)
+        return dc_replace(reference, **overrides), reference
+    except ValueError as exc:
+        # Given means not None, never truthy: 0 is a given --spread-min and
+        # False a given --no-tier-floors (the --any-* switches default to None)
+        given = [(dest, flag) for dest, flag in _LIVE_FLAGS
+                 if getattr(args, dest, None) is not None]
+        message = (f"invalid live setting for this run "
+                   f"({', '.join(flag for _, flag in given)}): {exc}")
+        percent = [flag for dest, flag in given if dest in _LIVE_PERCENT_FLAGS]
+        if percent:
+            # The flag's own unit, from the one grid definition (SIZE_CAP_STEP)
+            step = f"{SIZE_CAP_STEP * 100:g}"
+            message += (f" ({' and '.join(percent)} take{'s' if len(percent) == 1 else ''} "
+                        f"a whole percent, a multiple of {step} from {step} to 100, read "
+                        "as that percent / 100)")
+        parser.error(message)
+
+
+def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
+                       real_money: bool) -> None:
+    """
+    Log the run's toggles, any departure from config.py, and every live_rule_warnings line.
+
+    One INFO line marks each field that departs from reference "(config: X)";
+    only a real-money run WARNs on a departure. Resolves neither object itself
+    (TestLiveSettingsReachEverySite).
+
+    Args:
+        settings (LiveSettings): The run's toggles.
+        reference (LiveSettings): config.py's toggles (the run's own when a
+            run mode was handed none, which marks nothing).
+        real_money (bool): True for a prod run that submits orders.
+    """
+    # Every field, with a "(config: X)" mark on each one a flag moved
+    logging.info("Live settings: %s", describe_live_settings(settings, reference))
+    if real_money and settings != reference:
+        logging.warning(
+            "This PRODUCTION run overrides config.py's live settings (see the "
+            "\"(config: …)\" marks on the line above): its trades follow the "
+            "flags, not the committed configuration")
+    # A setting that empties part of the strategy or lifts one pair's stake
+    for text in live_rule_warnings(settings):
+        logging.warning("Live settings: %s", text)
+
+
+def _run_dev(client, args, settings: LiveSettings | None = None,
+             reference: LiveSettings | None = None) -> int:
     """
     Execute a full dev/sandbox mode scan and simulation.
 
@@ -507,6 +741,8 @@ def _run_dev(client, args) -> int:
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
+        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
+        reference (LiveSettings | None): config.py's toggles; None means the run's own.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -524,12 +760,20 @@ def _run_dev(client, args) -> int:
             Returned as an int (rather than None) for symmetry with _run_prod,
             since main() dispatches to either and passes the result to
             sys.exit().
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
+    # Resolved ONCE and handed to every site below that reads a toggle
+    settings = live_settings() if settings is None else settings
+    reference = settings if reference is None else reference
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
         "DEV mode: using real sandbox market data | virtual balance $%.2f",
         args.sandbox_balance,
     )
+    # Log the run's toggles; dev never submits, so no departure WARNING
+    _log_live_settings(settings, reference, real_money=False)
 
     # Read the exchange's per-shard status breakdown so ingest can drop shards
     # that aren't trading. Returns None on the sandbox / pre-sharding shape,
@@ -563,32 +807,37 @@ def _run_dev(client, args) -> int:
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
-    time_series_pairs = find_time_series_pairs(client, held_tickers=set(), markets=markets)
+    # The run's settings decide the time-series entry rule (tier floors, band)
+    time_series_pairs = find_time_series_pairs(
+        client, held_tickers=set(), markets=markets, settings=settings,
+    )
     # Detect same-title pairs separately — uses a different grouping key (exact title match)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
+    # Category/tag filter; no listing client, so the sandbox key never signs a prod request
+    candidate_pairs   = _filter_by_category(candidate_pairs, settings, None)
     # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity
+    # balance could actually buy, and validate liquidity under the run's rule
     candidate_pairs   = enrich_with_orderbook_prices(
-        client, candidate_pairs, sandbox_balance_cents,
+        client, candidate_pairs, sandbox_balance_cents, settings=settings,
     )
 
     if not candidate_pairs:
         # BS-26: write_dev_simulation() already logs "Dev simulation written: %s" —
         # this line carries the qualifier (why the file is empty) instead of
         # repeating the artifact path a second time. The thresholds come from
-        # _no_pairs_msg so they cannot drift out of sync with config.py.
+        # _no_pairs_msg, handed the run's settings, so they match the rule the run applied.
         logging.info(
             "%s Simulation file will contain headers only.",
-            _no_pairs_msg(sandbox=True),
+            _no_pairs_msg(sandbox=True, settings=settings),
         )
         # Write an empty simulation file so the run is still recorded
         write_dev_simulation([], [], sandbox_balance_cents)
         return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the virtual balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
+    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
@@ -625,7 +874,8 @@ def _run_dev(client, args) -> int:
     return EXIT_OK
 
 
-def _run_prod(client, args) -> int:
+def _run_prod(client, args, settings: LiveSettings | None = None,
+              reference: LiveSettings | None = None) -> int:
     """
     Execute a full production run using the real Kalshi account.
 
@@ -644,6 +894,9 @@ def _run_prod(client, args) -> int:
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
+        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
+        reference (LiveSettings | None): config.py's toggles, which departures
+            are marked against; None means the run's own.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -661,8 +914,16 @@ def _run_prod(client, args) -> int:
             means a human must check the account/trade log. EXIT_OK for every
             other path, including dry-run, no candidate pairs, no executable
             trades, and all-pairs-failed-pre-execution-check.
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
+    # Resolved ONCE, before any request, and handed to every site below that reads a toggle
+    settings = live_settings() if settings is None else settings
+    reference = settings if reference is None else reference
     logging.warning("Running in PRODUCTION mode — real money will be used!")
+    # Log the run's toggles; a departure is a WARNING when orders go out
+    _log_live_settings(settings, reference, real_money=not args.dry_run)
 
     # Confirm auth works and read the pre-trade balance broken out by shard
     shard_balances = verify_auth(client)
@@ -725,21 +986,26 @@ def _run_prod(client, args) -> int:
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (deadline-gap) and same-title
-    time_series_pairs = find_time_series_pairs(client, held_tickers, markets)
+    # Run both pair detection paths: time-series (the run's entry rule) and same-title
+    time_series_pairs = find_time_series_pairs(client, held_tickers, markets, settings=settings)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
+    # Category/tag filter, before enrichment so a dropped pair costs no book request
+    candidate_pairs   = _filter_by_category(candidate_pairs, settings, client)
     # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs, balance_cents)
+    # balance could actually buy, and validate liquidity under the run's rule
+    candidate_pairs   = enrich_with_orderbook_prices(
+        client, candidate_pairs, balance_cents, settings=settings,
+    )
 
     if not candidate_pairs:
-        logging.info(_no_pairs_msg())
+        # Names the entry rule this run applied, flags included
+        logging.info(_no_pairs_msg(settings=settings))
         return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the real account balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
+    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
@@ -759,8 +1025,8 @@ def _run_prod(client, args) -> int:
 
     _print_portfolio(portfolio, "Selected")
 
-    # Re-fetch order books for each pair concurrently and drop any whose prices moved
-    portfolio = pre_execution_check(client, portfolio)
+    # Re-fetch each pair's books and drop any that moved, under the run's rule
+    portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
         return EXIT_OK
@@ -811,8 +1077,13 @@ def _run_prod(client, args) -> int:
     # so the record of real fills is never lost, then re-raise.
     try:
         # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
-        # itself (BS-26) — don't duplicate that line here.
-        append_to_prod_log(results, balance_cents / 100, balance_after)
+        # itself (BS-26) — don't duplicate that line here. The note marks the
+        # toggles a flag moved, so the workbook tells rows traded under a flag
+        # from rows traded under config.py's values
+        append_to_prod_log(
+            results, balance_cents / 100, balance_after,
+            run_note=f"settings: {describe_live_settings(settings, reference)}",
+        )
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
@@ -911,9 +1182,11 @@ def main() -> None:
     pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
-    --max-horizon-days), configures logging, builds the appropriate Kalshi
-    client, and dispatches to _run_dev (sandbox simulation) or _run_prod
-    (real account trading). Exits the process via sys.exit() with the
+    --max-horizon-days, and the "live trading toggles" group), resolves the
+    run's settings and config.py's reference (_resolve_live_settings, before
+    logging is configured), configures logging, builds the appropriate Kalshi
+    client, and dispatches to _run_dev (sandbox simulation) or _run_prod (real
+    account trading) with both. Exits the process via sys.exit() with the
     dispatched run's return code (see the EXIT_* constants in config.py,
     BS-14) so a caller that only sees the process exit status — the
     scheduler, which runs this as a subprocess — can distinguish a clean run
@@ -950,9 +1223,76 @@ def main() -> None:
         "--max-horizon-days", type=int, default=None, metavar="DAYS",
         help="Only consider markets closing within DAYS from now (both modes; default: no limit)",
     )
+    # Every flag defaults to None (not given); LiveSettings alone validates the
+    # values — no choices, range check or literal here
+    live = parser.add_argument_group(
+        "live trading toggles",
+        "Override one config.py setting for THIS run only, in either mode. The weekly "
+        "scheduler passes none of these, so a scheduled run trades exactly config.py.",
+    )
+    live.add_argument(
+        "--tier-floors", action=argparse.BooleanOptionalAction, default=None,
+        help="Apply (or, with --no-tier-floors, drop) the deadline-gap tier floors on "
+             "time-series pairs (default: config.TIME_SERIES_TIER_FLOORS)",
+    )
+    live.add_argument(
+        "--spread-min", type=float, default=None, metavar="X",
+        help="Time-series spread-band FLOOR on pB - pA, 0-1 "
+             "(default: config.TIME_SERIES_SPREAD_BAND's floor)",
+    )
+    live.add_argument(
+        "--spread-max", type=float, default=None, metavar="Y",
+        help="Time-series spread-band CEILING on pB - pA, 0-1 "
+             "(default: config.TIME_SERIES_SPREAD_BAND's ceiling)",
+    )
+    live.add_argument(
+        "--interval-discount", type=float, default=None, metavar="K",
+        help="Time-series interval discount k, in (0, 1] "
+             "(default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)",
+    )
+    # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
+    cap_step = f"{SIZE_CAP_STEP * 100:g}"
+    live.add_argument(
+        "--size-cap", type=int, default=None, metavar="PCT",
+        help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
+             "steps; 100 = no cap (default: config.BUDGET_FRACTION)",
+    )
+    live.add_argument(
+        "--same-title-size-cap", type=int, default=None, metavar="PCT",
+        help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
+             "steps; 100 = no extra cap beyond --size-cap "
+             "(default: config.SAME_TITLE_SIZE_CAP)",
+    )
+    # Filed as the backtest dashboard files a trade (_filter_by_category)
+    categories = live.add_mutually_exclusive_group()
+    categories.add_argument(
+        "--category", action="append", default=None, metavar="NAME",
+        help="Trade only pairs filed under this Kalshi category, as the backtest "
+             "dashboard's Category select names it (repeatable; case-insensitive; "
+             "default: config.TRADE_CATEGORIES)",
+    )
+    categories.add_argument(
+        "--any-category", action="store_true", default=None,
+        help="Trade any category this run, whatever config.TRADE_CATEGORIES says",
+    )
+    tags = live.add_mutually_exclusive_group()
+    tags.add_argument(
+        "--tag", action="append", default=None, metavar="NAME",
+        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under ANY "
+             "category unless --category narrows it: the backtest dashboard's Tag "
+             "option \"C · T\" is --category C --tag T (repeatable; case-insensitive; "
+             "combined with --category by AND; default: config.TRADE_TAGS)",
+    )
+    tags.add_argument(
+        "--any-tag", action="store_true", default=None,
+        help="Trade any tag this run, whatever config.TRADE_TAGS says",
+    )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
+    # Validated BEFORE logging is configured (TS-20): a bad flag or config.py
+    # value exits 2 with nothing logged or requested
+    settings, reference = _resolve_live_settings(args, parser)
 
     # Echo to the console (foreground/interactive runs) as well as the
     # persistent log file (later inspection, scheduler-spawned runs)
@@ -980,10 +1320,11 @@ def main() -> None:
 
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
+    # Both run modes get the run's settings and config.py's reference
     if args.mode == "dev":
-        code = _run_dev(client, args)
+        code = _run_dev(client, args, settings, reference)
     else:
-        code = _run_prod(client, args)
+        code = _run_prod(client, args, settings, reference)
 
     # Only sys.exit() communicates the outcome to a subprocess caller (the
     # scheduler) — a bare return here would always look like exit 0.

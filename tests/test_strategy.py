@@ -9,6 +9,7 @@ import ast
 import inspect
 import json
 import logging
+import random
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -17,10 +18,11 @@ import pytest
 
 from kalshi_betting import backtester, config, dashboard, scanner, strategy
 from kalshi_betting.config import (
-    BUDGET_FRACTION,
     SAME_TITLE_CO_RESOLVE_PROB,
+    LiveSettings,
     fee_leg_exact,
     fee_per_pair_approx,
+    live_settings,
     max_affordable_pairs,
     time_series_profit_prob,
 )
@@ -163,34 +165,39 @@ def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
     return p - (1.0 - p) / b
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyP:
     """Probability-of-profit models: the discounted market gap for time-series
     (config.time_series_profit_prob) and the fixed co-resolution prior for
-    same-title."""
+    same-title, at k 0.75 (pre_toggle_defaults)."""
 
     def test_time_series_discounted_gap_model(self):
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
         # p = 1 - k * (pB - pA) = 1 - 0.75 * 0.30 = 0.775
-        assert _kelly_p(pair) == pytest.approx(0.775)
-        assert _kelly_p(pair) == pytest.approx(time_series_profit_prob(0.30, 0.60))
+        assert _kelly_p(pair, live_settings()) == pytest.approx(0.775)
+        assert _kelly_p(pair, live_settings()) == pytest.approx(
+            time_series_profit_prob(0.30, 0.60))
 
     def test_time_series_model_is_not_the_old_expression(self):
         # The pre-2026-09 formula 1 - pA*(1-pB) modelled the impossible
         # A=YES/B=NO cell; on this fixture it would read 0.88, not 0.775
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
-        assert _kelly_p(pair) != pytest.approx(1.0 - 0.30 * (1.0 - 0.60))
+        assert _kelly_p(pair, live_settings()) != pytest.approx(1.0 - 0.30 * (1.0 - 0.60))
 
     def test_same_title_fixed_prior(self):
         pair = make_pair(pA=0.80, pB=0.40, pair_type="same_title")
-        assert _kelly_p(pair) == SAME_TITLE_CO_RESOLVE_PROB
+        assert _kelly_p(pair, live_settings()) == SAME_TITLE_CO_RESOLVE_PROB
 
     def test_same_title_ignores_prices(self):
         pair_high = make_pair(pA=0.90, pB=0.80, pair_type="same_title")
         pair_low = make_pair(pA=0.10, pB=0.05, pair_type="same_title")
-        assert _kelly_p(pair_high) == _kelly_p(pair_low)
+        assert _kelly_p(pair_high, live_settings()) == _kelly_p(pair_low, live_settings())
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTrade:
+    """compute_trade's gates and caps under pre_toggle_defaults (k 0.75, 20% cap)."""
+
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
         assert compute_trade(pair, 100_000) is None
@@ -233,7 +240,7 @@ class TestComputeTrade:
         pair = make_pair(nA=0.01, pB=0.01)  # very cheap pair, massive edge
         result = compute_trade(pair, 1_000_000)
         assert result is not None
-        assert result.kelly_fraction <= BUDGET_FRACTION + 1e-9
+        assert result.kelly_fraction <= config.BUDGET_FRACTION + 1e-9
 
     def test_respects_max_contracts_limit(self):
         pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title", max_contracts=2)
@@ -308,12 +315,13 @@ class TestComputeTrade:
         assert result.total_cost_with_fees <= budget_dollars + 1e-9
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTradeTimeSeries:
     """The plan's flow-through fixture through compute_trade: YES on the
     earlier contract at 0.30 and NO on the later at 0.40 (later YES ask 0.60),
     $10,000 balance. Every expectation is derived from the config helpers in
     the test, not hardcoded, except the contract count and the dollar figures
-    the plan pins."""
+    the plan pins, all worked under pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     @staticmethod
     def _pair(**overrides) -> MagicMock:
@@ -344,7 +352,7 @@ class TestComputeTradeTimeSeries:
         # (0.1884 under the pre-DR-62 fee-less Kelly denominator; the gate is
         # strictly tighter now, so every size is the same or smaller.)
         assert expected_f == pytest.approx(0.1620, abs=1e-4)
-        assert expected_f < BUDGET_FRACTION
+        assert expected_f < config.BUDGET_FRACTION
         assert result.kelly_fraction == pytest.approx(expected_f)
 
     def test_flow_through_dollar_figures(self):
@@ -381,10 +389,10 @@ class TestComputeTradeTimeSeries:
         # The gap had to widen from 0.40 to 0.55 with the fee-inclusive Kelly
         # denominator (DR-62): at the old 0.30 → 0.70 / 0.30 fixture f* is now
         # 0.1905, just under the cap, so the cap no longer binds there.
-        assert _ts_kelly_fraction(0.30, 0.85, 0.15) > BUDGET_FRACTION
+        assert _ts_kelly_fraction(0.30, 0.85, 0.15) > config.BUDGET_FRACTION
         result = compute_trade(self._pair(pB=0.85, nB=0.15), 1_000_000)
         assert result is not None
-        assert result.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert result.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
 
     def test_respects_depth_cap(self):
         result = compute_trade(self._pair(max_contracts=100), 1_000_000)
@@ -401,6 +409,139 @@ class TestComputeTradeTimeSeries:
         assert (base.x, base.total_cost, base.min_payoff) == (
             other_nA.x, other_nA.total_cost, other_nA.min_payoff
         )
+
+
+def _live(k: float = 0.75, cap: float = 0.20, st_cap: float = 1.0) -> LiveSettings:
+    """A LiveSettings at the given k and caps, tier floors on and no band."""
+    return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
+                        size_cap=cap, same_title_size_cap=st_cap)
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestComputeTradeSettings:
+    """compute_trade reads k and both caps from ONE LiveSettings, hands it to
+    every internal helper, and resolves config.py's only when handed none.
+    "The default" is pre_toggle_defaults' (k 0.75, a 20% cap)."""
+
+    _ST = {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"}
+    _TS_WIDE = {"pA": 0.30, "pB": 0.85, "nA": 0.70, "nB": 0.15, "pair_type": "time_series"}
+    _TS = {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB, "pair_type": "time_series"}
+
+    @staticmethod
+    def _st_f() -> float:
+        fee = fee_per_pair_approx(0.20, 0.30)
+        net = 0.50 - fee
+        return SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) * (0.50 + fee) / net
+
+    def test_the_reference_pairs(self):
+        assert self._st_f() == pytest.approx(0.8945, abs=1e-4)
+        assert _ts_kelly_fraction(0.30, 0.85, 0.15) == pytest.approx(0.2163, abs=1e-4)
+
+    def test_an_explicit_cap_binds_where_the_default_would(self):
+        st = make_pair(**self._ST)
+        default = compute_trade(st, 1_000_000)
+        assert default.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
+        wider = compute_trade(st, 1_000_000, settings=_live(cap=0.35))
+        assert wider.kelly_fraction == pytest.approx(0.35)
+        assert wider.x > default.x
+        # The time-series f* (~0.216) sits between the caps: 0.20 binds, 0.35 does not
+        ts = make_pair(**self._TS_WIDE)
+        assert compute_trade(ts, 1_000_000, settings=_live(cap=0.20)).kelly_fraction == \
+            pytest.approx(0.20)
+        assert compute_trade(ts, 1_000_000, settings=_live(cap=0.35)).kelly_fraction == \
+            pytest.approx(_ts_kelly_fraction(0.30, 0.85, 0.15))
+        # ... on the booked path too (_solve_marginal_size -> _evaluate_size)
+        booked = make_booked_pair([(0.20, 0.30, 1_000_000.0)], pair_type="same_title")
+        assert compute_trade(booked, 1_000_000, settings=_live(cap=0.35)).kelly_fraction == \
+            pytest.approx(0.35)
+
+    def test_k_changes_p(self):
+        pair = make_pair(**self._TS)
+        base = compute_trade(pair, 1_000_000, settings=_live())
+        at_06 = compute_trade(pair, 1_000_000, settings=_live(k=0.6))
+        assert base.kelly_p == pytest.approx(0.775)
+        assert at_06.kelly_p == pytest.approx(1.0 - 0.6 * (_TS_PB - _TS_PA))
+        assert at_06.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB, k=0.6))
+        assert at_06.kelly_fraction > base.kelly_fraction
+        # The booked path prices at the run's k too (one flat level: one price at every n)
+        booked = make_booked_pair([(_TS_PA, _TS_NB, 1_000_000.0)], pB=_TS_PB)
+        spec = compute_trade(booked, 1_000_000, settings=_live(k=0.6))
+        assert spec is not None
+        assert spec.kelly_p == pytest.approx(at_06.kelly_p)
+        # _kelly_p reads the same k
+        assert strategy._kelly_p(pair, _live(k=0.6)) == pytest.approx(at_06.kelly_p)
+
+    def test_the_same_title_cap_binds_same_title_only(self):
+        st, ts = make_pair(**self._ST), make_pair(**self._TS_WIDE)
+        s = _live(cap=1.0, st_cap=0.20)
+        assert compute_trade(st, 1_000_000, settings=s).kelly_fraction == pytest.approx(0.20)
+        # With no same-title cap the pair sizes at its full f*
+        uncapped = compute_trade(st, 1_000_000, settings=_live(cap=1.0))
+        assert uncapped.kelly_fraction == pytest.approx(self._st_f())
+        # The same-title cap never reaches a time-series pair
+        assert compute_trade(ts, 1_000_000, settings=s).kelly_fraction == pytest.approx(
+            _ts_kelly_fraction(0.30, 0.85, 0.15))
+        # The tighter of the two caps binds a same-title pair
+        tight = compute_trade(st, 1_000_000, settings=_live(cap=0.10, st_cap=0.20))
+        assert tight.kelly_fraction == pytest.approx(0.10)
+        # ... on the booked path too
+        booked = make_booked_pair([(0.20, 0.30, 1_000_000.0)], pair_type="same_title")
+        assert compute_trade(booked, 1_000_000, settings=s).kelly_fraction == \
+            pytest.approx(0.20)
+
+    def test_none_is_config_pys_settings_read_at_call_time(self, monkeypatch):
+        for kwargs in (self._ST, self._TS_WIDE, self._TS):
+            pair = make_pair(**kwargs)
+            implicit = compute_trade(pair, 1_000_000)
+            explicit = compute_trade(pair, 1_000_000, settings=live_settings())
+            assert (implicit.x, implicit.kelly_fraction, implicit.kelly_p,
+                    implicit.total_cost_with_fees) == (
+                explicit.x, explicit.kelly_fraction, explicit.kelly_p,
+                explicit.total_cost_with_fees)
+        # Resolved at CALL time, from config.py's constants
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
+        assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
+            pytest.approx(0.35)
+        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.10)
+        assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
+            pytest.approx(0.10)
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.6)
+        assert compute_trade(make_pair(**self._TS), 1_000_000).kelly_p == pytest.approx(0.82)
+
+    def test_time_series_fraction_stays_under_one_minus_k(self):
+        # With no per-trade cap, 1 - k bounds a time-series f* whenever the
+        # reference YES ask is at or above the later book's YES bid (see
+        # config.max_kelly_fraction, which relies on it)
+        rng = random.Random(20260927)
+        balance = 1_000_000
+        for k in (0.4, 0.6, 0.75, 0.8, 0.9):
+            s = _live(k=k, cap=1.0)
+            bound = config.max_kelly_fraction("time_series", s)
+            sized = 0
+            books = [[(0.02, 0.02, 500.0)], [(0.05, 0.05, 50.0), (0.06, 0.07, 5000.0)]]
+            for _ in range(300):
+                pa, nb = rng.randint(1, 49) / 100, rng.randint(1, 49) / 100
+                levels = []
+                for _level in range(rng.randint(1, 3)):
+                    levels.append((pa, nb, float(rng.randint(10, 2000))))
+                    pa = round(pa + rng.randint(0, 3) / 100, 2)
+                    nb = round(nb + rng.randint(0, 3) / 100, 2)
+                books.append(levels)
+            for levels in books:
+                best_nb = levels[0][1]
+                # The reference YES ask, at or above the later book's YES bid
+                pB = rng.randint(round((1.0 - best_nb) * 100), 99) / 100
+                for pair in (make_booked_pair(levels, pB=pB),
+                             make_pair(pA=levels[0][0], pB=pB, nA=1 - levels[0][0],
+                                       nB=best_nb, pair_type="time_series")):
+                    spec = compute_trade(pair, balance, settings=s)
+                    if spec is None:
+                        continue
+                    sized += 1
+                    assert spec.kelly_fraction < 1.0 - k, (k, levels, pB, spec.kelly_fraction)
+                    assert spec.kelly_fraction <= bound, (k, levels, pB)
+            # Non-vacuous at every k, the 0.9 extreme included
+            assert sized > 0, k
 
 
 def _function_calls(module, func_name: str, callee: str) -> bool:
@@ -460,7 +601,8 @@ def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     if net_spread <= 0:
         return -1.0
     b = net_spread / (price_a + price_b + fee)
-    p = strategy._kelly_p_at(pair, price_a)
+    # config.py's k, as compute_trade(settings=None) resolves it
+    p = strategy._kelly_p_at(pair, price_a, k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
     return p - (1.0 - p) / b
 
 
@@ -511,8 +653,9 @@ class TestMarginalFillPricing:
                 assert spec.x <= pair.max_contracts
 
     def test_small_balance_pays_the_best_level(self):
-        # $30 * 20% = $6.00 at 0.70 a pair -> 8 pairs, well inside the 20 resting
-        # at the top rung, so the fill is the best level outright.
+        # f* < 1 - k = 0.20 at config.py's k of 0.80 (no per-trade cap, pB 0.62 uncrossed):
+        # at most $6.00 at 0.70 a pair -> 8 pairs, well inside the 20 resting at the top
+        # rung, so the fill is the best level outright.
         spec = compute_trade(make_booked_pair(self.LEVELS), 3_000)
         assert spec is not None
         assert spec.x <= 20
@@ -613,7 +756,7 @@ class TestTimeSeriesKellyParity:
 
     def test_kelly_p_equals_config_helper(self):
         pair = make_pair(pA=_TS_PA, pB=_TS_PB, nB=_TS_NB, pair_type="time_series")
-        assert _kelly_p(pair) == time_series_profit_prob(_TS_PA, _TS_PB)
+        assert _kelly_p(pair, live_settings()) == time_series_profit_prob(_TS_PA, _TS_PB)
 
     def test_dashboard_fraction_equals_compute_trade_fraction(self):
         dash = dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series")
@@ -625,9 +768,10 @@ class TestTimeSeriesKellyParity:
         assert live is not None
         assert live.kelly_fraction == pytest.approx(dash)
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_dashboard_fraction_uses_leg_prices_not_nA_pB(self):
         # On this fixture nA + pB = 1.30 — the old leg mapping would return 0.0
-        # (no spread), not the ~0.1620 the live sizer computes
+        # (no spread), not the ~0.1620 the live sizer computes at k 0.75 (pre_toggle_defaults)
         assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
     def test_dashboard_same_title_unchanged(self):
@@ -800,6 +944,10 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "pair_gap_days")
         assert not _function_calls(
             scanner, "enrich_with_orderbook_prices", "deadline_gap_days")
+        # validate_pair_price's ceiling test too: a wider close_time gap could raise
+        # the floor, and its BELOW_FLOOR answer would let an over-ceiling spread pass
+        assert _function_calls(scanner, "validate_pair_price", "pair_gap_days")
+        assert not _function_calls(scanner, "validate_pair_price", "deadline_gap_days")
 
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror
@@ -916,26 +1064,40 @@ class TestTimeSeriesKellyParity:
         assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
         assert not _function_calls(backtester, "_split_date", "_entry_mondays")
 
-    def test_ast_live_path_reads_no_band(self):
-        # The time-series spread band is a BACKTEST knob. If a band is ever
-        # applied live, its live constants must land in the same commit as
-        # live ceiling enforcement, so a band can never go live half-wired;
-        # until then only the band's backtest-side readers may reach it. The
-        # walk is DENY-BY-DEFAULT: every module of the package, the package
-        # root included, except those readers — so a live module added later
-        # is covered without editing any list here. In every walked module:
-        #   - every min_price_diff_for_gap call passes the gap alone (one
-        #     positional argument, no keyword, no */** splat) — the call that
-        #     returns the deadline-gap tier and reads no band value;
-        #   - the helper is never aliased, shadowed by a local def or
-        #     parameter, spelled as a string (a getattr/__dict__ lookup) or
-        #     passed around uncalled, any of which could hand a later
-        #     indirect call a floor;
-        #   - no band helper or band constant is referenced, by name or by
-        #     string;
-        #   - no band-reading module other than config is imported, so the
-        #     band cannot be reached transitively through one either.
-        # A band value hardcoded inline as a literal is outside this pin's
+    # The live entry points that may resolve config.py's toggles when handed
+    # none, in one statement of one form; every other def taking `settings` requires it.
+    _LIVE_SETTINGS_RESOLVERS = frozenset({
+        ("scanner", "find_time_series_pairs"),
+        ("scanner", "enrich_with_orderbook_prices"),
+        ("scanner", "validate_pair_price"),
+        ("strategy", "compute_trade"),
+        ("trader", "pre_execution_check"),
+        ("main", "_run_dev"),
+        ("main", "_run_prod"),
+        ("main", "_no_pairs_msg"),
+    })
+
+    # The one LIVE function that calls a bare live_settings(), once: it lays main.py's
+    # toggle flags over config.py's values for main() to hand on.
+    _DIRECT_RESOLVERS = frozenset({
+        ("main", "_resolve_live_settings"),
+    })
+
+    def test_ast_live_path_reads_toggles_only_through_live_settings(self):
+        # ONE frozen config.LiveSettings per run carries every live toggle, so
+        # no site applies a setting while another reads config.py. In every
+        # package module but config and the backtest-side band readers:
+        #   - no band/tier-floor helper or constant (min_price_diff_for_gap
+        #     included) or toggle constant is named, spelled, shadowed or
+        #     imported, and no band reader is imported;
+        #   - live_settings is read only by each whitelisted entry point's one
+        #     resolving statement and main._resolve_live_settings' one call;
+        #   - a def with a `settings` parameter is only ever called (pool.submit
+        #     too), with the bare name `settings`, never None or the `reference`,
+        #     and every whitelisted def, and only those, defaults it to None;
+        #   - time_series_profit_prob, _kelly_p_at and max_affordable_pairs always
+        #     get k / the fraction, never None, and are never passed around uncalled.
+        # A toggle value hardcoded inline as a literal is outside this pin's
         # reach; the constants-live-in-config rule covers that.
         import importlib
         import pkgutil
@@ -953,46 +1115,213 @@ class TestTimeSeriesKellyParity:
         modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}") for n in walked]
         no_import = band_readers - {"config"}
 
-        helper = "min_price_diff_for_gap"
         forbidden = {
+            "min_price_diff_for_gap",
             "time_series_spread_band",
             "time_series_spread_too_wide",
             "BACKTEST_DEFAULT_SPREAD_BAND",
             "SPREAD_BAND_SWEEP_FLOORS",
             "SPREAD_BAND_SWEEP_CEILINGS",
+            "TIME_SERIES_TIER_FLOORS",
+            "TIME_SERIES_SPREAD_BAND",
+            "TIME_SERIES_INTERVAL_PROB_DISCOUNT",
+            "BUDGET_FRACTION",
+            "SAME_TITLE_SIZE_CAP",
+            "TRADE_CATEGORIES",
+            "TRADE_TAGS",
         }
-        tier_calls = 0
-        for module in modules:
-            mod = module.__name__
-            tree = ast.parse(inspect.getsource(module))
-            called = set()
+        resolver = "live_settings"
+        # Helpers that read config.py's k / fraction when handed None (or, where
+        # it is defaulted, nothing): name -> (positional index, keyword name)
+        explicit_args = {
+            "time_series_profit_prob": (2, "k"),
+            "_kelly_p_at": (2, "k"),
+            "max_affordable_pairs": (2, "fraction"),
+        }
+
+        def short(module):
+            return module.__name__.rsplit(".", 1)[-1]
+
+        trees = {short(m): ast.parse(inspect.getsource(m)) for m in modules}
+
+        def param_default(node, name):
+            """(declared, default node or None) for the parameter `name`."""
+            positional = node.args.posonlyargs + node.args.args
+            defaults = [None] * (len(positional) - len(node.args.defaults)) + list(
+                node.args.defaults)
+            for arg, default in zip(positional, defaults, strict=True):
+                if arg.arg == name:
+                    return True, default
+            for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
+                if arg.arg == name:
+                    return True, default
+            return False, None
+
+        # Every def with a `settings` parameter, walked modules and config:
+        # name -> positional index, or None when it is keyword-only
+        takes_settings: dict = {}
+        for mod, tree in [*trees.items(), ("config", ast.parse(inspect.getsource(config)))]:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                positional = [a.arg for a in node.args.posonlyargs + node.args.args]
+                kwonly = [a.arg for a in node.args.kwonlyargs]
+                if "settings" in positional:
+                    where = positional.index("settings")
+                elif "settings" in kwonly:
+                    where = None
+                else:
+                    continue
+                assert takes_settings.get(node.name, where) == where, node.name
+                takes_settings[node.name] = where
+                # A whitelisted entry point defaults settings to None; every other def requires it
+                _, default = param_default(node, "settings")
+                if (mod, node.name) in self._LIVE_SETTINGS_RESOLVERS:
+                    assert isinstance(default, ast.Constant) and default.value is None, (
+                        f"{mod}.{node.name} must default settings to None")
+                else:
+                    assert default is None, (
+                        f"{mod}.{node.name} gives settings a default; only a whitelisted "
+                        "entry point may, and it must resolve it")
+        # Non-vacuous: the helpers and entry points this rule exists for
+        assert {"find_time_series_pairs", "enrich_with_orderbook_prices",
+                "validate_pair_price", "pre_execution_check", "_pair_max_sum",
+                "live_time_series_floor", "time_series_spread_refusal",
+                "max_kelly_fraction", "_run_dev", "_run_prod", "compute_trade",
+                "_evaluate_size", "_solve_marginal_size", "_kelly_p",
+                "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
+                "describe_live_settings", "live_rule_warnings", "_filter_by_category",
+                "describe_trade_filter"} <= set(takes_settings)
+        # _kelly_p_at's k is required: a default would price at config's k
+        kelly_p_at = next(n for n in ast.walk(trees["strategy"])
+                          if isinstance(n, ast.FunctionDef) and n.name == "_kelly_p_at")
+        declared, default = param_default(kelly_p_at, "k")
+        assert declared and default is None, "strategy._kelly_p_at must require k"
+
+        def passes_explicitly(call, fn_name):
+            """Whether the call hands fn_name its k/fraction, never a literal None."""
+            index, keyword = explicit_args[fn_name]
+            for kw in call.keywords:
+                if kw.arg == keyword:
+                    return not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            if any(isinstance(a, ast.Starred) for a in call.args) or len(call.args) <= index:
+                return False
+            value = call.args[index]
+            return not (isinstance(value, ast.Constant) and value.value is None)
+
+        def passes_settings(call, fn_name, skip):
+            """Whether the call hands `fn_name` the bare name `settings`,
+            positionally or by keyword; `skip` args precede the callee's own."""
+            def is_the_runs(value):
+                return isinstance(value, ast.Name) and value.id == "settings"
+
+            for kw in call.keywords:
+                if kw.arg == "settings":
+                    return is_the_runs(kw.value)
+            index = takes_settings[fn_name]
+            args = call.args[skip:]
+            if index is None or any(isinstance(a, ast.Starred) for a in args):
+                return False
+            if len(args) <= index:
+                return False
+            return is_the_runs(args[index])
+
+        def call_name(func):
+            return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+        resolutions: dict = {}
+        direct_resolutions: dict = {}
+        explicit_calls: dict = {}
+        for mod, tree in trees.items():
+            parents = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[id(child)] = node
+
+            def enclosing(node, parents=parents):
+                cur = parents.get(id(node))
+                while cur is not None and not isinstance(
+                        cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cur = parents.get(id(cur))
+                return cur.name if cur is not None else None
+
+            # The one allowed form, recorded by the id of its live_settings Name
+            allowed = {}
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id == "settings"
+                        and isinstance(node.value, ast.IfExp)):
+                    continue
+                ifexp = node.value
+                test, body, orelse = ifexp.test, ifexp.body, ifexp.orelse
+                if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                        and test.left.id == "settings" and len(test.ops) == 1
+                        and isinstance(test.ops[0], ast.Is)
+                        and isinstance(test.comparators[0], ast.Constant)
+                        and test.comparators[0].value is None
+                        and isinstance(body, ast.Call) and isinstance(body.func, ast.Name)
+                        and body.func.id == resolver and not body.args and not body.keywords
+                        and isinstance(orelse, ast.Name) and orelse.id == "settings"):
+                    allowed[id(body.func)] = enclosing(node)
+            # The bare live_settings() call, checked against _DIRECT_RESOLVERS
+            direct = {}
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == resolver and not node.args
+                        and not node.keywords and id(node.func) not in allowed):
+                    direct[id(node.func)] = enclosing(node)
+
+            # Callees handed as pool.submit's first argument, checked below
+            submitted = set()
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                fn = node.func
-                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-                if name != helper:
-                    continue
-                called.add(id(fn))
-                tier_calls += 1
+                name = call_name(node.func)
                 where = f"{mod}:{node.lineno}"
-                assert len(node.args) == 1, where
-                assert not isinstance(node.args[0], ast.Starred), where
-                assert not node.keywords, where
+                if name in explicit_args:
+                    assert passes_explicitly(node, name), (
+                        f"{where} calls {name} without its {explicit_args[name][1]}, or "
+                        "with None: it would read config.py rather than the run's settings")
+                    explicit_calls[name] = explicit_calls.get(name, 0) + 1
+                if (name == "submit" and node.args
+                        and call_name(node.args[0]) in takes_settings):
+                    target = call_name(node.args[0])
+                    submitted.add(id(node.args[0]))
+                    assert passes_settings(node, target, 1), (
+                        f"{where} submits {target} without settings=settings")
+                    continue
+                if name in takes_settings:
+                    assert passes_settings(node, name, 0), (
+                        f"{where} calls {name} without the run's `settings` (the bare "
+                        "name, never config.py's reference or another expression)")
+
+            called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+            # An ImportFrom's alias nodes are checked with it, so skipped below
+            from_aliases = {id(a) for n in ast.walk(tree)
+                            if isinstance(n, ast.ImportFrom) for a in n.names}
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for a in node.names:
                         assert a.name.split(".")[-1] not in no_import, f"{mod} imports {a.name}"
                     continue
                 if isinstance(node, ast.ImportFrom):
-                    assert (node.module or "").split(".")[-1] not in no_import, f"{mod} imports {node.module}"
+                    assert (node.module or "").split(".")[-1] not in no_import, (
+                        f"{mod} imports {node.module}")
+                    for a in node.names:
+                        assert a.name not in no_import, f"{mod} imports {a.name}"
+                        assert a.name not in forbidden, f"{mod} imports {a.name}"
+                        # Only the plain import is exempt; an alias could call it
+                        assert not (a.name == resolver and a.asname), mod
                     continue
                 if isinstance(node, ast.Constant):
                     if isinstance(node.value, str):
-                        assert node.value not in forbidden | {helper}, f"{mod}:{node.lineno} spells {node.value!r}"
+                        assert node.value not in forbidden | {resolver}, (
+                            f"{mod}:{node.lineno} spells {node.value!r}")
                     continue
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    assert node.name not in forbidden | {helper}, f"{mod}:{node.lineno} shadows {node.name}"
+                    assert node.name not in forbidden | {resolver}, (
+                        f"{mod}:{node.lineno} shadows {node.name}")
                     continue
                 if isinstance(node, ast.Name):
                     name = node.id
@@ -1001,20 +1330,76 @@ class TestTimeSeriesKellyParity:
                 elif isinstance(node, ast.arg):
                     name = node.arg
                 elif isinstance(node, ast.alias):
-                    # `from . import backtester` names the module here, not
-                    # in ImportFrom.module
+                    if id(node) in from_aliases:
+                        continue
+                    # `import x as y` alias nodes
                     name = node.name
                     assert name not in no_import, f"{mod} imports {name}"
-                    assert not (name == helper and node.asname), mod
                 else:
                     continue
-                assert name not in forbidden, f"{mod} references {name}"
-                if name == helper and not isinstance(node, ast.alias):
-                    assert id(node) in called, f"{mod}:{node.lineno} uncalled reference"
-        # Non-vacuous: the live finder, the pair ceiling and enrichment's
-        # fallback all call it, so a rename that hid every call from this walk
-        # must fail rather than pass with nothing checked.
-        assert tier_calls > 0
+                where = f"{mod}:{node.lineno}"
+                assert name not in forbidden, f"{where} references {name}"
+                if name == resolver and id(node) in direct:
+                    func = direct[id(node)]
+                    assert (mod, func) in self._DIRECT_RESOLVERS, (
+                        f"{where}: {mod}.{func} calls live_settings() directly; only "
+                        "main._resolve_live_settings may, and every other live "
+                        "function must be handed the run's settings")
+                    direct_resolutions[(mod, func)] = (
+                        direct_resolutions.get((mod, func), 0) + 1)
+                elif name == resolver:
+                    assert id(node) in allowed, (
+                        f"{where} reads live_settings outside the one allowed "
+                        "`settings = live_settings() if settings is None else settings`")
+                    func = allowed[id(node)]
+                    assert (mod, func) in self._LIVE_SETTINGS_RESOLVERS, (
+                        f"{where}: {mod}.{func} may not resolve config.py's settings")
+                    resolutions[(mod, func)] = resolutions.get((mod, func), 0) + 1
+                elif (name in takes_settings and isinstance(node, (ast.Name, ast.Attribute))
+                        and id(node) not in called and id(node) not in submitted):
+                    raise AssertionError(
+                        f"{where}: {name} takes settings and is passed around uncalled")
+                elif (name in explicit_args and isinstance(node, (ast.Name, ast.Attribute))
+                        and id(node) not in called):
+                    raise AssertionError(
+                        f"{where}: {name} is passed around uncalled, so its "
+                        f"{explicit_args[name][1]} cannot be checked")
+
+        # Each whitelisted entry point and the direct resolver resolves exactly
+        # once: two resolutions could straddle a monkeypatch
+        assert resolutions == dict.fromkeys(self._LIVE_SETTINGS_RESOLVERS, 1), resolutions
+        assert direct_resolutions == dict.fromkeys(self._DIRECT_RESOLVERS, 1), (
+            direct_resolutions)
+        # main() hands both run modes the settings it resolved, positionally
+        main_tree = trees["main"]
+        main_fn = next(n for n in ast.walk(main_tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        main_calls = {call_name(n.func) for n in ast.walk(main_fn) if isinstance(n, ast.Call)}
+        # (so the walk's check cannot pass on a main() missing a dispatch or the resolution)
+        assert {"_run_dev", "_run_prod", "_resolve_live_settings"} <= main_calls, main_calls
+        # Non-vacuous: _kelly_p and _evaluate_size price at the run's k, and the
+        # sizer and enrichment each turn a fraction into a count
+        assert explicit_calls.get("time_series_profit_prob", 0) >= 1, explicit_calls
+        assert explicit_calls.get("_kelly_p_at", 0) >= 2, explicit_calls
+        assert explicit_calls.get("max_affordable_pairs", 0) >= 2, explicit_calls
+
+        # Every live site of the spread rule (and enrichment's bound) goes through
+        # its one definition
+        assert _function_calls(scanner, "find_time_series_pairs", "time_series_spread_refusal")
+        assert _function_calls(scanner, "enrich_with_orderbook_prices",
+                               "time_series_spread_refusal")
+        assert _function_calls(scanner, "enrich_with_orderbook_prices", "max_kelly_fraction")
+        assert _function_calls(scanner, "validate_pair_price", "time_series_spread_refusal")
+        assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
+        # ... which reaches the floor through the helper _find_entry uses
+        assert _function_calls(config, "live_time_series_floor", "min_price_diff_for_gap")
+
+    def test_ast_every_sizer_caps_through_pair_size_cap(self):
+        # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
+        # so the live sizer, enrichment's bound and the backtester agree
+        assert _function_calls(strategy, "_evaluate_size", "pair_size_cap")
+        assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
+        assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
 
 
 # ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────
@@ -1040,7 +1425,7 @@ def _fee_shrunk_n(kelly_f: float, price_a: float, price_b: float, balance: float
     """compute_trade's budget-to-contracts step (capped Kelly budget, then the
     exact-fee shrink loop), so a test can size the SAME pair under a different
     Kelly fraction and compare the two counts."""
-    budget = balance * min(BUDGET_FRACTION, kelly_f)
+    budget = balance * min(config.BUDGET_FRACTION, kelly_f)
     n = int(budget / (price_a + price_b))
     fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
     while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget:
@@ -1082,6 +1467,7 @@ def _backtester_kelly_fraction(pA: float, pB: float, nA: float, nB: float) -> fl
     return trades[0].kelly_fraction
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyRiskIncludesFees:
     """Kelly's "b" divides by the dollars actually AT RISK, and the fee is one
     of them: a losing pair loses total_cost_with_fees in full, so the fee-less
@@ -1094,7 +1480,7 @@ class TestKellyRiskIncludesFees:
     charged. fee_per_pair_approx sits below fee_leg_exact, so a spec on the
     boundary can still be EV-negative on its own fields at single-digit n; that
     residual is pinned by test_small_n_can_still_be_ev_negative_on_exact_fees
-    rather than papered over."""
+    rather than papered over. Worked under pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     def test_the_headline_fixture_is_rejected(self):
         # THE pin. Accepted before DR-62, rejected now.
@@ -1164,7 +1550,7 @@ class TestKellyRiskIncludesFees:
         spec = compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"), 1_000_000)
         assert spec is not None
         # Both readings are far above the cap, so the sizing is byte-identical
-        assert spec.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert spec.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
         # ...and a same-title pair with no spread is still rejected either way
         assert compute_trade(make_pair(nA=0.60, pB=0.50, pair_type="same_title"),
                              1_000_000) is None
@@ -1391,7 +1777,7 @@ class TestKellyOperandsShareOneSnapshot:
         # unreachable; an inverted one is dropped before compute_trade sizes it
         if enriched.tradeable:
             assert enriched.pB > enriched.pA
-            assert _kelly_p(enriched) < 1.0
+            assert _kelly_p(enriched, live_settings()) < 1.0
         else:
             assert compute_trade(enriched, 100_000) is None
 
@@ -1407,10 +1793,10 @@ class TestKellyOperandsShareOneSnapshot:
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pB > enriched.pA
-        assert _kelly_p(enriched) == pytest.approx(
+        assert _kelly_p(enriched, live_settings()) == pytest.approx(
             time_series_profit_prob(enriched.pA, enriched.pB)
         )
-        assert _kelly_p(enriched) < 1.0
+        assert _kelly_p(enriched, live_settings()) < 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1914,7 @@ class TestReachableDepthSizing:
         forced = strategy._Sizing(
             n=1600, target=1600, price_a=price_a, price_b=price_b,
             p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
-            kelly_fraction=BUDGET_FRACTION, budget_dollars=940.0,
+            kelly_fraction=0.20, budget_dollars=940.0,
         )
         monkeypatch.setattr(strategy, "_solve_marginal_size",
                             lambda *a, **k: forced)

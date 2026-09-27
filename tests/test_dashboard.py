@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kalshi_betting import backtester, config, dashboard
+from kalshi_betting import backtester, config, dashboard, historical
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -54,7 +54,6 @@ from kalshi_betting.backtester import (
 )
 from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
     time_series_profit_prob,
@@ -154,8 +153,9 @@ class TestKellyFraction:
     """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
     prices time-series pairs through config.time_series_profit_prob."""
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620.
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at k 0.75.
         # b's denominator carries the fee — the dollars at risk include it,
         # because a losing pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
@@ -204,7 +204,7 @@ class TestKellyFractionIntervalDiscount:
     def test_none_resolves_to_the_config_constant(self):
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB, "time_series") == (
             _kelly_fraction(self._PA, self._NA, self._PB, self._NB, "time_series",
-                            k=TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+                            k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
         )
 
     def test_explicit_k_of_one_clamps_to_zero(self):
@@ -213,8 +213,8 @@ class TestKellyFractionIntervalDiscount:
                                "time_series", k=1.0) == 0.0
 
     def test_explicit_k_wins_over_a_monkeypatched_constant(self, monkeypatch):
-        # The constant is set to the never-trade value; the explicit k must
-        # still produce the configured-k fixture's ~0.1620 fraction.
+        # With the constant at the never-trade value, k=0.75 must still give
+        # test_time_series_flow_through_fixture's ~0.1620 fraction
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
                                "time_series", k=0.75) == pytest.approx(0.1620, abs=1e-4)
@@ -987,7 +987,7 @@ class TestDeploymentIsNotRenderedAsDrawdown:
         assert "+26.6%" in out
 
     def test_per_k_sweep_row_renders_the_same_drawdown(self):
-        point = SweepPoint(k=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+        point = SweepPoint(k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
                            trades=self._trades(), equity_df=self._equity())
         out = _section_interval_discount(
             BacktestSweep(primary=point, points=[point], calibration=None))
@@ -2092,6 +2092,310 @@ class TestRunSettingsHeader:
         assert "| same-event ladders: not recorded | per-trade cap:" in page
 
 
+class TestLiveRuleHeader:
+    """dashboard._live_rule_html(sweep, bar=...): config.py's own live rule, as
+    run_backtest_sweep read it before its fetch, and where this page shows it
+    (backtester._live_rule_view's verdict, in the filter bar's option texts),
+    on a <p> of its own: _run_settings_html's exact "</p>" suffix is pinned."""
+
+    _P = '<p style="color:#616161; font-size:14px;">'
+    _CAP = "same-title trades capped at the size cap shown, like every pair (20% at this run's own cap)"
+
+    @staticmethod
+    def _sweep(*, live_tier_floors=True, live_spread_band=(0.0, 1.0),
+               primary_band=(0.0, 1.0), size_cap=0.2, same_title_size_cap=1.0,
+               calibrations_by_band=None, tier_off_calibrations_by_band=None,
+               tier_off_scenarios=None, live_categories=None, live_tags=None,
+               same_event_ladders=None, config_same_event_ladders=None) -> BacktestSweep:
+        pt = dataclasses.replace(_scn_point(primary_band, 0.75), size_cap=size_cap)
+        return BacktestSweep(
+            primary=pt, points=[pt], calibration=None,
+            calibrations_by_band=(calibrations_by_band if calibrations_by_band is not None
+                                  else {primary_band: None}),
+            tier_off_calibrations_by_band=tier_off_calibrations_by_band or {},
+            tier_off_scenarios=tier_off_scenarios or [],
+            same_title_size_cap=same_title_size_cap,
+            same_event_ladders=same_event_ladders,
+            config_same_event_ladders=config_same_event_ladders,
+            live_tier_floors=live_tier_floors, live_spread_band=live_spread_band,
+            live_categories=live_categories, live_tags=live_tags,
+        )
+
+    @staticmethod
+    def _bar(bands=((0.0, 1.0),), primary=(0.0, 1.0), off=True, categories=(),
+             subcats=()) -> dict:
+        """The base-block keys _live_rule_html reads, labelled as _filter_payload labels them."""
+        def mark(b):
+            return " (primary)" if b == primary else ""
+        return {
+            "bands": [{"label": dashboard._band_option(b),
+                       "option": dashboard._band_option(b) + mark(b)} for b in bands],
+            "bands_off": None if not off else [
+                {"label": dashboard._band_label(b), "option": dashboard._band_label(b) + mark(b)}
+                for b in bands],
+            "categories": list(categories),
+            "subcats": [[list(categories).index(c), t] for c, t in subcats],
+        }
+
+    def _text(self, sweep, bar) -> str:
+        out = dashboard._live_rule_html(sweep, bar=bar)
+        assert out.startswith(self._P) and out.endswith("</p>")
+        return out[len(self._P):-len("</p>")]
+
+    # ── Not recorded ────────────────────────────────────────────────────────
+
+    def test_no_sweep_is_not_recorded(self):
+        assert dashboard._live_rule_html(None, bar=None) == (
+            self._P + "Live rule (config.py): not recorded</p>")
+
+    @pytest.mark.parametrize("live_tier_floors, live_spread_band",
+                             [(None, (0.0, 1.0)), (True, None), (None, None)])
+    def test_either_unrecorded_field_is_not_recorded(self, live_tier_floors, live_spread_band):
+        sweep = self._sweep(live_tier_floors=live_tier_floors,
+                            live_spread_band=live_spread_band)
+        assert dashboard._live_rule_html(sweep, bar=self._bar()) == (
+            self._P + "Live rule (config.py): not recorded</p>")
+
+    # ── The primary scenario ────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("bar", [True, False])
+    def test_the_primary_scenario_is_the_rule(self, bar):
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        # The page as rendered IS the primary scenario: no bar needed
+        assert self._text(self._sweep(), self._bar() if bar else None) == (
+            f"Live rule (config.py): {rule}; {self._CAP} — this run's primary")
+
+    def test_the_primary_is_matched_by_its_own_band(self):
+        rule = config.describe_time_series_rule(True, (0.3, 0.6))
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), primary_band=(0.3, 0.6))
+        assert self._text(sweep, self._bar(bands=[(0.3, 0.6)], primary=(0.3, 0.6))) == (
+            f"Live rule (config.py): {rule}; {self._CAP} — this run's primary")
+        # ... so a live band equal to the DEFAULT band is elsewhere on it
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        sweep = self._sweep(live_spread_band=(0.0, 1.0), primary_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], primary=(0.3, 0.6))
+        assert self._text(sweep, bar) == (
+            f"Live rule (config.py): {rule}; {self._CAP} — choose Spread band "
+            "max(tier,0)-1 and Tier floors on in the filter bar")
+
+    # ── Elsewhere on the grid, named as the bar names it ────────────────────
+
+    def test_a_tier_on_band_elsewhere_names_the_bars_option(self):
+        rule = config.describe_time_series_rule(True, (0.3, 0.6))
+        sweep = self._sweep(live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)])
+        assert self._text(sweep, bar) == (
+            f"Live rule (config.py): {rule}; {self._CAP} — choose Spread band "
+            "max(tier,0.3)-0.6 and Tier floors on in the filter bar")
+        assert "max(tier,0.3)-0.6" in [e["option"] for e in bar["bands"]]
+
+    def test_a_tier_off_band_is_chosen_after_the_tier_floors(self):
+        # Tiers off relabel the bar's bands: "off" first, then the bare band label
+        band = (0.0, 0.5)
+        rule = config.describe_time_series_rule(False, band)
+        sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
+                            calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_scenarios=[object()])
+        bar = self._bar(bands=[(0.0, 0.5), (0.0, 1.0)])
+        assert self._text(sweep, bar) == (
+            f"Live rule (config.py): {rule}; {self._CAP} — choose Tier floors off and "
+            "Spread band 0-0.5 in the filter bar")
+        # ... and at the primary band, its tier-off option carries the mark
+        sweep = self._sweep(live_tier_floors=False, live_spread_band=(0.0, 1.0),
+                            calibrations_by_band={(0.0, 1.0): None},
+                            tier_off_calibrations_by_band={(0.0, 1.0): None},
+                            tier_off_scenarios=[object()])
+        assert self._text(sweep, self._bar()).endswith(
+            "— choose Tier floors off and Spread band 0-1 (primary) in the filter bar")
+
+    def test_off_the_grid_is_not_simulated(self):
+        sweep = self._sweep(live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None})
+        assert self._text(sweep, self._bar()).endswith("— not simulated by this run")
+
+    def test_tier_floors_off_needs_the_whole_family(self):
+        band = (0.0, 1.0)
+        assert backtester._tier_floors_bind(band) is True
+        grid = {band: None, (0.2, 0.6): None}
+        # On the grid, but no tier-off family ran at all
+        sweep = self._sweep(live_tier_floors=False, calibrations_by_band=grid)
+        assert self._text(sweep, self._bar()).endswith("— not simulated by this run")
+        # The family lacks ANOTHER binding band: the page withholds the whole
+        # off view (dashboard._tier_off_binds)
+        assert backtester._tier_floors_bind((0.2, 0.6)) is True
+        sweep = self._sweep(live_tier_floors=False, calibrations_by_band=grid,
+                            tier_off_calibrations_by_band={band: None},
+                            tier_off_scenarios=[object()])
+        assert dashboard._tier_off_binds(sweep, list(grid)) is None
+        assert self._text(sweep, self._bar()).endswith("— not simulated by this run")
+        # The family names every binding band: reachable
+        sweep = self._sweep(live_tier_floors=False, calibrations_by_band=grid,
+                            tier_off_calibrations_by_band=dict(grid),
+                            tier_off_scenarios=[object()])
+        assert self._text(sweep, self._bar(bands=[band, (0.2, 0.6)])).endswith(
+            "— choose Tier floors off and Spread band 0-1 (primary) in the filter bar")
+
+    def test_tier_floors_off_where_no_tier_binds_is_the_tier_on_rule(self):
+        band = (0.35, 0.5)
+        assert backtester._tier_floors_bind(band) is False
+        note = " (no tier floor binds at this band, so off and on are one rule)"
+        # The primary at that band IS it
+        sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
+                            primary_band=band)
+        assert self._text(sweep, self._bar(bands=[band], primary=band)).endswith(
+            f"— this run's primary{note}")
+        # Elsewhere, its tier-on cell holds it, with or without the family
+        for family in ([], [object()]):
+            sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
+                                calibrations_by_band={(0.0, 1.0): None, band: None},
+                                tier_off_scenarios=family)
+            assert self._text(sweep, self._bar(bands=[(0.0, 1.0), band], off=False)).endswith(
+                f"— choose Spread band max(tier,0.35)-0.5 and Tier floors on{note} in the "
+                "filter bar")
+
+    # ── What this page can show ─────────────────────────────────────────────
+
+    def test_without_a_bar_a_grid_cell_is_not_shown(self):
+        sweep = self._sweep(live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        assert self._text(sweep, None).endswith(
+            "— not shown: this page's filter bar could not be built")
+
+    def test_a_bar_without_the_option_does_not_show_it(self):
+        band = (0.0, 0.5)
+        sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
+                            calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_scenarios=[object()])
+        # No tier-off view on the page (bands_off null), then no such band
+        for bar in (self._bar(bands=[band, (0.0, 1.0)], off=False), self._bar()):
+            assert self._text(sweep, bar).endswith(
+                "— not shown: this page's filter bar does not offer that scenario")
+
+    # ── The same-title cap at every cap the page offers ─────────────────────
+
+    @pytest.mark.parametrize("size_cap, st_cap, clause", [
+        (0.35, 1.0, "same-title trades capped at the size cap shown, like every pair "
+                    "(35% at this run's own cap)"),
+        (0.35, 0.10, "same-title trades capped at the lower of the size cap shown and 10% "
+                     "(10% at this run's own cap)"),
+        (1.0, 0.20, "same-title trades capped at the lower of the size cap shown and 20% "
+                    "(20% at this run's own cap)"),
+        (None, 1.0, "same-title cap not recorded"),
+        (0.2, None, "same-title cap not recorded"),
+    ])
+    def test_the_same_title_cap_clause(self, size_cap, st_cap, clause):
+        sweep = self._sweep(size_cap=size_cap, same_title_size_cap=st_cap)
+        assert f"; {clause} — this run's primary" in self._text(sweep, self._bar())
+
+    # ── The category/tag filter ─────────────────────────────────────────────
+
+    _CATS = ("Economics", "Oil & Gas", "Sports")
+    _SUBCATS = (("Economics", "Fed"), ("Economics", "Inflation"), ("Oil & Gas", "Fed"),
+                ("Sports", "Basketball"))
+
+    def _filtered(self, categories, tags, *, bar=True, **kw) -> str:
+        sweep = self._sweep(live_categories=categories, live_tags=tags, **kw)
+        return self._text(sweep, self._bar(categories=self._CATS, subcats=self._SUBCATS)
+                          if bar else None)
+
+    @pytest.mark.parametrize("categories, tags, tail", [
+        (("economics",), None, "this run's primary, with Category Economics chosen in the "
+                               "filter bar"),
+        (("Economics",), ("fed",), "this run's primary, with Tag Economics · Fed chosen in "
+                                   "the filter bar"),
+        # A tag the bar lists under two categories: two options, one at a time
+        (None, ("Fed",), "this run's primary; the live category/tag filter covers Tag "
+                         "Economics · Fed, Tag Oil &amp; Gas · Fed — the filter bar shows "
+                         "one of them at a time, never their union"),
+        (("Economics", "Sports"), None, "this run's primary; the live category/tag filter "
+                                        "covers Category Economics, Category Sports — the "
+                                        "filter bar shows one of them at a time, never "
+                                        "their union"),
+        (("Politics",), None, "this run's primary; no scenario of this run has a pair filed "
+                              "under the live category/tag filter"),
+    ])
+    def test_a_filter_names_the_bars_own_options(self, categories, tags, tail):
+        text = self._filtered(categories, tags)
+        words = backtester._live_filter_text(categories, tags)
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        assert text == (f"Live rule (config.py): {rule}; category/tag filter "
+                        f"({html.escape(words, quote=False)}); {self._CAP} — {tail}")
+
+    def test_a_filter_on_a_grid_cell_follows_its_band_choice(self):
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_categories=("Sports",),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], categories=self._CATS,
+                        subcats=self._SUBCATS)
+        assert self._text(sweep, bar).endswith(
+            "— choose Spread band max(tier,0.3)-0.6, Tier floors on and Category Sports in "
+            "the filter bar")
+        # A bar that does not offer the band names no slice of it either
+        bar = self._bar(categories=self._CATS, subcats=self._SUBCATS)
+        assert self._text(sweep, bar).endswith(
+            "— not shown: this page's filter bar does not offer that scenario")
+
+    def test_without_a_bar_the_filters_slice_is_not_shown(self):
+        assert self._filtered(("Economics",), None, bar=False).endswith(
+            "— this run's primary; this page's filter bar could not be built, so no "
+            "Category/Tag slice of it is shown")
+
+    def test_no_filter_says_nothing_about_one(self):
+        assert "categor" not in self._text(self._sweep(), self._bar(categories=self._CATS))
+
+    def test_kalshi_names_are_escaped_and_apostrophes_kept(self):
+        text = self._filtered(("Oil & Gas",), None)
+        assert "Oil &amp; Gas" in text and "Oil & Gas" not in text
+        assert "this run's primary" in text
+
+    # ── The ladder switch ───────────────────────────────────────────────────
+
+    def test_a_ladder_departure_is_named(self):
+        sweep = self._sweep(same_event_ladders=False, config_same_event_ladders=True)
+        assert self._text(sweep, self._bar()).endswith(
+            "— this run's primary; this run's same-event ladders are off and config.py's "
+            "on, so its pairs are not the live bot's")
+        for run, configured in ((True, True), (None, True), (False, None)):
+            sweep = self._sweep(same_event_ladders=run, config_same_event_ladders=configured)
+            assert self._text(sweep, self._bar()).endswith("— this run's primary")
+
+    # ── On the page ─────────────────────────────────────────────────────────
+
+    def test_it_renders_right_after_run_settings_on_the_page(self, monkeypatch, tmp_path):
+        pt = dataclasses.replace(_scn_point((0.0, 1.0), 0.75), size_cap=0.2)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(),
+                              live_tier_floors=True, live_spread_band=(0.0, 1.0),
+                              same_title_size_cap=1.0)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        run_settings = dashboard._run_settings_html(sweep)
+        # The primary needs no bar, so the line is the same whatever the page built
+        live_rule = dashboard._live_rule_html(sweep, bar=None)
+        assert live_rule.endswith("— this run's primary</p>")
+        assert run_settings in page
+        assert live_rule in page
+        assert (page.index("Period:") < page.index(run_settings)
+                < page.index(live_rule) < page.index("Portfolio Performance"))
+
+    def test_the_page_names_its_own_bars_option(self, monkeypatch, tmp_path):
+        # A band on the grid: the line names the Spread band option the bar offers
+        band = (0.3, 0.6)
+        points = [dataclasses.replace(_scn_point(b, 0.75), size_cap=0.2)
+                  for b in ((0.0, 1.0), band)]
+        sweep = BacktestSweep(primary=points[0], points=[points[0]], calibration=None,
+                              label_coverage=_scn_coverage(), scenarios=points,
+                              calibrations_by_band={(0.0, 1.0): None, band: None},
+                              live_tier_floors=True, live_spread_band=band,
+                              same_title_size_cap=1.0)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert ("— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter "
+                "bar</p>") in page
+        assert re.search(r'<select id="flt-band"[^>]*>.*?<option value="\d+">'
+                         r'max\(tier,0\.3\)-0\.6</option>', page)
+
 
 class TestCorpusProvenanceHeader:
     """DR-13 / M2 (P2): directly under the Period line the header says what
@@ -2643,8 +2947,12 @@ class TestReturnsByCategory:
 
     def test_combo_series_are_looked_up_literally(self):
         # Not scanner.event_series, which folds every KXMVE* series together
-        assert dashboard._series_ticker("KXMVECROSSCATEGORY0-S1") == "KXMVECROSSCATEGORY0"
-        assert dashboard._series_ticker("") == ""
+        assert historical.series_ticker("KXMVECROSSCATEGORY0-S1") == "KXMVECROSSCATEGORY0"
+        assert historical.series_ticker("") == ""
+
+    def test_the_page_files_by_the_one_rule_the_live_filter_shares(self):
+        # The one filing rule, shared with main._filter_by_category
+        assert dashboard._series_labels is historical.series_labels
 
     def test_the_section_charts_and_tabulates_each_category_tag(self):
         trades = [self._t("KXNCAAMBGAME-A", 30.0), self._t("KXNCAAMBGAME-B", -10.0),
@@ -2941,7 +3249,8 @@ class TestScenarioExplorerTierFloors:
                 "still apply.") in lead
         assert dashboard._TIER_FLOORS == (
             f"{config.MIN_PRICE_DIFF_SHORT_GAP:.2f}/{config.MIN_PRICE_DIFF_LONG_GAP:.2f}")
-        assert "live trading always applies the tier floors" in lead
+        assert ("Live trading follows config.TIME_SERIES_TIER_FLOORS (main.py "
+                "--tier-floors / --no-tier-floors for one run).") in lead
 
     def test_the_data_blocks_ship_each_off_cell_once(self):
         # (#68's test_the_data_block_ships_each_off_cell_once, over the base
@@ -3793,8 +4102,8 @@ class TestFilterPayloadTierOff:
             f"on — a time-series pair needs pB − pA of at least {short:.2f} when its "
             f"deadlines are up to {near} days apart and {long_:.2f} for {near + 1}–{cap} "
             "days, and at least the band's floor; off — the band's floor alone (the spread "
-            "must still be positive); a backtest what-if: live trading always applies the "
-            "tier floors.")
+            "must still be positive); live trading follows config.TIME_SERIES_TIER_FLOORS "
+            "(main.py --tier-floors / --no-tier-floors for one run).")
         assert dashboard._KHAT_TEXT["khat_scope_tier_off"] == (
             f"{{scope}}, with the {short:.2f}/{long_:.2f} tier floors off")
 
@@ -5337,11 +5646,13 @@ class TestFilterKAndCap:
         assert len(late.equity_df) == len(page_curve) + 1          # untouched
         assert seen[0][1]["all"] is on_time                        # nothing to cut
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_real_cap_sweep_pages_every_cap_at_its_own_simulation(
             self, monkeypatch, tmp_path):
         # A real run_backtest_sweep over the backtester's golden fixture,
         # narrowed to one band and one k: every cap the page offers is the
-        # scenario a fresh simulation at that cap produces, figure for figure
+        # scenario a fresh simulation at that cap produces, figure for figure.
+        # The run's own cap is pre_toggle_defaults' 20%, which the primary index uses
         golden = _tb.TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
@@ -9216,6 +9527,7 @@ class TestRiskFreeHeader:
         kwargs = {} if risk_free is None else {"risk_free": risk_free}
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, **kwargs)
         assert (page.index("Period:") < page.index("Primary spread band:")
+                < page.index("Live rule (config.py)")
                 < page.index(words) < page.index("Portfolio Performance"))
         assert page.count("Risk-free rate") == 1
 
