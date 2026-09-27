@@ -1,7 +1,8 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings, the live spread rule,
-the per-pair cap and the per-pair Kelly bound), and PROJECT_ROOT."""
+the per-pair cap and the per-pair Kelly bound, and the "Live settings" echo
+and warnings main.py logs from them), and PROJECT_ROOT."""
 import dataclasses
 import math
 import pathlib
@@ -880,3 +881,188 @@ class TestDescribeTimeSeriesRule:
         off = config.describe_time_series_rule(False, (0.0, 1.0))
         assert on.startswith("tier floors on (≥15% up to 15 days apart, ≥30% for 16-30)")
         assert off.startswith("tier floors off (pB - pA must still be positive)")
+
+    def test_a_band_bound_renders_as_the_live_settings_line_renders_it(self):
+        # %g keeps six significant digits, so 0.3000001 would print as 0.3:
+        # the rule and no-pairs lines must name the band the run applied, in
+        # the words its "Live settings:" line uses
+        band = (0.0, 0.3000001)
+        line = config.describe_time_series_rule(True, band)
+        assert line.endswith(", spread band 0-0.3000001 on pB - pA"), line
+        assert "spread band 0-0.3000001" in config.describe_live_settings(
+            _settings(spread_band=band))
+
+
+class TestDescribeLiveSettings:
+    """describe_live_settings names every live toggle on the one "Live
+    settings:" line main.py logs on every live run, and marks each field whose
+    RAW value departs from config.py's — never one whose rendering alone
+    differs, and never two different values that would print alike."""
+
+    def test_config_pys_values_render_with_no_mark(self):
+        s = _settings()
+        assert config.describe_live_settings(s, s) == (
+            "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
+            "same-title cap 100% (no extra cap)")
+        assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
+
+    def test_the_shipped_values_render_with_no_mark(self):
+        s = live_settings()
+        assert "(config:" not in config.describe_live_settings(s, s)
+
+    # One departing value per LiveSettings field, with the mark it must carry.
+    # Keyed by field and checked against dataclasses.fields(LiveSettings), so
+    # a field added to LiveSettings fails here until it is given a row — and
+    # describe_live_settings a renderer for it
+    _DEPARTURES = {
+        "tier_floors": (False, "tier floors off (config: on)"),
+        "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
+        "interval_discount": (0.6, "k 0.6 (config: 0.75)"),
+        "size_cap": (0.35, "per-trade cap 35% (config: 20%)"),
+        "same_title_size_cap": (0.25, "same-title cap 25% (config: 100% (no extra cap))"),
+    }
+
+    def test_every_field_has_a_departure_row(self):
+        assert set(self._DEPARTURES) == {f.name for f in dataclasses.fields(LiveSettings)}
+
+    def test_every_departing_field_is_marked_and_no_other(self):
+        ref = _settings()
+        s = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        assert config.describe_live_settings(s, ref) == (
+            "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
+            "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
+            "same-title cap 20% (config: 100% (no extra cap))")
+        for field in dataclasses.fields(LiveSettings):
+            value, mark = self._DEPARTURES[field.name]
+            line = config.describe_live_settings(
+                dataclasses.replace(ref, **{field.name: value}), ref)
+            assert line.count("(config:") == 1, line
+            assert mark in line, (field.name, line)
+
+    def test_k_renders_exactly(self):
+        # 0.751 and 0.75 must never print alike: a departure would read as none
+        ref = _settings()
+        line = config.describe_live_settings(_settings(interval_discount=0.751), ref)
+        assert "k 0.751 (config: 0.75)" in line
+
+    def test_a_band_bound_renders_exactly_when_the_short_form_would_not(self):
+        # %g keeps six significant digits: 0.3 and 0.3000001 print alike there
+        ref = _settings(spread_band=(0.3, 0.9))
+        s = _settings(spread_band=(0.3000001, 0.9))
+        line = config.describe_live_settings(s, ref)
+        assert "spread band 0.3000001-0.9 (config: 0.3-0.9)" in line
+
+    def test_no_reference_marks_nothing(self):
+        line = config.describe_live_settings(_settings(False, (0.0, 0.5), 0.8, 1.0, 0.2))
+        assert "(config:" not in line
+        assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
+                        "per-trade cap 100% (no cap) | same-title cap 20%")
+
+
+class TestLiveRuleWarnings:
+    """live_rule_warnings names every setting that empties part of the
+    time-series strategy or lets one pair stake more than
+    LIVE_EXPOSURE_WARN_FRACTION; main.py logs each as a WARNING."""
+
+    def test_the_shipped_values_warn_nothing(self):
+        assert config.live_rule_warnings(live_settings()) == []
+        assert config.live_rule_warnings(_settings()) == []
+
+    def test_a_ceiling_on_the_long_tier_keeps_only_that_spread(self):
+        (text,) = config.live_rule_warnings(_settings(spread_band=(0.0, 0.30)))
+        assert "sits on the 0.3 entry floor" in text and "16-30 days apart" in text
+
+    def test_a_ceiling_below_the_long_tier_empties_it(self):
+        (text,) = config.live_rule_warnings(_settings(spread_band=(0.0, 0.29)))
+        assert "is below the 0.3 entry floor" in text and "16-30 days apart" in text
+        assert "none of them can trade" in text
+
+    def test_a_ceiling_on_the_short_tier(self):
+        out = config.live_rule_warnings(_settings(spread_band=(0.0, 0.15)))
+        assert len(out) == 2
+        assert "sits on the 0.15 entry floor" in out[0] and "0-15 days apart" in out[0]
+        assert "is below the 0.3 entry floor" in out[1] and "16-30 days apart" in out[1]
+
+    def test_the_ceiling_is_judged_with_the_live_rules_epsilon(self):
+        # A ceiling a hair under a tier, within PRICE_EPSILON, still keeps a
+        # spread on it (time_series_spread_too_wide): "sits on", never "below"
+        (text,) = config.live_rule_warnings(
+            _settings(spread_band=(0.0, 0.30 - PRICE_EPSILON / 2)))
+        assert "sits on" in text
+
+    def test_with_the_tiers_off_the_band_floor_is_the_entry_floor(self):
+        # The band floor alone is the entry floor at every gap, and
+        # LiveSettings keeps it below the ceiling, so no ceiling empties it ...
+        assert config.live_rule_warnings(_settings(tier_floors=False, spread_band=(0.0, 0.1))) == []
+        assert config.live_rule_warnings(
+            _settings(tier_floors=False, spread_band=(0.2, 0.200002))) == []
+        # ... but the two can sit within PRICE_EPSILON of each other, which
+        # leaves only a spread on the floor tradeable: the same state the
+        # tiers-on case warns on, judged once for every deadline gap
+        (text,) = config.live_rule_warnings(
+            _settings(tier_floors=False, spread_band=(0.2, 0.2000001)))
+        assert text == ("the spread band's 0.2000001 ceiling sits on the 0.2 entry floor for "
+                        "time-series pairs at any deadline gap, so only spreads exactly on "
+                        "it can trade")
+        # The same band with the tiers on warns once per tier range: the floor
+        # there is max(tier, 0.2), and 0.2 is not on a tier
+        assert len(config.live_rule_warnings(
+            _settings(spread_band=(0.5, 0.5000005)))) == 2
+        assert len(config.live_rule_warnings(
+            _settings(tier_floors=False, spread_band=(0.5, 0.5000005)))) == 1
+
+    def test_a_ceiling_on_a_floor_of_zero_admits_nothing(self):
+        # With the tiers off and the band's floor at 0, a spread on the floor
+        # is not positive, which the live rule refuses first: nothing trades
+        band = (0.0, PRICE_EPSILON / 2)
+        (text,) = config.live_rule_warnings(_settings(tier_floors=False, spread_band=band))
+        assert "sits on the 0 entry floor for time-series pairs at any deadline gap" in text
+        assert "pB - pA must be positive, so none of them can trade" in text
+        assert "only spreads exactly on it" not in text
+        # ... which the live rule itself confirms: a spread on the floor, and
+        # one at the ceiling, are both refused
+        s = _settings(tier_floors=False, spread_band=band)
+        assert config.time_series_spread_refusal(0.0, 5, s) == config.SPREAD_NOT_POSITIVE
+        assert config.time_series_spread_refusal(band[1], 5, s) == config.SPREAD_NOT_POSITIVE
+
+    def test_a_ceiling_well_above_both_tiers_is_silent(self):
+        assert config.live_rule_warnings(_settings(spread_band=(0.2, 0.6))) == []
+
+    def test_a_lifted_cap_at_a_low_k_warns_for_both_types(self):
+        # --size-cap 60 --interval-discount 0.4: 1 - k = 0.6 lets a
+        # time-series pair size up to the cap, and same-title reaches it too
+        out = config.live_rule_warnings(_settings(interval_discount=0.4, size_cap=0.6))
+        assert out == [
+            "one time-series pair may stake up to 60% of the balance, above the 20% "
+            "this check accepts",
+            "one same-title pair may stake up to 60% of the balance, above the 20% "
+            "this check accepts",
+        ]
+
+    def test_no_cap_with_a_same_title_cap_of_50_warns_for_both_types(self):
+        # --size-cap 100 --same-title-size-cap 50 at k 0.75: time-series is
+        # bounded by 1 - k = 25%, same-title by its own cap
+        out = config.live_rule_warnings(_settings(size_cap=1.0, same_title_size_cap=0.5))
+        assert len(out) == 2
+        assert "one time-series pair may stake up to 25%" in out[0]
+        assert "one same-title pair may stake up to 50%" in out[1]
+
+    def test_a_same_title_cap_above_the_per_trade_cap_warns_nothing(self):
+        # --same-title-size-cap 50 alone: the 20% per-trade cap still binds
+        assert config.live_rule_warnings(_settings(same_title_size_cap=0.5)) == []
+
+    def test_a_bound_a_hair_over_the_threshold_prints_exactly(self):
+        # 1 - 0.7996 = 0.2004: over 20% by more than PRICE_EPSILON, and never
+        # printed as the threshold itself
+        (text,) = config.live_rule_warnings(_settings(interval_discount=0.7996, size_cap=1.0,
+                                                     same_title_size_cap=0.2))
+        assert "up to 20.04% of the balance" in text
+
+    def test_k_of_one_names_the_dead_time_series_leg(self):
+        (text,) = config.live_rule_warnings(_settings(interval_discount=1.0))
+        assert text.startswith("k = 1.0: ") and "no time-series trade can size" in text
+
+    def test_the_threshold_is_the_constant(self, monkeypatch):
+        monkeypatch.setattr(config, "LIVE_EXPOSURE_WARN_FRACTION", 0.10)
+        out = config.live_rule_warnings(_settings())
+        assert len(out) == 2 and all("above the 10%" in text for text in out)

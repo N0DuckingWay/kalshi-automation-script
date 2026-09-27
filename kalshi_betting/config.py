@@ -71,8 +71,9 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 # (f* <= p <= 1). Live runs read it through LiveSettings.size_cap —
 # live_settings() validates it before any live run makes a request, and
 # strategy.compute_trade and enrichment's affordability bound both read the
-# run's one LiveSettings. The backtest's primary scenario and its eager points
-# are sized under it too (backtester binds it by value at import).
+# run's one LiveSettings — and main.py --size-cap PCT overrides it for one
+# run. The backtest's primary scenario and its eager points are sized under it
+# too (backtester binds it by value at import; no main.py flag reaches it).
 BUDGET_FRACTION               = 0.20
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid; the effective
@@ -84,12 +85,13 @@ BUDGET_FRACTION               = 0.20
 # its loss cell (market A resolving YES and B NO — both legs worthless) loses
 # the whole stake; Kelly's q = 1 - SAME_TITLE_CO_RESOLVE_PROB treats every
 # failure to co-resolve as that loss, though A NO with B YES pays both legs.
-# Live sizing reads it through LiveSettings.same_title_size_cap, and so does
-# the backtester (binding it by value at import, like BUDGET_FRACTION,
-# refusing a value outside (0, 1] as it refuses a per-trade cap there, and
-# capping through pair_size_cap), so a default backtest sizes same-title as
-# live does. 1.0 adds no cap: at 1.0 every pair sizes exactly as it did before
-# this constant existed.
+# Live sizing reads it through LiveSettings.same_title_size_cap (main.py
+# --same-title-size-cap PCT overrides it for one run), and so does the
+# backtester (binding it by value at import, like BUDGET_FRACTION, refusing a
+# value outside (0, 1] as it refuses a per-trade cap there, and capping
+# through pair_size_cap), so a default backtest sizes same-title as a live run
+# without flags does. 1.0 adds no cap: at 1.0 every pair sizes exactly as it
+# did before this constant existed.
 SAME_TITLE_SIZE_CAP           = 1.0
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
@@ -422,7 +424,9 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # never fires; smaller values size more aggressively. Measure it against
 # settled history with `backtest.py --interval-discount K` (overrides k for
 # that backtest run only; this constant is what live sizing reads, through the
-# run's LiveSettings.interval_discount — see the live toggles below) and
+# run's LiveSettings.interval_discount, unless main.py's own
+# --interval-discount K overrides it for one live run — see the live toggles
+# below) and
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
 # calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
 # calibration (2026-09 follow-up)" for the full mechanism.
@@ -446,7 +450,18 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # The live time-series entry rule is these two constants. A live run resolves
 # them ONCE, together with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k),
 # BUDGET_FRACTION (the per-trade Kelly cap) and SAME_TITLE_SIZE_CAP (the extra
-# same-title cap) above, through live_settings() into one frozen LiveSettings.
+# same-title cap) above, through live_settings() into one frozen LiveSettings,
+# and main.py may override any of the five for that run with its own flags:
+# --tier-floors / --no-tier-floors, --spread-min / --spread-max,
+# --interval-discount, --size-cap and --same-title-size-cap (the caps in
+# percent). main._resolve_live_settings builds the run's object that way —
+# config.py's values, each flag given replacing its own field, validated by
+# LiveSettings itself before logging is configured, so a bad flag or a bad
+# value here is a usage error (exit 2) before any request — and each run mode
+# logs it (main._log_live_settings) on one "Live settings:" line, each field
+# that departs from this file marked "(config: X)", with a WARNING on a
+# production run that submits orders under any departure, and a WARNING for
+# every live_rule_warnings sentence.
 # main.py hands that one object to the time-series finder, to enrichment, to
 # the sizer (strategy.compute_trade, through main._compute_trade_specs) and to
 # pre_execution_check, which hands it to every validate_pair_price it runs. So
@@ -458,11 +473,20 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # file says.
 #
 # No live module reads these five constants directly, and every live call to a
-# function that takes a LiveSettings must hand it one explicitly; only a live
-# entry point handed none may resolve config.py's, once. Pinned by
-# tests/test_strategy.py::TestTimeSeriesKellyParity::
-# test_ast_live_path_reads_toggles_only_through_live_settings, so the rule can
-# never be applied at one site and read from config at another.
+# function that takes a LiveSettings must hand it the run's object explicitly,
+# under the one name `settings` — so config.py's own settings, which each run
+# mode holds beside the run's as the reference its departures are marked
+# against, can never be handed where the run's belong. Only a live entry point
+# handed none may resolve config.py's, once, and main._resolve_live_settings
+# is the one direct caller of live_settings(). Two tests pin this:
+#   - tests/test_strategy.py::TestTimeSeriesKellyParity::
+#     test_ast_live_path_reads_toggles_only_through_live_settings
+#   - tests/test_main.py::TestLiveSettingsReachEverySite, a production dry run
+#     and a dev run, each handed settings that differ in every field from the
+#     values that test pins this file's toggles to, with every module's
+#     live_settings raising
+# Together they ensure an override can never be applied at one site and missed
+# at another.
 
 # Whether the live time-series entry rule applies the deadline-gap tier floors
 # (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP).
@@ -471,7 +495,8 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 #            because a pair with no in-between mass has nothing to dispute.
 # Either way, the entry floor also sets the order-book leg-price-sum ceiling to
 # 1 - floor, exactly as backtester._find_entry applies it. The backtest
-# dashboard's "Tier floors: off" view simulates this rule.
+# dashboard's "Tier floors: off" view simulates this rule. main.py
+# --tier-floors / --no-tier-floors overrides it for one run.
 TIME_SERIES_TIER_FLOORS = True
 
 # The live time-series spread band (floor, ceiling) on pB - pA. It is
@@ -481,15 +506,28 @@ TIME_SERIES_TIER_FLOORS = True
 #   - at scan time, on the two YES asks;
 #   - in enrichment, on the top of the refreshed book;
 #   - before submission, on the top of a freshly fetched book.
-# (0.0, 1.0) means no band.
+# (0.0, 1.0) means no band. main.py --spread-min / --spread-max overrides
+# either bound for one run (the other keeps this file's value).
 TIME_SERIES_SPREAD_BAND = (0.0, 1.0)
 
 # The size caps' grid. BUDGET_FRACTION and SAME_TITLE_SIZE_CAP, read live as
-# LiveSettings.size_cap and .same_title_size_cap, must each be a multiple of it
-# from 5% to 100%, so every live cap is float-equal to
-# a cell of backtester.SIZE_CAP_SWEEP. It has the same value as
+# LiveSettings.size_cap and .same_title_size_cap, and main.py's --size-cap and
+# --same-title-size-cap (given in percent) must each be a multiple of it from
+# 5% to 100%, so every live cap is float-equal to a cell of
+# backtester.SIZE_CAP_SWEEP. It has the same value as
 # SAME_TITLE_MIN_PRICE_DIFF, but it is a different constant.
 SIZE_CAP_STEP = 0.05
+
+# The largest per-pair stake, as a fraction of the balance, that
+# live_rule_warnings accepts without a WARNING: a live run whose toggles let
+# one pair of either type size above it (max_kelly_fraction) says so on every
+# run. 20% was the one per-trade cap before the 2026-09-27 toggles, and this
+# file's values stay within it (live_rule_warnings(live_settings()) is empty,
+# pinned by tests/test_config.py::TestLiveRuleWarnings) — so the WARNING fires
+# only when a flag or an edit here lifts a pair's bound. It is not the
+# per-trade cap (BUDGET_FRACTION), whatever values the two hold: it bounds no
+# trade, it only decides when a live run is warned.
+LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1441,7 +1479,9 @@ def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[fl
     SPREAD_BAND_SWEEP_* band can do this (every grid ceiling sits above both
     tiers); a caller that accepts an operator-typed ceiling should warn when
     it sits at or below a tier, so an emptied tier is not read as a strategy
-    result.
+    result — backtest.main does for the backtest's primary band, and
+    live_rule_warnings (which main.py logs on every live run) does for the
+    live band, config.py's or --spread-max's.
 
     The default is resolved at CALL time, never bound as a default argument,
     so a test that monkeypatches BACKTEST_DEFAULT_SPREAD_BAND still takes
@@ -1488,13 +1528,14 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling — a pair
     sitting exactly on the documented bound is never dropped for float noise.
     This is the ONE place the ceiling's epsilon lives; callers test the
-    result and add no tolerance of their own. It has three callers:
+    result and add no tolerance of their own. It has four callers:
     backtester._find_entry, which tests it on time-series pairs only;
     backtest.main, which tests a spread sitting exactly on each deadline-gap
-    tier so it can warn when an operator-typed ceiling empties that tier; and
-    time_series_spread_refusal, the one live definition of the spread rule,
-    through which the live finder, enrichment and validate_pair_price reach
-    it. No live module calls it directly.
+    tier so it can warn when an operator-typed ceiling empties that tier;
+    live_rule_warnings, the same test of the live band against the live entry
+    floor; and time_series_spread_refusal, the one live definition of the
+    spread rule, through which the live finder, enrichment and
+    validate_pair_price reach it. No live module calls it directly.
 
     Args:
         spread (float): pB - pA, dollars.
@@ -1532,7 +1573,8 @@ def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> flo
     The optional k overrides that constant for one call. The live sizer
     (strategy._kelly_p_at) always passes it — the run's
     LiveSettings.interval_discount, which live_settings() reads from this
-    constant — so live sizing and enrichment's affordability bound price with
+    constant and main.py --interval-discount overrides for one run — so live
+    sizing and enrichment's affordability bound price with
     one k; a live call that omitted it would read this constant and could
     half-apply a run's own settings, which is why the live path never does
     (pinned by tests/test_strategy.py::TestTimeSeriesKellyParity::
@@ -1716,16 +1758,24 @@ class LiveSettings:
     """
     One live run's strategy toggles, validated and normalised on construction.
 
-    live_settings() builds one from this module's constants at call time, and
-    main.py's two run modes hand that one object to the time-series finder,
-    to enrichment, to the sizer (strategy.compute_trade, through
-    main._compute_trade_specs) and to pre_execution_check. The tier floors and
-    the band reach the finder, enrichment and validate_pair_price; k and the
-    two caps reach the sizer and enrichment's affordability bound
+    live_settings() builds one from this module's constants at call time.
+    main.py builds the run's one from those constants plus its per-run flags
+    (--tier-floors / --no-tier-floors, --spread-min / --spread-max,
+    --interval-discount, --size-cap and --same-title-size-cap), through
+    main._resolve_live_settings, which applies each flag given with
+    dataclasses.replace — that re-runs __post_init__, so an override is
+    validated exactly as this module's values are, and a bad one is a usage
+    error before any request. main.py's two run modes hand that one object to
+    the time-series finder, to enrichment, to the sizer (strategy.compute_trade,
+    through main._compute_trade_specs) and to pre_execution_check. The tier
+    floors and the band reach the finder, enrichment and validate_pair_price;
+    k and the two caps reach the sizer and enrichment's affordability bound
     (max_kelly_fraction). Every live site reads the same object, so no site
-    can apply one value while another reads this module.
-    dataclasses.replace re-runs __post_init__, so an override is validated
-    too. The object is frozen, so it states one rule for the whole run.
+    can apply one value while another reads this module
+    (tests/test_main.py::TestLiveSettingsReachEverySite runs a production dry
+    run and a dev run, each on an object that differs in every field from the
+    values that test pins this module's toggles to). The object is frozen, so
+    it states one rule for the whole run.
 
     Attributes:
         tier_floors (bool): Whether to apply the deadline-gap tier floors to
@@ -1799,15 +1849,23 @@ def live_settings() -> LiveSettings:
     The constants are read at CALL time, never bound at import, so a test that
     monkeypatches one ON THIS MODULE takes effect everywhere the live path reads
     it. This follows the time_series_profit_prob(k=None) idiom, not the by-value
-    TIME_SERIES_SAME_EVENT_LADDERS one. Only a live entry point handed no
-    settings calls this, once, in the one statement
-    `settings = live_settings() if settings is None else settings`.
+    TIME_SERIES_SAME_EVENT_LADDERS one. On the live path it is called in two
+    places only: once per run by main._resolve_live_settings, which lays
+    main.py's flags over the result, and by a live entry point handed no
+    settings, once, in the one statement
+    `settings = live_settings() if settings is None else settings`. main.py
+    always hands its run modes their settings, so the second form resolves
+    only for a caller outside main().
 
     Returns:
         LiveSettings: Built from this module's toggle constants.
 
     Raises:
-        ValueError: If any constant is out of range.
+        ValueError: If any constant is out of range. main.py reports this as a
+            usage error (exit 2) before logging is configured or any request
+            is made — so a scheduled run with an invalid value here writes
+            nothing to kalshi_arb.log, and its reason is on stderr, which the
+            scheduler logs under "Job failed (exit 2)".
     """
     return LiveSettings(
         tier_floors=TIME_SERIES_TIER_FLOORS,
@@ -1950,13 +2008,39 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     return min(cap, SAME_TITLE_CO_RESOLVE_PROB)
 
 
+def _exact_number(value: float) -> str:
+    """
+    Render a number in %g form when that form reads back as the same number, else exactly.
+
+    %g keeps six significant digits, so two different values can print
+    alike (0.3 and 0.3000001); falling back to repr then keeps a departure
+    from config.py visible in describe_live_settings' "(config: X)" note, and
+    keeps describe_time_series_rule naming the band the run applied rather
+    than a rounded neighbour — backtester's rule for k and band bounds on its
+    completion lines.
+
+    Args:
+        value (float): The number to render.
+
+    Returns:
+        str: f"{value:g}" when float() of it equals value, else repr(value).
+    """
+    short = f"{value:g}"
+    return short if float(short) == value else repr(value)
+
+
 def describe_time_series_rule(tier_floors: bool, spread_band: tuple[float, float]) -> str:
     """
     Describe the time-series entry rule in words.
 
-    Used for the time-series finder's always-logged rule line and the entry
-    floor refusal lines. It takes the two fields rather than a LiveSettings,
-    so a report built from recorded values need not invent the other fields.
+    Used for the time-series finder's always-logged rule line, its entry
+    floor refusal lines and main._no_pairs_msg. It takes the two fields rather
+    than a LiveSettings, so a report built from recorded values need not
+    invent the other fields. The band's bounds are rendered by _exact_number,
+    as describe_live_settings renders them, so one run's "Live settings:" line
+    and its rule and no-pairs lines always name the same band (0.3000001 is
+    never printed as 0.3); a bound %g reads back exactly, as every usual band
+    does, prints in %g form.
 
     Args:
         tier_floors (bool): Whether the deadline-gap tier floors apply.
@@ -1977,8 +2061,185 @@ def describe_time_series_rule(tier_floors: bool, spread_band: tuple[float, float
     if (lo, hi) == (0.0, 1.0):
         band = "no spread band"
     else:
-        band = f"spread band {lo:g}-{hi:g} on pB - pA"
+        band = f"spread band {_exact_number(lo)}-{_exact_number(hi)} on pB - pA"
     return f"{tiers}, {band}"
+
+
+def _band_text(spread_band: tuple[float, float]) -> str:
+    """
+    Name a live spread band as the backtest dashboard's band labels do.
+
+    Args:
+        spread_band (tuple[float, float]): A validated band (LiveSettings'),
+            so both bounds are floats.
+
+    Returns:
+        str: "none" for (0, 1), otherwise "floor-ceiling", e.g. "0-0.5", each
+            bound rendered by _exact_number.
+    """
+    lo, hi = spread_band
+    if (lo, hi) == (0.0, 1.0):
+        return "none"
+    return f"{_exact_number(lo)}-{_exact_number(hi)}"
+
+
+def _percent_text(fraction: float) -> str:
+    """
+    Render a fraction of the balance as a percentage, exactly to six significant digits.
+
+    Args:
+        fraction (float): A fraction in [0, 1].
+
+    Returns:
+        str: e.g. "20%" for 0.2, "35%" for 0.35000000000000003, "24.9%" for
+            0.249 — never rounded to a whole percent, so a bound a hair above
+            LIVE_EXPOSURE_WARN_FRACTION cannot print as the threshold itself.
+    """
+    return f"{fraction * 100:g}%"
+
+
+def _cap_text(cap: float, no_cap: str) -> str:
+    """
+    Name a validated size cap as a percentage.
+
+    Args:
+        cap (float): A cap on the SIZE_CAP_STEP grid, in (0, 1].
+        no_cap (str): What 1.0 means for this cap, in words.
+
+    Returns:
+        str: "100% (<no_cap>)" at 1.0, otherwise e.g. "20%".
+    """
+    if cap >= 1.0:
+        return f"100% ({no_cap})"
+    return _percent_text(cap)
+
+
+def describe_live_settings(settings: LiveSettings, reference: LiveSettings | None = None) -> str:
+    """
+    Name every live toggle on one line, marking each that departs from reference.
+
+    main._log_live_settings logs it on every live run against config.py's
+    toggles, and main._run_prod hands it, against the same reference, to the
+    prod trade log's separator row as the run's note — so the workbook itself
+    marks each field a flag moved, and a row traded under config.py's values
+    carries no mark. A field departs when its RAW value differs,
+    never when its rendering does, and every renderer here is exact where the
+    short form would print two values alike: k is rendered with repr, so 0.751
+    and 0.75 never print alike, the band's bounds with _exact_number, and the
+    caps, which sit on the SIZE_CAP_STEP grid, as whole percentages.
+
+    The same-title cap reads "100% (no extra cap)" at 1.0 rather than "no
+    cap": a same-title pair is still capped by the per-trade cap
+    (pair_size_cap).
+
+    Args:
+        settings (LiveSettings): The run's toggles.
+        reference (LiveSettings | None): config.py's toggles to compare
+            against; None (default) means no comparison and no marks.
+
+    Returns:
+        str: For example "tier floors off | spread band 0-0.5 | k 0.8 |
+            per-trade cap 100% (no cap) | same-title cap 20%", with
+            " (config: X)" after each field whose value differs from
+            reference's.
+    """
+    fields = (
+        ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
+        ("spread band", "spread_band", _band_text),
+        ("k", "interval_discount", repr),
+        ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
+        ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
+    )
+    parts = []
+    for label, name, render in fields:
+        value = getattr(settings, name)
+        text = f"{label} {render(value)}"
+        if reference is not None and getattr(reference, name) != value:
+            text += f" (config: {render(getattr(reference, name))})"
+        parts.append(text)
+    return " | ".join(parts)
+
+
+def live_rule_warnings(settings: LiveSettings) -> list[str]:
+    """
+    Name every setting that empties part of the time-series strategy or lifts one pair's exposure.
+
+    main._log_live_settings logs each sentence as a WARNING on every live run,
+    so a flag or an edit to config.py that changes what the bot can trade
+    says so before a single request is made. The first two cases judge the
+    band's ceiling against the entry floor (live_time_series_floor): with the
+    tier floors on, once per tier's gap range (0-15 and 16-30 days apart —
+    the floor is max(tier, band floor), constant across each range); with
+    them off, once for every gap, since the band's own floor is then the
+    entry floor at every gap. Four cases:
+      EMPTIED: the band's ceiling refuses a spread sitting exactly on the
+          entry floor (time_series_spread_too_wide(floor, ceiling) — the
+          ceiling test the live rule itself applies), so no pair in that
+          range can trade. With the tier floors off this cannot fire:
+          LiveSettings keeps the band's floor strictly below its ceiling.
+      ON THE FLOOR: the ceiling is within PRICE_EPSILON of that floor, so
+          only spreads exactly on it can trade — with the tier floors off too,
+          where a band whose two bounds sit that close (LiveSettings keeps
+          them apart, not PRICE_EPSILON apart) is the same state. A floor
+          within PRICE_EPSILON of 0 (only reachable with the tier floors off)
+          admits not even that: a spread on it is not positive, which the live
+          rule refuses first (time_series_spread_refusal), so the sentence
+          then says none of them can trade. These first two are the outcomes
+          backtest.main already warns on for the backtest's primary band.
+      EXPOSURE: a pair type's largest capped Kelly fraction
+          (max_kelly_fraction) exceeds LIVE_EXPOSURE_WARN_FRACTION. This
+          module's values never trigger it.
+      k = 1: max_kelly_fraction("time_series") is 0, so no time-series trade
+          can size.
+
+    Args:
+        settings (LiveSettings): The run's toggles.
+
+    Returns:
+        list[str]: One sentence per warning, in the order above; empty when
+            there are none.
+    """
+    out = []
+    ceiling = settings.spread_band[1]
+    if settings.tier_floors:
+        # One gap from each tier's range: the entry floor is constant across
+        # the range (max(tier, band floor)), so one gap judges all of it
+        ranges = ((0, f"time-series pairs 0-{SHORT_DEADLINE_GAP_DAYS} days apart"),
+                  (SHORT_DEADLINE_GAP_DAYS + 1,
+                   f"time-series pairs {SHORT_DEADLINE_GAP_DAYS + 1}-"
+                   f"{MAX_DEADLINE_GAP_DAYS} days apart"))
+    else:
+        # The band's own floor is the entry floor at every gap
+        ranges = ((0, "time-series pairs at any deadline gap"),)
+    for gap, scope in ranges:
+        floor = live_time_series_floor(gap, settings)
+        if time_series_spread_too_wide(floor, ceiling):
+            out.append(
+                f"the spread band's {_exact_number(ceiling)} ceiling is below the "
+                f"{_exact_number(floor)} entry floor for {scope}, so none of them can trade")
+        elif abs(ceiling - floor) <= PRICE_EPSILON:
+            if floor <= PRICE_EPSILON:
+                # A spread on a floor of 0 is not positive, and the live rule
+                # refuses that before it tests the floor or the ceiling
+                out.append(
+                    f"the spread band's {_exact_number(ceiling)} ceiling sits on the "
+                    f"{_exact_number(floor)} entry floor for {scope}, and pB - pA must be "
+                    "positive, so none of them can trade")
+            else:
+                out.append(
+                    f"the spread band's {_exact_number(ceiling)} ceiling sits on the "
+                    f"{_exact_number(floor)} entry floor for {scope}, so only spreads "
+                    "exactly on it can trade")
+    for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
+        bound = max_kelly_fraction(pair_type, settings)
+        if bound > LIVE_EXPOSURE_WARN_FRACTION + PRICE_EPSILON:
+            out.append(
+                f"one {label} pair may stake up to {_percent_text(bound)} of the balance, "
+                f"above the {_percent_text(LIVE_EXPOSURE_WARN_FRACTION)} this check accepts")
+    if max_kelly_fraction("time_series", settings) == 0:
+        out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
+                   "positive, so no time-series trade can size")
+    return out
 
 
 def create_new_output(path: Path) -> tuple[Path, BinaryIO]:

@@ -19,6 +19,16 @@ Purpose:
     subprocess, see scheduler.run_job) can distinguish a clean run from a
     low-balance skip or a run whose trades need manual review.
 
+    On the live toggles: main.py's "live trading toggles" flags and
+    _resolve_live_settings (TestLiveSettingsFlags), the "Live settings" line
+    and its WARNINGs (TestLogLiveSettings), and the runtime tripwire behind the
+    AST pin (TestLiveSettingsReachEverySite) — a production dry run and a dev
+    run, each handed settings that differ in every field from the pinned
+    config values while every module's live_settings raises. Those classes
+    pin config.py's toggles to known values (the pinned_config_toggles
+    fixture), so they state every departure in fixed terms whatever config.py
+    ships.
+
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
     plus config constants asserted against. The live-shape replays mock all
@@ -40,6 +50,7 @@ Notes:
     scalar — every mock of it here must return a dict, and _run_prod sizes on
     sum(...) of it.
 """
+import dataclasses
 import json
 import logging
 import logging.handlers
@@ -52,8 +63,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kalshi_betting import main
+from kalshi_betting import config, main
 from kalshi_betting import scanner as scanner_mod
+from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
@@ -69,6 +81,8 @@ from kalshi_betting.config import (
     SAME_TITLE_MIN_PRICE_DIFF,
     TRANSFER_PATH,
     V2_ORDER_PATH,
+    LiveSettings,
+    describe_live_settings,
     live_settings,
 )
 from kalshi_betting.reporter import TradeResult
@@ -179,6 +193,333 @@ class TestNoPairsMsg:
         monkeypatch.setattr(main, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 15 * 60)
         assert "closing within 15 minutes" in main._no_pairs_msg()
         assert "closing within 60 minutes" not in main._no_pairs_msg()
+
+    def test_the_time_series_clause_is_the_runs_own_rule(self):
+        # The message names the rule the run applied, in the finder's own
+        # words (config.describe_time_series_rule) — flags included — never
+        # the tiers alone when the run dropped them
+        on = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
+        off = main._no_pairs_msg(settings=LiveSettings(False, (0.0, 0.5), 0.75, 0.2))
+        assert config.describe_time_series_rule(True, (0.0, 1.0)) in on
+        assert config.describe_time_series_rule(False, (0.0, 0.5)) in off
+        assert "tier floors off" in off and "spread band 0-0.5" in off
+        assert f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}" not in off
+        # The same-title clause is the same under any time-series rule
+        assert off.endswith(on[on.index(" — or same-title"):])
+
+    def test_no_settings_reads_config_at_call_time(self, monkeypatch):
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
+        assert "tier floors off" in main._no_pairs_msg()
+
+
+@pytest.fixture
+def pinned_config_toggles(monkeypatch):
+    """Pin config.py's five live toggles to known values for one test.
+
+    live_settings() reads them at call time, so these tests state every
+    "(config: X)" mark and every departure in fixed terms whatever values
+    config.py ships: tier floors on, no band, k 0.75, a 20% per-trade cap and
+    no extra same-title cap."""
+    monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
+    monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
+    monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
+    monkeypatch.setattr(config, "BUDGET_FRACTION", 0.20)
+    monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
+
+
+def _main_with(monkeypatch, argv: list, **patches) -> dict:
+    """
+    Run main.main() with argv, stopping at its dispatch, and return what it did.
+
+    _run_dev/_run_prod are replaced by a recorder (unless `patches` supplies
+    them), build_client by a MagicMock and _setup_logging by a recorder, so
+    nothing is fetched and no handler is installed. The returned dict carries
+    "code" (the SystemExit code), and, when main() got that far, "settings"
+    and "reference" (what it handed the run mode), "mode", "logging_set_up"
+    and "client_built".
+    """
+    seen: dict = {"logging_set_up": False, "client_built": False}
+
+    def record_run(client, args, settings, reference):
+        seen.update(settings=settings, reference=reference, mode=args.mode)
+        return EXIT_OK
+
+    def record_client(mode):
+        seen["client_built"] = True
+        return MagicMock()
+
+    def record_logging(path):
+        seen["logging_set_up"] = True
+
+    monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", *argv])
+    monkeypatch.setattr(main, "_setup_logging", record_logging)
+    monkeypatch.setattr(main, "build_client", record_client)
+    monkeypatch.setattr(main, "_run_dev", patches.get("_run_dev", record_run))
+    monkeypatch.setattr(main, "_run_prod", patches.get("_run_prod", record_run))
+    for name, value in patches.items():
+        if name not in ("_run_dev", "_run_prod"):
+            monkeypatch.setattr(main, name, value)
+    with pytest.raises(SystemExit) as exc_info:
+        main.main()
+    seen["code"] = exc_info.value.code
+    return seen
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestLiveSettingsFlags:
+    """main.py's "live trading toggles" flags override ONE config.py toggle
+    each, for one run. main._resolve_live_settings lays them over
+    config.live_settings() — read at call time — and LiveSettings validates
+    the result, before logging is configured (TS-20): a bad value is a usage
+    error (exit 2) with nothing logged, no client built and no request."""
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, field, value", [
+        (["--no-tier-floors"], "tier_floors", False),
+        (["--spread-min", "0.1"], "spread_band", (0.1, 1.0)),
+        (["--spread-max", "0.5"], "spread_band", (0.0, 0.5)),
+        (["--interval-discount", "0.6"], "interval_discount", 0.6),
+        (["--size-cap", "35"], "size_cap", 0.35),
+        (["--same-title-size-cap", "25"], "same_title_size_cap", 0.25),
+    ])
+    def test_each_flag_overrides_only_its_own_field(self, monkeypatch, mode, argv, field, value):
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        # The reference is config.py's, whatever flag was given
+        assert reference == live_settings()
+        assert getattr(settings, field) == value
+        assert getattr(settings, field) != getattr(reference, field)
+        for other in dataclasses.fields(LiveSettings):
+            if other.name != field:
+                assert getattr(settings, other.name) == getattr(reference, other.name), other.name
+
+    def test_no_flag_hands_the_run_config_py_itself(self, monkeypatch):
+        # The scheduler's exact argv (tests/test_scheduler.py pins it)
+        seen = _main_with(monkeypatch, ["--mode", "prod"])
+        assert seen["settings"] == seen["reference"] == live_settings()
+
+    def test_a_flag_equal_to_config_departs_nothing(self, monkeypatch):
+        cfg = live_settings()
+        seen = _main_with(monkeypatch, [
+            "--mode", "prod", "--tier-floors" if cfg.tier_floors else "--no-tier-floors",
+            "--interval-discount", repr(cfg.interval_discount),
+            "--size-cap", str(round(cfg.size_cap * 100)),
+        ])
+        assert seen["settings"] == seen["reference"]
+
+    def test_one_band_flag_keeps_config_pys_other_bound(self, monkeypatch):
+        # Read at call time from config.py, never bound at import
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.8))
+        assert _main_with(monkeypatch, ["--spread-max", "0.5"])["settings"].spread_band == (0.1, 0.5)
+        assert _main_with(monkeypatch, ["--spread-min", "0.2"])["settings"].spread_band == (0.2, 0.8)
+        # 0 is a value, not "not given": it lowers config.py's floor to 0
+        assert _main_with(monkeypatch, ["--spread-min", "0"])["settings"].spread_band == (0.0, 0.8)
+        both = _main_with(monkeypatch, ["--spread-min", "0.05", "--spread-max", "0.9"])
+        assert both["settings"].spread_band == (0.05, 0.9)
+        assert both["reference"].spread_band == (0.1, 0.8)
+
+    # The unit note a cap flag's usage error carries: the validator speaks in
+    # fractions, the flag takes a whole percent on the SIZE_CAP_STEP grid
+    _STEP = f"{config.SIZE_CAP_STEP * 100:g}"
+    _PERCENT = f"a whole percent, a multiple of {_STEP} from {_STEP} to 100"
+
+    @pytest.mark.parametrize("argv, words, percent", [
+        (["--size-cap", "37"],
+         ["--size-cap", "size_cap", f"multiple of {config.SIZE_CAP_STEP:.0%}"], True),
+        (["--size-cap", "0"], ["--size-cap", "size_cap", "(0, 1]"], True),
+        (["--size-cap", "150"], ["--size-cap", "size_cap", "(0, 1]"], True),
+        (["--same-title-size-cap", "105"], ["--same-title-size-cap", "same_title_size_cap"],
+         True),
+        # 0 is a value, not "not given": refused, never silently config.py's
+        (["--same-title-size-cap", "0"],
+         ["--same-title-size-cap", "same_title_size_cap", "(0, 1]"], True),
+        (["--interval-discount", "0"], ["--interval-discount", "interval_discount"], False),
+        (["--interval-discount", "1.5"], ["--interval-discount", "interval_discount"], False),
+        (["--spread-min", "0.6", "--spread-max", "0.5"], ["--spread-min", "--spread-max",
+                                                          "spread_band"], False),
+        (["--spread-max", "0"], ["--spread-max", "spread_band"], False),
+    ])
+    def test_an_invalid_flag_is_a_usage_error_before_anything_runs(
+        self, monkeypatch, capsys, argv, words, percent,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        # Refused before logging is configured (TS-20), before the client is
+        # built, before either run mode is entered
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        for word in words:
+            assert word in err, (word, err)
+        # A cap flag's error names the unit the flag takes, so "got 0.37" is
+        # not read as a value to retype; no other flag's does
+        if percent:
+            assert f"{argv[0]} takes {self._PERCENT}, read as that percent / 100" in err, err
+        else:
+            assert "whole percent" not in err, err
+
+    def test_two_cap_flags_share_one_unit_note(self, monkeypatch, capsys):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--size-cap", "37",
+                                        "--same-title-size-cap", "25"])
+        assert seen["code"] == 2
+        err = capsys.readouterr().err
+        assert f"--size-cap and --same-title-size-cap take {self._PERCENT}" in err, err
+
+    def test_an_invalid_config_value_is_a_usage_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
+        seen = _main_with(monkeypatch, ["--mode", "prod"])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "config.py's live settings are invalid" in err and "size_cap" in err
+
+    def test_help_names_every_flag_and_the_grid(self, monkeypatch, capsys):
+        # argparse %-formats help strings: a bare "%" there raises when --help
+        # renders it, so the grid's "%%" is what this pins
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
+        with pytest.raises(SystemExit) as exc_info:
+            main.main()
+        assert exc_info.value.code == 0
+        # argparse wraps help to the terminal's width; judge the words, not
+        # where a line broke
+        out = " ".join(capsys.readouterr().out.split())
+        for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
+                     "--interval-discount", "--size-cap", "--same-title-size-cap"):
+            assert flag in out, flag
+        # The grid step comes from its one definition, never a literal
+        assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
+        assert "100 = no cap" in out
+        assert "100 = no extra cap beyond --size-cap" in out
+        assert "live trading toggles" in out
+
+    def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
+        seen = _main_with(monkeypatch, ["--interval-discount", "0.751"])
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        # k renders exactly, so 0.751 never prints as config.py's 0.75
+        assert "k 0.751 (config: 0.75)" in line
+        assert line.count("(config:") == 1
+
+        seen = _main_with(monkeypatch, [
+            "--no-tier-floors", "--spread-max", "0.5", "--size-cap", "35"])
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "tier floors off (config: on)" in line
+        assert "spread band 0-0.5 (config: none)" in line
+        assert "per-trade cap 35% (config: 20%)" in line
+        assert line.count("(config:") == 3
+
+
+def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
+    """Run main() in prod as far as the MIN_BALANCE_CENTS gate — the real
+    _run_prod, which logs its settings before any request — and return its
+    exit code (EXIT_SKIPPED_LOW_BALANCE)."""
+    with caplog.at_level(logging.INFO):
+        seen = _main_with(
+            monkeypatch, ["--mode", "prod", *argv],
+            _run_prod=main._run_prod,
+            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+        )
+    return seen["code"]
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestLogLiveSettings:
+    """Every live run names its toggles on one INFO line, marks each field a
+    flag moved away from config.py, WARNS when a production run submits orders
+    under any departure, and warns on every live_rule_warnings sentence."""
+
+    _DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
+
+    def test_a_scheduled_run_logs_config_py_with_no_mark_and_no_warning(
+        self, monkeypatch, caplog,
+    ):
+        # The scheduler's argv (--mode prod, nothing else): the run trades
+        # exactly config.py, and says so without a single departure mark
+        code = _prod_until_the_balance_gate(monkeypatch, [], caplog)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Live settings:")]
+        assert lines == [f"Live settings: {describe_live_settings(live_settings())}"]
+        assert "(config:" not in lines[0]
+        assert self._DEPARTURE not in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and r.getMessage().startswith("Live settings:")]
+
+    # One flag per LiveSettings field, each departing from the pinned config
+    # values, with the mark the "Live settings:" line must carry for it
+    _ONE_FLAG_PER_FIELD = {
+        "tier_floors": (["--no-tier-floors"], "tier floors off (config: on)"),
+        "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (config: none)"),
+        "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (config: 0.75)"),
+        "size_cap": (["--size-cap", "35"], "per-trade cap 35% (config: 20%)"),
+        "same_title_size_cap": (["--same-title-size-cap", "15"],
+                                "same-title cap 15% (config: 100% (no extra cap))"),
+    }
+
+    def test_every_field_has_a_departing_flag(self):
+        # A field added to LiveSettings must be given a row here, so the
+        # departure WARNING is tested on it too
+        assert set(self._ONE_FLAG_PER_FIELD) == {f.name for f in dataclasses.fields(LiveSettings)}
+
+    @pytest.mark.parametrize("field", sorted(_ONE_FLAG_PER_FIELD))
+    def test_a_departing_production_run_warns(self, monkeypatch, caplog, field):
+        # Every field, not only k: the WARNING judges the whole object
+        argv, mark = self._ONE_FLAG_PER_FIELD[field]
+        code = _prod_until_the_balance_gate(monkeypatch, argv, caplog)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("Live settings: tier floors")]
+        assert mark in line and line.count("(config:") == 1, line
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and self._DEPARTURE in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_a_departing_dry_run_marks_but_does_not_warn(self, monkeypatch, caplog):
+        _prod_until_the_balance_gate(
+            monkeypatch, ["--dry-run", "--interval-discount", "0.6"], caplog)
+        assert "k 0.6 (config: 0.75)" in caplog.text
+        assert self._DEPARTURE not in caplog.text
+
+    def test_a_departing_dev_run_marks_but_does_not_warn(self, caplog):
+        settings = dataclasses.replace(live_settings(), interval_discount=0.6)
+        with (
+            patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
+            patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[]),
+            caplog.at_level(logging.INFO),
+        ):
+            code = main._run_dev(
+                MagicMock(), SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                settings, live_settings(),
+            )
+        assert code == EXIT_NO_TRADEABLE_SHARDS
+        assert "k 0.6 (config: 0.75)" in caplog.text
+        assert self._DEPARTURE not in caplog.text
+
+    def test_every_rule_warning_is_logged(self, monkeypatch, caplog):
+        _prod_until_the_balance_gate(
+            monkeypatch, ["--dry-run", "--size-cap", "60", "--interval-discount", "0.4"], caplog)
+        warned = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.WARNING and r.getMessage().startswith("Live settings:")]
+        assert warned == [
+            f"Live settings: {text}"
+            for text in config.live_rule_warnings(LiveSettings(
+                config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND, 0.4, 0.6,
+                config.SAME_TITLE_SIZE_CAP))
+        ]
+        assert any("one time-series pair may stake up to 60%" in w for w in warned)
+
+    def test_it_never_resolves_config_py_itself(self, monkeypatch, caplog):
+        # Handed both objects, it reads config.py nowhere
+        def tripwire():
+            raise AssertionError("_log_live_settings resolved config.py's settings")
+        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        monkeypatch.setattr(main, "live_settings", tripwire)
+        monkeypatch.setattr(config, "live_settings", tripwire)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(s, r, real_money=True)
+        assert f"Live settings: {describe_live_settings(s, r)}" in caplog.text
+        assert self._DEPARTURE in caplog.text
 
 
 class TestSetupLogging:
@@ -1019,10 +1360,11 @@ class TestRunProdDryRunLiveShapeReplay:
         client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
         captured: dict = {}
 
-        def fake_append_to_prod_log(results, balance_before, balance_after):
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
             captured["results"] = results
             captured["balance_before"] = balance_before
             captured["balance_after"] = balance_after
+            captured["run_note"] = run_note
             return pathlib.Path("/fake/trade_log.xlsx")
 
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
@@ -1042,6 +1384,12 @@ class TestRunProdDryRunLiveShapeReplay:
         results = captured["results"]
         assert results, "expected at least one result"
         assert all(r.status == "simulated" for r in results)
+
+        # The separator row names the run's live toggles — config.py's here,
+        # since the run was handed none — with no departure marks
+        assert captured["run_note"].startswith("settings: ")
+        assert captured["run_note"] == f"settings: {describe_live_settings(live_settings())}"
+        assert "(config:" not in captured["run_note"]
 
         # HELD-A is held — the pair it would have formed with HELD-B must never surface.
         tickers: set = set()
@@ -1075,7 +1423,7 @@ class TestRunProdDryRunLiveShapeReplay:
         )
         captured: dict = {}
 
-        def fake_append_to_prod_log(results, balance_before, balance_after):
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
             captured["results"] = results
             return pathlib.Path("/fake/trade_log.xlsx")
 
@@ -1295,7 +1643,7 @@ class TestRunProdLiveV2Replay:
         )
         captured: dict = {}
 
-        def fake_append_to_prod_log(results, balance_before, balance_after):
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
             captured["results"] = results
             return pathlib.Path("/fake/trade_log.xlsx")
 
@@ -1507,6 +1855,242 @@ class TestRunProdLiveV2Replay:
         assert "No selected pair could be funded on its exchange shard" in caplog.text
         assert client.rest_client.request.call_count == 0
         client.create_order_without_preload_content.assert_not_called()
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestLiveSettingsReachEverySite:
+    """The runtime tripwire behind the AST pin
+    (tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_toggles_only_through_live_settings): a real
+    production dry run, and a real dev run, over the live-shape fixture — one
+    time-series pair (TS-EARLY / TS-LATE) and one same-title pair (SAME-EXP /
+    SAME-CHEAP) reaching sizing, both later books uncrossed — handed settings
+    that differ in EVERY field from the values pinned_config_toggles pins
+    config.py's toggles to, and an explicit reference (config.py's, read
+    before the tripwire is armed), while every module's live_settings raises.
+    A site that read config.py, re-resolved it, or was handed the reference
+    in place of the run's settings would either raise here or hand a spy a
+    value the run was not given. pre_execution_check swallows exceptions into
+    a WARNING, so that WARNING's absence is asserted too. A run that finds no
+    pair must name the run's rule too (_no_pairs_msg), in both modes.
+
+    The settings are chosen so both pairs still trade: with the tier floors
+    off the 0.30 time-series spread clears the band's 0.05 floor and its 0.9
+    ceiling, and the price-sum ceiling is 0.95; k 0.6 prices the time-series
+    pair at p = 0.82, f* about 0.33, between the 0.25 same-title cap and the
+    0.35 per-trade cap, and the same-title pair's f* of about 0.84 is capped at
+    0.25 — none of which the pinned config values produce."""
+
+    _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
+                             interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25)
+
+    # (module, spied name) — the CONSUMING modules' own bindings, and
+    # config's, for the calls config's helpers make among themselves
+    _SPIED = (
+        (scanner_mod, ("live_time_series_floor", "max_affordable_pairs",
+                       "max_kelly_fraction", "time_series_spread_refusal")),
+        (strategy_mod, ("max_affordable_pairs", "time_series_profit_prob", "pair_size_cap")),
+        (config, ("live_time_series_floor", "pair_size_cap")),
+    )
+
+    def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str):
+        """
+        Run one mode over the live-shape fixture on _SETTINGS, every
+        live_settings raising and every _SPIED binding recorded.
+
+        Returns:
+            tuple: (settings, reference, calls, captured) — calls maps
+                (module short name, function name) to the (args, kwargs) of
+                every call; captured holds execute_trades' "results" and, in
+                prod, the trade log's "run_note".
+        """
+        settings = self._SETTINGS
+        # config.py's toggles, read BEFORE the tripwire is armed, and the
+        # precondition that makes every spy below meaningful
+        reference = live_settings()
+        for field in dataclasses.fields(LiveSettings):
+            assert getattr(settings, field.name) != getattr(reference, field.name), field.name
+
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
+        )
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
+            captured["run_note"] = run_note
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        monkeypatch.setattr(main, "write_dev_simulation",
+                            lambda *a, **k: pathlib.Path("/fake/dev_sim.xlsx"))
+        real_execute = main.execute_trades
+
+        def execute_spy(client_, specs, dry_run=False):
+            captured["results"] = real_execute(client_, specs, dry_run=dry_run)
+            return captured["results"]
+
+        monkeypatch.setattr(main, "execute_trades", execute_spy)
+
+        # The tripwire: no module may resolve config.py's settings this run
+        def tripwire(*args, **kwargs):
+            raise AssertionError("live_settings() read during a run handed its settings")
+
+        for module in (config, scanner_mod, strategy_mod, trader_mod, main):
+            monkeypatch.setattr(module, "live_settings", tripwire)
+
+        calls: dict = {}
+
+        def spy(module, name):
+            real = getattr(module, name)
+            key = (module.__name__.rsplit(".", 1)[-1], name)
+
+            def wrapper(*args, **kwargs):
+                calls.setdefault(key, []).append((args, kwargs))
+                return real(*args, **kwargs)
+
+            monkeypatch.setattr(module, name, wrapper)
+
+        for module, names in self._SPIED:
+            for name in names:
+                spy(module, name)
+
+        with caplog.at_level(logging.INFO):
+            if mode == "prod":
+                code = main._run_prod(
+                    client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                    settings, reference,
+                )
+            else:
+                code = main._run_dev(
+                    client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                    settings, reference,
+                )
+        assert code == EXIT_OK
+        return settings, reference, calls, captured
+
+    @staticmethod
+    def _arg(call, index, keyword):
+        args, kwargs = call
+        return kwargs[keyword] if keyword in kwargs else args[index]
+
+    def _assert_every_site_read_the_runs_settings(self, settings, calls):
+        """Every spy was reached, each with the run's settings or its values,
+        and a time-series pair and a same-title pair both reached sizing."""
+        arg = self._arg
+        # Every spy was reached ...
+        for module, names in self._SPIED:
+            for name in names:
+                key = (module.__name__.rsplit(".", 1)[-1], name)
+                assert calls.get(key), f"{key} was never called"
+        # ... and every one was handed the run's settings, or its values
+        for key, index in ((("scanner", "live_time_series_floor"), 1),
+                           (("config", "live_time_series_floor"), 1),
+                           (("scanner", "time_series_spread_refusal"), 2),
+                           (("scanner", "max_kelly_fraction"), 1)):
+            for call in calls[key]:
+                assert arg(call, index, "settings") is settings, key
+        for call in calls[("strategy", "time_series_profit_prob")]:
+            assert arg(call, 2, "k") == settings.interval_discount
+        for key in (("strategy", "pair_size_cap"), ("config", "pair_size_cap")):
+            for call in calls[key]:
+                assert arg(call, 1, "size_cap") == settings.size_cap, key
+                assert arg(call, 2, "same_title_size_cap") == settings.same_title_size_cap, key
+        # Enrichment's affordability bound is the run's, per pair type
+        bounds = {arg(c, 2, "fraction") for c in calls[("scanner", "max_affordable_pairs")]}
+        assert bounds == {0.35, 0.25}
+        assert {arg(c, 0, "pair_type") for c in calls[("scanner", "max_kelly_fraction")]} >= {
+            "time_series", "same_title"}
+        # The sizer's fractions sit under the run's caps, above config.py's
+        fractions = {arg(c, 2, "fraction") for c in calls[("strategy", "max_affordable_pairs")]}
+        assert all(0 < f <= settings.size_cap for f in fractions), fractions
+        assert settings.same_title_size_cap in fractions
+        assert any(settings.same_title_size_cap < f < settings.size_cap for f in fractions)
+        # A time-series pair and a same-title pair both reached sizing
+        sized = {arg(c, 0, "pair_type") for c in calls[("strategy", "pair_size_cap")]}
+        assert sized == {"time_series", "same_title"}
+
+    def test_a_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
+        settings, reference, calls, captured = self._run_under_the_tripwire(
+            monkeypatch, caplog, "prod")
+        self._assert_every_site_read_the_runs_settings(settings, calls)
+
+        # execute_trades received both pairs, simulated
+        results = captured["results"]
+        assert {r.status for r in results} == {"simulated"}
+        by_type = {r.spec.pair.pair_type: r.spec for r in results}
+        assert set(by_type) == {"time_series", "same_title"}
+        assert by_type["time_series"].pair.market_a.ticker == _TICKER_TS_EARLY
+        assert by_type["same_title"].pair.market_a.ticker == _TICKER_SAME_EXP
+        assert by_type["time_series"].kelly_p == pytest.approx(1 - 0.6 * 0.30)
+        assert settings.same_title_size_cap < by_type["time_series"].kelly_fraction < 0.35
+        assert by_type["same_title"].kelly_fraction == settings.same_title_size_cap
+
+        # pre_execution_check swallows exceptions — so none may have happened
+        assert "Pre-execution check raised" not in caplog.text
+        # The run named its rule, its settings (every field marked) and the
+        # two exposures they lift; a dry run gets no departure WARNING
+        assert ("Time-series entry rule: "
+                + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
+        echo = f"Live settings: {describe_live_settings(settings, reference)}"
+        assert echo in caplog.text and echo.count("(config:") == 5
+        assert "This PRODUCTION run overrides" not in caplog.text
+        assert "one time-series pair may stake up to 35%" in caplog.text
+        assert "one same-title pair may stake up to 25%" in caplog.text
+        # The trade log's separator carries the same marked line: the workbook
+        # itself says which fields a flag moved, which the values alone cannot
+        assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
+        assert captured["run_note"].count("(config:") == 5
+
+    def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
+        # Dev's finder, enrichment and sizer read the run's object as prod's
+        # do — "in either mode", as the flags promise
+        settings, reference, calls, captured = self._run_under_the_tripwire(
+            monkeypatch, caplog, "dev")
+        self._assert_every_site_read_the_runs_settings(settings, calls)
+
+        results = captured["results"]
+        assert {r.status for r in results} == {"simulated"}
+        by_ticker = {r.spec.pair.market_a.ticker: r.spec for r in results}
+        ts, st = by_ticker[_TICKER_TS_EARLY], by_ticker[_TICKER_SAME_EXP]
+        assert ts.pair.pair_type == "time_series" and st.pair.pair_type == "same_title"
+        assert ts.kelly_p == pytest.approx(1 - 0.6 * 0.30)
+        assert settings.same_title_size_cap < ts.kelly_fraction < 0.35
+        assert st.kelly_fraction == settings.same_title_size_cap
+        # Every same-title spec sits under the run's same-title cap
+        assert all(r.spec.kelly_fraction <= settings.same_title_size_cap
+                   for r in results if r.spec.pair.pair_type == "same_title")
+        assert ("Time-series entry rule: "
+                + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
+        echo = f"Live settings: {describe_live_settings(settings, reference)}"
+        assert echo in caplog.text and echo.count("(config:") == 5
+        # Dev never submits an order, so never the production WARNING
+        assert "This PRODUCTION run overrides" not in caplog.text
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    def test_a_run_with_no_pairs_names_its_own_rule(self, monkeypatch, caplog, mode):
+        # The no-pairs line names the rule the run APPLIED — the run's
+        # settings, never config.py's reference beside them
+        settings = dataclasses.replace(live_settings(), tier_floors=False,
+                                       spread_band=(0.0, 0.5))
+        reference = live_settings()
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", lambda *a, **k: [])
+        monkeypatch.setattr(main, "write_dev_simulation",
+                            lambda *a, **k: pathlib.Path("/fake/dev_sim.xlsx"))
+        with caplog.at_level(logging.INFO):
+            if mode == "prod":
+                code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                                      settings, reference)
+            else:
+                code = main._run_dev(
+                    client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                    settings, reference)
+        assert code == EXIT_OK
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("No qualifying pairs found")]
+        assert config.describe_time_series_rule(False, (0.0, 0.5)) in line, line
+        assert config.describe_time_series_rule(True, (0.0, 1.0)) not in line, line
+        assert ("in sandbox" in line) is (mode == "dev")
 
 
 def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:

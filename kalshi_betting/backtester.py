@@ -143,7 +143,8 @@ Notes:
     Kelly gate, which is what stops the estimate confirming whatever k
     produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py,
     and live sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT
-    (through the run's config.LiveSettings).
+    (through the run's config.LiveSettings; only main.py's own
+    --interval-discount overrides it, for one live run).
 
     run_backtest_sweep() is the entry point that exposes all of that:
     _prepare_candidates() once, then _sweep_from_candidates() — one
@@ -182,7 +183,7 @@ Notes:
     also stays under SAME_TITLE_SIZE_CAP (read at call time and validated
     like the per-trade cap, at every cap), as live sizing keeps it under
     LiveSettings.same_title_size_cap, so a default backtest sizes same-title
-    as live does; at 1.0 it adds no cap.
+    as a live run without main.py's toggle flags does; at 1.0 it adds no cap.
 
     With cap_sweep, run_backtest_sweep also returns a CapSweep: every other
     cap of SIZE_CAP_SWEEP (5%..95% and no cap — a grid that lives here, not
@@ -388,8 +389,9 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
 # (config.pair_size_cap), so "no cap" means no per-trade cap on time-series
 # pairs and SAME_TITLE_SIZE_CAP on same-title ones — no cap at all while that
 # constant is 1.0. BACKTEST-ONLY: live sizing reads its caps from the run's
-# config.LiveSettings (config.BUDGET_FRACTION, config.SAME_TITLE_SIZE_CAP) and
-# strategy.py never imports this module. Rounded to two decimals, so 0.2
+# config.LiveSettings (config.BUDGET_FRACTION, config.SAME_TITLE_SIZE_CAP, or
+# main.py's --size-cap / --same-title-size-cap for one run) and strategy.py
+# never imports this module. Rounded to two decimals, so 0.2
 # is a member by value; the run's own cap is unioned in anyway (CapSweep), as
 # the k grid unions its primary. Lives here rather than in config.py beside
 # INTERVAL_DISCOUNT_SWEEP by the operator's instruction for this change (only
@@ -5502,8 +5504,8 @@ def _simulate_at_discount(
             config.time_series_profit_prob for every time-series candidate.
             None (default) means "no override", which that helper resolves at
             call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
-            the live sizer reads — so the default path prices exactly as it
-            always has.
+            the live sizer reads on a run without main.py's --interval-discount
+            — so the default path prices exactly as it always has.
         spread_band (tuple[float, float] | None): The spread band the entries
             were detected under — a label, never applied here. None (default)
             renders on the completion line as the resolved default band
@@ -5652,7 +5654,8 @@ def _simulate_at_discount(
         # definition live sizing uses): the per-trade cap for every pair
         # (config.BUDGET_FRACTION unless a size-cap sweep simulates another),
         # and for a same-title pair SAME_TITLE_SIZE_CAP too (st_cap), at every
-        # swept cap — so a default backtest sizes same-title as live does
+        # swept cap — so a default backtest sizes same-title as a live run
+        # without main.py's toggle flags does
         kelly_f_capped = min(pair_size_cap(pair_type, cap, st_cap), kelly_f)
 
         # Skip pairs where the settlement result is missing or non-binary
@@ -6289,8 +6292,9 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
     config.py, and the live sizer keeps reading
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (through the run's
-    config.LiveSettings) regardless of what this prints; acting on it is a
-    deliberate human edit.
+    config.LiveSettings, unless main.py's --interval-discount overrides it for
+    one run) regardless of what this prints; acting on it is a deliberate
+    human edit or a flag.
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
@@ -6328,7 +6332,8 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
         "  Configured k = %.3f (config.TIME_SERIES_INTERVAL_PROB_DISCOUNT) | "
         "pooled empirical k_hat = %s",
         # The CONFIG constant, not any sweep point's override: this line
-        # compares the measurement against what live sizing actually reads.
+        # compares the measurement against what live sizing reads on a run
+        # without main.py's --interval-discount (every scheduled run).
         TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         "-" if pooled_k is None else f"{pooled_k:.3f}",
     )
@@ -6356,7 +6361,8 @@ def run_backtest(
 
     Thin composition of the backtest's two halves, at the interval discount
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (i.e. exactly what the live sizer
-    uses): _prepare_entries() does the k-independent work and
+    uses on a run without main.py's --interval-discount): _prepare_entries()
+    does the k-independent work and
     _simulate_at_discount(..., k=None) does the k-dependent work.
 
     Algorithm (unchanged; the step split between the two helpers is noted):
@@ -7478,10 +7484,12 @@ def run_backtest_sweep(
 
     This function never writes config.py. The calibration it reports is a
     recommendation for a human to act on, live sizing keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here,
-    and no band or tier-floors setting passed here reaches the live path: the
-    live bot reads its own toggles (config.TIME_SERIES_SPREAD_BAND,
-    config.TIME_SERIES_TIER_FLOORS) only through config.LiveSettings.
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's own
+    --interval-discount, for one run) no matter what is passed here, and no
+    band or tier-floors setting passed here reaches the live path: the live
+    bot reads its own toggles (config.TIME_SERIES_SPREAD_BAND,
+    config.TIME_SERIES_TIER_FLOORS, each overridable for one run by a main.py
+    flag) only through config.LiveSettings.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -7495,7 +7503,7 @@ def run_backtest_sweep(
         interval_discount (float | None): Interval discount for the primary
             point, in [0, 1]. None (default) means "no override", which
             resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
-            live sizing reads.
+            live sizing reads on a run without main.py's --interval-discount.
         sweep (bool): When True (default), also simulate every discount in
             config.INTERVAL_DISCOUNT_SWEEP. When False, points holds the
             primary alone (and a band sweep simulates each band at the

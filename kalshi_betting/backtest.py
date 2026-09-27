@@ -44,9 +44,11 @@ Notes:
     --interval-discount overrides the time-series interval discount k for this
     run ONLY. It never reaches live sizing: the live sizer prices at its run's
     config.LiveSettings.interval_discount, which config.live_settings() reads
-    from config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, and no live module imports
-    this one. Nothing here writes config.py — the calibration the run reports
-    is a recommendation for a human to act on.
+    from config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (main.py's own
+    --interval-discount, a separate flag of a separate CLI, overrides it for
+    one live run), and no live module imports this one. Nothing here writes
+    config.py — the calibration the run reports is a recommendation for a
+    human to act on.
 
     --same-event-ladders / --no-same-event-ladders (DR-73) is the same kind of
     one-run override for config.TIME_SERIES_SAME_EVENT_LADDERS, and also never
@@ -82,7 +84,8 @@ Notes:
     config.min_price_diff_for_gap(spread_min=) and refuses a spread above the
     ceiling through config.time_series_spread_too_wide(). These flags never
     reach live trading, which reads its own band,
-    config.TIME_SERIES_SPREAD_BAND, only through config.LiveSettings (the
+    config.TIME_SERIES_SPREAD_BAND (or main.py's own --spread-min /
+    --spread-max, for one live run), only through config.LiveSettings (the
     same helpers apply it: config.time_series_spread_refusal). Either flag may be given
     alone; the omitted side comes from config.BACKTEST_DEFAULT_SPREAD_BAND,
     read through config.time_series_spread_band(None) at call time. Both
@@ -124,7 +127,8 @@ Notes:
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
-    config.BUDGET_FRACTION (and config.SAME_TITLE_SIZE_CAP), through its run's
+    config.BUDGET_FRACTION (and config.SAME_TITLE_SIZE_CAP), or main.py's own
+    --size-cap (and --same-title-size-cap) for one live run, through its run's
     config.LiveSettings, and nothing here writes config.py.
 """
 import argparse
@@ -316,7 +320,8 @@ def main() -> None:
     # literal (0.0, 1.0) here — which is why the help names the constant
     # rather than a number. Backtest-only — the live path never reads these
     # flags; its own band is config.TIME_SERIES_SPREAD_BAND, read through
-    # config.LiveSettings.
+    # config.LiveSettings (main.py's --spread-min / --spread-max, same names,
+    # separate CLI, override it for one live run).
     parser.add_argument(
         "--spread-min", type=float, default=None, metavar="X",
         help="Time-series spread-band FLOOR (0-1) for the primary scenario; "

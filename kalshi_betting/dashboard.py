@@ -713,7 +713,8 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
             config.time_series_profit_prob. None (default) means "no override",
             which that helper resolves at call time to
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value live sizing
-            reads. Ignored for same_title, which prices on a fixed prior.
+            reads on a run without main.py's --interval-discount. Ignored for
+            same_title, which prices on a fixed prior.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.

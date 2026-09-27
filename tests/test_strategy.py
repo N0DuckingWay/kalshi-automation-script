@@ -1006,17 +1006,16 @@ class TestTimeSeriesKellyParity:
         ("trader", "pre_execution_check"),
         ("main", "_run_dev"),
         ("main", "_run_prod"),
+        ("main", "_no_pairs_msg"),
     })
 
-    # (module, calling function, callee) calls that may omit settings. main()
-    # hands its two run modes none yet — each resolves config.py's once, in
-    # its own whitelisted statement — because main.py has no per-run toggle
-    # flags. The pin also asserts each exemption is USED: once main() resolves
-    # settings of its own and hands them on, the exemption must be deleted
-    # here, so it cannot silently cover a later unthreaded call.
-    _UNTHREADED_CALLS = frozenset({
-        ("main", "main", "_run_dev"),
-        ("main", "main", "_run_prod"),
+    # The one live function that calls live_settings() DIRECTLY, exactly once,
+    # as a bare `live_settings()`: main._resolve_live_settings, which lays
+    # main.py's toggle flags over config.py's values and hands main() both the
+    # run's settings and config.py's reference. main() hands both on to its
+    # run modes, so no live call omits settings — there is no exemption.
+    _DIRECT_RESOLVERS = frozenset({
+        ("main", "_resolve_live_settings"),
     })
 
     def test_ast_live_path_reads_toggles_only_through_live_settings(self):
@@ -1042,14 +1041,21 @@ class TestTimeSeriesKellyParity:
         #     transitively;
         #   - live_settings appears only in the whitelisted entry points above,
         #     each exactly once, as
-        #     `settings = live_settings() if settings is None else settings`
-        #     (an ImportFrom alias of it, not renamed, is the one exemption);
+        #     `settings = live_settings() if settings is None else settings`,
+        #     and as one bare `live_settings()` call in
+        #     main._resolve_live_settings, the one direct resolver, where
+        #     main.py's toggle flags are laid over it (an ImportFrom alias of
+        #     it, not renamed, is the one exemption);
         #   - every call to a function whose def (in a walked module or in
-        #     config) declares a `settings` parameter passes it explicitly,
-        #     positionally or by keyword, and never as a literal None — a
-        #     pool.submit(f, ...) of such a function included, which must
-        #     carry settings= — and no such function is passed around
-        #     uncalled any other way;
+        #     config) declares a `settings` parameter passes it explicitly, as
+        #     the bare name `settings`, positionally or as settings=settings —
+        #     never a literal None and never another expression, so the
+        #     `reference` each run mode holds beside it (config.py's own
+        #     toggles, for the "Live settings" marks) cannot be handed where
+        #     the run's settings belong; a pool.submit(f, ...) of such a
+        #     function included, which must carry settings=settings, and
+        #     main()'s calls to its two run modes too, with no exemption — and
+        #     no such function is passed around uncalled any other way;
         #   - every such def outside the whitelist declares `settings` with NO
         #     default, and every whitelisted one defaults it to None: a
         #     default on an internal helper would let a caller that forgets
@@ -1152,7 +1158,8 @@ class TestTimeSeriesKellyParity:
                 "live_time_series_floor", "time_series_spread_refusal",
                 "max_kelly_fraction", "_run_dev", "_run_prod", "compute_trade",
                 "_evaluate_size", "_solve_marginal_size", "_kelly_p",
-                "_compute_trade_specs"} <= set(takes_settings)
+                "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
+                "describe_live_settings", "live_rule_warnings"} <= set(takes_settings)
         # _kelly_p_at's k is required too: a default there would let a caller
         # that forgets it price at config's k
         kelly_p_at = next(n for n in ast.walk(trees["strategy"])
@@ -1172,25 +1179,30 @@ class TestTimeSeriesKellyParity:
             return not (isinstance(value, ast.Constant) and value.value is None)
 
         def passes_settings(call, fn_name, skip):
-            """Whether the call hands `fn_name` a settings argument that is not
-            a literal None; `skip` positional args precede the callee's own."""
+            """Whether the call hands `fn_name` the run's settings: the bare
+            name `settings`, positionally or as settings=settings — never a
+            literal None and never any other expression, so the `reference`
+            each run mode holds beside it (config.py's own) cannot be handed
+            in its place; `skip` positional args precede the callee's own."""
+            def is_the_runs(value):
+                return isinstance(value, ast.Name) and value.id == "settings"
+
             for kw in call.keywords:
                 if kw.arg == "settings":
-                    return not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+                    return is_the_runs(kw.value)
             index = takes_settings[fn_name]
             args = call.args[skip:]
             if index is None or any(isinstance(a, ast.Starred) for a in args):
                 return False
             if len(args) <= index:
                 return False
-            value = args[index]
-            return not (isinstance(value, ast.Constant) and value.value is None)
+            return is_the_runs(args[index])
 
         def call_name(func):
             return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
 
         resolutions: dict = {}
-        used_exemptions = set()
+        direct_resolutions: dict = {}
         explicit_calls: dict = {}
         for mod, tree in trees.items():
             parents = {}
@@ -1224,6 +1236,14 @@ class TestTimeSeriesKellyParity:
                         and body.func.id == resolver and not body.args and not body.keywords
                         and isinstance(orelse, ast.Name) and orelse.id == "settings"):
                     allowed[id(body.func)] = enclosing(node)
+            # The one direct form, a bare live_settings() call, recorded the
+            # same way; only a _DIRECT_RESOLVERS function may make it (below)
+            direct = {}
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == resolver and not node.args
+                        and not node.keywords and id(node.func) not in allowed):
+                    direct[id(node.func)] = enclosing(node)
 
             # Callees handed as pool.submit's first argument, checked below
             submitted = set()
@@ -1242,14 +1262,12 @@ class TestTimeSeriesKellyParity:
                     target = call_name(node.args[0])
                     submitted.add(id(node.args[0]))
                     assert passes_settings(node, target, 1), (
-                        f"{where} submits {target} without settings=")
+                        f"{where} submits {target} without settings=settings")
                     continue
                 if name in takes_settings:
-                    if passes_settings(node, name, 0):
-                        continue
-                    key = (mod, enclosing(node), name)
-                    assert key in self._UNTHREADED_CALLS, f"{where} calls {name} without settings"
-                    used_exemptions.add(key)
+                    assert passes_settings(node, name, 0), (
+                        f"{where} calls {name} without the run's `settings` (the bare "
+                        "name, never config.py's reference or another expression)")
 
             called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
             # ast.walk visits an ImportFrom's alias nodes on their own too;
@@ -1296,7 +1314,15 @@ class TestTimeSeriesKellyParity:
                     continue
                 where = f"{mod}:{node.lineno}"
                 assert name not in forbidden, f"{where} references {name}"
-                if name == resolver:
+                if name == resolver and id(node) in direct:
+                    func = direct[id(node)]
+                    assert (mod, func) in self._DIRECT_RESOLVERS, (
+                        f"{where}: {mod}.{func} calls live_settings() directly; only "
+                        "main._resolve_live_settings may, and every other live "
+                        "function must be handed the run's settings")
+                    direct_resolutions[(mod, func)] = (
+                        direct_resolutions.get((mod, func), 0) + 1)
+                elif name == resolver:
                     assert id(node) in allowed, (
                         f"{where} reads live_settings outside the one allowed "
                         "`settings = live_settings() if settings is None else settings`")
@@ -1318,10 +1344,20 @@ class TestTimeSeriesKellyParity:
         # (two resolutions could straddle a monkeypatch), none never (a
         # whitelist entry that no longer resolves must be removed)
         assert resolutions == dict.fromkeys(self._LIVE_SETTINGS_RESOLVERS, 1), resolutions
-        # Every exemption is still needed (see _UNTHREADED_CALLS)
-        assert used_exemptions == set(self._UNTHREADED_CALLS), (
-            "main() now hands its run modes their settings: delete the matching "
-            f"entries of _UNTHREADED_CALLS (unused: {self._UNTHREADED_CALLS - used_exemptions})")
+        # ... and the direct resolver calls live_settings() exactly once: a
+        # second call could straddle a monkeypatch and hand main() a
+        # reference that is not the base its flags were laid over
+        assert direct_resolutions == dict.fromkeys(self._DIRECT_RESOLVERS, 1), (
+            direct_resolutions)
+        # main() hands both run modes the settings it resolved, positionally
+        main_tree = trees["main"]
+        main_fn = next(n for n in ast.walk(main_tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        main_calls = {call_name(n.func) for n in ast.walk(main_fn) if isinstance(n, ast.Call)}
+        # (the settings argument of both dispatches is checked by the walk
+        # above; this only keeps that check from passing on a main() that no
+        # longer dispatches, or no longer resolves)
+        assert {"_run_dev", "_run_prod", "_resolve_live_settings"} <= main_calls, main_calls
         # Non-vacuous: the sizer prices through the model with the run's k at
         # two sites (_kelly_p and _evaluate_size), and both the sizer and
         # enrichment turn a fraction into a count
