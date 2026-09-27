@@ -4942,6 +4942,42 @@ class TestEnrichmentSpreadRule:
         assert self._lines(caplog, "sits below its own YES bid") == []
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
+    @pytest.mark.parametrize("pB_ref", [0.0199, 0.01])
+    def test_the_guard_drops_a_book_crossed_by_one_tick(self, caplog, pB_ref):
+        # A sub-cent book at the shipped rule: EARLY's YES ask 0.005, LATE's
+        # YES bid 0.02 (NO ask 0.98). A reference one tick (0.0001) under that
+        # bid is crossed and must drop, and so must one a cent under it: the
+        # guard tolerates PRICE_EPSILON, never a tick. Let through, the cent
+        # case sizes at a Kelly fraction of about 0.70 (V5 review, 2026-09-27),
+        # far past the 1 - k bound the no-cap default relies on
+        settings = _live(tier_floors=False, spread_band=(0.0, 0.5),
+                         interval_discount=0.80, size_cap=1.0)
+        pair = _ts_candidate(gap_days=5, pA=0.005, pB=0.02, nB=0.98)
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_orderbook_client(pA_fill=0.005, nB_fill=0.98, pB_ref=pB_ref), [pair],
+                _AMPLE_BALANCE_CENTS, settings=settings)
+        assert enriched.tradeable is False
+        [line] = self._lines(caplog, "sits below its own YES bid")
+        assert line.levelno == logging.WARNING
+
+    def test_a_reference_at_the_yes_bid_on_a_sub_cent_book_is_kept_under_one_minus_k(self):
+        # Control for the one-tick rows above: the same book with its YES ask
+        # exactly AT the 0.02 YES bid is uncrossed, is kept, and sizes under
+        # the 1 - k = 0.20 bound with no per-trade cap
+        from kalshi_betting.strategy import compute_trade
+
+        settings = _live(tier_floors=False, spread_band=(0.0, 0.5),
+                         interval_discount=0.80, size_cap=1.0)
+        pair = _ts_candidate(gap_days=5, pA=0.005, pB=0.02, nB=0.98)
+        [kept] = enrich_with_orderbook_prices(
+            _ts_orderbook_client(pA_fill=0.005, nB_fill=0.98, pB_ref=0.02), [pair],
+            _AMPLE_BALANCE_CENTS, settings=settings)
+        assert kept.tradeable is True
+        spec = compute_trade(kept, _AMPLE_BALANCE_CENTS, settings=settings)
+        assert spec is not None
+        assert 0.0 < spec.kelly_fraction < 0.20
+
     def test_the_ceiling_is_tested_on_the_top_of_the_book(self, caplog):
         # Fills 0.20 x10 and 0.30 x90 against a NO ask of 0.28, reference 0.72
         # (at the 0.72 YES bid, uncrossed). The average YES fill is 0.29, a
