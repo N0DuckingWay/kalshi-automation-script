@@ -51,18 +51,22 @@ Dependencies:
     live_settings, describe_time_series_rule and _names_text (the
     reporting-only "Live time-series rule" line),
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
-    grid _candle_window_open floors a market's open onto and
-    _checkpoint_floor floors an entry checkpoint onto),
+    length of one candle; _candle_window_open rounds a market's opening time
+    down to a candle boundary, and _checkpoint_floor rounds an entry
+    checkpoint down to one),
     LARGE_GROUP_WARN_THRESHOLD,
     INTERVAL_DISCOUNT_SWEEP and the band grid SPREAD_BAND_SWEEP_FLOORS /
     SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates;
     the size-cap grid SIZE_CAP_SWEEP is defined HERE instead, see Notes),
     MAX_DEADLINE_GAP_DAYS, SAME_TITLE_CO_RESOLVE_PROB, SAME_TITLE_MIN_PRICE_DIFF,
     SCHEDULED_RUN and its class ScheduledRun (the weekly live run's weekday,
-    time and zone: every entry checkpoint is its instant, the one definition
-    shared with scheduler.py; tests patch backtester.SCHEDULED_RUN, never
-    config.*), SETTLED_PREFILTER_CACHE_TAG (the version of _can_ever_enter's
-    logic, which _prefilter_cache_tag joins to SCHEDULED_RUN's slug),
+    time and time zone, the same object scheduler.py schedules the live run
+    from; every entry checkpoint is its UTC moment on a run weekday; this
+    module keeps its own reference from import time, so tests patch
+    backtester.SCHEDULED_RUN, never config.*), SETTLED_PREFILTER_CACHE_TAG
+    (the version name of _can_ever_enter's logic, which _prefilter_cache_tag
+    joins with SCHEDULED_RUN's file-name-safe slug to name the cached market
+    list),
     SHORT_DEADLINE_GAP_DAYS, TIME_SERIES_INTERVAL_PROB_DISCOUNT and
     TIME_SERIES_SAME_EVENT_LADDERS from config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py, plus its
@@ -195,25 +199,37 @@ Notes:
     points only and the tier-off one from tier-off points only. Live sizing
     never reads any of it.
 
-    Every entry checkpoint is the weekly live run's instant:
+    An ENTRY CHECKPOINT is a moment at which the backtest may open a
+    simulated trade. Every one is the moment the live bot runs each week:
     config.SCHEDULED_RUN (Monday 09:00 America/Los_Angeles, i.e. 16:00 UTC
-    under daylight time and 17:00 UTC under standard time), on each of its
-    run weekdays. The backtest's dates stay UTC dates — start_date, entry
-    dates, scan ends, the horizon and the equity curve — which is sound only
-    while each checkpoint lies on its own date in UTC and its wall time
-    occurs exactly once, so _prepare_candidates() refuses any other schedule
+    under daylight-saving time and 17:00 UTC under standard time), once on
+    each run weekday, so the backtest prices each entry as of the moment the
+    live bot runs (from each market's latest hourly candle at or before it).
+    The backtest keeps its dates as UTC calendar dates — start_date, entry
+    dates, the last date each pair's scan may reach, the horizon cap and the
+    equity curve. That is only sound while each
+    checkpoint falls on its own date in UTC and its wall time happens
+    exactly once that day (no clock change skips or repeats it), so
+    _prepare_candidates() refuses any schedule that breaks either rule
     (ScheduledRun.date_problems) before it fetches anything.
 
     Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
-    a necessary-condition prefilter: _find_entry() can only open a trade at an
-    entry checkpoint on/after start_date, and requires both legs to have an
-    hourly candle at-or-before that checkpoint — which, since a market has no
-    candle ending at or before the start of the candle period it opened in,
-    means it OPENED before the start of the checkpoint's candle period. A
-    market with no such checkpoint on or before its close_time's date minus
-    one day can never appear in any entered pair, as either leg, in either
-    pair type — dropping it up front avoids materializing it into any group
-    at all.
+    a PREFILTER: a cheap per-market test that drops only markets that
+    cannot be part of any simulated trade (given how Kalshi's candle
+    endpoint is observed to behave, described below).
+    _find_entry() can only open a trade at an entry checkpoint on/after
+    start_date, and needs a CANDLE — one period
+    (CANDLESTICK_PERIOD_INTERVAL_MINUTES, an hour) of a market's price
+    history, stamped with the moment the period ends — at or before that
+    checkpoint for both markets of the pair. Kalshi's candle endpoint is
+    observed never to serve a market a candle ending at or before the start
+    of the candle period it opened in, so a market can have one at or before
+    a checkpoint only if it OPENED before the start of the checkpoint's
+    candle period (_can_ever_enter gives the full argument). A market with
+    no such checkpoint on or
+    before its close_time's date minus one day can never appear in any
+    entered pair, as either leg, in either pair type — dropping it up front
+    avoids materializing it into any group at all.
     This matters because normalized-title groups can have 10,000+ members at
     current Kalshi volumes (hourly/intraday crypto ladders collapsing into one
     group) — without the prefilter, and without the close-time-windowed
@@ -356,10 +372,11 @@ from .scanner import (
 # rather than importing a private name.
 _DAY_SECONDS = 86_400
 
-# How far past today _prepare_candidates checks SCHEDULED_RUN's run dates for
-# soundness (ScheduledRun.date_problems): ten years, since a listed market's
-# close_time, and so the checkpoints _can_ever_enter compares it against, can
-# lie years out.
+# How far past today _prepare_candidates checks SCHEDULED_RUN's run dates
+# (ScheduledRun.date_problems: each run's UTC moment must fall on its own UTC
+# date and happen exactly once): ten years, because a listed market's
+# close_time, and so the checkpoints _can_ever_enter compares it with, can lie
+# years ahead.
 _SCHEDULE_CHECK_DAYS_AHEAD = 3_653
 
 # Deadline-gap bands the interval-discount calibration report groups its
@@ -1766,13 +1783,15 @@ class BacktestSweep:
         live_categories (tuple[str, ...] | None): config.py's TRADE_CATEGORIES;
             None means any category when live_tier_floors is recorded.
         live_tags (tuple[str, ...] | None): config.py's TRADE_TAGS, likewise.
-        entry_checkpoint (str | None): The weekly instant the run's entry
-            checkpoints fall at, as this module's SCHEDULED_RUN names it
-            (ScheduledRun.label(), e.g. "Monday 09:00 America/Los_Angeles")
-            — the live scheduler's run time. The dashboard header prints
-            it. None = not recorded (a hand-built sweep); both production
-            constructions pass it, the infeasible window included. Defaulted,
-            so a construction that omits it still builds.
+        entry_checkpoint (str | None): When the run's entry checkpoints fall
+            each week — the live scheduler's run time — as this module's
+            SCHEDULED_RUN.label() spells it (e.g. "Monday 09:00
+            America/Los_Angeles"). The dashboard prints it in the page header
+            (dashboard._entry_checkpoint_html). None = not recorded (a
+            hand-built sweep); both constructions run_backtest_sweep reaches
+            pass it, including the one for a window that holds no
+            checkpoint. Defaulted, so a construction that omits it still
+            builds.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -2002,43 +2021,57 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
     Necessary-condition prefilter: could this market possibly appear in any
     entered pair, as either leg, of either pair type?
 
+    A cheap test run on every settled market before the expensive grouping
+    and pairing, so that markets no entry checkpoint can reach are dropped
+    early. It drops a market only when its own open and close times show it
+    can never be entered (given the candle behaviour described below); when
+    unsure, e.g. a missing or unreadable time, it keeps it.
+    historical.fetch_all_settled_markets() applies it
+    while it assembles the backtest's market list (_prepare_candidates hands
+    it over), and _prepare_candidates applies it again in both of its passes.
+
     _find_entry() only opens a trade at an entry checkpoint — the live run's
-    instant on a SCHEDULED_RUN weekday (_checkpoint_datetime) — whose DATE
+    UTC moment on a SCHEDULED_RUN weekday (_checkpoint_datetime) — whose DATE
     lies in [start_date, min(close_a, close_b) - 1 day], and only when BOTH
-    legs have a candle at or before that checkpoint (_find_entry looks them
-    up through _candles_at_or_before). A candle's "ts" is its period END, and a market has no candle
-    ending at or before the start of the candle period it opened in (the
-    measured rule _candle_window_open's docstring records), so a market can
-    have a candle at or before a checkpoint only if it opened before the
-    start of the checkpoint's candle period (_checkpoint_floor). A market is
-    therefore kept iff some checkpoint the scan can reach — dated on or after
-    start_date and on or before close_time's date minus one day — has its
-    floor strictly after open_time: exactly the set the scan can reach. The
-    upper bound is read as a DATE, exactly as _find_entry builds scan_end.
-    The one-year lookback and the max_horizon_days cap _find_entry also
-    applies are not tested here: the first depends on the partner's close and
-    the second is not part of the corpus's identity (the prefilter cache tag,
-    _prefilter_cache_tag, names the corpus, not the run).
+    markets have a candle at or before that checkpoint (_find_entry looks
+    them up through _candles_at_or_before). A candle is one candle period
+    (CANDLESTICK_PERIOD_INTERVAL_MINUTES) of a market's price history, and
+    its "ts" is the moment that period ENDS, always on a period boundary
+    (_checkpoint_floor). A market has no candle ending at or before the
+    start of the candle period it opened in (an observed behaviour of
+    Kalshi's candle endpoint, recorded in _candle_window_open's docstring),
+    so it can have a candle at or before a checkpoint only if it opened
+    before the start of the checkpoint's candle period — the checkpoint's
+    "floor" (_checkpoint_floor). A market is therefore kept iff some
+    checkpoint dated on or after start_date and on or before close_time's
+    date minus one day has its floor strictly after open_time: exactly the
+    markets that could have a candle at or before some checkpoint in the
+    date range _find_entry scans. The upper bound is read as a DATE, exactly
+    as _find_entry builds scan_end. Two further limits _find_entry applies
+    are not tested here. Its one-year lookback depends on the other market's
+    close. max_horizon_days is a per-run setting, while one cached market
+    list serves runs with any horizon (the list's name carries no horizon).
 
-    That comparison is exact only while every checkpoint lies on its own
-    date in UTC, which _prepare_candidates checks (ScheduledRun.date_problems)
-    before this predicate runs. An open_time with no UTC offset (only a
-    hand-edited cache — every Kalshi timestamp carries one) cannot be placed
-    against a checkpoint, so it takes the date test on its wall-clock date:
-    that date's own checkpoint counts as reachable, which is looser than the
-    instant test with the wall clock read as UTC. So does an aware one whose
-    UTC instant falls outside datetime's range. A checkpoint whose floor
-    cannot be placed (_checkpoint_floor returns None) also counts as
-    reachable on the opening date, so the close-date bound alone decides.
-    The rest of the arithmetic is done on date DIFFERENCES, so no
-    parseable timestamp can make this predicate raise: it is the fetch's
-    assembly prefilter (on the live frontier's worker thread, too) and runs
-    in both of _prepare_candidates' passes, where an exception would end the
-    run instead of keeping one absurd record.
+    That comparison is exact only while every checkpoint falls on its own date in UTC, which
+    _prepare_candidates checks (ScheduledRun.date_problems) before this function runs. An
+    open_time with no UTC offset (only a hand-edited cache — every Kalshi timestamp carries
+    one) cannot be placed against a checkpoint, so it gets the DATE TEST instead: the date
+    written in the string is taken as the opening date, and a checkpoint on that same date
+    counts as reachable whatever the time of day. That keeps every market that reading the
+    time as UTC would keep, and possibly more. An open_time with an offset whose UTC moment
+    falls outside the range Python's datetime can hold gets the date test too. A checkpoint
+    whose floor cannot be placed (_checkpoint_floor returns None) also counts as reachable
+    on the opening date, so the close-date bound alone decides. The rest of the arithmetic
+    works on differences between dates, so no parseable timestamp can make this function
+    raise. That matters because it runs inside the fetch's assembly (including on the worker
+    thread that fetches the current day's settled markets) and in both of
+    _prepare_candidates' passes, where an exception would end the run instead of keeping one
+    absurd record.
 
-    Changing this predicate's logic, or CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-    requires a config.SETTLED_PREFILTER_CACHE_TAG bump; a changed
-    SCHEDULED_RUN re-keys the cache by itself (_prefilter_cache_tag).
+    Changing this function's logic, or CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    requires a new config.SETTLED_PREFILTER_CACHE_TAG; a changed
+    SCHEDULED_RUN gives the cached list a new name by itself
+    (_prefilter_cache_tag).
 
     Args:
         m (dict): Market dict as produced by historical._market_to_dict().
@@ -2062,7 +2095,7 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
         return True
 
     # Naive (no offset): no instant to compare, so the date alone, in the
-    # string's own wall clock.
+    # string's own wall clock (the date test the docstring describes).
     open_utc = None
     open_d = open_dt.date()
     if open_dt.utcoffset() is not None:
@@ -2086,15 +2119,18 @@ def _can_ever_enter(m: dict, start_date: date) -> bool:
     # ... may reach any checkpoint dated up to close_time's date minus one
     # day, exactly as _find_entry builds scan_end ...
     room = (close_d - first).days - 1
-    # ... and its first checkpoint is on the same advance-to-the-run-weekday
-    # step _monday_timestamps takes, so the two walk the same dates.
+    # ... and its first checkpoint is on the first run weekday on or after
+    # `first` — the date _monday_timestamps's advance-to-the-run-weekday loop
+    # reaches, found here by arithmetic on weekday numbers — so the two walk
+    # the same dates.
     ahead = (SCHEDULED_RUN.weekday - first.weekday()) % 7
     # A checkpoint dated strictly after the opening date has its floor
-    # strictly after the opening instant (each checkpoint lies on its own
-    # date in UTC). Only the opening date itself can put the floor at or
-    # before it: then the first checkpoint the market can reach is the NEXT
-    # week's. A floor that cannot be placed counts that checkpoint as
-    # reachable (looser, never tighter), so the close-date bound alone decides.
+    # strictly after the opening moment (each checkpoint falls on its own
+    # date in UTC). Only a checkpoint on the opening date itself can have its
+    # floor at or before the opening: then the first checkpoint the market
+    # can reach is the NEXT week's. A floor that cannot be placed counts that
+    # checkpoint as reachable (looser, never tighter), so the close-date
+    # bound alone decides.
     if open_utc is not None and ahead == 0 and first == open_d:
         floor = _checkpoint_floor(SCHEDULED_RUN, first)
         if floor is not None and open_utc >= floor:
@@ -3310,53 +3346,63 @@ def _extract_pairs(
 
 def _checkpoint_datetime(d: date) -> datetime:
     """
-    The entry checkpoint instant on one date: the live run's instant.
+    The entry checkpoint on one date: the UTC moment the live bot runs that day.
 
-    The instant the live scheduler runs at: ScheduledRun.instant, the one
-    definition of a checkpoint's instant, on this module's SCHEDULED_RUN
-    (config.SCHEDULED_RUN; tests patch backtester.SCHEDULED_RUN, never
-    config.*). _monday_timestamps builds every checkpoint _find_entry scans
-    from this function, and _can_ever_enter floors the same binding's
-    instant through _checkpoint_floor(SCHEDULED_RUN, d), so the prefilter and
-    the scan cannot disagree about when a checkpoint falls.
+    An entry checkpoint is a moment at which the backtest may open a
+    simulated trade; making it the live run's moment means the backtest
+    prices each entry as of the moment the live bot runs (from each market's
+    latest candle at or before it). The moment is this module's
+    SCHEDULED_RUN.instant(d). ScheduledRun.instant defines when the run
+    happens, and the live scheduler's startup check uses it too.
+    SCHEDULED_RUN is config.SCHEDULED_RUN, imported by name, so tests patch
+    backtester.SCHEDULED_RUN, never config.*. _monday_timestamps builds every checkpoint _find_entry
+    scans from this function, and the prefilter _can_ever_enter reads the
+    same SCHEDULED_RUN through _checkpoint_floor(SCHEDULED_RUN, d), so the
+    prefilter and the scan cannot disagree about when a checkpoint falls.
 
     Args:
         d (date): The checkpoint's date (a run weekday, for every caller).
 
     Returns:
-        datetime: The run's instant on d, tz-aware in UTC.
+        datetime: The run's moment on d, tz-aware in UTC.
 
     Raises:
         zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: The schedule's
             zone cannot be resolved (ScheduledRun.zone()).
-        OverflowError: The instant falls outside datetime's range.
+        OverflowError: The moment falls outside datetime's range.
     """
-    # The live run's instant: one definition with the scheduler
+    # The live run's UTC moment on d, from the same definition the scheduler checks
     return SCHEDULED_RUN.instant(d)
 
 
 @functools.lru_cache(maxsize=4096)
 def _checkpoint_floor(run: ScheduledRun, d: date) -> datetime | None:
     """
-    Start of the candle period that holds the run's instant on date `d`.
+    Start of the candle period that holds the run's moment on date `d`: the checkpoint's "floor".
 
-    The period is CANDLESTICK_PERIOD_INTERVAL_MINUTES long, on the same grid
-    _candle_window_open floors a market's open onto. A candle's "ts" is its
-    period END, on that grid, and a market has no candle ending at or before
-    the start of the period it opened in, so it can have a candle at or
-    before the checkpoint only if it opened before this floor (and one that
-    did can: its first candle may end on the floor). Cached per (schedule,
-    date), so a patched SCHEDULED_RUN never reads another schedule's entry.
+    The prefilter _can_ever_enter compares a market's opening time with this
+    floor. Candle periods are CANDLESTICK_PERIOD_INTERVAL_MINUTES long and
+    start at whole multiples of that length counted from the Unix epoch —
+    the same boundaries _candle_window_open rounds a market's opening time
+    down to — and a candle's "ts" (the moment its period ends) always falls
+    on one of those boundaries. _can_ever_enter explains why a market can
+    have a candle at or before the checkpoint only if it opened before this
+    floor; one that did can, since its first candle may end on the floor.
+    Results are cached per (schedule, date): the prefilter asks for a floor
+    every time it checks a market whose opening (read in UTC) falls on a run
+    weekday on or after start_date — many calls over few distinct dates —
+    and keying on the schedule too means a patched SCHEDULED_RUN never gets
+    another schedule's cached answer.
     _can_ever_enter reads the candle period through this floor, so changing
-    CANDLESTICK_PERIOD_INTERVAL_MINUTES requires a
-    config.SETTLED_PREFILTER_CACHE_TAG bump.
+    CANDLESTICK_PERIOD_INTERVAL_MINUTES requires a new
+    config.SETTLED_PREFILTER_CACHE_TAG.
 
     Args:
-        run (ScheduledRun): The schedule whose instant is floored.
+        run (ScheduledRun): The schedule whose moment is rounded down.
         d (date): The checkpoint's date.
 
     Returns:
-        datetime | None: The floor, tz-aware in UTC; None when the instant
+        datetime | None: The floor, tz-aware in UTC; None when the moment
             falls outside datetime's range (_can_ever_enter then counts that
             checkpoint as reachable).
 
@@ -3366,8 +3412,9 @@ def _checkpoint_floor(run: ScheduledRun, d: date) -> datetime | None:
     """
     period_seconds = CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
     try:
-        # The run's instant on d (config.ScheduledRun), floored onto the epoch
-        # grid exactly as _candle_window_open floors an open
+        # The run's UTC moment on d (config.ScheduledRun.instant), rounded down
+        # to a candle-period boundary exactly as _candle_window_open rounds
+        # down a market's opening time
         instant = run.instant(d)
         return instant - timedelta(seconds=int(instant.timestamp()) % period_seconds)
     except OverflowError:
@@ -3376,15 +3423,19 @@ def _checkpoint_floor(run: ScheduledRun, d: date) -> datetime | None:
 
 def _prefilter_cache_tag() -> str:
     """
-    Name the eligibility prefilter a settled-market corpus is assembled under.
+    Build the cache tag: the name of the prefilter a backtest market list is assembled under.
 
-    config.SETTLED_PREFILTER_CACHE_TAG (the version of _can_ever_enter's
-    logic) plus this module's SCHEDULED_RUN.cache_slug(), read when called:
-    the predicate reads the same binding, so the tag a corpus is cached under
-    always names the schedule it was filtered for, and a changed or patched
-    schedule re-keys the assembled cache. The candle period the predicate
-    also reads (CANDLESTICK_PERIOD_INTERVAL_MINUTES) is not in the tag: a
-    change to it needs a SETTLED_PREFILTER_CACHE_TAG bump.
+    _prepare_candidates passes it to historical.fetch_all_settled_markets,
+    which puts it in the file name of the assembled cache (the on-disk copy
+    of the prefiltered market list), so a list filtered one way is never
+    reused by a run filtering another way; _log_corpus_prefilter prints it.
+    It is config.SETTLED_PREFILTER_CACHE_TAG (the version name of
+    _can_ever_enter's logic) plus this module's SCHEDULED_RUN.cache_slug(),
+    read when called. The prefilter reads the same SCHEDULED_RUN, so the tag
+    always names the schedule the list was filtered for, and a changed or
+    patched schedule gives the cache a new name. The candle period the
+    prefilter also reads (CANDLESTICK_PERIOD_INTERVAL_MINUTES) is not in the
+    tag: a change to it needs a new SETTLED_PREFILTER_CACHE_TAG.
 
     Returns:
         str: e.g. "checkpoint-v3-mon0900-America-Los_Angeles".
@@ -3397,10 +3448,13 @@ def _monday_timestamps(start_date: date, end_date: date) -> list[int]:
     """
     Generate the Unix timestamp of every entry checkpoint in the given date range.
 
-    One checkpoint per SCHEDULED_RUN weekday (Monday on the shipped schedule)
-    in [start_date, end_date], at _checkpoint_datetime — the live run's
-    instant, shared with the _can_ever_enter prefilter. The backtest scans
-    these weekly checkpoints to simulate the bot's weekly run.
+    One checkpoint per SCHEDULED_RUN weekday in [start_date, end_date],
+    despite the function's name: the weekday is SCHEDULED_RUN's, which is
+    Monday on the shipped schedule. Each is _checkpoint_datetime of that
+    date, the live run's UTC moment, the same definition the _can_ever_enter
+    prefilter reads. _find_entry scans these weekly checkpoints to simulate
+    the bot's weekly run, and _prepare_candidates asks for them over
+    [start_date, today] to see whether the window holds any at all.
 
     Args:
         start_date (date): First date of the scan range (inclusive). The function
@@ -3434,8 +3488,11 @@ def _checkpoint_utc_times(start_date: date, end_date: date) -> list[str]:
     """
     List the distinct UTC times of day the entry checkpoints in a date range fall at.
 
-    Reads the checkpoints _find_entry scans (_monday_timestamps), so a range
-    spanning a clock change lists both of the run's UTC times.
+    For the "Entry checkpoint (backtest)" log line run_backtest_sweep writes
+    before the fetch. It reads the same checkpoints _find_entry scans
+    (_monday_timestamps), so a range spanning a clock change lists both of
+    the run's UTC times (one under daylight-saving time, one under standard
+    time).
 
     Args:
         start_date (date): First date of the range (inclusive).
@@ -3515,7 +3572,8 @@ def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[di
             key (Unix seconds), normally in time order.
         timestamps (list[int]): The moments to look up, in Unix seconds;
             _find_entry passes its entry checkpoints (_checkpoint_datetime,
-            one per Monday of its window), in date order.
+            one per run weekday of its window — Monday on the shipped
+            schedule), in date order.
 
     Returns:
         list[dict | None]: For each moment, in order, _candle_at_or_before's
@@ -3878,8 +3936,8 @@ def _find_entry(
 
     # Every qualifying Monday, earliest first (see Returns)
     mondays: list[dict] = []
-    # The Mondays to test, each at its entry checkpoint (_checkpoint_datetime:
-    # the live run's instant that day)
+    # The Mondays to test (SCHEDULED_RUN's weekday), each at its entry
+    # checkpoint: the live run's UTC moment that day (_checkpoint_datetime)
     checkpoints = _monday_timestamps(scan_start, scan_end)
     # candles_a is market A's hourly price history and candles_b market B's
     # (see Args). If the time-series branch above swapped the two markets so
@@ -4831,15 +4889,18 @@ def _log_corpus_prefilter(total: int, eligible: int,
     """
     Log what the corpus holds and what the eligibility prefilter did to it.
 
+    The corpus is the collection of settled markets the backtest analyses
+    (normally streamed from the assembled cache, not held as a list).
     _prepare_candidates hands _can_ever_enter to the fetch as its prefilter,
     so a fetched corpus is already the eligible set, and the first pass's own
-    re-check of the same predicate rejects nothing. The corpus's provenance
-    decides the wording:
+    re-check of the same test rejects nothing. The corpus's provenance (the
+    record of how it was assembled) decides the wording:
 
       * provenance present (a SettledCorpus or a LegacySettledCorpus, i.e.
         the corpus came from fetch_all_settled_markets under
-        _prefilter_cache_tag()): the corpus is N ELIGIBLE markets, and the
-        line names that tag and says the prefilter ran during assembly —
+        the cache tag _prefilter_cache_tag() builds): the corpus is N
+        ELIGIBLE markets, and the line names that tag and says the prefilter
+        ran during assembly —
         quoting its rejections of the records settled in the window when the
         corpus recorded them (CorpusProvenance.assembly_counts), and saying
         it recorded none otherwise (every legacy cache, and a streamed one
@@ -4867,8 +4928,8 @@ def _log_corpus_prefilter(total: int, eligible: int,
             type before the corpus is released; None for a plain list.
     """
     rejected_here = total - eligible
-    # The tag the fetch assembled this corpus under: the predicate's version
-    # plus the schedule it filters for
+    # The cache tag the fetch assembled this corpus under: the prefilter's
+    # version name plus the schedule it filters for
     tag = _prefilter_cache_tag()
     if provenance is None:
         logging.info(
@@ -4934,19 +4995,22 @@ def _prepare_candidates(
     """
     Run the half of the backtest that depends on neither the band nor k.
 
-    Everything here — the schedule check and feasibility pre-check, the
-    settled-market fetch, the eligibility prefilter, the outcome-label
-    census, both groupings, pair extraction and the candlestick fetch — is
-    driven purely by which markets exist and when they traded. Neither the
-    backtest's spread band (which acts only inside _find_entry's
-    per-checkpoint price tests) nor the interval discount k (which only
-    _simulate_at_discount reads) touches any of it, so one call can feed an
-    entry pass per band through _entries_for_band(). Its log lines come in
-    one fixed order, bracketed by two _log_rss lines, and the group maps and
-    records are released before the candlestick pool spawns.
+    Everything here — the schedule check (can SCHEDULED_RUN serve as the
+    entry checkpoint?), the feasibility pre-check (does the window hold any
+    checkpoint?), the settled-market fetch, the eligibility prefilter, the
+    outcome-label census, both groupings, pair extraction and the
+    candlestick fetch — is driven purely by which markets exist and when
+    they traded. Neither the backtest's spread band (which acts only inside
+    _find_entry's per-checkpoint price tests) nor the interval discount k
+    (which only _simulate_at_discount reads) touches any of it, so one call
+    can feed an entry pass per band through _entries_for_band(). Its log
+    lines come in one fixed order, bracketed by two _log_rss lines (peak
+    memory readings), and the group maps and records are released before
+    the candlestick pool spawns.
 
     It builds no eligible list of its own and groups only the groupable
-    subset. The fetched corpus is walked TWICE and treated as any
+    subset. The fetched corpus (the settled markets the fetch returns) is
+    walked TWICE and treated as any
     re-iterable of market dicts: the first pass (_index_eligible_keys)
     counts it, prefilters it, feeds the census and hashes each eligible
     record's two grouping keys; the second (_materialize_groupable) keeps
@@ -5004,9 +5068,10 @@ def _prepare_candidates(
             entry checkpoint: its zone cannot be resolved, or
             ScheduledRun.date_problems finds a run date from start_date to
             _SCHEDULE_CHECK_DAYS_AHEAD past today whose run time a clock
-            change skips or repeats, or whose instant lies on another date in
-            UTC. A configuration error, not a validation failure, so it
-            raises rather than returning None.
+            change skips or repeats, or whose UTC moment lies on another date
+            in UTC (or outside the range Python's datetime can hold). A
+            configuration error, not a validation failure, so it raises
+            rather than returning None.
         KeyError: Propagates out of the candlestick-fetch pool
             (_fetch_candles_parallel) if a ticker needed by a candidate pair
             was not properly excluded by the eligibility prefilter — this is
@@ -5035,18 +5100,24 @@ def _prepare_candidates(
     # structurally-impossible case, so it must be strictly conservative: an
     # over-tight end date would wrongly skip a real run (e.g. today is the run
     # weekday and start_date is within the last week).
-    # UTC, not local: the backtest's dates are UTC dates (each checkpoint lies
-    # on its own date in UTC — checked just below), as in _build_equity_curve.
-    # West of UTC the local date lags for the first hours of each UTC day, so
-    # a window whose ONLY checkpoint is on the current UTC day would
-    # short-circuit to zero trades when it is not structurally impossible.
+    # UTC, not local: the backtest's dates are UTC dates (each checkpoint
+    # falls on its own date in UTC — checked just below), as in
+    # _build_equity_curve. West of UTC the local date lags for the first
+    # hours of each UTC day, so a window whose ONLY checkpoint is on the
+    # current UTC day would short-circuit to zero trades when it is not
+    # structurally impossible.
     feasibility_end = datetime.now(UTC).date()
-    # The backtest keeps UTC dates (start_date, entry dates, scan ends, the
-    # horizon and the equity curve) while its checkpoints come from
-    # SCHEDULED_RUN, so every run date that can reach a checkpoint must put
-    # its instant on that same date in UTC, once: no clock change may skip or
-    # repeat its wall time. Refuse an unsound schedule before any fetch —
-    # a configuration error, not a validation None.
+    # The backtest works in UTC calendar dates (start_date, entry dates, the
+    # last date each pair's scan may reach, the horizon cap and the equity
+    # curve), while its checkpoints come from SCHEDULED_RUN's wall time in
+    # its own zone. The two only fit together if every run date the backtest
+    # may scan puts the run's UTC moment on that same UTC date, exactly once:
+    # no clock change may skip or repeat its wall time. The check runs from
+    # start_date to _SCHEDULE_CHECK_DAYS_AHEAD past today, because a market's
+    # close_time, and so the checkpoints the prefilter compares it with, can
+    # lie years ahead. A schedule that breaks this is a configuration error, so it
+    # raises before any fetch rather than returning the None that means
+    # "nothing to simulate".
     schedule_end = (date.max if (date.max - feasibility_end).days < _SCHEDULE_CHECK_DAYS_AHEAD
                     else feasibility_end + timedelta(days=_SCHEDULE_CHECK_DAYS_AHEAD))
     try:
@@ -5090,10 +5161,10 @@ def _prepare_candidates(
     # and cached first — result-neutral, since both passes below would
     # discard exactly those records anyway, but it keeps peak memory and the
     # assembled cache proportional to what the backtest can actually use.
-    # The tag keys that cache to _can_ever_enter's logic
-    # (config.SETTLED_PREFILTER_CACHE_TAG, which MUST be bumped if the
-    # predicate's logic changes) and to the schedule it filters for, read now
-    # from the same SCHEDULED_RUN binding the predicate reads.
+    # The cache tag names that cache after _can_ever_enter's logic
+    # (config.SETTLED_PREFILTER_CACHE_TAG, which MUST be changed if the
+    # prefilter's logic changes) and after the schedule it filters for, read
+    # now from the same SCHEDULED_RUN the prefilter reads.
     markets = fetch_all_settled_markets(
         hist_client, live_client, start_date, use_cache,
         prefilter=lambda m: _can_ever_enter(m, start_date),
@@ -5132,10 +5203,11 @@ def _prepare_candidates(
     # a 16 GB host. Pass 2 then keeps exactly the records whose key is shared.
     #
     # Necessary-condition prefilter, applied in BOTH passes: drop markets
-    # with no entry checkpoint on/after start_date whose candle period starts
-    # after their opening instant and which is dated on or before their close
-    # date minus one day, since _find_entry() can then never enter them as
-    # either leg of either pair type (see _can_ever_enter). This is what makes
+    # with no entry checkpoint that is dated on/after start_date and on or
+    # before their close date minus one day and whose floor (the start of the
+    # candle period holding that checkpoint, _checkpoint_floor) is after their
+    # opening moment, since _find_entry() can then never enter
+    # them as either leg of either pair type (see _can_ever_enter). This is what makes
     # grouping/pairing tractable at current Kalshi volumes (hourly/intraday
     # ladders are the overwhelming majority of settled markets and almost
     # never span a scannable checkpoint).
@@ -5837,7 +5909,9 @@ def _prepare_entries(
     _prepare_candidates() (everything through the candlestick fetch) and one
     _entries_for_band() pass at the DEFAULT band — config's
     BACKTEST_DEFAULT_SPREAD_BAND, (0.0, 1.0), which is no band at all — so
-    its entries follow the live rule (pinned by
+    no band floor or ceiling is added to the deadline-gap price thresholds
+    the live scanner applies (its output
+    on a fixed fixture is pinned by
     tests/test_backtester.py::TestPrepareEntriesGolden).
 
     Args:
@@ -6866,7 +6940,7 @@ def run_backtest(
       4. Fetch hourly candlesticks for every ticker appearing in a
          potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
          threads.                                                   [prepare]
-      5. Find every checkpoint (the live run's instant on each
+      5. Find every entry checkpoint (the live run's UTC moment on each
          SCHEDULED_RUN weekday) where the pair was tradeable at the
          threshold.                                                 [prepare]
       6. Enter each pair on the earliest qualifying Monday that passes
@@ -6922,8 +6996,9 @@ def run_backtest(
 
     Note:
         Before any network call, _prepare_entries() checks whether [start_date,
-        today] contains at least one entry checkpoint — a SCHEDULED_RUN
-        weekday (the only kind _find_entry() can ever act on). If not, no
+        today] contains at least one SCHEDULED_RUN weekday, and so at least
+        one entry checkpoint (the only moments at which _find_entry() can
+        enter a trade). If not, no
         trade can ever be entered regardless of what the fetch would return,
         so the fetch is skipped entirely, that helper returns None, and this
         returns the same empty-result shape as the zero-trade path ([], an
@@ -8155,11 +8230,13 @@ def run_backtest_sweep(
 
         Before the fetch, after the size-cap line, one INFO line names the
         entry checkpoint (SCHEDULED_RUN's label) and the UTC times its
-        checkpoints fall at over [start_date, today], or that the window
-        holds none, or that they cannot be computed. The line never raises:
-        _prepare_candidates then refuses an unresolvable zone or an unsound
-        schedule with its ValueError, and raises OverflowError for a
-        start_date whose next run weekday lies past date.max.
+        checkpoints fall at over [start_date, today], or says that the window
+        holds none, or that the times cannot be computed. Writing the line
+        never raises. _prepare_candidates, called next, then refuses an
+        unresolvable zone or a schedule that ScheduledRun.date_problems
+        rejects with its ValueError (whether or not the line could compute
+        the times), and raises OverflowError for a start_date whose next run
+        weekday lies past date.max.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -8223,13 +8300,13 @@ def run_backtest_sweep(
         same_title_clause,
         "on" if cap_sweep else "off",
     )
-    # And the entry checkpoint: the schedule every entry pass scans at (this
-    # module's SCHEDULED_RUN) and the UTC times its checkpoints fall at over
-    # [start_date, today], the feasibility window. Never raises: it catches
-    # everything _monday_timestamps can raise, and _prepare_candidates just
-    # below refuses an unresolvable zone or an unsound schedule with its
-    # ValueError (a start_date whose next run weekday lies past date.max
-    # raises OverflowError there).
+    # And the entry checkpoint: the schedule every entry pass scans at (this module's
+    # SCHEDULED_RUN) and the UTC times its checkpoints fall at over [start_date, today], the
+    # window the feasibility pre-check reads. This line never raises: it catches everything
+    # _monday_timestamps can raise and says the times are not computable.
+    # _prepare_candidates just below then refuses an unresolvable zone or a schedule that
+    # ScheduledRun.date_problems rejects with its ValueError (a start_date whose next run
+    # weekday lies past date.max raises OverflowError there).
     try:
         times = _checkpoint_utc_times(start_date, datetime.now(UTC).date())
     except (ZoneInfoNotFoundError, ValueError, OSError, OverflowError) as exc:

@@ -1322,9 +1322,12 @@ class TestPreToggleDefaults:
 
 class TestScheduledRun:
     """The weekly live run's schedule: one frozen value holding the weekday,
-    time and IANA zone, with the zone resolved only on use. instant() must
+    time and IANA zone, with the zone looked up only on use. instant() must
     follow the zone's daylight-saving rules, and date_problems() must flag
     every run date whose wall time is not one UTC moment on that same date.
+    It matters twice over: the scheduler fires the live run from this value,
+    and the backtest opens every simulated trade at instant(d), so a wrong
+    answer here moves real trading or the backtest's replay of it.
     """
 
     def test_the_shipped_schedule_is_monday_0900_los_angeles(self):

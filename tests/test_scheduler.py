@@ -873,9 +873,10 @@ class TestGuardedJobRegistration:
         """DR-59: main() must register run_job through _guarded_job, on the
         job _weekly_job() builds from config.SCHEDULED_RUN. main() spawns a
         real prod run and is never invoked by this suite, so no runtime test
-        can reach this line — without the pin, an edit reverting to
-        `.do(run_job)` restores DR-59, and one registering any other job (a
-        daily one, say) moves the live run, with a green suite."""
+        can reach this line. Without the pin, an edit back to `.do(run_job)`
+        would let a job that raises re-fire on every 60-second poll tick
+        (the DR-59 failure), and one registering any other job (a daily one,
+        say) would move the live run — both with a green suite."""
         calls = _do_calls_in("main")
         assert len(calls) == 1, "main() should register exactly one job"
         args = calls[0].args
@@ -1042,11 +1043,12 @@ class TestSetupLogging:
 
 
 class TestWeeklyJobIsTheOldRegistration:
-    """_weekly_job() builds exactly the job `schedule.every().monday.at("09:00")`
-    builds: the live run fires at Monday 09:00 on the host's clock, with no
-    zone of its own. schedule's tz path goes through pytz, whose
-    America/Los_Angeles table has no daylight time after 2037, so the job must
-    never carry one."""
+    """On the shipped schedule, _weekly_job() builds exactly the job the
+    literal `schedule.every().monday.at("09:00")` builds — same weekday, time
+    and first fire — so the live run fires at Monday 09:00 on the host's
+    clock, with no time zone of its own. It must never carry one: schedule's
+    time-zone option goes through the pytz library, whose America/Los_Angeles
+    table has no daylight-saving time after 2037."""
 
     def test_the_job_matches_the_literal_registration(self):
         job = scheduler._weekly_job()
@@ -1113,9 +1115,14 @@ class TestOneRunSchedule:
 @contextlib.contextmanager
 def _host_zone(name: str):
     """
-    Run the block with the process's local zone set to `name` (TZ, then tzset).
+    Run the block as if the host computer's clock were set to zone `name`.
 
-    TZ is restored, or deleted if it was unset, BEFORE the closing tzset(), so
+    Sets the TZ environment variable and calls time.tzset(), which makes
+    Python's local-time conversions (e.g. converting a datetime with no zone
+    attached to UTC) use that zone — the conversion the scheduler's
+    host-clock check relies on, and one the backtest must not depend on
+    (tests/test_backtester.py imports this helper to show it does not). TZ
+    is restored, or deleted if it was unset, BEFORE the closing tzset(), so
     the process is back on its own zone when the block exits. Skips where
     time.tzset is missing, or where the C library cannot load `name` (checked
     against zoneinfo in January and July).
@@ -1153,6 +1160,10 @@ def _criticals(caplog) -> list[str]:
 def _late_on(late: date) -> ScheduledRun:
     """
     Build the shipped schedule with instant() one minute late on one date.
+
+    A test double for the host-clock check: on a host whose clock keeps the
+    schedule's own zone, every run date matches except `late`, so a test can
+    put exactly one mismatch where it wants it.
 
     Args:
         late (date): The run date whose instant is moved.

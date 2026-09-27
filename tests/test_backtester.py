@@ -2446,8 +2446,8 @@ class TestCanEverEnter:
     upper = close_time's date - 1 day, and the market is eligible iff some
     Monday on/after start_date and on or before upper has its checkpoint's
     candle period starting after open_time. Every market here opens at
-    MIDNIGHT UTC, where that is the date test (a Monday on/after max(open
-    date, start_date)); the time-of-day cases are
+    MIDNIGHT UTC, where that reduces to comparing dates alone (some Monday
+    from max(open date, start_date) through upper); the time-of-day cases are
     TestCanEverEnterAtTheCheckpointInstant's."""
 
     def test_two_hour_market_never_spans_a_monday(self):
@@ -2520,10 +2520,14 @@ class TestCanEverEnter:
 # ─── The prefilter places the opening against the checkpoint's candle period ─
 
 def _date_granular_can_ever_enter(m: dict, start_date: date) -> bool:
-    """The pre-P5 backtester._can_ever_enter, verbatim: open_time read as a DATE.
+    """A date-only prefilter: open_time and close_time read as DATES, Monday only.
 
-    The reference the checkpoint-precise predicate must never widen, and the
-    predicate the result-neutrality tests below run the old pipeline under.
+    Keeps a market when some Monday on or after both start_date and its
+    opening date falls on or before the day before its close. The tests
+    compare backtester._can_ever_enter against it: for openings stamped in
+    UTC (every Kalshi timestamp) the real prefilter never keeps a market this
+    one drops, and the result-neutrality tests below run the pipeline under
+    it to show the real prefilter drops only markets that could never enter.
     """
     open_d = _parse_iso_date(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
@@ -2540,9 +2544,12 @@ def _date_granular_can_ever_enter(m: dict, start_date: date) -> bool:
 
 
 def _run_weekday_date_test(m: dict, start_date: date, weekday: int) -> bool:
-    """The date test on any run weekday: some `weekday` date in
-    [max(open date, start_date), close date - 1 day], open_time read as a DATE
-    in its own offset. What a naive open_time is held to, for any schedule."""
+    """Reference DATE TEST on any run weekday: keep the market iff some date
+    on `weekday` lies in [max(open date, start_date), close date - 1 day],
+    reading open_time's date in its own offset. This is the looser,
+    dates-only rule _can_ever_enter falls back to for an open_time with no
+    UTC offset; taking the weekday as an argument lets _scan_reachable use
+    it under a patched schedule."""
     open_d = _parse_iso_date(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
     if open_d is None or close_d is None:
@@ -2554,9 +2561,11 @@ def _run_weekday_date_test(m: dict, start_date: date, weekday: int) -> bool:
 
 
 def _utc0900_can_ever_enter(m: dict, start_date: date) -> bool:
-    """The Monday 09:00 UTC predicate (tag "monday-checkpoint-v2"), verbatim
-    but for the checkpoint, spelled inline: what an assembled cache keyed
-    under that tag holds. The current predicate must admit all of it."""
+    """Reference prefilter with the checkpoint fixed at Monday 09:00 UTC,
+    spelled inline, and otherwise the same steps as _can_ever_enter. The
+    shipped schedule's checkpoint (16:00 or 17:00 UTC) falls later on the
+    same UTC date, so the real prefilter must admit every market this one
+    admits: moving the checkpoint later that day only ever adds markets."""
     open_dt = _parse_iso_datetime(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
     if open_dt is None or close_d is None:
@@ -2615,10 +2624,12 @@ def _mkt_at(open_time: str | None, close_time: str | None) -> dict:
     return {"open_time": open_time, "close_time": close_time}
 
 
-# The schedules the exactness test runs the predicate under, by patching
-# backtester.SCHEDULED_RUN: the shipped one, Monday 09:00 UTC, one off the
-# hour grid (03:30 UTC), another weekday and minute across the clock changes
-# (16:30 / 17:30 UTC), and one on UTC midnight (00:00 UTC).
+# The schedules the exactness test runs the prefilter under, by patching
+# backtester.SCHEDULED_RUN. Each puts the checkpoint somewhere different
+# against the hourly candle boundaries and the UTC date: the shipped one,
+# Monday 09:00 UTC, one between two candle boundaries (03:30 UTC), another
+# weekday and minute across the clock changes (16:30 / 17:30 UTC), and one on
+# UTC midnight (00:00 UTC).
 _EXACTNESS_SCHEDULES = [
     pytest.param(SCHEDULED_RUN, id="shipped"),
     pytest.param(ScheduledRun(0, 9, 0, "UTC"), id="mon0900-UTC"),
@@ -2682,8 +2693,9 @@ class TestCanEverEnterAtTheCheckpointInstant:
         ("2026-09-22T05:59:59+14:00", True),    # 15:59:59Z
         # a Tuesday local date, 16:30Z on the Monday: dropped either way
         ("2026-09-22T06:30:00+14:00", False),
-        # a Tuesday local date, 15:30Z on the Monday: the date test read
-        # Tuesday and dropped it; the instant is before the checkpoint
+        # a Tuesday local date, 15:30Z on the Monday: the date test reads the
+        # local date, Tuesday, and drops it; the UTC moment is before the
+        # checkpoint
         ("2026-09-22T00:30:00+09:00", True),
         # a SUNDAY local date, 11:30Z on the Monday: before the checkpoint
         ("2026-09-20T23:30:00-12:00", True),
@@ -2752,11 +2764,11 @@ class TestCanEverEnterAtTheCheckpointInstant:
         # Seeded sweep of openings and closes in offsets from -12:00 to +14:00,
         # with start dates within a few weeks of either end of datetime's
         # range: never an exception, in any offset. And never a market the
-        # date test dropped, for openings stamped at or west of +07:00 (UTC,
-        # the only offset Kalshi emits, among them). Further east the date
-        # test drops what the scan reaches: at an offset X, a Tuesday local
-        # date is the Monday in UTC from 24:00 - X, which is before a 17:00 UTC
-        # checkpoint once X passes 7 hours (8 under daylight time's 16:00;
+        # date test dropped, for openings stamped at or west of +07:00 (this
+        # range includes UTC, the only offset Kalshi emits). Further east the
+        # date test drops what the scan reaches: at offset +X, local Tuesday
+        # 00:00 is Monday (24 - X):00 in UTC, which is before a 17:00 UTC
+        # checkpoint once X exceeds 7 hours (8 under daylight time's 16:00;
         # test_the_opening_is_compared_as_a_utc_instant).
         rng = random.Random(1_2026_0924)
         zones = [timezone(timedelta(minutes=15 * q)) for q in range(-48, 57)]
@@ -2933,9 +2945,10 @@ class TestCanEverEnterMatchesTheScan:
     (a market that can never enter would be grouped and paired for nothing)
     and no tighter (a dropped market that could enter would move a result) —
     under any schedule _prepare_candidates accepts. On the shipped schedule
-    it admits everything the Monday 09:00 UTC predicate admitted, and, for
-    openings stamped at or west of +07:00 or naive, nothing the date test
-    dropped."""
+    it also admits everything a fixed Monday 09:00 UTC checkpoint admits
+    (_utc0900_can_ever_enter), and, for openings stamped at or west of +07:00
+    or naive, nothing the date test (dates only, _date_granular_can_ever_enter)
+    drops."""
 
     @pytest.mark.parametrize("run", _EXACTNESS_SCHEDULES)
     def test_the_predicate_is_exactly_what_the_scan_can_reach(self, monkeypatch, run):
@@ -2946,11 +2959,11 @@ class TestCanEverEnterMatchesTheScan:
         assert mismatches == []
 
     def test_it_never_admits_what_the_date_test_dropped(self):
-        # Openings stamped at or west of +07:00 (UTC, the only offset Kalshi
-        # emits, among them) and naive ones. Further east the date test drops
-        # what the scan reaches: at an offset X, a Tuesday local date is the
-        # Monday in UTC from 24:00 - X, which is before a 17:00 UTC checkpoint
-        # once X passes 7 hours (8 under daylight time's 16:00).
+        # Openings stamped at or west of +07:00 (this range includes UTC, the
+        # only offset Kalshi emits) and naive ones. Further east the date test
+        # drops what the scan reaches: at offset +X, local Tuesday 00:00 is
+        # Monday (24 - X):00 in UTC, which is before a 17:00 UTC checkpoint
+        # once X exceeds 7 hours (8 under daylight time's 16:00).
         def west_of_plus_seven(open_time):
             offset = _parse_iso_datetime(open_time).utcoffset()
             return offset is None or offset <= timedelta(hours=7)
@@ -2965,9 +2978,13 @@ class TestCanEverEnterMatchesTheScan:
         assert sum(n for n in new) > 50_000
 
     def test_v3_admits_everything_v2_did(self):
-        # A corpus assembled under "monday-checkpoint-v2" is a subset of one
-        # assembled under the current predicate on the shipped schedule, in
-        # every offset: its checkpoint is later on the same UTC date.
+        # In this test's name, v2 is the fixed Monday 09:00 UTC reference
+        # (_utc0900_can_ever_enter) and v3 the prefilter on the shipped
+        # schedule (version numbers of the prefilter's cache tag;
+        # config.SETTLED_PREFILTER_CACHE_TAG is "checkpoint-v3"). Every
+        # market the reference admits, the prefilter admits too, in every
+        # offset, because the shipped checkpoint is later on the same UTC
+        # date; and it admits some the reference does not.
         grid = _p5_grid()
         new = [_can_ever_enter(m, s) for m, s in grid]
         v2 = [_utc0900_can_ever_enter(m, s) for m, s in grid]
@@ -3116,7 +3133,8 @@ class TestScheduleProblemsAreRefused:
 
     def test_it_runs_before_the_feasibility_short_circuit(self, monkeypatch):
         # A window with no checkpoint yet (it starts after today) still
-        # refuses an unsound schedule; under the shipped one it short-circuits.
+        # refuses a schedule ScheduledRun.date_problems rejects; under the
+        # shipped one it short-circuits.
         future = datetime.now(UTC).date() + timedelta(days=30)
         self._no_fetch(monkeypatch)
         assert self._prepare(start=future) is None
@@ -3136,10 +3154,12 @@ class TestScheduleProblemsAreRefused:
 
 
 class TestPrefilterCacheTag:
-    """The assembled cache is keyed by the predicate's version AND the
-    schedule it filters for, read when the fetch is called, so a corpus is
-    never served to a run filtering for another schedule. The candle period
-    the predicate also reads rides the version."""
+    """The assembled cache (the on-disk prefiltered market list) is named by
+    the prefilter's version AND the schedule it filters for, read when the
+    fetch is called, so a list is never served to a run filtering for
+    another schedule. The candle period the prefilter also reads is not in
+    the name: the version must change with it
+    (test_the_version_names_this_candle_period)."""
 
     def test_the_shipped_tag(self):
         assert backtester._prefilter_cache_tag() == "checkpoint-v3-mon0900-America-Los_Angeles"
@@ -12921,7 +12941,7 @@ class TestEntryCheckpointLogging:
     line, with the UTC times its checkpoints fall at over [start_date, today]
     (two when the window spans a clock change). The line never raises: an
     unresolvable zone still reaches _prepare_candidates' refusal, and a start
-    date at the end of date's range its OverflowError."""
+    date near date.max still reaches _prepare_candidates' OverflowError."""
 
     _PREFIX = "Entry checkpoint (backtest): "
     _SOURCE = " (config.SCHEDULED_RUN, the live scheduler's run time): "

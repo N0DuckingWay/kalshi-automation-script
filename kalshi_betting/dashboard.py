@@ -315,9 +315,9 @@ Notes:
     configured switch the run recorded
     (BacktestSweep.config_same_event_ladders), naming a departure from this
     checkout's config rather than rendering a bare on/off. The line under it
-    names the entry checkpoint every trade was entered at — the live
-    scheduler's weekly run time (BacktestSweep.entry_checkpoint), or "not
-    recorded".
+    names the entry checkpoint — the weekly moment at which every simulated
+    trade was opened, which is the live scheduler's run time
+    (BacktestSweep.entry_checkpoint) — or says "not recorded".
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -4127,13 +4127,16 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
 
 def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     """
-    Render the page-header line naming the weekly instant the run entered its trades at.
+    Render the page-header line naming the weekly moment at which the run opened its trades.
 
-    Every entry is priced at the entry checkpoint, the live scheduler's
-    weekly run time (config.SCHEDULED_RUN), which the run records as
-    BacktestSweep.entry_checkpoint. Read by type: anything but a non-empty
-    str (no sweep, a hand-built sweep, a stand-in object) reads "not
-    recorded".
+    The backtest opens simulated trades only at its entry checkpoints: the
+    live bot's weekly run time (config.SCHEDULED_RUN), and every entry is
+    priced from each market's latest candle (its hourly price record) at or
+    before that moment. The run records that schedule's label as
+    BacktestSweep.entry_checkpoint, and generate_dashboard() prints this
+    line under the run-settings line. The value is checked by type:
+    anything but a non-empty str (no sweep, a hand-built sweep that did not
+    record it, a stand-in test object) reads "not recorded".
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -9726,8 +9729,8 @@ def generate_dashboard(
     # The rate every ratio below subtracts, or its absence (DR-66)
     rf_note = _risk_free_html(risk_free, equity_df)
 
-    # The weekly instant every entry was priced at (the live scheduler's run
-    # time, BacktestSweep.entry_checkpoint), under the run-settings line
+    # The weekly moment every entry was priced at (the live scheduler's run
+    # time, BacktestSweep.entry_checkpoint), shown under the run-settings line
     entry_checkpoint = _entry_checkpoint_html(sweep)
 
     # Each section is built as it is written, so only one is alive at a time
