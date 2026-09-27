@@ -259,8 +259,9 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
 
     A record without a readable date or yield — a yield too large for a float
     included (a JSON integer of hundreds of digits in a hand-edited cache
-    raises OverflowError) — or with a yield outside [0%, 100%), is skipped and
-    counted. Two records on one date are averaged.
+    raises OverflowError), and a JSON true or false, which float() would read
+    as 1% or 0% since bool is an int subclass — or with a yield outside
+    [0%, 100%), is skipped and counted. Two records on one date are averaged.
 
     Args:
         rows: The API's records (a download's, or a cached copy's).
@@ -276,11 +277,14 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
     for row in rows:
         try:
             day = date.fromisoformat(row["auction_date"])
-            rate = float(row[RISK_FREE_RATE_FIELD]) / 100.0
+            raw = row[RISK_FREE_RATE_FIELD]
+            # A boolean is not a yield: float(True) is 1.0, which would read
+            # as a 1% auction rather than as an unreadable record
+            rate = None if isinstance(raw, bool) else float(raw) / 100.0
         except (KeyError, TypeError, ValueError, OverflowError):
             skipped += 1
             continue
-        if not (math.isfinite(rate) and 0.0 <= rate < 1.0):
+        if rate is None or not (math.isfinite(rate) and 0.0 <= rate < 1.0):
             skipped += 1
             continue
         by_date.setdefault(day, []).append(rate)
@@ -298,12 +302,18 @@ def _read_cache() -> RiskFreeRates | None:
     The copy an earlier run saved, or None when there is none usable.
 
     A copy saved for another bill term or rate field is not used: it describes
-    a different rate from the one config names.
+    a different rate from the one config names. Nor is one whose download
+    time is naive, or aware but without a UTC instant: the stamp is returned
+    in UTC, and an aware stamp within a day of datetime's range (a
+    hand-edited "9999-12-31T23:30:00-01:00" or "0001-01-01T00:30:00+01:00")
+    overflows there — the dashboard's header renders it in UTC, after the
+    backtest has finished.
 
     Returns:
         RiskFreeRates | None: source SOURCE_CACHE, stamped with the copy's own
-            download time; None when the file is absent, unreadable, for
-            another term or field, or holds no readable auction.
+            download time in UTC; None when the file is absent, unreadable, for
+            another term or field, stamped naive or out of range, or holds no
+            readable auction.
     """
     cached = _load_json_cache(_RATES_CACHE)
     if not isinstance(cached, dict) or cached.get("term") != RISK_FREE_BILL_TERM \
@@ -315,6 +325,12 @@ def _read_cache() -> RiskFreeRates | None:
     except (KeyError, TypeError, ValueError):
         return None
     if fetched_at.tzinfo is None:
+        return None
+    try:
+        # Normalized here, so no later reader can overflow converting it: an
+        # aware stamp within a day of datetime's range has no UTC instant
+        fetched_at = fetched_at.astimezone(UTC)
+    except OverflowError:
         return None
     return RiskFreeRates(auctions, SOURCE_CACHE, fetched_at)
 
@@ -333,11 +349,14 @@ def load_risk_free_rates() -> RiskFreeRates:
     Nothing escapes: a download that fails, a saved copy that cannot be read
     (an unsearchable directory's PermissionError, a deeply nested file's
     RecursionError, a yield no float can hold) and a save that fails (any
-    exception, not only OSError) each degrade with a WARNING. The worst case
-    is time, not an exception: a host that swallows packets costs each of
-    api_call_with_retry's 6 attempts the full TREASURY_API_TIMEOUT_SECONDS
-    (30 s) plus its 62 s of backoff between them — about 4 minutes — before
-    the fallback.
+    exception, not only OSError) each degrade with a WARNING, and a saved
+    copy stamped with a time that has no UTC instant is passed over as no
+    usable copy (_read_cache). The worst case is time, not an exception: a
+    host that swallows packets costs each of api_call_with_retry's 6
+    attempts at least TREASURY_API_TIMEOUT_SECONDS (30 s per resolved
+    address — the timeout bounds each socket operation, not the whole
+    request) plus its 62 s of backoff between them: about 4 minutes for a
+    single-address host, before the fallback.
 
     Returns:
         RiskFreeRates: The yields, with their source and download time.
@@ -362,8 +381,9 @@ def load_risk_free_rates() -> RiskFreeRates:
                 cached.fetched_at.isoformat(timespec="minutes"), cached.latest[0])
             return cached
         logging.warning(
-            "Treasury Fiscal Data unavailable (%s) and no copy is saved — the dashboard's "
-            "Sharpe and Sortino ratios subtract 0%%", _exception_summary(exc))
+            "Treasury Fiscal Data unavailable (%s) and no usable earlier download is saved "
+            "— the dashboard's Sharpe and Sortino ratios subtract 0%%",
+            _exception_summary(exc))
         return RiskFreeRates((), SOURCE_UNAVAILABLE, None)
     now = datetime.now(UTC)
     try:

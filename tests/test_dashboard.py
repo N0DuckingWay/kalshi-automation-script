@@ -35,6 +35,7 @@ import math
 import re
 import shutil
 import subprocess
+import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -8342,8 +8343,9 @@ def _hand_hurdle(eq: pd.DataFrame, trades: list[BacktestTrade],
     """
     A strategy curve's per-row annual hurdle by hand, never through the
     helpers under test: row t is charged the yield in force on its date times
-    the share of the previous row's portfolio in open trades — every trade
-    with entry <= previous date < exit, fee-inclusive — and row 0 nothing.
+    the share of the previous row's portfolio in open trades — the cost,
+    WITHOUT fees, of every trade with entry <= previous date < exit: the cost
+    basis the portfolio value itself carries — and row 0 nothing.
 
     The rule a trade whose entry and exit fall on the curve's axis (or its
     exit after the axis's end) follows; every fixture's does.
@@ -8353,9 +8355,8 @@ def _hand_hurdle(eq: pd.DataFrame, trades: list[BacktestTrade],
     out = [0.0] if days else []
     for row in range(1, len(days)):
         prev = days[row - 1]
-        deployed = sum(t.total_cost + t.fees for t in trades
-                       if t.entry_date <= prev < t.exit_date)
-        out.append(_hand_annual(rates, days[row]) * deployed / values[row - 1])
+        open_cost = sum(t.total_cost for t in trades if t.entry_date <= prev < t.exit_date)
+        out.append(_hand_annual(rates, days[row]) * open_cost / values[row - 1])
     return np.array(out, dtype=float)
 
 
@@ -8452,9 +8453,11 @@ class TestRiskFreeHurdle:
         assert list(dashboard._rf_hurdle_invested(unavailable, dates)) == [0.0] * 6
         assert list(dashboard._rf_hurdle(unavailable, eq, [make_trade()])) == [0.0] * 6
         # A strategy curve: the yield on the previous close's capital in open
-        # trades — make_trade's $3.50 + fees from 2026-01-05, on $1,000
+        # trades — make_trade's $3.50 cost from 2026-01-05, its fees left out
+        # (already spent), on $1,000
         t = make_trade()
-        share = (t.total_cost + t.fees) / 1000.0
+        assert t.fees > 0
+        share = t.total_cost / 1000.0
         assert list(dashboard._rf_hurdle(_rates(), eq, [t])) == pytest.approx(
             [0.0, 0.03 * share, 0.03 * share, 0.05 * share, 0.05 * share, 0.05 * share])
 
@@ -8511,11 +8514,15 @@ def _held(entry: date, exit_: date, cost: float, fees: float = 0.0) -> BacktestT
 
 
 class TestCapitalDeployedParity:
-    """_capital_deployed now returns _deployed_on_days (vectorized, one
-    definition shared with the risk-free hurdle). It must be BIT-identical to
-    the per-row loop it replaced — the Risk section's chart and every filter
-    view's redraw of it read it, and TestGoldenSections' Risk digest pins the
-    rendered chart — on every shape a curve and its trades can take."""
+    """_capital_deployed now returns _deployed_on_days with the fees included
+    (vectorized, one definition the risk-free hurdle reads without them). It
+    must be bit-identical to the per-row loop it replaced for datetime.date
+    trade dates (BacktestTrade's type) — the Risk section's chart and every
+    filter view's redraw of it read it, and TestGoldenSections' Risk digest
+    pins the rendered chart — on every shape a curve and its trades can
+    take. A trade dated with a datetime or Timestamp now matches its
+    calendar day, where the loop's dict lookup matched nothing; a None date
+    matches nothing, as before."""
 
     _D = date(2026, 1, 5)
 
@@ -8559,13 +8566,28 @@ class TestCapitalDeployedParity:
             "float noise": ([_held(d, d + 3 * day, 0.1, 0.2), _held(d, d + 5 * day, 0.7, 0.1),
                              _held(d + 1 * day, d + 3 * day, 1e-9, 0.3),
                              _held(d + 1 * day, d + 5 * day, 123.456, 0.0)], cls._curve(8)),
+            # A NaN poisons the running sum from its entry on: the floor keeps
+            # a value only when it is > 0.0, so every such row reads 0.0, as
+            # max(0.0, nan) did (np.maximum would read NaN)
+            "a NaN cost": ([_held(d + 1 * day, d + 4 * day, 5.0, 0.5),
+                            _held(d + 3 * day, d + 6 * day, float("nan")),
+                            _held(d + 5 * day, d + 7 * day, 2.0, 0.1)], cls._curve(10)),
+            "a -0.0 cost": ([_held(d, d + 2 * day, -0.0), _held(d + 1 * day, d + 2 * day, -0.0),
+                             _held(d + 3 * day, d + 5 * day, 4.0, -0.0)], cls._curve(8)),
+            # Hand-built trades: a None date matches no row, never raising
+            "a None entry or exit": ([dataclasses.replace(_held(d, d + 3 * day, 9.0, 0.4),
+                                                          entry_date=None),
+                                      dataclasses.replace(_held(d + 1 * day, d, 6.0, 0.2),
+                                                          exit_date=None),
+                                      _held(d + 2 * day, d + 5 * day, 3.0, 0.1)],
+                                     cls._curve(8)),
         }
 
     @pytest.mark.parametrize("name", [
         "no trade", "one trade", "same-day entry and exit", "overlapping",
         "entry before the axis", "exit after the axis", "entirely off the axis",
         "a Timestamp date column", "a tz-aware Timestamp column", "an empty curve",
-        "float noise"])
+        "float noise", "a NaN cost", "a -0.0 cost", "a None entry or exit"])
     def test_bit_identical_to_the_loop(self, name):
         trades, eq = self._fixtures()[name]
         new = dashboard._capital_deployed(trades, eq)
@@ -8589,12 +8611,46 @@ class TestCapitalDeployedParity:
             assert _float_bits(dashboard._capital_deployed(trades, eq)) \
                 == _float_bits(_old_capital_deployed(trades, eq))
 
+    def test_a_timestamp_trade_date_matches_its_calendar_day(self):
+        # The one departure from the loop: a trade dated with a datetime or a
+        # Timestamp now matches its calendar day, as a row's date does
+        # (treasury.day_numbers); the loop's dict, keyed on the Timestamp
+        # itself, matched no datetime.date row, so only the exit subtracted
+        d = self._D
+        eq = self._curve(6)
+        plain = _held(d + timedelta(days=1), d + timedelta(days=4), 10.0, 0.5)
+        want = dashboard._capital_deployed([plain], eq)
+        assert want == [0.0, 10.5, 10.5, 10.5, 0.0, 0.0]
+        for stamped in (pd.Timestamp(d + timedelta(days=1)) + pd.Timedelta(hours=9),
+                        datetime(2026, 1, 6, 9, 0)):
+            dated = dataclasses.replace(plain, entry_date=stamped)
+            assert dashboard._capital_deployed([dated], eq) == want
+            assert _old_capital_deployed([dated], eq) == [0.0] * 6
+
+    def test_a_none_trade_date_never_raises(self):
+        # A hand-built trade with no dates: the loop matched nothing for it,
+        # and C4's vectorized helper raised AttributeError from toordinal —
+        # the Risk section (never given rates) with it, and the hurdle
+        eq = make_equity([1000.0, 1004.0, 998.0, 1010.0, 1007.0, 1015.0, 1012.0, 1020.0])
+        dated = make_trade()
+        undated = dataclasses.replace(dated, entry_date=None, exit_date=None)
+        section = dashboard._section_risk([undated, dated], eq, 1000.0)
+        assert "Capital Deployed Over Time" in section
+        assert dashboard._capital_deployed([undated, dated], eq) \
+            == dashboard._capital_deployed([dated], eq) \
+            == _old_capital_deployed([undated, dated], eq)
+        assert list(dashboard._rf_hurdle(_rates(), eq, [undated, dated])) \
+            == list(dashboard._rf_hurdle(_rates(), eq, [dated]))
+        assert not dashboard._rf_hurdle(_rates(), eq, [undated]).any()
+
 
 class TestRiskFreeOnDeployedCapital:
     """A strategy curve is charged the bill's yield only on its capital in
     open trades (idle cash is taken to earn it): row t's hurdle is the yield
-    in force on its date times deployed[t-1] / portfolio_value[t-1]. The
-    ^GSPC row stays fully invested."""
+    in force on its date times open[t-1] / portfolio_value[t-1], open being
+    the open trades' cost WITHOUT fees — the cost basis the portfolio value
+    carries, so the share is at most 1 on a simulated curve. The ^GSPC row
+    stays fully invested."""
 
     _START = date(2026, 1, 5)
 
@@ -8630,13 +8686,14 @@ class TestRiskFreeOnDeployedCapital:
             == dashboard._strategy_row(curve, 1000.0)
 
     def test_a_fully_deployed_curve_equals_the_full_hurdle(self):
-        # Each close's whole value is in a trade held to the next close, with
-        # no fee: f = 1 on every row after the first, so the hurdle is the
-        # whole yield there (row 0 has no previous close and is charged 0)
+        # Each close's whole value is in a trade held to the next close: f = 1
+        # on every row after the first, so the hurdle is the whole yield there
+        # (row 0 has no previous close and is charged 0). The fees do not
+        # count — already spent, they are no part of the value carried
         eq = make_equity([1000.0, 1004.0, 998.0, 1010.0, 1007.0, 1015.0, 1012.0, 1020.0])
         days = list(eq["date"])
         values = list(eq["portfolio_value"])
-        trades = [_held(days[i], days[i + 1], values[i]) for i in range(len(days) - 1)]
+        trades = [_held(days[i], days[i + 1], values[i], 2.5) for i in range(len(days) - 1)]
         hurdle = dashboard._rf_hurdle(_rates(), eq, trades)
         full = dashboard._rf_hurdle_invested(_rates(), eq["date"])
         assert hurdle[0] == 0.0
@@ -8646,6 +8703,44 @@ class TestRiskFreeOnDeployedCapital:
             == dashboard._sharpe(eq["daily_return"], rf=full_but_row_0)
         assert dashboard._sharpe(eq["daily_return"], rf=hurdle) \
             < dashboard._sharpe(eq["daily_return"])
+
+    def test_a_fully_deployed_row_s_share_is_its_cost_over_its_value(self):
+        # A simulated curve whose one trade spends every dollar: cost + fees
+        # = the whole $1,000, so the next close holds no cash and a value of
+        # exactly the $990 cost basis. f = cost / V = 1, never above it; the
+        # fee-inclusive capital deployed ($1,000, which the Risk chart still
+        # shows) over V would have charged 1000 / 990 of the yield
+        trade = _held(date(2026, 1, 7), date(2026, 1, 10), 990.0, 10.0)
+        eq = backtester._build_equity_curve([trade], self._START, 1000.0,
+                                            end_date=date(2026, 1, 14))
+        # One auction at an exact binary fraction, so hurdle / yield is f exactly
+        rates = RiskFreeRates(((date(2026, 1, 1), 0.5),), SOURCE_API, None)
+        share = dashboard._rf_hurdle(rates, eq, [trade]) / 0.5
+        dates, values = list(eq["date"]), list(eq["portfolio_value"])
+        held = [i for i, d in enumerate(dates) if trade.entry_date <= d < trade.exit_date]
+        assert [values[i] for i in held] == [990.0, 990.0, 990.0]
+        for row in range(1, len(dates)):
+            want = trade.total_cost / values[row - 1] if row - 1 in held else 0.0
+            assert share[row] == want
+        assert [share[i + 1] for i in held] == [1.0, 1.0, 1.0]
+        assert share.max() <= 1.0
+        # The chart's capital deployed stays fee-inclusive
+        assert [dashboard._capital_deployed([trade], eq)[i] for i in held] == [1000.0] * 3
+
+    def test_a_ruined_curve_is_charged_nothing_after_a_non_positive_close(self):
+        # A hand-built curve whose value falls to 0 and below with a trade
+        # still open: a row whose previous close is not positive is charged
+        # nothing — no division, so no inf, no NaN, no sign flip, no warning
+        eq = make_equity([1000.0, 0.0, -50.0, 20.0, 40.0])
+        trade = _held(date(2026, 1, 5), date(2026, 1, 9), 100.0, 1.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            hurdle = dashboard._rf_hurdle(_rates(), eq, [trade])
+        # Held 01-05 to 01-09: 3% to 01-07, 5% from 01-08
+        assert list(hurdle[:4]) == [0.0, 0.03 * (100.0 / 1000.0), 0.0, 0.0]
+        # ... and a positive close charges again (a hand-built frame's cash is
+        # not the backtester's, so its share can exceed 1)
+        assert hurdle[4] == 0.05 * (100.0 / 20.0)
 
     def test_each_slice_is_charged_on_its_own_trades(self):
         # _view_payload's slices: each its own curve (_build_equity_curve over
@@ -8989,8 +9084,8 @@ class TestRiskFreeHeader:
         line = dashboard._risk_free_html(RiskFreeRates((), SOURCE_UNAVAILABLE, None), self._EQ)
         assert line.startswith('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
                                "Risk-free rate unavailable:")
-        assert ("the download from the Treasury's Fiscal Data API failed and no earlier "
-                "download is saved, so every Sharpe and "
+        assert ("the download from the Treasury's Fiscal Data API failed and no usable "
+                "earlier download is saved, so every Sharpe and "
                 "Sortino ratio on this page subtracts 0% instead of the 8-week bill's yield."
                 ) in line
 
@@ -9003,18 +9098,20 @@ class TestRiskFreeHeader:
             '<p style="color:#616161; font-size:14px;">Risk-free rate: the 8-week Treasury '
             "bill's auction yield (high_investment_rate, Treasury Fiscal Data) in force on "
             "each day — the latest auction on or before it — is subtracted in every Sharpe "
-            "and Sortino ratio on this page, charged on the capital each day had in open "
-            "trades: idle cash is taken to earn the same yield. The S&amp;P 500 row is fully "
-            "invested and is charged the whole yield. The yield averaged 4.25% over this "
-            "window. Latest auction 2026-01-08: 5.000% (downloaded 2026-09-27 06:30 UTC).</p>")
+            "and Sortino ratio on this page, charged on the capital in open trades at each "
+            "previous close: idle cash is taken to earn the same yield. The S&amp;P 500 row, "
+            "when shown, is fully invested and is charged the whole yield. The yield averaged "
+            "4.25% over this window. Latest auction 2026-01-08: 5.000% (downloaded "
+            "2026-09-27 06:30 UTC).</p>")
 
     def test_cached(self):
         line = dashboard._risk_free_html(_rates(SOURCE_CACHE), self._EQ)
         assert line.startswith('<p style="color:#E65100; font-size:14px; font-weight:700;">'
                                "Risk-free rate: the 8-week Treasury bill's auction yield")
         assert "The yield averaged 4.25% over this window." in line
-        assert ("charged on the capital each day had in open trades: idle cash is taken to "
-                "earn the same yield. The S&amp;P 500 row is fully invested") in line
+        assert ("charged on the capital in open trades at each previous close: idle cash is "
+                "taken to earn the same yield. The S&amp;P 500 row, when shown, is fully "
+                "invested") in line
         assert line.endswith(
             " The download failed: these are the yields downloaded 2026-09-27 06:30 "
             "UTC, whose latest auction (2026-01-08, 5.000%) stands for every day after it.</p>")
@@ -9026,6 +9123,15 @@ class TestRiskFreeHeader:
         assert "(downloaded 2026-09-27 06:30 UTC)" in line
         assert "at a time not recorded" in dashboard._risk_free_html(
             _rates(fetched_at=None), self._EQ)
+
+    @pytest.mark.parametrize("stamp", ["9999-12-31T23:30:00-01:00", "0001-01-01T00:30:00+01:00"])
+    def test_a_stamp_with_no_utc_instant_never_raises(self, stamp):
+        # treasury._read_cache refuses such a stamp; a hand-built RiskFreeRates
+        # may still carry one, and astimezone(UTC) overflows on it — the header
+        # is built after the backtest has finished, so it must not raise
+        rates = _rates(SOURCE_CACHE, fetched_at=datetime.fromisoformat(stamp))
+        line = dashboard._risk_free_html(rates, self._EQ)
+        assert "these are the yields downloaded at a time not recorded" in line
 
     def test_the_first_auction_note_only_before_it(self):
         note = "The 8-week bill was first auctioned on 2026-01-01; earlier days use"
@@ -9064,7 +9170,10 @@ class TestRiskFreeIsThreaded:
     function (or class) taking a keyword-only `risk_free` passes it; and every
     call that passes risk_free to a taker that also takes a keyword-only
     `trades` passes trades (never None). Without this, a dropped pass-through
-    computes that path at 0% silently and the page disagrees with itself."""
+    computes that path at 0% silently and the page disagrees with itself.
+    The pin checks how each pass-through is spelled, not what the name is
+    bound to: a local rebinding, a walrus or a helper taking risk_free
+    positionally passes it — the by-value page tests are what catch those."""
 
     # What the rules must find, so a refactor cannot make them vacuous
     _EXPECTED = {

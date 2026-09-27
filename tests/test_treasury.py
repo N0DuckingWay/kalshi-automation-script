@@ -30,9 +30,10 @@ import importlib
 import inspect
 import json
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -101,8 +102,11 @@ class TestParseAuctions:
         {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: float("nan")},  # NaN
         {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: "-0.1"},  # negative
         {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: "150"},   # >= 100%
+        # bool is an int subclass: float(True) is 1.0, a 1% yield, not a record
+        {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: True},    # JSON true
+        {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: False},   # JSON false
     ], ids=["null-date", "null-rate", "empty-string", "missing-key", "non-dict",
-            "nan", "negative", "over-100pct"])
+            "nan", "negative", "over-100pct", "json-true", "json-false"])
     def test_unreadable_or_out_of_range_records_are_skipped_and_counted(self, bad_row, caplog):
         good = {"auction_date": "2020-01-01", treasury.RISK_FREE_RATE_FIELD: "1.0"}
         with caplog.at_level(logging.INFO):
@@ -218,7 +222,7 @@ class TestLoad:
         with caplog.at_level(logging.WARNING):
             got = treasury.load_risk_free_rates()
         assert got == treasury.RiskFreeRates((), treasury.SOURCE_UNAVAILABLE, None)
-        assert "no copy is saved" in caplog.text
+        assert "no usable earlier download is saved" in caplog.text
 
     @pytest.mark.parametrize("bad_cache", [
         {"fetched_at": "2026-09-01T00:00:00+00:00", "term": "13-Week",
@@ -235,6 +239,30 @@ class TestLoad:
         _stub_fetch(monkeypatch, RuntimeError("offline"))
         got = treasury.load_risk_free_rates()
         assert got.source == treasury.SOURCE_UNAVAILABLE
+
+    @pytest.mark.parametrize("stamp", ["9999-12-31T23:30:00-01:00",
+                                       "0001-01-01T00:30:00+01:00"])
+    def test_a_stamp_with_no_utc_instant_is_no_usable_copy(self, monkeypatch, stamp):
+        # Aware, but within a day of datetime's range: astimezone(UTC)
+        # overflows. Served, it raised OverflowError out of the dashboard's
+        # header after a finished backtest; now it is no usable copy
+        treasury._RATES_CACHE.write_text(json.dumps({
+            "fetched_at": stamp, "term": treasury.RISK_FREE_BILL_TERM,
+            "field": treasury.RISK_FREE_RATE_FIELD, "records": GOOD_ROWS}))
+        _stub_fetch(monkeypatch, RuntimeError("offline"))
+        assert treasury._read_cache() is None
+        got = treasury.load_risk_free_rates()
+        assert got == treasury.RiskFreeRates((), treasury.SOURCE_UNAVAILABLE, None)
+
+    def test_a_cached_stamp_is_returned_in_utc(self, monkeypatch):
+        treasury._RATES_CACHE.write_text(json.dumps({
+            "fetched_at": "2026-09-01T02:30:00-04:00", "term": treasury.RISK_FREE_BILL_TERM,
+            "field": treasury.RISK_FREE_RATE_FIELD, "records": GOOD_ROWS}))
+        _stub_fetch(monkeypatch, RuntimeError("offline"))
+        got = treasury.load_risk_free_rates()
+        assert got.source == treasury.SOURCE_CACHE
+        assert got.fetched_at == datetime(2026, 9, 1, 6, 30, tzinfo=UTC)
+        assert got.fetched_at.utcoffset() == timedelta(0)
 
     def test_a_corrupt_cache_is_ignored(self, monkeypatch):
         treasury._RATES_CACHE.write_text("not valid json at all {")
@@ -279,7 +307,7 @@ class TestLoad:
             got = treasury.load_risk_free_rates()
         assert got == treasury.RiskFreeRates((), treasury.SOURCE_UNAVAILABLE, None)
         assert "Could not read the saved 8-Week bill yields" in caplog.text
-        assert "no copy is saved" in caplog.text
+        assert "no usable earlier download is saved" in caplog.text
 
     def test_any_error_saving_still_returns_source_api(self, monkeypatch, caplog):
         # Not only OSError: a TypeError out of the serializer must not cost the
@@ -381,6 +409,19 @@ class TestAnnualOn:
         assert list(treasury.day_numbers(local)) == [t.date().toordinal() for t in local]
         assert list(treasury.day_numbers(local)) == want
         assert len(treasury.day_numbers([])) == 0
+
+    def test_day_numbers_falls_back_to_pandas_for_what_has_no_toordinal(self):
+        # Strings and numpy datetime64 values carry no toordinal(): read
+        # through pd.to_datetime instead, on the same numbering
+        days = [date(2019, 12, 31), date(2020, 1, 13), date(2020, 3, 1)]
+        want = [d.toordinal() for d in days]
+        assert list(treasury.day_numbers([d.isoformat() for d in days])) == want
+        assert list(treasury.day_numbers(np.array(days, dtype="datetime64[D]"))) == want
+        stamped = np.array([f"{d.isoformat()}T23:15" for d in days], dtype="datetime64[m]")
+        assert list(treasury.day_numbers(stamped)) == want
+        assert list(treasury.day_numbers(list(stamped))) == want
+        assert list(self.RATES.annual_on(np.array(["2019-01-01", "2020-01-15"],
+                                                  dtype="datetime64[D]"))) == [0.01, 0.02]
 
     def test_annual_on_days_is_annual_on_for_day_numbers(self):
         days = [date(2019, 1, 1), date(2020, 1, 13), date(2020, 1, 15), date(2020, 6, 1)]

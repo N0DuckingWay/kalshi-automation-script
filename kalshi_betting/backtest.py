@@ -592,8 +592,10 @@ def main() -> None:
     # Treasury's Fiscal Data API that never raises (it falls back to the last
     # saved download, then to "unavailable", which the page's header names).
     # Its worst case is time: a host that swallows packets costs each of
-    # api_call_with_retry's 6 attempts the 30 s TREASURY_API_TIMEOUT_SECONDS
-    # plus 62 s of backoff between them — about 4 minutes before the fallback
+    # api_call_with_retry's 6 attempts at least TREASURY_API_TIMEOUT_SECONDS
+    # (30 s per resolved address — the timeout bounds each socket operation,
+    # not the whole request) plus 62 s of backoff between them: about 4
+    # minutes for a single-address host, before the fallback
     risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,

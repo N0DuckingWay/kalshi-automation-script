@@ -998,7 +998,8 @@ CALENDAR_DAYS_PER_YEAR: int = 365
 # multi-year window spans very different rates (near 0% in 2020-21, above 5% in
 # 2023). A strategy curve is charged it only on its capital in open trades
 # (dashboard._rf_hurdle: idle cash is taken to earn the yield, since the
-# backtester books it at 0%); the ^GSPC row, fully invested, in full. treasury.load_risk_free_rates() downloads them from the Treasury's
+# backtester books it at 0%); the ^GSPC row, fully invested, in full.
+# treasury.load_risk_free_rates() downloads them from the Treasury's
 # Fiscal Data API ("Treasury Securities Auctions Data": open, no key, GET only,
 # every value a string); backtest.py calls it beside the series-category read.
 # REPORTING ONLY: nothing sizes, prices or settles on it, and the live bot never
@@ -1014,10 +1015,13 @@ RISK_FREE_BILL_TERM: str = "8-Week"
 # percent: the yield a winning bidder earns. The discount rate (high_discnt_rate)
 # is a bank-discount quote that understates it.
 RISK_FREE_RATE_FIELD: str = "high_investment_rate"
-# Per page request; _http.api_call_with_retry retries a 429/500/502/503/504 or
-# a transient transport failure around it, so a host that swallows packets
-# costs up to 6 x 30 s plus 62 s of backoff — about 4 minutes — before
-# treasury.load_risk_free_rates falls back to the saved copy
+# Per socket operation, per resolved address — it bounds each connect or read,
+# not the whole request. _http.api_call_with_retry retries a
+# 429/500/502/503/504 or a transient transport failure around it, so a host
+# that swallows packets costs each of its 6 attempts at least this (30 s per
+# resolved address) plus 62 s of backoff: about 4 minutes for a
+# single-address host, before treasury.load_risk_free_rates falls back to the
+# saved copy
 TREASURY_API_TIMEOUT_SECONDS: int = 30
 # Records per page, and the most pages one download reads — a bound, not an
 # expectation: the whole 8-week history is one page
