@@ -8,7 +8,9 @@ Purpose:
     results of a backtest run. Assembles nine sections — portfolio performance
     (equity curve, Sharpe, drawdown, and the selection's empirical k-hat and
     k-hat − k), returns decomposition (by month, category,
-    entry price), calibration analysis (Brier score, reliability diagram),
+    entry price), calibration analysis (the time-series entry spread
+    pB − pA against the rate settled A = NO, B = YES: Brier score,
+    reliability diagram),
     interval-discount (k) calibration (the pooled empirical k-hat, and the
     equity curve and per-k table at the filter bar's k and size cap, at the
     primary spread band),
@@ -593,53 +595,82 @@ def _median_monthly_return(equity_df: pd.DataFrame | None) -> float | None:
     return float(np.median(returns)) if returns.size else None
 
 
-def _brier_score(trades: list[BacktestTrade]) -> float:
+def _spread_observations(trades: list[BacktestTrade]) -> list[tuple[float, int]]:
     """
-    Compute the mean Brier score across all market predictions in the trade list.
+    The time-series spread calibration's observations, one per time-series trade.
 
-    The Brier score is the mean squared error between predicted probabilities and
-    binary outcomes (1 for "yes", 0 for "no"). Lower scores indicate better calibration.
-    Each trade contributes two predictions: one for market A and one for market B.
+    The prediction is the entry spread pB − pA: the market-implied probability
+    that the event first happens between the two deadlines. The outcome is 1
+    when the pair settled A = NO, B = YES (the in-between cell, where both legs
+    lose) and 0 otherwise. Same-title trades are left out — their price gap is
+    not the probability of anything.
 
     Args:
-        trades (list[BacktestTrade]): List of completed backtest trades with entry prices
-            and settlement outcomes.
+        trades (list[BacktestTrade]): Completed trades of either pair type.
 
     Returns:
-        float: Mean Brier score in [0, 1]. Returns 0.0 if no trades are provided.
+        list[tuple[float, int]]: (spread, in_between) per time-series trade, in
+            list order; empty when there is none.
     """
-    scores = []
-    for t in trades:
-        for prob, outcome in [(t.entry_pA, t.outcome_a), (t.entry_pB, t.outcome_b)]:
-            actual = 1.0 if outcome == "yes" else 0.0
-            scores.append((prob - actual) ** 2)
-    return float(np.mean(scores)) if scores else 0.0
+    return [(t.entry_pB - t.entry_pA,
+             1 if (t.outcome_a, t.outcome_b) == ("no", "yes") else 0)
+            for t in trades if t.pair_type == "time_series"]
 
 
-def _log_loss(trades: list[BacktestTrade]) -> float:
+def _brier_score(obs: list[tuple[float, int]]) -> float | None:
     """
-    Compute the mean binary cross-entropy (log loss) across all market predictions.
+    Mean Brier score (squared error between prediction and binary outcome).
 
-    Measures how well predicted probabilities match binary settlement outcomes. Each
-    trade contributes two (probability, outcome) pairs. Probabilities are clipped to
-    [1e-7, 1-1e-7] to avoid log(0).
+    Lower scores indicate better calibration.
 
     Args:
-        trades (list[BacktestTrade]): List of completed backtest trades with entry prices
-            and settlement outcomes.
+        obs (list[tuple[float, int]]): (predicted probability, outcome 0/1)
+            pairs, as _spread_observations returns them.
 
     Returns:
-        float: Mean log loss. Lower values indicate better calibration. Returns 0.0 if
-            no trades are provided.
+        float | None: Mean Brier score in [0, 1]. Returns None if obs is empty.
     """
+    if not obs:
+        return None
+    return float(np.mean([(prob - actual) ** 2 for prob, actual in obs]))
+
+
+def _log_loss(obs: list[tuple[float, int]]) -> float | None:
+    """
+    Mean binary cross-entropy (log loss) of predictions against outcomes.
+
+    Probabilities are clipped to [1e-7, 1-1e-7] to avoid log(0).
+
+    Args:
+        obs (list[tuple[float, int]]): (predicted probability, outcome 0/1)
+            pairs, as _spread_observations returns them.
+
+    Returns:
+        float | None: Mean log loss; lower is better calibrated. Returns None
+            if obs is empty.
+    """
+    if not obs:
+        return None
     eps = 1e-7
     losses = []
-    for t in trades:
-        for prob, outcome in [(t.entry_pA, t.outcome_a), (t.entry_pB, t.outcome_b)]:
-            actual = 1.0 if outcome == "yes" else 0.0
-            p = max(eps, min(1 - eps, prob))
-            losses.append(-(actual * np.log(p) + (1 - actual) * np.log(1 - p)))
-    return float(np.mean(losses)) if losses else 0.0
+    for prob, actual in obs:
+        p = max(eps, min(1 - eps, prob))
+        losses.append(-(actual * np.log(p) + (1 - actual) * np.log(1 - p)))
+    return float(np.mean(losses))
+
+
+def _score_text(value: float | None) -> str:
+    """
+    Format a calibration score for a card or the filter payload.
+
+    Args:
+        value (float | None): A Brier score or log loss, or None when there
+            was nothing to score.
+
+    Returns:
+        str: The value to four decimals, or "—" for None.
+    """
+    return "—" if value is None else f"{value:.4f}"
 
 
 def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
@@ -1315,30 +1346,30 @@ def _section_decomposition(
 
 def _reliability(trades: list[BacktestTrade]) -> dict:
     """
-    Compute the price-calibration figures: Brier score, log loss and the
+    Compute the spread-calibration figures: Brier score, log loss and the
     reliability diagram's points.
 
-    Each trade contributes two predictions — market A's and market B's YES ask
-    at entry — against the side each market settled on. The diagram bins them
-    into 10 equal-width probability bins and keeps the non-empty ones.
+    Each time-series trade contributes one prediction — its entry spread
+    pB − pA, the market-implied probability that the event lands between the
+    two deadlines — against whether the pair settled A = NO, B = YES
+    (_spread_observations). Same-title trades contribute nothing. The diagram
+    bins the predictions into 10 equal-width probability bins and keeps the
+    non-empty ones.
 
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
 
     Returns:
-        dict: "brier" and "log_loss" (_brier_score / _log_loss, 0.0 with no
-            trades), and per non-empty bin, in ascending order: "mean_pred"
-            (mean predicted probability), "mean_act" (share that resolved YES),
-            "counts" (predictions in the bin), "labels" ("0.3–0.4"), and how the
-            diagram draws each bin: "sizes" (marker px) and "texts" (hover).
+        dict: "brier" and "log_loss" (_brier_score / _log_loss, None with no
+            time-series trade), and per non-empty bin, in ascending order:
+            "mean_pred" (mean spread), "mean_act" (share that settled in
+            between), "counts" (trades in the bin), "labels" ("0.3–0.4"), and
+            how the diagram draws each bin: "sizes" (marker px) and "texts"
+            (hover).
     """
-    # Collect (predicted_prob, actual_outcome) pairs
-    probs, actuals = [], []
-    for t in trades:
-        probs.append(t.entry_pA)
-        actuals.append(1 if t.outcome_a == "yes" else 0)
-        probs.append(t.entry_pB)
-        actuals.append(1 if t.outcome_b == "yes" else 0)
+    obs = _spread_observations(trades)
+    probs = [p for p, _ in obs]
+    actuals = [a for _, a in obs]
 
     # Reliability diagram — 10 equal-width bins
     bins   = np.linspace(0, 1, 11)
@@ -1357,7 +1388,7 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
         labels.append(f"{bins[i]:.1f}–{bins[i+1]:.1f}")
 
     return {
-        "brier": _brier_score(trades), "log_loss": _log_loss(trades),
+        "brier": _brier_score(obs), "log_loss": _log_loss(obs),
         "mean_pred": mean_pred, "mean_act": mean_act, "counts": counts, "labels": labels,
         # How the diagram draws each bin: a marker growing with its count
         # (never below 6 px) and "n=<count>" on hover
@@ -1366,18 +1397,28 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     }
 
 
-def _calibration_title(brier: float, log_loss: float) -> str:
+def _calibration_title(brier: float | None, log_loss: float | None) -> str:
     """
     Title of the reliability diagram, which states the two scores.
 
     Args:
-        brier (float): The Brier score.
-        log_loss (float): The log loss.
+        brier (float | None): The Brier score; None with no time-series trade.
+        log_loss (float | None): The log loss; None with no time-series trade.
 
     Returns:
-        str: "Calibration Curve (Brier=0.1234, LogLoss=0.5678)".
+        str: "Calibration Curve (Brier=0.1234, LogLoss=0.5678)", or
+            "Calibration Curve (no time-series trades)" when either is None.
     """
+    if brier is None or log_loss is None:
+        return "Calibration Curve (no time-series trades)"
     return f"Calibration Curve (Brier={brier:.4f}, LogLoss={log_loss:.4f})"
+
+
+_CALIBRATION_CAPTION = (
+    '<p style="color:#666;font-size:13px">Time-series trades only: the entry spread '
+    "pB − pA — the market-implied probability that the event lands between the two "
+    "deadlines — against how often the pair settled A = NO, B = YES.</p>"
+)
 
 
 def _section_calibration(trades: list[BacktestTrade]) -> str:
@@ -1385,7 +1426,10 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     Build the "Calibration Analysis" HTML section.
 
     Computes Brier score and log loss KPIs and renders a reliability diagram
-    (actual resolution rate vs. predicted probability per bin).
+    of the time-series entry spread pB − pA against the rate the pairs settled
+    A = NO, B = YES, per bin (_reliability). Same-title trades are not shown;
+    a selection without a time-series trade shows "—" cards and an empty
+    diagram.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry prices
@@ -1411,19 +1455,20 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     ))
     fig_cal.update_layout(
         title=_calibration_title(brier, ll),
-        xaxis_title="Predicted probability",
-        yaxis_title="Actual resolution rate",
+        xaxis_title="Predicted probability: spread pB − pA",
+        yaxis_title="Actual rate settled A = NO, B = YES",
         xaxis={"range": [0, 1]}, yaxis={"range": [0, 1]},
     )
 
     kpis = "".join([
-        _kpi("Brier Score", f"{brier:.4f}", "#2196F3", key="brier"),
-        _kpi("Log Loss",    f"{ll:.4f}",    "#2196F3", key="log_loss"),
+        _kpi("Brier Score", _score_text(brier), "#2196F3", key="brier"),
+        _kpi("Log Loss",    _score_text(ll),    "#2196F3", key="log_loss"),
     ])
 
     return (
         _SECTION_STYLE.format(title="Calibration Analysis")
-        + _filterable_body("cal", bool(trades), kpis + _fig_html(fig_cal, div_id="cal-curve"))
+        + _filterable_body("cal", bool(trades), _CALIBRATION_CAPTION + kpis
+                           + _fig_html(fig_cal, div_id="cal-curve"))
     )
 
 
@@ -2016,8 +2061,10 @@ def _section_interval_discount(
          and tag never reach this section.
 
     Deliberately named for the interval discount rather than "calibration"
-    alone: _section_calibration already exists and means price calibration
-    (Brier / log loss), which is a different measurement entirely.
+    alone: _section_calibration already exists and calibrates the TRADED
+    time-series pairs' entry spreads (Brier / log loss and a reliability
+    diagram), which is a different population: k-hat pools every candidate
+    entry, before the Kelly gate.
 
     Takes the BacktestSweep whole rather than its parts — it already carries
     .calibration, .points, .primary.k and .label_coverage, and passing those
@@ -7515,7 +7562,7 @@ def _view_payload(
 
     rel = _reliability(sel)
     view["cal"] = {
-        "brier": f"{rel['brier']:.4f}", "log_loss": f"{rel['log_loss']:.4f}",
+        "brier": _score_text(rel["brier"]), "log_loss": _score_text(rel["log_loss"]),
         "title": _calibration_title(rel["brier"], rel["log_loss"]),
         "x": [float(v) for v in rel["mean_pred"]], "y": [float(v) for v in rel["mean_act"]],
         "size": rel["sizes"], "text": rel["texts"],
