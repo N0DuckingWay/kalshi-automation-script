@@ -28,9 +28,11 @@ import math
 import numbers
 import pathlib
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
 
@@ -797,6 +799,218 @@ TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
 # once the funds land, infrequent enough not to spend rate-limit tokens on a hot
 # loop while money is in flight.
 TRANSFER_POLL_INTERVAL_SECONDS = 2
+
+# ── Weekly scheduler ──────────────────────────────────────────────────────────
+
+# datetime.weekday() order, spelled as schedule's Scheduler.every() attributes.
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+@dataclass(frozen=True)
+class ScheduledRun:
+    """
+    The weekly live run's wall-clock time: a weekday, an hour and minute, and an IANA zone.
+
+    The scheduler fires at weekday/hour/minute on the host's clock and checks at
+    startup that the host places those fires at instant(d). The zone is resolved
+    only by zone(), never at construction, so importing config needs no tz
+    database. Frozen, so it compares and hashes by value.
+
+    Attributes:
+        weekday (int): datetime.weekday() of the run, 0 = Monday.
+        hour (int): Wall-clock hour in the zone, 0-23.
+        minute (int): Wall-clock minute, 0-59.
+        timezone (str): IANA zone name, e.g. "America/Los_Angeles".
+    """
+    weekday: int
+    hour: int
+    minute: int
+    timezone: str
+
+    def __post_init__(self) -> None:
+        """
+        Validate every field's type and range.
+
+        Raises:
+            ValueError: weekday, hour or minute is not an int in range (a bool
+                is refused), or timezone is not a non-empty str.
+        """
+        for name, value, top in (("weekday", self.weekday, 6), ("hour", self.hour, 23),
+                                 ("minute", self.minute, 59)):
+            if type(value) is not int or not 0 <= value <= top:
+                raise ValueError(f"ScheduledRun.{name} must be an int in [0, {top}], got {value!r}")
+        if type(self.timezone) is not str or not self.timezone:
+            raise ValueError(f"ScheduledRun.timezone must be an IANA zone name, got {self.timezone!r}")
+
+    def zone(self) -> ZoneInfo:
+        """
+        Resolve the IANA zone.
+
+        Returns:
+            ZoneInfo: The zone named by `timezone`.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError: No tz database on this host has the name.
+            ValueError: The name is malformed, e.g. an absolute path.
+            OSError: The name is not a zone file, e.g. a directory such as "America".
+        """
+        return ZoneInfo(self.timezone)
+
+    def weekday_name(self) -> str:
+        """
+        Name the run weekday as schedule's Scheduler.every() attribute spells it.
+
+        Returns:
+            str: Lower-case English weekday, e.g. "monday".
+        """
+        return _WEEKDAY_NAMES[self.weekday]
+
+    def at_time(self) -> str:
+        """
+        Format the run time as schedule's Job.at() takes it.
+
+        Returns:
+            str: "HH:MM", e.g. "09:00".
+        """
+        return f"{self.hour:02d}:{self.minute:02d}"
+
+    def label(self) -> str:
+        """
+        Describe the schedule for log lines.
+
+        Returns:
+            str: e.g. "Monday 09:00 America/Los_Angeles".
+        """
+        return f"{self.weekday_name().capitalize()} {self.at_time()} {self.timezone}"
+
+    def cache_slug(self) -> str:
+        """
+        Name the schedule in a form safe for a file name.
+
+        Returns:
+            str: e.g. "mon0900-America-Los_Angeles".
+        """
+        return (f"{self.weekday_name()[:3]}{self.hour:02d}{self.minute:02d}"
+                f"-{self.timezone.replace('/', '-')}")
+
+    def wall_time(self, d: date) -> datetime:
+        """
+        Place the run's wall-clock time on date `d` in the zone.
+
+        In an hour the clock skips or repeats, fold=0 applies: the offset in
+        force before the clock change. date_problems() lists such dates.
+
+        Args:
+            d (date): The calendar date in the zone. Any weekday is accepted.
+
+        Returns:
+            datetime: The tz-aware wall-clock moment, tzinfo = zone().
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        return datetime(d.year, d.month, d.day, self.hour, self.minute, tzinfo=self.zone())
+
+    def instant(self, d: date) -> datetime:
+        """
+        Convert the run's wall-clock time on date `d` to UTC.
+
+        The zone's own rules decide the offset on that date, so the result
+        follows daylight-saving changes: 09:00 America/Los_Angeles is 16:00 UTC
+        under daylight time and 17:00 UTC under standard time.
+
+        Args:
+            d (date): The calendar date in the zone. Any weekday is accepted.
+
+        Returns:
+            datetime: The tz-aware UTC moment of the run on `d`.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+            OverflowError: The UTC moment falls outside datetime's range.
+        """
+        return self.wall_time(d).astimezone(UTC)
+
+    def clock_change(self, d: date) -> str | None:
+        """
+        Say whether a clock change skips or repeats the run's wall time on date `d`.
+
+        fold=0 takes the offset in force before the change and fold=1 the one
+        after: they differ only on a clock change, and the offset grows when
+        the clock springs forward (the wall time is skipped) and shrinks when
+        it falls back (the wall time occurs twice).
+
+        Args:
+            d (date): The calendar date in the zone. Any weekday is accepted.
+
+        Returns:
+            str | None: "skipped" or "repeated", or None when the wall time
+                occurs exactly once on `d`.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        wall = self.wall_time(d)
+        before, after = wall.utcoffset(), wall.replace(fold=1).utcoffset()
+        if before == after:
+            return None
+        return "skipped" if before < after else "repeated"
+
+    def date_problems(self, first: date, last: date) -> list[str]:
+        """
+        List the run dates in [first, last] whose run time is not one UTC moment on that date.
+
+        Each run-weekday date is listed at most once, naming the first of these
+        problems found: its UTC moment falls outside datetime's range; a clock
+        change skips or repeats the wall time (clock_change()); or instant(d)
+        lies on another date in UTC. Never raises OverflowError: an
+        out-of-range date is listed instead.
+
+        Args:
+            first (date): First date of the range, inclusive.
+            last (date): Last date of the range, inclusive.
+
+        Returns:
+            list[str]: One "YYYY-MM-DD: <problem>" entry per problem date, in
+                date order; empty when every run date is sound.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        zone = self.zone()
+        problems: list[str] = []
+        ahead = (self.weekday - first.weekday()) % 7
+        if (date.max - first).days < ahead:
+            return problems
+        d = first + timedelta(days=ahead)
+        where = f"{self.at_time()} {self.timezone}"
+        while d <= last:
+            wall = datetime(d.year, d.month, d.day, self.hour, self.minute, tzinfo=zone)
+            try:
+                utc = wall.astimezone(UTC)
+            except OverflowError:
+                problems.append(f"{d.isoformat()}: {where} falls outside datetime's range in UTC")
+            else:
+                change = self.clock_change(d)
+                if change is not None:
+                    problems.append(f"{d.isoformat()}: {where} is {change} by a clock change")
+                elif utc.date() != d:
+                    problems.append(
+                        f"{d.isoformat()}: {where} is {utc:%Y-%m-%d %H:%M} UTC, "
+                        f"on another date in UTC"
+                    )
+            if (date.max - d).days < 7:
+                break
+            d += timedelta(days=7)
+        return problems
+
+
+# The weekly live run. scheduler.py fires run_job at this weekday, hour and
+# minute on the host's clock, and checks at daemon start that the host's clock
+# places those fires at SCHEDULED_RUN.instant(d): 09:00 America/Los_Angeles is
+# 16:00 UTC under daylight time and 17:00 UTC under standard time. Tests patch
+# scheduler.SCHEDULED_RUN, never config.*.
+SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
