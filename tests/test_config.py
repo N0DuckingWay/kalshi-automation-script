@@ -1,7 +1,7 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
-tier-floors switch), the live toggles (LiveSettings, the live spread rule and
-the per-pair Kelly bound), and PROJECT_ROOT."""
+tier-floors switch), the live toggles (LiveSettings, the live spread rule,
+the per-pair cap and the per-pair Kelly bound), and PROJECT_ROOT."""
 import dataclasses
 import math
 import pathlib
@@ -33,6 +33,7 @@ from kalshi_betting.config import (
     max_affordable_pairs,
     max_kelly_fraction,
     min_price_diff_for_gap,
+    pair_size_cap,
     time_series_profit_prob,
     time_series_spread_refusal,
 )
@@ -40,10 +41,12 @@ from kalshi_betting.scanner import leg_prices
 from kalshi_betting.strategy import compute_trade
 
 
-def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20):
+def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
+              same_title_size_cap=1.0):
     """A LiveSettings with every field named, defaulting to today's values."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
-                        interval_discount=interval_discount, size_cap=size_cap)
+                        interval_discount=interval_discount, size_cap=size_cap,
+                        same_title_size_cap=same_title_size_cap)
 
 
 class TestProjectRoot:
@@ -180,8 +183,10 @@ class TestTimeSeriesProfitProb:
         assert config.TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
 
     def test_k_none_is_identical_to_omitting_it(self):
-        # None is the sentinel for "read the config constant", so the sweep's
-        # default point and the live sizer's override-free call must agree
+        # None is the sentinel for "read the config constant", so the
+        # backtest's default point (k=None) must price exactly as the live
+        # sizer does with config.py's k (LiveSettings.interval_discount, which
+        # live_settings() reads from that same constant)
         for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.60, 0.30)]:
             assert time_series_profit_prob(pA, pB, k=None) == time_series_profit_prob(pA, pB)
 
@@ -462,22 +467,21 @@ class TestMaxAffordablePairs:
     def test_budget_too_small_for_one_pair(self):
         assert max_affordable_pairs(100, 0.90, 0.20) == 0
 
-    @pytest.mark.parametrize("k, cap", [(0.75, 0.20), (0.40, 1.0), (0.80, 1.0), (0.60, 0.35)])
-    def test_scanner_cap_bounds_the_sizer(self, monkeypatch, k, cap):
+    @pytest.mark.parametrize("k, cap, st_cap", [
+        (0.75, 0.20, 1.0), (0.40, 1.0, 1.0), (0.80, 1.0, 1.0), (0.60, 0.35, 1.0),
+        (0.80, 1.0, 0.20), (0.40, 0.35, 0.05),
+    ])
+    def test_scanner_cap_bounds_the_sizer(self, k, cap, st_cap):
         # The invariant the whole design rests on: enrichment bounds its
         # average at max_kelly_fraction(pair type, settings) over the MINIMUM
         # (best-level) price sum, so its count can never be smaller than the
         # sizer's, whatever Kelly returns. Checked against the capped f* that
-        # compute_trade actually returns, for both pair types. compute_trade
-        # still reads k from config (TIME_SERIES_INTERVAL_PROB_DISCOUNT, at
-        # call time) and its cap from strategy's BUDGET_FRACTION binding, so
-        # both are patched to the settings under test.
-        from kalshi_betting import strategy
-
-        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", k)
-        monkeypatch.setattr(strategy, "BUDGET_FRACTION", cap)
+        # compute_trade actually returns, for both pair types, with the SAME
+        # settings handed to both — the object main.py hands enrichment and
+        # the sizer alike.
         settings = config.LiveSettings(
-            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k, size_cap=cap)
+            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k, size_cap=cap,
+            same_title_size_cap=st_cap)
         balance = 1_000_000
         now = datetime.now(UTC)
 
@@ -500,7 +504,7 @@ class TestMaxAffordablePairs:
               for pA, pB, nA in [(0.70, 0.30, 0.20), (0.60, 0.31, 0.44), (0.55, 0.30, 0.45)]]
         sized = {"time_series": 0, "same_title": 0}
         for p in ts + st:
-            spec = compute_trade(p, balance)
+            spec = compute_trade(p, balance, settings=settings)
             if spec is None:
                 continue
             sized[p.pair_type] += 1
@@ -663,11 +667,17 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 0.5))
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.8)
         monkeypatch.setattr(config, "BUDGET_FRACTION", 1.0)
-        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0)
+        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.2)
+        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
 
     def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
         with pytest.raises(ValueError, match="size_cap"):
+            live_settings()
+
+    def test_live_settings_refuses_an_invalid_same_title_cap(self, monkeypatch):
+        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.37)
+        with pytest.raises(ValueError, match="same_title_size_cap"):
             live_settings()
 
     def test_the_shipped_values_resolve(self):
@@ -677,8 +687,25 @@ class TestLiveSettings:
             spread_band=config.TIME_SERIES_SPREAD_BAND,
             interval_discount=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
             size_cap=config.BUDGET_FRACTION,
+            same_title_size_cap=config.SAME_TITLE_SIZE_CAP,
         )
         assert type(s.tier_floors) is bool
+
+    @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
+    def test_same_title_cap_off_the_grid_or_out_of_range_is_refused(self, cap):
+        # The same grid and validator as size_cap, reported under its own name
+        with pytest.raises(ValueError, match="same_title_size_cap"):
+            _settings(same_title_size_cap=cap)
+
+    def test_same_title_cap_is_normalised_and_defaults_to_no_cap(self):
+        assert _settings(same_title_size_cap=0.05 * 7).same_title_size_cap == 0.35
+        assert type(_settings(same_title_size_cap=1).same_title_size_cap) is float
+        # A construction that names only the first four fields adds no
+        # same-title cap: 1.0
+        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).same_title_size_cap == 1.0
+        # ... and replace re-validates it like every other field
+        with pytest.raises(ValueError, match="same_title_size_cap"):
+            dataclasses.replace(_settings(), same_title_size_cap=0.37)
 
 
 class TestTimeSeriesSpreadRefusal:
@@ -787,6 +814,43 @@ class TestMaxKellyFraction:
         assert max_affordable_pairs(1_000_000, 0.8, max_kelly_fraction("time_series", s)) == 2500
         # the unrounded bound loses a contract on this round-number book
         assert max_affordable_pairs(1_000_000, 0.8, 1.0 - 0.8) == 2499
+
+    def test_the_same_title_cap_bounds_same_title_only(self):
+        # The shipped-defaults shape: no general cap, a 20% same-title cap
+        s = _settings(interval_discount=0.8, size_cap=1.0, same_title_size_cap=0.2)
+        assert max_kelly_fraction("same_title", s) == 0.2
+        assert max_kelly_fraction("time_series", s) == 0.2   # 1 - k, not the cap
+        s = _settings(interval_discount=0.6, size_cap=1.0, same_title_size_cap=0.2)
+        assert max_kelly_fraction("time_series", s) == 0.4   # never the same-title cap
+        # The tighter of the two caps binds a same-title pair
+        s = _settings(size_cap=0.1, same_title_size_cap=0.2)
+        assert max_kelly_fraction("same_title", s) == 0.1
+        assert max_kelly_fraction("time_series", s) == 0.1
+
+
+class TestPairSizeCap:
+    """config.pair_size_cap is the one definition of a pair's per-trade cap,
+    shared by the live sizer, enrichment's bound and the backtester."""
+
+    def test_time_series_reads_the_general_cap_alone(self):
+        assert pair_size_cap("time_series", 1.0, 0.2) == 1.0
+        assert pair_size_cap("time_series", 0.35, 0.05) == 0.35
+
+    def test_same_title_takes_the_tighter_cap(self):
+        assert pair_size_cap("same_title", 1.0, 0.2) == 0.2
+        assert pair_size_cap("same_title", 0.1, 0.2) == 0.1
+        assert pair_size_cap("same_title", 0.2, 1.0) == 0.2
+
+    @pytest.mark.parametrize("pair_type", [None, "bogus", "Time_Series", MagicMock().pair_type])
+    def test_anything_but_time_series_reads_as_same_title(self, pair_type):
+        # scanner.leg_sides' rule: an unknown type is never the directional bet
+        assert pair_size_cap(pair_type, 1.0, 0.2) == 0.2
+
+    def test_the_shipped_caps_are_on_the_grid(self):
+        # Both must resolve through LiveSettings, which validates them
+        s = live_settings()
+        assert s.size_cap == config.BUDGET_FRACTION
+        assert s.same_title_size_cap == config.SAME_TITLE_SIZE_CAP
 
 
 class TestDescribeTimeSeriesRule:

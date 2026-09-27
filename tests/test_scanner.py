@@ -4589,7 +4589,7 @@ class TestEnrichmentRefreshesReferenceQuote:
         # scan-time 0.50. time_series_profit_prob clamps the negative gap to
         # zero and the pair models as RISKLESS.
         stale_shape = dataclasses.replace(pair, pA=0.54)
-        assert _kelly_p(stale_shape) == 1.0
+        assert _kelly_p(stale_shape, config.live_settings()) == 1.0
 
         # The fixed enrichment never produces such a pair: the refreshed
         # reference sits below the later book's own YES bid, so the

@@ -65,11 +65,32 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # ── Trading parameters ────────────────────────────────────────────────────────
 
-# Hard cap on the Kelly fraction allocated to any single trade. Even if the
-# mathematical Kelly says to bet more, we never exceed 20% of the balance on one pair.
-# It must be a multiple of SIZE_CAP_STEP from 5% to 100%: live_settings()
-# validates it, as LiveSettings.size_cap, before any live run makes a request.
+# The per-trade Kelly size cap for EVERY pair: even if the mathematical Kelly
+# says to bet more, one pair never takes more than this fraction of the
+# balance. A multiple of SIZE_CAP_STEP (5%) from 5% to 100%; 1.0 means no cap
+# (f* <= p <= 1). Live runs read it through LiveSettings.size_cap —
+# live_settings() validates it before any live run makes a request, and
+# strategy.compute_trade and enrichment's affordability bound both read the
+# run's one LiveSettings. The backtest's primary scenario and its eager points
+# are sized under it too (backtester binds it by value at import).
 BUDGET_FRACTION               = 0.20
+
+# An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid; the effective
+# same-title cap is min(BUDGET_FRACTION, SAME_TITLE_SIZE_CAP), and a
+# time-series pair never reads it (pair_size_cap is the one definition). A
+# time-series trade cannot exceed 1 - k anyway (max_kelly_fraction), so once
+# the general cap is lifted, this is what bounds a same-title pair: its Kelly
+# fraction reaches about 0.89 on a wide divergence (nA 0.20 + pB 0.30), and
+# its loss cell (market A resolving YES and B NO — both legs worthless) loses
+# the whole stake; Kelly's q = 1 - SAME_TITLE_CO_RESOLVE_PROB treats every
+# failure to co-resolve as that loss, though A NO with B YES pays both legs.
+# Live sizing reads it through LiveSettings.same_title_size_cap, and so does
+# the backtester (binding it by value at import, like BUDGET_FRACTION,
+# refusing a value outside (0, 1] as it refuses a per-trade cap there, and
+# capping through pair_size_cap), so a default backtest sizes same-title as
+# live does. 1.0 adds no cap: at 1.0 every pair sizes exactly as it did before
+# this constant existed.
+SAME_TITLE_SIZE_CAP           = 1.0
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
 # loop re-prices a pair at each candidate contract count and takes the SMALLER
@@ -386,7 +407,9 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # A time-series pair buys YES on the EARLIER contract (market_a) and NO
 # on the LATER one (market_b) — earlier/later by close_time, or by STATED
 # deadline for a same-event ladder (DR-73) — when the later contract's YES ask exceeds the
-# earlier's by at least the deadline-gap tier, and when BOTH legs are worded as
+# earlier's by at least the run's entry floor (the deadline-gap tier, the
+# spread band's floor, or both — see the live toggles below; the tier alone at
+# today's toggles), and when BOTH legs are worded as
 # cumulative "by <date>" deadlines (scanner.deadline_phrasing) — only then does
 # the earlier deadline's event nest inside the later one's, which is what makes
 # the model below meaningful at all. The market-implied probability
@@ -398,7 +421,8 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # face value) the Kelly fraction is <= 0 for every candidate and the strategy
 # never fires; smaller values size more aggressively. Measure it against
 # settled history with `backtest.py --interval-discount K` (overrides k for
-# that backtest run only; this constant is what live sizing always reads) and
+# that backtest run only; this constant is what live sizing reads, through the
+# run's LiveSettings.interval_discount — see the live toggles below) and
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
 # calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
 # calibration (2026-09 follow-up)" for the full mechanism.
@@ -420,18 +444,20 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
 # The live time-series entry rule is these two constants. A live run resolves
-# them ONCE, together with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k) and
-# BUDGET_FRACTION (the per-trade Kelly cap) above, through live_settings()
-# into one frozen LiveSettings. main.py hands that one object to the
-# time-series finder, to enrichment and to pre_execution_check, which hands it
-# to every validate_pair_price it runs. Its k and cap reach only enrichment's
-# affordability bound (max_kelly_fraction): strategy.compute_trade still
-# reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and BUDGET_FRACTION from this
-# module, which is the same value on every run main.py makes, since both come
-# from here. scheduler.py passes main.py no toggle flags (only --mode prod),
-# so a weekly run trades exactly what this file says.
+# them ONCE, together with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k),
+# BUDGET_FRACTION (the per-trade Kelly cap) and SAME_TITLE_SIZE_CAP (the extra
+# same-title cap) above, through live_settings() into one frozen LiveSettings.
+# main.py hands that one object to the time-series finder, to enrichment, to
+# the sizer (strategy.compute_trade, through main._compute_trade_specs) and to
+# pre_execution_check, which hands it to every validate_pair_price it runs. So
+# the tier floors and the band reach the finder, enrichment and
+# validate_pair_price, and k and the two caps reach the sizer and enrichment's
+# affordability bound (max_kelly_fraction) — one object, so the bound and the
+# sizer can never price with different values. scheduler.py passes main.py no
+# toggle flags (only --mode prod), so a weekly run trades exactly what this
+# file says.
 #
-# No live module reads these two constants directly, and every live call to a
+# No live module reads these five constants directly, and every live call to a
 # function that takes a LiveSettings must hand it one explicitly; only a live
 # entry point handed none may resolve config.py's, once. Pinned by
 # tests/test_strategy.py::TestTimeSeriesKellyParity::
@@ -458,8 +484,9 @@ TIME_SERIES_TIER_FLOORS = True
 # (0.0, 1.0) means no band.
 TIME_SERIES_SPREAD_BAND = (0.0, 1.0)
 
-# The size caps' grid. BUDGET_FRACTION, read live as LiveSettings.size_cap,
-# must be a multiple of it from 5% to 100%, so every live cap is float-equal to
+# The size caps' grid. BUDGET_FRACTION and SAME_TITLE_SIZE_CAP, read live as
+# LiveSettings.size_cap and .same_title_size_cap, must each be a multiple of it
+# from 5% to 100%, so every live cap is float-equal to
 # a cell of backtester.SIZE_CAP_SWEEP. It has the same value as
 # SAME_TITLE_MIN_PRICE_DIFF, but it is a different constant.
 SIZE_CAP_STEP = 0.05
@@ -1502,11 +1529,18 @@ def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> flo
     of the model — strategy._kelly_p, backtester.run_backtest and
     dashboard._kelly_fraction all call it, so the three can never drift.
 
-    The optional k overrides that constant for one call. It exists ONLY for the
-    backtester's calibration sweep (backtester.run_backtest_sweep): the live
-    sizer (strategy._kelly_p) never passes it, so live sizing always reads the
-    config constant. It is resolved at call time rather than bound as a default
-    argument, so tests that monkeypatch the constant still take effect.
+    The optional k overrides that constant for one call. The live sizer
+    (strategy._kelly_p_at) always passes it — the run's
+    LiveSettings.interval_discount, which live_settings() reads from this
+    constant — so live sizing and enrichment's affordability bound price with
+    one k; a live call that omitted it would read this constant and could
+    half-apply a run's own settings, which is why the live path never does
+    (pinned by tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_toggles_only_through_live_settings). The
+    backtester's calibration sweep (backtester.run_backtest_sweep) passes each
+    swept k, and the dashboard the k a plotted run was sized at. None is
+    resolved at call time rather than bound as a default argument, so tests
+    that monkeypatch the constant still take effect.
 
     Args:
         pA (float): YES ask of the earlier contract, dollars in [0, 1].
@@ -1594,17 +1628,22 @@ def max_affordable_pairs(
         type, the run's LiveSettings) and the BEST qualifying level's price
         sum, to bound how much order-book depth it averages into the pair's
         fill price.
-      * strategy.compute_trade() passes the capped Kelly fraction and the actual
+      * strategy.compute_trade() passes the capped Kelly fraction (capped by
+        pair_size_cap under the same LiveSettings) and the actual
         prefix-average price sum, to size the trade itself.
 
     The scanner's call is therefore an UPPER BOUND on the sizer's: its fraction
     is the largest capped Kelly fraction the sizer can return for that pair
-    type, and its price sum the minimum any prefix average can reach (levels
-    are ascending, so every deeper prefix costs at least as much per pair).
-    That bound is what lets enrichment price a pair at a size the sizer can
-    never exceed.
+    type under the run's settings, and its price sum the minimum any prefix
+    average can reach (levels are ascending, so every deeper prefix costs at
+    least as much per pair). That bound is what lets enrichment price a pair at
+    a size the sizer can never exceed.
 
-    fraction is resolved at CALL time rather than bound as a default argument,
+    Both live callers pass fraction explicitly: None would read
+    BUDGET_FRACTION rather than the run's LiveSettings (pinned by
+    tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_toggles_only_through_live_settings). The None
+    default is resolved at CALL time rather than bound as a default argument,
     so a test that monkeypatches BUDGET_FRACTION still takes effect — the same
     rule, for the same reason, as time_series_profit_prob's k.
 
@@ -1679,15 +1718,14 @@ class LiveSettings:
 
     live_settings() builds one from this module's constants at call time, and
     main.py's two run modes hand that one object to the time-series finder,
-    to enrichment and to pre_execution_check. The tier floors and the band
-    reach every live site that reads them. k and the cap reach only
-    enrichment's affordability bound (max_kelly_fraction):
-    strategy.compute_trade still reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and
-    BUDGET_FRACTION from this module, the same values live_settings() puts
-    here, so every run main.py makes sizes under the k and cap its bound
-    assumes. dataclasses.replace re-runs __post_init__, so an override is
-    validated too. The object is frozen, so it states one rule for the whole
-    run.
+    to enrichment, to the sizer (strategy.compute_trade, through
+    main._compute_trade_specs) and to pre_execution_check. The tier floors and
+    the band reach the finder, enrichment and validate_pair_price; k and the
+    two caps reach the sizer and enrichment's affordability bound
+    (max_kelly_fraction). Every live site reads the same object, so no site
+    can apply one value while another reads this module.
+    dataclasses.replace re-runs __post_init__, so an override is validated
+    too. The object is frozen, so it states one rule for the whole run.
 
     Attributes:
         tier_floors (bool): Whether to apply the deadline-gap tier floors to
@@ -1702,6 +1740,13 @@ class LiveSettings:
             operator's call.
         size_cap (float): The per-trade Kelly cap for every pair, on the
             SIZE_CAP_STEP grid. 1.0 means no cap, since f* <= p <= 1.
+        same_title_size_cap (float): An EXTRA per-trade cap on same-title
+            pairs, on the same grid: a same-title pair sizes under
+            min(size_cap, same_title_size_cap) and a time-series pair never
+            reads it (pair_size_cap). Defaults to 1.0, which adds no cap, so a
+            construction that names only the first four fields caps every
+            pair at size_cap alone; live_settings() always names it
+            (SAME_TITLE_SIZE_CAP).
 
     Raises:
         ValueError: If any field is out of range or of the wrong type.
@@ -1710,6 +1755,7 @@ class LiveSettings:
     spread_band: tuple[float, float]
     interval_discount: float
     size_cap: float
+    same_title_size_cap: float = 1.0
 
     def __post_init__(self) -> None:
         """
@@ -1742,6 +1788,8 @@ class LiveSettings:
             raise ValueError(f"interval_discount (k) must be in (0, 1], got {k!r}")
         object.__setattr__(self, "interval_discount", float(k))
         object.__setattr__(self, "size_cap", _step_cap(self.size_cap, "size_cap"))
+        object.__setattr__(self, "same_title_size_cap",
+                           _step_cap(self.same_title_size_cap, "same_title_size_cap"))
 
 
 def live_settings() -> LiveSettings:
@@ -1766,6 +1814,7 @@ def live_settings() -> LiveSettings:
         spread_band=TIME_SERIES_SPREAD_BAND,
         interval_discount=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         size_cap=BUDGET_FRACTION,
+        same_title_size_cap=SAME_TITLE_SIZE_CAP,
     )
 
 
@@ -1826,18 +1875,47 @@ def time_series_spread_refusal(
     return None
 
 
+def pair_size_cap(pair_type: str, size_cap: float, same_title_size_cap: float) -> float:
+    """
+    Return the per-trade Kelly cap for a pair of this type.
+
+    This is the one definition, shared by live sizing (strategy._evaluate_size,
+    with the run's LiveSettings), by enrichment's affordability bound (through
+    max_kelly_fraction) and by the backtester (_simulate_at_discount, with its
+    run's cap and SAME_TITLE_SIZE_CAP), so the paths can never cap a pair
+    differently.
+
+    Anything but the exact string "time_series" reads as same-title
+    (scanner.leg_sides' rule).
+
+    Args:
+        pair_type (str): The pair's type.
+        size_cap (float): The cap for every pair, in (0, 1].
+        same_title_size_cap (float): The extra cap on same-title pairs, in (0, 1].
+
+    Returns:
+        float: size_cap for time-series; min(size_cap, same_title_size_cap)
+            otherwise.
+    """
+    if pair_type == "time_series":
+        return size_cap
+    return min(size_cap, same_title_size_cap)
+
+
 def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     """
     Return the largest capped Kelly fraction a pair of this type sizes at under settings.
 
     Enrichment uses this to bound how much book depth it averages into a pair's
     price. That way a lifted cap never averages depth that no trade can use
-    (#51). It bounds strategy.compute_trade's fraction when the sizer prices
-    with the same k and cap. Until the sizer takes a LiveSettings of its own,
-    it reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and BUDGET_FRACTION from this
-    module, the values live_settings() hands every run main.py makes, so the
-    two agree on every such run. A caller that hands enrichment other settings
-    gets them in this bound alone.
+    (#51). It bounds strategy.compute_trade's fraction because the sizer
+    prices with the same k and caps: main.py hands both the run's one
+    LiveSettings. A caller that hands the two different settings breaks the
+    bound, which is why every live call passes the run's own explicitly.
+
+    The cap is pair_size_cap's (size_cap, or min(size_cap, same_title_size_cap)
+    for a same-title pair), further bounded by the pair type's own ceiling on
+    f*:
 
     time_series: f* = 1 - k*(pB - pA)/(1 - c), with c = pA + nB + fee. When
         the later market's YES ask is at or above its own YES bid, up to
@@ -1866,9 +1944,10 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     Returns:
         float: The run's cap for this pair type, capped further by the bound above.
     """
+    cap = pair_size_cap(pair_type, settings.size_cap, settings.same_title_size_cap)
     if pair_type == "time_series":
-        return min(settings.size_cap, round(1.0 - settings.interval_discount, 12))
-    return min(settings.size_cap, SAME_TITLE_CO_RESOLVE_PROB)
+        return min(cap, round(1.0 - settings.interval_discount, 12))
+    return min(cap, SAME_TITLE_CO_RESOLVE_PROB)
 
 
 def describe_time_series_rule(tier_floors: bool, spread_band: tuple[float, float]) -> str:

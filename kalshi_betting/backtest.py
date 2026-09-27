@@ -42,10 +42,11 @@ Notes:
     The backtest reads market data but never submits any orders.
 
     --interval-discount overrides the time-series interval discount k for this
-    run ONLY. It never reaches live sizing: strategy._kelly_p calls
-    config.time_series_profit_prob with no override, so live trades always price
-    on config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. Nothing here writes config.py
-    — the calibration the run reports is a recommendation for a human to act on.
+    run ONLY. It never reaches live sizing: the live sizer prices at its run's
+    config.LiveSettings.interval_discount, which config.live_settings() reads
+    from config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, and no live module imports
+    this one. Nothing here writes config.py — the calibration the run reports
+    is a recommendation for a human to act on.
 
     --same-event-ladders / --no-same-event-ladders (DR-73) is the same kind of
     one-run override for config.TIME_SERIES_SAME_EVENT_LADDERS, and also never
@@ -123,7 +124,8 @@ Notes:
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
-    config.BUDGET_FRACTION and nothing here writes config.py.
+    config.BUDGET_FRACTION (and config.SAME_TITLE_SIZE_CAP), through its run's
+    config.LiveSettings, and nothing here writes config.py.
 """
 import argparse
 import logging

@@ -69,6 +69,7 @@ from kalshi_betting.config import (
     SAME_TITLE_MIN_PRICE_DIFF,
     TRANSFER_PATH,
     V2_ORDER_PATH,
+    live_settings,
 )
 from kalshi_betting.reporter import TradeResult
 
@@ -132,18 +133,25 @@ class TestComputeTradeSpecs:
         pair_ok = make_pair("A1", "A2")
         pair_none = make_pair("B1", "B2")
 
-        def fake_compute_trade(pair, balance_cents):
+        settings = live_settings()
+        seen = []
+
+        def fake_compute_trade(pair, balance_cents, *, settings):
             # Only pair_ok produces a spec — pair_none has no edge (returns None)
+            seen.append(settings)
             if pair is pair_ok:
                 return SimpleNamespace(pair=pair)
             return None
 
         monkeypatch.setattr(main, "compute_trade", fake_compute_trade)
 
-        specs = main._compute_trade_specs([pair_ok, pair_none], balance_cents=100_000)
+        specs = main._compute_trade_specs([pair_ok, pair_none], balance_cents=100_000,
+                                          settings=settings)
 
         assert list(specs.keys()) == [id(pair_ok)]
         assert specs[id(pair_ok)].pair is pair_ok
+        # Every pair is sized under the ONE settings object the run handed in
+        assert len(seen) == 2 and all(s is settings for s in seen)
 
 
 class TestNoPairsMsg:

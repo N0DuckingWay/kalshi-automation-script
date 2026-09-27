@@ -680,7 +680,8 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
     Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
     shows the same theoretical Kelly the live sizer would compute (before the
-    BUDGET_FRACTION cap) — including the fee-inclusive Kelly denominator
+    per-pair cap, config.pair_size_cap: BUDGET_FRACTION, and for a same-title
+    pair SAME_TITLE_SIZE_CAP too) — including the fee-inclusive Kelly denominator
     b = net_spread / (price_a + price_b + fee), since the losing cell loses the
     fee too (DR-62). The legs are mapped exactly like scanner.leg_prices:
     a same_title pair costs nA + pB (NO on A, YES on B) and is priced on the
@@ -5770,7 +5771,9 @@ def _cap_option(cap: float | None) -> str:
 
     Returns:
         str: "20%", "off (full Kelly)" for 1.0 (Kelly's f* never exceeds 1,
-            so a 100% cap is no cap), or "not recorded".
+            so a 100% cap is no per-trade cap; same-title is still capped at
+            BacktestSweep.same_title_size_cap, which this label does not
+            name), or "not recorded".
     """
     if cap is None:
         return "not recorded"

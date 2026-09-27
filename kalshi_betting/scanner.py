@@ -4788,7 +4788,8 @@ def enrich_with_orderbook_prices(
     level's price sum, config.max_kelly_fraction(pair type, settings)) — the
     largest capped Kelly fraction the sizer can return for that pair type over
     the minimum price sum, so it is an upper bound on whatever
-    strategy.compute_trade sizes, and the price written here can never be
+    strategy.compute_trade sizes under the same settings (main.py hands both
+    the run's one LiveSettings), and the price written here can never be
     optimistic relative to the one that trade is finally priced at. The
     qualifying levels themselves are kept on the pair (depth_levels) so
     compute_trade can re-price at the exact n it settles on. Prices are
@@ -4828,8 +4829,10 @@ def enrich_with_orderbook_prices(
             real-money path with no signal that it had.
         settings (LiveSettings | None): Keyword-only. The run's live toggles:
             the tier floors and the band set the time-series price-sum ceiling
-            and the spread rule, and k and the cap set the affordability
-            bound. None resolves config.py's once, at the top of the call.
+            and the spread rule, and k and the two per-trade caps set the
+            affordability bound — the values strategy.compute_trade sizes
+            with when handed the same object. None resolves config.py's once,
+            at the top of the call.
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the
@@ -4964,9 +4967,9 @@ def enrich_with_orderbook_prices(
             # fault, named in its own words: at k = 1 no time-series Kelly
             # fraction can be positive, so no balance could afford a contract.
             # It is the only way a bound reaches 0 (LiveSettings refuses a
-            # size cap of 0, and the same-title bound is min(cap,
-            # SAME_TITLE_CO_RESOLVE_PROB)); the pair-type test keeps the
-            # wording true regardless.
+            # size cap or a same-title cap of 0, and the same-title bound is
+            # min(config.pair_size_cap(...), SAME_TITLE_CO_RESOLVE_PROB)); the
+            # pair-type test keeps the wording true regardless.
             zero_bound = ""
             if bound == 0 and pair.pair_type == "time_series":
                 zero_bound = (

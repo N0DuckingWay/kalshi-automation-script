@@ -9922,6 +9922,75 @@ class TestSizeCap:
         assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(ta, 1.0), abs=1e-12)
         assert point.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
 
+    def test_the_same_title_cap_binds_same_title_only(self, monkeypatch):
+        # SAME_TITLE_SIZE_CAP caps every same-title candidate at every cap,
+        # through config.pair_size_cap (the definition live sizing uses), read
+        # at call time from this module's binding — and never reaches a
+        # time-series candidate. The golden same-title pair's f* is ~0.77.
+        golden = TestPrepareEntriesGolden()
+        entries, _ = golden._prepare(monkeypatch, True)
+        st = [r for r in entries if r["pair_type"] == "same_title"]
+        st_f = _uncapped_kelly(st[0], TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+        assert st_f == pytest.approx(0.77, abs=0.01)
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 1.0)
+        no_extra = self._sim(st, size_cap=1.0)
+        assert [t.kelly_fraction for t in no_extra.trades] == [pytest.approx(st_f)]
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.2)
+        capped = self._sim(st, size_cap=1.0)
+        assert [t.kelly_fraction for t in capped.trades] == [pytest.approx(0.2)]
+        assert capped.trades[0].n < no_extra.trades[0].n
+        # The same-title cap is a sizing cap: Pass 1b's peak is still the
+        # uncapped f*, so a size-cap sweep keeps seeding on it
+        assert capped.peak_kelly_fraction == no_extra.peak_kelly_fraction
+        assert capped.size_cap == 1.0
+        # The tighter of the two caps binds
+        assert self._sim(st, size_cap=0.05).trades[0].kelly_fraction == pytest.approx(0.05)
+        # A time-series candidate never reads it: the wide-gap entry's f*
+        # ~0.216 sits above the 0.2 same-title cap and sizes at full Kelly
+        ts = self._entries(monkeypatch)
+        ts_f = _uncapped_kelly(ts[0], TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+        assert ts_f > 0.2
+        assert self._sim(ts, size_cap=1.0).trades[0].kelly_fraction == pytest.approx(ts_f)
+
+    # Every value config.LiveSettings refuses for a same-title cap on range or
+    # type, and that config.pair_size_cap's min() would otherwise read
+    # silently: NaN as no cap at all (min(1.0, nan) is 1.0), 0 or below as no
+    # same-title trade, None (min() raises TypeError deep in Pass 1b)
+    _INVALID_ST_CAPS = [float("nan"), 0, 0.0, -0.5, 1.5, float("inf"), True,
+                        np.bool_(True), "0.2", Decimal("0.2"), None, np.float64("nan")]
+
+    @pytest.mark.parametrize("st_cap", _INVALID_ST_CAPS)
+    def test_an_invalid_same_title_cap_raises_before_any_entry_is_scored(
+        self, monkeypatch, st_cap,
+    ):
+        entries = self._entries(monkeypatch)
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
+        monkeypatch.setattr(backtester, "time_series_profit_prob",
+                            lambda *a, **k: pytest.fail("an entry was scored"))
+        with pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP"):
+            self._sim(entries, size_cap=1.0)
+
+    @pytest.mark.parametrize("st_cap", _INVALID_ST_CAPS)
+    def test_an_invalid_same_title_cap_fails_the_sweep_before_any_log_or_fetch(
+        self, monkeypatch, caplog, st_cap,
+    ):
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("the fetch ran"))
+        with caplog.at_level(logging.DEBUG), \
+                pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP"):
+            run_backtest_sweep(MagicMock(), MagicMock(), self._START, 10_000.0)
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("st_cap,value", [
+        (np.float64(0.35), 0.35), (Fraction(1, 4), 0.25), (1, 1.0),
+    ])
+    def test_a_real_same_title_cap_resolves_to_a_builtin_float(self, monkeypatch, st_cap,
+                                                               value):
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
+        resolved = backtester._resolve_same_title_size_cap()
+        assert resolved == value and type(resolved) is float
+
     def test_the_peak_is_zero_when_nothing_passes_the_kelly_gate(self, monkeypatch):
         entries = self._entries(monkeypatch)
         # k = 1: the market's own in-between mass, so Kelly is negative
@@ -10460,6 +10529,144 @@ class TestCapSweep:
         # _simulate_at_discount, in TestSizeCap.)
 
 
+@pytest.fixture(scope="class")
+def st_cap_sweep_run():
+    """cap_sweep_run's narrowed golden band sweep, with cap_sweep=True, under
+    the shipped-defaults cap shape: backtester.BUDGET_FRACTION = 1.0 (no
+    per-trade cap) and backtester.SAME_TITLE_SIZE_CAP = 0.2. Those two sit on a
+    SEPARATE MonkeyPatch, created at fixture start and undone only after the
+    class's tests: every lazy cell reads both at call time, so they must hold
+    through the cell reads (and the fresh simulations the parity check runs),
+    not only through the eager run. The golden fetch patch and the narrowed
+    grid are undone before any cell is read, as in cap_sweep_run."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        toggles.setattr(backtester, "BUDGET_FRACTION", 1.0)
+        toggles.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.2)
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        on = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                start_date=golden._START, initial_balance=10_000.0,
+                                same_event_ladders=True, band_sweep=True, cap_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(on=on, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("st_cap_sweep_run")
+class TestCapSweepSameTitleCap:
+    """The size-cap sweep with a same-title cap tighter than the per-trade one:
+    each cap is the cap for every pair, and a same-title candidate stays under
+    SAME_TITLE_SIZE_CAP at every one (config.pair_size_cap). The reuse rule
+    still holds — for a cap C at or above a point's peak f*, a candidate sizes
+    at f* (time-series) or min(SAME_TITLE_SIZE_CAP, f*) (same-title), neither
+    depending on C — so every cap of every cell must equal a fresh simulation,
+    shared copies included."""
+
+    def test_the_run_records_both_caps(self, st_cap_sweep_run):
+        on = st_cap_sweep_run.on
+        assert on.primary.size_cap == 1.0
+        assert on.same_title_size_cap == 0.2
+        cs = on.cap_sweep
+        assert cs.primary_cap == 1.0 and cs.caps == backtester.SIZE_CAP_SWEEP
+        # Every same-title trade the eager run made sits at the 20% cap
+        st_trades = [t for p in [*on.scenarios, on.same_title_point] for t in p.trades
+                     if t.pair_type == "same_title"]
+        assert st_trades
+        assert all(t.kelly_fraction == pytest.approx(0.2) for t in st_trades)
+        # ... while the same-title cap never reaches a time-series trade: with
+        # no per-trade cap, the time-series trades size at their own f*, some
+        # of them above the 20% a leaked same-title cap would hold them to
+        ts_trades = [t for p in on.scenarios for t in p.trades
+                     if t.pair_type == "time_series"]
+        assert any(t.kelly_fraction > 0.2 + 1e-9 for t in ts_trades)
+
+    def test_every_cap_equals_a_fresh_simulation(self, st_cap_sweep_run):
+        on, start = st_cap_sweep_run.on, st_cap_sweep_run.start
+        cs = on.cap_sweep
+        checked = st_capped = ts_above = 0
+        for band in cs.bands:
+            for k in cs.ks:
+                cell = cs.cell(band, k)
+                subsets = _cap_sweep_subsets(cs.entries_by_band[band])
+                for cap in cs.caps:
+                    for pop, point in cell[cap].items():
+                        end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                        TestCapSweep._assert_parity(point, subsets[pop], start, k, band, pop,
+                                                    cap, on.split_date, checks=True,
+                                                    end_date=end)
+                        checked += 1
+                        for t in point.trades:
+                            if t.pair_type == "same_title":
+                                assert t.kelly_fraction <= min(cap, 0.2) + 1e-12
+                                st_capped += t.kelly_fraction == pytest.approx(0.2)
+                            else:
+                                # The parity above cannot see a same-title cap
+                                # leaking onto time-series pairs (the fresh
+                                # simulation would leak it too): only the cap
+                                # itself bounds a time-series trade
+                                assert t.kelly_fraction <= cap + 1e-12
+                                ts_above += t.kelly_fraction > 0.2 + 1e-9
+        st_end = backtester._curve_end_date(cs.same_title_eager)
+        for cap, point in cs.same_title().items():
+            TestCapSweep._assert_parity(point, cs.st_entries, start, cs.primary_k, None,
+                                        "same_title", cap, on.split_date, checks=True,
+                                        end_date=st_end)
+            checked += 1
+        assert checked > 500
+        # Not vacuous: the same-title cap actually bound in the cells, and
+        # time-series trades sized past it at the caps above 20%
+        assert st_capped > 0
+        assert ts_above > 0
+
+    def test_a_population_holding_same_title_trades_reuses_the_eager_point(
+        self, st_cap_sweep_run,
+    ):
+        # The primary cap (1.0) is at or above every peak, so every cap at or
+        # above the same-title population's peak f* (~0.77) is a copy of the
+        # eager point: the same trades, sized at the 20% same-title cap
+        cs = st_cap_sweep_run.on.cap_sweep
+        before = cs.reused
+        points = cs.same_title()
+        assert cs.reused > before
+        eager = cs.same_title_eager
+        assert eager.trades and eager.peak_kelly_fraction > 0.2
+        shared = [c for c, p in points.items()
+                  if c >= eager.peak_kelly_fraction and p is not eager]
+        assert shared
+        for cap in shared:
+            assert points[cap].trades is eager.trades
+            assert points[cap].size_cap == cap
+        assert all(t.kelly_fraction == pytest.approx(0.2) for t in eager.trades)
+        # ... and a cell's "all" population holding the same-title entry too,
+        # checked on that population itself (the cell's time-series-only
+        # populations reuse on their own, so a count over the whole cell would
+        # pass without it): every cap at or above its peak f* (~0.77, the
+        # same-title candidate's) other than the primary is a copy sharing the
+        # eager point's trades, and every cap below it is a simulation of its
+        # own
+        on = st_cap_sweep_run.on
+        band, k = on.primary.spread_band, on.primary.k
+        cell = cs.cell(band, k)
+        eager_all = cs.eager[(band, k, "all")]
+        assert cell[cs.primary_cap]["all"] is eager_all
+        assert any(t.pair_type == "same_title" for t in eager_all.trades)
+        assert eager_all.peak_kelly_fraction > 0.2
+        shared = [c for c in cs.caps
+                  if c != cs.primary_cap and cell[c]["all"].trades is eager_all.trades]
+        assert shared
+        assert shared == [c for c in cs.caps
+                          if c != cs.primary_cap and c >= eager_all.peak_kelly_fraction]
+        for cap in shared:
+            assert cell[cap]["all"] is not eager_all and cell[cap]["all"].size_cap == cap
+
+
 class TestCapSweepSeeding:
     """CapSweep._by_cap on hand-built eager points, for the three seeding
     shapes a real fixture cannot pin exactly: a cap EXACTLY on the seed, an
@@ -10660,6 +10867,36 @@ class TestCapSweepLogging:
             "(config.BUDGET_FRACTION); size-cap sweep on")
         assert cap == band + 1
         assert res.cap_sweep is None
+
+    def test_the_cap_line_names_the_same_title_cap_only_when_it_binds_tighter(
+        self, monkeypatch, caplog,
+    ):
+        # At SAME_TITLE_SIZE_CAP >= the per-trade cap the line is
+        # byte-identical to the one printed before that constant existed; a
+        # tighter same-title cap is named. The infeasible construction records
+        # the value either way.
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        base = (f"Per-trade size cap (backtest): {backtester._cap_percent(BUDGET_FRACTION)}% "
+                "(config.BUDGET_FRACTION)")
+
+        def run(st_cap):
+            monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
+            lines = [r.getMessage() for r in caplog.records
+                     if r.getMessage().startswith("Per-trade size cap")]
+            assert len(lines) == 1
+            return lines[0], res
+
+        for st_cap in (1.0, BUDGET_FRACTION):
+            line, res = run(st_cap)
+            assert line == base + "; size-cap sweep off"
+            assert res.same_title_size_cap == st_cap
+        line, res = run(0.10)
+        assert line == (base + ", same-title never above 10% (config.SAME_TITLE_SIZE_CAP); "
+                        "size-cap sweep off")
+        assert res.same_title_size_cap == 0.10
 
     def test_the_cap_sweep_summary_names_every_cap(self, monkeypatch, caplog):
         golden = TestPrepareEntriesGolden()

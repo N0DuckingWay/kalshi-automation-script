@@ -48,7 +48,10 @@ Dependencies:
     live module calls either — the live rule reaches them only through
     config.LiveSettings and config.time_series_spread_refusal, whose
     per-Monday parity with _find_entry is pinned by tests/test_backtester.py::
-    TestLiveBacktestSpreadParity), plus BUDGET_FRACTION,
+    TestLiveBacktestSpreadParity), plus BUDGET_FRACTION and
+    SAME_TITLE_SIZE_CAP (both bound by value, the per-trade caps every
+    simulation sizes under) and pair_size_cap (the one definition of a
+    pair's cap, shared with live sizing, so the two paths cap a pair alike),
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
     grid _candle_window_open floors a market's open onto),
     LARGE_GROUP_WARN_THRESHOLD,
@@ -128,7 +131,9 @@ Notes:
     wrapper over _prepare_entries() (_prepare_candidates() plus one
     _entries_for_band() pass at the default band, which is no band at all)
     and one _simulate_at_discount() call with k=None, which
-    config.time_series_profit_prob resolves to the live sizer's constant.
+    config.time_series_profit_prob resolves to
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the k config.live_settings()
+    hands the live sizer.
 
     _interval_calibration() measures the EMPIRICAL discount from one band's
     k-independent entries — the realised in-between rate divided by the mean
@@ -137,7 +142,8 @@ Notes:
     entries rather than _simulate_at_discount(), it is never filtered by the
     Kelly gate, which is what stops the estimate confirming whatever k
     produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py,
-    and live sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
+    and live sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT
+    (through the run's config.LiveSettings).
 
     run_backtest_sweep() is the entry point that exposes all of that:
     _prepare_candidates() once, then _sweep_from_candidates() — one
@@ -169,16 +175,24 @@ Notes:
 
     The per-trade Kelly size cap is a simulation parameter too:
     _simulate_at_discount(..., size_cap=None) sizes every candidate at
-    min(cap, f*), where None resolves this module's BUDGET_FRACTION at call
-    time — the live sizer's cap, so every existing call sizes exactly as
-    before. With cap_sweep, run_backtest_sweep also returns a CapSweep: every
-    other cap of SIZE_CAP_SWEEP (5%..95% and no cap — a grid that lives here,
-    not in config.py, by the operator's instruction for this change),
-    simulated LAZILY, one (band, k) cell at a time, when a reader asks —
-    keeping every band x k x cap x population point would hold gigabytes.
-    Each cell is seeded from the eager point: every cap at or above a point's
-    (cap-independent) peak_kelly_fraction sizes identically, so those caps
-    share one simulation. With tier_off_sweep too, a SECOND CapSweep
+    min(config.pair_size_cap(pair type, cap, SAME_TITLE_SIZE_CAP), f*), where
+    None resolves this module's BUDGET_FRACTION at call time — the value
+    config.live_settings() hands the live sizer as its cap for every pair —
+    so every existing call sizes exactly as before. A same-title candidate
+    also stays under SAME_TITLE_SIZE_CAP (read at call time and validated
+    like the per-trade cap, at every cap), as live sizing keeps it under
+    LiveSettings.same_title_size_cap, so a default backtest sizes same-title
+    as live does; at 1.0 it adds no cap.
+
+    With cap_sweep, run_backtest_sweep also returns a CapSweep: every other
+    cap of SIZE_CAP_SWEEP (5%..95% and no cap — a grid that lives here, not
+    in config.py, by the operator's instruction for this change), simulated
+    LAZILY, one (band, k) cell at a time, when a reader asks — keeping every
+    band x k x cap x population point would hold gigabytes. Each cell is
+    seeded from the eager point: every cap at or above a point's
+    (cap-independent) peak_kelly_fraction sizes identically — a time-series
+    candidate at f*, a same-title one at min(SAME_TITLE_SIZE_CAP, f*) — so
+    those caps share one simulation. With tier_off_sweep too, a SECOND CapSweep
     (BacktestSweep.tier_off_cap_sweep, tier_floors False) does the same over
     the tier-floors-off family's binding bands, seeded from that family's own
     points — so every tier x band x k x cap scenario is a real simulation.
@@ -283,6 +297,7 @@ from .config import (
     PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SAME_TITLE_SIZE_CAP,
     SETTLED_PREFILTER_CACHE_TAG,
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_BAND_SWEEP_CEILINGS,
@@ -292,6 +307,7 @@ from .config import (
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
+    pair_size_cap,
     time_series_profit_prob,
     time_series_spread_band,
     time_series_spread_too_wide,
@@ -367,14 +383,61 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
 # 95%, then 1.0 — NO cap. Kelly's f* = p - q/b <= p <= 1 (time_series_profit_prob
 # is 1 - k*max(0, pB-pA) with k in [0, 1]; same-title prices at the fixed
 # SAME_TITLE_CO_RESOLVE_PROB), so min(1.0, f*) is f* itself and "100%" and
-# "off" are one run. BACKTEST-ONLY: live sizing reads config.BUDGET_FRACTION
-# and strategy.py never imports this module. Rounded to two decimals, so 0.2
+# "off" are one run. Each cap is the cap for EVERY pair: a same-title
+# candidate also stays under SAME_TITLE_SIZE_CAP at every cap
+# (config.pair_size_cap), so "no cap" means no per-trade cap on time-series
+# pairs and SAME_TITLE_SIZE_CAP on same-title ones — no cap at all while that
+# constant is 1.0. BACKTEST-ONLY: live sizing reads its caps from the run's
+# config.LiveSettings (config.BUDGET_FRACTION, config.SAME_TITLE_SIZE_CAP) and
+# strategy.py never imports this module. Rounded to two decimals, so 0.2
 # is a member by value; the run's own cap is unioned in anyway (CapSweep), as
 # the k grid unions its primary. Lives here rather than in config.py beside
 # INTERVAL_DISCOUNT_SWEEP by the operator's instruction for this change (only
 # the dashboard and backtest code may move) — the one named exception in
 # CLAUDE.md's constants rule. Read only by _sweep_from_candidates.
 SIZE_CAP_SWEEP: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20)) + (1.0,)
+
+
+def _validated_cap(value: Any, name: str) -> float:
+    """
+    Validate one per-trade Kelly cap and return it as a builtin float.
+
+    The ONE check behind both caps a simulation sizes under —
+    _resolve_size_cap's (the cap for every pair) and
+    _resolve_same_title_size_cap's (the extra cap on same-title pairs) — so
+    the two are held to one rule. Any real number is accepted — a
+    numbers.Real, so numpy's float64/float32/int64 and a Fraction as well as
+    int and float — and returned as a builtin float. A cap outside (0, 1] is
+    refused: 0 sizes nothing, and above 1 means nothing because Kelly's f*
+    never exceeds 1 for k in [0, 1] (see SIZE_CAP_SWEEP); NaN fails that
+    range test too (every comparison is False). A bool (or numpy bool) is
+    refused although Python counts it as an int (True would silently read as
+    "no cap"), and so is anything that is not a numbers.Real, e.g. the string
+    "0.2" or a Decimal — each with a message naming the type rather than the
+    range, so a type bug is not reported as an out-of-range value. Range
+    only: the SIZE_CAP_STEP grid config.LiveSettings holds a live cap to is
+    not applied here, since a size-cap sweep simulates any cap in (0, 1].
+
+    Args:
+        value (Any): The cap as a fraction of the checkpoint's opening
+            balance.
+        name (str): The cap's name, for the error message.
+
+    Returns:
+        float: The cap, as a builtin float.
+
+    Raises:
+        ValueError: If value is a bool, not a numbers.Real, NaN, or outside
+            (0, 1].
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+        raise ValueError(
+            f"{name} must be a real number in (0, 1], got {value!r} "
+            f"({type(value).__name__})")
+    resolved = float(value)
+    if not 0.0 < resolved <= 1.0:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    return resolved
 
 
 def _resolve_size_cap(size_cap: float | None) -> float:
@@ -385,16 +448,9 @@ def _resolve_size_cap(size_cap: float | None) -> float:
     BUDGET_FRACTION, read at CALL time — never bound as a default at def time —
     so a test that monkeypatches backtester.BUDGET_FRACTION (e.g.
     TestCheckpointOpeningBalanceSizing::test_greedy_fit_skips_rather_than_shrinks)
-    still sizes at the patched value. Any real number is accepted — a
-    numbers.Real, so numpy's float64/float32/int64 and a Fraction as well as
-    int and float — and returned as a builtin float. A cap outside (0, 1] is
-    refused: 0 sizes nothing, and above 1 means nothing because Kelly's f*
-    never exceeds 1 for k in [0, 1] (see SIZE_CAP_SWEEP); NaN fails that
-    range test too (every comparison is False). A bool (or numpy bool) is
-    refused although Python counts it as an int (True would silently read as
-    "no cap"), and so is anything that is not a numbers.Real, e.g. the string
-    "0.2" or a Decimal — each with a message naming the type rather than the
-    range, so a type bug is not reported as an out-of-range value.
+    still sizes at the patched value. The resolved cap is held to
+    _validated_cap's rule: any real number in (0, 1], returned as a builtin
+    float; a bool, a non-real, NaN or anything out of range is refused.
 
     Args:
         size_cap (float | None): The cap as a fraction of the checkpoint's
@@ -408,15 +464,30 @@ def _resolve_size_cap(size_cap: float | None) -> float:
             or outside (0, 1] — a caller bug, raised before any entry is
             scored.
     """
-    cap = BUDGET_FRACTION if size_cap is None else size_cap
-    if isinstance(cap, (bool, np.bool_)) or not isinstance(cap, numbers.Real):
-        raise ValueError(
-            f"size_cap must be a real number in (0, 1], got {size_cap!r} "
-            f"({type(size_cap).__name__})")
-    value = float(cap)
-    if not 0.0 < value <= 1.0:
-        raise ValueError(f"size_cap must be in (0, 1], got {size_cap!r}")
-    return value
+    return _validated_cap(BUDGET_FRACTION if size_cap is None else size_cap, "size_cap")
+
+
+def _resolve_same_title_size_cap() -> float:
+    """
+    Resolve and validate the extra per-trade cap on same-title pairs.
+
+    Reads this module's SAME_TITLE_SIZE_CAP at CALL time — a by-value binding
+    of config.SAME_TITLE_SIZE_CAP, so a test patches backtester's, never
+    config's — and holds it to _validated_cap's rule, the one the per-trade
+    cap is held to here. Without the check a bad value would not fail at all:
+    config.pair_size_cap takes min(cap, same-title cap), which reads a NaN as
+    no same-title cap (min(1.0, nan) is 1.0) and a value of 0 or below as a
+    same-title trade of nothing — a strategy the live bot never runs, since
+    config.LiveSettings refuses all of them before any live request.
+
+    Returns:
+        float: SAME_TITLE_SIZE_CAP, as a builtin float in (0, 1].
+
+    Raises:
+        ValueError: If SAME_TITLE_SIZE_CAP is a bool, not a numbers.Real, NaN,
+            or outside (0, 1].
+    """
+    return _validated_cap(SAME_TITLE_SIZE_CAP, "SAME_TITLE_SIZE_CAP")
 
 
 def _cap_percent(cap: float) -> str:
@@ -454,9 +525,10 @@ def _cap_label(cap: float) -> str:
         cap (float): A resolved cap in (0, 1].
 
     Returns:
-        str: "no cap" for 1.0 (sizing at full Kelly — see SIZE_CAP_SWEEP),
-            else "cap <percent>%" through _cap_percent, so two caps never
-            share a label.
+        str: "no cap" for 1.0 (no per-trade cap: full Kelly — see
+            SIZE_CAP_SWEEP — though a same-title pair still stays under
+            SAME_TITLE_SIZE_CAP, which this label does not name), else "cap
+            <percent>%" through _cap_percent, so two caps never share a label.
     """
     return "no cap" if cap >= 1.0 else f"cap {_cap_percent(cap)}%"
 
@@ -829,8 +901,11 @@ class SweepPoint:
             tier-on point.
         size_cap (float | None): The RESOLVED per-trade Kelly size cap this
             point was sized under — config.BUDGET_FRACTION unless a size-cap
-            sweep simulated another; 1.0 means no cap (full Kelly). None only
-            on a hand-built point, which a report labels "not recorded".
+            sweep simulated another; 1.0 means no per-trade cap (full Kelly).
+            It caps every pair; a same-title pair was also capped at
+            SAME_TITLE_SIZE_CAP (config.pair_size_cap), which the sweep records
+            once, as BacktestSweep.same_title_size_cap. None only on a
+            hand-built point, which a report labels "not recorded".
             Appended with a default, like the two fields below it, so no
             existing construction moves.
         peak_kelly_fraction (float | None): The largest UNCAPPED Kelly
@@ -838,10 +913,12 @@ class SweepPoint:
             before the settlement-outcome and premise checks, so a candidate
             those later drop still counts — and 0.0 when none passed. It does
             not depend on the cap (Pass 1b scores every entry before any
-            sizing), and every cap at or above it sizes this point's entries
-            identically, since min(cap, f*) == f* for every candidate; a
-            size-cap sweep reuses one simulation for all such caps
-            (CapSweep). None only on a hand-built point.
+            sizing), and every cap C at or above it sizes this point's entries
+            identically: min(pair_size_cap(type, C, SAME_TITLE_SIZE_CAP), f*)
+            is f* for a time-series candidate and min(SAME_TITLE_SIZE_CAP, f*)
+            for a same-title one, neither depending on C. A size-cap sweep
+            reuses one simulation for all such caps (CapSweep). None only on
+            a hand-built point.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1225,8 +1302,14 @@ class CapSweep:
     for a cell twice simulates it twice.
 
     Seeded from the eager point. A point's peak_kelly_fraction does not depend
-    on the cap, and every cap at or above it sizes the point's entries
-    identically (min(cap, f*) == f* for every candidate). So:
+    on the cap, and every cap C at or above it sizes the point's entries
+    identically: a candidate is sized at
+    min(config.pair_size_cap(type, C, SAME_TITLE_SIZE_CAP), f*), which for
+    C >= f* is f* for a time-series candidate and min(SAME_TITLE_SIZE_CAP, f*)
+    for a same-title one — neither depends on C. (Each cap of the sweep is
+    the cap for every pair; a same-title candidate stays under
+    SAME_TITLE_SIZE_CAP at every one, read at call time — the eager point and
+    every cell read the same binding while it is not rebound.) So:
       * the primary cap always returns the eager object ITSELF;
       * when the primary cap is itself at or above the eager point's peak,
         every other cap at or above that peak returns a
@@ -1309,8 +1392,8 @@ class CapSweep:
     no-band entries, a few MB. The ~810 tier-on figure above is a different
     corpus's (the 365-day run's), whose tier-off-only count was not measured.
 
-    BACKTEST-ONLY, like the band and k sweeps: live sizing reads
-    config.BUDGET_FRACTION and never this module.
+    BACKTEST-ONLY, like the band and k sweeps: live sizing reads its caps from
+    the run's config.LiveSettings and never this module.
 
     Attributes:
         caps (tuple[float, ...]): Ascending: SIZE_CAP_SWEEP with the primary
@@ -1664,6 +1747,13 @@ class BacktestSweep:
             cap_sweep it simulates nothing during the run. Its primary-cap
             points ARE the tier_off_scenarios objects. Appended with a
             default, so no construction moves.
+        same_title_size_cap (float | None): The extra per-trade cap every
+            same-title candidate of this run was sized under at every cap
+            (this module's binding of config.SAME_TITLE_SIZE_CAP, through
+            config.pair_size_cap) — so a report can say what a size-cap axis
+            means for same-title pairs: "no cap" there is this cap. None when
+            not recorded (a hand-built sweep). Appended with a default, so no
+            construction moves; both production constructions record it.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -1682,6 +1772,7 @@ class BacktestSweep:
         default_factory=dict)
     cap_sweep: CapSweep | None = None
     tier_off_cap_sweep: CapSweep | None = None
+    same_title_size_cap: float | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -5386,13 +5477,17 @@ def _simulate_at_discount(
     premise-violation WARNING, the one summary line a simulation can emit
     beside its completion line.
 
-    size_cap DOES change the simulation: it is the per-trade Kelly cap, the
-    `min(cap, kelly_f)` every candidate is sized under — config.BUDGET_FRACTION
-    (this module's binding, read at call time) unless a size-cap sweep asks
-    for another. Pass 1b scores every entry before any sizing, so the cap
-    never moves which candidates pass the Kelly gate, the premise count or
-    the returned peak_kelly_fraction — only how large each admitted trade is
-    (and, through cash and n < 1 skips, which ones fit). quiet only moves the
+    size_cap DOES change the simulation: it is the per-trade Kelly cap for
+    every pair — config.BUDGET_FRACTION (this module's binding, read at call
+    time) unless a size-cap sweep asks for another — and every candidate is
+    sized at `min(config.pair_size_cap(pair_type, cap, SAME_TITLE_SIZE_CAP),
+    kelly_f)`: a same-title candidate also stays under SAME_TITLE_SIZE_CAP
+    (this module's binding, read at call time), as live sizing keeps it under
+    LiveSettings.same_title_size_cap, through the same helper. Pass 1b scores
+    every entry before any sizing, so neither cap moves which candidates pass
+    the Kelly gate, the premise count or the returned peak_kelly_fraction —
+    only how large each admitted trade is (and, through cash and n < 1 skips,
+    which ones fit). quiet only moves the
     completion line and the premise-violation WARNING to DEBUG, for the lazy
     size-cap runs, whose premise count repeats the primary-cap run's.
 
@@ -5425,10 +5520,12 @@ def _simulate_at_discount(
             " with the tier floors off" to the band on the completion line, so
             the two families never share a prefix, and " [tier floors off]"
             to the premise-violation WARNING; True (default) adds nothing.
-        size_cap (float | None): Keyword-only. The per-trade Kelly size cap,
-            in (0, 1]; 1.0 sizes at full Kelly (no cap). None (default)
-            resolves this module's BUDGET_FRACTION at call time — the live
-            sizer's cap — so every existing call sizes exactly as before.
+        size_cap (float | None): Keyword-only. The per-trade Kelly size cap
+            for every pair, in (0, 1]; 1.0 sizes at full Kelly (no per-trade
+            cap), a same-title candidate still under SAME_TITLE_SIZE_CAP. None
+            (default) resolves this module's BUDGET_FRACTION at call time —
+            the value config.live_settings() hands the live sizer — so every
+            existing call sizes exactly as before.
             Any cap other than BUDGET_FRACTION is named on the completion
             line (", cap 35%" / ", no cap" before the colon); the default
             cap's line is byte-identical to the pre-cap one.
@@ -5454,8 +5551,10 @@ def _simulate_at_discount(
         ValueError: If population is not one of the labels above (a typo would
             otherwise mislabel a scenario silently), from
             config.time_series_spread_band if spread_band is not a valid
-            band, or from _resolve_size_cap if size_cap is not a number in
-            (0, 1]. All are caller bugs, checked before any entry is scored.
+            band, from _resolve_size_cap if size_cap is not a number in
+            (0, 1], or from _resolve_same_title_size_cap if this module's
+            SAME_TITLE_SIZE_CAP is not. All are caller or configuration
+            bugs, checked before any entry is scored.
         TypeError: From config.time_series_spread_band, for a band that is not
             a pair of numbers.
     """
@@ -5473,6 +5572,9 @@ def _simulate_at_discount(
     # The per-trade cap in force — config.BUDGET_FRACTION unless a size-cap
     # sweep asks for another — resolved and validated before any entry.
     cap = _resolve_size_cap(size_cap)
+    # ... and the extra same-title cap (this module's SAME_TITLE_SIZE_CAP),
+    # held to the same rule: min() would read a NaN there as no cap at all
+    st_cap = _resolve_same_title_size_cap()
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
@@ -5546,9 +5648,12 @@ def _simulate_at_discount(
             # Kelly fraction is non-positive — the pair has no positive expected value
             continue
         peak_kelly = max(peak_kelly, kelly_f)
-        # Cap at the run's per-trade size cap (config.BUDGET_FRACTION, 20%,
-        # unless a size-cap sweep simulates another) to avoid over-concentration
-        kelly_f_capped = min(cap, kelly_f)
+        # The run's cap for this pair type (config.pair_size_cap, the one
+        # definition live sizing uses): the per-trade cap for every pair
+        # (config.BUDGET_FRACTION unless a size-cap sweep simulates another),
+        # and for a same-title pair SAME_TITLE_SIZE_CAP too (st_cap), at every
+        # swept cap — so a default backtest sizes same-title as live does
+        kelly_f_capped = min(pair_size_cap(pair_type, cap, st_cap), kelly_f)
 
         # Skip pairs where the settlement result is missing or non-binary
         outcome_a = mA.get("result", "")
@@ -6183,8 +6288,9 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
 
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
     config.py, and the live sizer keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT regardless of what this prints;
-    acting on it is a deliberate human edit.
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (through the run's
+    config.LiveSettings) regardless of what this prints; acting on it is a
+    deliberate human edit.
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
@@ -6877,7 +6983,10 @@ def _sweep_from_candidates(
             tier_off_sweep as well, also a tier-floors-off CapSweep on
             BacktestSweep.tier_off_cap_sweep, seeded from the family's own
             points only and keeping its entries alive. False (default)
-            returns cap_sweep=None and tier_off_cap_sweep=None.
+            returns cap_sweep=None and tier_off_cap_sweep=None. Each cap of
+            either sweep is the cap for every pair; a same-title candidate
+            also stays under SAME_TITLE_SIZE_CAP at every one
+            (config.pair_size_cap).
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -6887,14 +6996,17 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep and tier_off_cap_sweep — see BacktestSweep.
+            cap_sweep, tier_off_cap_sweep and same_title_size_cap (this
+            module's binding of config.SAME_TITLE_SIZE_CAP, as every
+            simulation resolved it) — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
             family is a band-sweep family: its split date, rescans and cells
-            are the band sweep's), checked before anything else runs; or,
-            from config.time_series_spread_band, if spread_band is not a
-            valid band.
+            are the band sweep's), checked before anything else runs; from
+            config.time_series_spread_band, if spread_band is not a valid
+            band; or, from the first simulation (_simulate_at_discount), if
+            this module's SAME_TITLE_SIZE_CAP is not a number in (0, 1].
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
@@ -7290,6 +7402,10 @@ def _sweep_from_candidates(
         tier_off_calibrations_by_band=tier_off_calibrations,
         cap_sweep=capped,
         tier_off_cap_sweep=off_capped,
+        # The extra same-title cap every simulation above sized under (and
+        # every lazy cap cell will), resolved and validated as they resolved
+        # it, so a report can say what the cap axis means for same-title pairs
+        same_title_size_cap=_resolve_same_title_size_cap(),
     )
 
 
@@ -7420,8 +7536,10 @@ def run_backtest_sweep(
             before anything is logged or fetched.
         cap_sweep (bool): When True, also return BacktestSweep.cap_sweep — a
             lazy CapSweep over SIZE_CAP_SWEEP (the per-trade Kelly size caps
-            5%..95% and no cap) that simulates each other cap only when a
-            reader asks for a (band, k) cell. Every point this function
+            5%..95% and no cap — each the cap for every pair; a same-title
+            candidate also stays under SAME_TITLE_SIZE_CAP at every one,
+            through config.pair_size_cap) that simulates each other cap only
+            when a reader asks for a (band, k) cell. Every point this function
             returns is still sized at the run's own cap
             (config.BUDGET_FRACTION), and the flag adds no simulation to the
             run itself. With tier_off_sweep too, also
@@ -7442,14 +7560,18 @@ def run_backtest_sweep(
             resolved same_event_ladders, the configured switch it is judged
             against (config_same_event_ladders), the corpus's provenance,
             None when not recorded, the tier-off family, empty unless
-            tier_off_sweep, and the lazy cap_sweep, None unless cap_sweep,
-            and tier_off_cap_sweep, None unless both cap_sweep and
-            tier_off_sweep (see BacktestSweep).
+            tier_off_sweep, the lazy cap_sweep, None unless cap_sweep,
+            tier_off_cap_sweep, None unless both cap_sweep and
+            tier_off_sweep, and same_title_size_cap (this module's binding
+            of config.SAME_TITLE_SIZE_CAP, the extra same-title cap every
+            simulation sized under) — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
-            without band_sweep; or, from config.time_series_spread_band, if
-            spread_band is not a valid band (0 <= floor < ceiling <= 1).
+            without band_sweep, or, from _resolve_same_title_size_cap, if
+            this module's SAME_TITLE_SIZE_CAP is not a number in (0, 1]; or,
+            from config.time_series_spread_band, if spread_band is not a
+            valid band (0 <= floor < ceiling <= 1).
         TypeError: From config.time_series_spread_band, before any fetch, if
             spread_band is not a pair of numbers.
         KeyError: Propagates out of the candlestick-fetch pool
@@ -7466,8 +7588,9 @@ def run_backtest_sweep(
         one), calibration=None, label_coverage=None, scenarios=[],
         calibrations_by_band={}, an empty tier-off family and the resolved
         same_event_ladders, with the configured switch
-        (config_same_event_ladders) still recorded. Callers therefore need
-        no special case for that path.
+        (config_same_event_ladders) and the same-title cap
+        (same_title_size_cap) still recorded. Callers therefore need no
+        special case for that path.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -7478,6 +7601,10 @@ def run_backtest_sweep(
     if tier_off_sweep and not band_sweep:
         raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
                          "re-runs the band sweep's binding bands")
+    # The same for the extra same-title cap (this module's SAME_TITLE_SIZE_CAP):
+    # a bad value is a configuration bug, refused here rather than after the
+    # fetch, where every simulation would refuse it anyway
+    same_title_cap = _resolve_same_title_size_cap()
 
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -7516,11 +7643,21 @@ def run_backtest_sweep(
     )
     # And for the per-trade size cap: the cap every point below is sized
     # under (this module's BUDGET_FRACTION, resolved at call time, so a
-    # monkeypatched value is the one printed), and whether the lazy size-cap
-    # sweep rides the result. Logged after the band line, before any fetch.
+    # monkeypatched value is the one printed), whether the lazy size-cap
+    # sweep rides the result, and — only when it binds tighter than that cap —
+    # the extra same-title cap every same-title candidate stays under at every
+    # cap. At SAME_TITLE_SIZE_CAP >= the cap the line is byte-identical to the
+    # one printed before that constant existed. Logged after the band line,
+    # before any fetch.
+    run_cap = _resolve_size_cap(None)
+    same_title_clause = (
+        f", same-title never above {_cap_percent(same_title_cap)}% "
+        "(config.SAME_TITLE_SIZE_CAP)"
+        if same_title_cap < run_cap else "")
     logging.info(
-        "Per-trade size cap (backtest): %s%% (config.BUDGET_FRACTION); size-cap sweep %s",
-        _cap_percent(_resolve_size_cap(None)),
+        "Per-trade size cap (backtest): %s%% (config.BUDGET_FRACTION)%s; size-cap sweep %s",
+        _cap_percent(run_cap),
+        same_title_clause,
         "on" if cap_sweep else "off",
     )
 
@@ -7552,7 +7689,8 @@ def run_backtest_sweep(
                              calibrations_by_band={},
                              same_event_ladders=bool(ladders),
                              corpus_provenance=None,
-                             config_same_event_ladders=config_ladders)
+                             config_same_event_ladders=config_ladders,
+                             same_title_size_cap=same_title_cap)
 
     # Every entry pass and every simulation. It deletes the candle series and
     # the pair list itself once the last entry pass is done (before any

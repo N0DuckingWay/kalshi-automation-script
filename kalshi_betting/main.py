@@ -25,7 +25,8 @@ Dependencies:
     (balance threshold, exit-code contract, price-gap thresholds, the
     same-title close-gap bound the no-pairs message names, file paths, and
     LiveSettings/live_settings — each run mode resolves the run's live toggles
-    once and hands that one object to the time-series finder, enrichment and
+    once and hands that one object to the time-series finder, enrichment, the
+    sizer (compute_trade, through _compute_trade_specs) and
     pre_execution_check),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
     leg_sides — the only source of truth for which side each leg buys — and
@@ -132,7 +133,9 @@ def _format_deadline(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "?"
 
 
-def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
+def _compute_trade_specs(
+    candidate_pairs: list, balance_cents: int, settings: LiveSettings,
+) -> dict:
     """
     Compute trade specifications for all qualifying candidate pairs.
 
@@ -140,6 +143,10 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
         candidate_pairs (list): List of CandidatePair objects to evaluate.
         balance_cents (int): Current account balance in cents, used to size
             each trade via Kelly criterion in compute_trade().
+        settings (LiveSettings): The run's live toggles, handed to every
+            compute_trade call — k and the per-pair caps are read from it.
+            Required: it must be the object enrichment's affordability bound
+            read, or the bound no longer bounds the size.
 
     Returns:
         dict: Mapping of id(pair) -> TradeSpec for each pair that produced
@@ -148,7 +155,9 @@ def _compute_trade_specs(candidate_pairs: list, balance_cents: int) -> dict:
     """
     specs: dict = {}
     for pair in candidate_pairs:
-        spec = compute_trade(pair, balance_cents)  # returns TradeSpec (Kelly-sized trade with cost/payoff/fractions) or None if pair is unprofitable
+        # Kelly-size under the run's k and caps (the settings enrichment's
+        # bound read); a TradeSpec, or None if the pair is unprofitable
+        spec = compute_trade(pair, balance_cents, settings=settings)
         if spec is not None:
             specs[id(pair)] = spec
     return specs
@@ -517,8 +526,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None) -> int:
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
         settings (LiveSettings | None): The run's live toggles, handed to the
-            time-series finder and enrichment. None resolves config.py's
-            once, at the top of the run, so both see one rule.
+            time-series finder, enrichment and the sizer. None resolves
+            config.py's once, at the top of the run, so all three see one
+            rule.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -538,9 +548,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None) -> int:
             sys.exit().
     """
     # The run's live toggles, resolved ONCE and handed to the time-series
-    # finder and enrichment, so neither reads config.py on its own. The sizer,
-    # compute_trade, still reads k and the per-trade cap from config.py; main()
-    # hands no settings, so the two agree on every run it makes
+    # finder, enrichment and the sizer, so none of them reads config.py on its
+    # own — and enrichment's affordability bound and the sizer read one k and
+    # one set of caps
     settings = live_settings() if settings is None else settings
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
@@ -607,8 +617,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None) -> int:
         write_dev_simulation([], [], sandbox_balance_cents)
         return EXIT_OK
 
-    # Apply Kelly sizing to each candidate pair using the virtual balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents)
+    # Apply Kelly sizing to each candidate pair using the virtual balance,
+    # under the settings enrichment bounded the depth with
+    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
@@ -665,9 +676,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None) -> int:
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
         settings (LiveSettings | None): The run's live toggles, handed to the
-            time-series finder, enrichment and pre_execution_check. None
-            resolves config.py's once, at the top of the run, so all three see
-            one rule.
+            time-series finder, enrichment, the sizer and pre_execution_check.
+            None resolves config.py's once, at the top of the run, so all four
+            see one rule.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -687,10 +698,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None) -> int:
             trades, and all-pairs-failed-pre-execution-check.
     """
     # The run's live toggles, resolved ONCE and before any request, and handed
-    # to the time-series finder, enrichment and pre_execution_check, so none of
-    # them reads config.py on its own. The sizer, compute_trade, still reads k
-    # and the per-trade cap from config.py; main() hands no settings, so the
-    # two agree on every run it makes
+    # to the time-series finder, enrichment, the sizer and pre_execution_check,
+    # so none of them reads config.py on its own — and enrichment's
+    # affordability bound and the sizer read one k and one set of caps
     settings = live_settings() if settings is None else settings
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
@@ -771,8 +781,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None) -> int:
         logging.info(_no_pairs_msg())
         return EXIT_OK
 
-    # Apply Kelly sizing to each candidate pair using the real account balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents)
+    # Apply Kelly sizing to each candidate pair using the real account balance,
+    # under the settings enrichment bounded the depth with
+    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
