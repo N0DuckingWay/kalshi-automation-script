@@ -14,9 +14,9 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, and main.py — plus the standalone, human-run verification
-    CLI kept deliberately outside the pipeline's import graph (see CLAUDE.md's
-    pipeline-isolation rule).
+    scheduler.py, treasury.py, and main.py — plus the standalone, human-run
+    verification CLI kept deliberately outside the pipeline's import graph
+    (see CLAUDE.md's pipeline-isolation rule).
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -982,6 +982,35 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # in-module caller inherits the correct base rather than the wrong one.
 TRADING_DAYS_PER_YEAR: int  = 252
 CALENDAR_DAYS_PER_YEAR: int = 365
+
+# ─── Risk-free rate (backtest dashboard only) ─────────────────────────────────
+# The backtest dashboard's Sharpe and Sortino ratios subtract, on each day of a
+# curve, the yield of the most recent auction of this Treasury bill on or before
+# that day (treasury.RiskFreeRates.annual_on) — not one fixed hurdle, because a
+# multi-year window spans very different rates (near 0% in 2020-21, above 5% in
+# 2023). treasury.load_risk_free_rates() downloads them from the Treasury's
+# Fiscal Data API ("Treasury Securities Auctions Data": open, no key, GET only,
+# every value a string); backtest.py calls it beside the series-category read.
+# REPORTING ONLY: nothing sizes, prices or settles on it, and the live bot never
+# imports it.
+TREASURY_AUCTIONS_URL: str = (
+    "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
+    "/v1/accounting/od/auctions_query"
+)
+# auctions_query's security_term for the bill. The 8-week bill was first
+# auctioned on 2018-10-16; its 416 regular auctions to 2026-09-24 fit one page.
+RISK_FREE_BILL_TERM: str = "8-Week"
+# The auction's stop-out yield on the investment-rate (bond-equivalent) basis, in
+# percent: the yield a winning bidder earns. The discount rate (high_discnt_rate)
+# is a bank-discount quote that understates it.
+RISK_FREE_RATE_FIELD: str = "high_investment_rate"
+# Per page request; _http.api_call_with_retry retries a 429/5xx or a transient
+# transport failure around it
+TREASURY_API_TIMEOUT_SECONDS: int = 30
+# Records per page, and the most pages one download reads — a bound, not an
+# expectation: the whole 8-week history is one page
+TREASURY_API_PAGE_SIZE: int = 1000
+TREASURY_API_MAX_PAGES: int = 20
 
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair
