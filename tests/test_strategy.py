@@ -419,6 +419,35 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
+    """Every place `key` is written in `tree`, as a string or as a keyword
+    argument: each string constant EQUAL to it (a dict key, a subscript, a
+    .get) and each keyword argument NAMED it (dict(entry, later=...)). Each
+    place is returned as (owner, line): owner is the outermost function
+    around it ("Class.method" for a method), or None at module or class
+    level. Equality, not substring, so a docstring that merely mentions the
+    word never matches. A key built at run time ("lat" + "er", an f-string)
+    is not found."""
+    homes: list[tuple[str | None, int]] = []
+
+    def visit(node: ast.AST, owner: str | None, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if owner is None and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, scope + child.name, scope)
+            elif owner is None and isinstance(child, ast.ClassDef):
+                visit(child, None, f"{scope}{child.name}.")
+            elif isinstance(child, ast.Constant):
+                if type(child.value) is str and child.value == key:
+                    homes.append((owner, child.lineno))
+            else:
+                if isinstance(child, ast.keyword) and child.arg == key:
+                    homes.append((owner, child.lineno))
+                visit(child, owner, scope)
+
+    visit(tree, None, "")
+    return homes
+
+
 def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     """Uncapped Kelly fraction for a pair priced at (price_a, price_b).
 
@@ -842,6 +871,50 @@ class TestTimeSeriesKellyParity:
         # Which bands the tiers bind at is decided THROUGH the helper, asked
         # both ways, never from a copy of the tier constants
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
+
+    def test_ast_later_mondays_have_one_reader(self):
+        # backtester._find_entry stores every qualifying Monday after the
+        # first under "later", and _entry_mondays is the one function the
+        # rest of the code reads them through (DR-75; its .get default
+        # matters, since hand-built entries have no "later"). This checks that
+        # the key is written — as a string or as a keyword argument,
+        # dict(e, later=...) — only in those two and in _split_halves, which
+        # trims the list, anywhere in the package; and, with the last two
+        # asserts, that the calibration and the split date, which must use
+        # only the first Monday, never read the rest. An unrelated "later"
+        # anywhere in the package fails this too: add it to the allowed places
+        # on purpose if one is ever needed.
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        # The walk finds a keyword spelling, not only a string one
+        probe = ast.parse("def f(e):\n    return dict(e, later=())\n")
+        assert _key_homes(probe, "later") == [("f", 2)]
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        assert "backtester" in names
+        modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}")
+                                      for n in names]
+        homes = [(module.__name__, owner, line)
+                 for module in modules
+                 for owner, line in _key_homes(ast.parse(inspect.getsource(module)), "later")]
+        found = {(mod, owner) for mod, owner, _line in homes}
+        writer = ("kalshi_betting.backtester", "_find_entry")
+        reader = ("kalshi_betting.backtester", "_entry_mondays")
+        truncator = ("kalshi_betting.backtester", "_split_halves")
+        assert found <= {writer, reader, truncator}, homes
+        # Not vacuous: the writer spells it (a renamed key would otherwise
+        # leave nothing to check), and so do the one reader and the truncator
+        assert writer in found and reader in found and truncator in found
+        # ... the count line, the Kelly gate, the excluding-top-event check and
+        # the cap sweep's event census read the Mondays through that reader ...
+        for function in ("_log_qualifying_mondays", "_simulate_at_discount",
+                         "_ex_top_event", "entry_events"):
+            assert _function_calls(backtester, function, "_entry_mondays"), function
+        # ... and the two first-Monday readers never call it
+        assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
+        assert not _function_calls(backtester, "_split_date", "_entry_mondays")
 
     def test_ast_live_path_reads_no_band(self):
         # The time-series spread band is a BACKTEST knob. If a band is ever

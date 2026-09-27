@@ -1907,8 +1907,8 @@ class TestFindEntryHorizon:
         # close_b (Feb 14) is 40 days from Jan 5, 33 from Jan 12, 26 from
         # Jan 19 — all beyond a 20-day horizon — but only 19 days from Jan 26,
         # so entry must land on Jan 26 rather than the earliest price-qualifying
-        # Monday. A single candle at _MONDAY_TS is found by _candle_at_or_before
-        # for every later checkpoint too, so price qualifies throughout.
+        # Monday. A single candle at _MONDAY_TS is the latest candle at or
+        # before every later checkpoint too, so price qualifies throughout.
         mA, mB = self._markets()
         candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
         candles_late  = [_candle(_MONDAY_TS, 0.60, 0.40)]
@@ -2265,19 +2265,26 @@ class TestActiveTickerRelease:
              "settlement_ts": "2026-02-20T12:00:00+00:00"},
         ]
 
-    def _run(self, monkeypatch, tx_settlement):
-        candles = {
+    @classmethod
+    def _candles(cls) -> dict[str, list[dict]]:
+        # Also used by TestFindEntryRecordsEveryQualifyingMonday: there the
+        # TX/TY same-title pair has A = TX on the first Monday and A = TY from
+        # the second, when TY becomes the pricier side.
+        return {
             # TX: pricier than TY (same-title gap) yet cheaper than the
             # later-closing TZ (time-series gap) — see the class docstring
             "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
             # TY: 0.30 at the first Monday (the same-title entry), then 0.60 —
             # keeps TY/TZ (18 days apart, like TX/TZ) under the 30% tier at the
             # second Monday; see the class docstring
-            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(self._M2, 0.60, 0.40)],
+            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(cls._M2, 0.60, 0.40)],
             # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
             # enter until then
-            "TZ": [_candle(self._M2, 0.75, 0.25)],
+            "TZ": [_candle(cls._M2, 0.75, 0.25)],
         }
+
+    def _run(self, monkeypatch, tx_settlement):
+        candles = self._candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: self._markets(tx_settlement))
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2519,7 +2526,7 @@ class TestCanEverEnterAtTheCheckpointInstant:
 
     @pytest.mark.parametrize(("open_time", "kept"), [
         ("2026-09-21T08:00:00Z", True),
-        # its first candle ends at 09:00, which _candle_at_or_before accepts
+        # its first candle ends at 09:00, which counts as at or before the checkpoint
         ("2026-09-21T08:30:00Z", True),
         ("2026-09-21T08:59:59Z", True),
         ("2026-09-21T08:59:59.999999Z", True),
@@ -7089,6 +7096,10 @@ class TestPrepareEntriesGolden:
     with ladders
     on AND off. The fetch and candle seams are mocked exactly as
     TestRunBacktestSweep mocks them.
+
+    Each row's last field lists the pair's later qualifying Mondays (DR-75).
+    Those dates come from an independent source too: the old first-Monday-only
+    scan, re-run from the day after each Monday it found.
     """
 
     _START = date(2026, 1, 1)
@@ -7139,18 +7150,29 @@ class TestPrepareEntriesGolden:
     }
 
     # (pair_type, canon, group_key, entry_date, pA, pB, nA, nB, gap_days,
-    #  ticker_a, ticker_b) — captured on main @ fe0a758.
+    #  ticker_a, ticker_b, later_dates). Every field but the last was captured
+    #  on main @ fe0a758; later_dates come from re-running the old
+    #  first-Monday-only scan from the day after each Monday it found. Each
+    #  pair's prices stay at its last candle's, so once a pair qualifies it
+    #  keeps qualifying every Monday up to the day before its earlier leg closes.
+    # EA/EB, TA/TB, WA/WB and SB/SA (first Monday 1/5, earlier close 2/1):
+    _LATER_WEEKS = (date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26))
+    # The ladder with the tier floors on (first Monday 1/12, both rungs close 3/20):
+    _LADDER_LATER = (date(2026, 1, 19), date(2026, 1, 26), date(2026, 2, 2),
+                     date(2026, 2, 9), date(2026, 2, 16), date(2026, 2, 23),
+                     date(2026, 3, 2), date(2026, 3, 9), date(2026, 3, 16))
     _EA_EB = ("time_series", "ev | team wins by", "ev | team wins by",
-              date(2026, 1, 5), 0.3, 0.6, 0.7, 0.4, 13, "EA", "EB")
+              date(2026, 1, 5), 0.3, 0.6, 0.7, 0.4, 13, "EA", "EB", _LATER_WEEKS)
     _LADDER = ("time_series", "will spacex launch another starship by ?",
                "will spacex launch another starship by ?",
-               date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE")
+               date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE",
+               _LADDER_LATER)
     _TA_TB = ("time_series", "snow | snow falls by", "snow | snow falls by",
-              date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB")
+              date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB", _LATER_WEEKS)
     _WA_WB = ("time_series", "hail | hail falls by", "hail | hail falls by",
-              date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB")
+              date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB", _LATER_WEEKS)
     _SAME_TITLE = ("same_title", "Q", ("EVS", "Q", ""),
-                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA")
+                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA", _LATER_WEEKS)
     _GOLDEN = {True: [_EA_EB, _LADDER, _TA_TB, _WA_WB, _SAME_TITLE],
                False: [_EA_EB, _TA_TB, _WA_WB, _SAME_TITLE]}
     # The census total main reported over the same fixture: every market is
@@ -7166,15 +7188,20 @@ class TestPrepareEntriesGolden:
 
     @staticmethod
     def _rows(entries: list[dict]) -> list[tuple]:
+        monday_keys = {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
         rows = []
         for rec in entries:
             # The record and entry shapes are part of the contract too.
             assert set(rec) == {"pair_type", "canon", "group_key", "entry"}
             e = rec["entry"]
-            assert set(e) == {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
+            assert set(e) == monday_keys | {"later"}
+            # Every later qualifying Monday carries every key but "later"
+            assert isinstance(e["later"], tuple)
+            assert all(set(m) == monday_keys for m in e["later"])
             rows.append((rec["pair_type"], rec["canon"], rec["group_key"],
                          e["entry_date"], e["pA"], e["pB"], e["nA"], e["nB"],
-                         e["gap_days"], e["mA"]["ticker"], e["mB"]["ticker"]))
+                         e["gap_days"], e["mA"]["ticker"], e["mB"]["ticker"],
+                         tuple(m["entry_date"] for m in e["later"])))
         return rows
 
     def _prepare(self, monkeypatch, ladders):
@@ -7288,6 +7315,1103 @@ class TestPrepareEntriesGolden:
         assert calls[0]["spread_band"] is None
         assert calls[0]["pair_types"] == ("time_series", "same_title")
         assert self._rows(entries) == self._GOLDEN[True]
+
+    @pytest.mark.parametrize("ladders,prepared,line", [
+        (True, "Prepared 5 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
+        (False, "Prepared 4 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 16 over 4 entries (4 qualify on more than one)"),
+    ], ids=["ladders-on", "ladders-off"])
+    def test_the_entry_pass_logs_its_qualifying_mondays(
+        self, monkeypatch, caplog, ladders, prepared, line,
+    ):
+        # One INFO line per entry pass, counting every qualifying Monday its
+        # entries recorded — from the rows above: 1 + 3 for each short pair
+        # and for SB/SA, 1 + 9 for the ladder
+        assert sum(1 + len(row[-1]) for row in self._GOLDEN[ladders]) == (26 if ladders else 16)
+        with caplog.at_level(logging.INFO):
+            self._prepare(monkeypatch, ladders)
+        messages = caplog.messages
+        assert [m for m in messages if m.startswith("Qualifying Mondays")] == [line]
+        # ... right after the line counting the same entries
+        assert messages[messages.index(line) - 1] == prepared
+
+
+# ─── DR-75: every qualifying Monday is recorded, not just the first ──────────
+
+# The third checkpoint a scan starting 2026-01-01 visits (2026-01-19 09:00 UTC)
+_MONDAY3_TS = _MONDAY2_TS + 7 * 86_400
+
+# One week between two checkpoints, in seconds
+_WEEK_SECONDS = 7 * 86_400
+
+
+def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
+    """Seeded random pairs for the restarted-scan check, each (candles_a,
+    candles_b, mA, mB, pair_type, start_date, kwargs).
+
+    Each Monday of a pair's window is drawn at random as either qualifying
+    prices or prices built, from the pair's own threshold and band ceiling,
+    to fail one filter (a dead or unparseable quote, the tier, the band
+    ceiling, a dead NO leg, the price-sum ceiling, the fee, or a spread that
+    is not positive). If the pair's settings make that failure impossible (no
+    band ceiling to exceed, say), the Monday gets qualifying prices instead;
+    and an earlier check can refuse a Monday before its filter is reached (a
+    horizon cap, when one is drawn, skips Mondays before any price is read).
+    A same-title pair's pricier side is drawn afresh each Monday, so which
+    market is A can change. The legs also start late, skip weeks (the last
+    candle then stands), carry in some weeks an extra earlier candle that
+    the Monday's own candle replaces and one just after a Monday that only a
+    later Monday can read, and are passed in either order. Prices are whole
+    cents (a dead quote is in half cents)."""
+    rng = random.Random(seed)
+    ri = rng.randint
+    cases: list[tuple] = []
+
+    def ts_quotes(kind: str, tier: int, ceiling: int) -> list:
+        # (pA, nA, pB, nB) in cents for a time-series Monday; tier and
+        # ceiling are the pair's threshold and band ceiling, in cents
+        if kind == "tier" and tier >= 2:
+            pA = ri(5, 40)
+            pB = pA + ri(1, tier - 1)
+            return [pA, 100 - pA, pB, 100 - pB]
+        if kind == "band-ceiling" and ceiling < 100:
+            spread = ri(ceiling + 1, ceiling + 15)
+            pA = ri(5, 94 - spread)
+            return [pA, 100 - pA, pA + spread, 100 - pA - spread]
+        if kind == "non-positive-spread":
+            pA = ri(10, 60)
+            pB = pA - ri(0, 5)
+            return [pA, 100 - pA, pB, 100 - pB]
+        if kind == "fee" and tier <= 3:
+            # Legs summing to within 3c of $1, where the fee (>= 3.36c for
+            # legs near 0.5) takes what is left
+            pA = ri(40, 50)
+            pB = pA + ri(max(tier, 1), 5)
+            return [pA, 100 - pA, pB, 100 - pA - ri(tier, 3)]
+        # A qualifying Monday — a spread between the threshold (at least 6c,
+        # clear of the fee) and the ceiling, on a tight book — which the
+        # shapes below then break
+        pA = ri(5, 40)
+        pB = pA + ri(max(tier, 6), min(ceiling, 55))
+        quotes = [pA, 100 - pA, pB, 100 - pB]
+        if kind == "leg-sum-ceiling":
+            quotes[3] = min(99, 101 - tier - pA + ri(0, 4))
+        elif kind == "dead-no-leg":
+            quotes[3] = 0.5
+        elif kind == "dead-yes-quote":
+            quotes[rng.choice((0, 2))] = rng.choice((0.5, 99.5))
+        return quotes
+
+    def st_quotes(kind: str) -> tuple[list, list]:
+        # (yes, no) in cents for the pricier and the cheaper market
+        cheap = ri(5, 60)
+        rich = cheap + (ri(0, 4) if kind == "tier" else ri(6, 30))
+        rich_q, cheap_q = [rich, 100 - rich], [cheap, 100 - cheap]
+        if kind == "leg-sum-ceiling":
+            rich_q[1] = min(99, 96 - cheap + ri(0, 3))
+        elif kind == "dead-no-leg":
+            rich_q[1] = 0.5
+        elif kind == "dead-yes-quote":
+            rng.choice((rich_q, cheap_q))[0] = rng.choice((0.5, 99.5))
+        return rich_q, cheap_q
+
+    kinds = ["qualifying"] * 6 + ["dead-yes-quote", "unparseable-quote", "tier",
+                                  "band-ceiling", "dead-no-leg", "leg-sum-ceiling",
+                                  "fee", "non-positive-spread"]
+    for k in range(count):
+        pair_type = "same_title" if rng.random() < 0.35 else "time_series"
+        weeks = ri(4, 10)
+        last_checkpoint = datetime.fromtimestamp(_MONDAY_TS + (weeks - 1) * _WEEK_SECONDS, tz=UTC)
+        # The earlier leg closes 1-6 days after the last checkpoint, so the
+        # scan (to the day before its close) ends between the two
+        close_a = last_checkpoint + timedelta(days=ri(1, 6), hours=ri(0, 14))
+        band = rng.choice([None, None, (0.20, 0.50), (0.25, 0.40), (0.30, 0.60), (0.0, 0.50)])
+        kw: dict = {"tier_floors": rng.random() < 0.6, "spread_band": band}
+        if rng.random() < 0.15:
+            kw["max_horizon_days"] = ri(10, 7 * weeks + 30)
+        if pair_type == "time_series":
+            gap_days = rng.choice([1, 5, 9, 13, 15, 16, 20, 29, 30, 31])
+            close_b = close_a + timedelta(days=gap_days, hours=ri(0, 5))
+            lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
+            tier = round(100 * min_price_diff_for_gap(
+                gap_days, spread_min=lo, tier_floors=kw["tier_floors"]))
+            ceiling = round(100 * hi)
+        else:
+            close_b = close_a + timedelta(minutes=ri(0, 50))
+        mA = {"ticker": f"A{k}", "event_ticker": f"EA{k}-1", "close_time": close_a.isoformat()}
+        mB = {"ticker": f"B{k}", "event_ticker": f"EB{k}-1", "close_time": close_b.isoformat()}
+        late = (ri(0, 1) * ri(0, 2), ri(0, 1) * ri(0, 2))
+        candles: tuple[list, list] = ([], [])
+        for week in range(weeks):
+            kind = rng.choice(kinds)
+            if pair_type == "time_series":
+                pA, nA, pB, nB = ts_quotes(kind, tier, ceiling)
+                legs = [[pA, nA], [pB, nB]]
+            else:
+                rich_q, cheap_q = st_quotes(kind)
+                legs = [rich_q, cheap_q] if rng.random() < 0.5 else [cheap_q, rich_q]
+            if kind == "unparseable-quote":
+                rng.choice(legs)[ri(0, 1)] = rng.choice((None, "abc"))
+            checkpoint = _MONDAY_TS + week * _WEEK_SECONDS
+            for leg in (0, 1):
+                if week < late[leg] or (week > late[leg] and rng.random() < 0.1):
+                    continue          # not listed yet, or no candle this week
+                quote = [q / 100 if isinstance(q, (int, float)) else q for q in legs[leg]]
+                at = checkpoint - rng.choice((0, 0, 3600, 7200, 86_400))
+                if rng.random() < 0.3:
+                    # An earlier candle of the same week, which this one supersedes
+                    candles[leg].append({"ts": at - 3600 * ri(1, 20),
+                                         "yes_ask_close": ri(5, 95) / 100,
+                                         "no_ask_close": ri(5, 95) / 100})
+                candles[leg].append({"ts": at, "yes_ask_close": quote[0],
+                                     "no_ask_close": quote[1]})
+                if rng.random() < 0.15:
+                    # Just after this checkpoint: only a later Monday reads it
+                    candles[leg].append({"ts": checkpoint + 3600,
+                                         "yes_ask_close": ri(5, 95) / 100,
+                                         "no_ask_close": ri(5, 95) / 100})
+        start = date(2026, 1, 1) + timedelta(days=ri(0, 20) if rng.random() < 0.2 else 0)
+        if rng.random() < 0.5:
+            cases.append((candles[0], candles[1], mA, mB, pair_type, start, kw))
+        else:
+            cases.append((candles[1], candles[0], mB, mA, pair_type, start, kw))
+    return cases
+
+
+class TestFindEntryRecordsEveryQualifyingMonday:
+    """_find_entry scans its whole window and returns the first qualifying
+    Monday's dict plus "later": one dict per later qualifying Monday, earliest
+    first, each with that Monday's own date, prices and legs (DR-75).
+
+    The main check re-runs _find_entry from the day after each Monday it
+    returns and keeps what each re-run finds first; the two lists must match.
+    That tests how one pass collects the Mondays, but not the per-Monday
+    filters or the candle lookup the two share: TestCandlesAtOrBefore tests
+    the lookup, and TestPrepareEntriesGolden's later dates, from the old
+    code, anchor the filters."""
+
+    _KEYS = ("entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days")
+
+    @staticmethod
+    def _restarted(candles_a, candles_b, mA, mB, pair_type, start, **kw) -> list[dict]:
+        """Every Monday the scan finds, by restarting it the day after each hit."""
+        found: list[dict] = []
+        while (entry := _find_entry(candles_a, candles_b, mA, mB, pair_type, start,
+                                    **kw)) is not None:
+            # Progress, so a scan that ignored its start date fails, not hangs
+            assert entry["entry_date"] >= start
+            found.append(entry)
+            start = entry["entry_date"] + timedelta(days=1)
+        return found
+
+    def _assert_later_is_the_restarted_scan(self, candles_a, candles_b, mA, mB, pair_type,
+                                            start, **kw) -> int:
+        """Assert (entry, *entry["later"]) is the restarted scan; return its length."""
+        entry = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+        restarted = self._restarted(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+        if entry is None:
+            assert restarted == []
+            return 0
+        recorded = (entry, *entry["later"])
+        assert len(recorded) == len(restarted)
+        values = [k for k in self._KEYS if k not in ("mA", "mB")]
+        for got, want in zip(recorded, restarted, strict=True):
+            assert {k: got[k] for k in values} == {k: want[k] for k in values}
+            # The legs by identity: this Monday's own, and never a copy
+            assert got["mA"] is want["mA"] and got["mB"] is want["mB"]
+        return len(recorded)
+
+    @staticmethod
+    def _tx_ty():
+        markets = {m["ticker"]: m
+                   for m in TestActiveTickerRelease._markets("2026-01-08T12:00:00+00:00")}
+        return markets, TestActiveTickerRelease._candles()
+
+    def test_later_is_the_scan_restarted_after_each_monday(self, monkeypatch):
+        # Every golden pair, at the default band and every grid band, with the
+        # tier floors on and off
+        c = TestBandSweepPhaseOneSubset._fresh(monkeypatch)
+        bands = [None] + [(lo, hi) for lo in SPREAD_BAND_SWEEP_FLOORS
+                          for hi in SPREAD_BAND_SWEEP_CEILINGS]
+        counts: dict = {}
+        for (mA, mB, _canon, _group_key), pair_type in c.all_pairs:
+            for band in bands:
+                for tier_floors in (True, False):
+                    counts[(mA["ticker"], band, tier_floors)] = \
+                        self._assert_later_is_the_restarted_scan(
+                            c.candles_by_ticker[mA["ticker"]],
+                            c.candles_by_ticker[mB["ticker"]], mA, mB, pair_type,
+                            c.start_date, max_horizon_days=c.max_horizon_days,
+                            same_event_ladders=c.same_event_ladders, spread_band=band,
+                            tier_floors=tier_floors)
+        # Not vacuous: at the default band EA/EB and SB/SA qualify on 4 Mondays,
+        # the ladder on 10 with the tiers on and 11 with them off (Monday 1
+        # too), and FA/FB (a pricier earlier contract) on none
+        assert counts[("EA", None, True)] == counts[("SA", None, True)] == 4
+        assert (counts[("RUNG-EARLY", None, True)],
+                counts[("RUNG-EARLY", None, False)]) == (10, 11)
+        assert counts[("FA", None, True)] == counts[("FA", None, False)] == 0
+        # ... and the same-title TX/TY pair, whose A changes from TX to TY on
+        # Monday 2, passed in either order
+        markets, candles = self._tx_ty()
+        for first, second in (("TX", "TY"), ("TY", "TX")):
+            assert self._assert_later_is_the_restarted_scan(
+                candles[first], candles[second], markets[first], markets[second],
+                "same_title", date(2026, 1, 1)) == 4
+
+    def test_later_is_the_restarted_scan_on_random_pairs(self):
+        # The same check over 300 seeded random pairs whose qualifying Mondays
+        # are mixed with Mondays each filter refuses, at both tier settings and
+        # under band ceilings, on time-series and same-title pairs (see
+        # _random_find_entry_cases)
+        entered = multi = stepped_past = flipped = 0
+        for candles_a, candles_b, mA, mB, pair_type, start, kw in _random_find_entry_cases(
+                20260927, 300):
+            recorded = self._assert_later_is_the_restarted_scan(
+                candles_a, candles_b, mA, mB, pair_type, start, **kw)
+            if not recorded:
+                continue
+            entry = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+            mondays = backtester._entry_mondays(entry)
+            dates = [m["entry_date"] for m in mondays]
+            entered += 1
+            multi += len(mondays) > 1
+            # A refused Monday between two recorded ones, which the scan had
+            # to step past
+            stepped_past += any((b - a).days > 7
+                                for a, b in zip(dates[:-1], dates[1:], strict=True))
+            flipped += len({m["mA"]["ticker"] for m in mondays}) > 1
+        # Not vacuous. This seed gives 269, 234, 150 and 78; bounds rather
+        # than pins, since random's integer draws are not promised to repeat
+        # across Python versions
+        assert entered >= 200 and multi >= 150 and stepped_past >= 100 and flipped >= 50
+
+    def test_each_later_monday_carries_its_own_same_title_legs(self):
+        markets, candles = self._tx_ty()
+        entry = _find_entry(candles["TX"], candles["TY"], markets["TX"], markets["TY"],
+                            "same_title", date(2026, 1, 1))
+        # Monday 1: TX (YES 0.40) is the pricier side, so it is A
+        assert (entry["entry_date"], entry["mA"]["ticker"], entry["mB"]["ticker"]) == (
+            date(2026, 1, 5), "TX", "TY")
+        assert (entry["pA"], entry["pB"], entry["nA"], entry["nB"]) == (0.40, 0.30, 0.60, 0.70)
+        assert entry["gap_days"] is None
+        # From Monday 2 TY (YES 0.60) is: every later Monday holds the legs the
+        # other way round, with its own quotes
+        assert [m["entry_date"] for m in entry["later"]] == [
+            date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26)]
+        for monday in entry["later"]:
+            assert monday["mA"] is markets["TY"] and monday["mB"] is markets["TX"]
+            assert (monday["pA"], monday["pB"], monday["nA"], monday["nB"]) == (
+                0.60, 0.40, 0.40, 0.60)
+            assert monday["gap_days"] is None
+        # ... whichever way round the pair was passed in
+        assert _find_entry(candles["TY"], candles["TX"], markets["TY"], markets["TX"],
+                           "same_title", date(2026, 1, 1)) == entry
+
+    # Mondays 1 and 3 of the refusal cases below, ((A yes, A no), (B yes, B
+    # no)): a 0.40 spread on legs pA 0.20 + nB 0.40 = 0.60, well clear of the
+    # fee, which qualifies at every setting the cases run at
+    _QUALIFYING = ((0.20, 0.80), (0.60, 0.40))
+
+    # Monday 2 of each case, and the settings it runs at: refused by exactly
+    # ONE per-Monday filter, the one named, and passing every other (checked
+    # filter by filter when the quotes were chosen). The last field is a
+    # setting that relaxes the named filter, or None where none can. A scan
+    # that ENDED at the first refused Monday after a hit, rather than stepping
+    # past it, would lose Monday 3 in every case.
+    _REFUSED_MONDAY_2 = [
+        # Spread 0.70 over a 0.60 band ceiling (legs 0.20 + 0.10 = 0.30 sit
+        # under the band floor's 0.70 sum ceiling)
+        pytest.param(((0.20, 0.80), (0.90, 0.10)), {"spread_band": (0.30, 0.60)}, {},
+                     id="band-ceiling"),
+        # Spread 0.10 under the 13-day gap's 0.15 tier, legs 0.20 + 0.60 = 0.80
+        # under the 0.85 sum ceiling: B's YES and NO asks sum to under $1
+        # (0.30 + 0.60, a crossed book: its YES ask below its YES bid), the
+        # only way the tier can refuse a Monday the sum ceiling passes
+        pytest.param(((0.20, 0.80), (0.30, 0.60)), {}, {"tier_floors": False}, id="tier"),
+        # Spread 0.40 clears the tier; legs 0.20 + 0.70 = 0.90 exceed the 0.85
+        # sum ceiling (the 0.10 left clears the fee)
+        pytest.param(((0.20, 0.80), (0.60, 0.70)), {}, {"tier_floors": False},
+                     id="leg-sum-ceiling"),
+        # B's YES ask 0.995 is a dead quote. B's YES ask is no leg price of a
+        # time-series pair, so nothing else refuses it; a dead YES on A (pA)
+        # would be refused again as a dead leg
+        pytest.param(((0.20, 0.80), (0.995, 0.40)), {}, None, id="dead-yes-quote"),
+        # A YES ask that does not parse
+        pytest.param(((None, 0.80), (0.60, 0.40)), {}, None, id="unparseable-quote"),
+        # Tiers off, no band: threshold 0 and a sum ceiling of 1. Spread 0.04 >
+        # 0, legs 0.48 + 0.50 = 0.98, and the 0.02 left does not clear the fee
+        # (0.07 x (0.48 x 0.52 + 0.50 x 0.50) = 0.035); with the tiers on the
+        # tier would refuse it first
+        pytest.param(((0.48, 0.52), (0.52, 0.50)), {"tier_floors": False}, None, id="fee"),
+        # Tiers off: a zero spread, refused as having nothing to dispute, while
+        # the floor-0 threshold, the sum (0.30 + 0.40) and the fee all pass —
+        # again only when B's YES and NO asks sum to under $1 (0.30 + 0.40, a
+        # crossed book)
+        pytest.param(((0.30, 0.70), (0.30, 0.40)), {"tier_floors": False}, None,
+                     id="non-positive-spread"),
+        # B's NO ask 0.005, the traded NO leg, is dead. Production candles never
+        # carry one (historical.fetch_candlesticks clamps no_ask_close into
+        # [0.01, 0.99]); _find_entry's input contract does
+        pytest.param(((0.20, 0.80), (0.60, 0.005)), {}, None, id="dead-no-leg"),
+    ]
+
+    @pytest.mark.parametrize("monday_2,settings,relaxed", _REFUSED_MONDAY_2)
+    def test_a_monday_the_filters_refuse_is_not_recorded(self, monday_2, settings, relaxed):
+        # Three Mondays in the window (the earlier leg closes 2026-01-21, so
+        # the scan ends 01-20) and a 13-day gap, the 0.15 tier: Mondays 1 and 3
+        # qualify and Monday 2 is refused, so "later" holds Monday 3 only
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-01-21T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-02-03T00:00:00+00:00"}
+
+        def scan(second, **kw):
+            (a_yes, a_no), (b_yes, b_no) = self._QUALIFYING
+            a = [_candle(_MONDAY_TS, a_yes, a_no), _candle(_MONDAY2_TS, *second[0]),
+                 _candle(_MONDAY3_TS, a_yes, a_no)]
+            b = [_candle(_MONDAY_TS, b_yes, b_no), _candle(_MONDAY2_TS, *second[1]),
+                 _candle(_MONDAY3_TS, b_yes, b_no)]
+            return _find_entry(a, b, mA, mB, "time_series", date(2026, 1, 1), **kw)
+
+        entry = scan(monday_2, **settings)
+        assert entry["entry_date"] == date(2026, 1, 5)
+        assert [m["entry_date"] for m in entry["later"]] == [date(2026, 1, 19)]
+        (monday_3,) = entry["later"]
+        assert (monday_3["pA"], monday_3["pB"], monday_3["nA"], monday_3["nB"]) == (
+            0.20, 0.60, 0.80, 0.40)
+        both = [date(2026, 1, 12), date(2026, 1, 19)]
+        # CONTROL: at the same settings a qualifying Monday 2 is recorded, so
+        # the refusal above is Monday 2's own quotes' doing
+        assert [m["entry_date"] for m in scan(self._QUALIFYING, **settings)["later"]] == both
+        # ... and where a setting relaxes the named filter, the same Monday 2
+        # is recorded under it: that filter refused it, and nothing else did
+        if relaxed is not None:
+            assert [m["entry_date"] for m in scan(monday_2, **relaxed)["later"]] == both
+
+    def test_a_single_qualifying_monday_leaves_later_empty(self):
+        # The earlier leg closes 2026-01-10: the scan ends 01-09, so 01-05 is
+        # the only checkpoint, and "later" is empty — but present
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-01-10T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-01-20T00:00:00+00:00"}
+        entry = _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)], [_candle(_MONDAY_TS, 0.60, 0.40)],
+                            mA, mB, "time_series", date(2026, 1, 1))
+        assert entry["entry_date"] == date(2026, 1, 5)
+        assert entry["later"] == ()
+        (only,) = backtester._entry_mondays(entry)
+        assert only is entry
+        # An entry built without the key, as several tests build them, reads
+        # the same: one Monday, itself
+        bare = {k: entry[k] for k in self._KEYS}
+        (only,) = backtester._entry_mondays(bare)
+        assert only is bare
+
+    def test_later_mondays_reference_the_same_market_dicts(self, monkeypatch):
+        # A memory guarantee as much as a correctness one: a later Monday adds
+        # one small dict and no market dict (CapSweep keeps every band's
+        # entries alive, TS-07)
+        c = TestBandSweepPhaseOneSubset._fresh(monkeypatch)
+        corpus = {id(m) for (mA, mB, _canon, _group_key), _pair_type in c.all_pairs
+                  for m in (mA, mB)}
+        seen = 0
+        for tier_floors in (True, False):
+            for rec in backtester._entries_for_band(c, tier_floors=tier_floors):
+                entry = rec["entry"]
+                legs = {id(entry["mA"]), id(entry["mB"])}
+                assert legs <= corpus
+                for monday in entry["later"]:
+                    assert monday is not entry and "later" not in monday
+                    # The pair's own two records — for a time-series pair in
+                    # the first Monday's order (a same-title pair's A is
+                    # decided per Monday; see the TX/TY test)
+                    assert {id(monday["mA"]), id(monday["mB"])} == legs
+                    if rec["pair_type"] == "time_series":
+                        assert monday["mA"] is entry["mA"] and monday["mB"] is entry["mB"]
+                    seen += 1
+        # 3 later Mondays for each short pair and SB/SA, plus the ladder's 9
+        # with the tiers on and 10 with them off
+        assert seen == (3 * 4 + 9) + (3 * 4 + 10)
+
+    def test_the_count_line_is_logged_at_zero_and_names_the_tier_setting(self, caplog):
+        # Logged on every pass, zero included (DR-66); an entry built without
+        # "later" counts as one Monday
+        one = {"entry": {"entry_date": date(2026, 1, 5)}}
+        three = {"entry": {"entry_date": date(2026, 1, 5), "later": ({}, {})}}
+        with caplog.at_level(logging.INFO):
+            backtester._log_qualifying_mondays([], None)
+            backtester._log_qualifying_mondays([one, three], (0.0, 1.0))
+            backtester._log_qualifying_mondays([], (0.25, 0.5), tier_floors=False)
+        assert caplog.messages == [
+            "Qualifying Mondays at band 0-1: 0 over 0 entries (0 qualify on more than one)",
+            "Qualifying Mondays at band 0-1: 4 over 2 entries (1 qualify on more than one)",
+            "Qualifying Mondays at band 0.25-0.5 with the tier floors off: 0 over 0 entries "
+            "(0 qualify on more than one)",
+        ]
+
+
+class TestCandlesAtOrBefore:
+    """_candles_at_or_before finds a market's latest candle at or before every
+    Monday of a window in one pass. These tests check that it gives
+    _candle_at_or_before's answer every time, and that it reads each candle
+    about once."""
+
+    @staticmethod
+    def _candles(rng: random.Random, shape: str) -> list[dict]:
+        # Hourly-ish stamps with repeats; "sorted" keeps the repeats, "unique"
+        # drops them, "unsorted" leaves the draw order
+        stamps = [1_000_000 + 3600 * rng.randint(0, 40) for _ in range(rng.choice(
+            (0, 1, 2, 3, 5, 8, 20)))]
+        if shape == "sorted":
+            stamps.sort()
+        elif shape == "unique":
+            stamps = sorted(set(stamps))
+        return [{"ts": ts, "i": i} for i, ts in enumerate(stamps)]
+
+    def test_every_answer_is_the_reference_rules(self):
+        rng = random.Random(75)
+        compared = 0
+        for trial in range(600):
+            candles = self._candles(rng, ("sorted", "unique", "unsorted")[trial % 3])
+            stamps = [c["ts"] for c in candles]
+            # Targets before every candle, after every candle, on a candle
+            # exactly, and between — non-decreasing, repeats included
+            pool = [999_000, 1_000_000 + 3600 * 41] + stamps + [
+                1_000_000 + rng.randint(-3600, 3600 * 41) for _ in range(6)]
+            targets = sorted(rng.choice(pool) for _ in range(rng.randint(0, 12)))
+            if trial % 4 == 3:
+                # ... and in any order: a target below its predecessor rescans
+                rng.shuffle(targets)
+            got = backtester._candles_at_or_before(candles, targets)
+            want = [backtester._candle_at_or_before(candles, ts) for ts in targets]
+            assert len(got) == len(want) == len(targets)
+            # The candle objects themselves, or both None
+            assert all(g is w for g, w in zip(got, want, strict=True)), (candles, targets)
+            compared += len(targets)
+        assert compared > 3000
+
+    def test_the_pass_reads_each_candle_about_once(self):
+        # A long-lived pair qualifying on every Monday of its one-year window
+        # (the scan's cap), over two years of hourly candles per leg: each
+        # leg's "ts" must be read O(candles + Mondays) times. A per-Monday
+        # _candle_at_or_before lookup rescans from the first candle every
+        # time: 680,108 reads per leg here, about 19x the bound below (the one
+        # pass reads 17,414).
+        reads = {"A": 0, "B": 0}
+
+        def counting(leg: str) -> type:
+            class Candle(dict):
+                def __getitem__(self, key):
+                    if key == "ts":
+                        reads[leg] += 1
+                    return super().__getitem__(key)
+            return Candle
+
+        close_a = datetime(2026, 6, 1, tzinfo=UTC)
+        first = int((close_a - timedelta(days=730)).timestamp())
+        last = int((close_a + timedelta(days=1)).timestamp())
+        a_candle, b_candle = counting("A"), counting("B")
+        candles_a = [a_candle(ts=ts, yes_ask_close=0.30, no_ask_close=0.70)
+                     for ts in range(first, last, 3600)]
+        candles_b = [b_candle(ts=ts, yes_ask_close=0.60, no_ask_close=0.40)
+                     for ts in range(first, last, 3600)]
+        mA = {"ticker": "A", "event_ticker": "EA-1", "close_time": close_a.isoformat()}
+        mB = {"ticker": "B", "event_ticker": "EB-1",
+              "close_time": (close_a + timedelta(days=14)).isoformat()}
+        entry = _find_entry(candles_a, candles_b, mA, mB, "time_series", date(2020, 1, 1))
+        mondays = len(backtester._entry_mondays(entry))
+        # Not vacuous: every Monday of the year qualified
+        assert mondays == 52
+        for leg, candles in (("A", candles_a), ("B", candles_b)):
+            assert reads[leg] <= 2 * len(candles) + 2 * mondays, (leg, reads[leg])
+
+
+# ─── DR-75: the Kelly gate enters a pair on its earliest passing Monday ──
+
+
+def _without_later(rec: dict) -> dict:
+    """The same record with its later Mondays stripped: the pair on its first
+    qualifying Monday alone."""
+    return {**rec, "entry": {k: v for k, v in rec["entry"].items() if k != "later"}}
+
+
+def _dr75_halves(entries: list[dict], split_date: date) -> tuple[list[dict], list[dict]]:
+    """The split-half rule, restated independently of backtester._split_halves:
+    each pair in the half of its FIRST qualifying Monday, and an H1 pair's
+    later Mondays cut to those before the split (DR-75)."""
+    first = [{**r, "entry": {**r["entry"], "later": tuple(
+                m for m in r["entry"].get("later", ()) if m["entry_date"] < split_date)}}
+             for r in entries if r["entry"]["entry_date"] < split_date]
+    return first, [r for r in entries if r["entry"]["entry_date"] >= split_date]
+
+
+def _flipping_same_title_record() -> tuple[dict, dict, dict]:
+    """(record, X, Y): a same-title pair on two series (X and Y), through the
+    real _find_entry. On 2026-01-05 X is the pricier side (YES 0.53 against
+    0.47), so A = X: a 0.06 gap on legs summing to 0.94 — it qualifies, but
+    its Kelly fraction is about -0.99. From 2026-01-12 Y is (YES 0.70 against
+    0.40), so A = Y on every later Monday, at about +0.81. X settled YES and Y
+    NO. Every other per-leg field differs between the two markets too — title,
+    subtitle, close, settlement, and an event filed under another category
+    (KXBTC: Crypto, KXGOLD: Finance) — so each field of a trade says which
+    leg it was read from. No finder would pair two such markets (their wording
+    differs and they close a week apart); _find_entry, which built this
+    record, reads neither the wording nor DR-74's close gap, only the closes'
+    scan window (to 2026-02-01, the earlier close's eve)."""
+    x = {"ticker": "X", "event_ticker": "KXBTCX-1", "event_title": "EV",
+         "title": "Will X happen?", "subtitle": "X label", "result": "yes",
+         "close_time": "2026-02-02T00:00:00+00:00",
+         "settlement_ts": "2026-02-03T12:00:00+00:00"}
+    y = {"ticker": "Y", "event_ticker": "KXGOLDY-1", "event_title": "EV",
+         "title": "Will Y happen?", "subtitle": "Y label", "result": "no",
+         "close_time": "2026-02-09T00:00:00+00:00",
+         "settlement_ts": "2026-02-10T12:00:00+00:00"}
+    candles = {"X": [_candle(_MONDAY_TS, 0.53, 0.47), _candle(_MONDAY2_TS, 0.40, 0.60)],
+               "Y": [_candle(_MONDAY_TS, 0.47, 0.53), _candle(_MONDAY2_TS, 0.70, 0.30)]}
+    entry = _find_entry(candles["X"], candles["Y"], x, y, "same_title", date(2026, 1, 1))
+    return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", ""),
+            "entry": entry}, x, y
+
+
+class TestKellyPicksTheEarliestPassingMonday:
+    """_simulate_at_discount enters each pair on its EARLIEST qualifying Monday
+    whose Kelly fraction is positive at the simulated k (DR-75) — the first
+    Monday the weekly live run could have entered it on — and everything
+    after the gate reads that Monday: its prices, its date and its legs.
+
+    The time-series Mondays are the golden tier-off ladder's quotes
+    (TestTierFloorsOff): Q1 pA 0.20 / pB 0.45 / nB 0.55 (a 0.25 spread on a
+    wide book) and Q2 pA 0.20 / pB 0.60 / nB 0.40; Q3 (pB 0.70 / nB 0.30) is
+    wider still. Kelly from the config helpers: at k = 0.90, Q1 -0.016, Q2
+    +0.032, Q3 +0.051; at 0.85, Q1 +0.041; at 0.95 all three negative (Q1
+    -0.072, Q2 -0.022, Q3 -0.002). By default EARLY settled NO and LATE YES:
+    the event happened between the two deadlines, the one outcome in which
+    the time-series bet loses."""
+
+    _START = date(2026, 1, 1)
+    _M1, _M2, _M3 = date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19)
+    _Q1 = (_M1, 0.45, 0.55)
+    _Q2 = (_M2, 0.60, 0.40)
+    _Q3 = (_M3, 0.70, 0.30)
+    _CLOSE = "2026-03-20"
+
+    @classmethod
+    def _legs(cls, result_a="no", result_b="yes", *, tag="", close=None):
+        """Two rungs of one event (a same-event ladder), closing and settling together."""
+        close = close or cls._CLOSE
+
+        def market(ticker, deadline, result):
+            return {"ticker": f"{ticker}{tag}", "event_ticker": f"KXLAD{tag}-1",
+                    "title": f"Will it happen by {deadline}?", "subtitle": "",
+                    "result": result, "close_time": f"{close}T00:00:00+00:00",
+                    "settlement_ts": f"{close}T12:00:00+00:00"}
+
+        return (market("EARLY", "March 1, 2026", result_a),
+                market("LATE", "March 20, 2026", result_b))
+
+    def _record(self, *quotes, legs=None, group_key="ladder", later=True, pA=0.20):
+        """One time-series record whose qualifying Mondays are quotes' (day,
+        pB, nB), in date order, all at pA (0.20 unless given) and nA = 1 - pA.
+        later=False builds the entry without the key, as a hand-built entry
+        has it."""
+        mA, mB = legs or self._legs()
+        nA = round(1.0 - pA, 4)
+        first, *rest = [{"entry_date": day, "pA": pA, "pB": pB, "nA": nA, "nB": nB,
+                         "mA": mA, "mB": mB, "gap_days": 19} for day, pB, nB in quotes]
+        entry = {**first, "later": tuple(rest)} if later else first
+        return {"pair_type": "time_series", "canon": group_key, "group_key": group_key,
+                "entry": entry}
+
+    def _sim(self, records, **kw):
+        # Pinned past every fixture's settlement (2026-03-23 is the latest close
+        # used in this class) so two back-to-back simulations compare equity
+        # curves that both end on the same day, rather than each ending on
+        # "today" (UTC) as read at its own simulation time.
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _kelly(rec, k):
+        """Each of a record's Mondays' uncapped Kelly fractions at k, from the
+        config helpers (_uncapped_kelly reads the Monday handed to it)."""
+        return [_uncapped_kelly({"pair_type": rec["pair_type"], "entry": monday}, k)
+                for monday in backtester._entry_mondays(rec["entry"])]
+
+    def test_a_first_monday_that_fails_enters_on_the_first_later_one_that_passes(self):
+        rec = self._record(self._Q1, self._Q2)
+        f1, f2 = self._kelly(rec, 0.90)
+        assert f1 == pytest.approx(-0.016, abs=1e-3) and f2 == pytest.approx(0.032, abs=1e-3)
+        point = self._sim([rec], k=0.90)
+        (t,) = point.trades
+        # Every quote is Monday 2's, and so is the date
+        assert (t.entry_date, t.entry_pA, t.entry_pB, t.entry_nA, t.entry_nB) == (
+            self._M2, 0.20, 0.60, 0.80, 0.40)
+        assert (t.ticker_a, t.ticker_b, t.pair_type) == ("EARLY", "LATE", "time_series")
+        # EARLY NO with LATE YES: the in-between cell, a loss of the whole stake
+        assert (t.outcome_a, t.outcome_b, t.actual_payoff) == ("no", "yes", 0.0)
+        assert t.profit == pytest.approx(-(t.total_cost + t.fees)) and t.profit < 0
+        # Sized at the chosen Monday's own fraction (under the 20% cap)
+        assert t.kelly_fraction == pytest.approx(f2, abs=1e-12)
+        assert t.total_cost == t.n * (0.20 + 0.40)
+        assert point.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        # CONTROL: on its first Monday alone it never enters at this k
+        assert self._sim([_without_later(rec)], k=0.90).trades == []
+
+    def test_at_a_k_the_first_monday_passes_it_is_the_entry(self):
+        rec = self._record(self._Q1, self._Q2)
+        f1, f2 = self._kelly(rec, 0.85)
+        assert f1 == pytest.approx(0.041, abs=1e-3) and f2 > f1
+        point = self._sim([rec], k=0.85)
+        (t,) = point.trades
+        assert (t.entry_date, t.entry_pB, t.entry_nB) == (self._M1, 0.45, 0.55)
+        assert point.peak_kelly_fraction == pytest.approx(f1, abs=1e-12)
+        # ... exactly the first-Monday-alone simulation
+        alone = self._sim([_without_later(rec)], k=0.85)
+        assert [astuple(x) for x in point.trades] == [astuple(x) for x in alone.trades]
+        pd.testing.assert_frame_equal(point.equity_df, alone.equity_df)
+
+    def test_no_passing_monday_drops_the_pair(self):
+        rec = self._record(self._Q1, self._Q2, self._Q3)
+        assert all(f < 0 for f in self._kelly(rec, 0.95))
+        point = self._sim([rec], k=0.95)
+        assert point.trades == [] and point.peak_kelly_fraction == 0.0
+
+    def test_a_pair_no_monday_passes_never_reaches_its_group_contest(self):
+        # ONE group at k = 0.95. R_FAIL fails the gate on both of its Mondays
+        # (pA 0.30 / pB 0.90 / nB 0.15: Kelly about -0.083) but carries the
+        # larger ranking ratio (profit ratio about 1.17); R_PASS passes (pA
+        # 0.10 / pB 0.45 / nB 0.52: about +0.067, profit ratio about 0.57).
+        # The gate drops R_FAIL BEFORE the one-pair-per-group contest: kept
+        # to it, R_FAIL would win the group and Pass 2 could not size its
+        # negative fraction, so nothing would trade.
+        r_fail = self._record((self._M1, 0.90, 0.15), (self._M2, 0.90, 0.15), pA=0.30,
+                              legs=self._legs("no", "no", tag="-F"), group_key="g")
+        r_pass = self._record((self._M1, 0.45, 0.52), pA=0.10,
+                              legs=self._legs("no", "no", tag="-P"), group_key="g")
+        assert self._kelly(r_fail, 0.95) == pytest.approx([-0.083, -0.083], abs=1e-3)
+        (f_pass,) = self._kelly(r_pass, 0.95)
+        assert f_pass == pytest.approx(0.067, abs=1e-3)
+
+        def profit_ratio(rec):
+            e = rec["entry"]
+            net = (1.0 - e["pA"] - e["nB"]) - fee_per_pair_approx(e["pA"], e["nB"])
+            return net / (e["pA"] + e["nB"])
+
+        assert profit_ratio(r_fail) == pytest.approx(1.17, abs=0.01)
+        assert profit_ratio(r_pass) == pytest.approx(0.57, abs=0.01)
+        point = self._sim([r_fail, r_pass], k=0.95)
+        (t,) = point.trades
+        assert (t.ticker_a, t.entry_date) == ("EARLY-P", self._M1)
+        assert point.peak_kelly_fraction == pytest.approx(f_pass, abs=1e-12)
+
+    def test_the_earliest_passing_monday_wins_over_a_better_later_one(self):
+        rec = self._record(self._Q1, self._Q2, self._Q3)
+        f1, f2, f3 = self._kelly(rec, 0.90)
+        assert f1 < 0 < f2 < f3
+        point = self._sim([rec], k=0.90)
+        (t,) = point.trades
+        assert (t.entry_date, t.entry_pB, t.entry_nB) == (self._M2, 0.60, 0.40)
+        # The peak is the CHOSEN Monday's fraction, never the best Monday's
+        assert point.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        assert point.peak_kelly_fraction < f3
+
+    def test_an_entry_without_later_is_one_monday(self):
+        # Hand-built entries carry no "later": they simulate exactly as the
+        # same entry with later == (), where its Monday passes and where not
+        bare = self._record(self._Q1, later=False)
+        empty = self._record(self._Q1)
+        assert "later" not in bare["entry"] and empty["entry"]["later"] == ()
+        for k in (0.85, 0.90):
+            a, b = self._sim([bare], k=k), self._sim([empty], k=k)
+            assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
+            pd.testing.assert_frame_equal(a.equity_df, b.equity_df)
+            assert a.peak_kelly_fraction == b.peak_kelly_fraction
+        # Not vacuous: one k trades and the other does not
+        assert self._sim([bare], k=0.85).trades and not self._sim([bare], k=0.90).trades
+
+    def test_a_rescued_pair_reaches_the_premise_check(self, caplog):
+        # EARLY YES with LATE NO — the impossible cell for a cumulative-deadline
+        # pair. The Kelly gate runs FIRST (the load-bearing statement order),
+        # so the pair is counted only at a k where one of its Mondays passes.
+        legs = self._legs("yes", "no")
+        rec = self._record(self._Q1, self._Q2, legs=legs)
+
+        def premise_lines(k, records):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                point = self._sim(records, k=k)
+            assert point.trades == []           # never traded, never paid
+            return [r.getMessage() for r in caplog.records
+                    if "cumulative-deadline premise" in r.getMessage()]
+
+        (line,) = premise_lines(0.90, [rec])    # rescued on Monday 2, then excluded
+        assert line.startswith("Excluded 1 time-series candidate(s)")
+        assert premise_lines(0.95, [rec]) == []  # no Monday passes: never reaches it
+        # CONTROL: on its first Monday alone (which fails at 0.90) it is never counted
+        assert premise_lines(0.90, [_without_later(rec)]) == []
+
+    def test_holding_days_and_ranking_use_the_chosen_monday(self):
+        # Two candidates in ONE group, which keeps the one with the larger
+        # entry_monthly_ratio = profit ratio x 30 / days from entry to the
+        # later close. R1 enters on Monday 2 (closing 03-20). R2 has Monday
+        # 2's prices on Monday 2 too, but closes 03-23, so its ratio falls
+        # between two readings of R1's ratio that differ only in where the
+        # horizon starts: R1's Monday 2 prices counted from its first Monday
+        # (74 days) and from Monday 2 (67). So R1 wins only if its horizon
+        # starts on the Monday it entered on — and it would lose on its first
+        # Monday's prices too.
+        r1 = self._record(self._Q1, self._Q2, group_key="g")
+        r2 = self._record(self._Q2, legs=self._legs(tag="-R2", close="2026-03-23"),
+                          group_key="g")
+        close_1, close_2 = date(2026, 3, 20), date(2026, 3, 23)
+
+        def ratio(monday, close):
+            price_a, price_b = monday["pA"], monday["nB"]
+            net = (1.0 - price_a - price_b) - fee_per_pair_approx(price_a, price_b)
+            return net / (price_a + price_b) * 30.0 / (close - monday["entry_date"]).days
+
+        m1, m2 = backtester._entry_mondays(r1["entry"])
+        (only,) = backtester._entry_mondays(r2["entry"])
+        from_first = {**m2, "entry_date": m1["entry_date"]}
+        assert ratio(m1, close_1) < ratio(only, close_2)
+        assert ratio(from_first, close_1) < ratio(only, close_2) < ratio(m2, close_1)
+        assert all(f > 0 for f in self._kelly(r2, 0.90))
+        point = self._sim([r1, r2], k=0.90)
+        (t,) = point.trades
+        # R1 wins the group, on its chosen Monday
+        assert (t.ticker_a, t.entry_date) == ("EARLY", self._M2)
+        # Held from the CHOSEN Monday to the later settlement (03-20)
+        assert t.exit_date == close_1
+        assert t.holding_days == (close_1 - self._M2).days == 67
+        assert t.monthly_profit_ratio == pytest.approx(t.profit_ratio * 30.0 / 67)
+
+    def test_a_same_title_pair_settles_on_the_chosen_mondays_legs(self):
+        rec, x, y = _flipping_same_title_record()
+        m1, m2, *rest = backtester._entry_mondays(rec["entry"])
+        # _find_entry re-decides A every Monday: X on the first, Y from the second
+        assert (m1["entry_date"], m2["entry_date"]) == (self._M1, self._M2)
+        assert m1["mA"] is x and m1["mB"] is y
+        assert all(m["mA"] is y and m["mB"] is x for m in (m2, *rest))
+        f1, f2, *_ = self._kelly(rec, TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+        assert f1 == pytest.approx(-0.99, abs=0.01) and f2 == pytest.approx(0.81, abs=0.01)
+        (t,) = self._sim([rec]).trades
+        # Every figure is Monday 2's, on Monday 2's legs: A = Y, B = X
+        assert (t.entry_date, t.ticker_a, t.ticker_b) == (self._M2, "Y", "X")
+        assert (t.entry_pA, t.entry_pB, t.entry_nA, t.entry_nB) == (0.70, 0.40, 0.30, 0.60)
+        # ... and so is every per-leg field, each of which differs between X
+        # and Y, so none can have been read off Monday 1's legs (A = X, B = Y)
+        assert (t.title_a, t.title_b) == ("Will Y happen?", "Will X happen?")
+        assert (t.subtitle_a, t.subtitle_b) == ("Y label", "X label")
+        assert (t.close_date_a, t.close_date_b) == (date(2026, 2, 9), date(2026, 2, 2))
+        assert (t.settled_date_a, t.settled_date_b) == (date(2026, 2, 10), date(2026, 2, 3))
+        assert (t.event_ticker, t.category) == ("KXGOLDY-1", "Finance")
+        assert historical.infer_category(x["event_ticker"]) == "Crypto"
+        # Held from the chosen Monday to the later leg's settlement
+        assert t.exit_date == date(2026, 2, 10)
+        assert t.holding_days == (date(2026, 2, 10) - self._M2).days == 29
+        # ... and it settles on them: NO on Y (settled NO) and YES on X
+        # (settled YES) both pay — where the first Monday's orientation (A = X)
+        # would have paid nothing on the same settlement
+        assert (t.outcome_a, t.outcome_b) == ("no", "yes")
+        assert t.actual_payoff == _settlement_receipt(t.n, "no", "yes", "same_title") == 2 * t.n
+        assert _settlement_receipt(t.n, "yes", "no", "same_title") == 0
+        assert t.total_cost == t.n * (0.30 + 0.40)
+        # CONTROL: its first Monday alone never enters
+        assert self._sim([_without_later(rec)]).trades == []
+
+
+class TestSplitHalvesKeepEachHalfOnItsSide:
+    """_split_halves: a pair stays in the half its first qualifying Monday
+    falls in, but in the first half (H1) it keeps only its Mondays before the
+    split, so the H1 simulation can never enter it on a second-period Monday
+    (DR-75). It is not copied into the second half (H2). A trimmed record is
+    rebuilt rather than edited, because entry records are shared."""
+
+    _SPLIT = date(2026, 1, 19)
+    _W = (date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26))
+
+    def _records(self):
+        g = TestKellyPicksTheEarliestPassingMonday()
+        w = self._W
+        return [
+            # H1, two later Mondays on or after the split: cut
+            g._record((w[0], 0.45, 0.55), (w[1], 0.60, 0.40), (w[2], 0.60, 0.40),
+                      (w[3], 0.60, 0.40), legs=g._legs(tag="-1")),
+            # H1, every later Monday before the split: nothing to cut
+            g._record((w[0], 0.60, 0.40), (w[1], 0.60, 0.40), legs=g._legs(tag="-2")),
+            # H1, built without "later" at all
+            g._record((w[1], 0.60, 0.40), legs=g._legs(tag="-3"), later=False),
+            # H2 (first Monday ON the split)
+            g._record((w[2], 0.45, 0.55), (w[3], 0.60, 0.40), legs=g._legs(tag="-4")),
+        ]
+
+    def test_h1_keeps_only_its_mondays_before_the_split(self):
+        recs = self._records()
+        cut_from = recs[0]
+        original = cut_from["entry"]["later"]
+        h1, _h2 = backtester._split_halves(recs, self._SPLIT)
+        cut = h1[0]
+        # A NEW record and entry ...
+        assert cut is not cut_from and cut["entry"] is not cut_from["entry"]
+        assert [m["entry_date"] for m in backtester._entry_mondays(cut["entry"])] == [
+            self._W[0], self._W[1]]
+        # ... sharing every first-Monday value, the market dicts and the kept
+        # Monday's own dict
+        assert _without_later(cut) == _without_later(cut_from)
+        assert cut["entry"]["mA"] is cut_from["entry"]["mA"]
+        assert cut["entry"]["mB"] is cut_from["entry"]["mB"]
+        assert cut["entry"]["later"][0] is original[0]
+        # The original is untouched: whoever else holds it still sees every Monday
+        assert cut_from["entry"]["later"] is original and len(original) == 3
+
+    def test_an_h2_record_and_an_uncut_h1_record_are_returned_by_identity(self):
+        recs = self._records()
+        h1, h2 = backtester._split_halves(recs, self._SPLIT)
+        assert h1[1] is recs[1] and h1[2] is recs[2]
+        assert len(h2) == 1 and h2[0] is recs[3]
+        # An H2 record keeps every Monday: each is on or after the split anyway
+        assert len(backtester._entry_mondays(h2[0]["entry"])) == 2
+
+    def test_the_counts_and_order_are_unchanged(self):
+        recs = self._records()
+        for split in (*self._W, date(2026, 2, 2), date(2025, 12, 29)):
+            h1, h2 = backtester._split_halves(recs, split)
+            # Exactly the split by first Monday, record for record
+            assert [r["entry"]["mA"]["ticker"] for r in h1] == [
+                r["entry"]["mA"]["ticker"] for r in recs if r["entry"]["entry_date"] < split]
+            assert h2 == [r for r in recs if r["entry"]["entry_date"] >= split]
+        assert [len(h) for h in backtester._split_halves(recs, self._SPLIT)] == [3, 1]
+
+    def test_a_first_half_pair_whose_only_passing_monday_is_on_or_after_the_split_trades_in_neither_half(
+        self,
+    ):
+        # Monday 1 fails at k = 0.90 and Monday 2 passes; split AT Monday 2
+        g = TestKellyPicksTheEarliestPassingMonday()
+        rec = g._record(g._Q1, g._Q2)
+        split = g._M2
+        # The full run (which is also what an UNCUT H1 record would simulate)
+        # trades it ON the split — the second period
+        full = g._sim([rec], k=0.90)
+        assert [t.entry_date for t in full.trades] == [split]
+        halves = backtester._split_halves([rec], split)
+        assert [len(h) for h in halves] == [1, 0]
+        (h1_rec,) = halves[0]
+        assert h1_rec is not rec and h1_rec["entry"]["later"] == ()
+        # The residual: it trades in neither half, though the full run trades it
+        h = backtester._half_split(halves, g._START, 10_000.0, 0.90, (0.0, 1.0))
+        assert (h.h1_entries, h.h2_entries, h.h1_trades, h.h2_trades) == (1, 0, 0, 0)
+
+    def test_neither_half_s_peak_exceeds_the_full_run_s(self):
+        # The CapSweep invariant its shared copies of the halves rest on:
+        # every half candidate is on the Monday the full run chose, or absent.
+        # P qualifies before the split (Monday 1, a small fraction at 0.85)
+        # and after it (Monday 3, a larger one); R first qualifies on the split.
+        g = TestKellyPicksTheEarliestPassingMonday()
+        p = g._record(g._Q1, g._Q3, legs=g._legs(tag="-P"))
+        r = g._record(g._Q2, legs=g._legs(tag="-R"))
+        split = g._M2
+        h1, h2 = backtester._split_halves([p, r], split)
+        for k in INTERVAL_DISCOUNT_SWEEP:
+            full = g._sim([p, r], k=k)
+            for half in (h1, h2):
+                point = g._sim(half, k=k)
+                assert point.peak_kelly_fraction <= full.peak_kelly_fraction, k
+            # ... and no H1 trade is ever dated in the second period
+            assert all(t.entry_date < split for t in g._sim(h1, k=k).trades), k
+        # Not vacuous: re-listing P in H2 on its Mondays after the split would
+        # enter it there at Monday 3 and lift H2's peak above the full run's
+        relisted = {**p, "entry": dict(p["entry"]["later"][0], later=())}
+        full = g._sim([p, r], k=0.85)
+        assert g._sim(h2 + [relisted], k=0.85).peak_kelly_fraction > full.peak_kelly_fraction
+
+    def test_a_cap_sweep_cell_s_halves_cut_h1_at_the_split(self):
+        # CapSweep builds its lazy halves through _split_halves too. One pair
+        # whose first Monday (1/5) fails at k = 0.90 and whose second (1/12,
+        # the split) passes: at every cap its H1 trades nothing, where an uncut
+        # H1 would have traded it on the split
+        g = TestKellyPicksTheEarliestPassingMonday()
+        rec = g._record(g._Q1, g._Q2)
+        band = (0.0, 1.0)
+        cs = backtester.CapSweep(
+            caps=(0.05, BUDGET_FRACTION, 1.0), primary_cap=BUDGET_FRACTION, bands=(band,),
+            ks=(0.90,), primary_k=0.90, start_date=g._START, initial_balance=10_000.0,
+            split_date=g._M2, checks=True, entries_by_band={band: [rec]}, st_entries=[],
+            eager={})
+        cell = cs.cell(band, 0.90)
+        uncut = backtester._half_split(([rec], []), g._START, 10_000.0, 0.90, band,
+                                       size_cap=1.0, quiet=True)
+        assert uncut.h1_trades == 1            # the leak the cut prevents
+        for cap, by_pop in cell.items():
+            for pop in ("all", "time_series"):
+                point = by_pop[pop]
+                assert [t.entry_date for t in point.trades] == [g._M2]
+                assert point.halves == backtester._half_split(
+                    _dr75_halves([rec], g._M2), g._START, 10_000.0, 0.90, band,
+                    population=pop, size_cap=cap, quiet=True)
+                assert (point.halves.h1_entries, point.halves.h1_trades,
+                        point.halves.h2_entries) == (1, 0, 0), (cap, pop)
+
+
+class TestExTopEventReadsEveryMonday:
+    """_ex_top_event drops every entry whose market-A event ticker is the top
+    event on ANY of its qualifying Mondays: a trade records market A of the
+    Monday it entered on, and for a same-title pair which market is A can
+    change from Monday to Monday (DR-75)."""
+
+    def test_an_entry_is_dropped_when_any_of_its_mondays_names_the_event(self, monkeypatch):
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append([id(r) for r in raw_entries])
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}))
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        # A same-title entry whose first Monday's A is on E1 and later
+        # Monday's on E2, beside one on E3
+        flip = {"pair_type": "same_title",
+                "entry": {"mA": {"event_ticker": "E1"},
+                          "later": ({"mA": {"event_ticker": "E2"}},)}}
+        other = {"pair_type": "same_title", "entry": {"mA": {"event_ticker": "E3"}}}
+        for top, kept in (("E2", [other]), ("E1", [other]), ("E3", [flip])):
+            point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
+                                          trades=[TestSweepHelpers._trade(top, 5.0)])
+            seen.clear()
+            assert backtester._ex_top_event(point, [flip, other], date(2026, 1, 1), 100.0,
+                                            (0.0, 1.0))[0] == top
+            assert seen == [[id(r) for r in kept]], top
+
+    def test_a_middle_monday_is_read_too(self, monkeypatch):
+        # A = X, Y, X: E5 is named by the MIDDLE Monday only, so a reader of
+        # the first and last Mondays alone would keep the entry for top = E5
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append([id(r) for r in raw_entries])
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}))
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        back = {"pair_type": "same_title",
+                "entry": {"mA": {"event_ticker": "E4"},
+                          "later": ({"mA": {"event_ticker": "E5"}},
+                                    {"mA": {"event_ticker": "E4"}})}}
+        other = {"pair_type": "same_title", "entry": {"mA": {"event_ticker": "E3"}}}
+        for top, kept in (("E5", [other]), ("E4", [other]), ("E3", [back])):
+            point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
+                                          trades=[TestSweepHelpers._trade(top, 5.0)])
+            seen.clear()
+            assert backtester._ex_top_event(point, [back, other], date(2026, 1, 1), 100.0,
+                                            (0.0, 1.0))[0] == top
+            assert seen == [[id(r) for r in kept]], top
+
+    def test_the_traded_monday_s_event_takes_its_entry_out(self):
+        # End to end: the X/Y pair trades on Monday 2 with A = Y, so its trade
+        # carries Y's event, which its FIRST Monday (A = X) does not name —
+        # yet the re-simulation without that event must drop it
+        rec, x, y = _flipping_same_title_record()
+        start = date(2026, 1, 1)
+        point = backtester._simulate_at_discount([rec], start, 10_000.0)
+        (t,) = point.trades
+        assert t.event_ticker == y["event_ticker"]
+        assert rec["entry"]["mA"]["event_ticker"] == x["event_ticker"] != y["event_ticker"]
+        assert backtester._total_return(point, 10_000.0) > 0
+        # Without its only entry there is nothing left to trade
+        assert backtester._ex_top_event(point, [rec], start, 10_000.0, (0.0, 1.0)) == (
+            y["event_ticker"], 0.0)
+
+
+class TestCapSweepEntryEventsReadEveryMonday:
+    """CapSweep.entry_events lists market A's event on EVERY qualifying Monday
+    of every entry — a superset of the events any cell's trades carry, since
+    a trade carries market A of the Monday it entered on (DR-75). The
+    dashboard lists its categories and tags from it before any cell is
+    simulated."""
+
+    @staticmethod
+    def _sweep(entries):
+        band = (0.0, 1.0)
+        return backtester.CapSweep(
+            caps=(BUDGET_FRACTION,), primary_cap=BUDGET_FRACTION, bands=(band,), ks=(0.75,),
+            primary_k=0.75, start_date=date(2026, 1, 1), initial_balance=10_000.0,
+            split_date=None, checks=False, entries_by_band={band: entries}, st_entries=[],
+            eager={})
+
+    def test_both_events_of_a_flipping_entry_are_listed(self):
+        flip = {"pair_type": "same_title",
+                "entry": {"mA": {"event_ticker": "KXONE-1"},
+                          "later": ({"mA": {"event_ticker": "KXTWO-1"}},)}}
+        events = self._sweep([flip]).entry_events()
+        assert events == {("KXONE-1", historical.infer_category("KXONE-1")),
+                          ("KXTWO-1", historical.infer_category("KXTWO-1"))}
+
+    def test_a_middle_monday_s_event_is_listed_too(self):
+        # A = X, Y, X: KXFOUR-1 is named by the MIDDLE Monday only, so a
+        # reader of the first and last Mondays alone would miss it
+        back = {"pair_type": "same_title",
+                "entry": {"mA": {"event_ticker": "KXTHREE-1"},
+                          "later": ({"mA": {"event_ticker": "KXFOUR-1"}},
+                                    {"mA": {"event_ticker": "KXTHREE-1"}})}}
+        events = self._sweep([back]).entry_events()
+        assert events == {("KXTHREE-1", historical.infer_category("KXTHREE-1")),
+                          ("KXFOUR-1", historical.infer_category("KXFOUR-1"))}
+
+    def test_every_traded_event_is_listed(self):
+        rec, x, y = _flipping_same_title_record()
+        events = self._sweep([rec]).entry_events()
+        (t,) = backtester._simulate_at_discount([rec], date(2026, 1, 1), 10_000.0).trades
+        assert (t.event_ticker, t.category) in events
+        # ... though the entry's FIRST Monday names the other series' event,
+        # filed under another category
+        assert events == {(m["event_ticker"], historical.infer_category(m["event_ticker"]))
+                          for m in (x, y)}
+        assert len({category for _event, category in events}) == 2
+
+
+class TestCalibrationReadsTheFirstMonday:
+    """What always uses each pair's first qualifying Monday, whatever its
+    later Mondays hold (DR-75): the interval calibration (measuring at the
+    Monday the Kelly gate picks, which depends on k, would let k shape the
+    very measurement meant to check it), the split date (every (spread band,
+    k) scenario must split at one date) and the populations."""
+
+    @staticmethod
+    def _entries(monkeypatch):
+        # The golden fixture with the tier floors off: the ladder first
+        # qualifies on Monday 1 at a 0.25 spread, and its later Mondays quote
+        # 0.40 — different prices behind the same pair
+        entries = backtester._entries_for_band(TestBandSweepPhaseOneSubset._fresh(monkeypatch),
+                                               tier_floors=False)
+        ladder = next(r for r in entries if r["entry"]["mA"]["ticker"] == "RUNG-EARLY")
+        first, *later = backtester._entry_mondays(ladder["entry"])
+        assert first["pB"] - first["pA"] == pytest.approx(0.25)
+        assert later and all(m["pB"] - m["pA"] == pytest.approx(0.40) for m in later)
+        return entries
+
+    def test_later_mondays_never_move_the_calibration(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        stripped = [_without_later(r) for r in entries]
+        for kw in ({}, {"spread_min": 0.2}, {"tier_floors": False}):
+            assert _interval_calibration(entries, **kw) == _interval_calibration(stripped, **kw)
+        # The ladder is measured at its first Monday's spread, not a later one's
+        implied = sorted(o.implied for o in _interval_calibration(entries).observations)
+        assert implied == pytest.approx([0.25, 0.30])
+        # ... and a hand-built entry whose later Monday prices a different
+        # spread is measured on its own first Monday too
+        hand = _cal_entry(10, 0.10, 0.40, "no", "yes")
+        hand["entry"]["later"] = ({**hand["entry"], "entry_date": date(2026, 1, 12),
+                                   "pB": 0.90, "nB": 0.10},)
+        assert _interval_calibration([hand]) == _interval_calibration([_without_later(hand)])
+        assert _interval_calibration([hand]).observations[0].implied == pytest.approx(0.30)
+
+    def test_later_mondays_never_move_the_split_date_or_the_populations(self, monkeypatch):
+        entries = self._entries(monkeypatch)
+        stripped = [_without_later(r) for r in entries]
+        start = date(2026, 1, 1)
+        assert backtester._split_date(entries, start) == backtester._split_date(stripped, start)
+
+        def shape(populations):
+            return [(label, [r["entry"]["mA"]["ticker"] for r in subset])
+                    for label, subset in populations]
+
+        assert shape(backtester._population_subsets(entries)) == shape(
+            backtester._population_subsets(stripped))
 
 
 class TestPrepareCandidates:
@@ -8791,6 +9915,9 @@ class TestBandSweep:
                                       for r in own)))
             h1 = by_key[(p.spread_band, p.k, "all/H1")]
             h2 = by_key[(p.spread_band, p.k, "all/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < split]
             assert [id(r) for r in h2["entries"]] == [
@@ -8859,6 +9986,23 @@ class TestBandSweep:
         assert announced[0] == "Spread band 1/36: 0-0.5"
         assert "Spread band 6/36: 0-1 (primary)" in announced
         assert sum(m.endswith("(primary)") for m in announced) == 1
+
+    def test_every_band_logs_its_qualifying_mondays(self, golden_band_sweep):
+        # DR-75: one count per entry pass — one per band, none with the tiers
+        # off (this sweep has no tier-off family) — right after that band's
+        # own Prepared line
+        messages = golden_band_sweep.messages
+        lines = [m for m in messages if m.startswith("Qualifying Mondays at band ")]
+        assert sorted(m.split(":")[0] for m in lines) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}" for b in _GRID_BANDS)
+        assert all(messages[messages.index(m) - 1].startswith("Prepared ") for m in lines)
+        # The default band's is the golden rows' own count (1 + 3 for each
+        # short pair and SB/SA, 1 + 9 for the ladder) ...
+        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
+                "(5 qualify on more than one)") in lines
+        # ... and at a 0.35 floor with a 0.5 ceiling only the ladder and SB/SA enter
+        assert ("Qualifying Mondays at band 0.35-0.5: 14 over 2 entries "
+                "(2 qualify on more than one)") in lines
 
     def test_the_sweep_records_the_resolved_ladder_setting(self, golden_band_sweep):
         assert golden_band_sweep.result.same_event_ladders is True
@@ -8936,6 +10080,24 @@ class TestBandSweepEdges:
                        for m in messages)
         assert [m for m in messages if m.startswith("Spread band ")] == [
             "Spread band 1/1: 0-1 (primary)"]
+
+    @pytest.mark.parametrize("band,prepared,line", [
+        (None, "Prepared 5 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
+        # At 0.3-0.6 TA/TB (0.15) and WA/WB (0.98) no longer enter: EA/EB's 4,
+        # the ladder's 10 and SB/SA's 4
+        ((0.3, 0.6), "Prepared 3 candidate entries for sizing",
+         "Qualifying Mondays at band 0.3-0.6: 18 over 3 entries (3 qualify on more than one)"),
+    ], ids=["default-band", "band-0.3-0.6"])
+    def test_a_single_band_run_logs_its_qualifying_mondays(
+        self, monkeypatch, caplog, band, prepared, line,
+    ):
+        # A single-band run logs the count too, right after its Prepared line
+        with caplog.at_level(logging.INFO):
+            self._run(monkeypatch, sweep=False, spread_band=band)
+        messages = caplog.messages
+        assert [m for m in messages if m.startswith("Qualifying Mondays")] == [line]
+        assert messages[messages.index(line) - 1] == prepared
 
     def test_the_infeasible_window_has_no_scenarios(self, monkeypatch):
         res = TestRunBacktestSweep()._infeasible(monkeypatch, band_sweep=True,
@@ -9339,7 +10501,8 @@ class TestBandSweepPhaseOneSubset:
         subset = [candidates.all_pairs[3], candidates.all_pairs[0]]
         narrowed = backtester._entries_for_band(candidates, pair_types=("time_series",),
                                                 _pairs=subset)
-        assert [r[-2] for r in rows(narrowed)] == ["TA", "EA"]
+        # r[9] is ticker_a (counted from the front: later_dates is the last column)
+        assert [r[9] for r in rows(narrowed)] == ["TA", "EA"]
         assert set(rows(narrowed)) <= set(rows(full))
         assert candidates.all_pairs == before
 
@@ -9575,6 +10738,9 @@ class TestTimeSeriesPopulation:
             own = by_point[id(p)]["entries"]
             h1 = by_key[(p.spread_band, p.k, "time_series/H1")]
             h2 = by_key[(p.spread_band, p.k, "time_series/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < res.split_date]
             assert [id(r) for r in h2["entries"]] == [
@@ -9700,9 +10866,12 @@ class TestExactLabels:
 # ─── C1: the per-trade size cap as a parameter, and the lazy cap sweep ───────
 
 def _uncapped_kelly(rec: dict, k: float) -> float | None:
-    """Pass 1b's uncapped Kelly fraction for one prepared entry, rebuilt from
-    the config helpers — the independent oracle for peak_kelly_fraction.
-    None when the net spread leaves nothing to size."""
+    """Pass 1b's uncapped Kelly fraction at one prepared entry's first
+    qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
+    that Monday), rebuilt from the config helpers — the oracle for
+    peak_kelly_fraction wherever each candidate enters on its first Monday
+    (TestPrepareEntriesGolden's tier-on entries, whose later Mondays repeat
+    the first's quotes). None when the net spread leaves nothing to size."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -10270,8 +11439,8 @@ class TestCapSweep:
         pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
         assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
         if checks and pop in ("all", "time_series"):
-            halves = ([r for r in subset if r["entry"]["entry_date"] < split_date],
-                      [r for r in subset if r["entry"]["entry_date"] >= split_date])
+            # H1's later Mondays cut at the split (DR-75)
+            halves = _dr75_halves(subset, split_date)
             assert point.halves == backtester._half_split(
                 halves, start, 10_000.0, k, band, population=pop, size_cap=cap, quiet=True,
                 end_date=end_date)
@@ -10949,15 +12118,20 @@ class TestTierOffSweep:
     gating the spread.
 
     On the golden fixture the ladder is the only pair the tiers hold back
-    (see TestTierFloorsOff): with them off it enters on Monday 1 at every
+    (see TestTierFloorsOff): with them off it enters on Monday 1 (its
+    recorded entry; at k = 0.90 it trades on Monday 2 — DR-75) at every
     binding band. EA/EB (0.30, 13 days), TA/TB (exactly 0.15, 9 days) and
     WA/WB (0.98, 9 days) are short-gap pairs whose 0.15 tier binds only at
     floor 0, where each clears it anyway, and FA/FB (a pricier earlier
     contract) never enters."""
 
+    # Its later qualifying Mondays are Monday 2 and every one the tier-on
+    # ladder qualifies on after it (the restarted-scan oracle that gives
+    # TestPrepareEntriesGolden its later dates)
     _LADDER_OFF = ("time_series", "will spacex launch another starship by ?",
                    "will spacex launch another starship by ?",
-                   date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE")
+                   date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE",
+                   (date(2026, 1, 12), *TestPrepareEntriesGolden._LADDER_LATER))
 
     @staticmethod
     def _same_point(a, b):
@@ -11053,6 +12227,65 @@ class TestTierOffSweep:
         assert ladder(off_point).entry_date == date(2026, 1, 5)
         assert ladder(res.primary).entry_date == date(2026, 1, 12)
 
+    def test_at_k_0_90_the_ladder_enters_on_its_first_kelly_passing_monday(
+        self, golden_tier_off_sweep,
+    ):
+        # With the tiers off the ladder first qualifies on Monday 1 (pA 0.20 /
+        # pB 0.45 / nB 0.55, Kelly -0.016 at k = 0.90 and +0.041 at 0.85), then
+        # on Monday 2 and after (pB 0.60 / nB 0.40, +0.032 at 0.90, -0.022 at
+        # 0.95). At 0.90 it enters on Monday 2 at every binding band (DR-75)
+        # and loses (RUNG-EARLY settled NO, RUNG-LATE YES: the in-between cell).
+        res = golden_tier_off_sweep.result
+
+        def ladder_trades(points, k):
+            return {p.spread_band: [t for t in p.trades if t.ticker_a == "RUNG-EARLY"]
+                    for p in points if p.population == "all" and p.k == k}
+
+        at_90 = ladder_trades(res.tier_off_scenarios, 0.90)
+        assert sorted(at_90) == _TIER_BOUND_BANDS
+        for band, trades in at_90.items():
+            (t,) = trades
+            assert (t.entry_date, t.entry_pA, t.entry_pB, t.entry_nB) == (
+                date(2026, 1, 12), 0.20, 0.60, 0.40), band
+            assert (t.outcome_a, t.outcome_b, t.actual_payoff) == ("no", "yes", 0.0)
+            assert t.profit < 0
+        at_85 = ladder_trades(res.tier_off_scenarios, 0.85)
+        assert sorted(at_85) == _TIER_BOUND_BANDS
+        assert all([(t.entry_date, t.entry_pB, t.entry_nB) for t in trades] == [
+            (date(2026, 1, 5), 0.45, 0.55)] for trades in at_85.values())
+        at_95 = ladder_trades(res.tier_off_scenarios, 0.95)
+        assert sorted(at_95) == _TIER_BOUND_BANDS
+        assert all(trades == [] for trades in at_95.values())
+        # CONTROL: with the tiers on the ladder first qualifies on Monday 2,
+        # which passes at 0.90 — it trades there, on its first Monday
+        on = ladder_trades(res.scenarios, 0.90)
+        assert sorted(on) == _GRID_BANDS
+        assert all([t.entry_date for t in trades] == [date(2026, 1, 12)]
+                   for trades in on.values())
+
+    def test_every_band_logs_its_qualifying_mondays_with_the_tiers_on_and_off(
+        self, golden_tier_off_sweep,
+    ):
+        # DR-75: the 36 tier-on counts, plus one per binding band with the tiers
+        # off, each right after its own tier-off Prepared line
+        messages = golden_tier_off_sweep.messages
+        lines = [m for m in messages if m.startswith("Qualifying Mondays at band ")]
+        suffix = " with the tier floors off"
+        off = [m for m in lines if m.split(":")[0].endswith(suffix)]
+        on = [m for m in lines if m not in off]
+        assert sorted(m.split(":")[0] for m in on) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}" for b in _GRID_BANDS)
+        assert sorted(m.split(":")[0] for m in off) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}{suffix}"
+            for b in _TIER_BOUND_BANDS)
+        assert all(messages[messages.index(m) - 1].startswith("Tier floors off: prepared ")
+                   for m in off)
+        # With the tiers off the ladder qualifies on Monday 1 too: 11, not 10
+        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
+                "(5 qualify on more than one)") in on
+        assert ("Qualifying Mondays at band 0-1 with the tier floors off: 27 over 5 entries "
+                "(5 qualify on more than one)") in off
+
     def test_every_completion_prefix_is_unique_across_both_families(self, golden_tier_off_sweep):
         prefixes = _completion_prefixes(golden_tier_off_sweep.messages)
         assert len(prefixes) == len(set(prefixes))
@@ -11109,6 +12342,9 @@ class TestTierOffSweep:
             # Split at the ONE split date, like every tier-on cell
             h1 = by_key[(p.spread_band, p.k, f"{p.population}/H1")]
             h2 = by_key[(p.spread_band, p.k, f"{p.population}/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < res.split_date]
             assert [id(r) for r in h2["entries"]] == [
@@ -11363,8 +12599,8 @@ class TestTierOffCapSweep:
         pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
         assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
         if pop in ("all", "time_series"):
-            halves = ([r for r in subset if r["entry"]["entry_date"] < split_date],
-                      [r for r in subset if r["entry"]["entry_date"] >= split_date])
+            # H1's later Mondays cut at the split (DR-75)
+            halves = _dr75_halves(subset, split_date)
             assert point.halves == backtester._half_split(
                 halves, start, 10_000.0, k, band, population=pop, tier_floors=False,
                 size_cap=cap, quiet=True, end_date=end_date)
@@ -11401,6 +12637,56 @@ class TestTierOffCapSweep:
         done = [r.getMessage() for r in caplog.records
                 if r.getMessage().startswith("Backtest complete")]
         assert done and all(" with the tier floors off, " in m for m in done)
+
+
+class TestLaterMondayThroughTheCapSweep:
+    """DR-75 through the lazy tier-floors-off size-cap sweep. At k = 0.90 the
+    golden ladder's first qualifying Monday (2026-01-05) fails the Kelly gate
+    with the tiers off and it enters on Monday 2 instead (see TestTierOffSweep).
+    CapSweep's reuse rule rests on the Monday choice depending on k and never
+    on the cap, so every cap of that re-dated cell must equal a fresh
+    simulation — entry dates included."""
+
+    def test_every_cap_of_a_redated_cell_equals_a_fresh_simulation(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        # One band (the no-band band, where the tiers bind) at k = 0.90, plus
+        # the primary 0.75
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.90,))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True,
+                                 tier_off_sweep=True, cap_sweep=True)
+        off = res.tier_off_cap_sweep
+        band = (0.0, 1.0)
+        assert off.bands == (band,) and off.ks == (0.75, 0.90)
+        # The ladder's recorded entry is still its first qualifying Monday ...
+        ladder = next(r for r in off.entries_by_band[band]
+                      if r["entry"]["mA"]["ticker"] == "RUNG-EARLY")
+        assert ladder["entry"]["entry_date"] == date(2026, 1, 5)
+        cell = off.cell(band, 0.90)
+        subsets = _cap_sweep_subsets(off.entries_by_band[band])
+        redated = 0
+        for cap in off.caps:
+            assert set(cell[cap]) == {pop for pop in TestTierOffCapSweep._POPS if subsets[pop]}
+            for pop, point in cell[cap].items():
+                end = backtester._curve_end_date(off.eager[(band, 0.90, pop)])
+                TestTierOffCapSweep._assert_parity(point, subsets[pop], golden._START, 0.90,
+                                                   band, pop, cap, res.split_date, end_date=end)
+                # ... while every cap trades it on Monday 2, at Monday 2's quotes
+                traded = [(t.entry_date, t.entry_pB, t.entry_nB) for t in point.trades
+                          if t.ticker_a == "RUNG-EARLY"]
+                if pop in ("all", "time_series", "ladder"):
+                    assert traded == [(date(2026, 1, 12), 0.60, 0.40)], (cap, pop)
+                    redated += 1
+                else:
+                    assert traded == []
+        # Not vacuous: three populations at every cap, and caps were simulated
+        # as well as shared
+        assert redated == 3 * len(off.caps)
+        assert off.simulated > 0 and off.reused > 0
 
 
 class TestCapSweepTierSetting:
