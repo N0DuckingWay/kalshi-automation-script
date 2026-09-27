@@ -27,11 +27,19 @@ Purpose:
     config values while every module's live_settings raises. Those classes
     pin config.py's toggles to known values (the pinned_config_toggles
     fixture), so they state every departure in fixed terms whatever config.py
-    ships.
+    ships. TestCategoryFilter covers the live category/tag filter
+    (main._filter_by_category) against a /series listing each test seeds into
+    its own tmp_path, including its parity with the backtest dashboard's
+    filing of the same event tickers.
 
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
-    plus config constants asserted against. The live-shape replays mock all
+    plus config constants asserted against; and, for the category/tag
+    filter's tests, kalshi_betting.historical (the cached /series listing's
+    path, its _historical_get request seam and infer_category), and
+    kalshi_betting.dashboard with backtester.BacktestTrade (the dashboard's
+    _trade_category, which the filter's filing is checked against). The
+    live-shape replays mock all
     Kalshi API interaction at the HTTP boundary (raw-response mocks and
     rest_client.request); the exit-code tests mock the heavy collaborators
     (auth, scanner, strategy, trader, reporter) at their main-module import
@@ -57,16 +65,18 @@ import logging.handlers
 import pathlib
 import re
 import sys
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kalshi_betting import config, main
+from kalshi_betting import config, dashboard, historical, main
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
+from kalshi_betting.backtester import BacktestTrade
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     EXIT_NO_TRADEABLE_SHARDS,
@@ -85,6 +95,7 @@ from kalshi_betting.config import (
     describe_live_settings,
     live_settings,
 )
+from kalshi_betting.historical import infer_category
 from kalshi_betting.reporter import TradeResult
 
 
@@ -211,20 +222,52 @@ class TestNoPairsMsg:
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
         assert "tier floors off" in main._no_pairs_msg()
 
+    def test_a_category_or_tag_filter_is_named_only_when_set(self):
+        # The filter can empty the list on its own, so the line names it —
+        # in the "Live settings:" line's words — and says nothing of it unset
+        plain = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
+        assert "category/tag filter" not in plain
+        for categories, tags in ((("Economics",), None), (None, ("Oil & Gas",))):
+            settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+                                    categories=categories, tags=tags)
+            msg = main._no_pairs_msg(settings=settings)
+            assert (f"among pairs filed under the run's category/tag filter "
+                    f"({config.describe_trade_filter(settings)})") in msg
+            # Everything before the clause is the unfiltered message's
+            assert msg.startswith(plain[:-2])
+
 
 @pytest.fixture
 def pinned_config_toggles(monkeypatch):
-    """Pin config.py's five live toggles to known values for one test.
+    """Pin config.py's seven live toggles to known values for one test.
 
     live_settings() reads them at call time, so these tests state every
     "(config: X)" mark and every departure in fixed terms whatever values
-    config.py ships: tier floors on, no band, k 0.75, a 20% per-trade cap and
-    no extra same-title cap."""
+    config.py ships: tier floors on, no band, k 0.75, a 20% per-trade cap, no
+    extra same-title cap, and no category or tag filter."""
     monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
     monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
     monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
     monkeypatch.setattr(config, "BUDGET_FRACTION", 0.20)
     monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
+    monkeypatch.setattr(config, "TRADE_CATEGORIES", None)
+    monkeypatch.setattr(config, "TRADE_TAGS", None)
+
+
+def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
+    """
+    Write Kalshi's /series listing as historical.load_series_categories'
+    cached copy, at the path conftest points into this test's tmp_path.
+
+    Args:
+        series (dict): series ticker -> [category, [tags...]], the cache's shape.
+        fetched_at (datetime | None): When the copy was fetched; None means
+            now, so a run with a client makes no request for it.
+    """
+    stamp = datetime.now(UTC) if fetched_at is None else fetched_at
+    historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
+        {"fetched_at": stamp.isoformat(), "series": series}))
 
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
@@ -281,6 +324,10 @@ class TestLiveSettingsFlags:
         (["--interval-discount", "0.6"], "interval_discount", 0.6),
         (["--size-cap", "35"], "size_cap", 0.35),
         (["--same-title-size-cap", "25"], "same_title_size_cap", 0.25),
+        (["--category", "Economics"], "categories", ("Economics",)),
+        (["--category", "Economics", "--category", " Sports "], "categories",
+         ("Economics", "Sports")),
+        (["--tag", "Oil & Gas"], "tags", ("Oil & Gas",)),
     ])
     def test_each_flag_overrides_only_its_own_field(self, monkeypatch, mode, argv, field, value):
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
@@ -339,6 +386,21 @@ class TestLiveSettingsFlags:
         (["--spread-min", "0.6", "--spread-max", "0.5"], ["--spread-min", "--spread-max",
                                                           "spread_band"], False),
         (["--spread-max", "0"], ["--spread-max", "spread_band"], False),
+        # An empty name would match nothing: refused, never "any"
+        (["--category", ""], ["--category", "categories"], False),
+        (["--tag", "Soccer", "--tag", "  "], ["--tag", "tags"], False),
+        # "any" is a switch, not a name: it would match nothing yet read as
+        # "any" on the Live settings line
+        (["--category", "any"], ["--category", "categories", "--any-category / --any-tag"],
+         False),
+        (["--tag", "ANY"], ["--tag", "tags", "--any-category / --any-tag"], False),
+        # The flags named are exactly those given: a --no-tier-floors (False)
+        # is given, and so is an --any-* switch; one left off is not
+        (["--no-tier-floors", "--spread-max", "0"],
+         ["invalid live setting for this run (--tier-floors/--no-tier-floors, "
+          "--spread-max):", "spread_band"], False),
+        (["--any-category", "--spread-max", "0"],
+         ["invalid live setting for this run (--spread-max, --any-category):"], False),
     ])
     def test_an_invalid_flag_is_a_usage_error_before_anything_runs(
         self, monkeypatch, capsys, argv, words, percent,
@@ -358,6 +420,38 @@ class TestLiveSettingsFlags:
             assert f"{argv[0]} takes {self._PERCENT}, read as that percent / 100" in err, err
         else:
             assert "whole percent" not in err, err
+
+    @pytest.mark.parametrize("field, constant, flag", [
+        ("categories", "TRADE_CATEGORIES", "--any-category"),
+        ("tags", "TRADE_TAGS", "--any-tag"),
+    ])
+    def test_an_any_flag_clears_config_pys_filter_for_one_run(
+        self, monkeypatch, field, constant, flag,
+    ):
+        monkeypatch.setattr(config, constant, ("Sports",))
+        seen = _main_with(monkeypatch, ["--mode", "prod", flag])
+        assert getattr(seen["reference"], field) == ("Sports",)
+        assert getattr(seen["settings"], field) is None
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert f"{field} any (config: Sports)" in line and line.count("(config:") == 1
+        # No flag keeps config.py's filter
+        seen = _main_with(monkeypatch, ["--mode", "prod"])
+        assert getattr(seen["settings"], field) == ("Sports",)
+
+    @pytest.mark.parametrize("argv, words", [
+        (["--category", "Sports", "--any-category"], ["--any-category", "--category"]),
+        (["--any-tag", "--tag", "Soccer"], ["--tag", "--any-tag"]),
+    ])
+    def test_a_filter_and_its_any_twin_are_mutually_exclusive(
+        self, monkeypatch, capsys, argv, words,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        for word in words:
+            assert word in err, (word, err)
 
     def test_two_cap_flags_share_one_unit_note(self, monkeypatch, capsys):
         seen = _main_with(monkeypatch, ["--mode", "prod", "--size-cap", "37",
@@ -385,8 +479,10 @@ class TestLiveSettingsFlags:
         # where a line broke
         out = " ".join(capsys.readouterr().out.split())
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
-                     "--interval-discount", "--size-cap", "--same-title-size-cap"):
+                     "--interval-discount", "--size-cap", "--same-title-size-cap",
+                     "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
+        assert "config.TRADE_CATEGORIES" in out and "config.TRADE_TAGS" in out
         # The grid step comes from its one definition, never a literal
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
@@ -454,6 +550,8 @@ class TestLogLiveSettings:
         "size_cap": (["--size-cap", "35"], "per-trade cap 35% (config: 20%)"),
         "same_title_size_cap": (["--same-title-size-cap", "15"],
                                 "same-title cap 15% (config: 100% (no extra cap))"),
+        "categories": (["--category", "Economics"], "categories Economics (config: any)"),
+        "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (config: any)"),
     }
 
     def test_every_field_has_a_departing_flag(self):
@@ -520,6 +618,276 @@ class TestLogLiveSettings:
             main._log_live_settings(s, r, real_money=True)
         assert f"Live settings: {describe_live_settings(s, r)}" in caplog.text
         assert self._DEPARTURE in caplog.text
+
+
+def _filter_pair(event_ticker: str) -> SimpleNamespace:
+    """A candidate-pair stand-in carrying only what _filter_by_category reads:
+    market A's event ticker (the leg whose series files the pair)."""
+    return SimpleNamespace(market_a=SimpleNamespace(event_ticker=event_ticker),
+                           market_b=SimpleNamespace(event_ticker="IGNORED-B"))
+
+
+def _filtered(pairs: list, categories=None, tags=None, listing_client=None) -> list:
+    """Run main._filter_by_category with only the category/tag fields set."""
+    settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, categories=categories, tags=tags)
+    return main._filter_by_category(pairs, settings, listing_client)
+
+
+class TestCategoryFilter:
+    """main._filter_by_category keeps only the pairs filed under the run's
+    Kalshi categories and tags, by the backtest dashboard's own rule:
+    MARKET A's LITERAL series (historical.series_ticker) looked up in Kalshi's
+    /series listing, its category and FIRST tag (historical.series_labels),
+    the ticker-prefix label (historical.infer_category) for a series the
+    listing lacks. Case-insensitive; categories and tags combine by AND; no
+    filter, no request; no listing, no pair (fail closed)."""
+
+    # Kalshi's /series listing as cached: series ticker -> [category, tags]
+    LISTING = {
+        "KXNCAAMBGAME": ["Sports", ["Basketball"]],
+        "KXUCLGAME": ["Sports", ["Soccer", "Europe"]],
+        "KXBRENTW": ["Commodities", ["Oil & Gas", "Energy"]],
+        "KXFISAEXTEND": ["Politics", ["Congress"]],
+        "KXSCOTUSLAST": ["Politics", []],
+        "KXMVECROSSCATEGORY": ["", []],
+    }
+
+    def _pairs(self) -> list:
+        return [_filter_pair(t) for t in (
+            "KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19",
+            "KXFISAEXTEND-26", "KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X",
+            "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None,
+        )]
+
+    @staticmethod
+    def _tickers(pairs: list) -> list:
+        return [p.market_a.event_ticker for p in pairs]
+
+    def test_no_filter_makes_no_request_and_returns_the_pairs_untouched(
+        self, monkeypatch, caplog,
+    ):
+        def no_listing(*args, **kwargs):
+            raise AssertionError("the listing was read with no filter set")
+
+        monkeypatch.setattr(main, "load_series_categories", no_listing)
+        pairs = self._pairs()
+        with caplog.at_level(logging.INFO):
+            out = _filtered(pairs, listing_client=MagicMock())
+        assert out is pairs
+        assert "Category/tag filter" not in caplog.text
+
+    def test_a_category_matches_case_insensitively(self, caplog):
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.INFO):
+            out = _filtered(self._pairs(), categories=("sPoRtS",))
+        assert self._tickers(out) == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
+        assert "kept 2 of 10 candidate pairs — dropped " in caplog.text
+        assert "Politics · General 1" in caplog.text and "Other · General 3" in caplog.text
+
+    def test_the_first_tag_is_the_one_matched(self):
+        _seed_series_listing(self.LISTING)
+        # KXBRENTW carries "Oil & Gas" first and "Energy" second: only the
+        # first files it, as the dashboard's Tag select shows it
+        assert self._tickers(_filtered(self._pairs(), tags=("oil & gas",))) == [
+            "KXBRENTW-26SEP19"]
+        assert _filtered(self._pairs(), tags=("Energy",)) == []
+        assert self._tickers(_filtered(self._pairs(), tags=("Europe",))) == []
+
+    def test_categories_and_tags_combine_by_and(self):
+        _seed_series_listing(self.LISTING)
+        assert self._tickers(_filtered(self._pairs(), categories=("Sports",),
+                                       tags=("Soccer",))) == ["KXUCLGAME-26APR14ATMBAR"]
+        # A tag of another category keeps nothing
+        assert _filtered(self._pairs(), categories=("Politics",), tags=("Soccer",)) == []
+        # Several names on one axis are an OR within it
+        assert self._tickers(_filtered(self._pairs(), categories=("Politics", "Commodities"),
+                                       tags=("Congress", "Oil & Gas"))) == [
+            "KXBRENTW-26SEP19", "KXFISAEXTEND-26"]
+
+    def test_a_combo_series_is_looked_up_literally(self):
+        # Not scanner.event_series, which folds every KXMVE* series together:
+        # KXMVECROSSCATEGORY is in the listing with no category, while
+        # KXMVECROSSCATEGORY0 is not in it at all
+        _seed_series_listing(self.LISTING)
+        assert self._tickers(_filtered(self._pairs(), categories=("Uncategorised",))) == [
+            "KXMVECROSSCATEGORY-S2026X"]
+        assert "KXMVECROSSCATEGORY0-S2026Y" in self._tickers(
+            _filtered(self._pairs(), categories=("Other",)))
+
+    def test_an_unlisted_series_falls_back_to_the_ticker_prefix_label(self, caplog):
+        _seed_series_listing(self.LISTING)
+        assert infer_category("KXBTCD-26SEP1517") == "Crypto"
+        with caplog.at_level(logging.WARNING):
+            out = _filtered(self._pairs(), categories=("crypto",), tags=("General",))
+        assert self._tickers(out) == ["KXBTCD-26SEP1517"]
+        # A label only a fallback files under is not a typo
+        assert "check the spelling" not in caplog.text
+        # A missing or empty event ticker files under infer_category's "Other"
+        assert self._tickers(_filtered(self._pairs(), categories=("Other",)))[-2:] == ["", None]
+
+    def test_no_listing_keeps_nothing_and_says_why(self, monkeypatch, caplog):
+        # Dev (no client) with no cached copy
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(self._pairs(), categories=("Sports",)) == []
+        assert "no cached copy exists (a dev run reads the cached copy only" in caplog.text
+        assert "this run trades none" in caplog.text
+        # Prod: the request fails and there is no cached copy
+        caplog.clear()
+
+        def offline(client, path, **params):
+            raise RuntimeError("offline")
+
+        monkeypatch.setattr(historical, "_historical_get", offline)
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(self._pairs(), tags=("Soccer",), listing_client=MagicMock()) == []
+        assert "Kalshi's /series listing could not be read and no cached copy exists" in (
+            caplog.text)
+
+    def test_a_name_no_series_carries_is_warned_as_a_typo(self, caplog):
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(self._pairs(), categories=("Sprots",)) == []
+        assert "Category 'Sprots' names no category in Kalshi's listing of 6 series" in (
+            caplog.text)
+        caplog.clear()
+        # The dashboard's Tag option spells "category · tag": the warning says
+        # how to write it as flags
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(self._pairs(), tags=("Sports · Soccer",)) == []
+        assert "Tag 'Sports · Soccer' is no series' first tag" in caplog.text
+        assert "is --category 'Sports' --tag 'Soccer'" in caplog.text
+        caplog.clear()
+        # A real name draws no warning, even when it matches no pair this run
+        with caplog.at_level(logging.WARNING):
+            _filtered([_filter_pair("KXBRENTW-1")], categories=("Politics",), tags=("congress",))
+        assert "check the spelling" not in caplog.text
+
+    def test_a_fallback_tag_is_not_a_typo_when_no_listed_series_is_untagged(self, caplog):
+        # "General" is also the tag a series the listing lacks is filed under:
+        # with no untagged series in the listing, only this run's own filing
+        # knows the name, and a pair filed under it is kept without a warning
+        _seed_series_listing({"KXBRENTW": ["Commodities", ["Oil & Gas"]]})
+        pairs = [_filter_pair("KXBRENTW-26SEP19"), _filter_pair("KXNOTLISTED-1")]
+        with caplog.at_level(logging.WARNING):
+            assert self._tickers(_filtered(pairs, tags=("general",))) == ["KXNOTLISTED-1"]
+        assert "check the spelling" not in caplog.text
+
+    def test_dev_reads_the_cached_listing_only_however_old(self, monkeypatch, caplog):
+        # Recorded, not only raised: load_series_categories turns a failed
+        # request into a WARNING, so a raise alone would pass either way
+        requests = []
+
+        def no_request(client, path, **params):
+            requests.append((client, path))
+            raise AssertionError("a request was made with no listing client")
+
+        monkeypatch.setattr(historical, "_historical_get", no_request)
+        _seed_series_listing(self.LISTING, fetched_at=datetime(2020, 1, 1, tzinfo=UTC))
+        with caplog.at_level(logging.WARNING):
+            assert self._tickers(_filtered(self._pairs(), categories=("Commodities",))) == [
+                "KXBRENTW-26SEP19"]
+        assert requests == []
+        assert "Series category listing unavailable" not in caplog.text
+
+    def test_prod_refreshes_a_stale_listing_with_its_own_client(self, monkeypatch):
+        _seed_series_listing({"KXBRENTW": ["Sports", ["Soccer"]]},
+                             fetched_at=datetime(2020, 1, 1, tzinfo=UTC))
+        clients = []
+
+        def fresh(client, path, **params):
+            clients.append(client)
+            return {"series": [{"ticker": "KXBRENTW", "category": "Commodities",
+                                "tags": ["Oil & Gas"]}]}
+
+        monkeypatch.setattr(historical, "_historical_get", fresh)
+        client = MagicMock()
+        out = _filtered(self._pairs(), categories=("Commodities",), listing_client=client)
+        assert self._tickers(out) == ["KXBRENTW-26SEP19"]
+        assert clients == [client]
+
+    # Copied from tests/test_dashboard.py::TestReturnsByCategory.SERIES, never
+    # imported: importing a test module's class would make pytest collect it
+    # a second time
+    DASHBOARD_SERIES = {
+        "KXNCAAMBGAME": ("Sports", ("Basketball",)),
+        "KXUCLGAME": ("Sports", ("Soccer", "Europe")),
+        "KXFISAEXTEND": ("Politics", ("Congress",)),
+        "KXSCOTUSLAST": ("Politics", ()),
+        "KXMVECROSSCATEGORY": ("", ()),
+    }
+
+    @staticmethod
+    def _trade(event_ticker: str) -> BacktestTrade:
+        """A BacktestTrade carrying what dashboard._trade_category reads: market
+        A's event ticker and the ticker-prefix category the backtester gives it
+        (infer_category, as _simulate_at_discount sets BacktestTrade.category)."""
+        return BacktestTrade(
+            pair_type="same_title", ticker_a="A", ticker_b="B", title_a="Q", title_b="Q",
+            category=infer_category(event_ticker), entry_date=date(2026, 1, 5),
+            exit_date=date(2026, 1, 12), entry_pA=0.5, entry_pB=0.4, entry_nA=0.5,
+            entry_nB=0.6, n=1, total_cost=0.9, fees=0.02, outcome_a="yes", outcome_b="yes",
+            actual_payoff=1.0, profit=0.08, profit_ratio=0.1, monthly_profit_ratio=0.4,
+            kelly_fraction=0.1, expected_payoff=0.08, slippage=0.0, holding_days=7,
+            balance_at_entry=1000.0, event_ticker=event_ticker,
+        )
+
+    def test_it_files_every_pair_as_the_dashboard_files_the_trade(self):
+        # A pair is filed where the dashboard files a trade of the same event:
+        # for every (category, tag) the page files a trade under, the filter
+        # set to that category and tag keeps exactly those pairs (this map
+        # holds no tag under two categories and no tag spelled two ways — the
+        # next test covers what the filter keeps when one does)
+        _seed_series_listing({t: [c, list(tags)] for t, (c, tags) in
+                              self.DASHBOARD_SERIES.items()})
+        events = ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXSCOTUSLAST-26",
+                  "KXFISAEXTEND-26", "KXMVECROSSCATEGORY-S2026X",
+                  "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "KXNOTLISTED-1", ""]
+        pairs = [_filter_pair(e) for e in events]
+        filed: dict = {}
+        for event in events:
+            category, subcategory = dashboard._trade_category(
+                self._trade(event), self.DASHBOARD_SERIES)
+            assert subcategory.startswith(f"{category} · ")
+            filed.setdefault((category, subcategory[len(category) + 3:]), []).append(event)
+        assert len(filed) >= 6
+        for (category, tag), expected in filed.items():
+            kept = _filtered(pairs, categories=(category,), tags=(tag,))
+            assert self._tickers(kept) == expected, (category, tag)
+        # ... and each category alone keeps exactly its trades, whatever the tag
+        for category in {c for c, _ in filed}:
+            expected = [e for (c, _), es in filed.items() if c == category for e in es]
+            kept = _filtered(pairs, categories=(category,))
+            assert sorted(self._tickers(kept)) == sorted(expected), category
+
+    def test_a_tag_is_matched_under_every_category_and_in_any_case(self):
+        # The dashboard's Tag options are category-scoped and case-exact; the
+        # filter's tag is neither. Kalshi's 2026-09-25 listing files "Soccer"
+        # first under Sports, Economics and Entertainment, and spells
+        # Entertainment's "Anime Awards" two ways
+        listing = {"KXCLUBWC": ["Sports", ["Soccer"]], "KXHKANE": ["Economics", ["Soccer"]],
+                   "KXANIMEB": ["Entertainment", ["Anime Awards"]],
+                   "ANIMEB": ["Entertainment", ["Anime awards"]]}
+        _seed_series_listing(listing)
+        events = ["KXCLUBWC-1", "KXHKANE-1", "KXANIMEB-1", "ANIMEB-1"]
+        pairs = [_filter_pair(e) for e in events]
+        series = {t: (c, tuple(tags)) for t, (c, tags) in listing.items()}
+        # Four Tag options on the page ...
+        assert [dashboard._trade_category(self._trade(e), series)[1] for e in events] == [
+            "Sports · Soccer", "Economics · Soccer", "Entertainment · Anime Awards",
+            "Entertainment · Anime awards"]
+        # ... "Sports · Soccer" is --category Sports --tag Soccer; --tag Soccer
+        # alone keeps every category's Soccer series
+        assert self._tickers(_filtered(pairs, categories=("Sports",), tags=("Soccer",))) == [
+            "KXCLUBWC-1"]
+        assert self._tickers(_filtered(pairs, tags=("Soccer",))) == ["KXCLUBWC-1", "KXHKANE-1"]
+        # ... and either spelling of one tag keeps both options' series
+        for spelling in ("Anime Awards", "Anime awards"):
+            assert self._tickers(_filtered(pairs, categories=("Entertainment",),
+                                           tags=(spelling,))) == ["KXANIMEB-1", "ANIMEB-1"]
+
+    def test_dashboard_and_live_filter_share_one_filing_rule(self):
+        assert dashboard._series_labels is historical.series_labels
+        assert main.series_labels is historical.series_labels
 
 
 class TestSetupLogging:
@@ -1879,10 +2247,30 @@ class TestLiveSettingsReachEverySite:
     ceiling, and the price-sum ceiling is 0.95; k 0.6 prices the time-series
     pair at p = 0.82, f* about 0.33, between the 0.25 same-title cap and the
     0.35 per-trade cap, and the same-title pair's f* of about 0.84 is capped at
-    0.25 — none of which the pinned config values produce."""
+    0.25 — none of which the pinned config values produce. The category and
+    tag filters keep both pairs and only them: the cached /series listing
+    this test seeds (_LISTING) files TS-EARLY's series under Economics ·
+    Inflation and SAME-EXP's under Politics · Elections — matched
+    case-insensitively — and the fixture's other same-title pairs under a
+    category the filter does not name (TICK-A's) or none at all, so they are
+    dropped before enrichment, which must be handed exactly the pairs the
+    filter kept; main._filter_by_category must be handed the run's settings
+    (and, in dev, no listing client), and the listing, seeded fresh, must be
+    read without a /series request in either mode."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
-                             interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25)
+                             interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
+                             categories=("economics", "POLITICS"),
+                             tags=("Inflation", "elections"))
+
+    # Kalshi's /series listing as the cached copy the filter reads: series
+    # ticker -> [category, tags]. SHARDAEVT and HELDAEVT are missing, so their
+    # pairs fall back to the ticker-prefix label ("Other") and "General"
+    _LISTING = {
+        "EVT": ["Economics", ["Inflation", "Fed"]],
+        "EXPEVT": ["Politics", ["Elections"]],
+        "TICKAEVT": ["Sports", ["Soccer"]],
+    }
 
     # (module, spied name) — the CONSUMING modules' own bindings, and
     # config's, for the calls config's helpers make among themselves
@@ -1915,6 +2303,37 @@ class TestLiveSettingsReachEverySite:
             monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
         )
         captured: dict = {}
+        # The cached /series listing the category/tag filter files pairs by,
+        # fresh, so a prod run makes no request for it (conftest points the
+        # cache at this test's tmp_path)
+        _seed_series_listing(self._LISTING)
+        real_filter = main._filter_by_category
+
+        def filter_spy(pairs, settings_, listing_client):
+            kept = real_filter(pairs, settings_, listing_client)
+            captured.setdefault("filter", []).append(
+                (list(pairs), settings_, listing_client, list(kept)))
+            return kept
+
+        monkeypatch.setattr(main, "_filter_by_category", filter_spy)
+        # The listing is fresh, so neither mode may request it. Recorded, not
+        # raised: load_series_categories turns a failed request into a WARNING
+        series_requests: list = []
+
+        def no_series_request(client_, path, **params):
+            series_requests.append(path)
+            raise AssertionError("the fresh /series listing was requested")
+
+        monkeypatch.setattr(historical, "_historical_get", no_series_request)
+        # The filter runs BEFORE enrichment, so a dropped pair costs no
+        # order-book request: enrichment must be handed the filter's own list
+        real_enrich = main.enrich_with_orderbook_prices
+
+        def enrich_spy(client_, pairs, *args, **kwargs):
+            captured.setdefault("enriched", []).append(list(pairs))
+            return real_enrich(client_, pairs, *args, **kwargs)
+
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich_spy)
 
         def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
             captured["run_note"] = run_note
@@ -1966,6 +2385,21 @@ class TestLiveSettingsReachEverySite:
                     settings, reference,
                 )
         assert code == EXIT_OK
+        # The category/tag filter ran once, on the run's own settings, and
+        # kept both pairs — and only them — out of a longer candidate list
+        ((pairs, filter_settings, listing_client, kept),) = captured["filter"]
+        assert filter_settings is settings
+        assert listing_client is (client if mode == "prod" else None)
+        assert {p.market_a.ticker for p in kept} == {_TICKER_TS_EARLY, _TICKER_SAME_EXP}
+        assert len(pairs) > len(kept)
+        assert (f"Category/tag filter ({config.describe_trade_filter(settings)}): kept 2 of "
+                f"{len(pairs)} candidate pairs") in caplog.text
+        # ... before enrichment, which was handed exactly the pairs it kept
+        (enriched,) = captured["enriched"]
+        assert [id(p) for p in enriched] == [id(p) for p in kept]
+        # ... from the fresh cached listing, with no request and no WARNING
+        assert series_requests == []
+        assert "Series category" not in caplog.text
         return settings, reference, calls, captured
 
     @staticmethod
@@ -2032,14 +2466,14 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 5
+        assert echo in caplog.text and echo.count("(config:") == 7
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
         # The trade log's separator carries the same marked line: the workbook
         # itself says which fields a flag moved, which the values alone cannot
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 5
+        assert captured["run_note"].count("(config:") == 7
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         # Dev's finder, enrichment and sizer read the run's object as prod's
@@ -2062,7 +2496,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 5
+        assert echo in caplog.text and echo.count("(config:") == 7
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 

@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kalshi_betting import backtester, config, dashboard
+from kalshi_betting import backtester, config, dashboard, historical
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -2633,8 +2633,13 @@ class TestReturnsByCategory:
 
     def test_combo_series_are_looked_up_literally(self):
         # Not scanner.event_series, which folds every KXMVE* series together
-        assert dashboard._series_ticker("KXMVECROSSCATEGORY0-S1") == "KXMVECROSSCATEGORY0"
-        assert dashboard._series_ticker("") == ""
+        assert historical.series_ticker("KXMVECROSSCATEGORY0-S1") == "KXMVECROSSCATEGORY0"
+        assert historical.series_ticker("") == ""
+
+    def test_the_page_files_by_the_one_rule_the_live_filter_shares(self):
+        # historical.series_labels is the one filing rule: the page imports it,
+        # and main._filter_by_category files a live pair by it too
+        assert dashboard._series_labels is historical.series_labels
 
     def test_the_section_charts_and_tabulates_each_category_tag(self):
         trades = [self._t("KXNCAAMBGAME-A", 30.0), self._t("KXNCAAMBGAME-B", -10.0),

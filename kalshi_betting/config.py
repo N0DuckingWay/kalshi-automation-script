@@ -447,14 +447,16 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# The live time-series entry rule is these two constants. A live run resolves
-# them ONCE, together with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k),
-# BUDGET_FRACTION (the per-trade Kelly cap) and SAME_TITLE_SIZE_CAP (the extra
-# same-title cap) above, through live_settings() into one frozen LiveSettings,
-# and main.py may override any of the five for that run with its own flags:
-# --tier-floors / --no-tier-floors, --spread-min / --spread-max,
-# --interval-discount, --size-cap and --same-title-size-cap (the caps in
-# percent). main._resolve_live_settings builds the run's object that way —
+# The live time-series entry rule is the first two constants below, and the
+# Kalshi categories and tags a live pair may trade in are the next two
+# (TRADE_CATEGORIES, TRADE_TAGS). A live run resolves the four ONCE, together
+# with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k), BUDGET_FRACTION (the per-trade
+# Kelly cap) and SAME_TITLE_SIZE_CAP (the extra same-title cap) above, through
+# live_settings() into one frozen LiveSettings, and main.py may override any of
+# the seven for that run with its own flags: --tier-floors / --no-tier-floors,
+# --spread-min / --spread-max, --interval-discount, --size-cap and
+# --same-title-size-cap (the caps in percent), --category / --any-category and
+# --tag / --any-tag. main._resolve_live_settings builds the run's object that way —
 # config.py's values, each flag given replacing its own field, validated by
 # LiveSettings itself before logging is configured, so a bad flag or a bad
 # value here is a usage error (exit 2) before any request — and each run mode
@@ -462,17 +464,18 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # that departs from this file marked "(config: X)", with a WARNING on a
 # production run that submits orders under any departure, and a WARNING for
 # every live_rule_warnings sentence.
-# main.py hands that one object to the time-series finder, to enrichment, to
-# the sizer (strategy.compute_trade, through main._compute_trade_specs) and to
-# pre_execution_check, which hands it to every validate_pair_price it runs. So
-# the tier floors and the band reach the finder, enrichment and
-# validate_pair_price, and k and the two caps reach the sizer and enrichment's
-# affordability bound (max_kelly_fraction) — one object, so the bound and the
-# sizer can never price with different values. scheduler.py passes main.py no
-# toggle flags (only --mode prod), so a weekly run trades exactly what this
-# file says.
+# main.py hands that one object to the time-series finder, to its category/tag
+# filter (main._filter_by_category, between pair dedup and enrichment), to
+# enrichment, to the sizer (strategy.compute_trade, through
+# main._compute_trade_specs) and to pre_execution_check, which hands it to
+# every validate_pair_price it runs. So the tier floors and the band reach the
+# finder, enrichment and validate_pair_price, the categories and tags reach the
+# filter, and k and the two caps reach the sizer and enrichment's affordability
+# bound (max_kelly_fraction) — one object, so the bound and the sizer can never
+# price with different values. scheduler.py passes main.py no toggle flags
+# (only --mode prod), so a weekly run trades exactly what this file says.
 #
-# No live module reads these five constants directly, and every live call to a
+# No live module reads these seven constants directly, and every live call to a
 # function that takes a LiveSettings must hand it the run's object explicitly,
 # under the one name `settings` — so config.py's own settings, which each run
 # mode holds beside the run's as the reference its departures are marked
@@ -509,6 +512,37 @@ TIME_SERIES_TIER_FLOORS = True
 # (0.0, 1.0) means no band. main.py --spread-min / --spread-max overrides
 # either bound for one run (the other keeps this file's value).
 TIME_SERIES_SPREAD_BAND = (0.0, 1.0)
+
+# Kalshi categories a live pair may trade in ("Economics", "Sports", ...), or
+# None for any. Matching is case-insensitive, against the category the backtest
+# dashboard's Category select files a trade under: Kalshi's /series category
+# for MARKET A's literal series (historical.series_labels; "Uncategorised" when
+# Kalshi gives the series none). A series missing from Kalshi's listing falls
+# back to the ticker-prefix label (historical.infer_category). A non-empty
+# tuple of names; an empty one is refused (it would trade nothing — use None
+# for any), and so is the name "any" in any case (None is how any is spelled).
+# main.py --category NAME (repeatable) or --any-category overrides it for one
+# run. main._filter_by_category applies it after pair dedup and before
+# enrichment, and fails CLOSED: with no listing to file by, a run with a
+# filter set trades nothing. One name here keeps exactly the dashboard's
+# Category option of that name (no two of Kalshi's 20 categories differ only
+# in case); several names keep their union.
+TRADE_CATEGORIES: tuple[str, ...] | None = None
+
+# Kalshi tags a live pair may trade in, or None for any. Matched, again
+# case-insensitively, against the series' FIRST tag ("General" when it has
+# none, or is missing from the listing), the dashboard's Tag rule. Combined
+# with TRADE_CATEGORIES by AND, and matched under EVERY category: the
+# dashboard's Tag options are category-scoped, so its option
+# "Sports · Basketball" is TRADE_CATEGORIES ("Sports",) with TRADE_TAGS
+# ("Basketball",) — TRADE_TAGS ("Soccer",) alone also keeps the Economics and
+# Entertainment series whose first tag is Soccer (62 of the 210 first tags on
+# Kalshi's 2026-09-25 /series listing sit under more than one category).
+# Matching ignores case, so a first tag Kalshi spells two ways under one
+# category ("Anime Awards" / "Anime awards", both Entertainment, on that
+# listing) keeps both, where the dashboard lists them as two options. main.py
+# --tag NAME (repeatable) or --any-tag overrides it for one run.
+TRADE_TAGS: tuple[str, ...] | None = None
 
 # The size caps' grid. BUDGET_FRACTION and SAME_TITLE_SIZE_CAP, read live as
 # LiveSettings.size_cap and .same_title_size_cap, and main.py's --size-cap and
@@ -1186,10 +1220,15 @@ EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS = 86_400
 
 # How long historical.load_series_categories reuses its cached copy of Kalshi's
 # /series listing (every series' official category and tags — 14,391 series in
-# ONE response, measured 2026-09-25) before fetching it again. It feeds only the
-# backtest dashboard's returns-by-category breakdown, and a series' category
-# rarely changes, so a week is plenty; a series missing from the cached copy is
-# not refetched early — it reads as "Uncategorised" until the next refresh.
+# ONE response, measured 2026-09-25) before fetching it again. It feeds the
+# backtest dashboard's category and tag breakdowns and filter, and — when
+# TRADE_CATEGORIES or TRADE_TAGS (or main.py's --category / --tag) is set —
+# which pairs a live run may trade (main._filter_by_category; a production run
+# refreshes a stale copy, a dev run reads the cached copy only, however old).
+# A series' category rarely changes, so a week is plenty; a series missing from
+# the cached copy is not refetched early — until the next refresh it is filed
+# under its ticker-prefix label (historical.infer_category) and the tag
+# "General", on the page and in the live filter alike (historical.series_labels).
 # Seven days in seconds.
 SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS = 7 * 86_400
 
@@ -1753,6 +1792,53 @@ def _step_cap(value, name: str) -> float:
     return round(SIZE_CAP_STEP * steps, 2)
 
 
+def _names(value, name: str) -> tuple[str, ...] | None:
+    """
+    Validate a category or tag filter and normalise it to a tuple of names.
+
+    None means "any" and passes through. Anything else must be a non-empty
+    tuple or list of strings, each non-empty once stripped of surrounding
+    whitespace. A bare str is refused rather than read as one name: iterating
+    it would filter on its single characters. An empty collection is refused
+    too: it would match no pair and trade nothing, which None for "any" or a
+    real name says plainly. So is a name reading "any" in any case: it would
+    match nothing (no Kalshi category or first tag is named "any" — none of
+    the 20 categories and 210 first tags of the 2026-09-25 /series listing)
+    while the "Live settings:" line and the trade-log note rendered it
+    exactly like None; "any" is None here, or --any-category / --any-tag on
+    main.py.
+
+    Args:
+        value: The filter, from TRADE_CATEGORIES / TRADE_TAGS or main.py's
+            --category / --tag.
+        name (str): The field's name, used in the error message.
+
+    Returns:
+        tuple[str, ...] | None: The stripped names in their given order, or
+            None for any.
+
+    Raises:
+        ValueError: If the value is a str, not a tuple or list, empty, or holds
+            anything but a non-empty string, or a name reading "any".
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) or not isinstance(value, (tuple, list)):
+        raise ValueError(f"{name} must be None (any) or a tuple of names, got {value!r}")
+    if not value:
+        raise ValueError(f"{name} must name at least one, or be None for any, got {value!r}")
+    names = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{name} must hold non-empty names, got {item!r} in {value!r}")
+        if item.strip().casefold() == "any":
+            raise ValueError(
+                f"{name} cannot hold the name {item!r} (in {value!r}): any category or "
+                "tag is None in config.py, or --any-category / --any-tag on main.py")
+        names.append(item.strip())
+    return tuple(names)
+
+
 @dataclass(frozen=True)
 class LiveSettings:
     """
@@ -1761,16 +1847,19 @@ class LiveSettings:
     live_settings() builds one from this module's constants at call time.
     main.py builds the run's one from those constants plus its per-run flags
     (--tier-floors / --no-tier-floors, --spread-min / --spread-max,
-    --interval-discount, --size-cap and --same-title-size-cap), through
+    --interval-discount, --size-cap and --same-title-size-cap, --category /
+    --any-category and --tag / --any-tag), through
     main._resolve_live_settings, which applies each flag given with
     dataclasses.replace — that re-runs __post_init__, so an override is
     validated exactly as this module's values are, and a bad one is a usage
     error before any request. main.py's two run modes hand that one object to
-    the time-series finder, to enrichment, to the sizer (strategy.compute_trade,
-    through main._compute_trade_specs) and to pre_execution_check. The tier
-    floors and the band reach the finder, enrichment and validate_pair_price;
-    k and the two caps reach the sizer and enrichment's affordability bound
-    (max_kelly_fraction). Every live site reads the same object, so no site
+    the time-series finder, to the category/tag filter
+    (main._filter_by_category), to enrichment, to the sizer
+    (strategy.compute_trade, through main._compute_trade_specs) and to
+    pre_execution_check. The tier floors and the band reach the finder,
+    enrichment and validate_pair_price; the categories and tags reach the
+    filter; k and the two caps reach the sizer and enrichment's affordability
+    bound (max_kelly_fraction). Every live site reads the same object, so no site
     can apply one value while another reads this module
     (tests/test_main.py::TestLiveSettingsReachEverySite runs a production dry
     run and a dev run, each on an object that differs in every field from the
@@ -1797,6 +1886,18 @@ class LiveSettings:
             construction that names only the first four fields caps every
             pair at size_cap alone; live_settings() always names it
             (SAME_TITLE_SIZE_CAP).
+        categories (tuple[str, ...] | None): The Kalshi categories a pair may
+            trade in, matched case-insensitively against the category market
+            A's series is filed under (historical.series_labels), or None for
+            any. Validated by _names: a non-empty tuple (a list is accepted and
+            normalised) of non-empty names, each stripped of surrounding
+            whitespace; a bare str and an empty collection are refused.
+        tags (tuple[str, ...] | None): The Kalshi tags a pair may trade in,
+            matched against its series' FIRST tag, or None for any; validated
+            like categories, and combined with it by AND. Both default to None,
+            so a construction that names only the first five fields filters
+            nothing; live_settings() always names them (TRADE_CATEGORIES,
+            TRADE_TAGS).
 
     Raises:
         ValueError: If any field is out of range or of the wrong type.
@@ -1806,6 +1907,8 @@ class LiveSettings:
     interval_discount: float
     size_cap: float
     same_title_size_cap: float = 1.0
+    categories: tuple[str, ...] | None = None
+    tags: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """
@@ -1840,6 +1943,8 @@ class LiveSettings:
         object.__setattr__(self, "size_cap", _step_cap(self.size_cap, "size_cap"))
         object.__setattr__(self, "same_title_size_cap",
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
+        object.__setattr__(self, "categories", _names(self.categories, "categories"))
+        object.__setattr__(self, "tags", _names(self.tags, "tags"))
 
 
 def live_settings() -> LiveSettings:
@@ -1873,6 +1978,8 @@ def live_settings() -> LiveSettings:
         interval_discount=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         size_cap=BUDGET_FRACTION,
         same_title_size_cap=SAME_TITLE_SIZE_CAP,
+        categories=TRADE_CATEGORIES,
+        tags=TRADE_TAGS,
     )
 
 
@@ -2114,6 +2221,50 @@ def _cap_text(cap: float, no_cap: str) -> str:
     return _percent_text(cap)
 
 
+def _names_text(names: tuple[str, ...] | None) -> str:
+    """
+    Name a validated category or tag filter.
+
+    Exact where a plain join would print two filters alike: a name holding a
+    comma, a ";" or a "|" (each reads as a separator here, in
+    describe_trade_filter or on the "Live settings:" line) switches every name
+    to its repr, so ("a, b",) and ("a", "b") never render the same. No Kalshi
+    category or first tag seen so far holds any of them, so in practice the
+    names print as typed. None renders "any", which no name can read
+    (_names refuses it in any case), so a filter never renders like None.
+
+    Args:
+        names (tuple[str, ...] | None): A filter as LiveSettings holds it.
+
+    Returns:
+        str: "any" for None, otherwise the names joined by ", " in their given
+            order, e.g. "Economics, Sports".
+    """
+    if names is None:
+        return "any"
+    if any(sep in name for name in names for sep in (",", ";", "|")):
+        return ", ".join(repr(name) for name in names)
+    return ", ".join(names)
+
+
+def describe_trade_filter(settings: LiveSettings) -> str:
+    """
+    Name a run's category/tag filter, as describe_live_settings renders it.
+
+    main._filter_by_category's log lines and main._no_pairs_msg use it, so
+    every line that names the filter spells it the way the run's "Live
+    settings:" line does.
+
+    Args:
+        settings (LiveSettings): The run's toggles.
+
+    Returns:
+        str: e.g. "categories Economics, Sports; tags any"; "categories any;
+            tags any" when no filter is set.
+    """
+    return f"categories {_names_text(settings.categories)}; tags {_names_text(settings.tags)}"
+
+
 def describe_live_settings(settings: LiveSettings, reference: LiveSettings | None = None) -> str:
     """
     Name every live toggle on one line, marking each that departs from reference.
@@ -2125,8 +2276,10 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     carries no mark. A field departs when its RAW value differs,
     never when its rendering does, and every renderer here is exact where the
     short form would print two values alike: k is rendered with repr, so 0.751
-    and 0.75 never print alike, the band's bounds with _exact_number, and the
-    caps, which sit on the SIZE_CAP_STEP grid, as whole percentages.
+    and 0.75 never print alike, the band's bounds with _exact_number, the
+    caps, which sit on the SIZE_CAP_STEP grid, as whole percentages, and the
+    category and tag filters as their names ("any" for None; _names_text,
+    which quotes every name when one holds a separator).
 
     The same-title cap reads "100% (no extra cap)" at 1.0 rather than "no
     cap": a same-title pair is still capped by the per-trade cap
@@ -2139,9 +2292,9 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
 
     Returns:
         str: For example "tier floors off | spread band 0-0.5 | k 0.8 |
-            per-trade cap 100% (no cap) | same-title cap 20%", with
-            " (config: X)" after each field whose value differs from
-            reference's.
+            per-trade cap 100% (no cap) | same-title cap 20% | categories any
+            | tags any", with " (config: X)" after each field whose value
+            differs from reference's.
     """
     fields = (
         ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
@@ -2149,6 +2302,8 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
         ("k", "interval_discount", repr),
         ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
         ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
+        ("categories", "categories", _names_text),
+        ("tags", "tags", _names_text),
     )
     parts = []
     for label, name, render in fields:

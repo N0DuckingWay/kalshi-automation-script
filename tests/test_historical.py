@@ -5764,6 +5764,66 @@ class TestLoadSeriesCategories:
         assert "falls back to ticker-prefix categories" in caplog.text
         assert not cache.exists()
 
+    @pytest.mark.parametrize("fetched_at", [
+        datetime(2020, 1, 1, tzinfo=UTC),               # stale
+        datetime.now(UTC) + timedelta(days=30),         # in the future
+        None,                                           # unreadable stamp
+    ])
+    def test_no_client_reads_the_cached_copy_only_however_old(self, cache, monkeypatch,
+                                                               caplog, fetched_at):
+        # main.py's dev mode: the sandbox key must never sign a production
+        # request, so a None client makes no request at all
+        cache.write_text(json.dumps({
+            "fetched_at": None if fetched_at is None else fetched_at.isoformat(),
+            "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        calls = self._stub(monkeypatch, AssertionError("a request with no client"))
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(None) == {"KXA": ("Sports", ("Soccer",))}
+        assert calls == [] and caplog.text == ""
+
+    def test_no_client_and_no_cache_is_empty_with_no_request(self, cache, monkeypatch, caplog):
+        calls = self._stub(monkeypatch, AssertionError("a request with no client"))
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(None) == {}
+        assert calls == [] and caplog.text == "" and not cache.exists()
+
+    @pytest.mark.parametrize("cached", [None, {"KXA": ["Sports", ["Soccer"]]}])
+    def test_a_fetched_listing_is_returned_when_its_cache_cannot_be_written(
+        self, cache, monkeypatch, caplog, cached,
+    ):
+        # A full disk, or two processes refreshing a stale copy at once and
+        # colliding on _save_json_cache's tmp file: the write fails, and the
+        # listing in hand is still returned, never the older copy or {}
+        if cached is not None:
+            cache.write_text(json.dumps({
+                "fetched_at": datetime(2020, 1, 1, tzinfo=UTC).isoformat(), "series": cached}))
+        before = cache.read_text() if cache.exists() else None
+        self._stub(monkeypatch, self.LISTING)
+
+        def disk_full(path, data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(historical, "_save_json_cache", disk_full)
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_series_categories(MagicMock())
+        assert got == {
+            "KXNCAAMBGAME": ("Sports", ("Basketball",)),
+            "KXFISAEXTEND": ("Politics", ("Congress",)),
+            "KXSCOTUSLAST": ("Politics", ()),
+            "KXODD": ("", ("Tag",)),
+        }
+        assert "could not cache Kalshi's /series listing" in caplog.text
+        assert "still files by the 4 series it fetched" in caplog.text
+        assert "Series category listing unavailable" not in caplog.text
+        assert (cache.read_text() if cache.exists() else None) == before
+
+    def test_the_failure_warning_says_a_live_filter_trades_nothing(self, cache, monkeypatch,
+                                                                   caplog):
+        self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.WARNING):
+            historical.load_series_categories(MagicMock())
+        assert "a live category/tag filter, if set, trades nothing" in caplog.text
+
     def test_a_paginated_listing_is_followed_and_a_repeated_cursor_stops(self, cache,
                                                                         monkeypatch):
         pages = iter([

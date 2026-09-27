@@ -43,11 +43,12 @@ from kalshi_betting.strategy import compute_trade
 
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-              same_title_size_cap=1.0):
+              same_title_size_cap=1.0, categories=None, tags=None):
     """A LiveSettings with every field named, defaulting to today's values."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
-                        same_title_size_cap=same_title_size_cap)
+                        same_title_size_cap=same_title_size_cap,
+                        categories=categories, tags=tags)
 
 
 class TestProjectRoot:
@@ -669,7 +670,10 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.8)
         monkeypatch.setattr(config, "BUDGET_FRACTION", 1.0)
         monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.2)
-        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics",))
+        monkeypatch.setattr(config, "TRADE_TAGS", ["Oil & Gas"])
+        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2,
+                                            ("Economics",), ("Oil & Gas",))
 
     def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
@@ -689,6 +693,8 @@ class TestLiveSettings:
             interval_discount=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
             size_cap=config.BUDGET_FRACTION,
             same_title_size_cap=config.SAME_TITLE_SIZE_CAP,
+            categories=config.TRADE_CATEGORIES,
+            tags=config.TRADE_TAGS,
         )
         assert type(s.tier_floors) is bool
 
@@ -707,6 +713,47 @@ class TestLiveSettings:
         # ... and replace re-validates it like every other field
         with pytest.raises(ValueError, match="same_title_size_cap"):
             dataclasses.replace(_settings(), same_title_size_cap=0.37)
+
+    @pytest.mark.parametrize("field", ["categories", "tags"])
+    @pytest.mark.parametrize("bad", [
+        "Sports",            # a bare str would filter on its characters
+        (), [],              # matches nothing: None is "any"
+        ("",), ("  ",),      # an empty name, before or after stripping
+        # "any" would match nothing yet render exactly like None
+        ("any",), ("Sports", "ANY"), (" Any ",),
+        ("Sports", None), ("Sports", 7), (b"Sports",),
+        {"Sports"},          # a set has no order to render or keep
+        7, True,
+    ])
+    def test_a_filter_must_be_none_or_a_non_empty_tuple_of_names(self, field, bad):
+        with pytest.raises(ValueError, match=field):
+            _settings(**{field: bad})
+        # replace re-validates it too
+        with pytest.raises(ValueError, match=field):
+            dataclasses.replace(_settings(), **{field: bad})
+
+    @pytest.mark.parametrize("field", ["categories", "tags"])
+    def test_a_filter_is_normalised_to_a_tuple_of_stripped_names(self, field):
+        s = _settings(**{field: [" Sports ", "Oil & Gas"]})
+        assert getattr(s, field) == ("Sports", "Oil & Gas")
+        assert type(getattr(s, field)) is tuple
+        # Order and case are kept as given; matching is case-insensitive
+        # (main._filter_by_category), not the stored value
+        assert getattr(_settings(**{field: ("b", "A")}), field) == ("b", "A")
+        assert getattr(_settings(**{field: None}), field) is None
+
+    def test_a_construction_without_the_filters_filters_nothing(self):
+        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        assert s.categories is None and s.tags is None
+        # Appended with defaults: the first five fields keep their positions
+        assert [f.name for f in dataclasses.fields(LiveSettings)][-2:] == ["categories", "tags"]
+
+    @pytest.mark.parametrize("name, value", [("TRADE_CATEGORIES", "Sports"),
+                                             ("TRADE_TAGS", ())])
+    def test_live_settings_refuses_an_invalid_filter(self, monkeypatch, name, value):
+        monkeypatch.setattr(config, name, value)
+        with pytest.raises(ValueError, match="categories" if "CATEG" in name else "tags"):
+            live_settings()
 
 
 class TestTimeSeriesSpreadRefusal:
@@ -903,7 +950,7 @@ class TestDescribeLiveSettings:
         s = _settings()
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
-            "same-title cap 100% (no extra cap)")
+            "same-title cap 100% (no extra cap) | categories any | tags any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -920,6 +967,8 @@ class TestDescribeLiveSettings:
         "interval_discount": (0.6, "k 0.6 (config: 0.75)"),
         "size_cap": (0.35, "per-trade cap 35% (config: 20%)"),
         "same_title_size_cap": (0.25, "same-title cap 25% (config: 100% (no extra cap))"),
+        "categories": (("Economics",), "categories Economics (config: any)"),
+        "tags": (("Oil & Gas", "Energy"), "tags Oil & Gas, Energy (config: any)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -931,7 +980,7 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, ref) == (
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
-            "same-title cap 20% (config: 100% (no extra cap))")
+            "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any")
         for field in dataclasses.fields(LiveSettings):
             value, mark = self._DEPARTURES[field.name]
             line = config.describe_live_settings(
@@ -956,7 +1005,47 @@ class TestDescribeLiveSettings:
         line = config.describe_live_settings(_settings(False, (0.0, 0.5), 0.8, 1.0, 0.2))
         assert "(config:" not in line
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
-                        "per-trade cap 100% (no cap) | same-title cap 20%")
+                        "per-trade cap 100% (no cap) | same-title cap 20% | "
+                        "categories any | tags any")
+
+    def test_a_filter_renders_its_names_and_any_for_none(self):
+        # The config value departs: "any" in the mark, the run's names beside it
+        ref = _settings(categories=("Sports",))
+        line = config.describe_live_settings(_settings(tags=("Basketball", "Soccer")), ref)
+        assert "categories any (config: Sports)" in line
+        assert "tags Basketball, Soccer (config: any)" in line
+        # Case is part of the raw value: a case-only change departs and shows
+        line = config.describe_live_settings(_settings(categories=("sports",)), ref)
+        assert "categories sports (config: Sports)" in line
+
+    def test_a_filter_name_holding_a_separator_renders_exactly(self):
+        # ("a, b",) and ("a", "b") must never print alike, here or on the
+        # trade log's note
+        one = config.describe_live_settings(_settings(categories=("a, b",)))
+        two = config.describe_live_settings(_settings(categories=("a", "b")))
+        assert "categories 'a, b' |" in one
+        assert "categories a, b |" in two
+        assert one != two
+        for sep in (";", "|"):
+            line = config.describe_live_settings(_settings(tags=(f"x{sep}y", "z")))
+            assert f"tags 'x{sep}y', 'z'" in line
+
+    @pytest.mark.parametrize("field", ["categories", "tags"])
+    def test_only_the_name_any_is_refused_never_a_name_containing_it(self, field):
+        # "any" alone would render like None (and is refused); a real name
+        # holding the letters — Kalshi's "Companies" category — is a name
+        s = _settings(**{field: ("Companies", "Any Awards")})
+        assert getattr(s, field) == ("Companies", "Any Awards")
+        assert f"{field} Companies, Any Awards" in config.describe_live_settings(s)
+        assert config.describe_live_settings(s) != config.describe_live_settings(_settings())
+
+    def test_describe_trade_filter_names_the_filter_in_the_same_words(self):
+        assert config.describe_trade_filter(_settings()) == "categories any; tags any"
+        s = _settings(categories=("Economics", "Sports"), tags=("Oil & Gas",))
+        assert config.describe_trade_filter(s) == (
+            "categories Economics, Sports; tags Oil & Gas")
+        line = config.describe_live_settings(s)
+        assert "categories Economics, Sports" in line and "tags Oil & Gas" in line
 
 
 class TestLiveRuleWarnings:

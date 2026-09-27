@@ -81,7 +81,14 @@ Dependencies:
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
-    live sizer computes. Uses plotly, numpy, pandas, and yfinance (all
+    live sizer computes. Imports historical.series_labels (as _series_labels),
+    the one rule that files an event under Kalshi's category and the series'
+    FIRST tag — shared with main.py's live category/tag filter, so a pair
+    there and a trade here of the same event are filed alike (which of this
+    page's Category and Tag options a live filter equals is
+    main._filter_by_category's docstring: its matching ignores case, and its
+    tag is matched under every category, where this page scopes a Tag option
+    to one) — and scanner.leg_sides. Uses plotly, numpy, pandas, and yfinance (all
     external). Called by backtest.py after run_backtest_sweep() completes.
 
 Notes:
@@ -353,6 +360,7 @@ from .config import (
     fee_per_pair_approx,
     time_series_profit_prob,
 )
+from .historical import series_labels as _series_labels
 from .scanner import leg_sides
 
 # The one dashboard file every backtest run writes (and overwrites) in PROJECT_ROOT.
@@ -1030,58 +1038,6 @@ def _section_performance(
 
 
 # ─── Section 2: Returns Decomposition ────────────────────────────────────────
-
-def _series_ticker(event_ticker: str) -> str:
-    """
-    The series part of an event ticker (everything before its first hyphen).
-
-    Deliberately NOT scanner.event_series, which collapses every KXMVE* combo
-    series onto one family for the one-series pairing rule: Kalshi files each
-    literal series under its own category, and that is what is looked up here.
-
-    Args:
-        event_ticker (str): An event ticker, e.g. "KXNCAAMBGAME-26JAN13WIUEIU".
-
-    Returns:
-        str: The series ticker ("KXNCAAMBGAME"), or "" for an empty ticker.
-    """
-    return (event_ticker or "").split("-", 1)[0]
-
-
-def _series_labels(
-    event_ticker: str,
-    fallback_category: str,
-    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
-) -> tuple[str, str]:
-    """
-    Name the Kalshi category and FIRST tag an event's series is filed under.
-
-    The one filing rule behind every category and tag on the page — the
-    Returns Decomposition, the page-wide filter and the k-hat breakdown — so
-    a trade and a k-hat observation of the same event can never be filed
-    apart. First tag only, so every breakdown PARTITIONS what it breaks down: a
-    series can carry several tags, and counting it under each would make the
-    groups add up to more than the whole.
-
-    Args:
-        event_ticker (str): The event ticker whose series is looked up
-            (_series_ticker).
-        fallback_category (str): The label to use when there is no map or the
-            series is missing from it — the ticker-prefix category
-            (BacktestTrade.category, CalibrationObservation.category).
-        series_categories (dict | None): historical.load_series_categories'
-            series ticker -> (category, tags), or None when not loaded.
-
-    Returns:
-        tuple[str, str]: (category, tag). The tag reads "General" when the
-            series has none (or is not in the map); the category
-            "Uncategorised" when Kalshi gives it none.
-    """
-    entry = (series_categories or {}).get(_series_ticker(event_ticker))
-    if entry is None:
-        return fallback_category, "General"
-    return entry[0] or "Uncategorised", entry[1][0] if entry[1] else "General"
-
 
 def _trade_category(
     trade: BacktestTrade,

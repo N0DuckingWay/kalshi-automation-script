@@ -1020,9 +1020,10 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_live_path_reads_toggles_only_through_live_settings(self):
         # Every live toggle — the time-series entry rule (tier floors, spread
-        # band), k and both per-trade caps — is read through ONE frozen
-        # config.LiveSettings per run, so no site can apply a setting while
-        # another reads config.py: the finder, enrichment (its spread rule
+        # band), k, both per-trade caps and the category/tag filter — is read
+        # through ONE frozen config.LiveSettings per run, so no site can apply
+        # a setting while another reads config.py: the finder, the category/
+        # tag filter (main._filter_by_category), enrichment (its spread rule
         # and its affordability bound, max_kelly_fraction), the sizer
         # (strategy.compute_trade: k through _kelly_p_at, the caps through
         # config.pair_size_cap) and validate_pair_price all read the one
@@ -1032,7 +1033,8 @@ class TestTimeSeriesKellyParity:
         # (backtester, backtest, dashboard) — so a live module added later is
         # covered without editing any list here. In every walked module:
         #   - no band or tier-floor helper or constant, and no toggle constant
-        #     (the two caps and k included), is referenced, by name, by string
+        #     (the two caps, k, TRADE_CATEGORIES and TRADE_TAGS included), is
+        #     referenced, by name, by string
         #     (a getattr/__dict__ lookup), by shadowing def or parameter, or
         #     by import — min_price_diff_for_gap included: the live path
         #     reaches the entry floor only through
@@ -1096,6 +1098,8 @@ class TestTimeSeriesKellyParity:
             "TIME_SERIES_INTERVAL_PROB_DISCOUNT",
             "BUDGET_FRACTION",
             "SAME_TITLE_SIZE_CAP",
+            "TRADE_CATEGORIES",
+            "TRADE_TAGS",
         }
         resolver = "live_settings"
         # Helpers whose k / fraction would silently read config.py when left
@@ -1159,7 +1163,8 @@ class TestTimeSeriesKellyParity:
                 "max_kelly_fraction", "_run_dev", "_run_prod", "compute_trade",
                 "_evaluate_size", "_solve_marginal_size", "_kelly_p",
                 "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
-                "describe_live_settings", "live_rule_warnings"} <= set(takes_settings)
+                "describe_live_settings", "live_rule_warnings", "_filter_by_category",
+                "describe_trade_filter"} <= set(takes_settings)
         # _kelly_p_at's k is required too: a default there would let a caller
         # that forgets it price at config's k
         kelly_p_at = next(n for n in ast.walk(trees["strategy"])

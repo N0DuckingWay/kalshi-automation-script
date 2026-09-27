@@ -11,7 +11,12 @@ Purpose:
     and (2) hourly candlestick price series for individual markets used to find
     the week when each pair first became tradeable. All data is cached to JSON
     (or gzipped JSON-lines) files on disk so re-runs do not re-fetch from the
-    API.
+    API. It also serves the live bot: Kalshi's /series listing
+    (load_series_categories) and the one rule that files an event under a
+    Kalshi category and first tag (series_ticker / series_labels, with
+    infer_category's ticker-prefix label as the fallback) are what
+    main._filter_by_category, the live category/tag filter, files pairs by —
+    the same rule the backtest dashboard files trades by.
 
 Dependencies:
     Imports build_client from auth.py; api_call_with_retry and fetch_json_page
@@ -31,7 +36,17 @@ Dependencies:
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
-    all called by backtester.py. Also exports SettledCorpus — the
+    all called by backtester.py. The series labels are the one filing rule
+    shared by the backtest dashboard and the live bot:
+    load_series_categories() (Kalshi's category and tags per series, cached a
+    week) is called by backtest.py for the dashboard and by main.py for its
+    live category/tag filter (main._filter_by_category — a production run
+    with its own client, a dev run with None, which reads the cached copy
+    only), and series_ticker() / series_labels() file an event under a
+    category and FIRST tag for dashboard.py and main.py alike, with
+    infer_category()'s ticker-prefix label as the fallback for a series the
+    listing lacks (BacktestTrade.category on the page, a direct call in
+    main.py). Also exports SettledCorpus — the
     disk-backed, re-iterable corpus fetch_all_settled_markets returns — and
     LegacySettledCorpus, the list a legacy settled_markets_*.json hit
     returns; each carries a CorpusProvenance (when, and under which archive
@@ -239,6 +254,65 @@ def infer_category(event_ticker: str) -> str:
     return "Other"
 
 
+def series_ticker(event_ticker: str) -> str:
+    """
+    The series part of an event ticker (everything before its first hyphen).
+
+    Deliberately NOT scanner.event_series, which collapses every KXMVE* combo
+    series onto one family for the one-series pairing rule: Kalshi files each
+    literal series under its own category, and that is what is looked up here.
+
+    Args:
+        event_ticker (str): An event ticker, e.g. "KXNCAAMBGAME-26JAN13WIUEIU".
+
+    Returns:
+        str: The series ticker ("KXNCAAMBGAME"), or "" for an empty ticker.
+    """
+    return (event_ticker or "").split("-", 1)[0]
+
+
+def series_labels(
+    event_ticker: str,
+    fallback_category: str,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+) -> tuple[str, str]:
+    """
+    Name the Kalshi category and FIRST tag an event's series is filed under.
+
+    The one filing rule behind every category and tag on the backtest
+    dashboard — the Returns Decomposition, the page-wide filter and the k-hat
+    breakdown — and behind main.py's live category/tag filter
+    (main._filter_by_category), so a trade and a k-hat observation of the same
+    event can never be filed apart, and a pair and a trade of the same event
+    are filed under one category and tag. (Which pairs a live filter KEEPS is
+    main._filter_by_category's matching — case-insensitive, and a tag matched
+    under every category — so its docstring says which dashboard slice a
+    filter equals.) First tag only, so every
+    breakdown PARTITIONS what it breaks down: a series can carry several tags,
+    and counting it under each would make the groups add up to more than the
+    whole.
+
+    Args:
+        event_ticker (str): The event ticker whose series is looked up
+            (series_ticker).
+        fallback_category (str): The label to use when there is no map or the
+            series is missing from it — the ticker-prefix category
+            (infer_category: BacktestTrade.category,
+            CalibrationObservation.category, and the live filter's own call).
+        series_categories (dict | None): load_series_categories' series ticker
+            -> (category, tags), or None when not loaded.
+
+    Returns:
+        tuple[str, str]: (category, tag). The tag reads "General" when the
+            series has none (or is not in the map); the category
+            "Uncategorised" when Kalshi gives it none.
+    """
+    entry = (series_categories or {}).get(series_ticker(event_ticker))
+    if entry is None:
+        return fallback_category, "General"
+    return entry[0] or "Uncategorised", entry[1][0] if entry[1] else "General"
+
+
 # Disk copy of Kalshi's /series listing: {"fetched_at": ISO, "series":
 # {series_ticker: [category, [tags...]]}}. See load_series_categories.
 _SERIES_CATEGORIES_CACHE = CACHE_DIR / "series_categories.json"
@@ -280,20 +354,34 @@ def load_series_categories(
     finer tags ("Basketball", "Congress", "Oil & Gas", ...). The backtest
     dashboard breaks returns down by them, because infer_category's ticker
     prefixes predate the "KX" prefix every current series carries and so file
-    nearly every trade under "Other". Reporting only: nothing is priced,
-    sized, paired or settled on these labels.
+    nearly every trade under "Other". Nothing is priced, sized or settled on
+    these labels; they decide how the dashboard files a trade and, when a live
+    category/tag filter is set (config.TRADE_CATEGORIES / TRADE_TAGS, or
+    main.py's --category / --tag), which pairs main.py may trade
+    (main._filter_by_category, through series_labels).
 
     The listing is cached in backtest_cache/series_categories.json and reused
     while younger than max_age_seconds. It is one read-only GET (retried like
-    every other historical read). This never raises: on any failure it logs a
-    WARNING and falls back to the cached copy however old, or to {} when there
-    is none — in which case the dashboard files trades under infer_category's
-    labels, exactly as before.
+    every other historical read). This never raises: on any failure to fetch
+    it logs a WARNING and falls back to the cached copy however old, or to {}
+    when there is none — in which case the dashboard files trades under
+    infer_category's labels, exactly as before, and a live run with a
+    category/tag filter set trades nothing (main._filter_by_category fails
+    closed on an empty map). A listing that was fetched is returned even when
+    writing its cached copy fails (a full disk, or two processes refreshing a
+    stale copy at once and colliding on _save_json_cache's tmp file): that
+    failure costs the cache, not the listing, and logs its own WARNING.
+    With client None it makes no request at all: it returns the cached copy
+    however old, or {} — main.py's dev mode reads it this way, so the sandbox
+    key never signs a request to the production host.
 
     Args:
-        client (Any): A KalshiClient pointed at prod (build_prod_live_client()).
+        client (Any): A KalshiClient pointed at prod (build_prod_live_client(),
+            or a production run's own client), or None to read the cached copy
+            only.
         max_age_seconds (int): Reuse the cached copy while it is younger than
             this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS.
+            Ignored when client is None.
 
     Returns:
         dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
@@ -308,6 +396,11 @@ def load_series_categories(
             fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
         except (TypeError, ValueError):
             fetched_at = None
+    if client is None:
+        # Nothing to sign a request with: the cached copy, however old, or {}
+        # (main.py's dev mode — the sandbox key must never sign a production
+        # request)
+        return cached_map
     now = datetime.now(UTC)
     if (cached_map and fetched_at is not None and fetched_at.tzinfo is not None
             and 0 <= (now - fetched_at).total_seconds() < max_age_seconds):
@@ -333,20 +426,26 @@ def load_series_categories(
             seen.add(cursor)
         if not fresh:
             raise ValueError("/series returned no series")
-        _save_json_cache(_SERIES_CATEGORIES_CACHE, {
-            "fetched_at": now.isoformat(),
-            "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
-        })
-        logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
-        return fresh
-    except Exception as exc:  # reporting only — never end a backtest over it
+    except Exception as exc:  # never end a run over it (the live filter fails closed on {})
         logging.warning(
             "Series category listing unavailable (%s) — %s",
             _exception_summary(exc),
             f"using the cached copy of {len(cached_map)} series" if cached_map
-            else "the dashboard falls back to ticker-prefix categories",
+            else "every series falls back to ticker-prefix categories (and a live "
+                 "category/tag filter, if set, trades nothing)",
         )
         return cached_map
+    try:
+        _save_json_cache(_SERIES_CATEGORIES_CACHE, {
+            "fetched_at": now.isoformat(),
+            "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
+        })
+    except Exception as exc:  # the listing is in hand: a failed write costs the cache only
+        logging.warning(
+            "Series categories: could not cache Kalshi's /series listing (%s) — this run "
+            "still files by the %d series it fetched", _exception_summary(exc), len(fresh))
+    logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
+    return fresh
 
 
 def _signed_raw_get(client: Any, path: str, **params):
