@@ -771,8 +771,11 @@ class TestOneEventSeriesIsTwoFixtures:
         # The prices are deliberately chosen so that NOTHING ELSE rejects the
         # pair: the YES asks diverge 0.25 (>= SAME_TITLE_MIN_PRICE_DIFF for the
         # same-title finder) and, with the earlier leg the cheaper one, give
-        # pB - pA = 0.25 at a zero-day gap (>= the 15% short-tier threshold,
-        # and pA + nB = 0.75 <= the 0.85 ceiling) for the time-series finder.
+        # pB - pA = 0.25 at a zero-day gap for the time-series finder, which
+        # clears the tier-on rule (>= the 15% short-tier threshold, and
+        # pA + nB = 0.75 <= the 0.85 ceiling) and the rule config.py ships
+        # since 2026-09-27 (strictly positive, within the 0.5 band ceiling,
+        # and pA + nB under $1).
         close = datetime(2026, 9, 15, 20, tzinfo=UTC)
         earlier = _mock_market(
             ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
@@ -2502,7 +2505,10 @@ class TestSameEventDeadlineLadders:
         assert len(pairs) == 1
         assert pairs[0].stated_gap_days == 19
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_stated_gap_chooses_the_tier_a_zero_close_gap_would_not(self, monkeypatch):
+        # (config.py's tier-on toggles before the 2026-09-27 flip, pinned by
+        # pre_toggle_defaults: with the tier floors off no tier is chosen at all)
         # control for the row above, and the reason the stated gap must travel
         # with the pair: a 0.20 spread clears the SHORT tier (0.15) that a
         # close gap of 0 days would select, and fails the LONG tier (0.30) the
@@ -2697,7 +2703,11 @@ class TestSameEventDeadlineLadders:
                           close_time=datetime(2026, 3, 15, tzinfo=UTC))
         return m1, m2, m3
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_wider_ladder_wins_the_groups_one_best_slot(self, monkeypatch):
+        # (config.py's toggles before the 2026-09-27 flip, pinned by
+        # pre_toggle_defaults: the ladder's 0.75 spread is above the shipped
+        # band's 0.5 ceiling, which would refuse it before the contest)
         pairs = self._scan(list(self._mixed_group()), monkeypatch)
         assert len(pairs) == 1
         # M1 x M3 (one event, spread 0.75) beats the cross-event M1 x M2
@@ -2752,11 +2762,14 @@ class TestPairGapDays:
         # ladder — the same fail-safe-by-type rule leg_sides follows.
         assert scanner.pair_gap_days(self._pair(bad, close_gap=9)) == 9
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_ceiling_is_tiered_on_the_stated_gap(self):
         # _pair_max_sum is the downstream re-derivation that matters: a ladder
         # whose rungs closed at one instant must keep the LONG tier its stated
         # gap chose, not drop to the short one a 0-day close gap implies.
-        # Settings are required, so config.py's are handed in explicitly.
+        # Settings are required, so config.py's are handed in explicitly —
+        # pinned to their tier-on values before the 2026-09-27 flip
+        # (pre_toggle_defaults), since the tier is what this pins.
         settings = config.live_settings()
         assert scanner._pair_max_sum(self._pair(19, close_gap=0), settings) == pytest.approx(0.70)
         assert scanner._pair_max_sum(self._pair(None, close_gap=0), settings) == pytest.approx(0.85)
@@ -3738,11 +3751,15 @@ def _ts_pair_markets(*, gap_days: int, pA: float, pB: float, nB: float | None = 
     return mA, mB
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestTimeSeriesTieredThreshold:
     """The minimum price gap (later YES ask minus earlier YES ask) is tiered
     by deadline gap: 15% for gaps <= 15 days, 30% for 16-30 days, and gaps
     > 30 days are never candidates. Every fixture has the LATER contract
-    pricier (pB > pA) except the direction test."""
+    pricier (pB > pA) except the direction test. The finder runs with no
+    settings, so it reads config.py's live toggles, pinned to their values
+    before the 2026-09-27 flip (conftest's pre_toggle_defaults: tier floors
+    on, no band) — the rule these tiers belong to."""
 
     def _scan(self, gap_days, pA, pB):
         mA, mB = _ts_pair_markets(gap_days=gap_days, pA=pA, pB=pB)
@@ -4147,6 +4164,7 @@ def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> Candi
     )
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestEnrichmentBoundsDepthByAffordability:
     """Enrichment must average only the depth this balance could actually buy.
 
@@ -4154,6 +4172,13 @@ class TestEnrichmentBoundsDepthByAffordability:
     market's full book priced every pair against levels no single trade can
     reach — inflating the fill price and killing pairs at the profitability gate
     on contracts we would never have bought.
+
+    Pinned to config.py's toggles before the 2026-09-27 flip
+    (pre_toggle_defaults: tier floors on, a 20% per-trade cap), the rule its
+    ceiling and cap arithmetic below are worked in. At the shipped values the
+    same results come about another way — the 1.0 price-sum ceiling admits the
+    0.97 rung and the fee cut trims it, and the bound is 1 - k = 0.20 — which
+    TestShippedLiveToggles pins.
     """
 
     # Each column ascends on its own (see _ts_multilevel_client), so the sweep
@@ -4284,10 +4309,14 @@ class TestEnrichmentStoresOrientedDepthLevels:
         assert pair.depth_levels == ()
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestOrderbookCeilingTieredByDeadlineGap:
     """enrich_with_orderbook_prices and validate_pair_price must apply the
     deadline-gap-tiered LEG-price-sum ceiling (0.85 for gaps <= 15 days, 0.70
-    for 16-30 days), not the old flat 1 - 15% = 0.85.
+    for 16-30 days), not the old flat 1 - 15% = 0.85. Both read config.py's
+    live toggles here, pinned to their values before the 2026-09-27 flip
+    (conftest's pre_toggle_defaults: tier floors on, no band); with the tier
+    floors off the ceiling is 1 - the band floor alone.
 
     The fixtures use a deliberately WIDE later book: with a tight nB = 1 - pB
     the leg sum is exactly 1 - (pB - pA), which is always <= the ceiling once
@@ -4627,7 +4656,10 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert st_e.tradeable is True
         assert st_e.pA == st.pA
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_ceiling_tier_is_the_stated_gap_for_a_ladder(self, caplog):
+        # (config.py's tier-on toggles before the 2026-09-27 flip, pinned by
+        # pre_toggle_defaults: the tier is what sets the ceiling tested here)
         # DR-73, pinned BY VALUE because the AST pin beside it cannot see
         # this: test_ast_pair_ceiling_reads_the_pair_gap only asserts that a
         # pair_gap_days call is present and a deadline_gap_days call absent,
@@ -4685,7 +4717,9 @@ class TestEnrichmentRefreshesReferenceQuote:
 
 
 def _live(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20):
-    """An explicit LiveSettings, every field named, defaulting to today's values."""
+    """An explicit LiveSettings, every field named, defaulting to config.py's
+    values before the 2026-09-27 flip (tier floors on, no band, k 0.75, a 20%
+    cap)."""
     return config.LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                                interval_discount=interval_discount, size_cap=size_cap)
 
@@ -5024,7 +5058,8 @@ class TestEnrichmentSpreadRule:
             _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=20000, pA_ref=0.60), [st],
             1_000_000, settings=_live(size_cap=1.0))
         assert st_e.max_contracts == int(10_000 * 0.95 / 0.75)
-        # Today's settings: 0.20 for both, as before
+        # The settings before the 2026-09-27 flip (_live()): 0.20 for both, as
+        # at the values shipped since
         [ts_t] = enrich_with_orderbook_prices(
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
             1_000_000, settings=_live())
@@ -5048,7 +5083,9 @@ class TestEnrichmentSpreadRule:
 class TestValidatePairPriceSpreadRule:
     """validate_pair_price re-checks a selected time-series spec on a FRESH
     book: it fails closed with no later YES ask, and refuses a top-of-book
-    spread above the band's ceiling. The floor stays the price-sum ceiling."""
+    spread above the band's ceiling. The floor stays the price-sum ceiling, and
+    the fresh book is cut at the first level with no edge left after the fee
+    (the cut enrichment prices with) before any depth is counted."""
 
     def test_a_fresh_spread_over_the_ceiling_is_dropped(self, caplog):
         # Fill 0.30 against LATE's YES bid 0.70 (NO ask 0.30) and a fresh
@@ -5100,6 +5137,60 @@ class TestValidatePairPriceSpreadRule:
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, pB_ref=0.60), spec,
             settings=_live()) is True
 
+    def test_a_fresh_book_with_no_edge_after_the_fee_is_dropped(self, caplog):
+        # A thin-edge spec sized at pA 0.01 / nB 0.97 (FoK caps 0.02 / 0.98)
+        # under the tier-floors-off rule; the book then moves a tick against
+        # both legs, to 0.02 / 0.98. That sum of 1.00 sits inside the 1.0
+        # price-sum ceiling of a floor of 0, and within both caps — so only the
+        # fee cut drops it; filled there, every settlement cell loses
+        pair = _ts_candidate(gap_days=10, pA=0.01, pB=0.03, nB=0.97)
+        spec = SimpleNamespace(pair=pair, x=748)
+        moved = _ts_orderbook_client(pA_fill=0.02, nB_fill=0.98, qty=5000, pB_ref=0.03)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(moved, spec, settings=_TIERS_OFF_HALF) is False
+        [line] = [r for r in caplog.records if "keeps an edge after the fee" in r.getMessage()]
+        assert line.levelno == logging.WARNING
+        assert line.getMessage() == (
+            f"Pre-execution check failed for '{pair.canonical_title}' — no contract pair "
+            "on the book now keeps an edge after the fee; dropping")
+        assert [r for r in caplog.records if "gap no longer qualifies" in r.getMessage()] == []
+        # control: the book the spec was sized on (a 0.02 edge over a ~0.003
+        # fee) still passes
+        unmoved = _ts_orderbook_client(pA_fill=0.01, nB_fill=0.97, qty=5000, pB_ref=0.03)
+        assert validate_pair_price(unmoved, spec, settings=_TIERS_OFF_HALF) is True
+        # control: with the tiers on, the 0.85 ceiling refuses the moved book
+        # on its own, as it always did
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(moved, spec, settings=_live()) is False
+        assert [r for r in caplog.records if "gap no longer qualifies" in r.getMessage()]
+
+    def test_depth_is_counted_only_over_levels_with_an_edge(self, caplog):
+        # 100 contracts rest at 0.30 + 0.45 (a 0.25 edge) and 900 more at
+        # 0.53 + 0.46 (0.99: inside the 1.0 ceiling, a 0.01 edge under its
+        # ~0.035 fee). A spec of 150 is reachable at its caps only by counting
+        # the no-edge level, so it is dropped; a spec of 100 passes
+        pair = _ts_candidate(gap_days=10, pA=0.52, pB=0.60, nB=0.45)
+        levels = [(0.30, 0.45, 100), (0.53, 0.46, 900)]
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.60),
+                                       SimpleNamespace(pair=pair, x=150),
+                                       settings=_live(tier_floors=False)) is False
+        [line] = [r for r in caplog.records if "reachable at the FoK limit" in r.getMessage()]
+        assert "only 100.0 contracts" in line.getMessage()
+        assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.60),
+                                   SimpleNamespace(pair=pair, x=100),
+                                   settings=_live(tier_floors=False)) is True
+
+    def test_the_cut_is_inert_under_a_tier_on_ceiling(self):
+        # Tiers on at 10 days: every level under the 0.85 ceiling keeps at
+        # least 0.15 of edge, more than any fee, so a spec reaching the level
+        # right on the ceiling (0.36 + 0.49) still counts all 100 contracts
+        pair = _ts_candidate(gap_days=10, pA=0.35, pB=0.62, nB=0.48)
+        levels = [(0.30, 0.45, 10), (0.36, 0.49, 90)]
+        assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.62),
+                                   SimpleNamespace(pair=pair, x=100), settings=_live()) is True
+
     def test_same_title_reads_no_reference(self):
         # Same-title is untouched: A's NO side empty, the check still passes
         pair = _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
@@ -5109,7 +5200,11 @@ class TestValidatePairPriceSpreadRule:
 
 
 class TestTimeSeriesBestPairPerGroup:
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_group_of_three_keeps_largest_later_minus_earlier_gap(self):
+        # (config.py's tier-on toggles before the 2026-09-27 flip, pinned by
+        # pre_toggle_defaults: with the tier floors off MID -> LATE qualifies
+        # too, and the premise below would not hold)
         # Three contracts on one normalized title, all within the short tier:
         # EARLY→MID gap 0.20 and EARLY→LATE gap 0.30 both qualify, MID→LATE
         # (0.10) does not. One pair per group survives — the largest pB - pA.
@@ -5220,9 +5315,11 @@ class TestLegHelpers:
         m = SimpleNamespace(close_time=datetime(2026, 3, 1, tzinfo=UTC))
         assert deadline_gap_days(m, m) == 0
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_scanner_and_ceiling_share_the_gap(self):
         # _pair_max_sum tiers off the same order-independent gap the finder
         # used, so a 16-day pair gets the long-tier ceiling from either side
+        # (config.py's tier-on toggles before the 2026-09-27 flip)
         pair = _ts_candidate(gap_days=16, pA=0.30, pB=0.65, nB=0.40)
         settings = config.live_settings()
         assert scanner._pair_max_sum(pair, settings) == pytest.approx(0.70)
@@ -7137,13 +7234,17 @@ class TestBidsToAskLevelsSubCent:
         assert scanner._MAX_ACTIVE_PRICE == 0.99
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestPriceEpsilonThresholds:
     """
     TS-09: prices are floats parsed from cent-quantized dollar strings, so a
     pair sitting EXACTLY on a documented threshold can evaluate a hair under it
     and be rejected for representation noise rather than for its price.
     Measured over live books: the same-title 5c test rejected 50 of 94
-    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69.
+    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69. The tier
+    thresholds bind only with the tier floors on, so config.py's live toggles
+    are pinned to their values before the 2026-09-27 flip (conftest's
+    pre_toggle_defaults: tier floors on, no band).
     """
 
     def test_the_float_noise_this_exists_for_is_real(self):

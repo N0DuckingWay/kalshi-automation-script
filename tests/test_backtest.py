@@ -46,7 +46,6 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_SHORT_GAP,
     PRICE_EPSILON,
     SHORT_DEADLINE_GAP_DAYS,
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     min_price_diff_for_gap,
     time_series_spread_too_wide,
 )
@@ -62,14 +61,17 @@ def _equity(final_value: float = 10_691.38) -> pd.DataFrame:
     return df
 
 
-def _sweep(k: float = TIME_SERIES_INTERVAL_PROB_DISCOUNT, n_trades: int = 0) -> BacktestSweep:
+def _sweep(k: float | None = None, n_trades: int = 0) -> BacktestSweep:
     """A BacktestSweep whose primary point carries n_trades profitable trades.
 
     main() reads only `.profit` off each trade (the win-rate count), so a plain
     SimpleNamespace stands in for BacktestTrade without duplicating its fixture.
+    k None is the k a run given no --interval-discount resolves to: backtest's
+    binding of config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, read at call time so a
+    test that patches it (conftest's pre_toggle_defaults) is honoured.
     """
     point = SweepPoint(
-        k=k,
+        k=backtest.TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k,
         trades=[SimpleNamespace(profit=5.0) for _ in range(n_trades)],
         equity_df=_equity(),
     )
@@ -796,7 +798,7 @@ class TestSummaryBlock:
     def test_config_echo_defaults_to_the_config_constant(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert f"k={TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
+        assert f"k={config.TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
 
 
 class TestCorpusProvenanceLine:

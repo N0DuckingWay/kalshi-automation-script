@@ -2,18 +2,23 @@
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings, the live spread rule,
 the per-pair cap and the per-pair Kelly bound, and the "Live settings" echo
-and warnings main.py logs from them), and PROJECT_ROOT."""
+and warnings main.py logs from them), the values config.py ships since the
+2026-09-27 flip and the evidence recorded beside them, tests/conftest.py's
+apply_pre_toggle_defaults, and PROJECT_ROOT."""
+import ast
 import dataclasses
+import importlib
+import logging
 import math
 import pathlib
+import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import config
+from kalshi_betting import backtester, config, scanner
 from kalshi_betting.config import (
-    BUDGET_FRACTION,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -25,7 +30,6 @@ from kalshi_betting.config import (
     SPREAD_BELOW_FLOOR,
     SPREAD_NOT_POSITIVE,
     TAKER_FEE_RATE,
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_LEG_SIDES,
     LiveSettings,
     fee_leg_exact,
@@ -41,10 +45,18 @@ from kalshi_betting.config import (
 from kalshi_betting.scanner import leg_prices
 from kalshi_betting.strategy import compute_trade
 
+# The backtester's and the scanner's test modules as modules, never their
+# classes: a Test* class imported here would be collected twice
+from . import test_backtester as _tb
+from . import test_scanner as _ts
+from .conftest import apply_pre_toggle_defaults
+
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               same_title_size_cap=1.0, categories=None, tags=None):
-    """A LiveSettings with every field named, defaulting to today's values."""
+    """A LiveSettings with every field named, defaulting to config.py's values
+    before the 2026-09-27 flip (tier floors on, no band, k 0.75, a 20% cap for
+    every pair, no extra same-title cap, no filter)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
@@ -145,13 +157,15 @@ class TestTimeSeriesProfitProb:
     market-implied probability that the event first happens between the two
     deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair)."""
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_flow_through_fixture(self):
-        # pA 0.30, pB 0.60 → gap 0.30 → p = 1 - 0.75 * 0.30 = 0.775
+        # pA 0.30, pB 0.60 → gap 0.30 → p = 1 - 0.75 * 0.30 = 0.775 (k 0.75,
+        # the value config.py shipped before the 2026-09-27 flip)
         assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.775)
 
     def test_matches_definition_from_constant(self):
         for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.30, 0.70)]:
-            expected = 1.0 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * (pB - pA)
+            expected = 1.0 - config.TIME_SERIES_INTERVAL_PROB_DISCOUNT * (pB - pA)
             assert time_series_profit_prob(pA, pB) == pytest.approx(expected)
 
     def test_clamps_to_one_when_earlier_is_pricier(self):
@@ -171,11 +185,13 @@ class TestTimeSeriesProfitProb:
         assert time_series_profit_prob(0.30, 0.60) == 1.0
 
     def test_discount_constant_value_and_range(self):
-        # The user's conservative choice ("prices converge by 25%") — pinned so
-        # a silent retune is visible in review; must stay inside [0, 1]
-        assert TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
-        assert 0.0 <= TIME_SERIES_INTERVAL_PROB_DISCOUNT <= 1.0
+        # The operator's choice ("prices converge by 20%"; 0.75 until the
+        # 2026-09-27 decision) — pinned so a silent retune is visible in
+        # review; must stay inside (0, 1], the range LiveSettings accepts
+        assert config.TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.80
+        assert 0.0 < config.TIME_SERIES_INTERVAL_PROB_DISCOUNT <= 1.0
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_explicit_k_overrides_the_constant(self):
         # The backtester's calibration sweep passes one k per simulation; the
         # override must win over the config constant — 1 - 0.50 * 0.30 = 0.85 —
@@ -450,8 +466,9 @@ class TestMaxAffordablePairs:
 
     def test_defaults_to_budget_fraction(self):
         assert (max_affordable_pairs(100_000, 0.50)
-                == max_affordable_pairs(100_000, 0.50, BUDGET_FRACTION))
+                == max_affordable_pairs(100_000, 0.50, config.BUDGET_FRACTION))
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_fraction_default_resolves_at_call_time(self, monkeypatch):
         # Bound as a default argument this would freeze at import time, so a
         # test (or an operator edit) of the constant would silently not apply —
@@ -665,15 +682,23 @@ class TestLiveSettings:
             _settings().size_cap = 1.0
 
     def test_live_settings_reads_config_at_call_time(self, monkeypatch):
-        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 0.5))
-        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.8)
-        monkeypatch.setattr(config, "BUDGET_FRACTION", 1.0)
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.2)
+        # Every value differs from what config.py ships, so the test cannot
+        # pass on a read of the shipped constants (tier_floors is a bool, so it
+        # can differ from only one of the values before and after the
+        # 2026-09-27 flip; every other field differs from both)
+        shipped = live_settings()
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.6))
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.6)
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
+        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.25)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics",))
         monkeypatch.setattr(config, "TRADE_TAGS", ["Oil & Gas"])
-        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2,
-                                            ("Economics",), ("Oil & Gas",))
+        expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
+                             ("Economics",), ("Oil & Gas",))
+        assert live_settings() == expected
+        assert all(getattr(expected, f.name) != getattr(shipped, f.name)
+                   for f in dataclasses.fields(LiveSettings))
 
     def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
@@ -1155,3 +1180,273 @@ class TestLiveRuleWarnings:
         monkeypatch.setattr(config, "LIVE_EXPOSURE_WARN_FRACTION", 0.10)
         out = config.live_rule_warnings(_settings())
         assert len(out) == 2 and all("above the 10%" in text for text in out)
+
+
+class TestShippedLiveToggles:
+    """The live toggles config.py ships since the operator decision of
+    2026-09-27 (see the decision record in config.py's live-toggles block):
+    tier floors off, spread band 0-0.5, k 0.80, no per-trade cap, a 20%
+    same-title cap, no category or tag filter. Every test here reads the
+    SHIPPED values — none patches a toggle — so turning one back means
+    re-pinning this class, as each constant's comment says.
+
+    What those values are meant to do, end to end: admit any strictly positive
+    time-series spread up to 0.5 at any gap within the cap, price books up to
+    a leg-price sum of 1.0 with the no-edge levels cut, and keep one pair's
+    stake at or under 20% of the balance — a time-series trade under 1 - k, a
+    same-title one at its own cap — so no live_rule_warnings sentence fires. A
+    default backtest follows k and the two caps but keeps its own primary
+    (band 0-1, tier floors on), and says it departs from the live rule."""
+
+    _SHIPPED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                            size_cap=1.0, same_title_size_cap=0.2, categories=None, tags=None)
+    # The rule before the flip, for the controls
+    _BEFORE = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                           size_cap=0.2, same_title_size_cap=1.0)
+
+    def test_the_shipped_settings(self):
+        assert live_settings() == self._SHIPPED
+        assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
+                config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
+                config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None)
+
+    def test_the_finder_admits_any_positive_spread_up_to_the_ceiling(self, caplog):
+        # 0.10 at 10 days and 0.20 at 20 days: both under their old tier (0.15,
+        # 0.30), both admitted now; 0.55 is over the 0.5 ceiling and refused,
+        # on its own counted line
+        def scan(gap, pA, pB, settings=None):
+            mA, mB = _ts._ts_pair_markets(gap_days=gap, pA=pA, pB=pB)
+            return scanner.find_time_series_pairs(MagicMock(), held_tickers=set(),
+                                                  markets=[mA, mB], settings=settings)
+
+        for gap, pA, pB in ((10, 0.30, 0.40), (20, 0.30, 0.50)):
+            [pair] = scan(gap, pA, pB)
+            assert pair.pB - pair.pA == pytest.approx(pB - pA)
+            # Control: the rule before the flip refused it at its tier
+            assert scan(gap, pA, pB, settings=self._BEFORE) == []
+        with caplog.at_level(logging.INFO):
+            assert scan(10, 0.30, 0.85) == []
+        assert ("Time-series candidates refused above the spread band's 0.5 ceiling "
+                "(pB - pA; before the one-best-per-group contest): 1") in caplog.text
+        # Control: before the flip there was no ceiling
+        assert len(scan(10, 0.30, 0.85, settings=self._BEFORE)) == 1
+
+    def test_the_price_sum_ceiling_is_one_and_the_fee_cut_is_live(self):
+        # The fixture of tests/test_scanner.py::TestEnrichmentSpreadRule::
+        # test_levels_are_cut_at_the_first_with_no_edge_after_the_fee, at the
+        # SHIPPED settings: its second level (0.53 + 0.45 = 0.98) sits inside
+        # the 1.0 ceiling with a 0.02 edge under its fee, so it is cut, and the
+        # sizer buys exactly the 100 contracts of the first
+        pair = _ts._ts_candidate(gap_days=10, pA=0.30, pB=0.56, nB=0.45)
+        assert scanner._pair_max_sum(pair, live_settings()) == 1.0
+        [enriched] = scanner.enrich_with_orderbook_prices(
+            _ts.TestEnrichmentSpreadRule._adversary_client(), [pair], 1_000_000)
+        assert enriched.tradeable is True
+        assert enriched.depth_levels == (pytest.approx((0.30, 0.45, 100.0)),)
+        spec = compute_trade(enriched, 1_000_000)
+        assert spec is not None and spec.x == 100
+        # Before the flip the 0.85 ceiling excluded that level on its own
+        assert scanner._pair_max_sum(pair, self._BEFORE) == pytest.approx(0.85)
+
+    def test_the_same_title_reference_pair_is_capped_at_20_percent(self):
+        # nA 0.20 + pB 0.30: an uncapped f* of ~0.8945, with no per-trade cap
+        # left to bind it — SAME_TITLE_SIZE_CAP does
+        fee = fee_per_pair_approx(0.20, 0.30)
+        net = 0.50 - fee
+        f_star = config.SAME_TITLE_CO_RESOLVE_PROB - (
+            1 - config.SAME_TITLE_CO_RESOLVE_PROB) * (0.50 + fee) / net
+        assert f_star == pytest.approx(0.8945, abs=1e-4)
+        pair = MagicMock()
+        pair.pA, pair.pB, pair.nA, pair.nB = 0.70, 0.30, 0.20, 0.70
+        pair.pair_type, pair.tradeable, pair.max_contracts = "same_title", True, 0
+        pair.canonical_title = "same-title reference pair"
+        pair.market_a.close_time = pair.market_b.close_time = (
+            datetime.now(UTC) + timedelta(days=15))
+        spec = compute_trade(pair, 1_000_000)
+        assert spec is not None
+        assert spec.kelly_fraction == pytest.approx(0.20)
+        assert spec.total_cost_with_fees <= 10_000.0 * 0.20 + 1e-9
+        assert max_kelly_fraction("same_title", live_settings()) == 0.2
+
+    def test_every_time_series_spec_stakes_under_20_percent(self):
+        # No per-trade cap: what bounds a time-series trade is 1 - k = 0.20
+        # (max_kelly_fraction), on every uncrossed book — the reference YES ask
+        # at or above the later market's own YES bid
+        assert max_kelly_fraction("time_series", live_settings()) == 0.2
+        now = datetime.now(UTC)
+        sized = 0
+        for pA in (0.01, 0.05, 0.10, 0.20, 0.30, 0.40):
+            for nB in (0.05, 0.15, 0.30, 0.45):
+                for extra in (0.0, 0.02, 0.10):
+                    pB = round(1.0 - nB + extra, 2)
+                    if pB >= 1.0 or pB - pA > 0.5:
+                        continue
+                    pair = MagicMock()
+                    pair.pA, pair.pB, pair.nA, pair.nB = pA, pB, 1 - pA, nB
+                    pair.pair_type, pair.tradeable, pair.max_contracts = "time_series", True, 0
+                    pair.canonical_title = f"ts {pA}/{pB}/{nB}"
+                    pair.market_a.close_time = now + timedelta(days=5)
+                    pair.market_b.close_time = now + timedelta(days=15)
+                    spec = compute_trade(pair, 1_000_000)
+                    if spec is None:
+                        continue
+                    sized += 1
+                    assert spec.kelly_fraction < 0.2, (pA, pB, nB, spec.kelly_fraction)
+        assert sized > 0
+
+    def test_no_live_rule_warning_fires(self):
+        assert config.live_rule_warnings(live_settings()) == []
+
+    def test_a_default_backtest_departs_from_the_live_rule(self, monkeypatch, caplog):
+        # The backtester binds k and both caps, so its primary follows them;
+        # its band (0, 1) and tier floors (on) are its own, so the live rule
+        # is a cell of its grid rather than its primary, and the run's last
+        # line says so. The golden fixture's band sweep, narrowed to four bands
+        # (floors 0 and 0.35, ceilings 0.5 and 1) and the primary k alone
+        golden = _tb.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        with caplog.at_level(logging.INFO):
+            res = backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), golden._START, 10_000.0, sweep=False,
+                band_sweep=True, tier_off_sweep=True)
+        primary = res.primary
+        assert (primary.k, primary.size_cap, primary.spread_band, primary.tier_floors) == (
+            0.8, 1.0, (0.0, 1.0), True)
+        assert res.same_title_size_cap == 0.2
+        assert (res.live_tier_floors, res.live_spread_band) == (False, (0.0, 0.5))
+        rule = config.describe_time_series_rule(False, (0.0, 0.5))
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Live time-series rule (config.py):")]
+        assert lines == [
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0-1); its grid simulated the live rule as band 0-0.5 "
+            "with the tier floors off, which the dashboard's filter bar shows"]
+
+    def test_validate_re_checks_the_edge_after_the_fee(self, caplog):
+        # With the tier floors off the price-sum ceiling is 1.0, so the fee cut
+        # is validate_pair_price's one re-check of the edge before submission.
+        # A thin-edge spec — pA 0.01 / pB 0.03 / nB 0.97 on $10,000: n = 748,
+        # FoK caps 0.02 / 0.98 — whose book then moves a tick against both
+        # legs would fill at 0.02 + 0.98, where every settlement cell loses;
+        # it is dropped instead
+        balance = 1_000_000
+        pair = _ts._ts_candidate(gap_days=10, pA=0.01, pB=0.03, nB=0.97)
+        sized_on = _ts._ts_orderbook_client(pA_fill=0.01, nB_fill=0.97, qty=5000, pB_ref=0.03)
+        [enriched] = scanner.enrich_with_orderbook_prices(sized_on, [pair], balance)
+        spec = compute_trade(enriched, balance)
+        assert spec is not None and spec.x == 748
+        n, fill_a, fill_b = spec.x, 0.02, 0.98
+        assert n * (1 - fill_a - fill_b) - fee_leg_exact(n, fill_a) - fee_leg_exact(n, fill_b) < 0
+        moved = _ts._ts_orderbook_client(pA_fill=0.02, nB_fill=0.98, qty=5000, pB_ref=0.03)
+        with caplog.at_level(logging.INFO):
+            assert scanner.validate_pair_price(moved, spec) is False
+        assert "keeps an edge after the fee" in caplog.text
+        # Control: the book it was sized on still passes
+        assert scanner.validate_pair_price(sized_on, spec) is True
+
+    # The 2026-09-27 evidence stands, one identical block, in the decision
+    # record and in each of the five flipped toggles' comments
+    _EVIDENCE_START = "# >>> 2026-09-27 evidence, verbatim."
+    _EVIDENCE_END = "# <<< end of the 2026-09-27 evidence"
+    _FLIPPED = ("BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP", "TIME_SERIES_INTERVAL_PROB_DISCOUNT",
+                "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND")
+
+    def test_every_flipped_toggle_carries_the_same_evidence(self):
+        lines = pathlib.Path(config.__file__).read_text().splitlines()
+        starts = [i for i, line in enumerate(lines) if line.startswith(self._EVIDENCE_START)]
+        blocks = [lines[i:lines.index(self._EVIDENCE_END, i) + 1] for i in starts]
+        assert len(blocks) == 6
+        # Verbatim: six copies of ONE text, so no copy can drift from the rest
+        assert len({"\n".join(block) for block in blocks}) == 1
+        # Five end right above a flipped toggle's assignment, the sixth in the
+        # decision record
+        ends = {starts[n] + len(block) - 1 for n, block in enumerate(blocks)}
+        for name in self._FLIPPED:
+            [at] = [i for i, line in enumerate(lines) if re.match(rf"{name}\s*=", line)]
+            assert at - 1 in ends, name
+        record = next(i for i, line in enumerate(lines)
+                      if line.startswith("# ── The 2026-09-27 decision record"))
+        [record_end] = [i for i, line in enumerate(lines)
+                        if re.match(r"TIME_SERIES_TIER_FLOORS\s*=", line)]
+        # The record's own block, then the tier floors' (the next toggle)
+        assert len([i for i in starts if record < i < record_end]) == 2
+        # What the record must say, verbatim, with its sources
+        text = " ".join(" ".join(line.lstrip("#").split()) for line in blocks[0])
+        for fragment in (
+                "Source: backtest_dashboard.html, built 2026-09-26 21:05; corpus assembled "
+                "2026-09-25 11:06 UTC; 365 days from 2025-09-24, ladders on",
+                "band 0-0.5, tier floors off, k 0.80, cap 20%",
+                "All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%",
+                "the adjacent band 0-0.6, with the same other settings, returns -49.9%",
+                "this cell ranks 53rd of 468",
+                "This cell is a proxy, not a replay",
+                "Source: .git/live-toggles/v0/report.md",
+                "tiers off, band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, "
+                "enrichment or fills modelled",
+                "Backtest-mode reproduction: 33 trades, +78.4%, max drawdown -9.3%",
+                "Live-contest replay: 77 trades (74 ladders + 3 same-title), +50.8%, max "
+                "drawdown -28.4% against a -20% stop limit, H1 +19.8% / H2 +30.5%, "
+                "ex-top-event +26.3%, 24 extra entries beyond one per group",
+                "(KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on drawdown.",
+                "The anchor finding, confirmed by an independent re-run",
+                "09:00 host-local (16:00/17:00 UTC)",
+                "Anchored at 09:00 PT the backtest-mode cell returns +26.3% with a -24.2% max "
+                "drawdown (not +78.4% / -9.3%) and the live replay -8.7% / -24.8%; across 13 "
+                "anchors the live-replay return spans -56% to +51%",
+                "the dashboard's scenario evidence for this rule is anchor-fragile",
+                "Operator decision of 2026-09-27: ship these defaults despite V0's STOP and "
+                "the anchor finding.",
+                "The no-cap default's time-series safety holds because f* < 1 - k; a lower k "
+                "raises that bound, and live_rule_warnings says so."):
+            assert fragment in text, fragment
+
+
+class TestPreToggleDefaults:
+    """tests/conftest.py's apply_pre_toggle_defaults is the ONE definition of
+    the live toggles as they stood before the 2026-09-27 flip, and it must
+    move every binding of them together: config's constants, which
+    live_settings() reads at call time, AND every copy a package module binds
+    by value at import. The binders are found by walking the package's
+    imports, so a new one is caught rather than silently left at the shipped
+    value."""
+
+    _TOGGLES = frozenset({
+        "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
+        "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
+        "TRADE_CATEGORIES", "TRADE_TAGS"})
+
+    @classmethod
+    def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
+        """(module, bound name, toggle) for every `from X import <toggle>` in
+        directory's modules."""
+        found = []
+        for path in sorted(directory.glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom):
+                    found += [(path.stem, alias.asname or alias.name, alias.name)
+                              for alias in node.names if alias.name in cls._TOGGLES]
+        return found
+
+    def test_every_package_binder_reads_the_pre_flip_value(self, monkeypatch):
+        binders = self._by_value_binders(pathlib.Path(config.__file__).parent)
+        # Not vacuous: the four known binders are among them
+        assert {("backtester", "BUDGET_FRACTION"), ("backtester", "SAME_TITLE_SIZE_CAP"),
+                ("backtester", "TIME_SERIES_INTERVAL_PROB_DISCOUNT"),
+                ("backtest", "TIME_SERIES_INTERVAL_PROB_DISCOUNT")} <= {
+            (module, toggle) for module, _, toggle in binders}
+        apply_pre_toggle_defaults(monkeypatch)
+        assert live_settings() == LiveSettings(
+            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
+            same_title_size_cap=1.0, categories=None, tags=None)
+        for module, bound, toggle in binders:
+            assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
+                getattr(config, toggle)), (module, toggle)
+
+    def test_no_test_module_binds_a_toggle_by_value(self):
+        # A test reads config.X (or the module's own binding) at run time, or
+        # states the literal: a by-value import would freeze the shipped value
+        # past every patch
+        assert self._by_value_binders(pathlib.Path(__file__).parent) == []

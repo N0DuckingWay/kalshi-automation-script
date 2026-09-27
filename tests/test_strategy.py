@@ -18,7 +18,6 @@ import pytest
 
 from kalshi_betting import backtester, config, dashboard, scanner, strategy
 from kalshi_betting.config import (
-    BUDGET_FRACTION,
     SAME_TITLE_CO_RESOLVE_PROB,
     LiveSettings,
     fee_leg_exact,
@@ -166,10 +165,12 @@ def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
     return p - (1.0 - p) / b
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyP:
     """Probability-of-profit models: the discounted market gap for time-series
     (config.time_series_profit_prob) and the fixed co-resolution prior for
-    same-title."""
+    same-title. Priced at k 0.75, config.py's value before the 2026-09-27
+    flip (conftest's pre_toggle_defaults), which the figures were derived at."""
 
     def test_time_series_discounted_gap_model(self):
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
@@ -194,7 +195,12 @@ class TestKellyP:
         assert _kelly_p(pair_high, live_settings()) == _kelly_p(pair_low, live_settings())
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTrade:
+    """compute_trade's gates and caps under config.py's live toggles as they
+    stood before the 2026-09-27 flip (conftest's pre_toggle_defaults): a 20%
+    per-trade cap for every pair, no extra same-title cap, k 0.75."""
+
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
         assert compute_trade(pair, 100_000) is None
@@ -237,7 +243,7 @@ class TestComputeTrade:
         pair = make_pair(nA=0.01, pB=0.01)  # very cheap pair, massive edge
         result = compute_trade(pair, 1_000_000)
         assert result is not None
-        assert result.kelly_fraction <= BUDGET_FRACTION + 1e-9
+        assert result.kelly_fraction <= config.BUDGET_FRACTION + 1e-9
 
     def test_respects_max_contracts_limit(self):
         pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title", max_contracts=2)
@@ -312,12 +318,15 @@ class TestComputeTrade:
         assert result.total_cost_with_fees <= budget_dollars + 1e-9
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTradeTimeSeries:
     """The plan's flow-through fixture through compute_trade: YES on the
     earlier contract at 0.30 and NO on the later at 0.40 (later YES ask 0.60),
     $10,000 balance. Every expectation is derived from the config helpers in
     the test, not hardcoded, except the contract count and the dollar figures
-    the plan pins."""
+    the plan pins. Sized under config.py's toggles as they stood before the
+    2026-09-27 flip (conftest's pre_toggle_defaults: k 0.75, a 20% cap), which
+    those figures were derived at."""
 
     @staticmethod
     def _pair(**overrides) -> MagicMock:
@@ -348,7 +357,7 @@ class TestComputeTradeTimeSeries:
         # (0.1884 under the pre-DR-62 fee-less Kelly denominator; the gate is
         # strictly tighter now, so every size is the same or smaller.)
         assert expected_f == pytest.approx(0.1620, abs=1e-4)
-        assert expected_f < BUDGET_FRACTION
+        assert expected_f < config.BUDGET_FRACTION
         assert result.kelly_fraction == pytest.approx(expected_f)
 
     def test_flow_through_dollar_figures(self):
@@ -385,10 +394,10 @@ class TestComputeTradeTimeSeries:
         # The gap had to widen from 0.40 to 0.55 with the fee-inclusive Kelly
         # denominator (DR-62): at the old 0.30 → 0.70 / 0.30 fixture f* is now
         # 0.1905, just under the cap, so the cap no longer binds there.
-        assert _ts_kelly_fraction(0.30, 0.85, 0.15) > BUDGET_FRACTION
+        assert _ts_kelly_fraction(0.30, 0.85, 0.15) > config.BUDGET_FRACTION
         result = compute_trade(self._pair(pB=0.85, nB=0.15), 1_000_000)
         assert result is not None
-        assert result.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert result.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
 
     def test_respects_depth_cap(self):
         result = compute_trade(self._pair(max_contracts=100), 1_000_000)
@@ -408,17 +417,22 @@ class TestComputeTradeTimeSeries:
 
 
 def _live(k: float = 0.75, cap: float = 0.20, st_cap: float = 1.0) -> LiveSettings:
-    """A LiveSettings at the given k and caps, today's entry rule otherwise."""
+    """A LiveSettings at the given k and caps, with the tier floors on and no
+    band otherwise; the defaults are config.py's values before the 2026-09-27
+    flip."""
     return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
                         size_cap=cap, same_title_size_cap=st_cap)
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTradeSettings:
     """compute_trade reads k and both per-pair caps from ONE LiveSettings,
     hands it to every internal helper, and resolves config.py's only when
     handed none. The two reference pairs: same-title nA 0.20 + pB 0.30, whose
     uncapped f* is ~0.8945, and the wide time-series pair 0.30 -> 0.85 with a
-    0.15 NO ask, whose f* at k 0.75 is ~0.216."""
+    0.15 NO ask, whose f* at k 0.75 is ~0.216. config.py is pinned to its
+    toggles before the 2026-09-27 flip (conftest's pre_toggle_defaults), so
+    "the default" below is a 20% cap for every pair and k 0.75."""
 
     _ST = {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"}
     _TS_WIDE = {"pA": 0.30, "pB": 0.85, "nA": 0.70, "nB": 0.15, "pair_type": "time_series"}
@@ -437,7 +451,7 @@ class TestComputeTradeSettings:
     def test_an_explicit_cap_binds_where_the_default_would(self):
         st = make_pair(**self._ST)
         default = compute_trade(st, 1_000_000)
-        assert default.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert default.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
         wider = compute_trade(st, 1_000_000, settings=_live(cap=0.35))
         assert wider.kelly_fraction == pytest.approx(0.35)
         assert wider.x > default.x
@@ -627,8 +641,10 @@ class TestMarginalFillPricing:
                 assert spec.x <= pair.max_contracts
 
     def test_small_balance_pays_the_best_level(self):
-        # $30 * 20% = $6.00 at 0.70 a pair -> 8 pairs, well inside the 20 resting
-        # at the top rung, so the fill is the best level outright.
+        # At most $30 * 20% = $6.00 (the per-trade cap before the 2026-09-27
+        # flip; under 1 - k = 0.20 at the k shipped since) at 0.70 a pair ->
+        # 8 pairs, well inside the 20 resting at the top rung, so the fill is
+        # the best level outright.
         spec = compute_trade(make_booked_pair(self.LEVELS), 3_000)
         assert spec is not None
         assert spec.x <= 20
@@ -741,9 +757,11 @@ class TestTimeSeriesKellyParity:
         assert live is not None
         assert live.kelly_fraction == pytest.approx(dash)
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_dashboard_fraction_uses_leg_prices_not_nA_pB(self):
         # On this fixture nA + pB = 1.30 — the old leg mapping would return 0.0
-        # (no spread), not the ~0.1620 the live sizer computes
+        # (no spread), not the ~0.1620 the live sizer computes at k 0.75
+        # (config.py's k before the 2026-09-27 flip; pre_toggle_defaults)
         assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
     def test_dashboard_same_title_unchanged(self):
@@ -1418,7 +1436,7 @@ def _fee_shrunk_n(kelly_f: float, price_a: float, price_b: float, balance: float
     """compute_trade's budget-to-contracts step (capped Kelly budget, then the
     exact-fee shrink loop), so a test can size the SAME pair under a different
     Kelly fraction and compare the two counts."""
-    budget = balance * min(BUDGET_FRACTION, kelly_f)
+    budget = balance * min(config.BUDGET_FRACTION, kelly_f)
     n = int(budget / (price_a + price_b))
     fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
     while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget:
@@ -1460,6 +1478,7 @@ def _backtester_kelly_fraction(pA: float, pB: float, nA: float, nB: float) -> fl
     return trades[0].kelly_fraction
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyRiskIncludesFees:
     """Kelly's "b" divides by the dollars actually AT RISK, and the fee is one
     of them: a losing pair loses total_cost_with_fees in full, so the fee-less
@@ -1472,7 +1491,11 @@ class TestKellyRiskIncludesFees:
     charged. fee_per_pair_approx sits below fee_leg_exact, so a spec on the
     boundary can still be EV-negative on its own fields at single-digit n; that
     residual is pinned by test_small_n_can_still_be_ev_negative_on_exact_fees
-    rather than papered over."""
+    rather than papered over.
+
+    Every figure was derived at k 0.75 and a 20% cap for every pair, config.py's
+    values before the 2026-09-27 flip, which conftest's pre_toggle_defaults
+    restores for each test."""
 
     def test_the_headline_fixture_is_rejected(self):
         # THE pin. Accepted before DR-62, rejected now.
@@ -1542,7 +1565,7 @@ class TestKellyRiskIncludesFees:
         spec = compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"), 1_000_000)
         assert spec is not None
         # Both readings are far above the cap, so the sizing is byte-identical
-        assert spec.kelly_fraction == pytest.approx(BUDGET_FRACTION)
+        assert spec.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
         # ...and a same-title pair with no spread is still rejected either way
         assert compute_trade(make_pair(nA=0.60, pB=0.50, pair_type="same_title"),
                              1_000_000) is None
@@ -1906,7 +1929,7 @@ class TestReachableDepthSizing:
         forced = strategy._Sizing(
             n=1600, target=1600, price_a=price_a, price_b=price_b,
             p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
-            kelly_fraction=BUDGET_FRACTION, budget_dollars=940.0,
+            kelly_fraction=0.20, budget_dollars=940.0,
         )
         monkeypatch.setattr(strategy, "_solve_marginal_size",
                             lambda *a, **k: forced)

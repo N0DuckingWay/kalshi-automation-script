@@ -98,6 +98,8 @@ from kalshi_betting.config import (
 from kalshi_betting.historical import infer_category
 from kalshi_betting.reporter import TradeResult
 
+from .conftest import apply_pre_toggle_defaults
+
 
 def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
     """Minimal stand-in for a CandidatePair — only the attributes
@@ -181,8 +183,13 @@ class TestComputeTradeSpecs:
 
 class TestNoPairsMsg:
     def test_no_pairs_log_lines_format_thresholds_from_config(self):
-        prod_msg = main._no_pairs_msg()
-        dev_msg = main._no_pairs_msg(sandbox=True)
+        # The tier thresholds appear only in a tier-on rule's wording, so the
+        # run is handed one explicitly: config.py ships the tier floors off
+        # since 2026-09-27 (test_no_settings_reads_config_at_call_time covers
+        # the settings=None path)
+        tiers_on = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        prod_msg = main._no_pairs_msg(settings=tiers_on)
+        dev_msg = main._no_pairs_msg(sandbox=True, settings=tiers_on)
 
         for msg in (prod_msg, dev_msg):
             assert f"{MIN_PRICE_DIFF_SHORT_GAP:.0%}" in msg
@@ -219,8 +226,12 @@ class TestNoPairsMsg:
         assert off.endswith(on[on.index(" — or same-title"):])
 
     def test_no_settings_reads_config_at_call_time(self, monkeypatch):
+        # Both directions, so the test cannot pass on whichever value config.py
+        # happens to ship
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
         assert "tier floors off" in main._no_pairs_msg()
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
+        assert "tier floors on" in main._no_pairs_msg()
 
     def test_a_category_or_tag_filter_is_named_only_when_set(self):
         # The filter can empty the list on its own, so the line names it —
@@ -243,15 +254,11 @@ def pinned_config_toggles(monkeypatch):
 
     live_settings() reads them at call time, so these tests state every
     "(config: X)" mark and every departure in fixed terms whatever values
-    config.py ships: tier floors on, no band, k 0.75, a 20% per-trade cap, no
-    extra same-title cap, and no category or tag filter."""
-    monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
-    monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
-    monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
-    monkeypatch.setattr(config, "BUDGET_FRACTION", 0.20)
-    monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
-    monkeypatch.setattr(config, "TRADE_CATEGORIES", None)
-    monkeypatch.setattr(config, "TRADE_TAGS", None)
+    config.py ships: the pre-2026-09-27 values — tier floors on, no band,
+    k 0.75, a 20% per-trade cap, no extra same-title cap, and no category or
+    tag filter. It is conftest's apply_pre_toggle_defaults, the one definition
+    of those values, so the two can never drift apart."""
+    apply_pre_toggle_defaults(monkeypatch)
 
 
 def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
@@ -1657,9 +1664,10 @@ class TestRunDevLiveShapeReplay:
             for r in captured["results"] if r.status == "simulated"
         )
 
-        # Sized against the $1,000 sandbox balance at f* ~ 0.1620 the pair
-        # would buy 231 contracts; the 100-contract book depth caps it, so
-        # x == y == 100. total_cost = 100 x (0.30 + 0.40) = 70.00 and profit
+        # Sized against the $1,000 sandbox balance at the shipped k of 0.80,
+        # f* ~ 0.1061, the pair would buy 151 contracts (231 at f* ~ 0.1620
+        # under k 0.75, config.py's value before the 2026-09-27 flip); the
+        # 100-contract book depth caps it either way, so x == y == 100. total_cost = 100 x (0.30 + 0.40) = 70.00 and profit
         # if won = 100 x (1 - 0.70) - exact fees (1.47 + 1.68) = 26.85.
         ts_result = next(
             r for r in captured["results"]

@@ -4757,6 +4757,42 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
 
+def _levels_with_edge_after_fee(qualifying: list) -> list:
+    """
+    Cut a pair's qualifying levels at the first one with no edge left after
+    the fee.
+
+    The edge after fee, 1 - yes - no - fee_per_pair_approx(yes, no), strictly
+    decreases in both leg prices, and the levels ascend by combined price, so
+    what remains is a contiguous prefix and FoK prefix pricing stays valid. It
+    removes nothing while the price-sum ceiling leaves more edge than any fee
+    (1 - max_sum >= 0.05 > 0.035, the largest fee_per_pair_approx): every
+    same-title pair, and every time-series pair whose entry floor is at least
+    0.035. At a floor of 0 (tier floors off, the shipped default since the
+    operator decision of 2026-09-27) the price-sum ceiling is 1.0, and this cut
+    is the only thing that keeps a level with no edge out of a pair. The one
+    definition: enrichment applies it before pricing (without it, no-edge
+    levels drag the prefix average under the profitability line and drop a
+    pair a Kelly-sized trade profits on — #51 again), and validate_pair_price
+    applies it to the freshly fetched books before counting reachable depth
+    (without it, a book that moved a tick against a thin-edge spec still
+    passes, and the FoK caps' one tick of slippage per leg fills it where every
+    settlement cell loses).
+
+    Args:
+        qualifying (list): (yes_price, no_price, qty) levels in SIDE order,
+            ascending by combined price, already under the price-sum ceiling.
+
+    Returns:
+        list: The longest prefix of those levels whose every level still has an
+            edge after the fee; empty when the first one has none.
+    """
+    return list(itertools.takewhile(
+        lambda lvl: (1.0 - lvl[0] - lvl[1]) > fee_per_pair_approx(lvl[0], lvl[1]),
+        qualifying,
+    ))
+
+
 def enrich_with_orderbook_prices(
     client: Any, pairs: list, balance_cents: int, *,
     settings: LiveSettings | None = None,
@@ -4897,21 +4933,17 @@ def enrich_with_orderbook_prices(
             if yp + np_ <= max_sum + PRICE_EPSILON
         ]
 
-        # Keep only the prefix of levels that still has an edge after the fee.
-        # The edge after fee strictly decreases in both leg prices, and levels
-        # ascend, so this is a contiguous prefix and FoK prefix pricing stays
-        # valid. It changes nothing while the price-sum ceiling leaves more edge
-        # than any fee (1 - max_sum >= 0.05 > 0.035, the largest
+        # Keep only the prefix of levels that still has an edge after the fee
+        # (_levels_with_edge_after_fee, the one definition validate_pair_price
+        # applies too). It changes nothing while the price-sum ceiling leaves
+        # more edge than any fee (1 - max_sum >= 0.05 > 0.035, the largest
         # fee_per_pair_approx): that covers every same-title pair and every
         # time-series pair whose floor is at least 0.035. At a floor of 0 (tier
         # floors off), no-edge levels would otherwise pass the 1.0 ceiling and
         # drag the average below the profitability line, dropping pairs a
         # Kelly-sized trade profits on (#51).
         before = len(qualifying)
-        qualifying = list(itertools.takewhile(
-            lambda lvl: (1.0 - lvl[0] - lvl[1]) > fee_per_pair_approx(lvl[0], lvl[1]),
-            qualifying,
-        ))
+        qualifying = _levels_with_edge_after_fee(qualifying)
         if before and not qualifying:
             logging.info(
                 "No contract pair for '%s' keeps an edge after the fee — skipping",
@@ -5124,8 +5156,12 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     confirm the gap threshold still holds at the required contract depth.
 
     Returns True only if qualifying depth >= spec.x contracts remain at the
-    pair's gap threshold (the run's price-sum ceiling, _pair_max_sum). For a
-    time-series pair it also fails CLOSED when the later market has no YES ask
+    pair's gap threshold (the run's price-sum ceiling, _pair_max_sum), counted
+    only over the levels that still keep an edge after the fee
+    (_levels_with_edge_after_fee, the cut enrichment prices with — the one
+    re-check of the edge left once a floor of 0 makes the ceiling 1.0; a book
+    under the ceiling with no such level is dropped with its own WARNING). For
+    a time-series pair it also fails CLOSED when the later market has no YES ask
     on its book now (nothing prices the in-between mass the trade was sized
     on, exactly as enrichment refuses it), and refuses a spread above the
     band's ceiling on the top of the FRESH book — the quantity enrichment and
@@ -5181,6 +5217,20 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
             "Pre-execution check failed for '%s' — gap no longer qualifies; dropping",
             pair.canonical_title,
         )
+        return False
+
+    # Cut the fresh book at the first level with no edge left after the fee —
+    # the one definition enrichment prices with. At a floor of 0 (tier floors
+    # off) the 1.0 price-sum ceiling above re-checks no edge at all, so without
+    # the cut a book that moved a tick against a thin-edge spec would still
+    # pass, and the FoK caps' tick of slippage per leg would fill it where
+    # every settlement cell loses. Inert while the ceiling leaves more edge than
+    # any fee (every same-title pair, and every tier-on time-series rule).
+    qualifying = _levels_with_edge_after_fee(qualifying)
+    if not qualifying:
+        logging.warning(
+            "Pre-execution check failed for '%s' — no contract pair on the book now "
+            "keeps an edge after the fee; dropping", pair.canonical_title)
         return False
 
     if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:

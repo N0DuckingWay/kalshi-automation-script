@@ -74,7 +74,81 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 # run's one LiveSettings — and main.py --size-cap PCT overrides it for one
 # run. The backtest's primary scenario and its eager points are sized under it
 # too (backtester binds it by value at import; no main.py flag reaches it).
-BUDGET_FRACTION               = 0.20
+#
+# SHIPPED 1.0 — NO PER-TRADE CAP — BY OPERATOR DECISION OF 2026-09-27 (the
+# block below); it was 0.20 until then. What bounds one pair at 1.0:
+#   - a time-series trade sizes under 1 - k (max_kelly_fraction), i.e. under
+#     0.20 at the shipped k of 0.80; live_rule_warnings WARNS on every run whose
+#     bound exceeds LIVE_EXPOSURE_WARN_FRACTION, as a lower k's does.
+#   - a same-title trade sizes at most at SAME_TITLE_SIZE_CAP (0.20) below.
+# So one pair still stakes at most 20% of the balance, as before the flip; what
+# lifting this cap changed is which bound binds, not how large a pair can get.
+# On the 365-day dashboard in the block below, the time-series row is identical
+# at every cap from 20% to 100%, and only same-title moves (+7.7% uncapped vs
+# +4.8% at 20%).
+# To turn it back: set 0.20 here (and re-pin
+# tests/test_config.py::TestShippedLiveToggles), or pass main.py --size-cap 20
+# for one run.
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
+BUDGET_FRACTION               = 1.0
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid; the effective
 # same-title cap is min(BUDGET_FRACTION, SAME_TITLE_SIZE_CAP), and a
@@ -92,7 +166,78 @@ BUDGET_FRACTION               = 0.20
 # through pair_size_cap), so a default backtest sizes same-title as a live run
 # without flags does. 1.0 adds no cap: at 1.0 every pair sizes exactly as it
 # did before this constant existed.
-SAME_TITLE_SIZE_CAP           = 1.0
+#
+# SHIPPED 0.20 BY OPERATOR DECISION OF 2026-09-27 (the block below), together
+# with lifting BUDGET_FRACTION to 1.0 above; it was 1.0 (no extra cap) until
+# then, when BUDGET_FRACTION's 0.20 capped same-title instead. The effective
+# same-title cap is therefore unchanged at 20%: every same-title trade V0
+# replayed sat at it. To turn it back: set 1.0 here (with BUDGET_FRACTION back
+# at 0.20, so same-title stays capped at 20%, and re-pin
+# tests/test_config.py::TestShippedLiveToggles), or pass main.py
+# --same-title-size-cap 100 --size-cap 20 for one run (--same-title-size-cap
+# 100 alone, under the shipped no-cap BUDGET_FRACTION, sizes same-title at
+# full Kelly — about 0.89 on a wide divergence — and live_rule_warnings says
+# so).
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
+SAME_TITLE_SIZE_CAP           = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
 # loop re-prices a pair at each candidate contract count and takes the SMALLER
@@ -124,7 +269,11 @@ SHORT_DEADLINE_GAP_DAYS       = 15
 
 # The BACKTEST's default time-series spread band (floor, ceiling) on pB - pA —
 # (0.0, 1.0) is "no band": the floor is the deadline-gap tier alone and there
-# is no ceiling. It is the backtest's primary band; the LIVE band is
+# is no ceiling. It is the backtest's primary band, simulated with the tier
+# floors on; since the 2026-09-27 decision that primary is no longer the live
+# rule (tier floors off, band 0-0.5), which a default backtest's
+# "Live time-series rule (config.py)" line and the dashboard's "Live rule
+# (config.py)" header line locate in its grid. The LIVE band is
 # TIME_SERIES_SPREAD_BAND below, a separate constant with its own ceiling
 # enforcement (the live-toggles block), which landed in one commit so a band
 # could never go live half-wired. Read ONLY by time_series_spread_band(). No
@@ -269,16 +418,24 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   violations in the archive come from the CROSS-EVENT pairs this finder admits.
 #
 #   Live funnel (2026-09-22 snapshot, 113,303 markets, on which the finder
-#   emits 0 time-series and 0 same-title pairs with the switch off): 3,354
+#   emits 0 time-series and 0 same-title pairs with the switch off), under the
+#   live rule shipped until 2026-09-27 (tier floors on, no band): 3,354
 #   same-event candidates -> 2,840 past the identical-wording check (-502)
 #   and the cumulative-wording one (-12 snapshot) -> 2,774 reading as two
 #   different calendar days (-31 undated, -35 field conflict) -> 350 within
 #   the 30-day stated-gap cap -> 89 past the price tier -> 87
 #   past the pA + nB < $1 guard -> 24 pairs emitted, in 24 events and 23
-#   series, all tradeable.
+#   series, all tradeable. Re-measured 2026-09-27 at the defaults shipped since
+#   (tier floors off, band 0-0.5): the same 350 within the cap, then 110
+#   skipped at the $1 guard and 41 refused above the 0.5 ceiling (a spread
+#   that is not strictly positive is refused uncounted) -> 48 pairs emitted, in
+#   48 events, 47 of them tradeable.
 #
-#   Exposure. strategy.compute_trade + select_portfolio over those 24 pairs at
-#   a $10,000 balance size 17 trades and SELECT 6, deploying $9,803.66 — 98%
+#   Exposure, measured 2026-09-26 at the live toggles then shipped (k 0.75, a
+#   20% BUDGET_FRACTION cap for every pair, tier floors on, no band — the
+#   2026-09-27 decision record below changed all four):
+#   strategy.compute_trade + select_portfolio over those 24 pairs at a $10,000
+#   balance size 17 trades and SELECT 6, deploying $9,803.66 — 98%
 #   of the balance — with an aggregate market-implied EV of -$3,039.94, i.e.
 #   -31% of what is deployed. Every one of the 24 is market-EV-negative, and
 #   NOT because of k: at market prices this structure's EV per contract pair
@@ -291,10 +448,11 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   capital concentrates on the widest spreads, which is Kelly behaving correctly (the haircut is worth
 #   0.25 x (pB - pA) in absolute probability, so a 0.94 spread carries a
 #   23.5-point claimed edge against a 12c stake) — FOUR of the six sit exactly
-#   at the BUDGET_FRACTION cap and a fifth at f* = 0.17, the five together
-#   deploying $9,716.81. BUDGET_FRACTION caps each PAIR, not the portfolio,
-#   and under the MODEL's own probabilities those five lose together 12.7% of
-#   the time IF THE FIVE UNDERLYINGS ARE INDEPENDENT — the figure is the
+#   at the BUDGET_FRACTION cap (then 0.20) and a fifth at f* = 0.17, the five
+#   together deploying $9,716.81. The per-trade cap caps each PAIR, not the
+#   portfolio, and under the MODEL's own probabilities those five lose
+#   together 12.7% of the time IF THE FIVE UNDERLYINGS ARE INDEPENDENT — the
+#   figure is the
 #   PRODUCT of the five marginal loss probabilities, and nothing here models
 #   correlation, which can only raise it (53.5% at market prices, by the same
 #   product). Each loses its full stake in that cell. At the account's real
@@ -313,10 +471,15 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   event with >= 2 dated rungs, the other 184 of which name one day apiece
 #   and so cannot be non-monotone at all; 42 of the 251 same-event GROUPS the
 #   one-best rule actually contests). Those are counts of EVENTS and GROUPS,
-#   not of emitted pairs: on the same snapshot NONE of the 24 emitted pairs
-#   has an intervening rung of its own event priced outside [pA, pB], so the
-#   guard below would have changed nothing on that snapshot — the effect is
-#   latent in the population, not present in that snapshot's selection. An
+#   not of emitted pairs: on the same snapshot, under the rule shipped until
+#   2026-09-27, NONE of the 24 emitted pairs has an intervening rung of its own
+#   event priced outside [pA, pB], so the guard below would have changed
+#   nothing on that snapshot — the effect is latent in the population, not
+#   present in that snapshot's selection. Re-measured 2026-09-27 at the
+#   defaults shipped since, 1 of the 48 emitted pairs has one:
+#   KXHEAVENLYOPEN-27-22NOV26 / -20DEC26, whose -13DEC26 rung quotes a YES ask
+#   of 1.00 against a pB of 0.97 — most likely an empty ask rather than a stale
+#   quote, which was not verified. An
 #   intervening-rung staleness guard is the natural answer and is deliberately
 #   not built here.
 #
@@ -338,10 +501,13 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   only 22 of the extended archive's 1,448 ladder pairs close before 2025, so
 #   both, and the backtest below, largely share one 2025-2026 population (see
 #   backtester._stated_deadline_dict for how an archive corpus differs from the
-#   live ladder population). Live sizing assumes k = 0.75
-#   (TIME_SERIES_INTERVAL_PROB_DISCOUNT), below the k-hat above a 0.60 spread in
-#   both runs, where the capital concentrates, so it sizes those trades on more
-#   edge than was measured. The operator turned the switch on regardless.
+#   live ladder population). Live sizing assumed k = 0.75 at that decision
+#   (TIME_SERIES_INTERVAL_PROB_DISCOUNT's value until 2026-09-27), below the
+#   k-hat above a 0.60 spread in both runs, where the capital concentrates, so
+#   it sized those trades on more edge than was measured. The operator turned
+#   the switch on regardless. (Since the 2026-09-27 decision live sizing reads
+#   k 0.80, still below both, and the live band's 0.5 ceiling refuses every
+#   spread above 0.60 in any case.)
 #
 #   Backtest. The 365-day window from 2025-09-24 (corpus assembled 2026-09-25
 #   11:06 UTC; k 0.75, default band; run 2026-09-26 on main @ ba00633) with
@@ -368,9 +534,11 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # already records at backtester._simulate_at_discount's one-best dedup: the
 # backtest's one-best-per-group winner is the largest entry_monthly_ratio, not
 # the live finder's tradeable-then-largest-gap, so the two paths can replay
-# DIFFERENT rungs of the same ladder (on the 2026-09-22 snapshot the live
-# funnel narrows 87 eligible ladder candidates to 24 emitted, so that contest
-# decides 63 of them). backtest.py's
+# DIFFERENT rungs of the same ladder (on the 2026-09-22 snapshot, under the
+# live rule shipped until 2026-09-27, the live funnel narrows 87 eligible
+# ladder candidates to 24 emitted, so that contest decides 63 of them; at the
+# defaults shipped since, the same snapshot emits 48, and how many eligible
+# candidates that contest narrows was not re-measured). backtest.py's
 # --same-event-ladders / --no-same-event-ladders overrides this constant for
 # ONE run — --no-same-event-ladders replays the rule as it stood before the
 # switch was turned on; scanner.py binds the constant at import, so that
@@ -410,15 +578,18 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # on the LATER one (market_b) — earlier/later by close_time, or by STATED
 # deadline for a same-event ladder (DR-73) — when the later contract's YES ask exceeds the
 # earlier's by at least the run's entry floor (the deadline-gap tier, the
-# spread band's floor, or both — see the live toggles below; the tier alone at
-# today's toggles), and when BOTH legs are worded as
+# spread band's floor, or both — see the live toggles below; since the
+# 2026-09-27 decision the band floor alone, which is 0, so any strictly
+# positive spread clears it, up to the band's 0.5 ceiling; the tier alone
+# before it), and when BOTH legs are worded as
 # cumulative "by <date>" deadlines (scanner.deadline_phrasing) — only then does
 # the earlier deadline's event nest inside the later one's, which is what makes
 # the model below meaningful at all. The market-implied probability
 # that the event first happens BETWEEN the two deadlines is (pB - pA); that is
 # the trade's single loss scenario (earlier NO, later YES). This constant is the
-# fraction of that market-implied in-between mass we believe — 0.75 means "the
-# market overstates it by a quarter; prices will converge by 25%". It is an
+# fraction of that market-implied in-between mass we believe — 0.80 means "the
+# market overstates it by a fifth; prices will converge by 20%" (0.75 — "by a
+# quarter; 25%" — until the 2026-09-27 decision). It is an
 # operator-tunable ESTIMATE, not a measured quantity: at 1.0 (take the market at
 # face value) the Kelly fraction is <= 0 for every candidate and the strategy
 # never fires; smaller values size more aggressively. Measure it against
@@ -430,7 +601,78 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
 # calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
 # calibration (2026-09 follow-up)" for the full mechanism.
-TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
+#
+# SHIPPED 0.80 BY OPERATOR DECISION OF 2026-09-27 (the block below); it was
+# 0.75 until then. k also bounds every time-series trade: f* < 1 - k
+# (max_kelly_fraction), so with BUDGET_FRACTION's per-trade cap lifted (1.0) a
+# time-series trade stakes under 0.20 at k 0.80 (at 0.75, 1 - k = 0.25 exceeds
+# LIVE_EXPOSURE_WARN_FRACTION, and live_rule_warnings WARNS on every run with
+# no per-trade cap). The pooled empirical k-hat at the shipped band with the
+# tier floors off is 0.799 over 545 entries on the 365-day dashboard in the
+# block below. To turn it back: set 0.75 here (with BUDGET_FRACTION back at
+# 0.20, or live_rule_warnings warns on every run; and re-pin
+# tests/test_config.py::TestShippedLiveToggles), or pass main.py
+# --interval-discount 0.75 --size-cap 20 for one run.
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
+TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.80
 
 # Grid of k values backtester.run_backtest_sweep() re-simulates so the dashboard
 # can offer a k selector without a re-run and, on a band sweep, as the scenario
@@ -490,6 +732,96 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 #     live_settings raising
 # Together they ensure an override can never be applied at one site and missed
 # at another.
+#
+# ── The 2026-09-27 decision record ───────────────────────────────────────────
+#
+# Five live toggles were flipped on 2026-09-27, together:
+#   TIME_SERIES_TIER_FLOORS             True        -> False
+#   TIME_SERIES_SPREAD_BAND             (0.0, 1.0)  -> (0.0, 0.5)
+#   TIME_SERIES_INTERVAL_PROB_DISCOUNT  0.75        -> 0.80
+#   BUDGET_FRACTION                     0.20        -> 1.0 (no per-trade cap)
+#   SAME_TITLE_SIZE_CAP                 1.0         -> 0.20
+# TRADE_CATEGORIES and TRADE_TAGS stay None (any). Each constant's own comment
+# says how to turn it back, by an edit here or by main.py's flag for one run.
+# One pair's largest stake is still 20% of the balance: a time-series trade
+# sizes under 1 - k = 0.20 (max_kelly_fraction), a same-title trade at most at
+# SAME_TITLE_SIZE_CAP = 0.20, so live_rule_warnings is empty at these values
+# (pinned by tests/test_config.py::TestShippedLiveToggles). A default BACKTEST
+# follows k and the two caps (backtester binds them) but keeps its own primary
+# band (0, 1) with the tier floors on, so its primary is no longer the live
+# rule; its "Live time-series rule (config.py)" log line and the dashboard's
+# "Live rule (config.py)" header line name the filter-bar cell that is.
+#
+# With the tier floors off the leg-price-sum ceiling is 1.0, so the one live
+# re-check of a pair's edge after the fee is the cut at the first level with
+# none (scanner._levels_with_edge_after_fee): enrichment prices with it, and
+# validate_pair_price applies it to the freshly fetched books, so a book that
+# moved a tick against a thin-edge spec is dropped before submission rather
+# than filled where every settlement cell loses. Known residual: a book that
+# moves AFTER validate_pair_price can still fill within the FoK caps' one tick
+# of slippage per leg, and a spec whose edge is thinner than that then loses in
+# the win cells too (the tier-on ceiling's edge of at least 0.15 absorbed it).
+#
+# The evidence the decision was taken against, with its sources:
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
 
 # Whether the live time-series entry rule applies the deadline-gap tier floors
 # (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP).
@@ -500,7 +832,83 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # 1 - floor, exactly as backtester._find_entry applies it. The backtest
 # dashboard's "Tier floors: off" view simulates this rule. main.py
 # --tier-floors / --no-tier-floors overrides it for one run.
-TIME_SERIES_TIER_FLOORS = True
+#
+# SHIPPED False BY OPERATOR DECISION OF 2026-09-27 (the block below); it was
+# True until then. With the band floor at 0, the entry floor is 0 (pB - pA must
+# only be strictly positive) and the order-book leg-price-sum ceiling is 1.0,
+# so the cut at the first level with no edge left after the fee
+# (scanner._levels_with_edge_after_fee, inert while a tier sets the ceiling) is
+# what keeps a level with no edge out of a pair: enrichment prices with it, and
+# validate_pair_price applies it again to the freshly fetched books before it
+# counts reachable depth, so a book that moved a tick against a thin-edge spec
+# is dropped rather than filled where every settlement cell loses. Known
+# residual: a book that moves after validate_pair_price, before submission,
+# can still fill within the FoK caps' one tick of slippage per leg, and on a
+# spec whose edge is thinner than that the win cells then lose too (with the
+# tiers on, the 0.85 / 0.70 ceiling's edge of at least 0.15 absorbed it). To
+# turn it back: set True here (and re-pin
+# tests/test_config.py::TestShippedLiveToggles), or pass main.py --tier-floors
+# for one run.
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
+TIME_SERIES_TIER_FLOORS = False
 
 # The live time-series spread band (floor, ceiling) on pB - pA. It is
 # validated like the backtest's band: 0 <= floor < ceiling <= 1. The floor is
@@ -511,7 +919,73 @@ TIME_SERIES_TIER_FLOORS = True
 #   - before submission, on the top of a freshly fetched book.
 # (0.0, 1.0) means no band. main.py --spread-min / --spread-max overrides
 # either bound for one run (the other keeps this file's value).
-TIME_SERIES_SPREAD_BAND = (0.0, 1.0)
+#
+# SHIPPED (0.0, 0.5) BY OPERATOR DECISION OF 2026-09-27 (the block below); it
+# was (0.0, 1.0), no band, until then. The ceiling refuses every time-series
+# pair whose spread pB - pA exceeds 0.5, at scan time, in enrichment and before
+# submission. To turn it back: set (0.0, 1.0) here (and re-pin
+# tests/test_config.py::TestShippedLiveToggles), or pass main.py --spread-max 1
+# for one run (the floor is already 0).
+#
+# >>> 2026-09-27 evidence, verbatim. The same block stands in the decision
+# >>> record and in each of the five flipped toggles' comments (pinned
+# >>> identical by tests/test_config.py::TestShippedLiveToggles).
+#
+# (1) The 365-day backtest dashboard. Source: backtest_dashboard.html, built
+#     2026-09-26 21:05; corpus assembled 2026-09-25 11:06 UTC; 365 days from
+#     2025-09-24, ladders on. At k 0.80, time-series never reaches 20%, and
+#     same-title is capped at 20%, so the live rule after the flip equals this
+#     page's cell: band 0-0.5, tier floors off, k 0.80, cap 20%.
+#       All: 33 trades, 87.9% won, +78.4% ($17,839.77), max drawdown -9.3%,
+#         Sharpe 2.24, H1 / H2 +12.4% / +52.4%, ex-top event +62.1%.
+#       Time-series (all ladders; 0 cross-event): 30 trades, 86.7% won,
+#         +71.2%, max drawdown -9.3%, Sharpe 2.16, H1 / H2 +12.4% / +46.1%,
+#         ex-top event +55.6%.
+#       Same-title (20% cap): 3 trades, 100% won, +4.8%, max drawdown -1.9%,
+#         Sharpe 0.69.
+#     Pooled k-hat at this band with the tiers off is 0.799 over 545 entries:
+#     0.45 at 0-7 days, 0.996 at 8-15, 0.994 at 16-30. The size cap only
+#     affects same-title: the time-series row is identical at every cap from
+#     20% to 100%, and same-title is +7.7% uncapped vs +4.8% at 20%.
+#     Fragility, reported rather than re-argued: the adjacent band 0-0.6, with
+#     the same other settings, returns -49.9% (33 time-series trades), and it
+#     is negative at every k from 0.40 to 0.90; band 0-1 with the tiers off
+#     returns +68.1%; 28.2% of tier-off cells are positive; the split-half
+#     Spearman is -0.057; this cell ranks 53rd of 468. The live rule before
+#     the flip returns +111.8% on the same run, and that rests on one event:
+#     -92.8% without it, with a -82.2% max drawdown. This cell is a proxy, not
+#     a replay: the backtest keeps one pair per group for the whole window,
+#     ranked by monthly return after Kelly, and enters a pair only on its first
+#     qualifying Monday; live keeps one per group per weekly run, ranked by the
+#     widest spread before Kelly, and a held ticker is excluded, so a later run
+#     can stack further rungs of one ladder.
+#
+# (2) V0. Source: .git/live-toggles/v0/report.md — a weekly live-contest replay
+#     of this rule at the backtest's Monday 09:00 UTC checkpoint (tiers off,
+#     band 0-0.5, k 0.80, cap 0.20, ladders on, $10,000; no depth, enrichment
+#     or fills modelled). Backtest-mode reproduction: 33 trades, +78.4%, max
+#     drawdown -9.3%. Live-contest replay: 77 trades (74 ladders + 3
+#     same-title), +50.8%, max drawdown -28.4% against a -20% stop limit, H1
+#     +19.8% / H2 +30.5%, ex-top-event +26.3%, 24 extra entries beyond one per
+#     group — stacked consecutive ladder rungs lost together
+#     (KXSENATEREC-26MAY, KXMLBRETURN-26DETTSKUBAL29). Verdict: STOP on
+#     drawdown.
+#
+# (3) The anchor finding, confirmed by an independent re-run. The backtest's
+#     entry checkpoint is Monday 09:00 UTC while the scheduler runs Monday
+#     09:00 host-local (16:00/17:00 UTC). Anchored at 09:00 PT the
+#     backtest-mode cell returns +26.3% with a -24.2% max drawdown (not +78.4%
+#     / -9.3%) and the live replay -8.7% / -24.8%; across 13 anchors the
+#     live-replay return spans -56% to +51% — the dashboard's scenario evidence
+#     for this rule is anchor-fragile.
+#
+# (4) Operator decision of 2026-09-27: ship these defaults despite V0's STOP
+#     and the anchor finding.
+#
+# The no-cap default's time-series safety holds because f* < 1 - k; a lower k
+# raises that bound, and live_rule_warnings says so.
+# <<< end of the 2026-09-27 evidence
+TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 
 # Kalshi categories a live pair may trade in ("Economics", "Sports", ...), or
 # None for any. Matching is case-insensitive, against the category the backtest
@@ -556,9 +1030,12 @@ SIZE_CAP_STEP = 0.05
 # live_rule_warnings accepts without a WARNING: a live run whose toggles let
 # one pair of either type size above it (max_kelly_fraction) says so on every
 # run. 20% was the one per-trade cap before the 2026-09-27 toggles, and this
-# file's values stay within it (live_rule_warnings(live_settings()) is empty,
-# pinned by tests/test_config.py::TestLiveRuleWarnings) — so the WARNING fires
-# only when a flag or an edit here lifts a pair's bound. It is not the
+# file's values stay within it — since that decision a time-series pair sizes
+# under 1 - k = 0.20 with no per-trade cap, and a same-title pair at most at
+# SAME_TITLE_SIZE_CAP = 0.20 (live_rule_warnings(live_settings()) is empty,
+# pinned by tests/test_config.py::TestLiveRuleWarnings and
+# ::TestShippedLiveToggles) — so the WARNING fires only when a flag or an edit
+# here lifts a pair's bound (a lower k, or a larger same-title cap). It is not the
 # per-trade cap (BUDGET_FRACTION), whatever values the two hold: it bounds no
 # trade, it only decides when a live run is warned.
 LIVE_EXPOSURE_WARN_FRACTION = 0.20

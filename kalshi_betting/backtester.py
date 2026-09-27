@@ -400,7 +400,9 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
 # candidate also stays under SAME_TITLE_SIZE_CAP at every cap
 # (config.pair_size_cap), so "no cap" means no per-trade cap on time-series
 # pairs and SAME_TITLE_SIZE_CAP on same-title ones — no cap at all while that
-# constant is 1.0. BACKTEST-ONLY: live sizing reads its caps from the run's
+# constant is 1.0, as it was until the 2026-09-27 decision (it ships 0.20
+# since, with config.BUDGET_FRACTION lifted to 1.0, so a default run's own cap
+# is the "no cap" option). BACKTEST-ONLY: live sizing reads its caps from the run's
 # config.LiveSettings (config.BUDGET_FRACTION, config.SAME_TITLE_SIZE_CAP, or
 # main.py's --size-cap / --same-title-size-cap for one run) and strategy.py
 # never imports this module. Rounded to two decimals, so 0.2
@@ -3499,7 +3501,13 @@ def _find_entry(
     back inside the band can still be the entry. The default band,
     config.BACKTEST_DEFAULT_SPREAD_BAND = (0.0, 1.0), is no band at all — a
     floor of 0 is inert under every tier and no spread exceeds 1 — so the
-    default reproduces the live rule. same_title pairs never read the band.
+    default, with the tier floors on, reproduces the tier rule alone: the
+    live rule until the 2026-09-27 decision, not since (the live rule is now
+    config.TIME_SERIES_TIER_FLOORS off with config.TIME_SERIES_SPREAD_BAND
+    0-0.5, config.live_time_series_floor's rule, which a call with
+    spread_band=(0.0, 0.5) and tier_floors=False reproduces — pinned per
+    Monday by tests/test_backtester.py::TestLiveBacktestSpreadParity).
+    same_title pairs never read the band.
 
     tier_floors (BACKTEST-only, like the band) switches the deadline-gap tier
     itself off: the threshold is then the band floor alone, which drives the
@@ -3552,9 +3560,11 @@ def _find_entry(
         tier_floors (bool): Keyword-only, BACKTEST-only. False enters
             time-series pairs at the band floor alone, the deadline-gap tier
             not applied (the band sweep's tier-floors-off family) — still
-            only at a strictly positive spread; True (the default) is the
-            live rule, the tier with the floor layered on it. Ignored by
-            same_title pairs.
+            only at a strictly positive spread; True (the default) layers
+            the floor on the tier — the live rule while
+            config.TIME_SERIES_TIER_FLOORS is True, which it was until the
+            2026-09-27 decision (it ships False since). Ignored by same_title
+            pairs.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -5550,8 +5560,9 @@ def _entries_for_band(
         spread_band (tuple[float, float] | None): BACKTEST-only (floor,
             ceiling) band on the time-series spread pB − pA, handed verbatim
             to every _find_entry() call. None (the default) resolves
-            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band,
-            i.e. the live rule.
+            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band:
+            with the tier floors on, the tier rule alone (the live rule until
+            the 2026-09-27 decision, not since).
         pair_types (tuple[str, ...]): Which pair types to scan — any subset
             of ("time_series", "same_title"). Keyword-only. Defaults to both.
         tier_floors (bool): Keyword-only, BACKTEST-only; handed to every
@@ -5734,7 +5745,10 @@ def _prepare_entries(
     # probability model — so this sweep yields identical entries at every
     # interval discount and is run exactly once, ahead of any sizing. At the
     # default spread band (spread_band=None, which _find_entry resolves to
-    # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band) it is the live rule.
+    # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band), with the tier floors
+    # on, it is the tier rule alone — the live rule until the 2026-09-27
+    # decision, not since (run_backtest_sweep's "Live time-series rule" line
+    # names where a band sweep's grid holds the live rule).
     raw_entries = _entries_for_band(candidates, spread_band=None)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
@@ -7861,7 +7875,11 @@ def run_backtest_sweep(
         spread_band (tuple[float, float] | None): The primary scenario's
             BACKTEST-only time-series spread band (floor, ceiling) on pB − pA.
             None (default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND —
-            (0.0, 1.0), no band, the live rule. Resolved and validated at the
+            (0.0, 1.0), no band: with the tier floors on, the tier rule alone,
+            the live rule until the 2026-09-27 decision and not since (the
+            "Live time-series rule (config.py)" line this function logs last
+            names the live rule and where this run's grid holds it). Resolved
+            and validated at the
             TOP of this function, before anything is logged or fetched, so a
             bad band fails in milliseconds rather than after the fetch.
         band_sweep (bool): When True, also sweep every band of the config

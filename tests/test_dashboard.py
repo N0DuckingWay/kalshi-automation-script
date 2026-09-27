@@ -50,7 +50,6 @@ from kalshi_betting.backtester import (
 )
 from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     fee_leg_exact,
     fee_per_pair_approx,
     time_series_profit_prob,
@@ -144,8 +143,10 @@ class TestKellyFraction:
     """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
     prices time-series pairs through config.time_series_profit_prob."""
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620.
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at
+        # k 0.75 (config.py's k before the 2026-09-27 flip; pre_toggle_defaults).
         # b's denominator carries the fee — the dollars at risk include it,
         # because a losing pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
@@ -194,7 +195,7 @@ class TestKellyFractionIntervalDiscount:
     def test_none_resolves_to_the_config_constant(self):
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB, "time_series") == (
             _kelly_fraction(self._PA, self._NA, self._PB, self._NB, "time_series",
-                            k=TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+                            k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
         )
 
     def test_explicit_k_of_one_clamps_to_zero(self):
@@ -203,8 +204,10 @@ class TestKellyFractionIntervalDiscount:
                                "time_series", k=1.0) == 0.0
 
     def test_explicit_k_wins_over_a_monkeypatched_constant(self, monkeypatch):
-        # The constant is set to the never-trade value; the explicit k must
-        # still produce the configured-k fixture's ~0.1620 fraction.
+        # The constant is set to the never-trade value; the explicit k 0.75
+        # must still produce test_time_series_flow_through_fixture's ~0.1620
+        # fraction (measured at k 0.75, config.py's k before the 2026-09-27
+        # flip).
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
                                "time_series", k=0.75) == pytest.approx(0.1620, abs=1e-4)
@@ -977,7 +980,7 @@ class TestDeploymentIsNotRenderedAsDrawdown:
         assert "+26.6%" in out
 
     def test_per_k_sweep_row_renders_the_same_drawdown(self):
-        point = SweepPoint(k=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+        point = SweepPoint(k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
                            trades=self._trades(), equity_df=self._equity())
         out = _section_interval_discount(
             BacktestSweep(primary=point, points=[point], calibration=None))
@@ -5645,11 +5648,15 @@ class TestFilterKAndCap:
         assert len(late.equity_df) == len(page_curve) + 1          # untouched
         assert seen[0][1]["all"] is on_time                        # nothing to cut
 
+    @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_real_cap_sweep_pages_every_cap_at_its_own_simulation(
             self, monkeypatch, tmp_path):
         # A real run_backtest_sweep over the backtester's golden fixture,
         # narrowed to one band and one k: every cap the page offers is the
-        # scenario a fresh simulation at that cap produces, figure for figure
+        # scenario a fresh simulation at that cap produces, figure for figure.
+        # Run at config.py's toggles before the 2026-09-27 flip (a 20% run
+        # cap, no extra same-title cap; conftest's pre_toggle_defaults), so the
+        # primary sits at the 20% cap the assertions below index by
         golden = _tb.TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
