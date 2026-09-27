@@ -812,9 +812,10 @@ class ScheduledRun:
     The weekly live run's wall-clock time: a weekday, an hour and minute, and an IANA zone.
 
     The scheduler fires at weekday/hour/minute on the host's clock and checks at
-    startup that the host places those fires at instant(d). The zone is resolved
-    only by zone(), never at construction, so importing config needs no tz
-    database. Frozen, so it compares and hashes by value.
+    startup that the host places those fires at instant(d); the backtest enters
+    every trade at instant(d) (backtester._checkpoint_datetime). The zone is
+    resolved only by zone(), never at construction, so importing config needs
+    no tz database. Frozen, so it compares and hashes by value.
 
     Attributes:
         weekday (int): datetime.weekday() of the run, 0 = Monday.
@@ -1005,11 +1006,17 @@ class ScheduledRun:
         return problems
 
 
-# The weekly live run. scheduler.py fires run_job at this weekday, hour and
-# minute on the host's clock, and checks at daemon start that the host's clock
-# places those fires at SCHEDULED_RUN.instant(d): 09:00 America/Los_Angeles is
-# 16:00 UTC under daylight time and 17:00 UTC under standard time. Tests patch
-# scheduler.SCHEDULED_RUN, never config.*.
+# The weekly live run, and the backtest's entry checkpoint (the same instant).
+# scheduler.py fires run_job at this weekday, hour and minute on the host's
+# clock, and checks at daemon start that the host's clock places those fires
+# at SCHEDULED_RUN.instant(d): 09:00 America/Los_Angeles is 16:00 UTC under
+# daylight time and 17:00 UTC under standard time. The backtest opens every
+# trade at instant(d) on each run weekday, so changing this also moves every
+# backtest entry and re-keys the backtest's assembled cache
+# (backtester._prefilter_cache_tag); the backtest refuses a schedule whose
+# instant falls on another date in UTC or whose wall time a clock change skips
+# or repeats (ScheduledRun.date_problems). Tests patch scheduler.SCHEDULED_RUN
+# / backtester.SCHEDULED_RUN, never config.*.
 SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
@@ -1323,50 +1330,40 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # concurrent write against the account.
 TRADER_MAX_WORKERS = 8
 
-# Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
-# passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
-# markets are dropped during assembly instead of being held in memory and
-# written to the assembled cache. The tag is part of that cache's filename
-# (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz since SS-1, and the
-# same stem with .json for the legacy caches still served — the trailing
-# marker is INCLUDE_MVE_MARKETS=False's, DR-57) and of the streamed cache's
-# meta block, so a cache built under one filter can never be served to code
-# expecting another. Because that marker is a bare
-# suffix rather than a delimited field, a tag ending in "_nomve" would collide
-# with the same tag minus the suffix under the other flag setting; harmless
-# while the tag is this single hand-edited constant, worth a delimiter if tags
-# ever become caller-supplied. (A streamed cache would still be refused on
-# such a collision, because its meta block carries the tag and the flag
-# separately; a legacy .json has no meta block to check.)
+# Names the version of backtester._can_ever_enter()'s logic, which
+# backtester._prepare_candidates() passes to
+# historical.fetch_all_settled_markets() as a prefilter so ineligible markets
+# are dropped during assembly instead of being held in memory and written to
+# the assembled cache. The fetch keys that cache by
+# backtester._prefilter_cache_tag(): this literal plus SCHEDULED_RUN's
+# cache_slug(), read when called ("checkpoint-v3-mon0900-America-Los_Angeles"),
+# so the predicate and the tag always name the same schedule and a schedule
+# change re-keys the cache by itself. The tag is part of that cache's filename
+# (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz, and the same stem with
+# .json for a legacy cache — the trailing marker is INCLUDE_MVE_MARKETS=False's,
+# DR-57) and of the streamed cache's meta block, so a cache built under one
+# filter can never be served to code expecting another. Because that marker is
+# a bare suffix rather than a delimited field, a tag ending in "_nomve" would
+# collide with the same tag minus the suffix under the other flag setting;
+# harmless while the tag is built from this literal and a schedule slug, worth
+# a delimiter if tags ever become caller-supplied. (A streamed cache would
+# still be refused on such a collision, because its meta block carries the tag
+# and the flag separately; a legacy .json has no meta block to check.)
 #
-# MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
-# stale prefiltered cache is silently reused and the backtest sees a market set
-# the current predicate would not have produced. Since M9 (P3) half of that is
-# no longer silent: _prepare_candidates re-applies the predicate to every
-# fetched corpus, and a re-check that rejects anything on a corpus assembled
-# under this tag is a WARNING naming this constant
-# (backtester._log_corpus_prefilter) — which catches a TIGHTENED predicate. A
-# LOOSENED one is still invisible, since the records the old predicate dropped
-# are simply absent from the cache.
-#
-# History: "monday-eligibility-v1" read open_time as a DATE, so it kept every
-# market that opened later on the checkpoint Monday itself — 2,192,241 of the
-# 7,274,215 records of the 2026-09-17 window's assembled cache (30.1%, the
-# 2026-09-24 review's M8) and 336,750 of the 570,506 of the 2026-07-13 one
-# (59.0%, streamed for P5). "monday-checkpoint-v2" (P5) compares open_time with
-# the 09:00 UTC checkpoint INSTANT (backtester._can_ever_enter). v2 admits a
-# subset of what v1 admitted (for every real UTC offset) and drops only
-# markets that can never be entered, so the entries a backtest finds over the
-# same settled records are unchanged. The bump ORPHANS every assembled cache
-# written under v1: the name stem changed, so none of them is ever read
-# again, and a rebuild retires only a legacy file of its OWN stem, so none is
-# ever deleted either — remove
-# backtest_cache/settled_markets_*_monday-eligibility-v1.* by hand. The day
-# slices are not keyed by this tag and are unaffected. Every eligible-record
-# count quoted in this repo from before P5 — 7,274,215 and 7,260,952 for the
-# 2026-09-17 window (and its 184,255 groupable), the frontier's 7,190,452 of
-# 9,176,306, 570,506 for 2026-07-13 — was measured under v1.
-SETTLED_PREFILTER_CACHE_TAG = "monday-checkpoint-v2"
+# MUST be bumped whenever _can_ever_enter's logic changes, and whenever
+# CANDLESTICK_PERIOD_INTERVAL_MINUTES changes (the predicate floors each
+# checkpoint onto that candle period, backtester._checkpoint_floor, and the
+# tag does not name it) — otherwise a stale prefiltered cache is served and
+# the backtest sees a market set the current predicate would not have
+# produced. _prepare_candidates re-applies the
+# predicate to every fetched corpus, and a re-check that rejects anything on a
+# corpus assembled under this tag is a WARNING naming this constant
+# (backtester._log_corpus_prefilter), which catches a TIGHTENED predicate; a
+# LOOSENED one is invisible, since the records the old predicate dropped are
+# simply absent from the cache. The day slices are not keyed by this tag.
+# CLAUDE.md's prefilter gotcha keeps the tag's history and the caches each
+# bump orphaned.
+SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 
 # How young an EMPTY assembled settled-market cache must be to still be served
 # (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it
@@ -1565,6 +1562,9 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 # markets regardless of liquidity, which silently zeroed out backtest entries.
 # 60 (hourly) is the finest granularity actually available — period_interval=1
 # (minute) returns HTTP 400.
+# The backtest's eligibility prefilter reads this period too
+# (backtester._checkpoint_floor): changing it requires a
+# SETTLED_PREFILTER_CACHE_TAG bump.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 
 # The most candles /historical/markets/{ticker}/candlesticks serves in ONE

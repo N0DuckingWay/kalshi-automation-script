@@ -37,7 +37,9 @@ Notes:
     The scheduler runs the bot in production mode (--mode prod). For the bot to
     trade, valid prod credentials must be present in secrets.json and the PEM key
     file. To run the scheduler on a different weekday or at a different time,
-    edit config.SCHEDULED_RUN.
+    edit config.SCHEDULED_RUN — it is also the backtest's entry checkpoint
+    (backtester._checkpoint_datetime), so the edit moves every backtest entry
+    and re-keys the backtest's assembled cache.
 
     Log file (C2): the daemon writes to PROJECT_ROOT / "kalshi_scheduler.log"
     (rotating, 5MB x 3), NOT to kalshi_arb.log. kalshi_arb.log belongs to the
@@ -56,7 +58,9 @@ Notes:
     clock places the next _HOST_CLOCK_CHECK_WEEKS fires at
     SCHEDULED_RUN.instant(d), and logs CRITICAL naming the first mismatch (or
     any run date whose wall time the zone skips) otherwise; the daemon fires
-    on the host's clock either way.
+    on the host's clock either way. The backtest enters at
+    SCHEDULED_RUN.instant(d), so on a host that fails the check it no longer
+    replays the runs this daemon fires.
 
     CPython quirk (BS-16, reproduced on this host): subprocess.TimeoutExpired's
     .stdout/.stderr are raw BYTES even when subprocess.run() was called with
@@ -276,7 +280,8 @@ def _host_clock_realises_run(today: date | None = None) -> bool:
     from `today` on, that naive local time as the host converts it to UTC must
     equal SCHEDULED_RUN.instant(d). Three cases are logged CRITICAL:
       - the first date where the host's clock misses instant(d), naming the
-        host's time zone as the thing to fix;
+        host's time zone as the thing to fix (the backtest enters at
+        instant(d), so it then no longer replays this host's runs);
       - each run date before that mismatch whose wall time the schedule's own
         zone skips at a clock change (ScheduledRun.clock_change()), naming the
         schedule as the thing to fix, since no host's clock fires that week's
@@ -349,9 +354,10 @@ def _host_clock_realises_run(today: date | None = None) -> bool:
         d, fired, scheduled = mismatch
         logging.critical(
             "The host's clock does not keep config.SCHEDULED_RUN (%s): on "
-            "%s the daemon fires at %s UTC, not %s UTC. It still fires every "
-            "%s; set the host's time zone to %s, or change "
-            "config.SCHEDULED_RUN.",
+            "%s the daemon fires at %s UTC, not %s UTC, so the backtest, which "
+            "enters at config.SCHEDULED_RUN's instants, no longer replays this "
+            "host's runs. It still fires every %s; set the host's time zone "
+            "to %s, or change config.SCHEDULED_RUN.",
             run.label(), d.isoformat(), f"{fired:%Y-%m-%d %H:%M}",
             f"{scheduled:%Y-%m-%d %H:%M}", _host_clock_label(), run.timezone,
         )

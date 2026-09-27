@@ -1191,6 +1191,9 @@ class TestHostClockCheck:
         [message] = _criticals(caplog)
         assert "on 2026-09-28" in message
         assert "2026-09-28 09:00 UTC, not 2026-09-28 16:00 UTC" in message
+        # The backtest enters at SCHEDULED_RUN's instants, so the operator is
+        # told it no longer replays this host's runs.
+        assert "the backtest" in message and "no longer replays this host's runs" in message
 
     def test_a_host_without_daylight_time_is_flagged_at_the_clock_change(self, caplog):
         # Phoenix keeps UTC-7 all year: it matches Los Angeles until Los Angeles
