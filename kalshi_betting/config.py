@@ -972,10 +972,16 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # any meaningful sense. Verified on a series any reader can re-run, the negation
 # of tests/test_dashboard.py's _RETURNS: sharpe@252 = -2.4820064 vs
 # sharpe@365 = -2.9870951, ratio 1.2035002. At rf != 0 it is not a constant
-# rescale at all, because the per-period hurdle rf/periods_per_year moves too.
+# rescale at all, because the per-period hurdle rf/periods_per_year moves too —
+# and rf is not 0 on a page built with rates (dashboard.generate_dashboard's
+# risk_free): every dashboard ratio then subtracts the 8-week Treasury bill's
+# yield in force on each day (treasury.py, the risk-free block below; rf / 365
+# per calendar day on a strategy curve, rf / 252 per trading day on the ^GSPC
+# row), so the sqrt(365/252) identity holds only for a page built without
+# rates (rf = 0).
 #
-# dashboard._sharpe/_sortino default to the CALENDAR base: four of their five
-# call sites consume _build_equity_curve output, and the single trading-day
+# dashboard._sharpe/_sortino default to the CALENDAR base: every call site but
+# one consumes _build_equity_curve output, and the single trading-day
 # consumer is the external ^GSPC row, which passes TRADING_DAYS_PER_YEAR
 # explicitly. Defaulting to the majority case is the same fail-safe-default
 # rule scanner.leg_sides() and scanner._shard_index() follow — a future

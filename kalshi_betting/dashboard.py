@@ -72,6 +72,8 @@ Dependencies:
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (the header names the bill
+    and the yield field the ratios subtract),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
     and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
     tier-off banner name the tier floors and their deadline-gap bounds from
@@ -79,8 +81,11 @@ Dependencies:
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
-    live sizer computes. Uses plotly, numpy, pandas, and yfinance (all
-    external). Called by backtest.py after run_backtest_sweep() completes.
+    live sizer computes. Imports RiskFreeRates and SOURCE_CACHE from
+    treasury.py: generate_dashboard's risk_free is a RiskFreeRates, whose
+    per-day yields (annual_on) every Sharpe and Sortino subtracts. Uses
+    plotly, numpy, pandas, and yfinance (all external). Called by
+    backtest.py after run_backtest_sweep() completes.
 
 Notes:
     The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
@@ -94,7 +99,27 @@ Notes:
     ^GSPC benchmark row is the one TRADING-day series on the page and is the
     single site that passes TRADING_DAYS_PER_YEAR explicitly. The two must never
     share a factor — at rf = 0 the mismatch is exactly sqrt(365/252) = 1.2035 of
-    magnitude.
+    magnitude (at rf != 0 it is not a constant rescale).
+
+    Every Sharpe and Sortino on the page subtracts the 8-week Treasury bill's
+    auction yield in force on each row's date — _rf_hurdle, over
+    treasury.RiskFreeRates.annual_on, one annual yield per row, subtracted by
+    POSITION (a date-indexed Series would align on the index and turn every
+    ratio into NaN), per period (rf / 365 on a strategy curve, rf / 252 on
+    the ^GSPC row's trading days). The rates come from generate_dashboard's
+    risk_free, which every function and visitor between it and a ratio takes
+    keyword-only and passes on — pinned by
+    tests/test_dashboard.py::TestRiskFreeIsThreaded, since a dropped
+    pass-through would compute that path at 0% with no error. None — what
+    every direct section call and the golden harness pass — subtracts 0%,
+    exactly as before rates existed. Both ratios read 0.0 on a curve that
+    never moves (_varies), which a nonzero rate would otherwise turn into
+    -9.6e16 (Sharpe) and exactly -sqrt(365) (Sortino). The backtester's idle
+    cash earns nothing, so a mostly idle run is now charged the bill's yield
+    on uninvested capital and its ratios can go strongly negative — the
+    honest reading.
+    The header says which rate was subtracted, or that none was
+    (_risk_free_html), on every page.
 
     Every section but the scenario explorer is rendered at the run's primary
     scenario — its primary k (the CLI's --interval-discount, or
@@ -345,6 +370,8 @@ from .config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
+    RISK_FREE_BILL_TERM,
+    RISK_FREE_RATE_FIELD,
     SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
     TRADING_DAYS_PER_YEAR,
@@ -352,13 +379,62 @@ from .config import (
     time_series_profit_prob,
 )
 from .scanner import leg_sides
+from .treasury import SOURCE_CACHE, RiskFreeRates
 
 # The one dashboard file every backtest run writes (and overwrites) in PROJECT_ROOT.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 
-def _sharpe(daily_returns: pd.Series, rf: float = 0.0, *,
+def _varies(returns: pd.Series) -> bool:
+    """
+    Whether a returns series takes more than one value (NaNs ignored).
+
+    The flat-curve guard _sharpe and _sortino both run first. A curve with no
+    trade never moves, and neither ratio is defined on it: at rf = 0 both
+    already returned 0.0 there (a zero standard deviation, no downside), but a
+    nonzero rf turns every flat day into the same small negative excess
+    return, whose float standard deviation can come out ~1e-20 rather than 0
+    (measured: _sharpe -9.6e16 over 300 flat rows at rf = 0.05), and which
+    _sortino reads as exactly -sqrt(periods_per_year).
+
+    Args:
+        returns (pd.Series): Per-period returns.
+
+    Returns:
+        bool: False for a flat, empty or all-NaN series — a curve with no
+            trade, on which neither ratio is defined.
+    """
+    return bool(returns.max() > returns.min())
+
+
+def _rf_hurdle(risk_free: RiskFreeRates | None, dates) -> float | np.ndarray:
+    """
+    The annual risk-free rate a curve's Sharpe and Sortino subtract, row by row.
+
+    Every caller computes it ONCE, from the same frame whose daily_return it
+    passes, and hands it to both ratios. The array is POSITIONAL (element i
+    belongs to row i), which is why _sharpe/_sortino subtract it by position:
+    a date-indexed Series subtracted from a RangeIndex returns Series would
+    align on the index and turn every ratio into NaN.
+
+    Args:
+        risk_free (RiskFreeRates | None): The page's rates (generate_dashboard's
+            risk_free). None — a direct section call, or a caller that supplied
+            none — subtracts nothing, exactly as before rates existed.
+        dates: The curve's dates, one per return row: its "date" column, or
+            the ^GSPC series' trading-day index.
+
+    Returns:
+        float | np.ndarray: 0.0 without rates; else the yield in force on each
+            date (RiskFreeRates.annual_on — zeros when unavailable).
+    """
+    # treasury.RiskFreeRates.annual_on is the one per-day rule: the latest
+    # auction on or before each date, positional, zeros when unavailable
+    return 0.0 if risk_free is None else risk_free.annual_on(dates)
+
+
+def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
             periods_per_year: int = CALENDAR_DAYS_PER_YEAR) -> float:
     """
     Compute the annualized Sharpe ratio from a series of per-period returns.
@@ -377,37 +453,50 @@ def _sharpe(daily_returns: pd.Series, rf: float = 0.0, *,
     sqrt(365/252) = 1.2035 at rf = 0, leaving the sign alone (at rf != 0 it is
     not a constant rescale, since the per-period hurdle moves too).
 
-    The default is the CALENDAR base because four of the five calls to this
-    helper and _sortino in this module consume _build_equity_curve output; the
+    The default is the CALENDAR base because every call to this helper and
+    _sortino in this module but one consumes _build_equity_curve output; the
     single trading-day consumer (_section_benchmark's ^GSPC row) passes
     TRADING_DAYS_PER_YEAR explicitly. The parameter is keyword-only so it can
-    never be passed positionally into `rf`'s slot.
+    never be passed positionally into `rf`'s slot. Every call on the page
+    passes `rf` — _rf_hurdle's per-day yield of the 8-week Treasury bill, or
+    0.0 when the page was given no rates (pinned by
+    tests/test_dashboard.py::TestRiskFreeIsThreaded).
 
     Args:
         daily_returns (pd.Series): Series of per-period fractional returns
             (e.g. 0.01 for 1%).
-        rf (float): Annual hurdle rate (the T-bill "rf" term of the Sharpe
-            formula) as a decimal (e.g. 0.05 for 5%). Defaults to 0.0.
+        rf (float | np.ndarray): Annual hurdle rate as a decimal (0.05 for
+            5%): one value for every period, or one per period, POSITIONALLY
+            aligned with daily_returns (the page passes _rf_hurdle's — the
+            8-week bill's yield in force on each row's date). Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
             positive; not validated, since every value that reaches it is a
-            config constant — three of this helper's four in-module call sites
-            take the CALENDAR_DAYS_PER_YEAR default and the fourth
-            (_section_benchmark's ^GSPC row) passes TRADING_DAYS_PER_YEAR
-            explicitly. Defaults to CALENDAR_DAYS_PER_YEAR (365).
+            config constant — every in-module call site but one takes the
+            CALENDAR_DAYS_PER_YEAR default and the other (_section_benchmark's
+            ^GSPC row) passes TRADING_DAYS_PER_YEAR explicitly. Defaults to
+            CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
-        float: Annualized Sharpe ratio. Returns 0.0 if the standard deviation is zero.
+        float: Annualized Sharpe ratio. 0.0 when daily_returns never varies (a
+            curve with no trade) or the excess return's standard deviation is
+            zero. The first guard matters once rf is nonzero: a flat curve's
+            excess return is then a constant whose float standard deviation
+            can come out ~1e-20 rather than 0 (measured: -9.6e16 over 300 flat
+            rows at rf = 0.05).
 
     Raises:
-        ZeroDivisionError: If `periods_per_year` is 0 (the per-period hurdle
-            divides by it).
+        ValueError: If rf is an array whose length differs from daily_returns
+            (the positional subtraction cannot broadcast).
     """
-    excess = daily_returns - rf / periods_per_year
+    if not _varies(daily_returns):
+        return 0.0
+    # Positional: rf is one scalar or one value per row, never index-aligned
+    excess = daily_returns - np.asarray(rf, dtype=float) / periods_per_year
     std = excess.std()
     return float(excess.mean() / std * np.sqrt(periods_per_year)) if std > 0 else 0.0
 
 
-def _sortino(daily_returns: pd.Series, rf: float = 0.0, *,
+def _sortino(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
              periods_per_year: int = CALENDAR_DAYS_PER_YEAR) -> float:
     """
     Compute the annualized Sortino ratio from a series of per-period returns.
@@ -427,20 +516,27 @@ def _sortino(daily_returns: pd.Series, rf: float = 0.0, *,
 
     Args:
         daily_returns (pd.Series): Series of per-period fractional returns.
-        rf (float): Annual hurdle rate (the T-bill "rf" term) as a decimal.
-            Defaults to 0.0.
+        rf (float | np.ndarray): Annual hurdle rate as a decimal: one value
+            for every period, or one per period, POSITIONALLY aligned with
+            daily_returns (the page passes _rf_hurdle's). Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
-            positive; not validated, since its one call site takes the default.
-            Defaults to CALENDAR_DAYS_PER_YEAR (365).
+            positive; not validated, since both of its call sites take the
+            default. Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
-        float: Annualized Sortino ratio. Returns 0.0 if there are no negative excess returns.
+        float: Annualized Sortino ratio. 0.0 when daily_returns never varies —
+            with a nonzero rf every flat day would otherwise be a downside day,
+            and a flat curve reads exactly -sqrt(periods_per_year) — or when
+            there are no negative excess returns.
 
     Raises:
-        ZeroDivisionError: If `periods_per_year` is 0 (the per-period hurdle
-            divides by it).
+        ValueError: If rf is an array whose length differs from daily_returns
+            (the positional subtraction cannot broadcast).
     """
-    excess = daily_returns - rf / periods_per_year
+    if not _varies(daily_returns):
+        return 0.0
+    # Positional: rf is one scalar or one value per row, never index-aligned
+    excess = daily_returns - np.asarray(rf, dtype=float) / periods_per_year
     # Standard downside deviation: RMS of the negative excess returns over ALL
     # periods (positives clipped to 0). Using the sample std of only the
     # negative values returns NaN with a single loss and is not Sortino.
@@ -836,6 +932,8 @@ def _performance_kpis(
     equity_df: pd.DataFrame,
     trades: list[BacktestTrade],
     initial_balance: float,
+    *,
+    risk_free: RiskFreeRates | None = None,
 ) -> list[tuple[str, str, str, str]]:
     """
     Compute the Portfolio Performance KPI cards, formatted, in render order.
@@ -852,6 +950,9 @@ def _performance_kpis(
             returns are taken over.
         initial_balance (float): Starting portfolio value in dollars, the base
             of the total return.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            and Sortino cards subtract, row by row, on equity_df's own dates
+            (_rf_hurdle). None (default) subtracts nothing.
 
     Returns:
         list[tuple[str, str, str, str]]: (key, label, value, colour) per card:
@@ -862,8 +963,10 @@ def _performance_kpis(
     final_value  = float(equity_df["portfolio_value"].iloc[-1])
     total_return = (final_value - initial_balance) / initial_balance
     daily_ret    = equity_df["daily_return"]
-    sharpe       = _sharpe(daily_ret)
-    sortino      = _sortino(daily_ret)
+    # The bill's yield in force on each row's date, shared by both ratios
+    hurdle       = _rf_hurdle(risk_free, equity_df["date"])
+    sharpe       = _sharpe(daily_ret, rf=hurdle)
+    sortino      = _sortino(daily_ret, rf=hurdle)
     # _max_drawdown reports the trough via the Series' index, so it must be
     # indexed by date rather than equity_df's default RangeIndex — otherwise
     # the KPI shows a meaningless row number instead of a calendar date.
@@ -927,6 +1030,7 @@ def _section_performance(
     initial_balance: float,
     *,
     extra_kpis: list[tuple[str, str, str, str]] | None = None,
+    risk_free: RiskFreeRates | None = None,
 ) -> str:
     """
     Build the "Portfolio Performance" HTML section.
@@ -951,13 +1055,17 @@ def _section_performance(
             k-hat cards (_khat_kpis). None (default) renders the section
             exactly as it was before those cards existed: no card and no
             caption.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            and Sortino cards subtract, day by day (_performance_kpis). None
+            (default) subtracts nothing.
 
     Returns:
         str: Self-contained HTML section string including KPI cards and two Plotly charts.
     """
     # Keyed, so the filter script can rewrite each card for another selection
     kpis = "".join(_kpi(label, value, color, key=key) for key, label, value, color
-                   in _performance_kpis(equity_df, trades, initial_balance))
+                   in _performance_kpis(equity_df, trades, initial_balance,
+                                        risk_free=risk_free))
     if extra_kpis is not None:
         # Keyed too: the filter script rewrites the k-hat cards for the band,
         # category or tag and k on screen (renderKhatCards)
@@ -1780,7 +1888,8 @@ def _kd_k_text(k: float | None) -> str:
     return "not recorded" if k is None else _exact_label(k, ".3f")
 
 
-def _kd_cells(point: SweepPoint, is_primary: bool) -> list[str]:
+def _kd_cells(point: SweepPoint, is_primary: bool, *,
+              risk_free: RiskFreeRates | None = None) -> list[str]:
     """
     One row of the interval-discount section's per-k table, as its cells.
 
@@ -1802,6 +1911,9 @@ def _kd_cells(point: SweepPoint, is_primary: bool) -> list[str]:
             one size cap.
         is_primary (bool): True for the run's own k — its label is marked
             " (primary)".
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            cell subtracts, row by row, on the point's own dates (_rf_hurdle).
+            None (default) subtracts nothing.
 
     Returns:
         list[str]: The k label (_k_label), the trade count, total return,
@@ -1826,8 +1938,9 @@ def _kd_cells(point: SweepPoint, is_primary: bool) -> list[str]:
     # the trough label a calendar date, and the result is a 2-tuple.
     max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
     # A one-row curve has no pct_change to speak of; _sharpe returns 0.0 on
-    # a zero standard deviation, so no extra guard is needed here.
-    sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else 0.0
+    # a curve that never moves, so no extra guard is needed here.
+    sharpe = (_sharpe(eq["daily_return"], rf=_rf_hurdle(risk_free, eq["date"]))
+              if "daily_return" in eq else 0.0)
     return [label, trades, f"{total_return:+.1%}", f"${final:,.2f}", f"{max_dd:.1%}",
             f"{sharpe:.2f}"]
 
@@ -1937,7 +2050,8 @@ def _kd_assemble(ks: tuple, caps: tuple, primary: tuple[int, int], rows: list,
     }
 
 
-def _kd_from_points(sweep: BacktestSweep) -> dict:
+def _kd_from_points(sweep: BacktestSweep, *,
+                    risk_free: RiskFreeRates | None = None) -> dict:
     """
     The interval-discount section's data from a sweep's own points alone.
 
@@ -1952,6 +2066,8 @@ def _kd_from_points(sweep: BacktestSweep) -> dict:
 
     Args:
         sweep (BacktestSweep): A sweep with at least one point.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates each row's
+            Sharpe subtracts (_kd_cells). None (default) subtracts nothing.
 
     Returns:
         dict: _kd_assemble's data over (the points' ks) x (the primary's
@@ -1965,7 +2081,8 @@ def _kd_from_points(sweep: BacktestSweep) -> dict:
     )
     eq = points[primary_idx].equity_df
     axis = pd.DatetimeIndex(pd.to_datetime(list(eq["date"]) if eq is not None else []))
-    rows = [[_kd_cells(pt, i == primary_idx) for i, pt in enumerate(points)]]
+    rows = [[_kd_cells(pt, i == primary_idx, risk_free=risk_free)
+             for i, pt in enumerate(points)]]
     curves = [[_kd_curve(pt, axis)] for pt in points]
     return _kd_assemble(tuple(pt.k for pt in points), (sweep.primary.size_cap,),
                         (primary_idx, 0), rows, curves, axis, _pooled_k(sweep))
@@ -1977,6 +2094,7 @@ def _section_interval_discount(
     *,
     bar: bool = True,
     kd_failed: bool = False,
+    risk_free: RiskFreeRates | None = None,
 ) -> str:
     """
     Build the "Interval Discount (k) Calibration" HTML section.
@@ -2046,6 +2164,10 @@ def _section_interval_discount(
             renders statically from sweep.points and says so
             (_KD_TEXT["failed"]), so the bar's k select visibly does not move
             it rather than silently.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the static
+            form's per-k Sharpe column subtracts (_kd_from_points); a kd from
+            the walk was computed with the page's rates already. None
+            (default) subtracts nothing.
 
     Returns:
         str: Self-contained HTML section string.
@@ -2062,7 +2184,7 @@ def _section_interval_discount(
         notice = f"<p style='{notice_style}'>{html.escape(_KD_TEXT['failed'])}</p>"
     if kd is None or not bar:
         # The static form: the sweep's own points, at the run's own cap
-        kd = _kd_from_points(sweep)
+        kd = _kd_from_points(sweep, risk_free=risk_free)
     pk, pc = kd["primary"]
     cal = sweep.calibration
     # The outcome-label census, carried k-independently on the sweep exactly as
@@ -2979,7 +3101,7 @@ def _curve_on_axis(eq: pd.DataFrame | None, axis: pd.DatetimeIndex) -> list[floa
                           len(axis))
 
 
-def _point_kpis(point: SweepPoint) -> dict:
+def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) -> dict:
     """
     Compute one standalone SweepPoint's KPI-table row.
 
@@ -2992,6 +3114,9 @@ def _point_kpis(point: SweepPoint) -> dict:
 
     Args:
         point (SweepPoint): One simulated scenario, band sweep or not.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            and Sortino subtract, row by row, on the point's own dates
+            (_rf_hurdle). None (default) subtracts nothing.
 
     Returns:
         dict: {trades, win_rate, mean_per_trade, median_per_trade,
@@ -3003,7 +3128,8 @@ def _point_kpis(point: SweepPoint) -> dict:
             across trades; median_per_trade is the median of the same
             quantity, which a few outsized trades cannot move. Sharpe and
             Sortino are annualised on the calendar-day base (365), like every
-            other figure computed on a strategy curve. Every value is None
+            other figure computed on a strategy curve, net of risk_free's
+            per-day yield. Every value is None
             where the underlying quantity is undefined (no trades, or an
             empty/absent equity curve) rather than a misleading 0.0.
     """
@@ -3024,8 +3150,13 @@ def _point_kpis(point: SweepPoint) -> dict:
         final_balance = float(eq["portfolio_value"].iloc[-1])
         total_return = (final_balance - opening) / opening if opening else None
         max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
-        sharpe = _sharpe(eq["daily_return"]) if "daily_return" in eq else None
-        sortino = _sortino(eq["daily_return"]) if "daily_return" in eq else None
+        if "daily_return" in eq:
+            # The bill's yield in force on each row's date, shared by both ratios
+            hurdle = _rf_hurdle(risk_free, eq["date"])
+            sharpe = _sharpe(eq["daily_return"], rf=hurdle)
+            sortino = _sortino(eq["daily_return"], rf=hurdle)
+        else:
+            sharpe = sortino = None
     return {
         "trades": n, "win_rate": win_rate, "mean_per_trade": mean_per_trade,
         "median_per_trade": median_per_trade, "total_return": total_return, "final_balance": final_balance,
@@ -3660,6 +3791,68 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     )
 
 
+def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) -> str:
+    """
+    Render the page-header line naming the risk-free rate every Sharpe and Sortino subtracts.
+
+    Always renders a line (DR-66: absence must never be the only signal).
+    Grey when the yields were downloaded this run, or when the caller
+    supplied none (every ratio at 0%). Amber when the API could not be
+    reached and an earlier download stands in. Red when neither was
+    available (every ratio at 0%).
+
+    Args:
+        risk_free (RiskFreeRates | None): generate_dashboard's risk_free.
+        equity_df (pd.DataFrame): The page's curve: the window the average
+            yield is taken over.
+
+    Returns:
+        str: One <p> line.
+    """
+    term = RISK_FREE_BILL_TERM.lower()
+    grey = "color:#616161; font-size:14px;"
+    if risk_free is None:
+        return (f'<p style="{grey}">Risk-free rate: none supplied — every Sharpe and '
+                "Sortino ratio on this page subtracts 0%.</p>")
+    if risk_free.latest is None:
+        return ('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+                "Risk-free rate unavailable: the Treasury's Fiscal Data API could not be "
+                "reached and no earlier download is saved, so every Sharpe and Sortino "
+                f"ratio on this page subtracts 0% instead of the {term} bill's yield.</p>")
+    first_day = risk_free.auctions[0][0]
+    last_day, last_rate = risk_free.latest
+    dates = list(equity_df["date"]) if len(equity_df) else []
+    text = (f"Risk-free rate: the {term} Treasury bill's auction yield "
+            f"({RISK_FREE_RATE_FIELD}, Treasury Fiscal Data) in force on each day — the "
+            "latest auction on or before it — is subtracted in every Sharpe and Sortino "
+            "ratio on this page.")
+    if dates:
+        # treasury.RiskFreeRates.annual_on: the same per-day yields the ratios
+        # subtract, averaged over the page's own curve
+        text += (f" It averaged {float(np.mean(risk_free.annual_on(dates))):.2%} over "
+                 "this window.")
+        # Timestamps on both sides: a hand-built curve may carry Timestamps,
+        # which do not compare with a datetime.date
+        if pd.to_datetime(dates).min() < pd.Timestamp(first_day):
+            text += (f" The {term} bill was first auctioned on {first_day}; earlier days "
+                     "use that auction's yield.")
+    fetched_at = risk_free.fetched_at
+    if fetched_at is not None and fetched_at.tzinfo is not None:
+        # Labelled UTC below, so shown in UTC whatever offset it was stamped in
+        fetched_at = fetched_at.astimezone(UTC)
+    stamp = (fetched_at.strftime("%Y-%m-%d %H:%M UTC")
+             if fetched_at is not None else "at a time not recorded")
+    if risk_free.source == SOURCE_CACHE:
+        return ('<p style="color:#E65100; font-size:14px; font-weight:700;">'
+                + html.escape(text + " The API could not be reached: these are the yields "
+                              f"downloaded {stamp}, whose latest auction ({last_day}, "
+                              f"{last_rate:.3%}) stands for every day after it.",
+                              quote=False) + "</p>")
+    return (f'<p style="{grey}">' + html.escape(
+        text + f" Latest auction {last_day}: {last_rate:.3%} (downloaded {stamp}).",
+        quote=False) + "</p>")
+
+
 def _corpus_provenance_html(sweep: BacktestSweep | None, *,
                             traded: int | None = None) -> str:
     """
@@ -3921,6 +4114,7 @@ def _section_scenario_explorer(
     *,
     unavailable: bool = False,
     own_cap_only: bool = False,
+    risk_free: RiskFreeRates | None = None,
 ) -> str:
     """
     Build the "Scenario Explorer" HTML section.
@@ -4087,6 +4281,10 @@ def _section_scenario_explorer(
             it from (generate_dashboard logged why): a grey line above the
             banner says the section shows the run's own size cap only
             (_EXPLORER_OWN_CAP_HTML). False (default) adds nothing.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates every
+            Sharpe and Sortino of the fallback build subtracts
+            (_explorer_from_sweep); data from the walk was computed with the
+            page's rates already. None (default) subtracts nothing.
 
     Returns:
         str: Self-contained HTML section string.
@@ -4102,7 +4300,8 @@ def _section_scenario_explorer(
     if unavailable:
         return title + _EXPLORER_UNAVAILABLE_HTML
     # The walk's data, or the sweep's own eager points at the run's own cap
-    data = explorer if explorer is not None else _explorer_from_sweep(sweep)
+    data = (explorer if explorer is not None
+            else _explorer_from_sweep(sweep, risk_free=risk_free))
     if not data.checks:
         # The band sweep did not run for the grid walked: no populations to
         # compare, whatever the walk produced
@@ -4716,7 +4915,8 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 
 # ─── Section 8: Benchmark Comparison ─────────────────────────────────────────
 
-def _strategy_row(equity_df: pd.DataFrame, initial_balance: float) -> dict[str, str]:
+def _strategy_row(equity_df: pd.DataFrame, initial_balance: float, *,
+                  risk_free: RiskFreeRates | None = None) -> dict[str, str]:
     """
     Compute the benchmark table's strategy row, formatted.
 
@@ -4724,6 +4924,10 @@ def _strategy_row(equity_df: pd.DataFrame, initial_balance: float) -> dict[str, 
         equity_df (pd.DataFrame): The strategy's equity curve
             (_build_equity_curve: one row per CALENDAR day).
         initial_balance (float): Starting balance the return divides by.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            subtracts, row by row, on equity_df's own dates (_rf_hurdle) —
+            the same yield the ^GSPC row beside it subtracts on its trading
+            days. None (default) subtracts nothing.
 
     Returns:
         dict[str, str]: "return" (total return), "sharpe" (annualised on the
@@ -4733,7 +4937,8 @@ def _strategy_row(equity_df: pd.DataFrame, initial_balance: float) -> dict[str, 
     # Calendar-daily by construction (_build_equity_curve emits one row per
     # calendar day), so this takes _sharpe's CALENDAR_DAYS_PER_YEAR default
     # while the ^GSPC row overrides it to the trading-day base.
-    strat_sharpe = _sharpe(equity_df["daily_return"])
+    strat_sharpe = _sharpe(equity_df["daily_return"],
+                           rf=_rf_hurdle(risk_free, equity_df["date"]))
     strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
     return {
         "return": f"{strat_ret:+.1%}",
@@ -4759,7 +4964,8 @@ def _bench_cell_id(row_name: str, field: str) -> str:
 
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
-                        initial_balance: float) -> str:
+                        initial_balance: float, *,
+                        risk_free: RiskFreeRates | None = None) -> str:
     """
     Build the "Benchmark Comparison" HTML section.
 
@@ -4775,7 +4981,10 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     (its curve has one row per calendar day) while the ^GSPC row passes
     TRADING_DAYS_PER_YEAR, since yfinance serves trading days only (DR-56).
     Sharing one factor would make the comparison this section exists for
-    apples-to-oranges by exactly sqrt(365/252) = 1.2035 of magnitude.
+    apples-to-oranges by exactly sqrt(365/252) = 1.2035 of magnitude. Both
+    rows subtract the same risk-free yield, each on its own dates and its own
+    base: the strategy row per calendar day (rf / 365), the ^GSPC row per
+    trading day (rf / 252), so the two face one hurdle.
 
     Args:
         equity_df (pd.DataFrame): Daily equity curve with columns
@@ -4789,6 +4998,9 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             have. yfinance serves trading days only, so the first S&P bar can
             also land later than start_date - 1.
         initial_balance (float): Starting portfolio value in dollars.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates both rows'
+            Sharpe subtract, day by day (_rf_hurdle). None (default) subtracts
+            nothing.
 
     Returns:
         str: Self-contained HTML section string with comparison table and chart.
@@ -4833,14 +5045,18 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             ))
             sp_ret = float(sp_norm.iloc[-1] / initial_balance - 1)
             sp_daily = sp.pct_change().dropna()
+            # yfinance serves TRADING days only, so this is the one series on
+            # the page that is not calendar-daily: it must override _sharpe's
+            # calendar default or the two rows of this very table would be
+            # annualized on different bases (DR-56). The same bill's yield, on
+            # the S&P's own trading days, per trading day (rf / 252), so the
+            # two rows face one hurdle.
+            sp_sharpe = _sharpe(sp_daily, rf=_rf_hurdle(risk_free, sp_daily.index),
+                                periods_per_year=TRADING_DAYS_PER_YEAR)
             bench_rows.append({
                 "name": "S&P 500",
                 "return": f"{sp_ret:+.1%}",
-                # yfinance serves TRADING days only, so this is the one series
-                # on the page that is not calendar-daily: it must override
-                # _sharpe's calendar default or the two rows of this very table
-                # would be annualized on different bases (DR-56).
-                "sharpe": f"{_sharpe(sp_daily, periods_per_year=TRADING_DAYS_PER_YEAR):.2f}",
+                "sharpe": f"{sp_sharpe:.2f}",
                 "max_dd": f"{_max_drawdown(sp_norm)[0]:.1%}",
             })
         except Exception as e:
@@ -4852,7 +5068,7 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     # here is string-matched by the table renderer below, so both must agree.
     # They are not a claim that the time-series leg is an arbitrage.
     bench_rows.insert(0, {"name": "Kalshi Arbitrage Strategy",
-                          **_strategy_row(equity_df, initial_balance)})
+                          **_strategy_row(equity_df, initial_balance, risk_free=risk_free)})
 
     fig.update_layout(title="Strategy vs Benchmarks", yaxis_title="Portfolio Value ($)",
                       xaxis_title="Date")
@@ -6213,13 +6429,16 @@ class _KdVisitor:
         axis (pd.DatetimeIndex): The page's date axis.
         pooled_k (float | None): The pooled empirical k-hat the section
             compares every k with (_pooled_k).
+        risk_free (RiskFreeRates | None): The rates each row's Sharpe
+            subtracts (_kd_cells).
         rows (list): rows[cap][k] -> _kd_cells, or None (never simulated).
         curves (list): curves[k][cap] -> _kd_curve, or None likewise.
         failed (bool): Whether building a row or curve raised.
     """
 
     def __init__(self, source: _GridSource, axis: pd.DatetimeIndex,
-                 pooled_k: float | None) -> None:
+                 pooled_k: float | None, *,
+                 risk_free: RiskFreeRates | None = None) -> None:
         """
         Prepare to walk a grid.
 
@@ -6228,9 +6447,13 @@ class _KdVisitor:
             axis (pd.DatetimeIndex): The page's date axis (the page's own
                 curve's dates — the base block's "dates").
             pooled_k (float | None): The pooled empirical k-hat.
+            risk_free (RiskFreeRates | None): Keyword-only. The rates each
+                row's Sharpe subtracts. None (default) subtracts nothing.
         """
         self.axis = axis
         self.pooled_k = pooled_k
+        # Kept across reset(): the rate does not depend on the grid walked
+        self.risk_free = risk_free
         self.reset(source)
 
     def reset(self, source: _GridSource) -> None:
@@ -6261,7 +6484,8 @@ class _KdVisitor:
             return
         try:
             # "(primary)" marks the run's own k, at every cap
-            self.rows[ci][ki] = _kd_cells(point, ki == self.source.primary[1])
+            self.rows[ci][ki] = _kd_cells(point, ki == self.source.primary[1],
+                                          risk_free=self.risk_free)
             self.curves[ki][ci] = _kd_curve(point, self.axis)
         except Exception:
             logging.warning("The Interval Discount section's k and size-cap figures could "
@@ -6435,10 +6659,13 @@ class _ExplorerVisitor:
         calibrations (dict): Band -> IntervalCalibration or None
             (BacktestSweep.calibrations_by_band, read as the explorer always
             has: a band without an entry has no k-hat).
+        risk_free (RiskFreeRates | None): The rates every Sharpe and Sortino
+            subtracts (_point_kpis).
         failed (bool): Whether building a figure raised.
     """
 
-    def __init__(self, source: _GridSource, sweep: BacktestSweep) -> None:
+    def __init__(self, source: _GridSource, sweep: BacktestSweep, *,
+                 risk_free: RiskFreeRates | None = None) -> None:
         """
         Prepare to walk a grid.
 
@@ -6447,10 +6674,16 @@ class _ExplorerVisitor:
             sweep (BacktestSweep): The run's sweep: its primary curve decides
                 the explorer's axis, its primary k centres the k-hat metric,
                 and its calibrations_by_band give each band's k-hat.
+            risk_free (RiskFreeRates | None): Keyword-only. The rates every
+                Sharpe and Sortino subtracts. None (default) subtracts
+                nothing.
         """
         self.axis = _equity_axis(sweep.primary.equity_df)
         self.primary_k = sweep.primary.k
         self.calibrations = dict(sweep.calibrations_by_band)
+        # Kept across reset(): the rate does not depend on the grid walked,
+        # and the rows memoised per cell need no rate in their key
+        self.risk_free = risk_free
         self._data: _ExplorerData | None = None
         self.reset(source)
 
@@ -6549,7 +6782,7 @@ class _ExplorerVisitor:
                population)
         hit = self._cache.get(key)
         if hit is None:
-            kpis = _point_kpis(point)
+            kpis = _point_kpis(point, risk_free=self.risk_free)
             if population in (_ALL_VIEW, _HEADLINE_POPULATION):
                 kpis.update(_robustness_extras(point))
             row = dict(kpis)
@@ -6660,7 +6893,7 @@ class _ExplorerVisitor:
             for ci, cap in enumerate(self.source.caps):
                 point = by_cap.get(cap)
                 self.same_titles[ci] = None if point is None else _strict_json(
-                    _point_kpis(point))
+                    _point_kpis(point, risk_free=self.risk_free))
         except Exception:
             logging.warning("The Scenario Explorer's same-title figures could not be built; "
                             "it shows the run's own size cap only", exc_info=True)
@@ -6997,6 +7230,9 @@ class _ChunkVisitor:
             off_grid() aliases them); None when the grid has no family.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
+        risk_free (RiskFreeRates | None): The rates every view's Sharpe and
+            Sortino subtracts (_list_payload), and _filter_payload's empty
+            view's too.
         failed (bool): Whether building a chunk raised.
     """
 
@@ -7009,6 +7245,8 @@ class _ChunkVisitor:
         start_date: date,
         initial_balance: float,
         series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+        *,
+        risk_free: RiskFreeRates | None = None,
     ) -> None:
         """
         Prepare to walk a grid.
@@ -7024,10 +7262,16 @@ class _ChunkVisitor:
             start_date (date): The backtest's start date.
             initial_balance (float): Starting balance in dollars.
             series_categories (dict | None): The series-category map.
+            risk_free (RiskFreeRates | None): Keyword-only. The rates every
+                view's Sharpe and Sortino subtracts. None (default)
+                subtracts nothing. The chunk dedup (_list_key) needs no rate
+                in its key: one rate serves the whole page.
         """
         self.trades, self.equity_df, self.k_used = trades, equity_df, k_used
         self.start_date, self.initial_balance = start_date, initial_balance
         self.series_categories = series_categories
+        # Kept across reset(): the rate does not depend on the grid walked
+        self.risk_free = risk_free
         self.axis = pd.DatetimeIndex(pd.to_datetime(list(equity_df["date"])))
         self.reset(source)
 
@@ -7205,7 +7449,8 @@ class _ChunkVisitor:
             strings = _StringTable()
             lst = _list_payload(listed, curve, self.axis, self.start_date,
                                 self.initial_balance, self.series_categories, k,
-                                self.cat_index, self.sub_index, strings, heads=self.heads)
+                                self.cat_index, self.sub_index, strings, heads=self.heads,
+                                risk_free=self.risk_free)
             cid = len(self.chunks)
             self.chunks.append(_packed_json_script(
                 f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
@@ -7235,6 +7480,7 @@ def _build_filter_grid(
     *,
     pooled_k: float | None = None,
     explorer: _ExplorerVisitor | None = None,
+    risk_free: RiskFreeRates | None = None,
 ) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]:
     """
     Walk the page's grid once with the page's visitors.
@@ -7254,6 +7500,10 @@ def _build_filter_grid(
             explorer's visitor, walked with the others (its data is read off
             it afterwards, _ExplorerVisitor.payload); None (default) walks
             without one.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the chunk
+            and interval-discount visitors' Sharpe and Sortino subtract (the
+            explorer's visitor carries its own). None (default) subtracts
+            nothing.
 
     Returns:
         tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]: The grid
@@ -7262,22 +7512,26 @@ def _build_filter_grid(
             simulated once for all of them and for the explorer's.
     """
     chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
-                           series_categories)
+                           series_categories, risk_free=risk_free)
     most = _MaxTrades()
-    kd = _KdVisitor(source, chunks.axis, pooled_k)
+    kd = _KdVisitor(source, chunks.axis, pooled_k, risk_free=risk_free)
     axis_end = chunks.axis[-1] if len(chunks.axis) else None
     visitors = [chunks, most, kd] + ([] if explorer is None else [explorer])
     walked = _walk_grid(source, visitors, axis_end)
     return walked, chunks, most, kd
 
 
-def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep) -> _ExplorerVisitor | None:
+def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep, *,
+                          risk_free: RiskFreeRates | None = None) -> _ExplorerVisitor | None:
     """
     The scenario explorer's visitor for the page's walk, or None if it cannot be made.
 
     Args:
         source (_GridSource): The grid about to be walked.
         sweep (BacktestSweep): The run's sweep.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates every
+            Sharpe and Sortino the visitor computes subtracts. None (default)
+            subtracts nothing.
 
     Returns:
         _ExplorerVisitor | None: The visitor; None (with a WARNING) when
@@ -7285,19 +7539,24 @@ def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep) -> _Explore
             own points, and the filter bar is unaffected.
     """
     try:
-        return _ExplorerVisitor(source, sweep)
+        return _ExplorerVisitor(source, sweep, risk_free=risk_free)
     except Exception:
         logging.warning("The Scenario Explorer's figures could not be prepared from the "
                         "page's grid; it shows the run's own size cap only", exc_info=True)
         return None
 
 
-def _explorer_fallback(sweep: BacktestSweep) -> tuple[_ExplorerData | None, bool]:
+def _explorer_fallback(sweep: BacktestSweep, *,
+                       risk_free: RiskFreeRates | None = None
+                       ) -> tuple[_ExplorerData | None, bool]:
     """
     Build the scenario explorer's data from the sweep's own points, never raising.
 
     Args:
         sweep (BacktestSweep): A sweep with scenarios.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates every
+            Sharpe and Sortino subtracts (_explorer_from_sweep). None
+            (default) subtracts nothing.
 
     Returns:
         tuple[_ExplorerData | None, bool]: (_explorer_from_sweep's data, False),
@@ -7305,14 +7564,15 @@ def _explorer_fallback(sweep: BacktestSweep) -> tuple[_ExplorerData | None, bool
             then a notice, and the page is still written.
     """
     try:
-        return _explorer_from_sweep(sweep), False
+        return _explorer_from_sweep(sweep, risk_free=risk_free), False
     except Exception:
         logging.warning("The Scenario Explorer could not be built for this run; the page "
                         "is written with a notice in its place", exc_info=True)
         return None, True
 
 
-def _explorer_from_sweep(sweep: BacktestSweep) -> _ExplorerData:
+def _explorer_from_sweep(sweep: BacktestSweep, *,
+                         risk_free: RiskFreeRates | None = None) -> _ExplorerData:
     """
     Build the scenario explorer's data from the sweep's own eager points.
 
@@ -7327,6 +7587,9 @@ def _explorer_from_sweep(sweep: BacktestSweep) -> _ExplorerData:
 
     Args:
         sweep (BacktestSweep): A sweep with scenarios.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates every
+            Sharpe and Sortino subtracts (_ExplorerVisitor). None (default)
+            subtracts nothing.
 
     Returns:
         _ExplorerData: The data.
@@ -7338,7 +7601,7 @@ def _explorer_from_sweep(sweep: BacktestSweep) -> _ExplorerData:
     # The eager points alone: nothing here simulates
     source = _grid_source(sweep, primary.trades, primary.equity_df, primary.k,
                           use_cap_sweep=False)
-    visitor = _ExplorerVisitor(source, sweep)
+    visitor = _ExplorerVisitor(source, sweep, risk_free=risk_free)
     eq = primary.equity_df
     axis_end = (pd.Timestamp(pd.to_datetime(eq["date"].iloc[-1]))
                 if eq is not None and len(eq) else None)
@@ -7440,6 +7703,8 @@ def _view_payload(
     kelly_x: list[float],
     row_of,
     strings: _StringTable,
+    *,
+    risk_free: RiskFreeRates | None = None,
 ) -> dict:
     """
     Compute everything the filtered sections show for one selection of trades.
@@ -7465,6 +7730,11 @@ def _view_payload(
             _trade_row_head in the shared head table, its _trade_row_tail in
             `strings` (None for a selection with no trade, which has no rows).
         strings (_StringTable): Where HTML fragments are stored.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
+            and Sortino cards and the benchmark row subtract, on the
+            axis-filtered curve's own dates (its index is not reset, which
+            the positional hurdle does not need). None (default) subtracts
+            nothing.
 
     Returns:
         dict: "n", "idx", "kpi" (card key -> formatted value), the sparse
@@ -7487,14 +7757,14 @@ def _view_payload(
         "n": len(sel),
         "idx": idx,
         "kpi": {key: value for key, _, value, _ in
-                _performance_kpis(equity_df, sel, initial_balance)},
+                _performance_kpis(equity_df, sel, initial_balance, risk_free=risk_free)},
         "total": _sparse_on_axis(dates, total, axis, 4),
         "types": [[label, _sparse_on_axis(dates, series, axis, 4)]
                   for label, _, series in type_lines],
         "dd": _sparse_on_axis(dates, drawdown, axis, 4),
         "eq": _sparse_on_axis(dates, equity_df["portfolio_value"], axis, 2),
         "dep": _sparse_on_axis(dates, _capital_deployed(sel, equity_df), axis, 2),
-        "bench": _strategy_row(equity_df, initial_balance),
+        "bench": _strategy_row(equity_df, initial_balance, risk_free=risk_free),
     }
     if not sel:
         return view
@@ -7540,6 +7810,7 @@ def _list_payload(
     strings: _StringTable,
     *,
     heads: _StringTable,
+    risk_free: RiskFreeRates | None = None,
 ) -> dict:
     """
     Compute one distinct trade list's per-trade arrays and every view of it.
@@ -7569,6 +7840,9 @@ def _list_payload(
             (_trade_row_head) shared by every chunk of the page: a head does
             not depend on the trade's size, so every size-cap scenario that
             trades one pair shares it.
+        risk_free (RiskFreeRates | None): Keyword-only. The rates every
+            view's Sharpe and Sortino subtract (_view_payload). None (default)
+            subtracts nothing.
 
     Returns:
         dict: Per-trade arrays "ret" (return in percent), "slip", "hold",
@@ -7613,7 +7887,8 @@ def _list_payload(
         curve = (equity_df if key == _ALL_VIEW
                  else _build_equity_curve(sel, start_date, initial_balance))
         views[key] = _view_payload(sel, idx, curve, axis, initial_balance,
-                                   series_categories, kelly_x, row_of, strings)
+                                   series_categories, kelly_x, row_of, strings,
+                                   risk_free=risk_free)
     return {
         # The histogram's x values, exactly as _section_diagnostics draws them
         "ret": [t.profit_ratio * 100 for t in trades],
@@ -7716,8 +7991,11 @@ def _filter_payload(
     axis = chunks.axis
     pb, pk, pc = source.primary
     # A selection with no trade: the flat curve backtester draws for no trade
+    # (its ratios read 0.0 at any rate — _sharpe/_sortino's flat guard — but
+    # it takes the walk's rates like every other view)
     empty = _view_payload([], [], _build_equity_curve([], start_date, initial_balance),
-                          axis, initial_balance, series_categories, [], None, _StringTable())
+                          axis, initial_balance, series_categories, [], None, _StringTable(),
+                          risk_free=chunks.risk_free)
     binds = source.tier_binds
     grid_off = chunks.off_grid()
     # Without an off grid (no family, or no chunk for it) there is no off view
@@ -8825,6 +9103,7 @@ def generate_dashboard(
     sweep: BacktestSweep | None = None,
     interval_discount: float | None = None,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
+    risk_free: RiskFreeRates | None = None,
 ) -> Path:
     """
     Assemble all nine dashboard sections into a single self-contained HTML file.
@@ -8947,6 +9226,13 @@ def generate_dashboard(
             Decomposition section and the page-wide filter bar file each
             trade under (its category and first tag). None (default) falls
             back to each trade's ticker-prefix category.
+        risk_free (RiskFreeRates | None): treasury.load_risk_free_rates'
+            8-week bill yields. Every Sharpe and Sortino on the page — the
+            performance cards, both benchmark rows, the per-k table, the
+            scenario explorer and every filter-bar view — subtracts the yield
+            in force on each row's date, and the header names it
+            (_risk_free_html). None (default) subtracts 0%, exactly as before,
+            and the header says none was supplied.
 
     Returns:
         Path: Absolute path to the HTML file written,
@@ -9047,16 +9333,17 @@ def generate_dashboard(
     explorer_failed = explorer_rebuilt = False
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
-        explorer_visitor = _new_explorer_visitor(source, sweep) if explores else None
+        explorer_visitor = (_new_explorer_visitor(source, sweep, risk_free=risk_free)
+                            if explores else None)
         source, chunker, counter, kd_visitor = _build_filter_grid(
             source, trades, equity_df, k_used, start_date, initial_balance, series_categories,
-            pooled_k=_pooled_k(sweep), explorer=explorer_visitor)
+            pooled_k=_pooled_k(sweep), explorer=explorer_visitor, risk_free=risk_free)
         walked = source
         if explores:
             explorer_data = None if explorer_visitor is None else explorer_visitor.payload()
             if explorer_data is None:
                 # Its visitor failed (and said so): the sweep's own points
-                explorer_data, explorer_failed = _explorer_fallback(sweep)
+                explorer_data, explorer_failed = _explorer_fallback(sweep, risk_free=risk_free)
                 explorer_rebuilt = not explorer_failed
         if not counter.failed:
             most_traded = counter.most
@@ -9102,7 +9389,7 @@ def generate_dashboard(
         kd, kd_failed = None, False
     if explores and explorer_data is None and not explorer_failed:
         # The walk never got as far as the explorer: its own eager points
-        explorer_data, explorer_failed = _explorer_fallback(sweep)
+        explorer_data, explorer_failed = _explorer_fallback(sweep, risk_free=risk_free)
         explorer_rebuilt = not explorer_failed
 
     # The ladder setting decides which pairs exist, the primary spread band
@@ -9137,19 +9424,22 @@ def generate_dashboard(
               # The eager points' busiest (the log's closing line reads the same)
               else max(most_traded, max_trades_simulated(sweep)))
     corpus_note = _corpus_provenance_html(sweep, traded=traded)
+    # Which risk-free rate every Sharpe and Sortino below subtracts — or that
+    # none was supplied, or it was unavailable. Rendered on every page (DR-66)
+    rf_note = _risk_free_html(risk_free, equity_df)
 
     # Each section is built as it is written, so only one is alive at a time
     sections = (
         # The two k-hat cards ride along (None without a sweep: no cards)
         lambda: _section_performance(equity_df, trades, start_date, initial_balance,
-                                     extra_kpis=khat_cards),
+                                     extra_kpis=khat_cards, risk_free=risk_free),
         lambda: _section_decomposition(trades, series_categories),
         lambda: _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k),
         # and the walk's data for the bar's k and size cap: static — with a
         # notice — when the bar could not be built or that data could not be
         lambda: _section_interval_discount(sweep, kd, bar=filter_data is not None,
-                                           kd_failed=kd_failed),
+                                           kd_failed=kd_failed, risk_free=risk_free),
         # The same k-hat, broken down by category, tag and spread band — read
         # off the filter's base block, so it follows the filter bar like the
         # trade sections do (None when the filter could not be built)
@@ -9163,12 +9453,14 @@ def generate_dashboard(
         # grey line when the sweep's own points stand in for a size-cap sweep)
         lambda: _section_scenario_explorer(
             sweep, explorer_data, unavailable=explorer_failed,
-            own_cap_only=explorer_rebuilt and sweep.cap_sweep is not None),
+            own_cap_only=explorer_rebuilt and sweep.cap_sweep is not None,
+            risk_free=risk_free),
         lambda: _section_diagnostics(trades),
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
         lambda: _section_risk(trades, equity_df, initial_balance, k=k_used),
-        lambda: _section_benchmark(equity_df, start_date, initial_balance),
+        lambda: _section_benchmark(equity_df, start_date, initial_balance,
+                                   risk_free=risk_free),
     )
 
     # Named head (not `html`) so it can't shadow the `html` module used by
@@ -9193,6 +9485,7 @@ def generate_dashboard(
 </p>
 {corpus_note}
 {run_settings}
+{rf_note}
 {header_note}
 {filter_bar}
 """

@@ -1,8 +1,10 @@
 """Tests for dashboard.py — HTML escaping of Kalshi-controlled titles (BS-20),
 the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
-annualization base and its per-row use in the benchmark table (DR-56), and the
+annualization base and its per-row use in the benchmark table (DR-56), the
 interval-discount (k) section, whose curve and per-k table follow the page-wide
-filter bar's k and size cap.
+filter bar's k and size cap, and the risk-free rate every Sharpe and Sortino
+subtracts day by day (TestRiskFreeHurdle, TestRiskFreeReachesEveryRatio,
+TestRiskFreeHeader, and the AST pin TestRiskFreeIsThreaded).
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -19,10 +21,12 @@ predate it are pinned against digests captured on main by
 tests/dashboard_golden.py (TestGoldenSections). Tests that do render a whole
 page stub dashboard.yf.download and redirect dashboard.PROJECT_ROOT.
 """
+import ast
 import base64
 import dataclasses
 import gzip
 import html
+import inspect
 import json
 import logging
 import math
@@ -62,6 +66,12 @@ from kalshi_betting.dashboard import (
     _section_interval_discount,
     _section_risk,
     _section_scenario_explorer,
+)
+from kalshi_betting.treasury import (
+    SOURCE_API,
+    SOURCE_CACHE,
+    SOURCE_UNAVAILABLE,
+    RiskFreeRates,
 )
 
 # test_backtester as a module, never its classes: a Test* class imported
@@ -887,8 +897,8 @@ class TestCalendarAnnualizationAtTheUnpinnedCallSites:
     already pinned elsewhere: the performance card's Sharpe and Sortino, and
     the interval-discount section's per-k sweep row. FOUR of the module's five
     calls consume a _build_equity_curve output and so must annualize on the
-    CALENDAR base (see dashboard._sharpe's own "four of the five calls"
-    paragraph); the fourth of them — the Benchmark table's STRATEGY row, which
+    CALENDAR base (see dashboard._sharpe's own paragraph on its calendar
+    default); the fourth of them — the Benchmark table's STRATEGY row, which
     reads equity_df["daily_return"] — and the one TRADING-base call (that
     table's ^GSPC row) are both pinned by TestBenchmarkAnnualizationPerRow
     above.
@@ -8278,3 +8288,468 @@ class TestGoldenSections:
         assert dashboard_golden._UUID_RE.search(unnamed)
         assert "UUID" in dashboard_golden.normalize(unnamed)
         assert not dashboard_golden._UUID_RE.search(dashboard_golden.normalize(unnamed))
+
+
+# ─── The risk-free rate: the 8-week Treasury bill's yield, day by day ─────────
+
+def _rates(source: str = SOURCE_API,
+           fetched_at: datetime | None = datetime(2026, 9, 27, 6, 30, tzinfo=UTC)
+           ) -> RiskFreeRates:
+    """Two auctions — 3% on 2026-01-01, 5% on 2026-01-08 — so the rate changes
+    inside every fixture window below (make_equity's opens on 2026-01-05, the
+    _flt/_kc/_ex curves on 2026-01-04), and every rf-adjusted figure can be
+    told from its rf = 0 value."""
+    return RiskFreeRates(((date(2026, 1, 1), 0.03), (date(2026, 1, 8), 0.05)), source,
+                         fetched_at)
+
+
+def _hand_ratios(returns: pd.Series, rf, periods: int) -> tuple[float, float]:
+    """(Sharpe, Sortino) of a returns series against a per-period rf array,
+    computed by hand from the textbook definitions — never through the
+    helpers under test."""
+    excess = returns.to_numpy(dtype=float) - np.asarray(rf, dtype=float) / periods
+    sharpe = excess.mean() / excess.std(ddof=1) * math.sqrt(periods)
+    downside = np.minimum(excess, 0.0)
+    sortino = excess.mean() / math.sqrt(float(np.mean(downside ** 2))) * math.sqrt(periods)
+    return float(sharpe), float(sortino)
+
+
+class TestRiskFreeHurdle:
+    """_sharpe / _sortino subtract rf POSITIONALLY — one scalar, or one annual
+    yield per row (_rf_hurdle's) — and read 0.0 on a curve that never moves,
+    whatever the rate. At rf = 0 nothing changed."""
+
+    # Four days at 3%, then four at 5%, one per row of _RETURNS
+    _VARYING = np.array([0.03] * 4 + [0.05] * 4)
+
+    def test_a_constant_array_equals_the_scalar(self):
+        full = np.full(len(_RETURNS), 0.05)
+        for helper in (dashboard._sharpe, dashboard._sortino):
+            assert helper(_RETURNS, rf=full) == pytest.approx(helper(_RETURNS, 0.05))
+            assert helper(_RETURNS, 0.05) != pytest.approx(helper(_RETURNS))
+
+    @pytest.mark.parametrize("periods", [365, 252])
+    def test_a_time_varying_rate_matches_a_hand_computation(self, periods):
+        sharpe, sortino = _hand_ratios(_RETURNS, self._VARYING, periods)
+        assert dashboard._sharpe(_RETURNS, rf=self._VARYING,
+                                 periods_per_year=periods) == pytest.approx(sharpe)
+        assert dashboard._sortino(_RETURNS, rf=self._VARYING,
+                                  periods_per_year=periods) == pytest.approx(sortino)
+        # ... and neither is the flat 3% or 5% hurdle's figure
+        for flat in (0.03, 0.05):
+            assert dashboard._sharpe(_RETURNS, rf=self._VARYING, periods_per_year=periods) \
+                != pytest.approx(dashboard._sharpe(_RETURNS, flat, periods_per_year=periods))
+
+    def test_rf_zero_is_bit_identical_to_the_old_expression(self):
+        # The pre-change bodies, verbatim: no rate (the default, None's 0.0
+        # hurdle, or unavailable rates' zeros) must reproduce them exactly
+        excess = _RETURNS - 0.0 / 365
+        old_sharpe = float(excess.mean() / excess.std() * np.sqrt(365))
+        downside = np.minimum(excess, 0.0)
+        old_sortino = float(excess.mean() / float(np.sqrt(np.mean(np.square(downside))))
+                            * np.sqrt(365))
+        zeros = RiskFreeRates((), SOURCE_UNAVAILABLE, None).annual_on(
+            [date(2026, 1, 5) + timedelta(days=i) for i in range(len(_RETURNS))])
+        for rf in (0.0, dashboard._rf_hurdle(None, []), zeros):
+            assert dashboard._sharpe(_RETURNS, rf=rf) == old_sharpe
+            assert dashboard._sortino(_RETURNS, rf=rf) == old_sortino
+
+    @pytest.mark.parametrize("rf", [0.05, np.full(300, 0.05), np.linspace(0.01, 0.05, 300)],
+                             ids=["scalar", "constant array", "varying array"])
+    def test_a_flat_curve_reads_zero_at_any_rate(self, rf):
+        # A curve with no trade. Without the guard a nonzero rate makes every
+        # flat day the same negative excess return: Sharpe came out -9.6e16
+        # (a float std of ~1e-20, not 0) and Sortino exactly -sqrt(365)
+        flat = pd.Series([0.0] * 300)
+        assert dashboard._sharpe(flat, rf=rf) == 0.0
+        assert dashboard._sortino(flat, rf=rf) == 0.0
+        # The Sortino hazard the guard removes, reproduced by hand
+        excess = flat - np.asarray(rf, dtype=float) / 365
+        downside = np.minimum(excess, 0.0)
+        unguarded = excess.mean() / math.sqrt(float(np.mean(downside ** 2))) * math.sqrt(365)
+        assert unguarded < -1.0
+
+    def test_varies(self):
+        assert dashboard._varies(_RETURNS)
+        assert not dashboard._varies(pd.Series([0.0] * 5))
+        assert not dashboard._varies(pd.Series([], dtype=float))
+        assert not dashboard._varies(pd.Series([np.nan, np.nan]))
+        assert not dashboard._varies(pd.Series([0.01, np.nan, 0.01]))
+
+    def test_a_rate_of_the_wrong_length_raises(self):
+        # Positional, so a misaligned array is an error, never a silent
+        # broadcast or an index alignment into NaN
+        short = np.full(len(_RETURNS) - 1, 0.05)
+        with pytest.raises(ValueError):
+            dashboard._sharpe(_RETURNS, rf=short)
+        with pytest.raises(ValueError):
+            dashboard._sortino(_RETURNS, rf=short)
+
+    def test_the_hurdle(self):
+        dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(6)]
+        assert dashboard._rf_hurdle(None, dates) == 0.0
+        assert list(dashboard._rf_hurdle(_rates(), dates)) == [0.03, 0.03, 0.03, 0.05, 0.05,
+                                                               0.05]
+        unavailable = RiskFreeRates((), SOURCE_UNAVAILABLE, None)
+        assert list(dashboard._rf_hurdle(unavailable, dates)) == [0.0] * 6
+
+    def test_a_filtered_frame_is_read_by_position(self):
+        # _view_payload cuts a curve to the page's axis without resetting its
+        # index: the hurdle must follow the rows, not the index labels
+        eq = make_equity([1000.0, 1000.0, 1010.0, 1004.0, 1020.0, 1015.0, 1030.0, 1025.0])
+        cut = eq[eq.index >= 2]
+        assert cut.index[0] == 2
+        rates = _rates()
+        on_cut = dashboard._performance_kpis(cut, [make_trade()], 1000.0, risk_free=rates)
+        on_reset = dashboard._performance_kpis(cut.reset_index(drop=True), [make_trade()],
+                                               1000.0, risk_free=rates)
+        assert on_cut == on_reset
+        cards = {key: value for key, _, value, _ in on_cut}
+        sharpe, sortino = _hand_ratios(cut["daily_return"], rates.annual_on(cut["date"]), 365)
+        assert (cards["sharpe"], cards["sortino"]) == (f"{sharpe:.2f}", f"{sortino:.2f}")
+        assert cards["sharpe"] != "nan"
+
+
+# ^GSPC closes for the risk-free page: eight trading days around the second
+# auction, so the S&P row's rate changes inside its window too
+_RF_SP_INDEX = pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+                               "2026-01-09", "2026-01-12", "2026-01-13", "2026-01-14"])
+_RF_SP_CLOSE = [100.0, 101.0, 99.5, 102.0, 101.2, 103.0, 102.1, 104.0]
+
+# The benchmark table's S&P row: (return, Sharpe)
+_RF_SP_ROW = re.compile(r"font-weight:400'>S&P 500</td><td style='padding:8px 16px;'>"
+                        r"([^<]*)</td><td style='padding:8px 16px;'>([^<]*)</td>")
+
+
+def _rf_page(monkeypatch, tmp_path, sweep: BacktestSweep,
+             risk_free: RiskFreeRates | None) -> str:
+    """A whole page of `sweep` (TestFilterPage._page's call) with `risk_free`,
+    and ^GSPC stubbed to _RF_SP_CLOSE so the benchmark's S&P row renders."""
+    monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(dashboard.yf, "download", lambda *a, **k: pd.DataFrame(
+        {"Close": _RF_SP_CLOSE}, index=_RF_SP_INDEX))
+    out = dashboard.generate_dashboard(sweep.primary.trades, sweep.primary.equity_df,
+                                       _FLT_START, 1000.0, sweep=sweep, interval_discount=0.75,
+                                       series_categories=_FLT_SERIES, risk_free=risk_free)
+    return out.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="class")
+def rf_pages(tmp_path_factory):
+    """(sweep, rates, {"rf": page with the rates, "zero": page without}) —
+    one _ex_sweep (a band sweep with a size-cap sweep: every section that
+    shows a ratio has data) rendered both ways."""
+    sweep, rates = _ex_sweep(), _rates()
+    pages = {}
+    with pytest.MonkeyPatch.context() as mp:
+        for name, rf in (("rf", rates), ("zero", None)):
+            pages[name] = _rf_page(mp, tmp_path_factory.mktemp(name), sweep, rf)
+    return sweep, rates, pages
+
+
+class TestRiskFreeReachesEveryRatio:
+    """generate_dashboard(risk_free=...) reaches every Sharpe and Sortino on
+    the page: the performance cards, both benchmark rows, the per-k table
+    (static and walked), every filter-bar chunk and the scenario explorer.
+    Each figure is checked against its own curve's rf-adjusted value AND
+    against the same page built without rates, so a dropped pass-through —
+    which would silently compute at 0% — fails here."""
+
+    @staticmethod
+    def _expected(eq: pd.DataFrame, rates: RiskFreeRates) -> tuple[str, str]:
+        return (f"{dashboard._sharpe(eq['daily_return'], rf=rates.annual_on(eq['date'])):.2f}",
+                f"{dashboard._sortino(eq['daily_return'], rf=rates.annual_on(eq['date'])):.2f}")
+
+    def test_the_performance_cards(self, rf_pages):
+        sweep, rates, pages = rf_pages
+        eq = sweep.primary.equity_df
+        sharpe, sortino = self._expected(eq, rates)
+        assert _page_kpi(pages["rf"], "sharpe")[0] == sharpe
+        assert _page_kpi(pages["rf"], "sortino")[0] == sortino
+        assert _page_kpi(pages["zero"], "sharpe")[0] == f"{dashboard._sharpe(eq['daily_return']):.2f}"
+        assert _page_kpi(pages["zero"], "sortino")[0] \
+            == f"{dashboard._sortino(eq['daily_return']):.2f}"
+        assert _page_kpi(pages["rf"], "sharpe")[0] != _page_kpi(pages["zero"], "sharpe")[0]
+        assert _page_kpi(pages["rf"], "sortino")[0] != _page_kpi(pages["zero"], "sortino")[0]
+
+    def test_both_benchmark_rows(self, rf_pages):
+        sweep, rates, pages = rf_pages
+        strategy = {name: re.search(r'<td id="bench-sharpe"[^>]*>([^<]*)</td>', page).group(1)
+                    for name, page in pages.items()}
+        assert strategy["rf"] == self._expected(sweep.primary.equity_df, rates)[0]
+        assert strategy["rf"] != strategy["zero"]
+        # The S&P row: the same bill's yield on its own TRADING days, per
+        # trading day (rf / 252), by hand
+        sp_daily = pd.Series(_RF_SP_CLOSE, index=_RF_SP_INDEX).pct_change().dropna()
+        hurdle = rates.annual_on(sp_daily.index)
+        assert len(set(hurdle)) == 2
+        sp = {name: _RF_SP_ROW.search(page).group(2) for name, page in pages.items()}
+        assert sp["rf"] == f"{_hand_ratios(sp_daily, hurdle, 252)[0]:.2f}"
+        assert sp["zero"] == f"{_hand_ratios(sp_daily, np.zeros(len(sp_daily)), 252)[0]:.2f}"
+        assert sp["rf"] != sp["zero"]
+
+    def test_the_per_k_table_static_and_walked(self, rf_pages):
+        sweep, rates, pages = rf_pages
+        expected = [self._expected(pt.equity_df, rates)[0] for pt in sweep.points]
+        # Static: the section's own form, from the sweep's points
+        static_rf, _ = _kd_table(_section_interval_discount(sweep, risk_free=rates))
+        static_zero, _ = _kd_table(_section_interval_discount(sweep))
+        assert [row[-1] for row in static_rf] == expected
+        assert [row[-1] for row in static_zero] \
+            == [f"{dashboard._sharpe(pt.equity_df['daily_return']):.2f}" for pt in sweep.points]
+        assert [row[-1] for row in static_rf] != [row[-1] for row in static_zero]
+        # Walked: the base block's rows at every k and cap, and the table the
+        # page renders from them
+        for name in ("rf", "zero"):
+            kd = TestFilterPage._data(pages[name])["kd"]
+            _, pc = kd["primary"]
+            assert _kd_table(pages[name])[0] == kd["rows"][pc]
+        kd = TestFilterPage._data(pages["rf"])["kd"]
+        kd_zero = TestFilterPage._data(pages["zero"])["kd"]
+        for ci, cap in enumerate(_EX_CAPS):
+            for ki, k in enumerate((0.6, 0.75)):
+                point = sweep.cap_sweep.points[(_KC_B0, k, cap)]["all"]
+                assert kd["rows"][ci][ki][-1] == self._expected(point.equity_df, rates)[0]
+                assert kd["rows"][ci][ki][-1] != kd_zero["rows"][ci][ki][-1]
+
+    def test_every_chunk(self, rf_pages):
+        sweep, rates, pages = rf_pages
+        base = TestFilterPage._data(pages["rf"])
+        chunks = TestFilterPage._chunks(pages["rf"])
+        base_zero = TestFilterPage._data(pages["zero"])
+        chunks_zero = TestFilterPage._chunks(pages["zero"])
+        pb, pk, pc = base["primary"]
+        # The primary chunk's view is the cards as rendered
+        view = _view(base, chunks, pb, pk, pc, "all")
+        assert view["kpi"]["sharpe"] == _page_kpi(pages["rf"], "sharpe")[0]
+        assert view["kpi"]["sortino"] == _page_kpi(pages["rf"], "sortino")[0]
+        assert view["bench"]["sharpe"] == self._expected(sweep.primary.equity_df, rates)[0]
+        # Every other scenario's chunk: its own curve's rf-adjusted figures.
+        # Not (no cap, k 0.75): _ex_sweep books that cell's curve on a 1,100
+        # balance under the 20% cell's very trades, which a chunk never sees —
+        # chunks are shared by trade list (_list_key), so it shows the 20% one
+        for ci, cap in enumerate(_EX_CAPS):
+            for ki, k in enumerate((0.6, 0.75)):
+                if (cap, k) == (1.0, 0.75):
+                    continue
+                point = sweep.cap_sweep.points[(_KC_B0, k, cap)]["all"]
+                view = _view(base, chunks, 0, ki, ci, "all")
+                assert (view["kpi"]["sharpe"], view["kpi"]["sortino"]) \
+                    == self._expected(point.equity_df, rates)
+                assert view["kpi"]["sharpe"] \
+                    != _view(base_zero, chunks_zero, 0, ki, ci, "all")["kpi"]["sharpe"]
+        # A category slice: its attributed curve, on its own dates
+        key = next(k for k in _view_keys(chunks[base["grid"][pb][pk][pc]]) if k != "all")
+        sliced = _view(base, chunks, pb, pk, pc, key)
+        sliced_zero = _view(base_zero, chunks_zero, pb, pk, pc, key)
+        assert sliced["kpi"]["sharpe"] != sliced_zero["kpi"]["sharpe"]
+        # The empty view (a selection with no trade) stays 0.00 at any rate
+        assert base["empty"]["kpi"]["sharpe"] == base["empty"]["kpi"]["sortino"] == "0.00"
+
+    def test_the_scenario_explorer(self, rf_pages):
+        sweep, rates, pages = rf_pages
+        rows = {}
+        for name, page in pages.items():
+            section = _ex_section(page)
+            data, cap = _scn_data(section), _scn_cap(section)
+            ts = data["populations"].index("time_series")
+            pb, pk, _ = data["primary"]
+            rows[name] = (cap["cells"][pb][pk][ts], cap["matrices"]["sharpe"][pb][pk],
+                          cap["cells"][1][0][ts], cap["same_title"])
+        point = sweep.cap_sweep.points[(_KC_B0, 0.75, 0.2)]["time_series"]
+        expected = dashboard._point_kpis(point, risk_free=rates)
+        row, sharpe, flat, same_title = rows["rf"]
+        assert row["sharpe"] == pytest.approx(expected["sharpe"])
+        assert row["sortino"] == pytest.approx(expected["sortino"])
+        assert sharpe == pytest.approx(expected["sharpe"])
+        assert row["sharpe"] != pytest.approx(rows["zero"][0]["sharpe"])
+        assert row["sortino"] != pytest.approx(rows["zero"][0]["sortino"])
+        # The same-title row takes the rates too ...
+        assert same_title["sharpe"] == pytest.approx(
+            dashboard._point_kpis(sweep.cap_sweep.same_title()[0.2], risk_free=rates)["sharpe"])
+        assert same_title["sharpe"] != pytest.approx(rows["zero"][3]["sharpe"])
+        # ... and a cell that traded nothing still reads 0.0, not -1e16
+        assert flat["trades"] == 0 and flat["sharpe"] == 0.0 and flat["sortino"] == 0.0
+
+    def test_the_explorer_built_from_the_sweep_takes_the_rates(self):
+        # The section's own fallback (_explorer_from_sweep), as a direct call
+        sweep, rates = _ex_sweep(), _rates()
+        section = _section_scenario_explorer(sweep, risk_free=rates)
+        data, cap = _scn_data(section), _scn_cap(section)
+        ts = data["populations"].index("time_series")
+        pb, pk, _ = data["primary"]
+        point = next(p for p in sweep.scenarios if p.population == "time_series"
+                     and p.spread_band == _KC_B0 and p.k == 0.75)
+        assert cap["cells"][pb][pk][ts]["sharpe"] == pytest.approx(
+            dashboard._point_kpis(point, risk_free=rates)["sharpe"])
+        assert cap["cells"][pb][pk][ts]["sharpe"] != pytest.approx(
+            dashboard._point_kpis(point)["sharpe"])
+
+
+def _view_keys(chunk: dict) -> list[str]:
+    """A chunk's view keys ("all", then its categories' and tags')."""
+    return list(chunk["list"]["views"])
+
+
+class TestRiskFreeHeader:
+    """One header line names the rate every ratio subtracts — on every page,
+    in four states (DR-66: absence is never the only signal)."""
+
+    _EQ = make_equity([1000.0, 1000.0, 1010.0, 1004.0, 1020.0, 1015.0, 1030.0, 1025.0])
+
+    def test_none_supplied(self):
+        line = dashboard._risk_free_html(None, self._EQ)
+        assert line == ('<p style="color:#616161; font-size:14px;">Risk-free rate: none '
+                        "supplied — every Sharpe and Sortino ratio on this page subtracts "
+                        "0%.</p>")
+
+    def test_unavailable(self):
+        line = dashboard._risk_free_html(RiskFreeRates((), SOURCE_UNAVAILABLE, None), self._EQ)
+        assert line.startswith('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+                               "Risk-free rate unavailable:")
+        assert ("could not be reached and no earlier download is saved, so every Sharpe and "
+                "Sortino ratio on this page subtracts 0% instead of the 8-week bill's yield."
+                ) in line
+
+    def test_downloaded(self):
+        rates = _rates()
+        line = dashboard._risk_free_html(rates, self._EQ)
+        average = float(np.mean(rates.annual_on(self._EQ["date"])))
+        assert f"{average:.2%}" == "4.25%"    # 3 days at 3%, 5 at 5%
+        assert line == (
+            '<p style="color:#616161; font-size:14px;">Risk-free rate: the 8-week Treasury '
+            "bill's auction yield (high_investment_rate, Treasury Fiscal Data) in force on "
+            "each day — the latest auction on or before it — is subtracted in every Sharpe "
+            "and Sortino ratio on this page. It averaged 4.25% over this window. Latest "
+            "auction 2026-01-08: 5.000% (downloaded 2026-09-27 06:30 UTC).</p>")
+
+    def test_cached(self):
+        line = dashboard._risk_free_html(_rates(SOURCE_CACHE), self._EQ)
+        assert line.startswith('<p style="color:#E65100; font-size:14px; font-weight:700;">'
+                               "Risk-free rate: the 8-week Treasury bill's auction yield")
+        assert "It averaged 4.25% over this window." in line
+        assert line.endswith(
+            " The API could not be reached: these are the yields downloaded 2026-09-27 06:30 "
+            "UTC, whose latest auction (2026-01-08, 5.000%) stands for every day after it.</p>")
+
+    def test_the_download_time_is_shown_in_utc(self):
+        from datetime import timezone
+        eastern = datetime(2026, 9, 27, 2, 30, tzinfo=timezone(timedelta(hours=-4)))
+        line = dashboard._risk_free_html(_rates(fetched_at=eastern), self._EQ)
+        assert "(downloaded 2026-09-27 06:30 UTC)" in line
+        assert "at a time not recorded" in dashboard._risk_free_html(
+            _rates(fetched_at=None), self._EQ)
+
+    def test_the_first_auction_note_only_before_it(self):
+        note = "The 8-week bill was first auctioned on 2026-01-01; earlier days use"
+        assert note not in dashboard._risk_free_html(_rates(), self._EQ)
+        early = make_equity([1000.0, 1001.0, 999.0, 1003.0, 1002.0, 1004.0],
+                            start=date(2025, 12, 29))
+        line = dashboard._risk_free_html(_rates(), early)
+        assert note in line
+        # Before the first auction a day takes that auction's yield: 3% from
+        # 2025-12-29 to 2026-01-03
+        assert "It averaged 3.00% over this window." in line
+        # An empty curve: no average, no note
+        assert "averaged" not in dashboard._risk_free_html(_rates(), self._EQ.iloc[:0])
+
+    @pytest.mark.parametrize("risk_free, words", [
+        (None, "Risk-free rate: none supplied"),
+        (_rates(), "Risk-free rate: the 8-week Treasury bill"),
+        (RiskFreeRates((), SOURCE_UNAVAILABLE, None), "Risk-free rate unavailable"),
+    ])
+    def test_it_sits_under_the_run_settings_line(self, monkeypatch, tmp_path, risk_free,
+                                                 words):
+        kwargs = {} if risk_free is None else {"risk_free": risk_free}
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, **kwargs)
+        assert (page.index("Period:") < page.index("Primary spread band:")
+                < page.index(words) < page.index("Portfolio Performance"))
+        assert page.count("Risk-free rate") == 1
+
+
+class TestRiskFreeIsThreaded:
+    """AST pin over dashboard.py: every _sharpe / _sortino call passes rf, and
+    every in-module call to a function (or class) taking a keyword-only
+    `risk_free` passes it. Without this, a dropped pass-through computes that
+    path at 0% silently and the page disagrees with itself."""
+
+    # What the rule must find, so a refactor cannot make it vacuous
+    _EXPECTED = {
+        "_performance_kpis", "_section_performance", "_kd_cells", "_kd_from_points",
+        "_section_interval_discount", "_point_kpis", "_section_scenario_explorer",
+        "_strategy_row", "_section_benchmark", "_build_filter_grid", "_new_explorer_visitor",
+        "_explorer_fallback", "_explorer_from_sweep", "_view_payload", "_list_payload",
+        "generate_dashboard", "_KdVisitor", "_ExplorerVisitor", "_ChunkVisitor",
+    }
+
+    @staticmethod
+    def _kw_only_risk_free(tree: ast.Module) -> set[str]:
+        """Names of the functions — and classes, by their __init__ — with a
+        keyword-only parameter named risk_free."""
+        def takes_it(fn) -> bool:
+            return any(a.arg == "risk_free" for a in fn.args.kwonlyargs)
+
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "__init__" \
+                            and takes_it(item):
+                        found.add(node.name)
+            elif isinstance(node, ast.FunctionDef) and node.name != "__init__" \
+                    and takes_it(node):
+                found.add(node.name)
+        return found
+
+    @staticmethod
+    def _calls(tree: ast.Module, names: set[str]) -> list[tuple[str, ast.Call]]:
+        """Every call to one of `names`, by bare name or attribute."""
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                if name in names:
+                    out.append((name, node))
+        return out
+
+    def _violations(self, source: str) -> tuple[set[str], list[str]]:
+        tree = ast.parse(source)
+        takers = self._kw_only_risk_free(tree)
+        missing = [f"{name} (line {call.lineno})"
+                   for name, call in self._calls(tree, takers)
+                   if not any(kw.arg == "risk_free" for kw in call.keywords)]
+        return takers, missing
+
+    def test_every_ratio_call_passes_rf(self):
+        tree = ast.parse(inspect.getsource(dashboard))
+        calls = self._calls(tree, {"_sharpe", "_sortino"})
+        assert sum(name == "_sharpe" for name, _ in calls) >= 5
+        assert sum(name == "_sortino" for name, _ in calls) >= 2
+        missing = [f"{name} (line {call.lineno})" for name, call in calls
+                   if len(call.args) < 2 and not any(kw.arg == "rf" for kw in call.keywords)]
+        assert missing == []
+
+    def test_every_risk_free_taker_is_passed_it(self):
+        source = inspect.getsource(dashboard)
+        takers, missing = self._violations(source)
+        assert self._EXPECTED <= takers, sorted(self._EXPECTED - takers)
+        assert missing == []
+        # Every taker but the entry point is actually called in the module,
+        # so the rule above checked something for each
+        called = {name for name, _ in self._calls(ast.parse(source), takers)}
+        assert self._EXPECTED - {"generate_dashboard"} <= called
+
+    def test_the_rule_catches_a_dropped_pass_through(self):
+        source = ("class V:\n"
+                  "    def __init__(self, *, risk_free=None):\n"
+                  "        pass\n"
+                  "def f(x, *, risk_free=None):\n"
+                  "    return x\n"
+                  "def g(risk_free, dates):\n"
+                  "    return f(1, risk_free=risk_free), V(risk_free=risk_free), g(1, 2)\n"
+                  "def h():\n"
+                  "    return f(2), V()\n")
+        takers, missing = self._violations(source)
+        assert takers == {"V", "f"}
+        assert missing == ["f (line 9)", "V (line 9)"]
