@@ -4,14 +4,16 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures. Holds exactly one: an autouse guard that points
+    Suite-wide pytest fixtures. Holds two, both autouse: a guard that points
     the backtester's event-title accumulator at a per-test temporary directory,
     so no test can read, rewrite, migrate or delete the operator's real
-    backtest_cache/event_titles_v2.json or its legacy event_titles.json.
+    backtest_cache/event_titles_v2.json or its legacy event_titles.json; and a
+    guard that keeps every test off the Treasury API and the real rates cache.
 
 Dependencies:
     Imports kalshi_betting.historical (its _EVENT_TITLES_CACHE and
-    _LEGACY_EVENT_TITLES_CACHE module paths). Imported by pytest only.
+    _LEGACY_EVENT_TITLES_CACHE module paths) and kalshi_betting.treasury (its
+    _RATES_CACHE path and _get_json). Imported by pytest only.
 
 Notes:
     Before DR-51 four tests in test_historical.py (TestFetchAllSettledMarkets'
@@ -29,7 +31,7 @@ Notes:
 """
 import pytest
 
-from kalshi_betting import historical
+from kalshi_betting import historical, treasury
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +47,25 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
                         tmp_path / "event_titles_v2.json")
     monkeypatch.setattr(historical, "_LEGACY_EVENT_TITLES_CACHE",
                         tmp_path / "event_titles.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_treasury_rates(tmp_path, monkeypatch):
+    """
+    Keep every test off the Treasury API and away from the real rates cache.
+
+    The stub raises a plain RuntimeError, which api_call_with_retry treats as
+    fatal, so a test that reaches the loader falls through at once instead of
+    sleeping through the retry backoff.
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the real path and function
+            afterwards.
+    """
+    monkeypatch.setattr(treasury, "_RATES_CACHE", tmp_path / "treasury_bill_rates.json")
+
+    def _offline(url):
+        raise RuntimeError("the Treasury API is not reachable from the test suite")
+
+    monkeypatch.setattr(treasury, "_get_json", _offline)
