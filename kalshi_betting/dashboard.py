@@ -358,6 +358,7 @@ from .backtester import (
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
+    FLAT_RETURN_TOLERANCE,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -380,21 +381,31 @@ DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 def _varies(returns: pd.Series) -> bool:
     """
-    Whether a returns series takes more than one value (NaNs ignored).
+    Whether a curve's daily returns actually move (missing values ignored).
 
-    The flat-curve guard _sharpe and _sortino run first: neither ratio is
-    defined on a curve that never moves. With a nonzero rf a flat curve's
-    excess return is a constant whose float std can come out ~1e-20 rather
-    than 0, which would read as a huge negative Sharpe, and _sortino would
-    count every flat day as downside.
+    Sharpe and Sortino divide the average return by how much the returns
+    swing. If a curve never moves (a run with no trades), there is no swing
+    to divide by, so neither ratio means anything; both functions check this
+    first and report 0.0 instead.
+
+    Skipping the ratio outright, rather than letting the division run, matters
+    because of how computers store decimals. Subtract a nonzero risk-free
+    rate from a flat curve and every day becomes the same small negative
+    number, whose swing should be exactly zero but can come out as a tiny
+    rounding error (around 0.00000000000000000001). Dividing by that would
+    report a nonsensical Sharpe of minus several quadrillion.
+
+    "Moves" means the largest and smallest returns differ by more than
+    config.FLAT_RETURN_TOLERANCE, so float noise alone never counts.
 
     Args:
         returns (pd.Series): Per-period returns.
 
     Returns:
-        bool: False for a flat, empty or all-NaN series.
+        bool: False for a flat, empty or all-missing series.
     """
-    return bool(returns.max() > returns.min())
+    # A NaN range (empty or all-missing) compares False
+    return bool(returns.max() - returns.min() > FLAT_RETURN_TOLERANCE)
 
 
 def _sum_on_days(keys: np.ndarray, values: np.ndarray, days: np.ndarray) -> np.ndarray:
@@ -450,9 +461,14 @@ def _deployed_on_days(trades: list[BacktestTrade], days: np.ndarray, *,
     The capital tied up in open trades on each row, for rows given as day numbers.
 
     The one definition of capital in open trades: with fees for the Risk
-    section's chart (_capital_deployed), without them for the risk-free
-    hurdle (_rf_hurdle), whose share must be the cost basis the portfolio
-    value carries. A row counts every trade with entry <= its date < exit.
+    section's chart (_capital_deployed), which shows everything a trade
+    cost; without them for the risk-free hurdle (_rf_hurdle). The hurdle
+    asks what the money sitting in open trades could have earned in T-bills
+    instead. A fee is not sitting anywhere: it left the account on the entry
+    day and is already a loss in the curve, and the portfolio value (the
+    hurdle's denominator) no longer holds it. Charging the yield on it too
+    would count it twice, and could push the charged share above 100% of
+    the account. A row counts every trade with entry <= its date < exit.
     Dates are matched EXACTLY against the rows' days: an entry or exit on no
     row never adds or subtracts, and a non-date matches no row (_trade_day).
     Each row is floored at 0 but the running sum is not, so a trade entered
@@ -499,8 +515,9 @@ def _rf_hurdle(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame,
     0%), so only the capital in open trades is charged: row t's hurdle is
     annual_t x open[t-1] / portfolio_value[t-1] (0 on row 0), annual_t being
     the yield in force on row t's date and open the cost of every trade with
-    entry <= date < exit WITHOUT fees — the cost basis the portfolio value
-    carries, its fees already spent. A trade is thus charged for exactly
+    entry <= date < exit WITHOUT fees: fees were paid out on the entry day
+    and are already a loss in the curve, so they hold no money that could
+    have earned the yield (see _deployed_on_days). A trade is thus charged for exactly
     exit - entry days (a same-day trade nothing), and the share is at most 1
     wherever cash >= 0, i.e. on every simulated curve; a category or tag
     slice whose cash goes negative is charged above 1, as borrowing. A row

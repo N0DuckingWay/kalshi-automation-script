@@ -8473,6 +8473,26 @@ class TestRiskFreeHurdle:
         assert not dashboard._varies(pd.Series([np.nan, np.nan]))
         assert not dashboard._varies(pd.Series([0.01, np.nan, 0.01]))
 
+    def test_float_noise_alone_is_not_movement(self):
+        # A range at or under config.FLAT_RETURN_TOLERANCE is noise, never a move
+        tol = config.FLAT_RETURN_TOLERANCE
+        assert not dashboard._varies(pd.Series([0.0, 1e-17, -1e-17, 0.0]))
+        assert not dashboard._varies(pd.Series([0.0, tol]))
+        # ...while a real move, however small, still counts
+        assert dashboard._varies(pd.Series([0.0, 10 * tol]))
+        assert dashboard._varies(pd.Series([0.0, 1e-9]))
+
+    def test_a_noise_only_curve_reads_zero_not_an_absurd_ratio(self):
+        # Returns that differ only by float noise, with a rate subtracted: an
+        # exact max > min test would let them through and divide by a std of
+        # ~1e-17
+        noisy = pd.Series([0.0, 1e-17, -1e-17] * 100)
+        excess = noisy - 0.05 / 365
+        unguarded = excess.mean() / excess.std() * math.sqrt(365)
+        assert abs(unguarded) > 1e6
+        assert dashboard._sharpe(noisy, rf=0.05) == 0.0
+        assert dashboard._sortino(noisy, rf=0.05) == 0.0
+
     def test_a_rate_of_the_wrong_length_raises(self):
         # Positional, so a misaligned array is an error, never a silent
         # broadcast or an index alignment into NaN

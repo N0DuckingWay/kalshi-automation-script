@@ -1009,6 +1009,14 @@ TREASURY_API_TIMEOUT_SECONDS: int = 30
 # history fits one page)
 TREASURY_API_PAGE_SIZE: int = 1000
 TREASURY_API_MAX_PAGES: int = 20
+# How far apart a curve's largest and smallest daily return must be for the
+# dashboard to compute a Sharpe or Sortino at all (dashboard._varies): a curve
+# whose returns differ by less than this never really moved, and its ratios
+# read 0.0. A tolerance rather than rounding, since rounding can split two
+# nearly equal returns across a rounding boundary. 1e-12 of the balance is
+# $0.00000001 on $10,000, far below any real day's move and far above the
+# float noise the equity curve can carry (~1e-16 of the balance).
+FLAT_RETURN_TOLERANCE: float = 1e-12
 
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair
