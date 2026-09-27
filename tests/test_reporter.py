@@ -1,6 +1,6 @@
 """Tests for reporter.py — sidecar locking, atomic save, and lock-timeout
-fallback around append_to_prod_log() (BS-18), the run note main.py appends to
-the separator row on both paths (the run's live toggles), plus the row/Notes/candidates
+fallback around append_to_prod_log() (BS-18), the run note (main._run_prod's
+live toggles) it appends to the separator row on both paths, plus the row/Notes/candidates
 sheet layout after the 2026-09 strategy change (side-neutral x/y headers, the
 "[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]] " Notes prefix, and the "nB (NO
 ask)" candidates column). All tests run offline against tmp_path; no real
@@ -295,7 +295,7 @@ class TestSeparatorRunNote:
     """append_to_prod_log's run_note (main._run_prod passes the run's live
     toggles) is appended to the separator banner on BOTH paths — the shared
     log and the lock-timeout fallback file — never as a column; with no note
-    the banner is exactly what it always was."""
+    the banner ends at its trade count."""
 
     _NOTE = "settings: tier floors off | spread band 0-0.5 | k 0.8"
     _BANNER = re.compile(

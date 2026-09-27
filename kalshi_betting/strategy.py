@@ -10,12 +10,10 @@ Purpose:
     directional bet priced on config.time_series_profit_prob.
 
 Dependencies:
-    config (constants, fee helpers, the probability model, and the run's
-    toggles: LiveSettings, live_settings — resolved only by compute_trade when
-    handed none — and pair_size_cap, the one per-pair cap definition, shared
-    with the backtester) and scanner (CandidatePair, leg_prices/leg_sides,
-    book-pricing helpers). TradeSpec is consumed by trader and reporter; main
-    calls compute_trade — handing it the run's LiveSettings — and
+    config (constants, fee helpers, the probability model, LiveSettings,
+    live_settings, pair_size_cap) and scanner (CandidatePair,
+    leg_prices/leg_sides, book-pricing helpers). TradeSpec is consumed by
+    trader and reporter; main calls compute_trade and
     select_portfolio. backtester and dashboard do NOT import this module: they
     share config's probability model, fee helpers and constants, but
     re-implement the Kelly formula (net spread, b with the fee in its
@@ -27,13 +25,8 @@ Notes:
     same_title, (pA, nB) for time_series. cost_with_fees_a/_b are per MARKET,
     not per side — trader funds each market's exchange shard from them.
 
-    k (the time-series interval discount) and the per-trade caps come from ONE
-    config.LiveSettings per call: compute_trade resolves it once (config.py's
-    when handed none) and hands it to every internal helper, which require it,
-    so a run's settings can never apply at one size and config.py at another.
-    Enrichment's affordability bound (config.max_kelly_fraction) reads the
-    same object on a live run, which is what keeps it an upper bound on the
-    size solved here.
+    k and the per-pair caps come from one config.LiveSettings per call, which
+    compute_trade hands to both sizing paths (config.py's when handed none).
 """
 import logging
 from dataclasses import dataclass
@@ -86,9 +79,7 @@ class TradeSpec:
         monthly_profit_ratio (float): profit_ratio scaled to 30 days; the
             portfolio ranking key.
         kelly_p (float): Probability of profit, in (0, 1].
-        kelly_fraction (float): Kelly fraction, capped at the run's per-pair
-            cap: config.pair_size_cap(pair_type, settings.size_cap,
-            settings.same_title_size_cap).
+        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
         cost_with_fees_a (float): market_a's leg cost including its exact fee.
         cost_with_fees_b (float): market_b's leg cost including its exact fee.
             The two sum to total_cost_with_fees; both default to 0.0.
@@ -131,8 +122,7 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float:
     for pairs the scanner confirmed ask one question — same wording, different
     series, closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS (DR-02, DR-74).
 
-    time_series: config.time_series_profit_prob(pA, pB, k) = 1 - k*(pB - pA),
-    with k the run's settings.interval_discount.
+    time_series: config.time_series_profit_prob(pA, pB, k) = 1 - k*(pB - pA).
     Given the cumulative-deadline premise (screened by wording, DR-67), the
     trade loses only if the event lands between the two deadlines; pB - pA is
     the market's price for that, and the model believes the fraction k of it
@@ -141,20 +131,13 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float:
     conservative estimate of that mass.
 
     The helper clamps pB - pA at zero, which would model a pair as riskless.
-    Enrichment refreshes pB from the later book and drops a time-series pair
-    that has no fresh reference (fail closed — the scan-time quote no longer
-    stands in), whose later book is crossed (its YES ask below its own YES
-    bid), or whose spread the run's rule refuses (config.
-    time_series_spread_refusal: not strictly positive at the YES fill's
-    affordability-capped size, under the entry floor, or over the band's
-    ceiling at the top of the book); compute_trade rejects non-tradeable pairs
-    first. Every qualifying level then sits below the fresh pB, so the clamp
-    cannot fire on an enriched pair.
+    Enrichment marks non-tradeable, and compute_trade skips, every time-series
+    pair whose fresh pB is missing or not above every YES fill the sizer can
+    reach, so the clamp cannot fire on an enriched pair.
 
     Args:
         pair (CandidatePair): Supplies pair_type, pA and pB.
-        settings (LiveSettings): The run's toggles; only interval_discount (k)
-            is read. Required, like every internal helper's.
+        settings (LiveSettings): The run's toggles; reads interval_discount (k).
 
     Returns:
         float: p in (0, 1], the "p" in compute_trade's Kelly formula.
@@ -174,19 +157,15 @@ def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float) -> float:
     Args:
         pair (CandidatePair): Supplies pair_type and pB.
         yes_leg_price (float): pA at the size being evaluated, in (0, 1).
-        k (float): The run's interval discount (LiveSettings.interval_discount),
-            in (0, 1]. Required and never None: None would make
-            config.time_series_profit_prob read its own constant and half-apply
-            a run's settings.
+        k (float): The run's interval discount, in (0, 1]. Never None, which
+            would read config's constant instead.
 
     Returns:
         float: p in (0, 1].
     """
     if pair.pair_type == "time_series":
         # Single shared definition of the time-series model — backtester and
-        # dashboard call the same helper so the three sizers cannot drift. The
-        # run's k, always passed: a missing k would silently read config's and
-        # half-apply a per-run override
+        # dashboard call the same helper so the three sizers cannot drift
         return time_series_profit_prob(yes_leg_price, pair.pB, k=k)
     return SAME_TITLE_CO_RESOLVE_PROB
 
@@ -206,8 +185,7 @@ class _Sizing(NamedTuple):
         p (float): Probability of profit at that price.
         profit_ratio (float): Reported return on contract cost at that price;
             not Kelly's b (see _evaluate_size).
-        kelly_fraction (float): Kelly fraction, capped at the run's per-pair
-            cap (config.pair_size_cap under the run's LiveSettings).
+        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
         budget_dollars (float): Contract-only budget the fee shrink measures against.
     """
     n: int
@@ -271,9 +249,7 @@ def _evaluate_size(
             means price on the stored scalars instead.
         n (int): Contract count to price at. Ignored when levels is empty.
         balance_cents (int): Account balance in integer cents.
-        settings (LiveSettings): The run's toggles: interval_discount prices
-            p, and size_cap / same_title_size_cap cap the Kelly fraction
-            (config.pair_size_cap). Required.
+        settings (LiveSettings): The run's toggles (k and the per-pair caps).
 
     Returns:
         _Sizing | None: The priced, Kelly-evaluated candidate, or None when any
@@ -328,10 +304,7 @@ def _evaluate_size(
         # No positive EV once fees are counted
         return None
 
-    # The run's cap for this pair type (config.pair_size_cap, the one
-    # definition, shared with the backtester and enrichment's bound):
-    # settings.size_cap, and for a same-title pair settings.same_title_size_cap
-    # too. A time-series f* already sits under 1 - k
+    # The one cap definition, shared with the backtester and enrichment's bound
     kelly_fraction_capped = min(
         pair_size_cap(pair.pair_type, settings.size_cap, settings.same_title_size_cap),
         kelly_fraction)
@@ -372,12 +345,10 @@ def _solve_marginal_size(
     because the gates bite hardest at full depth.
 
     Args:
-        pair (CandidatePair): The pair being sized; max_contracts bounds the
-            search.
+        pair (CandidatePair): The pair being sized; max_contracts bounds the search.
         levels (tuple): The pair's qualifying depth (non-empty).
         balance_cents (int): Account balance in integer cents.
-        settings (LiveSettings): The run's toggles, handed to every
-            _evaluate_size call. Required.
+        settings (LiveSettings): The run's toggles.
 
     Returns:
         _Sizing | None: The largest verified count, or None if none is supported.
@@ -418,10 +389,8 @@ def compute_trade(
         fee        = fee_per_pair_approx(price_a, price_b)
         net_spread = (1 - price_a - price_b) - fee
         b          = net_spread / (price_a + price_b + fee)   # dollars at risk
-        f*         = p - (1 - p) / b, capped at
-                     config.pair_size_cap(pair_type, settings.size_cap,
-                                          settings.same_title_size_cap)
-    with p priced at settings.interval_discount for a time-series pair.
+        f*         = p - (1 - p) / b, capped by config.pair_size_cap
+    with a time-series p priced at settings.interval_discount.
 
     The fee is in b's denominator because a losing pair loses its fees too
     (DR-62). f* > 0 means positive EV under the continuous fee approximation
@@ -433,11 +402,9 @@ def compute_trade(
         pair (CandidatePair): Must be tradeable. max_contracts 0 means not
             enriched (no depth cap).
         balance_cents (int): Account balance in cents.
-        settings (LiveSettings | None): Keyword-only. The run's toggles — k
-            and the per-pair caps are read from it, and it is handed to every
-            internal helper. main.py passes the run's own, the object
-            enrichment's affordability bound read, so the bound holds. None
-            resolves config.py's once, at call time (config.live_settings()).
+        settings (LiveSettings | None): Keyword-only. The run's toggles; pass
+            the object enrichment's affordability bound read. None resolves
+            config.live_settings() once.
 
     Returns:
         TradeSpec | None: None if the pair is not tradeable, a leg price is
@@ -449,12 +416,9 @@ def compute_trade(
         AttributeError/TypeError: If a market's close_time is None. Scanner
             pairs never have one (scanner._filter_active_markets drops them);
             only a hand-built pair can.
-        ValueError: From config.live_settings() when settings is None and one
-            of config.py's toggles is invalid.
+        ValueError: If settings is None and a config.py toggle is invalid.
     """
-    # The run's toggles, resolved ONCE and handed to both sizing paths, so k
-    # and the caps are one value for every size this call evaluates. main.py
-    # hands its run's own; a caller that passes none gets config.py's.
+    # Resolved once, so every size this call evaluates reads one k and cap
     settings = live_settings() if settings is None else settings
     if not pair.tradeable:
         return None

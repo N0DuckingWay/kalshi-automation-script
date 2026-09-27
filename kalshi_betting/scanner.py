@@ -24,13 +24,9 @@ Purpose:
     liquidity.
 
 Dependencies:
-    Imports constants, the leg-side tuples, and fee helpers from config.py —
-    with the live toggles' LiveSettings and the helpers that read it
-    (live_settings, live_time_series_floor, time_series_spread_refusal and its
-    SPREAD_* reasons, max_kelly_fraction, describe_time_series_rule), so the
-    finder, enrichment and validate_pair_price apply one run's time-series
-    entry rule through one definition — and the retry/raw-fetch helpers from
-    _http.py. Exports the CandidatePair and
+    Imports constants, the leg-side tuples, fee helpers and the live toggles
+    (LiveSettings and the helpers that read it) from config.py, and the
+    retry/raw-fetch helpers from _http.py. Exports the CandidatePair and
     ApiMarket dataclasses, the leg helpers leg_sides()/leg_prices()/
     deadline_gap_days() (the only source of truth for which side each leg
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
@@ -3238,31 +3234,18 @@ def find_time_series_pairs(
          order-independently by deadline_gap_days() for a cross-event pair and
          by the two STATED deadlines for a same-event ladder — one number
          either way afterwards, through pair_gap_days()
-      6. pB - pA passes the run's live spread rule,
-         config.time_series_spread_refusal — the one definition enrichment
-         and validate_pair_price apply too. Directional: the LATER contract
-         (B) — later by close_time for a cross-event pair, by STATED deadline
-         for a same-event ladder — must be priced strictly higher than the
-         earlier one (A), and by at least the entry floor
-         (config.live_time_series_floor): max(tier, band floor) with
-         settings.tier_floors on (the tier is 15% when the deadlines are
-         <= 15 days apart, 30% for 16-30 days), the band floor alone with them
-         off. That gap is the market-implied probability that the event first
-         happens between the two deadlines; the strategy disputes it. A
-         pricier or equally priced EARLIER contract is never a candidate —
-         there is no in-between mass to dispute — and is not counted; a gap
-         under the floor is counted on its own silent-at-zero line.
+      6. pB - pA strictly positive (B is the LATER contract; the gap is the
+         in-between mass the strategy disputes) and at or above the run's entry
+         floor (config.time_series_spread_refusal). A non-positive spread is
+         skipped uncounted; one under the floor is counted.
       7. Skips candidates whose leg ASK prices already sum to $1 or more. A
          win pays only $1, so such a pair cannot profit in any cell. It is not
          impossible: wide books quote it even on genuine ladders
          (KXDEFAULT-28DEC31/-29DEC31 at 0.11 + 0.96 on 2026-09-21). It only
          changes which NON-tradeable row represents a group, because tradeable
          already requires 1 - pA - nB > fee.
-      8. pB - pA at or under the spread band's ceiling. Tested right after
-         item 7, so a candidate refused by both still counts on the price-sum
-         line, and BEFORE the group's one-best contest below, so an in-band
-         runner-up represents a group whose widest candidate is refused — as
-         backtester._find_entry refuses the Monday.
+      8. pB - pA at or under the spread band's ceiling, refused before the
+         group's one-best contest below.
 
     Per normalized title+outcome key, keeps the single best pair (tradeable
     preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
@@ -3303,11 +3286,8 @@ def find_time_series_pairs(
             both run modes do. IGNORED when markets is supplied — which is what
             every caller does today, making the fallback unreachable. None
             excludes no shard.
-        settings (LiveSettings | None): Keyword-only. The run's live toggles;
-            the tier floors and the spread band decide item 6 and item 8.
-            main.py hands in its one per-run object; None resolves config.py's
-            once, at the top of the call, so every candidate is judged under
-            one rule. The rule is logged on every call.
+        settings (LiveSettings | None): Keyword-only. The run's toggles (items 6
+            and 8). None resolves config.live_settings() once.
 
     Returns:
         list: CandidatePair objects, one per normalized title+outcome group
@@ -3323,12 +3303,9 @@ def find_time_series_pairs(
             additionally carries stated_gap_days, the calendar-day gap between
             its two STATED deadlines; every other pair carries None there.
     """
-    # The run's toggles, resolved ONCE, so every candidate below is judged
-    # under one rule. main.py hands its per-run LiveSettings in; a caller that
-    # passes none gets config.py's.
+    # Resolved once, so every candidate below is judged under one rule
     settings = live_settings() if settings is None else settings
-    # ALWAYS logged. The admission rule depends on the run's settings, so the
-    # run must say which rule it applied (DR-66).
+    # Always logged: the admission rule depends on the run's settings (DR-66)
     logging.info("Time-series entry rule: %s",
                  describe_time_series_rule(settings.tier_floors, settings.spread_band))
 
@@ -3438,13 +3415,10 @@ def find_time_series_pairs(
     # run whose time-series zero it caused logged no cause; counted where it
     # fires, before the wording check, exactly as find_same_title_pairs
     # counts its own series skips. (The price-parse `continue` and the
-    # direction filter — a spread that is not strictly positive — further
-    # down stay uncounted, as they always were.)
+    # non-positive-spread `continue` further down stay uncounted.)
     series_skips = 0
-    # The live spread rule's two counted refusals (config.
-    # time_series_spread_refusal): a spread under the run's entry floor, and
-    # one above the spread band's ceiling. Cross-event candidates here; the
-    # ladder branch's own pair is below, per DR-73's ladder/cross split.
+    # The spread rule's counted refusals (below the floor, above the ceiling);
+    # a ladder candidate counts on ladder_floor/ceiling_skips instead (DR-73).
     floor_skips = 0
     ceiling_skips = 0
     # DR-73's same-event ladder branch keeps its OWN counters rather than
@@ -3676,25 +3650,13 @@ def find_time_series_pairs(
                 except (ValueError, TypeError):
                     continue
 
-                # The live time-series spread rule, one definition shared with
-                # enrichment and validate_pair_price
-                # (config.time_series_spread_refusal). It requires:
-                #   - pB - pA strictly positive (a pricier or equal EARLIER
-                #     contract has no in-between mass and is never a candidate);
-                #   - at or above the entry floor: max(tier, band floor) with the
-                #     tier floors on, the band floor alone with them off;
-                #   - at or under the band's ceiling.
-                # Same order and PRICE_EPSILON placement as
-                # backtester._find_entry's per-Monday tests (TS-09). The ceiling
-                # is acted on below the $1 guard, so a pair refused by both
-                # still counts where it always did.
+                # The spread rule, in backtester._find_entry's order and PRICE_EPSILON
+                # placement (TS-09).
                 # Directional, never abs(): mA is always the EARLIER contract —
                 # by close_time for a cross-event pair (the sort above), by
                 # STATED deadline for a same-event ladder (swapped inside the
-                # branch above, because that sort cannot order one) — and abs()
-                # would let a pricier earlier contract through as an
-                # untradeable placeholder that could still win the group's
-                # one-pair-per-title slot below.
+                # branch above); abs() would let a pricier earlier contract win
+                # the group's one-pair slot below as an untradeable placeholder.
                 refusal = time_series_spread_refusal(pB - pA, gap_days, settings)
                 if refusal == SPREAD_NOT_POSITIVE:
                     continue
@@ -3740,9 +3702,9 @@ def find_time_series_pairs(
                     continue
 
                 if refusal == SPREAD_ABOVE_CEILING:
-                    # Refused BEFORE the group's one-best contest below, exactly
-                    # as backtester._find_entry refuses the Monday, so an in-band
-                    # runner-up can represent the group
+                    # After the $1 guard, so a pair refused by both counts there; before
+                    # the one-best contest, as backtester._find_entry refuses the Monday,
+                    # so an in-band runner-up can represent the group
                     if stated_gap is not None:
                         ladder_ceiling_skips += 1
                     else:
@@ -3844,9 +3806,8 @@ def find_time_series_pairs(
             "Time-series candidates skipped for a leg price sum at or above $1: %d",
             price_sum_skips,
         )
-    # The live spread rule's two counted refusals, silent at zero like every
-    # line above. The rule's text is the always-logged "Time-series entry
-    # rule" line's own, so the two can never describe different floors.
+    # Silent at zero. The floor lines print the entry-rule line's own text, so
+    # they cannot describe a different floor.
     rule_text = describe_time_series_rule(settings.tier_floors, settings.spread_band)
     if floor_skips:
         logging.info("Time-series candidates refused below the entry floor (%s): %d",
@@ -4452,10 +4413,8 @@ def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
 
     Returns:
         float | None: The lowest YES ask on the non-YES-leg market, or None
-            when that side carries no usable resting bids. On None, a
-            same-title caller keeps the pair's scan-time value; a time-series
-            pair fails CLOSED in both enrichment and validate_pair_price,
-            because nothing then prices its in-between mass.
+            when that side carries no usable resting bids: a same-title pair
+            keeps its scan-time value, a time-series pair is dropped.
     """
     # leg_sides is the only source of truth for which market carries the YES
     # leg: YES on A for time_series, YES on B for same_title
@@ -4718,29 +4677,19 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
     The sum is over the two LEG prices (the YES leg's YES ask plus the NO leg's
     NO ask, whichever markets those sit on). same_title pairs use the flat
     SAME_TITLE_MIN_PRICE_DIFF threshold (sum <= 1 - SAME_TITLE_MIN_PRICE_DIFF).
-    time_series pairs use 1 - the run's entry floor,
-    config.live_time_series_floor: with settings.tier_floors on, the floor is
-    max(tier, band floor) (sum <= 1 - MIN_PRICE_DIFF_SHORT_GAP when the
+    time_series pairs use 1 - the run's entry floor
+    (config.live_time_series_floor), the leg-price-sum ceiling
+    backtester._find_entry applies. With the tier floors on that floor is
+    max(tier, band floor); at no band, sum <= 1 - MIN_PRICE_DIFF_SHORT_GAP when the
     deadlines are <= SHORT_DEADLINE_GAP_DAYS apart, sum <= 1 -
-    MIN_PRICE_DIFF_LONG_GAP for wider gaps up to MAX_DEADLINE_GAP_DAYS, at
-    no band); with them off it is the band floor alone (a sum ceiling of 1.0
-    at a floor of 0) — exactly the leg-price-sum ceiling
-    backtester._find_entry applies. The gap comes from pair_gap_days(), which
-    is order-independent, so the ceiling does not depend on which leg closes
-    first — and which returns the pair's STATED deadline gap for a same-event
-    ladder (DR-73), whose rungs can share a close_time entirely. It is the one
-    definition of the price-sum ceiling: enrichment and validate_pair_price
-    both read it here. It is not the only downstream site that re-derives the
-    floor — both of those also apply the spread rule
-    (config.time_series_spread_refusal), and enrichment prints the floor in
-    its below-floor WARNING — but every one of them reads the gap through
-    pair_gap_days.
+    MIN_PRICE_DIFF_LONG_GAP up to MAX_DEADLINE_GAP_DAYS. With them off it is the
+    band floor alone. This is the live path's one definition of the price-sum
+    ceiling (enrichment and validate_pair_price); _find_entry mirrors it with
+    its own 1 - threshold.
 
     Args:
         pair (CandidatePair): The pair whose ceiling is needed.
-        settings (LiveSettings): The run's toggles. Required: a default would
-            let one site read config.py while the run's override applies at
-            another.
+        settings (LiveSettings): The run's toggles.
 
     Returns:
         float: Maximum qualifying yes_price + no_price sum (dollars, 0-1).
@@ -4751,41 +4700,28 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
         # otherwise (DR-73). Re-deriving it from close_time here would
         # re-tier a ladder the finder already tiered.
         gap_days = pair_gap_days(pair)
-        # 1 - the run's entry floor: max(tier, band floor), or the band floor
-        # alone with the tier floors off (1.0 at a floor of 0)
+        # The floor config.time_series_spread_refusal applies, so the two agree
         return 1.0 - live_time_series_floor(gap_days, settings)
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
 
 def _levels_with_edge_after_fee(qualifying: list) -> list:
     """
-    Cut a pair's qualifying levels at the first one with no edge left after
-    the fee.
+    Cut a pair's qualifying levels at the first one with no edge left after the fee.
 
-    The edge after fee, 1 - yes - no - fee_per_pair_approx(yes, no), strictly
-    decreases in both leg prices, and the levels ascend by combined price, so
-    what remains is a contiguous prefix and FoK prefix pricing stays valid. It
-    removes nothing while the price-sum ceiling leaves more edge than any fee
-    (1 - max_sum >= 0.05 > 0.035, the largest fee_per_pair_approx): every
-    same-title pair, and every time-series pair whose entry floor is at least
-    0.035. At a floor of 0 (tier floors off, the shipped default since the
-    operator decision of 2026-09-27) the price-sum ceiling is 1.0, and this cut
-    is the only thing that keeps a level with no edge out of a pair. The one
-    definition: enrichment applies it before pricing (without it, no-edge
-    levels drag the prefix average under the profitability line and drop a
-    pair a Kelly-sized trade profits on — #51 again), and validate_pair_price
-    applies it to the freshly fetched books before counting reachable depth
-    (without it, a book that moved a tick against a thin-edge spec still
-    passes, and the FoK caps' one tick of slippage per leg fills it where every
-    settlement cell loses).
+    The edge, 1 - yes - no - fee_per_pair_approx(yes, no), falls as either leg
+    price rises, and neither falls along the levels (the _pair_orderbooks
+    sweep), so the cut drops only no-edge levels and FoK prefix pricing stays
+    valid. It binds only when 1 - max_sum is under 0.035, the largest
+    fee_per_pair_approx (as at a time-series floor of 0). The one definition:
+    enrichment prices with it (#51), validate_pair_price re-checks with it.
 
     Args:
         qualifying (list): (yes_price, no_price, qty) levels in SIDE order,
             ascending by combined price, already under the price-sum ceiling.
 
     Returns:
-        list: The longest prefix of those levels whose every level still has an
-            edge after the fee; empty when the first one has none.
+        list: The longest prefix whose every level keeps an edge after the fee.
     """
     return list(itertools.takewhile(
         lambda lvl: (1.0 - lvl[0] - lvl[1]) > fee_per_pair_approx(lvl[0], lvl[1]),
@@ -4805,52 +4741,23 @@ def enrich_with_orderbook_prices(
 
       same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
       time_series: yes_price + no_price <= 1 - the run's entry floor
-                   (config.live_time_series_floor)
 
-    The qualifying levels are then cut at the first one with no edge left
-    after the fee. The edge after fee strictly decreases in both leg prices
-    and the levels ascend, so what remains is a contiguous prefix. While the
-    price-sum ceiling leaves more edge than any fee this removes nothing; with
-    the tier floors off at a floor of 0 it stops no-edge levels, which pass
-    the 1.0 ceiling, from dragging the average below the profitability line
-    (#51 again).
+    The qualifying levels are then cut at the first with no edge after the fee
+    (_levels_with_edge_after_fee).
 
     The two leg prices are replaced with weighted-average fill prices over the
     contracts this account could actually BUY — not over the whole qualifying
-    book. Averaging a liquid market's full depth priced every pair against
-    levels no single trade can reach: it inflated the fill price and killed
-    pairs at the profitability gate below on contracts we would never have
-    bought. The bound is config.max_affordable_pairs(balance_cents, best
-    level's price sum, config.max_kelly_fraction(pair type, settings)) — the
-    largest capped Kelly fraction the sizer can return for that pair type over
-    the minimum price sum, so it is an upper bound on whatever
-    strategy.compute_trade sizes under the same settings (main.py hands both
-    the run's one LiveSettings), and the price written here can never be
-    optimistic relative to the one that trade is finally priced at. The
+    book (#51). The averaged count is capped at config.max_affordable_pairs
+    over the best level's price sum at config.max_kelly_fraction(pair type,
+    settings), an upper bound on what strategy.compute_trade sizes under the
+    same settings, so the price written here is never below the traded one. The
     qualifying levels themselves are kept on the pair (depth_levels) so
-    compute_trade can re-price at the exact n it settles on. Prices are
-    written back to nA/pB for a same-title pair and to pA/nB for a time-series
-    pair. The pair's REFERENCE quote (the non-leg market's YES ask: pB for
-    time_series, pA for same_title) is refreshed from the same books via
-    _reference_yes_ask, so downstream models never subtract a scan-time quote
-    from a depth-weighted one; the remaining quote (nA for time_series, nB for
-    same_title) is reporting-only and stays untouched. max_contracts is set to
-    that affordability-bounded count, i.e. how many contracts the written
-    prices are valid for.
+    compute_trade can re-price at the exact n it settles on; max_contracts is
+    that capped count. nA and nB stay as scanned where they are not leg prices;
+    the reference quote comes from _reference_yes_ask.
 
-    Pairs are marked tradeable=False when they have no qualifying contracts,
-    no contract with an edge after the fee, or no contract the budget can
-    afford — and, for time_series only, when:
-      - the later market has no YES ask on its book now (no resting NO bids):
-        fail CLOSED, since nothing prices the in-between mass, and a stale
-        scan-time pB below the book's own YES bid would let Kelly exceed 1 - k;
-      - the later market's YES ask sits below its own YES bid (a crossed
-        book), the one state in which Kelly can exceed 1 - k;
-      - the run's spread rule (config.time_series_spread_refusal) refuses the
-        refreshed reference minus the YES leg's fill (positivity and the
-        floor), or the refreshed reference minus the TOP of the qualifying
-        YES book (the ceiling: the widest spread any size prices at).
-    Same-title keeps its scan-time reference when that book side is empty.
+    A failing pair is marked tradeable=False; the time-series checks include a
+    later book with no YES ask (fail closed), a crossed one, and the spread rule.
 
     Args:
         client (Any): Authenticated KalshiClient used to fetch each pair's
@@ -4863,12 +4770,9 @@ def enrich_with_orderbook_prices(
             Required rather than defaulted: both call sites already hold it,
             and a default would silently restore whole-book pricing on a
             real-money path with no signal that it had.
-        settings (LiveSettings | None): Keyword-only. The run's live toggles:
-            the tier floors and the band set the time-series price-sum ceiling
-            and the spread rule, and k and the two per-trade caps set the
-            affordability bound — the values strategy.compute_trade sizes
-            with when handed the same object. None resolves config.py's once,
-            at the top of the call.
+        settings (LiveSettings | None): Keyword-only. The run's toggles (the
+            price-sum ceiling, the spread rule, the affordability bound). None
+            resolves config.live_settings() once.
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the
@@ -4877,7 +4781,7 @@ def enrich_with_orderbook_prices(
             only when the reference book side had resting bids), tradeable,
             max_contracts and depth_levels replaced by depth-validated values.
     """
-    # One rule for every pair below: the run's LiveSettings, or config's
+    # Resolved once, so every pair below is judged under one rule
     settings = live_settings() if settings is None else settings
 
     # Cache order books by ticker to avoid fetching the same book twice
@@ -4924,8 +4828,7 @@ def enrich_with_orderbook_prices(
 
         # Keep only contract pairs where the combined fill price leaves the required
         # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
-        # the run's entry floor (config.live_time_series_floor) — see
-        # _pair_max_sum for the exact ceilings.
+        # the run's entry floor — see _pair_max_sum for the exact ceilings.
         max_sum    = _pair_max_sum(pair, settings)
         qualifying = [
             (yp, np_, qty)
@@ -4933,15 +4836,7 @@ def enrich_with_orderbook_prices(
             if yp + np_ <= max_sum + PRICE_EPSILON
         ]
 
-        # Keep only the prefix of levels that still has an edge after the fee
-        # (_levels_with_edge_after_fee, the one definition validate_pair_price
-        # applies too). It changes nothing while the price-sum ceiling leaves
-        # more edge than any fee (1 - max_sum >= 0.05 > 0.035, the largest
-        # fee_per_pair_approx): that covers every same-title pair and every
-        # time-series pair whose floor is at least 0.035. At a floor of 0 (tier
-        # floors off), no-edge levels would otherwise pass the 1.0 ceiling and
-        # drag the average below the profitability line, dropping pairs a
-        # Kelly-sized trade profits on (#51).
+        # Keep the prefix that still has an edge after the fee, as validate_pair_price does
         before = len(qualifying)
         qualifying = _levels_with_edge_after_fee(qualifying)
         if before and not qualifying:
@@ -4974,14 +4869,8 @@ def enrich_with_orderbook_prices(
         # Bound the average at the most contracts any Kelly result could ever
         # afford, rather than averaging the whole book. Levels ascend by
         # combined price, so the largest capped fraction over the BEST level's
-        # sum (the cheapest any prefix average can be) is an upper bound on the
-        # n that trade finally sizes — the price written here is therefore
-        # never optimistic relative to it.
-        # The largest capped Kelly fraction the sizer can return for this pair
-        # type (config.max_kelly_fraction): under 1 - k for time-series, which
-        # the fail-closed fallback and the crossed-book guard below keep true,
-        # and under the same-title caps otherwise. Averaging deeper than a trade
-        # can use re-opens #51.
+        # sum (the cheapest any prefix average can be) bounds the n compute_trade
+        # sizes. The time-series bound, 1 - k, holds only through the checks below.
         best_a, best_b, _ = depth_levels[0]
         bound = max_kelly_fraction(pair.pair_type, settings)
         affordable = max_affordable_pairs(balance_cents, best_a + best_b, bound)
@@ -4995,13 +4884,8 @@ def enrich_with_orderbook_prices(
             # — the sub-one-contract hole that overloaded sentinel used to have.
             # Both figures are named because they are different faults with
             # different fixes (add funds vs. the book is too thin), and the
-            # binding one is whichever is smaller. A bound of 0 is a third
-            # fault, named in its own words: at k = 1 no time-series Kelly
-            # fraction can be positive, so no balance could afford a contract.
-            # It is the only way a bound reaches 0 (LiveSettings refuses a
-            # size cap or a same-title cap of 0, and the same-title bound is
-            # min(config.pair_size_cap(...), SAME_TITLE_CO_RESOLVE_PROB)); the
-            # pair-type test keeps the wording true regardless.
+            # binding one is whichever is smaller. A bound of 0 gets its own wording: only
+            # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
             zero_bound = ""
             if bound == 0 and pair.pair_type == "time_series":
                 zero_bound = (
@@ -5016,9 +4900,7 @@ def enrich_with_orderbook_prices(
             enriched.append(dc_replace(pair, tradeable=False))
             continue
 
-        # Back to SIDE order for the time-series spread checks, the fee check
-        # and the writeback below, all of which speak in "the YES leg"/"the NO
-        # leg"
+        # Back to SIDE order ("the YES leg"/"the NO leg") for the code below
         avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
 
         # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
@@ -5029,37 +4911,27 @@ def enrich_with_orderbook_prices(
         # pair models as RISKLESS and Kelly sizes it at the per-trade cap.
         ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
 
-        # The time-series spread rule, re-asserted on the fresh book for
-        # TIME_SERIES ONLY. same_title is deliberately NOT guarded here: its
-        # model is the fixed co-resolution prior (strategy._kelly_p), so pA is
-        # not a model input and there is no clamp to protect, and it keeps its
-        # scan-time reference when that book side is empty (the writeback
-        # below). These three checks are what keep config.max_kelly_fraction's
-        # 1 - k a true bound on the time-series fraction the bound above used.
+        # Time-series only: same_title's model is the fixed co-resolution prior,
+        # so its pA is not a model input and there is no clamp to protect
         is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
         direction_ok = True
         if is_time_series:
-            # pair_gap_days, not deadline_gap_days: a same-event ladder is
-            # tiered on its STATED deadline gap (DR-73)
+            # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
             gap = pair_gap_days(pair)
             if ref_yes is None:
-                # The later book has no YES ask (no resting NO bids), so nothing
-                # prices its in-between mass right now. Fail CLOSED. The
-                # scan-time pB used to stand in here, but a stale pB below the
-                # book's own YES bid lets Kelly exceed 1 - k (pA 0.30, bid 0.90,
-                # stale pB 0.50 gives f* 0.74 at k 0.75, 0.72 at k 0.80), and no
-                # size cap bounds that once the cap is lifted. The backtest
-                # still enters on its latest candle at or before the
-                # checkpoint, which can be older (a recorded residual).
+                # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
+                # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
+                # 100% default) does not stop. backtester._find_entry does not mirror this
+                # (CLAUDE.md: "Known residual of the live spread rule").
                 direction_ok = False
                 logging.warning(
                     "Pair '%s' dropped: the later contract has no YES ask on its book "
                     "(no resting NO bids), so nothing prices its in-between mass now",
                     pair.canonical_title)
             elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
-                # no_levels[0] is the later market's best NO ask, i.e. 1 - its
-                # best YES bid. A YES ask below that YES bid is a crossed book,
-                # the one state in which Kelly can exceed 1 - k.
+                # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
+                # YES ask below that bid is a crossed book, the one state where Kelly can
+                # exceed 1 - k.
                 direction_ok = False
                 logging.warning(
                     "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
@@ -5067,13 +4939,11 @@ def enrich_with_orderbook_prices(
                     pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
             else:
                 # Positivity and the floor are tested on the spread the sizer
-                # prices (the prefix average). The ceiling is tested on the TOP
-                # of the book, the widest spread any size prices at. Once the
-                # guard above passes, every qualifying level has
-                # yes <= bid - floor + eps <= ref - floor + 2 * eps, so
-                # BELOW_FLOOR cannot fire beyond 2 * PRICE_EPSILON, and the
-                # truncation leaves a spread above the fee. Those two checks
-                # stay as defence; only the ceiling is ever live here.
+                # prices (the prefix average), the ceiling on the TOP of the
+                # book. Past the guards above, the price-sum ceiling implies the
+                # floor to within 2 * PRICE_EPSILON and the edge cut leaves a
+                # spread above the fee, so only the ceiling is live here; the
+                # other two stay as defence (TS-34).
                 basis = f"fresh reference ask {ref_yes:.4f}"
                 refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
                 if refusal is None:
@@ -5117,8 +4987,7 @@ def enrich_with_orderbook_prices(
             leg_updates = {"pA": avg_yes, "nB": avg_no}
             # pB is the model's reference quote, not a leg price — refreshed so
             # strategy._kelly_p's pB - pA subtraction has both operands from one
-            # snapshot. Left alone when the reference side had no resting bids,
-            # which has already dropped the pair above (fail closed).
+            # snapshot. Left alone when None, which has dropped the pair above.
             if ref_yes is not None:
                 leg_updates["pB"] = ref_yes
         else:
@@ -5156,34 +5025,25 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     confirm the gap threshold still holds at the required contract depth.
 
     Returns True only if qualifying depth >= spec.x contracts remain at the
-    pair's gap threshold (the run's price-sum ceiling, _pair_max_sum), counted
-    only over the levels that still keep an edge after the fee
-    (_levels_with_edge_after_fee, the cut enrichment prices with — the one
-    re-check of the edge left once a floor of 0 makes the ceiling 1.0; a book
-    under the ceiling with no such level is dropped with its own WARNING). For
-    a time-series pair it also fails CLOSED when the later market has no YES ask
-    on its book now (nothing prices the in-between mass the trade was sized
-    on, exactly as enrichment refuses it), and refuses a spread above the
-    band's ceiling on the top of the FRESH book — the quantity enrichment and
-    backtester._find_entry test (config.time_series_spread_refusal). The
-    floor needs no second test here: the price-sum ceiling over this book
-    already applies it. A False result means prices have moved since the
+    pair's price-sum ceiling (_pair_max_sum), over the levels that keep an
+    edge after the fee (_levels_with_edge_after_fee). A time-series pair also
+    fails CLOSED with no YES ask on the later book and is refused above the
+    band's ceiling on the fresh top of book; the price-sum ceiling implies the
+    floor on an uncrossed book. A False result means prices have moved since the
     scan and the trade should be skipped. Every False return is logged here,
     once, at WARNING, with its reason — callers must not log the drop again.
 
     Args:
         client: Authenticated KalshiClient from auth.build_client().
         spec: TradeSpec whose pair prices should be re-validated.
-        settings (LiveSettings | None): Keyword-only. The run's live toggles
-            (the price-sum ceiling and the band's ceiling).
-            trader.pre_execution_check hands every call its one per-run
-            object; None resolves config.py's.
+        settings (LiveSettings | None): Keyword-only. The run's toggles; None
+            resolves config.live_settings().
 
     Returns:
         bool: True if the pair still qualifies; False if prices moved or order
             books are unavailable.
     """
-    # The run's toggles: the object pre_execution_check hands in, or config's
+    # The run's toggles, or config's when none are handed in
     settings = live_settings() if settings is None else settings
     pair   = spec.pair
     ob_a   = _fetch_orderbook(client, pair.market_a.ticker)
@@ -5200,8 +5060,7 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     # opposite-side bids, and the NO leg's market depends on the pair type
     no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
     paired     = _pair_orderbooks(no_levels, yes_levels)
-    # Same per-pair gap ceiling used at scan time (1 - the run's entry floor
-    # for time_series) — the trade must still qualify at execution time
+    # The scan-time price-sum ceiling: the trade must still qualify now
     max_sum    = _pair_max_sum(pair, settings)
     qualifying = [
         (yp, np_, qty)
@@ -5219,13 +5078,8 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
         )
         return False
 
-    # Cut the fresh book at the first level with no edge left after the fee —
-    # the one definition enrichment prices with. At a floor of 0 (tier floors
-    # off) the 1.0 price-sum ceiling above re-checks no edge at all, so without
-    # the cut a book that moved a tick against a thin-edge spec would still
-    # pass, and the FoK caps' tick of slippage per leg would fill it where
-    # every settlement cell loses. Inert while the ceiling leaves more edge than
-    # any fee (every same-title pair, and every tier-on time-series rule).
+    # The edge cut enrichment prices with. At a floor of 0 the 1.0 ceiling above checks
+    # no edge, so this is then the only edge re-check before submission.
     qualifying = _levels_with_edge_after_fee(qualifying)
     if not qualifying:
         logging.warning(
@@ -5236,15 +5090,12 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
         ref_now = _reference_yes_ask(pair, ob_a, ob_b)
         if ref_now is None:
-            # Fail CLOSED, as enrichment does: with no YES ask on the later book,
-            # nothing prices the in-between mass the trade was sized on
+            # Fail CLOSED, as enrichment does: nothing prices the in-between mass
             logging.warning(
                 "Pre-execution check failed for '%s' — the later contract has no YES "
                 "ask on its book now; dropping", pair.canonical_title)
             return False
-        # The band's CEILING on the top of the FRESH book: the quantity
-        # enrichment and backtester._find_entry test. The floor stays what it
-        # always was here, the price-sum ceiling over this book, applied above.
+        # The band's ceiling on the fresh top of book, as enrichment tests it
         spread = ref_now - qualifying[0][0]
         if (time_series_spread_refusal(spread, pair_gap_days(pair), settings)
                 == SPREAD_ABOVE_CEILING):

@@ -1771,22 +1771,14 @@ class TestFindEntryDirection:
 
 
 class TestLiveBacktestSpreadParity:
-    """The live time-series spread rule (config.time_series_spread_refusal,
-    what the finder, enrichment and validate_pair_price apply) and the
-    backtest's per-Monday tests in _find_entry must agree on every spread.
-
-    _find_entry is NOT modified by the live toggles, so this calls it: one
-    Monday, one candle per leg, leg prices far inside the price-sum ceiling
-    and the fee check at every threshold on the grid, so the only thing
-    either path decides on is pB - pA. The spread handed to the live rule is
-    computed from the candle floats exactly as _find_entry computes its gap,
-    including the float-noise neighbours of every boundary."""
+    """The live spread rule (config.time_series_spread_refusal) and
+    _find_entry agree on every spread, the float-noise neighbours of every
+    boundary included, with pB - pA computed from the candle floats as
+    _find_entry computes its gap."""
 
     _MONDAY = datetime(2026, 1, 5, 9, 0, tzinfo=UTC)
-    # Leg prices: YES on A at pA, NO on B at 0.05 — the sum is at most 0.35
-    # (pA 0.30 on the float-noise rows), under 1 - 0.40 (the largest
-    # threshold on the grid), and leaves an edge
-    # far above any fee, so neither test ever decides a row
+    # NO on B at 0.05: pA + nB <= 0.35, under 1 - 0.40 (the grid's largest
+    # threshold) with an edge far above any fee, so only pB - pA decides a row
     _NB = 0.05
     _BOUNDARIES = (0.0, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
     _NUDGES = (-2e-6, -5e-7, 0.0, 5e-7, 2e-6)
@@ -1812,8 +1804,7 @@ class TestLiveBacktestSpreadParity:
                     pB = pA + b + d
                     if 0.01 <= pB <= 0.99:
                         rows.append((pA, pB))
-        # The documented float-noise pairs (TS-09): 0.35 - 0.20 sits a hair
-        # under 0.15, 0.90 - 0.30 a hair over 0.60
+        # TS-09's float-noise pairs: 0.35 - 0.20 is under 0.15, 0.90 - 0.30 over 0.60
         rows += [(0.20, 0.35), (0.30, 0.90), (0.30, 0.45), (0.10, 0.60)]
         return rows
 
@@ -5845,10 +5836,8 @@ class TestCheckpointOpeningBalanceSizing:
     """Pass 2 must size every candidate of one entry date against that
     checkpoint's OPENING balance (live: one verify_auth read per run feeding
     every compute_trade call), then admit greedily against the running cash
-    (live: strategy.select_portfolio's decrementing budget). Sized under
-    config.py's toggles as they stood before the 2026-09-27 flip (conftest's
-    pre_toggle_defaults: a 20% cap for every pair, no extra same-title cap),
-    which the two same-title pairs' sizes were derived at."""
+    (live: strategy.select_portfolio's decrementing budget). Sizes are at
+    pre_toggle_defaults' 20% cap for every pair, with no extra same-title cap."""
 
     # Two same-title pairs whose only qualifying Monday is 2026-01-05. Distinct
     # event_titles ("EV1"/"EV2") keep them in separate (event_title, title,
@@ -5908,8 +5897,7 @@ class TestCheckpointOpeningBalanceSizing:
             assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
 
     def test_greedy_fit_skips_rather_than_shrinks(self, monkeypatch):
-        # With BUDGET_FRACTION at 0.20 (its value before the 2026-09-27 flip,
-        # pinned for this class) two same-day trades always fit
+        # With BUDGET_FRACTION at 0.20 (pre_toggle_defaults) two same-day trades always fit
         # (0.2 + 0.2 < 1), so the greedy-skip branch is unreachable. Raise the
         # cap to 0.60 for this test only — backtester imports the constant by
         # value (`from .config import BUDGET_FRACTION`), so patching the module
@@ -5939,9 +5927,7 @@ class TestCheckpointOpeningBalanceSizing:
 class TestRunBacktestTimeSeriesFlow:
     """End-to-end flow of a time-series pair through run_backtest.
 
-    Every figure below is at config.py's toggles as they stood before the
-    2026-09-27 flip (k 0.75, a 20% cap for every pair), which conftest's
-    pre_toggle_defaults restores for each test.
+    Figures are at pre_toggle_defaults' k 0.75 and 20% cap for every pair.
 
     Fixture (the plan's hand-picked illustrative numbers, not market data):
     EA closes 2026-02-01 and EB 2026-02-14 (13-day gap, short tier, threshold
@@ -8548,14 +8534,9 @@ def golden_band_sweep():
     """ONE full band sweep (36 bands x 13 k, ladders on) over the
     TestPrepareEntriesGolden fixture, with spies on every seam the tests
     below read, plus a band_sweep=False run of the same fixture. Class-scoped
-    so the whole class pays for one sweep, not one per test.
-    config.py's live toggles, and backtester's by-value copies, are pinned to
-    their values before the 2026-09-27 flip (conftest's
-    apply_pre_toggle_defaults: k 0.75, a 20% per-trade cap, no extra
-    same-title cap) on a SEPARATE MonkeyPatch, created at fixture start and
-    undone only after the class's tests — the patches above it are undone
-    mid-fixture, and every lazy cell the tests read resolves the cap and k at
-    call time."""
+    so the whole class pays for one sweep, not one per test. Pins
+    apply_pre_toggle_defaults on its own MonkeyPatch, held through both runs
+    and the class's tests, which re-simulate at call time."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     handler = _LogCapture()
@@ -9010,8 +8991,6 @@ class TestBandSweepEdges:
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_single_band_run_keeps_the_pre_band_log_wording(self, monkeypatch, caplog):
-        # (k 0.75, config.py's primary k before the 2026-09-27 flip:
-        # pre_toggle_defaults)
         # Band sweep off: the entry and re-simulation lines read as they did
         # before the band existed, and the band-sweep-only lines are absent.
         with caplog.at_level(logging.INFO):
@@ -9818,11 +9797,8 @@ def _completion_lines(caplog) -> list[str]:
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestSizeCap:
     """_simulate_at_discount(size_cap=..., quiet=...): the per-trade Kelly cap
-    as a simulation parameter, defaulting to BUDGET_FRACTION so every existing
-    call sizes — and logs — exactly as before. Every test runs at config.py's
-    toggles as they stood before the 2026-09-27 flip (conftest's
-    pre_toggle_defaults: a 20% default cap, no extra same-title cap, k 0.75),
-    which the figures and log lines below were derived at."""
+    as a simulation parameter, defaulting to BUDGET_FRACTION at call time.
+    Figures are at pre_toggle_defaults (a 20% cap, no same-title cap, k 0.75)."""
 
     _START = date(2026, 1, 1)
 
@@ -9950,10 +9926,9 @@ class TestSizeCap:
         assert point.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
 
     def test_the_same_title_cap_binds_same_title_only(self, monkeypatch):
-        # SAME_TITLE_SIZE_CAP caps every same-title candidate at every cap,
-        # through config.pair_size_cap (the definition live sizing uses), read
-        # at call time from this module's binding — and never reaches a
-        # time-series candidate. The golden same-title pair's f* is ~0.77.
+        # SAME_TITLE_SIZE_CAP (backtester's binding, read at call time, applied
+        # through config.pair_size_cap) caps every same-title candidate at every
+        # cap and never a time-series one. The golden same-title f* is ~0.77.
         golden = TestPrepareEntriesGolden()
         entries, _ = golden._prepare(monkeypatch, True)
         st = [r for r in entries if r["pair_type"] == "same_title"]
@@ -9966,23 +9941,20 @@ class TestSizeCap:
         capped = self._sim(st, size_cap=1.0)
         assert [t.kelly_fraction for t in capped.trades] == [pytest.approx(0.2)]
         assert capped.trades[0].n < no_extra.trades[0].n
-        # The same-title cap is a sizing cap: Pass 1b's peak is still the
-        # uncapped f*, so a size-cap sweep keeps seeding on it
+        # A sizing cap only: the peak stays the uncapped f* the cap sweep seeds on
         assert capped.peak_kelly_fraction == no_extra.peak_kelly_fraction
         assert capped.size_cap == 1.0
         # The tighter of the two caps binds
         assert self._sim(st, size_cap=0.05).trades[0].kelly_fraction == pytest.approx(0.05)
-        # A time-series candidate never reads it: the wide-gap entry's f*
-        # ~0.216 sits above the 0.2 same-title cap and sizes at full Kelly
+        # A time-series candidate never reads it: the wide-gap f* (~0.216) sizes in full
         ts = self._entries(monkeypatch)
         ts_f = _uncapped_kelly(ts[0], backtester.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
         assert ts_f > 0.2
         assert self._sim(ts, size_cap=1.0).trades[0].kelly_fraction == pytest.approx(ts_f)
 
-    # Every value config.LiveSettings refuses for a same-title cap on range or
-    # type, and that config.pair_size_cap's min() would otherwise read
-    # silently: NaN as no cap at all (min(1.0, nan) is 1.0), 0 or below as no
-    # same-title trade, None (min() raises TypeError deep in Pass 1b)
+    # Values config.LiveSettings refuses for a same-title cap. Unvalidated,
+    # pair_size_cap's min() would read NaN as no cap (min(1.0, nan) is 1.0), 0
+    # or below as no same-title trade, and None would raise deep in Pass 1b
     _INVALID_ST_CAPS = [float("nan"), 0, 0.0, -0.5, 1.5, float("inf"), True,
                         np.bool_(True), "0.2", Decimal("0.2"), None, np.float64("nan")]
 
@@ -10286,14 +10258,8 @@ def cap_sweep_run():
     band_sweep=False cap sweep, beside it. Every simulation DURING the runs
     goes through a FIXED six-parameter spy, so a default-cap call that
     forwarded size_cap or quiet would raise TypeError; the spy is undone
-    before any cell is read, so the cells run the real function.
-    config.py's live toggles, and backtester's by-value copies, are pinned to
-    their values before the 2026-09-27 flip (conftest's
-    apply_pre_toggle_defaults: k 0.75, a 20% per-trade cap, no extra
-    same-title cap) on a SEPARATE MonkeyPatch, created at fixture start and
-    undone only after the class's tests — the patches above it are undone
-    mid-fixture, and every lazy cell the tests read resolves the cap and k at
-    call time."""
+    before any cell is read, so the cells run the real function. Pins
+    apply_pre_toggle_defaults on its own MonkeyPatch (see that helper's mp)."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -10339,8 +10305,7 @@ class TestCapSweep:
     eager primary-cap points. Parity with a fresh simulation is the gate."""
 
     _POPS = ("all", "time_series", "ladder", "cross")
-    # The run's own per-trade cap: cap_sweep_run pins config.py's pre-flip
-    # 20% (conftest's apply_pre_toggle_defaults). Cells are indexed by this
+    # The run's own cap as cap_sweep_run pins it: cells are indexed by this
     # literal, never by a read of backtester.BUDGET_FRACTION
     _PRIMARY_CAP = 0.20
 
@@ -10394,16 +10359,11 @@ class TestCapSweep:
         assert (cs.simulated, cs.reused) == (0, 0)
 
     def test_the_pinned_toggles_hold_through_every_cell_read(self, cap_sweep_run):
-        # (Defined after test_the_cap_sweep_s_shape, which asserts no cell has
-        # been read yet: a cell read here counts toward CapSweep.simulated.)
-        # cap_sweep_run pins config.py's pre-flip toggles on a MonkeyPatch it
-        # undoes only AFTER the class's tests, because every lazy cell resolves
-        # SAME_TITLE_SIZE_CAP at call time. The parity checks below cannot see
-        # a patch undone too early — the fresh simulation they compare against
-        # reads the same values — so this reads one cell directly: at the "no
-        # cap" option the golden same-title pair sizes at its full f* (~0.77),
-        # which it can only do with no extra same-title cap in force (the
-        # shipped 0.20 would cap it)
+        # Must stay after test_the_cap_sweep_s_shape, which asserts nothing is
+        # simulated yet: this read simulates. The parity checks cannot see the
+        # toggles undone too early, so check one directly: at "no cap" the golden
+        # same-title pair sizes at its full f* (~0.77), which the shipped 0.20
+        # same-title cap would prevent
         st = cap_sweep_run.on.cap_sweep.same_title()
         [trade] = st[1.0].trades
         assert trade.kelly_fraction == pytest.approx(0.77, abs=0.01)
@@ -10588,18 +10548,11 @@ class TestCapSweep:
 
 @pytest.fixture(scope="class")
 def st_cap_sweep_run():
-    """cap_sweep_run's narrowed golden band sweep, with cap_sweep=True, under
-    the shipped cap shape (config.py's since the 2026-09-27 flip):
-    backtester.BUDGET_FRACTION = 1.0 (no per-trade cap) and
-    backtester.SAME_TITLE_SIZE_CAP = 0.2, laid over every other toggle pinned
-    to its value before the flip (conftest's apply_pre_toggle_defaults: k
-    0.75, the primary k of cap_sweep_run's grid), so the two caps are the one
-    difference from cap_sweep_run. All of them sit on a SEPARATE MonkeyPatch,
-    created at fixture start and undone only after the class's tests: every
-    lazy cell reads the caps and k at call time, so they must hold through the
-    cell reads (and the fresh simulations the parity check runs), not only
-    through the eager run. The golden fetch patch and the narrowed grid are
-    undone before any cell is read, as in cap_sweep_run."""
+    """cap_sweep_run's narrowed golden band sweep, with cap_sweep=True, at
+    config.py's shipped caps — backtester.BUDGET_FRACTION 1.0 (no per-trade
+    cap) and SAME_TITLE_SIZE_CAP 0.2 — its one difference from cap_sweep_run.
+    Both caps sit over apply_pre_toggle_defaults on the toggles MonkeyPatch,
+    which outlasts mp because the lazy cells read them at call time."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -10623,13 +10576,13 @@ def st_cap_sweep_run():
 
 @pytest.mark.usefixtures("st_cap_sweep_run")
 class TestCapSweepSameTitleCap:
-    """The size-cap sweep with a same-title cap tighter than the per-trade one:
-    each cap is the cap for every pair, and a same-title candidate stays under
-    SAME_TITLE_SIZE_CAP at every one (config.pair_size_cap). The reuse rule
-    still holds — for a cap C at or above a point's peak f*, a candidate sizes
-    at f* (time-series) or min(SAME_TITLE_SIZE_CAP, f*) (same-title), neither
-    depending on C — so every cap of every cell must equal a fresh simulation,
-    shared copies included."""
+    """The size-cap sweep with SAME_TITLE_SIZE_CAP tighter than the per-trade
+    cap. At every cap C a same-title candidate sizes at most
+    min(C, SAME_TITLE_SIZE_CAP) (config.pair_size_cap). Reuse still holds —
+    at a cap C at or above a point's peak f*, a candidate sizes at f*
+    (time-series) or min(SAME_TITLE_SIZE_CAP, f*) (same-title), neither
+    depending on C — so every cap of every cell must equal a fresh
+    simulation, shared copies included."""
 
     def test_the_run_records_both_caps(self, st_cap_sweep_run):
         on = st_cap_sweep_run.on
@@ -10642,9 +10595,7 @@ class TestCapSweepSameTitleCap:
                      if t.pair_type == "same_title"]
         assert st_trades
         assert all(t.kelly_fraction == pytest.approx(0.2) for t in st_trades)
-        # ... while the same-title cap never reaches a time-series trade: with
-        # no per-trade cap, the time-series trades size at their own f*, some
-        # of them above the 20% a leaked same-title cap would hold them to
+        # ... while that cap never reaches a time-series trade: some size above 20%
         ts_trades = [t for p in on.scenarios for t in p.trades
                      if t.pair_type == "time_series"]
         assert any(t.kelly_fraction > 0.2 + 1e-9 for t in ts_trades)
@@ -10669,10 +10620,9 @@ class TestCapSweepSameTitleCap:
                                 assert t.kelly_fraction <= min(cap, 0.2) + 1e-12
                                 st_capped += t.kelly_fraction == pytest.approx(0.2)
                             else:
-                                # The parity above cannot see a same-title cap
-                                # leaking onto time-series pairs (the fresh
-                                # simulation would leak it too): only the cap
-                                # itself bounds a time-series trade
+                                # Parity cannot catch the same-title cap
+                                # leaking onto these (a fresh run would leak
+                                # it too), so only the cap bounds them
                                 assert t.kelly_fraction <= cap + 1e-12
                                 ts_above += t.kelly_fraction > 0.2 + 1e-9
         st_end = backtester._curve_end_date(cs.same_title_eager)
@@ -10682,17 +10632,15 @@ class TestCapSweepSameTitleCap:
                                         end_date=st_end)
             checked += 1
         assert checked > 500
-        # Not vacuous: the same-title cap actually bound in the cells, and
-        # time-series trades sized past it at the caps above 20%
+        # Not vacuous: the same-title cap bound, and time-series trades sized above it
         assert st_capped > 0
         assert ts_above > 0
 
     def test_a_population_holding_same_title_trades_reuses_the_eager_point(
         self, st_cap_sweep_run,
     ):
-        # The primary cap (1.0) is at or above every peak, so every cap at or
-        # above the same-title population's peak f* (~0.77) is a copy of the
-        # eager point: the same trades, sized at the 20% same-title cap
+        # The primary cap (1.0) reaches every peak, so every other cap at or
+        # above the same-title peak f* (~0.77) copies the eager point, sized at 20%
         cs = st_cap_sweep_run.on.cap_sweep
         before = cs.reused
         points = cs.same_title()
@@ -10706,13 +10654,9 @@ class TestCapSweepSameTitleCap:
             assert points[cap].trades is eager.trades
             assert points[cap].size_cap == cap
         assert all(t.kelly_fraction == pytest.approx(0.2) for t in eager.trades)
-        # ... and a cell's "all" population holding the same-title entry too,
-        # checked on that population itself (the cell's time-series-only
-        # populations reuse on their own, so a count over the whole cell would
-        # pass without it): every cap at or above its peak f* (~0.77, the
-        # same-title candidate's) other than the primary is a copy sharing the
-        # eager point's trades, and every cap below it is a simulation of its
-        # own
+        # ... and on a cell's "all" population (checked alone: its time-series
+        # populations reuse on their own) exactly the non-primary caps at or
+        # above its peak f* (~0.77) share the eager point's trades
         on = st_cap_sweep_run.on
         band, k = on.primary.spread_band, on.primary.k
         cell = cs.cell(band, k)
@@ -10913,10 +10857,8 @@ class TestCapSweepEndDate:
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestCapSweepLogging:
-    """The run names its per-trade cap and whether the cap sweep rides it. At
-    config.py's toggles as they stood before the 2026-09-27 flip (conftest's
-    pre_toggle_defaults: a 20% cap, no extra same-title cap), so the default
-    line carries no same-title clause."""
+    """The run names its per-trade cap and whether the cap sweep rides it (at
+    pre_toggle_defaults, so the default line has no same-title clause)."""
 
     def test_the_cap_line_follows_the_band_line_and_the_infeasible_run_has_none(
         self, monkeypatch, caplog,
@@ -10938,10 +10880,8 @@ class TestCapSweepLogging:
     def test_the_cap_line_names_the_same_title_cap_only_when_it_binds_tighter(
         self, monkeypatch, caplog,
     ):
-        # At SAME_TITLE_SIZE_CAP >= the per-trade cap the line is
-        # byte-identical to the one printed before that constant existed; a
-        # tighter same-title cap is named. The infeasible construction records
-        # the value either way.
+        # Only a same-title cap tighter than the per-trade cap is named; the
+        # infeasible construction records the value either way
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
         base = ("Per-trade size cap (backtest): "
                 f"{backtester._cap_percent(backtester.BUDGET_FRACTION)}% "
@@ -10991,16 +10931,12 @@ class TestCapSweepLogging:
 
 
 class TestLiveRuleLine:
-    """"Live time-series rule (config.py): ..." — config.py's own live rule and
-    category/tag filter (never main.py's per-run overrides, which this module
-    cannot see), read ONCE before the fetch (_live_settings_for_report),
-    recorded on BacktestSweep.live_* by both constructions, and logged once
-    the sweep exists (_live_rule_line) with where THIS run's grid holds it —
-    backtester._live_rule_view, the one verdict dashboard._live_rule_html
-    renders too, so the log and the page never disagree."""
+    """"Live time-series rule (config.py): ..." — config.py's live rule and
+    filter, read once before the fetch, recorded on BacktestSweep.live_* and
+    logged once the sweep exists with where its grid holds the rule
+    (backtester._live_rule_view, the one verdict the dashboard renders too)."""
 
-    # A narrowed band grid (4 bands: floors 0 and 0.35, ceilings 0.5 and 1),
-    # one k: the golden fixture's feasible band sweep in about a second
+    # A narrowed 4-band grid and one k keep the golden band sweep small
     _FLOORS, _CEILINGS = (0.0, 0.35), (0.5, 1.0)
 
     @staticmethod
@@ -11053,8 +10989,7 @@ class TestLiveRuleLine:
                             "primary scenario applies it")
 
     def test_the_feasible_line_is_the_last_the_sweep_logs(self, monkeypatch, caplog):
-        # Logged from the BUILT sweep: after the size-cap summary and every
-        # completion line, so what it says of the grid is what the grid holds
+        # Logged from the built sweep, after every line about the grid it describes
         self._live(monkeypatch, True, (0.0, 1.0))
         self._feasible(monkeypatch, caplog, band_sweep=True, cap_sweep=True)
         messages = [r.getMessage() for r in caplog.records]
@@ -11066,10 +11001,9 @@ class TestLiveRuleLine:
         self, monkeypatch, caplog, feasible,
     ):
         from kalshi_betting import config
-        # A floor at or above the ceiling fails LiveSettings' own validation
-        # (config.time_series_spread_band), so live_settings() raises — once
-        # per run, on the feasible path too, where _sweep_from_candidates is
-        # handed the one read rather than taking its own
+        # A floor above the ceiling fails LiveSettings' validation, so
+        # live_settings() raises, read once per run: _sweep_from_candidates is
+        # handed that read (None) rather than reading again
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
         res = (self._feasible if feasible else self._infeasible)(monkeypatch, caplog)
         assert (res.live_tier_floors, res.live_spread_band, res.live_categories,
@@ -11133,8 +11067,7 @@ class TestLiveRuleLine:
     def test_a_primary_off_the_shipped_grid_still_holds_a_tier_off_rule(
         self, monkeypatch, caplog,
     ):
-        # --spread-min 0.1 --spread-max 0.6: a binding band off the grid, which
-        # the tier-off family re-runs because it is the primary
+        # A binding band off the grid, which the tier-off family re-runs because it is the primary
         rule = self._live(monkeypatch, False, (0.1, 0.6))
         res = self._feasible(monkeypatch, caplog, spread_band=(0.1, 0.6), band_sweep=True,
                              tier_off_sweep=True)
@@ -11177,8 +11110,7 @@ class TestLiveRuleLine:
     def test_tier_floors_off_where_no_tier_binds_is_the_tier_on_rule(
         self, monkeypatch, caplog,
     ):
-        # Floor 0.35 sits above both tiers: off and on are one rule there, so
-        # the primary at that band IS it, and a grid band needs no family
+        # Floor 0.35 is above both tiers, so off and on are one rule there
         assert backtester._tier_floors_bind((0.35, 0.5)) is False
         rule = self._live(monkeypatch, False, (0.35, 0.5))
         self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5))
@@ -11193,8 +11125,7 @@ class TestLiveRuleLine:
             "on are one rule), which the dashboard's filter bar shows")
 
     def test_the_infeasible_path_holds_only_its_empty_primary(self, monkeypatch, caplog):
-        # Nothing but the empty primary was built: a flag that WOULD have put
-        # the rule on the grid cannot, and the page agrees (the plan's V4 run)
+        # Only the empty primary exists, so no flag puts the rule on the grid
         from kalshi_betting import dashboard
         for tier_floors, band in ((False, (0.0, 0.5)), (True, (0.3, 0.6))):
             rule = self._live(monkeypatch, tier_floors, band)
@@ -11216,9 +11147,8 @@ class TestLiveRuleLine:
     def test_the_page_says_what_the_log_says(
         self, monkeypatch, caplog, tmp_path, tier_floors, band, page_tail,
     ):
-        # One feasible band sweep with its tier-off family, then the real
-        # dashboard over it: the header line names the cell the log names, in
-        # the rendered bar's own option texts
+        # The real dashboard over a feasible band sweep names the cell the log
+        # names, in the bar's own option texts
         import base64
         import gzip
         import html
@@ -11561,14 +11491,8 @@ def golden_tier_off_sweep():
     on) over the TestPrepareEntriesGolden fixture, through spies that tolerate
     any keyword (tier_floors included), plus the same run with
     tier_off_sweep=False — the oracle for the tier-on payload, which the
-    family must leave exactly as it was. Class-scoped, like golden_band_sweep.
-    config.py's live toggles, and backtester's by-value copies, are pinned to
-    their values before the 2026-09-27 flip (conftest's
-    apply_pre_toggle_defaults: k 0.75, a 20% per-trade cap, no extra
-    same-title cap) on a SEPARATE MonkeyPatch, created at fixture start and
-    undone only after the class's tests — the patches above it are undone
-    mid-fixture, and every lazy cell the tests read resolves the cap and k at
-    call time."""
+    family must leave exactly as it was. Class-scoped, with
+    apply_pre_toggle_defaults on its own MonkeyPatch, held through both runs."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     handler = _LogCapture()
@@ -11919,14 +11843,8 @@ def tier_off_cap_run():
     fresh tier-off simulation. Beside it: the same run without the cap sweep,
     and runs without the family or without the band sweep. Every simulation
     DURING the runs goes through a spy that records its keywords; the spy is
-    undone before any cell is read, so the cells run the real function.
-    config.py's live toggles, and backtester's by-value copies, are pinned to
-    their values before the 2026-09-27 flip (conftest's
-    apply_pre_toggle_defaults: k 0.75, a 20% per-trade cap, no extra
-    same-title cap) on a SEPARATE MonkeyPatch, created at fixture start and
-    undone only after the class's tests — the patches above it are undone
-    mid-fixture, and every lazy cell the tests read resolves the cap and k at
-    call time."""
+    undone before any cell is read, so the cells run the real function. Pins
+    apply_pre_toggle_defaults as cap_sweep_run does."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -12015,8 +11933,7 @@ class TestTierOffCapSweep:
         assert off.bands == self._BINDING
         assert sorted(both.tier_off_calibrations_by_band) == list(self._BINDING)
         assert off.caps == on.caps and off.ks == on.ks == (0.5, 0.75, 1.0)
-        # 0.20: the per-trade cap tier_off_cap_run pins (config.py's before the
-        # 2026-09-27 flip), never read back off backtester.BUDGET_FRACTION
+        # The pinned 0.20, never read back off backtester.BUDGET_FRACTION
         assert off.primary_cap == on.primary_cap == 0.20
         assert off.primary_k == on.primary_k and off.split_date == on.split_date
         assert off.checks is True and off.st_entries == [] and off.same_title_eager is None
@@ -12035,17 +11952,9 @@ class TestTierOffCapSweep:
             i for i, m in enumerate(messages) if m.startswith("Size-cap sweep:"))
 
     def test_the_pinned_toggles_hold_through_every_cell_read(self, tier_off_cap_run):
-        # (Defined after test_its_shape, which asserts no cell has been read
-        # yet: a cell read here counts toward CapSweep.simulated.)
-        # tier_off_cap_run pins config.py's pre-flip toggles on a MonkeyPatch
-        # it undoes only AFTER the class's tests, because every lazy cell
-        # resolves SAME_TITLE_SIZE_CAP at call time. The parity checks below
-        # cannot see a patch undone too early — the fresh simulation they
-        # compare against reads the same values — so this reads one tier-off
-        # cell directly: at the "no cap" option the golden same-title pair in
-        # the "all" population sizes at its full f* (~0.77), which it can only
-        # do with no extra same-title cap in force (the shipped 0.20 would cap
-        # it). TestCapSweep's twin covers cap_sweep_run
+        # Must stay after test_its_shape, which asserts nothing is simulated yet:
+        # this read simulates. TestCapSweep's twin, on a tier-off cell's "all"
+        # population
         cell = tier_off_cap_run.both.tier_off_cap_sweep.cell((0.0, 1.0), 0.75)
         [trade] = [t for t in cell[1.0]["all"].trades if t.pair_type == "same_title"]
         assert trade.kelly_fraction == pytest.approx(0.77, abs=0.01)
@@ -12187,8 +12096,7 @@ class TestCapSweepTierSetting:
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_a_cap_equal_to_the_budget_fraction_is_still_named(self, monkeypatch):
-        # (backtester.BUDGET_FRACTION at 0.20, its value before the 2026-09-27
-        # flip — pre_toggle_defaults — so it sits between the other two caps)
+        # (BUDGET_FRACTION at pre_toggle_defaults' 0.20, between the other caps)
         # No eager point, so the run's own cap is simulated too: it is passed
         # as size_cap=0.2 by name, never dropped as _sim_options drops a
         # default — the CapSweep's cap must be the one its caps tuple names

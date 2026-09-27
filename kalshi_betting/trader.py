@@ -84,8 +84,7 @@ Dependencies:
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py, with
-    LiveSettings and live_settings (pre_execution_check hands every
-    validate_pair_price it runs the run's one LiveSettings). Called by
+    LiveSettings and live_settings for pre_execution_check. Called by
     main.py after select_portfolio() selects the final trade list. Depends on
     the KalshiClient produced by auth.py.
 
@@ -1301,25 +1300,25 @@ def pre_execution_check(client: Any, portfolio: list, *,
 
     Fetches both order books for each spec in parallel and drops any whose gap
     threshold is no longer met or whose available depth is less than the intended
-    contract count — and, for a time-series pair, any whose later book has no
-    YES ask now or whose fresh spread sits above the run's band ceiling (see
-    scanner.validate_pair_price). This reduces the window between price
-    observation and order submission, lowering the chance of submitting
-    against a stale price. Each drop is logged once, with its reason, by
-    validate_pair_price (or by the exception handler here); this function adds
-    only a summary count.
+    contract count, or whose fresh book keeps no level with an edge after the
+    fee, or (time-series) whose later book has no YES ask or whose spread tops
+    the run's band ceiling (scanner.validate_pair_price). This reduces the
+    window between price observation and order submission, lowering the chance
+    of submitting against a stale price. Each drop is logged once, with its
+    reason, by validate_pair_price (or by the exception handler here); this
+    function adds only a summary count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         portfolio (list): List of TradeSpec objects selected by select_portfolio().
-        settings (LiveSettings | None): Keyword-only. The run's live toggles,
-            handed to every validate_pair_price call so each spec is
-            re-checked under the one rule it was selected under. None resolves
-            config.py's once.
+        settings (LiveSettings | None): Keyword-only; the run's toggles. None reads config.py's.
 
     Returns:
         list: Filtered list of TradeSpec objects that still pass the price check.
             May be empty if all pairs' prices moved since the scan.
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
     if not portfolio:
         return []
@@ -1330,8 +1329,7 @@ def pre_execution_check(client: Any, portfolio: list, *,
     valid = []
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(portfolio))) as pool:
         future_to_spec = {
-            # Re-check each spec's books under the run's settings, the same
-            # object every other live site of this run was handed
+            # Re-check each spec's books under the run's one LiveSettings
             pool.submit(validate_pair_price, client, spec, settings=settings): spec
             for spec in portfolio
         }

@@ -20,37 +20,21 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
-    The run's live strategy toggles (tier floors, spread band, k, the
-    per-trade and same-title caps, the category and tag filters) are
-    config.py's, and a flag of the "live trading toggles" group overrides any
-    of them for this run only. _resolve_live_settings builds the run's one
-    config.LiveSettings — and config.py's own, the reference its departures
-    are judged against — before logging is configured, so a bad value is a
-    usage error (exit 2) before any request; each run mode logs it
-    (_log_live_settings) and hands it to every live site. The scheduler
-    passes no toggle flag, so a scheduled run trades exactly config.py.
-
-    Beyond orchestration this module holds two pair-list filters, both
-    applied between the finders and enrichment: _dedup_pairs (a same-title
-    pair wins a ticker-pair collision) and _filter_by_category (keep only the
-    pairs filed under the run's Kalshi categories and tags — a no-op, with no
-    request, when neither is set).
+    The live toggles are config.py's, each overridable for one run by a flag
+    of the "live trading toggles" group. _resolve_live_settings builds the
+    run's one config.LiveSettings before logging is configured (a bad value
+    exits 2); each run mode logs it (_log_live_settings) and hands it to
+    every live site. The scheduler passes no toggle flag. Two pair-list
+    filters run between the finders and enrichment: _dedup_pairs and
+    _filter_by_category.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, the same-title price threshold and
-    close-gap bound the no-pairs message names, file paths, and the live
-    toggles' LiveSettings/live_settings, describe_live_settings,
-    describe_time_series_rule, describe_trade_filter, live_rule_warnings and
-    SIZE_CAP_STEP, the caps' grid the cap flags' help and usage errors name —
-    the run's live toggles are resolved once, by _resolve_live_settings, and
-    that one object is handed to the time-series finder, the category/tag
-    filter, enrichment, the sizer (compute_trade, through
-    _compute_trade_specs) and pre_execution_check), historical.py
-    (load_series_categories, series_labels and infer_category — the backtest
-    dashboard's own filing rule, so the live category/tag filter files a pair
-    under the category and tag the dashboard files a trade of the same event
-    under; _filter_by_category's docstring says which slice a filter keeps),
+    (balance threshold, exit-code contract, the same-title threshold and
+    close-gap bound, file paths, and the live toggles: LiveSettings,
+    live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
+    historical.py (load_series_categories, series_labels, infer_category —
+    the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
     leg_sides — the only source of truth for which side each leg buys — and
     close_gap_bound_text, which renders that close-gap bound in the same
@@ -172,10 +156,8 @@ def _compute_trade_specs(
         candidate_pairs (list): List of CandidatePair objects to evaluate.
         balance_cents (int): Current account balance in cents, used to size
             each trade via Kelly criterion in compute_trade().
-        settings (LiveSettings): The run's live toggles, handed to every
-            compute_trade call — k and the per-pair caps are read from it.
-            Required: it must be the object enrichment's affordability bound
-            read, or the bound no longer bounds the size.
+        settings (LiveSettings): The run's toggles — the object enrichment
+            bounded the depth with (strategy.compute_trade).
 
     Returns:
         dict: Mapping of id(pair) -> TradeSpec for each pair that produced
@@ -184,8 +166,7 @@ def _compute_trade_specs(
     """
     specs: dict = {}
     for pair in candidate_pairs:
-        # Kelly-size under the run's k and caps (the settings enrichment's
-        # bound read); a TradeSpec, or None if the pair is unprofitable
+        # Kelly-size under the run's k and caps; None when the pair does not qualify
         spec = compute_trade(pair, balance_cents, settings=settings)
         if spec is not None:
             specs[id(pair)] = spec
@@ -241,41 +222,27 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
     """
     Build the "no qualifying pairs found" log message with the run's live rule.
 
-    Words the time-series entry rule the run applied through
-    config.describe_time_series_rule(settings.tier_floors,
-    settings.spread_band) — the words the time-series finder's always-logged
-    "Time-series entry rule" line uses — so the tiers it names (≥15% / ≥30%
-    by deadline gap, read from config's tier constants), or their absence
-    with the tier floors off, and any spread band are the ones the run
-    actually applied, flags included, and can never drift out of sync with
-    config.py. Names the same-title threshold straight from config.py for the
-    same reason. Names the cumulative-deadline requirement too: since that
-    rule landed, price is no longer the only reason a time-series candidate
-    can be absent, and an operator reading this line would otherwise go
-    looking at the thresholds for a result the WORDING decided. Names the
+    Words the time-series rule as the finder's "Time-series entry rule" line
+    does, and names the cumulative-deadline requirement so a reader does not
+    blame the price rule for what the wording decided. Names the
     same-title pairing rules for the same reason: a same-title pair also needs
     two different event series whose markets close within
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-02/DR-54, DR-74), with
     the bound read from that constant and rendered by
-    scanner.close_gap_bound_text. When the run sets a category or tag filter
-    (settings.categories / settings.tags), it names that too, in
-    config.describe_trade_filter's words: _filter_by_category can empty the
-    list on its own, and a reader must not go looking at the thresholds for
-    a result the filter decided. With no filter the message is unchanged.
+    scanner.close_gap_bound_text. A set category/tag filter is named too,
+    since it can empty the list on its own.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
             ("... found in sandbox ..."), False for a production run.
             Defaults to False.
-        settings (LiveSettings | None): The run's live toggles; both run
-            modes pass theirs. None resolves config.py's once.
+        settings (LiveSettings | None): The run's toggles; None reads config.py's.
 
     Returns:
         str: The fully formatted log message, ready to pass to logging.info().
 
     Raises:
-        ValueError: Only when settings is None and a config.py toggle is out
-            of range (config.live_settings).
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
     # The run's toggles, or config.py's for a caller that hands none
     settings = live_settings() if settings is None else settings
@@ -283,12 +250,11 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
         "time-series: both legs worded as cumulative deadlines "
         "(“by <date>”, two different ones) with the later leg's YES ask above "
         "the earlier's by the run's entry rule — "
-        # The rule as the finder's own rule line words it (config's tier
-        # constants and the run's band), so the two can never disagree
+        # In the finder's own rule-line words, so the two cannot disagree
         f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
         " — or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
-        # This module's own binding, like every threshold above; the scanner
+        # This module's own binding, like the same-title threshold above; the scanner
         # helper only renders it, in the words the refusal lines use.
         f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
     )
@@ -350,63 +316,27 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
     """
     Keep only the pairs filed under the run's categories and tags.
 
-    Files each pair by the backtest dashboard's own rule, so a pair and a
-    trade of the same event are filed under the same category and tag:
-      - MARKET A's literal series (historical.series_ticker; never
-        scanner.event_series, which collapses the KXMVE* combo family onto one
-        series) is looked up in Kalshi's /series listing
-        (historical.load_series_categories, cached a week);
-      - that gives Kalshi's category ("Uncategorised" when it gives none) and
-        the series' FIRST tag ("General" when it has none), through
-        historical.series_labels;
-      - a series missing from the listing is filed under its ticker-prefix
-        category (historical.infer_category) and "General".
-    Matching is case-insensitive, and the categories and the tags combine by
-    AND: a pair is kept when its category is one of settings.categories (any,
-    when None) and its tag one of settings.tags (any, when None).
-
-    Which dashboard slice a filter keeps: one category alone keeps exactly the
-    Category option of that name (no two of Kalshi's categories differ only
-    in case), and one category with one tag keeps exactly the Tag option
-    "category · tag" — except that a first tag Kalshi spells in two casings
-    under one category ("Anime Awards" / "Anime awards", both Entertainment,
-    on the 2026-09-25 listing) is one tag here and two options there. The
-    dashboard's Tag options are category-scoped while a tag here is matched
-    under EVERY category, so a tag without a category keeps every category's
-    series with that first tag ("Soccer" alone also keeps Economics' and
-    Entertainment's), and several names on one axis keep their union.
-
-    With both filters None — config.py's TRADE_CATEGORIES and TRADE_TAGS as
-    shipped, and every scheduled run — the pairs are returned untouched,
-    nothing is logged and no request is made. The filter fails CLOSED: with no
-    listing to file by (the request failed and there is no cached copy, or a
-    dev run has no cached copy), nothing is kept, rather than filing nearly
-    every KX-prefixed ticker under infer_category's "Other" and trading on a
-    label nobody chose. Such a run goes on to find no pair and exits EXIT_OK
-    like any run that finds none — satisfying a scheduled Monday slot — so
-    this function's WARNING is the one line that says why. A filter name that
-    names no category (no first tag) in the listing, nor any this run's pairs
-    were filed under, logs a WARNING: it is almost certainly a typo, and it
-    matches nothing.
+    Files each pair by MARKET A's series through historical.series_labels,
+    the dashboard's filing rule. Matching is case-insensitive, the two axes
+    combine by AND (None = any), and a tag matches under EVERY category, unlike
+    the dashboard's category-scoped Tag options. Fails CLOSED: with no
+    listing nothing is kept, rather than filing nearly every KX ticker as "Other",
+    and its WARNING is the one line saying why, since the run exits EXIT_OK.
+    A name matching no listed label and no pair draws a typo WARNING.
 
     Args:
         pairs (list): CandidatePairs after dedup, before enrichment.
-        settings (LiveSettings): The run's toggles (categories and tags are
-            read). Required: the run's one object, never config.py's.
-        listing_client: A production KalshiClient for the /series request
-            (made only when the cached listing is missing, unreadable or older
-            than config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS), or None to read the
-            cached listing only, however old. Dev passes None, so it never
-            signs a request to the production host with the sandbox key.
+        settings (LiveSettings): The run's toggles.
+        listing_client: A production KalshiClient, or None to read the cached
+            /series listing only (dev: the sandbox key never signs a prod request).
 
     Returns:
-        list: The kept pairs, in their original order — the input list itself
-            when no filter is set, an empty list when there is no listing.
+        list: The kept pairs, in their original order — the input list itself,
+            with no request, when no filter is set; [] when there is no listing.
     """
     if settings.categories is None and settings.tags is None:
         return pairs
-    # Kalshi's category and tags per series (cached a week; None reads the
-    # cached copy only) — the map the backtest dashboard files trades by
+    # Kalshi's category and tags per series, the map the dashboard files by
     series_categories = load_series_categories(listing_client)
     # The filter in the "Live settings:" line's own words
     wanted = describe_trade_filter(settings)
@@ -426,8 +356,7 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
     filed_tags: set = set()
     for pair in pairs:
         event = pair.market_a.event_ticker
-        # Market A's series, filed exactly as the dashboard files a trade: the
-        # ticker-prefix label when the listing lacks the series
+        # Filed exactly as the dashboard files a trade of this event
         category, tag = series_labels(event, infer_category(event), series_categories)
         filed_cats.add(category.casefold())
         filed_tags.add(tag.casefold())
@@ -441,8 +370,7 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
         len(kept), len(pairs),
         "" if not dropped else " — dropped " + ", ".join(
             f"{name} {n}" for name, n in dropped.most_common()))
-    # A name that no series carries, and no pair of this run was filed under,
-    # is almost certainly a typo — and matches nothing
+    # A name matching no listed label and no pair is almost certainly a typo
     known_cats = filed_cats | {(c or "Uncategorised").casefold()
                                for c, _ in series_categories.values()}
     known_tags = filed_tags | {(t[0] if t else "General").casefold()
@@ -681,8 +609,7 @@ def _blind_run_reason(markets: list, shard_statuses, inactive_shards: set) -> st
     return None
 
 
-# argparse destination -> the flag an operator types, for _resolve_live_settings'
-# usage error, in the "live trading toggles" group's order
+# argparse destination -> the flag an operator types, for the usage error
 _LIVE_FLAGS = (
     ("tier_floors", "--tier-floors/--no-tier-floors"),
     ("spread_min", "--spread-min"),
@@ -696,8 +623,7 @@ _LIVE_FLAGS = (
     ("any_tag", "--any-tag"),
 )
 
-# The destinations of the two cap flags, which take a whole percent where
-# LiveSettings (and its error messages) hold a fraction of the balance
+# The cap flags, which take a whole percent where LiveSettings holds a fraction
 _LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
 
 
@@ -705,46 +631,27 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     """
     Resolve this run's LiveSettings, and config.py's to compare it against.
 
-    The run's settings are config.py's (config.live_settings(), read at call
-    time) with each flag of the "live trading toggles" group that was GIVEN
-    replacing its own field: --tier-floors / --no-tier-floors the tier floors,
-    --spread-min / --spread-max one bound of the band each (the other keeps
-    config.py's, so --spread-max alone keeps config's floor), --interval-discount
-    k, --size-cap / --same-title-size-cap PCT the two caps as PCT / 100, and
-    --category NAME / --tag NAME (each repeatable, the names given in order)
-    the category and tag filters, or --any-category / --any-tag None (any),
-    clearing a filter config.py sets; argparse refuses a filter flag beside
-    its --any-* twin.
-    Validation is LiveSettings' own (dataclasses.replace re-runs its
-    __post_init__), so a flag is held to exactly the rule config.py's values
-    are: a cap off the SIZE_CAP_STEP grid, k outside (0, 1] or a band outside
-    0 <= floor < ceiling <= 1 is reported in that validator's own words, never
-    with a literal here. Those words speak in fractions (the validator judges
-    config.py's values too), so when --size-cap or --same-title-size-cap was
-    given the usage error also names the unit the flag takes — a whole
-    percent on the SIZE_CAP_STEP grid, read as that percent / 100 — so "got
-    0.37" is not read as a value to retype. main() calls this before logging
-    is configured (the TS-20 order backtest.py follows), so a bad value is a
-    usage error — exit 2, nothing logged, no request made. This is the one
-    live function that calls config.live_settings() directly
-    (tests/test_strategy.py::TestTimeSeriesKellyParity::
+    The run's settings are config.py's (read at call time) with each GIVEN
+    toggle flag replacing its field; LiveSettings validates the result
+    (dataclasses.replace re-runs __post_init__), so a flag meets config.py's
+    rule. Called before logging is configured (TS-20); the one live function
+    that calls config.live_settings() unconditionally (the AST pin
     test_ast_live_path_reads_toggles_only_through_live_settings).
 
     Args:
-        args (argparse.Namespace): The parsed flags. A missing attribute reads
-            as "not given", so a Namespace built by hand without the toggle
-            flags resolves config.py's settings unchanged.
+        args (argparse.Namespace): The parsed flags; a missing attribute reads
+            as not given.
         parser (argparse.ArgumentParser): Used to report an invalid value.
 
     Returns:
-        tuple[LiveSettings, LiveSettings]: (this run's settings, config.py's).
-            The two are equal when no toggle flag was given, as on every
-            scheduled run. Never returns on an invalid config.py value or
-            flag: parser.error exits with status 2.
+        tuple[LiveSettings, LiveSettings]: (this run's settings, config.py's),
+            equal when no toggle flag was given.
+
+    Raises:
+        SystemExit: Status 2 (parser.error) on an invalid config.py value or flag.
     """
     try:
-        # config.py's toggles, read and validated at call time: the reference
-        # every departure is judged against, and the base the flags lay over
+        # config.py's toggles: the reference, and the base the flags lay over
         reference = live_settings()
     except ValueError as exc:
         parser.error(f"config.py's live settings are invalid: {exc}")
@@ -761,9 +668,8 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["size_cap"] = args.size_cap / 100
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
-    # --category / --tag (repeatable) name the filter; --any-category /
-    # --any-tag clear config.py's for this run (argparse keeps each pair
-    # mutually exclusive)
+    # --category / --tag (repeatable) set the filter; --any-category / --any-tag
+    # clear config.py's (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
         overrides["categories"] = tuple(args.category)
     elif getattr(args, "any_category", None):
@@ -776,17 +682,15 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         # replace re-validates every field (LiveSettings.__post_init__)
         return dc_replace(reference, **overrides), reference
     except ValueError as exc:
-        # A flag is "given" unless it is absent (None) — never by truthiness:
-        # 0 is a given --spread-min and False a given --no-tier-floors. The
-        # --any-* switches default to None, so one left off is absent too
+        # Given means not None, never truthy: 0 is a given --spread-min and
+        # False a given --no-tier-floors (the --any-* switches default to None)
         given = [(dest, flag) for dest, flag in _LIVE_FLAGS
                  if getattr(args, dest, None) is not None]
         message = (f"invalid live setting for this run "
                    f"({', '.join(flag for _, flag in given)}): {exc}")
         percent = [flag for dest, flag in given if dest in _LIVE_PERCENT_FLAGS]
         if percent:
-            # The unit the flag itself takes, from the one grid definition
-            # (config.SIZE_CAP_STEP), never a literal here
+            # The flag's own unit, from the one grid definition (SIZE_CAP_STEP)
             step = f"{SIZE_CAP_STEP * 100:g}"
             message += (f" ({' and '.join(percent)} take{'s' if len(percent) == 1 else ''} "
                         f"a whole percent, a multiple of {step} from {step} to 100, read "
@@ -799,26 +703,15 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
     """
     Log the run's toggles, any departure from config.py, and every live_rule_warnings line.
 
-    Always logs one INFO line, "Live settings: …" (config.describe_live_settings),
-    every field that departs from reference marked "(config: X)" — so a run
-    that passes no flag, like every scheduled run, logs its toggles with no
-    mark at all. A production run that submits orders under ANY departure
-    also logs a WARNING saying its trades follow the flags, not the committed
-    configuration. Then every config.live_rule_warnings sentence is a WARNING
-    of its own: a band ceiling that empties a gap range, a pair type that may
-    stake more than LIVE_EXPOSURE_WARN_FRACTION of the balance, k = 1.
-
-    Takes the config.py reference explicitly and never resolves either object
-    itself, so a run handed its settings reads config.py nowhere
-    (tests/test_main.py::TestLiveSettingsReachEverySite).
+    One INFO line marks each field that departs from reference "(config: X)";
+    only a real-money run WARNs on a departure. Resolves neither object itself
+    (TestLiveSettingsReachEverySite).
 
     Args:
         settings (LiveSettings): The run's toggles.
-        reference (LiveSettings): config.py's toggles, as
-            _resolve_live_settings returned them (or the run's own settings,
-            which marks nothing, when a run mode is called with none).
-        real_money (bool): True for a prod run that submits orders; only such
-            a run gets the departure WARNING.
+        reference (LiveSettings): config.py's toggles (the run's own when a
+            run mode was handed none, which marks nothing).
+        real_money (bool): True for a prod run that submits orders.
     """
     # Every field, with a "(config: X)" mark on each one a flag moved
     logging.info("Live settings: %s", describe_live_settings(settings, reference))
@@ -848,16 +741,8 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
-        settings (LiveSettings | None): The run's live toggles (main()
-            passes _resolve_live_settings' result), handed to the time-series
-            finder, the category/tag filter (with no listing client: dev
-            reads the cached /series listing only), enrichment, the sizer and
-            the no-pairs message. None resolves config.py's once, at the top
-            of the run, so every site sees one rule.
-        reference (LiveSettings | None): config.py's toggles, which the
-            "Live settings" line marks departures against. None reads as the
-            run's own settings: nothing is marked, and config.py is never
-            read for it.
+        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
+        reference (LiveSettings | None): config.py's toggles; None means the run's own.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -875,11 +760,11 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
             Returned as an int (rather than None) for symmetry with _run_prod,
             since main() dispatches to either and passes the result to
             sys.exit().
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
-    # The run's live toggles, resolved ONCE and handed to the time-series
-    # finder, the category/tag filter, enrichment and the sizer, so none of
-    # them reads config.py on its own — and enrichment's affordability bound
-    # and the sizer read one k and one set of caps
+    # Resolved ONCE and handed to every site below that reads a toggle
     settings = live_settings() if settings is None else settings
     reference = settings if reference is None else reference
     sandbox_balance_cents = int(args.sandbox_balance * 100)
@@ -887,8 +772,7 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         "DEV mode: using real sandbox market data | virtual balance $%.2f",
         args.sandbox_balance,
     )
-    # Name the run's toggles and any departure from config.py; dev never
-    # submits an order, so a departure is never the production WARNING
+    # Log the run's toggles; dev never submits, so no departure WARNING
     _log_live_settings(settings, reference, real_money=False)
 
     # Read the exchange's per-shard status breakdown so ingest can drop shards
@@ -931,9 +815,7 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Keep only the run's categories and tags (a no-op with neither set). No
-    # listing client: the sandbox key must never sign a production request, so
-    # dev reads the cached /series listing only
+    # Category/tag filter; no listing client, so the sandbox key never signs a prod request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, None)
     # Replace best-ask prices with order book averages over the depth this
     # balance could actually buy, and validate liquidity under the run's rule
@@ -945,8 +827,7 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         # BS-26: write_dev_simulation() already logs "Dev simulation written: %s" —
         # this line carries the qualifier (why the file is empty) instead of
         # repeating the artifact path a second time. The thresholds come from
-        # _no_pairs_msg, handed the run's settings, so they cannot drift out
-        # of sync with the rule the run applied.
+        # _no_pairs_msg, handed the run's settings, so they match the rule the run applied.
         logging.info(
             "%s Simulation file will contain headers only.",
             _no_pairs_msg(sandbox=True, settings=settings),
@@ -955,8 +836,7 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         write_dev_simulation([], [], sandbox_balance_cents)
         return EXIT_OK
 
-    # Apply Kelly sizing to each candidate pair using the virtual balance,
-    # under the settings enrichment bounded the depth with
+    # Apply Kelly sizing to each candidate pair using the virtual balance
     trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
@@ -1014,18 +894,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
-        settings (LiveSettings | None): The run's live toggles (main()
-            passes _resolve_live_settings' result), handed to the time-series
-            finder, the category/tag filter (with this run's client, which
-            refreshes a stale /series listing), enrichment, the sizer,
-            pre_execution_check, the no-pairs message and the trade log's
-            separator note. None resolves config.py's once, at the top of the
-            run, so every site sees one rule.
-        reference (LiveSettings | None): config.py's toggles, which the
-            "Live settings" line and the trade log's separator note mark
-            departures against and which decide the departure WARNING of a
-            run that submits orders. None reads as the run's own settings:
-            nothing departs, and config.py is never read for it.
+        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
+        reference (LiveSettings | None): config.py's toggles, which departures
+            are marked against; None means the run's own.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -1043,17 +914,15 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             means a human must check the account/trade log. EXIT_OK for every
             other path, including dry-run, no candidate pairs, no executable
             trades, and all-pairs-failed-pre-execution-check.
+
+    Raises:
+        ValueError: When settings is None and a config.py toggle is invalid.
     """
-    # The run's live toggles, resolved ONCE and before any request, and handed
-    # to the time-series finder, the category/tag filter, enrichment, the sizer
-    # and pre_execution_check, so none of them reads config.py on its own —
-    # and enrichment's affordability bound and the sizer read one k and one
-    # set of caps
+    # Resolved ONCE, before any request, and handed to every site below that reads a toggle
     settings = live_settings() if settings is None else settings
     reference = settings if reference is None else reference
     logging.warning("Running in PRODUCTION mode — real money will be used!")
-    # Name the run's toggles and any departure from config.py — a WARNING of
-    # its own when this run submits orders under a flag's settings
+    # Log the run's toggles; a departure is a WARNING when orders go out
     _log_live_settings(settings, reference, real_money=not args.dry_run)
 
     # Confirm auth works and read the pre-trade balance broken out by shard
@@ -1117,15 +986,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (deadline-gap, under the
-    # run's entry rule) and same-title
+    # Run both pair detection paths: time-series (the run's entry rule) and same-title
     time_series_pairs = find_time_series_pairs(client, held_tickers, markets, settings=settings)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Keep only the run's categories and tags (a no-op with neither set),
-    # before enrichment so a dropped pair costs no order-book request; the
-    # run's own client refreshes a stale /series listing
+    # Category/tag filter, before enrichment so a dropped pair costs no book request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, client)
     # Replace best-ask prices with order book averages over the depth this
     # balance could actually buy, and validate liquidity under the run's rule
@@ -1138,8 +1004,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(_no_pairs_msg(settings=settings))
         return EXIT_OK
 
-    # Apply Kelly sizing to each candidate pair using the real account balance,
-    # under the settings enrichment bounded the depth with
+    # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
     # Greedy portfolio selection ranked by monthly_profit_ratio descending
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
@@ -1160,8 +1025,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     _print_portfolio(portfolio, "Selected")
 
-    # Re-fetch order books for each pair concurrently and drop any whose prices
-    # moved, re-checked under the same settings the pairs were selected under
+    # Re-fetch each pair's books and drop any that moved, under the run's rule
     portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
@@ -1213,12 +1077,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # so the record of real fills is never lost, then re-raise.
     try:
         # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
-        # itself (BS-26) — don't duplicate that line here. The run's toggles
-        # ride on the separator row, marked against config.py's exactly as the
-        # "Live settings:" line is, so a row traded under a flag's settings
-        # can be told from one traded under config.py's without the log file
-        # (the values alone cannot say which: a flag can set a value a later
-        # config.py ships)
+        # itself (BS-26) — don't duplicate that line here. The note marks the
+        # toggles a flag moved, so the workbook tells rows traded under a flag
+        # from rows traded under config.py's values
         append_to_prod_log(
             results, balance_cents / 100, balance_after,
             run_note=f"settings: {describe_live_settings(settings, reference)}",
@@ -1321,14 +1182,11 @@ def main() -> None:
     pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
-    --max-horizon-days, and the "live trading toggles" group, which overrides
-    one config.py toggle each for this run only), resolves the run's one
-    config.LiveSettings and config.py's own through _resolve_live_settings —
-    before logging is configured, so a bad value is a usage error (exit 2)
-    and nothing is logged or requested — configures logging, builds the
-    appropriate Kalshi client, and dispatches to _run_dev (sandbox
-    simulation) or _run_prod (real account trading) with both settings
-    objects. Exits the process via sys.exit() with the
+    --max-horizon-days, and the "live trading toggles" group), resolves the
+    run's settings and config.py's reference (_resolve_live_settings, before
+    logging is configured), configures logging, builds the appropriate Kalshi
+    client, and dispatches to _run_dev (sandbox simulation) or _run_prod (real
+    account trading) with both. Exits the process via sys.exit() with the
     dispatched run's return code (see the EXIT_* constants in config.py,
     BS-14) so a caller that only sees the process exit status — the
     scheduler, which runs this as a subprocess — can distinguish a clean run
@@ -1365,9 +1223,8 @@ def main() -> None:
         "--max-horizon-days", type=int, default=None, metavar="DAYS",
         help="Only consider markets closing within DAYS from now (both modes; default: no limit)",
     )
-    # Every flag here defaults to None ("not given"), so the run keeps
-    # config.py's value for each flag it was not given; the values are
-    # validated by config.LiveSettings in _resolve_live_settings, never here
+    # Every flag defaults to None (not given); LiveSettings alone validates the
+    # values — no choices, range check or literal here
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one config.py setting for THIS run only, in either mode. The weekly "
@@ -1393,8 +1250,7 @@ def main() -> None:
         help="Time-series interval discount k, in (0, 1] "
              "(default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)",
     )
-    # The caps' grid step, in percent, from its one definition (SIZE_CAP_STEP);
-    # argparse %-formats help, hence the "%%" beside it
+    # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
     live.add_argument(
         "--size-cap", type=int, default=None, metavar="PCT",
@@ -1407,8 +1263,7 @@ def main() -> None:
              "steps; 100 = no extra cap beyond --size-cap "
              "(default: config.SAME_TITLE_SIZE_CAP)",
     )
-    # A pair is filed under MARKET A's series' Kalshi category and FIRST tag,
-    # as the backtest dashboard files a trade (main._filter_by_category)
+    # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()
     categories.add_argument(
         "--category", action="append", default=None, metavar="NAME",
@@ -1435,10 +1290,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
-    # The run's one LiveSettings (config.py's, each flag given replacing its
-    # field) and config.py's own to mark departures against — resolved and
-    # validated BEFORE logging is configured (TS-20), so a bad flag or a bad
-    # config.py value exits 2 with nothing logged and no request made
+    # Validated BEFORE logging is configured (TS-20): a bad flag or config.py
+    # value exits 2 with nothing logged or requested
     settings, reference = _resolve_live_settings(args, parser)
 
     # Echo to the console (foreground/interactive runs) as well as the
@@ -1467,8 +1320,7 @@ def main() -> None:
 
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
-    # Both run modes get the one settings object every live site will read,
-    # and config.py's to judge its departures against
+    # Both run modes get the run's settings and config.py's reference
     if args.mode == "dev":
         code = _run_dev(client, args, settings, reference)
     else:

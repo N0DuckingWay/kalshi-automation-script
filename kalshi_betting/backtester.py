@@ -37,29 +37,19 @@ Dependencies:
     stays the live one's verbatim twin), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
-    spread_min and tier_floors keywords this module passes to apply its
-    bands and its tier-floors-off family, as config.live_time_series_floor
-    passes them for the live rule — and time_series_profit_prob), the
+    spread_min and tier_floors keywords apply this module's bands and
+    tier-floors-off family — and time_series_profit_prob), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
     and resolves a band up front in _entries_for_band, run_backtest_sweep,
     _sweep_from_candidates and _simulate_at_discount's completion line; no
-    live module calls either — the live rule reaches them only through
-    config.LiveSettings and config.time_series_spread_refusal, whose
-    per-Monday parity with _find_entry is pinned by tests/test_backtester.py::
-    TestLiveBacktestSpreadParity), plus BUDGET_FRACTION and
-    SAME_TITLE_SIZE_CAP (both bound by value, the per-trade caps every
-    simulation sizes under) and pair_size_cap (the one definition of a
-    pair's cap, shared with live sizing, so the two paths cap a pair alike),
-    LiveSettings, live_settings (called only by _live_settings_for_report,
-    the one place this module reads config.live_settings() at all: a
-    fail-soft read of config.py's own live toggles, recorded on
-    BacktestSweep.live_tier_floors/live_spread_band/live_categories/
-    live_tags — reporting only), describe_time_series_rule and _names_text
-    (the "Live time-series rule" log line's rule and, through
-    _live_filter_text, its category/tag filter, worded as
-    config.describe_trade_filter words it),
+    live module calls either except through config's own live helpers, and
+    TestLiveBacktestSpreadParity pins _find_entry to the live spread rule),
+    plus BUDGET_FRACTION and SAME_TITLE_SIZE_CAP (bound by value),
+    pair_size_cap (one definition, shared with live sizing), LiveSettings,
+    live_settings, describe_time_series_rule and _names_text (the
+    reporting-only "Live time-series rule" line),
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
     grid _candle_window_open floors a market's open onto),
     LARGE_GROUP_WARN_THRESHOLD,
@@ -140,8 +130,7 @@ Notes:
     _entries_for_band() pass at the default band, which is no band at all)
     and one _simulate_at_discount() call with k=None, which
     config.time_series_profit_prob resolves to
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the k config.live_settings()
-    hands the live sizer.
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     _interval_calibration() measures the EMPIRICAL discount from one band's
     k-independent entries — the realised in-between rate divided by the mean
@@ -150,9 +139,7 @@ Notes:
     entries rather than _simulate_at_discount(), it is never filtered by the
     Kelly gate, which is what stops the estimate confirming whatever k
     produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py,
-    and live sizing keeps reading config.TIME_SERIES_INTERVAL_PROB_DISCOUNT
-    (through the run's config.LiveSettings; only main.py's own
-    --interval-discount overrides it, for one live run).
+    and live sizing reads its k from its run's config.LiveSettings.
 
     run_backtest_sweep() is the entry point that exposes all of that:
     _prepare_candidates() once, then _sweep_from_candidates() — one
@@ -163,9 +150,7 @@ Notes:
     band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
     that k grid and adds standalone time-series (ladders + cross-event),
     ladder, cross-event and same-title populations, a split-half check and an
-    excluding-top-event check — the backtest-only scenario explorer, whose
-    grid bands no live module reads (the live band is
-    config.TIME_SERIES_SPREAD_BAND, read only through config.LiveSettings).
+    excluding-top-event check — the backtest-only scenario explorer.
     run_backtest() is untouched by it — same signature, same two-tuple — so
     every existing caller keeps working.
 
@@ -174,7 +159,7 @@ Notes:
     (_tier_floors_bind: a floor below a tier — on the shipped grid floors 0,
     0.20 and 0.25, 18 of the 36 bands) is entered and simulated a second
     time with the tiers not applied — config.min_price_diff_for_gap's
-    backtest-only tier_floors=False, so that band's floor alone gates pB − pA
+    tier_floors=False, so that band's floor alone gates pB − pA
     (which must still be strictly positive) and sets the leg-price-sum
     ceiling — through the same scenario block, and returned beside the
     tier-on grid as BacktestSweep.tier_off_scenarios /
@@ -184,24 +169,13 @@ Notes:
 
     The per-trade Kelly size cap is a simulation parameter too:
     _simulate_at_discount(..., size_cap=None) sizes every candidate at
-    min(config.pair_size_cap(pair type, cap, SAME_TITLE_SIZE_CAP), f*), where
-    None resolves this module's BUDGET_FRACTION at call time — the value
-    config.live_settings() hands the live sizer as its cap for every pair —
-    so every existing call sizes exactly as before. A same-title candidate
-    also stays under SAME_TITLE_SIZE_CAP (read at call time and validated
-    like the per-trade cap, at every cap), as live sizing keeps it under
-    LiveSettings.same_title_size_cap, so a default backtest sizes same-title
-    as a live run without main.py's toggle flags does; at 1.0 it adds no cap.
+    min(config.pair_size_cap(pair type, size_cap, SAME_TITLE_SIZE_CAP), f*),
+    None meaning this module's BUDGET_FRACTION.
 
-    With cap_sweep, run_backtest_sweep also returns a CapSweep: every other
-    cap of SIZE_CAP_SWEEP (5%..95% and no cap — a grid that lives here, not
-    in config.py, by the operator's instruction for this change), simulated
-    LAZILY, one (band, k) cell at a time, when a reader asks — keeping every
-    band x k x cap x population point would hold gigabytes. Each cell is
-    seeded from the eager point: every cap at or above a point's
-    (cap-independent) peak_kelly_fraction sizes identically — a time-series
-    candidate at f*, a same-title one at min(SAME_TITLE_SIZE_CAP, f*) — so
-    those caps share one simulation. With tier_off_sweep too, a SECOND CapSweep
+    With cap_sweep, run_backtest_sweep also returns a CapSweep over every other
+    cap of SIZE_CAP_SWEEP (defined here, not in config.py), seeded from the
+    eager points (caps at or above a point's peak share one simulation) and
+    simulated lazily, one (band, k) cell at a time. With tier_off_sweep too, a SECOND CapSweep
     (BacktestSweep.tier_off_cap_sweep, tier_floors False) does the same over
     the tier-floors-off family's binding bands, seeded from that family's own
     points — so every tier x band x k x cap scenario is a real simulation.
@@ -396,16 +370,9 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
 # 95%, then 1.0 — NO cap. Kelly's f* = p - q/b <= p <= 1 (time_series_profit_prob
 # is 1 - k*max(0, pB-pA) with k in [0, 1]; same-title prices at the fixed
 # SAME_TITLE_CO_RESOLVE_PROB), so min(1.0, f*) is f* itself and "100%" and
-# "off" are one run. Each cap is the cap for EVERY pair: a same-title
-# candidate also stays under SAME_TITLE_SIZE_CAP at every cap
-# (config.pair_size_cap), so "no cap" means no per-trade cap on time-series
-# pairs and SAME_TITLE_SIZE_CAP on same-title ones — no cap at all while that
-# constant is 1.0, as it was until the 2026-09-27 decision (it ships 0.20
-# since, with config.BUDGET_FRACTION lifted to 1.0, so a default run's own cap
-# is the "no cap" option). BACKTEST-ONLY: live sizing reads its caps from the run's
-# config.LiveSettings (config.BUDGET_FRACTION, config.SAME_TITLE_SIZE_CAP, or
-# main.py's --size-cap / --same-title-size-cap for one run) and strategy.py
-# never imports this module. Rounded to two decimals, so 0.2
+# "off" are one run. A same-title candidate also stays under
+# SAME_TITLE_SIZE_CAP at every cap (config.pair_size_cap). BACKTEST-ONLY:
+# strategy.py never imports this module. Rounded to two decimals, so 0.2
 # is a member by value; the run's own cap is unioned in anyway (CapSweep), as
 # the k grid unions its primary. Lives here rather than in config.py beside
 # INTERVAL_DISCOUNT_SWEEP by the operator's instruction for this change (only
@@ -418,10 +385,7 @@ def _validated_cap(value: Any, name: str) -> float:
     """
     Validate one per-trade Kelly cap and return it as a builtin float.
 
-    The ONE check behind both caps a simulation sizes under —
-    _resolve_size_cap's (the cap for every pair) and
-    _resolve_same_title_size_cap's (the extra cap on same-title pairs) — so
-    the two are held to one rule. Any real number is accepted — a
+    Shared by both cap resolvers. Any real number is accepted — a
     numbers.Real, so numpy's float64/float32/int64 and a Fraction as well as
     int and float — and returned as a builtin float. A cap outside (0, 1] is
     refused: 0 sizes nothing, and above 1 means nothing because Kelly's f*
@@ -430,21 +394,18 @@ def _validated_cap(value: Any, name: str) -> float:
     refused although Python counts it as an int (True would silently read as
     "no cap"), and so is anything that is not a numbers.Real, e.g. the string
     "0.2" or a Decimal — each with a message naming the type rather than the
-    range, so a type bug is not reported as an out-of-range value. Range
-    only: the SIZE_CAP_STEP grid config.LiveSettings holds a live cap to is
-    not applied here, since a size-cap sweep simulates any cap in (0, 1].
+    range, so a type bug is not reported as an out-of-range value. No
+    config.SIZE_CAP_STEP grid applies: a sweep simulates any cap in (0, 1].
 
     Args:
-        value (Any): The cap as a fraction of the checkpoint's opening
-            balance.
+        value (Any): The cap, a fraction of the checkpoint's opening balance.
         name (str): The cap's name, for the error message.
 
     Returns:
         float: The cap, as a builtin float.
 
     Raises:
-        ValueError: If value is a bool, not a numbers.Real, NaN, or outside
-            (0, 1].
+        ValueError: If value is a bool, not a numbers.Real, or not in (0, 1].
     """
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
         raise ValueError(
@@ -460,13 +421,9 @@ def _resolve_size_cap(size_cap: float | None) -> float:
     """
     Resolve and validate the per-trade Kelly size cap one simulation sizes under.
 
-    None is the "no override" sentinel and resolves to this module's
-    BUDGET_FRACTION, read at CALL time — never bound as a default at def time —
-    so a test that monkeypatches backtester.BUDGET_FRACTION (e.g.
-    TestCheckpointOpeningBalanceSizing::test_greedy_fit_skips_rather_than_shrinks)
-    still sizes at the patched value. The resolved cap is held to
-    _validated_cap's rule: any real number in (0, 1], returned as a builtin
-    float; a bool, a non-real, NaN or anything out of range is refused.
+    None resolves this module's BUDGET_FRACTION at CALL time, never as a
+    def-time default, so a monkeypatch of backtester.BUDGET_FRACTION binds.
+    The result is held to _validated_cap's rule.
 
     Args:
         size_cap (float | None): The cap as a fraction of the checkpoint's
@@ -487,21 +444,16 @@ def _resolve_same_title_size_cap() -> float:
     """
     Resolve and validate the extra per-trade cap on same-title pairs.
 
-    Reads this module's SAME_TITLE_SIZE_CAP at CALL time — a by-value binding
-    of config.SAME_TITLE_SIZE_CAP, so a test patches backtester's, never
-    config's — and holds it to _validated_cap's rule, the one the per-trade
-    cap is held to here. Without the check a bad value would not fail at all:
-    config.pair_size_cap takes min(cap, same-title cap), which reads a NaN as
-    no same-title cap (min(1.0, nan) is 1.0) and a value of 0 or below as a
-    same-title trade of nothing — a strategy the live bot never runs, since
-    config.LiveSettings refuses all of them before any live request.
+    Reads this module's by-value SAME_TITLE_SIZE_CAP at CALL time (patch
+    backtester's). Checked because a bad value would not fail otherwise:
+    pair_size_cap's min() reads NaN as no cap and 0 or below as no same-title
+    trade.
 
     Returns:
         float: SAME_TITLE_SIZE_CAP, as a builtin float in (0, 1].
 
     Raises:
-        ValueError: If SAME_TITLE_SIZE_CAP is a bool, not a numbers.Real, NaN,
-            or outside (0, 1].
+        ValueError: As _validated_cap, for a bad SAME_TITLE_SIZE_CAP.
     """
     return _validated_cap(SAME_TITLE_SIZE_CAP, "SAME_TITLE_SIZE_CAP")
 
@@ -541,10 +493,8 @@ def _cap_label(cap: float) -> str:
         cap (float): A resolved cap in (0, 1].
 
     Returns:
-        str: "no cap" for 1.0 (no per-trade cap: full Kelly — see
-            SIZE_CAP_SWEEP — though a same-title pair still stays under
-            SAME_TITLE_SIZE_CAP, which this label does not name), else "cap
-            <percent>%" through _cap_percent, so two caps never share a label.
+        str: "no cap" for 1.0 (a same-title pair still stays under
+            SAME_TITLE_SIZE_CAP), else "cap <percent>%" through _cap_percent.
     """
     return "no cap" if cap >= 1.0 else f"cap {_cap_percent(cap)}%"
 
@@ -917,10 +867,8 @@ class SweepPoint:
             tier-on point.
         size_cap (float | None): The RESOLVED per-trade Kelly size cap this
             point was sized under — config.BUDGET_FRACTION unless a size-cap
-            sweep simulated another; 1.0 means no per-trade cap (full Kelly).
-            It caps every pair; a same-title pair was also capped at
-            SAME_TITLE_SIZE_CAP (config.pair_size_cap), which the sweep records
-            once, as BacktestSweep.same_title_size_cap. None only on a
+            sweep simulated another; 1.0 means no per-trade cap (full Kelly),
+            same-title pairs still under SAME_TITLE_SIZE_CAP. None only on a
             hand-built point, which a report labels "not recorded".
             Appended with a default, like the two fields below it, so no
             existing construction moves.
@@ -929,12 +877,8 @@ class SweepPoint:
             before the settlement-outcome and premise checks, so a candidate
             those later drop still counts — and 0.0 when none passed. It does
             not depend on the cap (Pass 1b scores every entry before any
-            sizing), and every cap C at or above it sizes this point's entries
-            identically: min(pair_size_cap(type, C, SAME_TITLE_SIZE_CAP), f*)
-            is f* for a time-series candidate and min(SAME_TITLE_SIZE_CAP, f*)
-            for a same-title one, neither depending on C. A size-cap sweep
-            reuses one simulation for all such caps (CapSweep). None only on
-            a hand-built point.
+            sizing); every cap at or above it sizes the point identically
+            (CapSweep reuses one simulation). None only on a hand-built point.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1318,14 +1262,9 @@ class CapSweep:
     for a cell twice simulates it twice.
 
     Seeded from the eager point. A point's peak_kelly_fraction does not depend
-    on the cap, and every cap C at or above it sizes the point's entries
-    identically: a candidate is sized at
-    min(config.pair_size_cap(type, C, SAME_TITLE_SIZE_CAP), f*), which for
-    C >= f* is f* for a time-series candidate and min(SAME_TITLE_SIZE_CAP, f*)
-    for a same-title one — neither depends on C. (Each cap of the sweep is
-    the cap for every pair; a same-title candidate stays under
-    SAME_TITLE_SIZE_CAP at every one, read at call time — the eager point and
-    every cell read the same binding while it is not rebound.) So:
+    on the cap, and every cap at or above it sizes the point's entries
+    identically — provided SAME_TITLE_SIZE_CAP, read at call time, is not
+    rebound between the eager point and the cell. So:
       * the primary cap always returns the eager object ITSELF;
       * when the primary cap is itself at or above the eager point's peak,
         every other cap at or above that peak returns a
@@ -1407,9 +1346,6 @@ class CapSweep:
     new dicts (derived, not measured) beside at most 660 for its 330 tier-on
     no-band entries, a few MB. The ~810 tier-on figure above is a different
     corpus's (the 365-day run's), whose tier-off-only count was not measured.
-
-    BACKTEST-ONLY, like the band and k sweeps: live sizing reads its caps from
-    the run's config.LiveSettings and never this module.
 
     Attributes:
         caps (tuple[float, ...]): Ascending: SIZE_CAP_SWEEP with the primary
@@ -1763,37 +1699,19 @@ class BacktestSweep:
             cap_sweep it simulates nothing during the run. Its primary-cap
             points ARE the tier_off_scenarios objects. Appended with a
             default, so no construction moves.
-        same_title_size_cap (float | None): The extra per-trade cap every
-            same-title candidate of this run was sized under at every cap
-            (this module's binding of config.SAME_TITLE_SIZE_CAP, through
-            config.pair_size_cap) — so a report can say what a size-cap axis
-            means for same-title pairs: "no cap" there is this cap. None when
-            not recorded (a hand-built sweep). Appended with a default, so no
-            construction moves; both production constructions record it.
-        live_tier_floors (bool | None): config.py's live
-            TIME_SERIES_TIER_FLOORS, from ONE read of config.live_settings()
-            that run_backtest_sweep takes before anything is fetched
-            (_live_settings_for_report) — so a report can say whether THIS
-            run's primary scenario, some other cell of its own grid, or
-            nothing on it is the rule the live bot trades
-            (_live_rule_view). main.py's per-run overrides are not visible
-            here: they never reach config.py. Reporting only — nothing this
-            run enters or sizes reads it. None when config.py's live
-            toggles do not validate (one WARNING is logged and the run still
-            completes) or when not recorded (a hand-built sweep); the other
-            three live_* fields are then None too, from the same read.
-            Appended with a default, so no construction moves; both
-            production constructions record it.
-        live_spread_band (tuple[float, float] | None): config.py's live
-            TIME_SERIES_SPREAD_BAND, validated and resolved by
-            config.LiveSettings, from the same read; None exactly when
-            live_tier_floors is.
-        live_categories (tuple[str, ...] | None): config.py's live
-            TRADE_CATEGORIES, from the same read. None means ANY category
-            when live_tier_floors is recorded, and not recorded when it is
-            None.
-        live_tags (tuple[str, ...] | None): config.py's live TRADE_TAGS,
-            from the same read, read like live_categories.
+        same_title_size_cap (float | None): The extra cap every same-title
+            candidate was sized under (this module's SAME_TITLE_SIZE_CAP).
+            None only on a hand-built sweep.
+        live_tier_floors (bool | None): config.py's TIME_SERIES_TIER_FLOORS,
+            from run_backtest_sweep's one fail-soft pre-fetch read
+            (_live_settings_for_report); reporting only, blind to main.py's
+            per-run overrides. None, with the other live_* fields, when the
+            toggles do not validate or on a hand-built sweep.
+        live_spread_band (tuple[float, float] | None): config.py's resolved
+            TIME_SERIES_SPREAD_BAND.
+        live_categories (tuple[str, ...] | None): config.py's TRADE_CATEGORIES;
+            None means any category when live_tier_floors is recorded.
+        live_tags (tuple[str, ...] | None): config.py's TRADE_TAGS, likewise.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -3501,13 +3419,9 @@ def _find_entry(
     back inside the band can still be the entry. The default band,
     config.BACKTEST_DEFAULT_SPREAD_BAND = (0.0, 1.0), is no band at all — a
     floor of 0 is inert under every tier and no spread exceeds 1 — so the
-    default, with the tier floors on, reproduces the tier rule alone: the
-    live rule until the 2026-09-27 decision, not since (the live rule is now
-    config.TIME_SERIES_TIER_FLOORS off with config.TIME_SERIES_SPREAD_BAND
-    0-0.5, config.live_time_series_floor's rule, which a call with
-    spread_band=(0.0, 0.5) and tier_floors=False reproduces — pinned per
-    Monday by tests/test_backtester.py::TestLiveBacktestSpreadParity).
-    same_title pairs never read the band.
+    default reproduces the tier rule alone, and the live band and tier
+    setting reproduce config.time_series_spread_refusal
+    (TestLiveBacktestSpreadParity). same_title pairs never read the band.
 
     tier_floors (BACKTEST-only, like the band) switches the deadline-gap tier
     itself off: the threshold is then the band floor alone, which drives the
@@ -3561,10 +3475,7 @@ def _find_entry(
             time-series pairs at the band floor alone, the deadline-gap tier
             not applied (the band sweep's tier-floors-off family) — still
             only at a strictly positive spread; True (the default) layers
-            the floor on the tier — the live rule while
-            config.TIME_SERIES_TIER_FLOORS is True, which it was until the
-            2026-09-27 decision (it ships False since). Ignored by same_title
-            pairs.
+            the floor on the tier. Ignored by same_title pairs.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -5154,9 +5065,8 @@ def _band_label(band: tuple[float, float]) -> str:
     return f"{_exact_label(lo, 'g')}-{_exact_label(hi, 'g')}"
 
 
-# _sweep_from_candidates' default for its live keyword: "read config.py's live
-# toggles yourself" (a direct caller), as distinct from None, which is a read
-# run_backtest_sweep took and found invalid.
+# _sweep_from_candidates' default for live: read config.py's toggles there (a
+# direct caller); None is a read run_backtest_sweep took and found invalid.
 _LIVE_NOT_READ = object()
 
 
@@ -5164,25 +5074,11 @@ def _live_settings_for_report() -> LiveSettings | None:
     """
     Read config.py's live toggles for this run's report, failing soft.
 
-    One call to config.live_settings(), at CALL time, so a test that
-    monkeypatches config.py's own constants is reflected. live_settings()
-    never reads this module's by-value bindings of BUDGET_FRACTION,
-    SAME_TITLE_SIZE_CAP and TIME_SERIES_INTERVAL_PROB_DISCOUNT, so patching
-    those moves what this run simulates, never what it reports as live.
-    run_backtest_sweep calls it once, before anything is fetched, and hands
-    the result to whichever construction builds the sweep; a direct caller of
-    _sweep_from_candidates that hands nothing gets one read of its own.
-
-    The result is reporting only (BacktestSweep.live_*, the "Live time-series
-    rule" log line, dashboard._live_rule_html): nothing this run enters or
-    sizes reads it. A config.py toggle that fails config.LiveSettings' own
-    validation must therefore not abort a backtest over a reporting line, so
-    this fails soft where config.LiveSettings itself, and
-    _resolve_same_title_size_cap, deliberately raise.
+    Reporting only: invalid toggles log one WARNING instead of aborting.
+    config.live_settings() reads config's constants, not this module's copies.
 
     Returns:
-        LiveSettings | None: config.live_settings(); or None, with one
-            WARNING logged, when config.py's live toggles do not validate.
+        LiveSettings | None: The toggles; None when they do not validate.
     """
     try:
         return live_settings()
@@ -5197,17 +5093,15 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     """
     Name the BacktestSweep keywords that record config.py's live rule.
 
-    Both production constructions (run_backtest_sweep's Monday-infeasible
-    branch and _sweep_from_candidates) spread this into BacktestSweep, so the
-    four fields are always recorded together, from one read, or not at all.
+    Both production BacktestSweep constructions spread this (beside
+    same_title_size_cap), so the four fields are recorded together from one
+    read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: live_tier_floors, live_spread_band, live_categories and
-            live_tags from live; empty when live is None, which leaves all
-            four at their None default ("not recorded").
+        dict: The four live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -5220,10 +5114,8 @@ def _live_filter_text(categories: tuple[str, ...] | None,
     """
     Name a recorded category/tag filter as config.describe_trade_filter does.
 
-    describe_trade_filter takes a whole LiveSettings, and a report holds only
-    the recorded fields, so this spells the same words from the two fields
-    through the same config._names_text (pinned equal to
-    describe_trade_filter by tests/test_backtester.py::TestLiveRuleLine).
+    Same words from the two recorded fields, through config._names_text (pinned
+    equal by tests/test_backtester.py::TestLiveRuleLine).
 
     Args:
         categories (tuple[str, ...] | None): BacktestSweep.live_categories.
@@ -5240,11 +5132,9 @@ def _live_filter_is_one_slice(categories: tuple[str, ...] | None,
     """
     Say whether a live category/tag filter is ONE of the filter bar's options.
 
-    The bar shows one Category (every tag under it) or one Tag option ("C · T",
-    one category's tag) at a time. A filter naming exactly one category, and
-    at most one tag, is one such option; anything else — several categories
-    or tags, or a tag with any category, which the bar lists once per
-    category that carries it — can only be read one slice at a time.
+    The bar offers one Category, or one "C · T" Tag option, at a time: one
+    category with at most one tag is one option; anything else may span
+    several.
 
     Args:
         categories (tuple[str, ...] | None): The live categories, None for any.
@@ -5256,9 +5146,8 @@ def _live_filter_is_one_slice(categories: tuple[str, ...] | None,
     return categories is not None and len(categories) == 1 and len(tags or ()) <= 1
 
 
-# Where THIS run's own grid holds config.py's live time-series rule
-# (_LiveRuleView.where): the primary scenario itself, another cell of the
-# grid, or nowhere.
+# _LiveRuleView.where: this run's primary scenario holds config.py's live
+# time-series rule, another cell of its grid does, or none does.
 _LIVE_RULE_PRIMARY = "primary"
 _LIVE_RULE_GRID = "grid"
 _LIVE_RULE_NOT_SIMULATED = "not simulated"
@@ -5270,13 +5159,9 @@ class _LiveRuleView:
     Where a run's own grid holds config.py's live time-series rule.
 
     Attributes:
-        where (str): _LIVE_RULE_PRIMARY, _LIVE_RULE_GRID or
-            _LIVE_RULE_NOT_SIMULATED.
-        tier_floors (bool): The Tier floors setting of the cell that holds it
-            — the live setting, except that the tier floors off at a band no
-            tier binds at is the tier-on rule (backtester._tier_floors_bind
-            False: that band was never simulated again, and its tier-on cells
-            ARE its tier-off ones), so it is True there.
+        where (str): One of the three _LIVE_RULE_* constants.
+        tier_floors (bool): The holding cell's Tier floors setting: the live
+            one, except True where no tier binds (its on and off cells are one).
     """
     where: str
     tier_floors: bool
@@ -5286,31 +5171,17 @@ def _live_rule_view(sweep: BacktestSweep) -> _LiveRuleView | None:
     """
     Say where a run's own grid holds config.py's live time-series rule.
 
-    The ONE definition, read by the "Live time-series rule" log line
-    (_live_rule_line) and by dashboard._live_rule_html, so the log and the
-    page can never disagree. It reads only what the sweep RECORDED, never
-    the run's flags, so a Monday-infeasible run (nothing simulated beyond
-    its empty primary) and a hand-built sweep are judged on what they carry:
-      - the primary scenario is the rule when the live band is its band and
-        the live rule is tier-on (or tier-off at a band no tier binds at);
-      - another cell holds it when the live band is a band this run
-        simulated (every one is a key of calibrations_by_band, the primary's
-        included) and, with the tier floors off at a band a tier binds at,
-        the run carries the tier-floors-off view the dashboard can show —
-        dashboard._tier_off_binds' rule: the family ran and names EVERY band
-        of the grid a tier binds at, since the page withholds the whole off
-        view rather than one band's;
-      - otherwise nothing on this run's grid is the live rule.
-    Only the time-series rule is judged; the category/tag filter is a slice
-    of whichever cell this names, and the ladder switch is read beside it by
-    the renderers.
+    The one definition, shared by _live_rule_line and dashboard._live_rule_html
+    and judged only on what the sweep RECORDED: the primary scenario when its
+    band is the live band and the live tiers are on or never bind there; another
+    cell when the live band was simulated and, tier-off at a binding band, the
+    tier-off family covers every binding band (dashboard._tier_off_binds).
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        _LiveRuleView | None: The verdict, or None when the sweep does not
-            record the live rule (live_tier_floors or live_spread_band None).
+        _LiveRuleView | None: The verdict; None when no live rule is recorded.
     """
     tier_floors, band = sweep.live_tier_floors, sweep.live_spread_band
     if tier_floors is None or band is None:
@@ -5336,19 +5207,13 @@ def _live_rule_ladder_note(sweep: BacktestSweep) -> str:
     """
     Qualify a live-rule verdict whose run departs from config.py's ladder switch.
 
-    The live rule names the time-series ENTRY rule; which pairs exist is the
-    ladder switch's (DR-73), which the run-settings line reads against
-    config.py. A run whose recorded ladder setting departs from the switch it
-    recorded beside it does not replay the live bot's pairs even where its
-    entry rule is the live one, and the verdict must say so rather than sit
-    under a line saying "not a replay" unqualified.
+    Which pairs exist is the ladder switch's (DR-73), not the entry rule's.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        str: "" when the two agree or either is not recorded, otherwise a
-            clause beginning with "; ".
+        str: A "; ..." clause, or "" when the two agree or either is unrecorded.
     """
     run, configured = sweep.same_event_ladders, sweep.config_same_event_ladders
     if run is None or configured is None or bool(run) == bool(configured):
@@ -5362,25 +5227,11 @@ def _live_rule_line(sweep: BacktestSweep) -> str | None:
     """
     Word the "Live time-series rule (config.py): ..." log line from a built sweep.
 
-    Logged once by run_backtest_sweep, on every run, once the sweep exists
-    (the Monday-infeasible branch included), from the fields the sweep
-    records and the verdict _live_rule_view gives them — the verdict
-    dashboard._live_rule_html renders under the page's run-settings line,
-    which names the filter bar's own options where this names the grid's
-    cell. A live category/tag filter is named after the rule, and the tail
-    says the dashboard's filter bar shows it as one Category or Tag option
-    of that cell, or (_live_filter_is_one_slice False: several categories or
-    tags, or a tag under any category) one option at a time — each offered
-    only where this run filed a pair under it, which the page, knowing the
-    options its bar offers, names.
-
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        str | None: The line; None when the sweep records no live rule
-            (config.py's toggles did not validate — that WARNING was logged
-            when they were read).
+        str | None: The line; None when the sweep records no live rule.
     """
     view = _live_rule_view(sweep)
     if view is None:
@@ -5408,8 +5259,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str | None:
                 "which the dashboard's filter bar shows")
         subject = "that scenario"
     if filtered:
-        # Which options the bar offers depends on what this run filed pairs
-        # under, which only the page knows: the page names them
+        # Only the page knows which options the bar offers, so it names them
         tail += ("; the dashboard's filter bar shows the live category/tag filter as one "
                  f"Category or Tag option of {subject} (offered where this run filed a "
                  "pair under it)"
@@ -5560,9 +5410,7 @@ def _entries_for_band(
         spread_band (tuple[float, float] | None): BACKTEST-only (floor,
             ceiling) band on the time-series spread pB − pA, handed verbatim
             to every _find_entry() call. None (the default) resolves
-            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band:
-            with the tier floors on, the tier rule alone (the live rule until
-            the 2026-09-27 decision, not since).
+            config.BACKTEST_DEFAULT_SPREAD_BAND there — (0.0, 1.0), no band.
         pair_types (tuple[str, ...]): Which pair types to scan — any subset
             of ("time_series", "same_title"). Keyword-only. Defaults to both.
         tier_floors (bool): Keyword-only, BACKTEST-only; handed to every
@@ -5746,9 +5594,7 @@ def _prepare_entries(
     # interval discount and is run exactly once, ahead of any sizing. At the
     # default spread band (spread_band=None, which _find_entry resolves to
     # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band), with the tier floors
-    # on, it is the tier rule alone — the live rule until the 2026-09-27
-    # decision, not since (run_backtest_sweep's "Live time-series rule" line
-    # names where a band sweep's grid holds the live rule).
+    # on, it is the tier rule alone.
     raw_entries = _entries_for_band(candidates, spread_band=None)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
@@ -5799,17 +5645,11 @@ def _simulate_at_discount(
     premise-violation WARNING, the one summary line a simulation can emit
     beside its completion line.
 
-    size_cap DOES change the simulation: it is the per-trade Kelly cap for
-    every pair — config.BUDGET_FRACTION (this module's binding, read at call
-    time) unless a size-cap sweep asks for another — and every candidate is
-    sized at `min(config.pair_size_cap(pair_type, cap, SAME_TITLE_SIZE_CAP),
-    kelly_f)`: a same-title candidate also stays under SAME_TITLE_SIZE_CAP
-    (this module's binding, read at call time), as live sizing keeps it under
-    LiveSettings.same_title_size_cap, through the same helper. Pass 1b scores
-    every entry before any sizing, so neither cap moves which candidates pass
-    the Kelly gate, the premise count or the returned peak_kelly_fraction —
-    only how large each admitted trade is (and, through cash and n < 1 skips,
-    which ones fit). quiet only moves the
+    size_cap DOES change the simulation: every candidate is sized at
+    `min(config.pair_size_cap(pair_type, cap, SAME_TITLE_SIZE_CAP), kelly_f)`
+    (cap: the resolved size_cap). Pass 1b scores every entry before sizing, so
+    neither cap moves the Kelly gate, the premise count or peak_kelly_fraction
+    — only trade sizes, and so which trades fit. quiet only moves the
     completion line and the premise-violation WARNING to DEBUG, for the lazy
     size-cap runs, whose premise count repeats the primary-cap run's.
 
@@ -5824,8 +5664,7 @@ def _simulate_at_discount(
             config.time_series_profit_prob for every time-series candidate.
             None (default) means "no override", which that helper resolves at
             call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
-            the live sizer reads on a run without main.py's --interval-discount
-            — so the default path prices exactly as it always has.
+            live sizing reads on a run without main.py's --interval-discount.
         spread_band (tuple[float, float] | None): The spread band the entries
             were detected under — a label, never applied here. None (default)
             renders on the completion line as the resolved default band
@@ -5842,12 +5681,10 @@ def _simulate_at_discount(
             " with the tier floors off" to the band on the completion line, so
             the two families never share a prefix, and " [tier floors off]"
             to the premise-violation WARNING; True (default) adds nothing.
-        size_cap (float | None): Keyword-only. The per-trade Kelly size cap
-            for every pair, in (0, 1]; 1.0 sizes at full Kelly (no per-trade
-            cap), a same-title candidate still under SAME_TITLE_SIZE_CAP. None
-            (default) resolves this module's BUDGET_FRACTION at call time —
-            the value config.live_settings() hands the live sizer — so every
-            existing call sizes exactly as before.
+        size_cap (float | None): Keyword-only. The per-trade Kelly cap for
+            every pair, in (0, 1] (1.0: no per-trade cap; a same-title
+            candidate still stays under SAME_TITLE_SIZE_CAP). None (default)
+            resolves this module's BUDGET_FRACTION at call time.
             Any cap other than BUDGET_FRACTION is named on the completion
             line (", cap 35%" / ", no cap" before the colon); the default
             cap's line is byte-identical to the pre-cap one.
@@ -5873,10 +5710,8 @@ def _simulate_at_discount(
         ValueError: If population is not one of the labels above (a typo would
             otherwise mislabel a scenario silently), from
             config.time_series_spread_band if spread_band is not a valid
-            band, from _resolve_size_cap if size_cap is not a number in
-            (0, 1], or from _resolve_same_title_size_cap if this module's
-            SAME_TITLE_SIZE_CAP is not. All are caller or configuration
-            bugs, checked before any entry is scored.
+            band, or from _resolve_size_cap / _resolve_same_title_size_cap
+            for a bad cap — all checked before any entry is scored.
         TypeError: From config.time_series_spread_band, for a band that is not
             a pair of numbers.
     """
@@ -5894,8 +5729,7 @@ def _simulate_at_discount(
     # The per-trade cap in force — config.BUDGET_FRACTION unless a size-cap
     # sweep asks for another — resolved and validated before any entry.
     cap = _resolve_size_cap(size_cap)
-    # ... and the extra same-title cap (this module's SAME_TITLE_SIZE_CAP),
-    # held to the same rule: min() would read a NaN there as no cap at all
+    # ... and the extra same-title cap, held to the same rule
     st_cap = _resolve_same_title_size_cap()
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
@@ -5970,12 +5804,7 @@ def _simulate_at_discount(
             # Kelly fraction is non-positive — the pair has no positive expected value
             continue
         peak_kelly = max(peak_kelly, kelly_f)
-        # The run's cap for this pair type (config.pair_size_cap, the one
-        # definition live sizing uses): the per-trade cap for every pair
-        # (config.BUDGET_FRACTION unless a size-cap sweep simulates another),
-        # and for a same-title pair SAME_TITLE_SIZE_CAP too (st_cap), at every
-        # swept cap — so a default backtest sizes same-title as a live run
-        # without main.py's toggle flags does
+        # config.pair_size_cap: the one definition live sizing caps through
         kelly_f_capped = min(pair_size_cap(pair_type, cap, st_cap), kelly_f)
 
         # Skip pairs where the settlement result is missing or non-binary
@@ -6461,8 +6290,8 @@ def _interval_calibration(
       - It is conditional on the strategy's own entry filters — only pairs
         whose gap already cleared its tier ever produced an entry. That is a
         feature, not a sampling flaw: it is exactly the conditional
-        distribution the live sizer faces, so k_hat is the right number to
-        compare TIME_SERIES_INTERVAL_PROB_DISCOUNT against.
+        distribution the live sizer faces under the same entry rule, so k_hat
+        is the right number to compare TIME_SERIES_INTERVAL_PROB_DISCOUNT against.
 
     Args:
         raw_entries (list[dict]): Prepared entries (_prepare_entries() output,
@@ -6611,10 +6440,8 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
 
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
     config.py, and the live sizer keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (through the run's
-    config.LiveSettings, unless main.py's --interval-discount overrides it for
-    one run) regardless of what this prints; acting on it is a deliberate
-    human edit or a flag.
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's --interval-discount)
+    whatever this prints.
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
@@ -6652,8 +6479,7 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
         "  Configured k = %.3f (config.TIME_SERIES_INTERVAL_PROB_DISCOUNT) | "
         "pooled empirical k_hat = %s",
         # The CONFIG constant, not any sweep point's override: this line
-        # compares the measurement against what live sizing reads on a run
-        # without main.py's --interval-discount (every scheduled run).
+        # compares the measurement against the k a scheduled live run sizes at
         TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         "-" if pooled_k is None else f"{pooled_k:.3f}",
     )
@@ -6681,8 +6507,7 @@ def run_backtest(
 
     Thin composition of the backtest's two halves, at the interval discount
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (i.e. exactly what the live sizer
-    uses on a run without main.py's --interval-discount): _prepare_entries()
-    does the k-independent work and
+    uses by default): _prepare_entries() does the k-independent work and
     _simulate_at_discount(..., k=None) does the k-dependent work.
 
     Algorithm (unchanged; the step split between the two helpers is noted):
@@ -7310,17 +7135,9 @@ def _sweep_from_candidates(
             tier_off_sweep as well, also a tier-floors-off CapSweep on
             BacktestSweep.tier_off_cap_sweep, seeded from the family's own
             points only and keeping its entries alive. False (default)
-            returns cap_sweep=None and tier_off_cap_sweep=None. Each cap of
-            either sweep is the cap for every pair; a same-title candidate
-            also stays under SAME_TITLE_SIZE_CAP at every one
-            (config.pair_size_cap).
-        live (LiveSettings | None): Keyword-only. config.py's live toggles
-            as run_backtest_sweep read them before the fetch
-            (_live_settings_for_report — None when they do not validate),
-            recorded on the returned sweep and never read by any entry pass
-            or simulation. Left out, this function reads them itself, once,
-            so a direct caller still records them (and a bad config.py
-            still logs its one WARNING).
+            returns cap_sweep=None and tier_off_cap_sweep=None.
+        live (LiveSettings | None): Keyword-only. run_backtest_sweep's read of
+            config.py's live toggles (None: invalid); left out, read here.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -7330,18 +7147,15 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap (this
-            module's binding of config.SAME_TITLE_SIZE_CAP, as every
-            simulation resolved it) and the four live_* fields (from live —
-            see _live_rule_fields) — see BacktestSweep.
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap and the four
+            live_* fields — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
             family is a band-sweep family: its split date, rescans and cells
-            are the band sweep's), checked before anything else runs; from
-            config.time_series_spread_band, if spread_band is not a valid
-            band; or, from the first simulation (_simulate_at_discount), if
-            this module's SAME_TITLE_SIZE_CAP is not a number in (0, 1].
+            are the band sweep's), checked first; from
+            config.time_series_spread_band for an invalid band; or from the
+            first simulation, for a bad SAME_TITLE_SIZE_CAP.
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
@@ -7351,9 +7165,8 @@ def _sweep_from_candidates(
                          "re-runs the band sweep's binding bands")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
-    # config.py's live toggles, recorded on the sweep this returns: the read
-    # run_backtest_sweep took before the fetch, or one of its own for a
-    # direct caller that handed none (reporting only; fails soft)
+    # config.py's live toggles: run_backtest_sweep's read, or our own for a
+    # direct caller
     if live is _LIVE_NOT_READ:
         live = _live_settings_for_report()
     # The ladder setting this sweep's pairs were extracted under, resolved the
@@ -7742,12 +7555,9 @@ def _sweep_from_candidates(
         tier_off_calibrations_by_band=tier_off_calibrations,
         cap_sweep=capped,
         tier_off_cap_sweep=off_capped,
-        # The extra same-title cap every simulation above sized under (and
-        # every lazy cap cell will), resolved and validated as they resolved
-        # it, so a report can say what the cap axis means for same-title pairs
+        # Resolved as every simulation, lazy cap cells included, resolves it
         same_title_size_cap=_resolve_same_title_size_cap(),
-        # config.py's live rule and category/tag filter, from the one read
-        # above (every field None when config.py's toggles did not validate)
+        # config.py's live rule and filter, from the one read above
         **_live_rule_fields(live),
     )
 
@@ -7821,20 +7631,12 @@ def run_backtest_sweep(
 
     This function never writes config.py. The calibration it reports is a
     recommendation for a human to act on, live sizing keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's own
-    --interval-discount, for one run) no matter what is passed here, and no
-    band or tier-floors setting passed here reaches the live path: the live
-    bot reads its own toggles (config.TIME_SERIES_SPREAD_BAND,
-    config.TIME_SERIES_TIER_FLOORS, each overridable for one run by a main.py
-    flag) only through config.LiveSettings.
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's --interval-discount)
+    whatever is passed here; no band or tier setting here reaches live.
 
-    It does REPORT them. config.py's live toggles are read once, before the
-    fetch (_live_settings_for_report — one WARNING, and nothing recorded,
-    when they do not validate), recorded on the result (the four live_*
-    fields), and named by one INFO line logged once the result exists, on
-    every path: "Live time-series rule (config.py): <rule>[; category/tag
-    filter (...)] — <where this run's grid holds it>" (_live_rule_line, over
-    _live_rule_view, the verdict dashboard._live_rule_html renders too).
+    It reports config.py's live time-series rule and category/tag filter: one
+    fail-soft read before the fetch, recorded on the four live_* fields and,
+    worded by _live_rule_line, logged last.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -7875,11 +7677,7 @@ def run_backtest_sweep(
         spread_band (tuple[float, float] | None): The primary scenario's
             BACKTEST-only time-series spread band (floor, ceiling) on pB − pA.
             None (default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND —
-            (0.0, 1.0), no band: with the tier floors on, the tier rule alone,
-            the live rule until the 2026-09-27 decision and not since (the
-            "Live time-series rule (config.py)" line this function logs last
-            names the live rule and where this run's grid holds it). Resolved
-            and validated at the
+            (0.0, 1.0), no band. Resolved and validated at the
             TOP of this function, before anything is logged or fetched, so a
             bad band fails in milliseconds rather than after the fetch.
         band_sweep (bool): When True, also sweep every band of the config
@@ -7893,10 +7691,9 @@ def run_backtest_sweep(
             before anything is logged or fetched.
         cap_sweep (bool): When True, also return BacktestSweep.cap_sweep — a
             lazy CapSweep over SIZE_CAP_SWEEP (the per-trade Kelly size caps
-            5%..95% and no cap — each the cap for every pair; a same-title
-            candidate also stays under SAME_TITLE_SIZE_CAP at every one,
-            through config.pair_size_cap) that simulates each other cap only
-            when a reader asks for a (band, k) cell. Every point this function
+            5%..95% and no cap; same-title pairs stay under
+            SAME_TITLE_SIZE_CAP at every cap) that simulates each other cap
+            only when a reader asks for a (band, k) cell. Every point this function
             returns is still sized at the run's own cap
             (config.BUDGET_FRACTION), and the flag adds no simulation to the
             run itself. With tier_off_sweep too, also
@@ -7917,23 +7714,13 @@ def run_backtest_sweep(
             resolved same_event_ladders, the configured switch it is judged
             against (config_same_event_ladders), the corpus's provenance,
             None when not recorded, the tier-off family, empty unless
-            tier_off_sweep, the lazy cap_sweep, None unless cap_sweep,
-            tier_off_cap_sweep, None unless both cap_sweep and
-            tier_off_sweep, same_title_size_cap (this module's binding
-            of config.SAME_TITLE_SIZE_CAP, the extra same-title cap every
-            simulation sized under), and live_tier_floors,
-            live_spread_band, live_categories and live_tags (config.py's own
-            live rule and category/tag filter, from the one read taken
-            before the fetch — reporting only, never what this run itself
-            simulated; all four None when config.py's live toggles do not
-            validate) — see BacktestSweep.
+            tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep,
+            same_title_size_cap and the live_* fields — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
-            without band_sweep, or, from _resolve_same_title_size_cap, if
-            this module's SAME_TITLE_SIZE_CAP is not a number in (0, 1]; or,
-            from config.time_series_spread_band, if spread_band is not a
-            valid band (0 <= floor < ceiling <= 1).
+            without band_sweep, if this module's SAME_TITLE_SIZE_CAP is not a
+            number in (0, 1], or if spread_band is not a valid band.
         TypeError: From config.time_series_spread_band, before any fetch, if
             spread_band is not a pair of numbers.
         KeyError: Propagates out of the candlestick-fetch pool
@@ -7950,11 +7737,9 @@ def run_backtest_sweep(
         one), calibration=None, label_coverage=None, scenarios=[],
         calibrations_by_band={}, an empty tier-off family and the resolved
         same_event_ladders, with the configured switch
-        (config_same_event_ladders), the same-title cap
-        (same_title_size_cap) and config.py's live rule and filter (the
-        four live_* fields, all None if they do not validate) still
-        recorded, and the live-rule line still logged. Callers therefore
-        need no special case for that path.
+        (config_same_event_ladders), same_title_size_cap and, when config.py's
+        toggles validate, the live_* fields recorded and the live-rule line
+        logged, so callers need no special case.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -7965,9 +7750,7 @@ def run_backtest_sweep(
     if tier_off_sweep and not band_sweep:
         raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
                          "re-runs the band sweep's binding bands")
-    # The same for the extra same-title cap (this module's SAME_TITLE_SIZE_CAP):
-    # a bad value is a configuration bug, refused here rather than after the
-    # fetch, where every simulation would refuse it anyway
+    # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
 
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
@@ -8007,12 +7790,8 @@ def run_backtest_sweep(
     )
     # And for the per-trade size cap: the cap every point below is sized
     # under (this module's BUDGET_FRACTION, resolved at call time, so a
-    # monkeypatched value is the one printed), whether the lazy size-cap
-    # sweep rides the result, and — only when it binds tighter than that cap —
-    # the extra same-title cap every same-title candidate stays under at every
-    # cap. At SAME_TITLE_SIZE_CAP >= the cap the line is byte-identical to the
-    # one printed before that constant existed. Logged after the band line,
-    # before any fetch.
+    # monkeypatched value is the one printed), the same-title cap only when it
+    # binds tighter, and whether the lazy size-cap sweep rides the result.
     run_cap = _resolve_size_cap(None)
     same_title_clause = (
         f", same-title never above {_cap_percent(same_title_cap)}% "
@@ -8024,13 +7803,8 @@ def run_backtest_sweep(
         same_title_clause,
         "on" if cap_sweep else "off",
     )
-    # config.py's own LIVE toggles — never main.py's per-run overrides, which
-    # this module cannot see — read ONCE, here, before anything is fetched
-    # (so an invalid config.py logs its one WARNING at the top of the run),
-    # and handed to whichever construction below builds the sweep. Reporting
-    # only: no entry pass or simulation reads them. The "Live time-series
-    # rule" line is logged from the built sweep instead (_live_rule_line),
-    # because what it says of THIS run's grid is only known once the grid is.
+    # config.py's own live toggles (never main.py's per-run overrides), read
+    # ONCE before the fetch so an invalid config.py warns at the top of the run
     live = _live_settings_for_report()
 
     # The band- and k-independent half — one fetch, one pairing, one candle
@@ -8065,20 +7839,15 @@ def run_backtest_sweep(
                                same_title_size_cap=same_title_cap,
                                **_live_rule_fields(live))
     else:
-        # Every entry pass and every simulation. It deletes the candle series
-        # and the pair list itself once the last entry pass is done (before
-        # any simulation), so holding `candidates` here pins neither.
+        # Every entry pass and simulation. It deletes the candles and pair list
+        # after the last entry pass, so holding `candidates` pins neither
         result = _sweep_from_candidates(
             candidates, initial_balance,
             interval_discount=interval_discount, sweep=sweep,
             spread_band=primary_band, band_sweep=band_sweep,
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep, live=live,
         )
-    # The live rule, and where THIS run's grid holds it, read off the sweep
-    # just built — the one verdict (_live_rule_view) dashboard._live_rule_html
-    # renders too, so the log and the page agree on every path, the
-    # Monday-infeasible one included. No line when config.py's toggles did
-    # not validate (their WARNING was logged when they were read).
+    # On every path; None when config.py's toggles did not validate
     line = _live_rule_line(result)
     if line is not None:
         logging.info("%s", line)

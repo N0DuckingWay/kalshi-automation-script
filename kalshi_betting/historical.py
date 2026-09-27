@@ -11,12 +11,8 @@ Purpose:
     and (2) hourly candlestick price series for individual markets used to find
     the week when each pair first became tradeable. All data is cached to JSON
     (or gzipped JSON-lines) files on disk so re-runs do not re-fetch from the
-    API. It also serves the live bot: Kalshi's /series listing
-    (load_series_categories) and the one rule that files an event under a
-    Kalshi category and first tag (series_ticker / series_labels, with
-    infer_category's ticker-prefix label as the fallback) are what
-    main._filter_by_category, the live category/tag filter, files pairs by —
-    the same rule the backtest dashboard files trades by.
+    API. It also loads Kalshi's series categories and holds series_labels, the
+    one category/tag filing rule the dashboard and the live filter share.
 
 Dependencies:
     Imports build_client from auth.py; api_call_with_retry and fetch_json_page
@@ -36,17 +32,10 @@ Dependencies:
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
-    all called by backtester.py. The series labels are the one filing rule
-    shared by the backtest dashboard and the live bot:
-    load_series_categories() (Kalshi's category and tags per series, cached a
-    week) is called by backtest.py for the dashboard and by main.py for its
-    live category/tag filter (main._filter_by_category — a production run
-    with its own client, a dev run with None, which reads the cached copy
-    only), and series_ticker() / series_labels() file an event under a
-    category and FIRST tag for dashboard.py and main.py alike, with
-    infer_category()'s ticker-prefix label as the fallback for a series the
-    listing lacks (BacktestTrade.category on the page, a direct call in
-    main.py). Also exports SettledCorpus — the
+    all called by backtester.py (infer_category() by main.py too).
+    load_series_categories() is called by backtest.py and main.py,
+    series_labels() by dashboard.py and main.py.
+    Also exports SettledCorpus — the
     disk-backed, re-iterable corpus fetch_all_settled_markets returns — and
     LegacySettledCorpus, the list a legacy settled_markets_*.json hit
     returns; each carries a CorpusProvenance (when, and under which archive
@@ -258,9 +247,8 @@ def series_ticker(event_ticker: str) -> str:
     """
     The series part of an event ticker (everything before its first hyphen).
 
-    Deliberately NOT scanner.event_series, which collapses every KXMVE* combo
-    series onto one family for the one-series pairing rule: Kalshi files each
-    literal series under its own category, and that is what is looked up here.
+    Not scanner.event_series, which collapses the KXMVE* combo family for the
+    one-series rule: Kalshi files each literal series under its own category.
 
     Args:
         event_ticker (str): An event ticker, e.g. "KXNCAAMBGAME-26JAN13WIUEIU".
@@ -279,33 +267,18 @@ def series_labels(
     """
     Name the Kalshi category and FIRST tag an event's series is filed under.
 
-    The one filing rule behind every category and tag on the backtest
-    dashboard — the Returns Decomposition, the page-wide filter and the k-hat
-    breakdown — and behind main.py's live category/tag filter
-    (main._filter_by_category), so a trade and a k-hat observation of the same
-    event can never be filed apart, and a pair and a trade of the same event
-    are filed under one category and tag. (Which pairs a live filter KEEPS is
-    main._filter_by_category's matching — case-insensitive, and a tag matched
-    under every category — so its docstring says which dashboard slice a
-    filter equals.) First tag only, so every
-    breakdown PARTITIONS what it breaks down: a series can carry several tags,
-    and counting it under each would make the groups add up to more than the
-    whole.
+    The one filing rule behind the backtest dashboard's categories and tags and
+    main._filter_by_category's live filter (which states its own matching). First
+    tag only, so every breakdown partitions what it breaks down.
 
     Args:
-        event_ticker (str): The event ticker whose series is looked up
-            (series_ticker).
-        fallback_category (str): The label to use when there is no map or the
-            series is missing from it — the ticker-prefix category
-            (infer_category: BacktestTrade.category,
-            CalibrationObservation.category, and the live filter's own call).
-        series_categories (dict | None): load_series_categories' series ticker
-            -> (category, tags), or None when not loaded.
+        event_ticker (str): The event whose series (series_ticker) is looked up.
+        fallback_category (str): Category for a series the map lacks (infer_category).
+        series_categories (dict | None): load_series_categories' map, or None.
 
     Returns:
-        tuple[str, str]: (category, tag). The tag reads "General" when the
-            series has none (or is not in the map); the category
-            "Uncategorised" when Kalshi gives it none.
+        tuple[str, str]: (category, tag); the tag "General" when the series has none
+            or is not in the map, the category "Uncategorised" when Kalshi gives none.
     """
     entry = (series_categories or {}).get(series_ticker(event_ticker))
     if entry is None:
@@ -355,30 +328,19 @@ def load_series_categories(
     dashboard breaks returns down by them, because infer_category's ticker
     prefixes predate the "KX" prefix every current series carries and so file
     nearly every trade under "Other". Nothing is priced, sized or settled on
-    these labels; they decide how the dashboard files a trade and, when a live
-    category/tag filter is set (config.TRADE_CATEGORIES / TRADE_TAGS, or
-    main.py's --category / --tag), which pairs main.py may trade
-    (main._filter_by_category, through series_labels).
+    these labels; they file the dashboard's trades and decide which pairs a
+    live category/tag filter keeps.
 
     The listing is cached in backtest_cache/series_categories.json and reused
     while younger than max_age_seconds. It is one read-only GET (retried like
-    every other historical read). This never raises: on any failure to fetch
-    it logs a WARNING and falls back to the cached copy however old, or to {}
-    when there is none — in which case the dashboard files trades under
-    infer_category's labels, exactly as before, and a live run with a
-    category/tag filter set trades nothing (main._filter_by_category fails
-    closed on an empty map). A listing that was fetched is returned even when
-    writing its cached copy fails (a full disk, or two processes refreshing a
-    stale copy at once and colliding on _save_json_cache's tmp file): that
-    failure costs the cache, not the listing, and logs its own WARNING.
-    With client None it makes no request at all: it returns the cached copy
-    however old, or {} — main.py's dev mode reads it this way, so the sandbox
-    key never signs a request to the production host.
+    every other historical read). It never raises: a failed fetch logs a WARNING
+    and returns the cached copy however old, or {} — on which the dashboard files
+    by infer_category and a set live category/tag filter keeps nothing. A fetched
+    listing is returned even when writing its cache fails.
 
     Args:
-        client (Any): A KalshiClient pointed at prod (build_prod_live_client(),
-            or a production run's own client), or None to read the cached copy
-            only.
+        client (Any): A KalshiClient pointed at prod (build_prod_live_client() or
+            a production run's own), or None to read the cached copy only.
         max_age_seconds (int): Reuse the cached copy while it is younger than
             this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS.
             Ignored when client is None.
@@ -397,9 +359,7 @@ def load_series_categories(
         except (TypeError, ValueError):
             fetched_at = None
     if client is None:
-        # Nothing to sign a request with: the cached copy, however old, or {}
-        # (main.py's dev mode — the sandbox key must never sign a production
-        # request)
+        # Dev mode: the sandbox key must never sign a production request
         return cached_map
     now = datetime.now(UTC)
     if (cached_map and fetched_at is not None and fetched_at.tzinfo is not None

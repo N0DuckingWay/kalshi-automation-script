@@ -19,27 +19,16 @@ Purpose:
     subprocess, see scheduler.run_job) can distinguish a clean run from a
     low-balance skip or a run whose trades need manual review.
 
-    On the live toggles: main.py's "live trading toggles" flags and
-    _resolve_live_settings (TestLiveSettingsFlags), the "Live settings" line
-    and its WARNINGs (TestLogLiveSettings), and the runtime tripwire behind the
-    AST pin (TestLiveSettingsReachEverySite) — a production dry run and a dev
-    run, each handed settings that differ in every field from the pinned
-    config values while every module's live_settings raises. Those classes
-    pin config.py's toggles to known values (the pinned_config_toggles
-    fixture), so they state every departure in fixed terms whatever config.py
-    ships. TestCategoryFilter covers the live category/tag filter
-    (main._filter_by_category) against a /series listing each test seeds into
-    its own tmp_path, including its parity with the backtest dashboard's
-    filing of the same event tickers.
+    On the live toggles: TestLiveSettingsFlags, TestLogLiveSettings and
+    TestLiveSettingsReachEverySite (the runtime half of test_strategy.py's
+    live-toggle AST pin) run under pinned_config_toggles; TestCategoryFilter
+    covers main._filter_by_category.
 
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
-    plus config constants asserted against; and, for the category/tag
-    filter's tests, kalshi_betting.historical (the cached /series listing's
-    path, its _historical_get request seam and infer_category), and
-    kalshi_betting.dashboard with backtester.BacktestTrade (the dashboard's
-    _trade_category, which the filter's filing is checked against). The
-    live-shape replays mock all
+    plus config constants asserted against and conftest's
+    apply_pre_toggle_defaults; for the category/tag filter, historical,
+    dashboard and backtester.BacktestTrade. The live-shape replays mock all
     Kalshi API interaction at the HTTP boundary (raw-response mocks and
     rest_client.request); the exit-code tests mock the heavy collaborators
     (auth, scanner, strategy, trader, reporter) at their main-module import
@@ -183,10 +172,7 @@ class TestComputeTradeSpecs:
 
 class TestNoPairsMsg:
     def test_no_pairs_log_lines_format_thresholds_from_config(self):
-        # The tier thresholds appear only in a tier-on rule's wording, so the
-        # run is handed one explicitly: config.py ships the tier floors off
-        # since 2026-09-27 (test_no_settings_reads_config_at_call_time covers
-        # the settings=None path)
+        # A tier-on rule, the only one whose wording names the tier thresholds
         tiers_on = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
         prod_msg = main._no_pairs_msg(settings=tiers_on)
         dev_msg = main._no_pairs_msg(sandbox=True, settings=tiers_on)
@@ -213,9 +199,7 @@ class TestNoPairsMsg:
         assert "closing within 60 minutes" not in main._no_pairs_msg()
 
     def test_the_time_series_clause_is_the_runs_own_rule(self):
-        # The message names the rule the run applied, in the finder's own
-        # words (config.describe_time_series_rule) — flags included — never
-        # the tiers alone when the run dropped them
+        # The rule the run applied, never the tiers alone when it dropped them
         on = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
         off = main._no_pairs_msg(settings=LiveSettings(False, (0.0, 0.5), 0.75, 0.2))
         assert config.describe_time_series_rule(True, (0.0, 1.0)) in on
@@ -226,16 +210,14 @@ class TestNoPairsMsg:
         assert off.endswith(on[on.index(" — or same-title"):])
 
     def test_no_settings_reads_config_at_call_time(self, monkeypatch):
-        # Both directions, so the test cannot pass on whichever value config.py
-        # happens to ship
+        # Both values, so the test cannot pass on whichever one config.py ships
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
         assert "tier floors off" in main._no_pairs_msg()
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
         assert "tier floors on" in main._no_pairs_msg()
 
     def test_a_category_or_tag_filter_is_named_only_when_set(self):
-        # The filter can empty the list on its own, so the line names it —
-        # in the "Live settings:" line's words — and says nothing of it unset
+        # A filter alone can empty the list: named when set, unmentioned when not
         plain = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
         assert "category/tag filter" not in plain
         for categories, tags in ((("Economics",), None), (None, ("Oil & Gas",))):
@@ -250,26 +232,19 @@ class TestNoPairsMsg:
 
 @pytest.fixture
 def pinned_config_toggles(monkeypatch):
-    """Pin config.py's seven live toggles to known values for one test.
-
-    live_settings() reads them at call time, so these tests state every
-    "(config: X)" mark and every departure in fixed terms whatever values
-    config.py ships: the pre-2026-09-27 values — tier floors on, no band,
-    k 0.75, a 20% per-trade cap, no extra same-title cap, and no category or
-    tag filter. It is conftest's apply_pre_toggle_defaults, the one definition
-    of those values, so the two can never drift apart."""
+    """Pin the seven live toggles through conftest's apply_pre_toggle_defaults, the
+    one definition of their values, so every "(config: X)" mark reads the same
+    whatever config.py ships."""
     apply_pre_toggle_defaults(monkeypatch)
 
 
 def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
     """
-    Write Kalshi's /series listing as historical.load_series_categories'
-    cached copy, at the path conftest points into this test's tmp_path.
+    Seed historical.load_series_categories' cached /series listing (in tmp_path).
 
     Args:
-        series (dict): series ticker -> [category, [tags...]], the cache's shape.
-        fetched_at (datetime | None): When the copy was fetched; None means
-            now, so a run with a client makes no request for it.
+        series (dict): series ticker -> [category, [tags...]].
+        fetched_at (datetime | None): When it was fetched; None means now (fresh).
     """
     stamp = datetime.now(UTC) if fetched_at is None else fetched_at
     historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -279,14 +254,11 @@ def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> No
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
     """
-    Run main.main() with argv, stopping at its dispatch, and return what it did.
+    Run main.main() with argv up to its dispatch and return what it did.
 
-    _run_dev/_run_prod are replaced by a recorder (unless `patches` supplies
-    them), build_client by a MagicMock and _setup_logging by a recorder, so
-    nothing is fetched and no handler is installed. The returned dict carries
-    "code" (the SystemExit code), and, when main() got that far, "settings"
-    and "reference" (what it handed the run mode), "mode", "logging_set_up"
-    and "client_built".
+    _run_dev/_run_prod (unless `patches` supplies them), build_client and
+    _setup_logging are recorders. The dict holds "code", "logging_set_up",
+    "client_built" and, when a run-mode recorder ran, "settings", "reference", "mode".
     """
     seen: dict = {"logging_set_up": False, "client_built": False}
 
@@ -317,11 +289,9 @@ def _main_with(monkeypatch, argv: list, **patches) -> dict:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLiveSettingsFlags:
-    """main.py's "live trading toggles" flags override ONE config.py toggle
-    each, for one run. main._resolve_live_settings lays them over
-    config.live_settings() — read at call time — and LiveSettings validates
-    the result, before logging is configured (TS-20): a bad value is a usage
-    error (exit 2) with nothing logged, no client built and no request."""
+    """Each live-toggle flag overrides ONE config.py toggle for one run, over
+    config.live_settings() read at call time; a value LiveSettings refuses is a
+    usage error (exit 2) before logging is configured (TS-20) or a client built."""
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, field, value", [
@@ -340,7 +310,6 @@ class TestLiveSettingsFlags:
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
         assert seen["code"] == EXIT_OK and seen["mode"] == mode
         settings, reference = seen["settings"], seen["reference"]
-        # The reference is config.py's, whatever flag was given
         assert reference == live_settings()
         assert getattr(settings, field) == value
         assert getattr(settings, field) != getattr(reference, field)
@@ -373,8 +342,7 @@ class TestLiveSettingsFlags:
         assert both["settings"].spread_band == (0.05, 0.9)
         assert both["reference"].spread_band == (0.1, 0.8)
 
-    # The unit note a cap flag's usage error carries: the validator speaks in
-    # fractions, the flag takes a whole percent on the SIZE_CAP_STEP grid
+    # The unit note on a cap flag's usage error: the flag takes a whole percent
     _STEP = f"{config.SIZE_CAP_STEP * 100:g}"
     _PERCENT = f"a whole percent, a multiple of {_STEP} from {_STEP} to 100"
 
@@ -396,13 +364,11 @@ class TestLiveSettingsFlags:
         # An empty name would match nothing: refused, never "any"
         (["--category", ""], ["--category", "categories"], False),
         (["--tag", "Soccer", "--tag", "  "], ["--tag", "tags"], False),
-        # "any" is a switch, not a name: it would match nothing yet read as
-        # "any" on the Live settings line
+        # "any" is the --any-* switch, not a name: it would print like no filter (config._names)
         (["--category", "any"], ["--category", "categories", "--any-category / --any-tag"],
          False),
         (["--tag", "ANY"], ["--tag", "tags", "--any-category / --any-tag"], False),
-        # The flags named are exactly those given: a --no-tier-floors (False)
-        # is given, and so is an --any-* switch; one left off is not
+        # The error names exactly the flags given, --no-tier-floors and --any-* included
         (["--no-tier-floors", "--spread-max", "0"],
          ["invalid live setting for this run (--tier-floors/--no-tier-floors, "
           "--spread-max):", "spread_band"], False),
@@ -414,15 +380,13 @@ class TestLiveSettingsFlags:
     ):
         seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
         assert seen["code"] == 2
-        # Refused before logging is configured (TS-20), before the client is
-        # built, before either run mode is entered
+        # Refused before logging (TS-20), the client and either run mode
         assert not seen["logging_set_up"] and not seen["client_built"]
         assert "settings" not in seen
         err = capsys.readouterr().err
         for word in words:
             assert word in err, (word, err)
-        # A cap flag's error names the unit the flag takes, so "got 0.37" is
-        # not read as a value to retype; no other flag's does
+        # Only a cap flag's error names the percent unit its value was read in
         if percent:
             assert f"{argv[0]} takes {self._PERCENT}, read as that percent / 100" in err, err
         else:
@@ -476,21 +440,18 @@ class TestLiveSettingsFlags:
         assert "config.py's live settings are invalid" in err and "size_cap" in err
 
     def test_help_names_every_flag_and_the_grid(self, monkeypatch, capsys):
-        # argparse %-formats help strings: a bare "%" there raises when --help
-        # renders it, so the grid's "%%" is what this pins
+        # argparse %-formats help: a bare "%" would raise here, so "%%" is pinned
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
         with pytest.raises(SystemExit) as exc_info:
             main.main()
         assert exc_info.value.code == 0
-        # argparse wraps help to the terminal's width; judge the words, not
-        # where a line broke
+        # argparse wraps help to the terminal: compare words, not line breaks
         out = " ".join(capsys.readouterr().out.split())
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
         assert "config.TRADE_CATEGORIES" in out and "config.TRADE_TAGS" in out
-        # The grid step comes from its one definition, never a literal
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
@@ -513,9 +474,8 @@ class TestLiveSettingsFlags:
 
 
 def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
-    """Run main() in prod as far as the MIN_BALANCE_CENTS gate — the real
-    _run_prod, which logs its settings before any request — and return its
-    exit code (EXIT_SKIPPED_LOW_BALANCE)."""
+    """Run the real _run_prod up to the MIN_BALANCE_CENTS gate (it logs its
+    settings first) and return the exit code."""
     with caplog.at_level(logging.INFO):
         seen = _main_with(
             monkeypatch, ["--mode", "prod", *argv],
@@ -527,17 +487,15 @@ def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLogLiveSettings:
-    """Every live run names its toggles on one INFO line, marks each field a
-    flag moved away from config.py, WARNS when a production run submits orders
-    under any departure, and warns on every live_rule_warnings sentence."""
+    """Each live run logs its toggles on one INFO line, marking each departure from
+    config.py; it WARNS on every live_rule_warnings sentence and, when a prod run
+    that submits orders departs, on that."""
 
     _DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
 
     def test_a_scheduled_run_logs_config_py_with_no_mark_and_no_warning(
         self, monkeypatch, caplog,
     ):
-        # The scheduler's argv (--mode prod, nothing else): the run trades
-        # exactly config.py, and says so without a single departure mark
         code = _prod_until_the_balance_gate(monkeypatch, [], caplog)
         assert code == EXIT_SKIPPED_LOW_BALANCE
         lines = [r.getMessage() for r in caplog.records
@@ -548,8 +506,7 @@ class TestLogLiveSettings:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING
                     and r.getMessage().startswith("Live settings:")]
 
-    # One flag per LiveSettings field, each departing from the pinned config
-    # values, with the mark the "Live settings:" line must carry for it
+    # One departing flag per LiveSettings field, with the mark its line must carry
     _ONE_FLAG_PER_FIELD = {
         "tier_floors": (["--no-tier-floors"], "tier floors off (config: on)"),
         "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (config: none)"),
@@ -562,13 +519,11 @@ class TestLogLiveSettings:
     }
 
     def test_every_field_has_a_departing_flag(self):
-        # A field added to LiveSettings must be given a row here, so the
-        # departure WARNING is tested on it too
+        # A new LiveSettings field needs a row, so its departure WARNING is tested
         assert set(self._ONE_FLAG_PER_FIELD) == {f.name for f in dataclasses.fields(LiveSettings)}
 
     @pytest.mark.parametrize("field", sorted(_ONE_FLAG_PER_FIELD))
     def test_a_departing_production_run_warns(self, monkeypatch, caplog, field):
-        # Every field, not only k: the WARNING judges the whole object
         argv, mark = self._ONE_FLAG_PER_FIELD[field]
         code = _prod_until_the_balance_gate(monkeypatch, argv, caplog)
         assert code == EXIT_SKIPPED_LOW_BALANCE
@@ -614,7 +569,6 @@ class TestLogLiveSettings:
         assert any("one time-series pair may stake up to 60%" in w for w in warned)
 
     def test_it_never_resolves_config_py_itself(self, monkeypatch, caplog):
-        # Handed both objects, it reads config.py nowhere
         def tripwire():
             raise AssertionError("_log_live_settings resolved config.py's settings")
         s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
@@ -628,8 +582,7 @@ class TestLogLiveSettings:
 
 
 def _filter_pair(event_ticker: str) -> SimpleNamespace:
-    """A candidate-pair stand-in carrying only what _filter_by_category reads:
-    market A's event ticker (the leg whose series files the pair)."""
+    """A pair stand-in carrying market A's event ticker, all the filter reads."""
     return SimpleNamespace(market_a=SimpleNamespace(event_ticker=event_ticker),
                            market_b=SimpleNamespace(event_ticker="IGNORED-B"))
 
@@ -641,13 +594,9 @@ def _filtered(pairs: list, categories=None, tags=None, listing_client=None) -> l
 
 
 class TestCategoryFilter:
-    """main._filter_by_category keeps only the pairs filed under the run's
-    Kalshi categories and tags, by the backtest dashboard's own rule:
-    MARKET A's LITERAL series (historical.series_ticker) looked up in Kalshi's
-    /series listing, its category and FIRST tag (historical.series_labels),
-    the ticker-prefix label (historical.infer_category) for a series the
-    listing lacks. Case-insensitive; categories and tags combine by AND; no
-    filter, no request; no listing, no pair (fail closed)."""
+    """main._filter_by_category keeps the pairs filed under the run's categories
+    and tags by historical.series_labels (the dashboard's rule): case-insensitive,
+    categories AND tags; no filter, no request; no listing, no pair (fail closed)."""
 
     # Kalshi's /series listing as cached: series ticker -> [category, tags]
     LISTING = {
@@ -693,8 +642,7 @@ class TestCategoryFilter:
 
     def test_the_first_tag_is_the_one_matched(self):
         _seed_series_listing(self.LISTING)
-        # KXBRENTW carries "Oil & Gas" first and "Energy" second: only the
-        # first files it, as the dashboard's Tag select shows it
+        # Only KXBRENTW's first tag files it, as on the dashboard's Tag select
         assert self._tickers(_filtered(self._pairs(), tags=("oil & gas",))) == [
             "KXBRENTW-26SEP19"]
         assert _filtered(self._pairs(), tags=("Energy",)) == []
@@ -712,9 +660,8 @@ class TestCategoryFilter:
             "KXBRENTW-26SEP19", "KXFISAEXTEND-26"]
 
     def test_a_combo_series_is_looked_up_literally(self):
-        # Not scanner.event_series, which folds every KXMVE* series together:
-        # KXMVECROSSCATEGORY is in the listing with no category, while
-        # KXMVECROSSCATEGORY0 is not in it at all
+        # The literal series, not scanner.event_series (which folds KXMVE*):
+        # KXMVECROSSCATEGORY is listed uncategorised, KXMVECROSSCATEGORY0 not at all
         _seed_series_listing(self.LISTING)
         assert self._tickers(_filtered(self._pairs(), categories=("Uncategorised",))) == [
             "KXMVECROSSCATEGORY-S2026X"]
@@ -757,8 +704,7 @@ class TestCategoryFilter:
         assert "Category 'Sprots' names no category in Kalshi's listing of 6 series" in (
             caplog.text)
         caplog.clear()
-        # The dashboard's Tag option spells "category · tag": the warning says
-        # how to write it as flags
+        # A dashboard Tag option ("category · tag"): the warning spells it as flags
         with caplog.at_level(logging.WARNING):
             assert _filtered(self._pairs(), tags=("Sports · Soccer",)) == []
         assert "Tag 'Sports · Soccer' is no series' first tag" in caplog.text
@@ -770,9 +716,8 @@ class TestCategoryFilter:
         assert "check the spelling" not in caplog.text
 
     def test_a_fallback_tag_is_not_a_typo_when_no_listed_series_is_untagged(self, caplog):
-        # "General" is also the tag a series the listing lacks is filed under:
-        # with no untagged series in the listing, only this run's own filing
-        # knows the name, and a pair filed under it is kept without a warning
+        # "General" also files a series the listing lacks: with no untagged listed
+        # series, only this run's filing knows it, and its pair is kept unwarned
         _seed_series_listing({"KXBRENTW": ["Commodities", ["Oil & Gas"]]})
         pairs = [_filter_pair("KXBRENTW-26SEP19"), _filter_pair("KXNOTLISTED-1")]
         with caplog.at_level(logging.WARNING):
@@ -780,8 +725,7 @@ class TestCategoryFilter:
         assert "check the spelling" not in caplog.text
 
     def test_dev_reads_the_cached_listing_only_however_old(self, monkeypatch, caplog):
-        # Recorded, not only raised: load_series_categories turns a failed
-        # request into a WARNING, so a raise alone would pass either way
+        # Recorded as well as raised: load_series_categories turns a raise into a WARNING
         requests = []
 
         def no_request(client, path, **params):
@@ -812,9 +756,8 @@ class TestCategoryFilter:
         assert self._tickers(out) == ["KXBRENTW-26SEP19"]
         assert clients == [client]
 
-    # Copied from tests/test_dashboard.py::TestReturnsByCategory.SERIES, never
-    # imported: importing a test module's class would make pytest collect it
-    # a second time
+    # A copy of test_dashboard.py's TestReturnsByCategory.SERIES: importing a
+    # test class would make pytest collect it twice
     DASHBOARD_SERIES = {
         "KXNCAAMBGAME": ("Sports", ("Basketball",)),
         "KXUCLGAME": ("Sports", ("Soccer", "Europe")),
@@ -825,9 +768,7 @@ class TestCategoryFilter:
 
     @staticmethod
     def _trade(event_ticker: str) -> BacktestTrade:
-        """A BacktestTrade carrying what dashboard._trade_category reads: market
-        A's event ticker and the ticker-prefix category the backtester gives it
-        (infer_category, as _simulate_at_discount sets BacktestTrade.category)."""
+        """A BacktestTrade carrying market A's event ticker and its infer_category label."""
         return BacktestTrade(
             pair_type="same_title", ticker_a="A", ticker_b="B", title_a="Q", title_b="Q",
             category=infer_category(event_ticker), entry_date=date(2026, 1, 5),
@@ -839,11 +780,9 @@ class TestCategoryFilter:
         )
 
     def test_it_files_every_pair_as_the_dashboard_files_the_trade(self):
-        # A pair is filed where the dashboard files a trade of the same event:
-        # for every (category, tag) the page files a trade under, the filter
-        # set to that category and tag keeps exactly those pairs (this map
-        # holds no tag under two categories and no tag spelled two ways — the
-        # next test covers what the filter keeps when one does)
+        # For each (category, tag) the dashboard files a trade under, the filter
+        # keeps exactly those pairs (this map spells no tag two ways; the next
+        # test covers one that does)
         _seed_series_listing({t: [c, list(tags)] for t, (c, tags) in
                               self.DASHBOARD_SERIES.items()})
         events = ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXSCOTUSLAST-26",
@@ -867,10 +806,7 @@ class TestCategoryFilter:
             assert sorted(self._tickers(kept)) == sorted(expected), category
 
     def test_a_tag_is_matched_under_every_category_and_in_any_case(self):
-        # The dashboard's Tag options are category-scoped and case-exact; the
-        # filter's tag is neither. Kalshi's 2026-09-25 listing files "Soccer"
-        # first under Sports, Economics and Entertainment, and spells
-        # Entertainment's "Anime Awards" two ways
+        # Dashboard Tag options are category-scoped and case-exact; the filter's are not
         listing = {"KXCLUBWC": ["Sports", ["Soccer"]], "KXHKANE": ["Economics", ["Soccer"]],
                    "KXANIMEB": ["Entertainment", ["Anime Awards"]],
                    "ANIMEB": ["Entertainment", ["Anime awards"]]}
@@ -1244,12 +1180,9 @@ def _raw_events_page(events: list, cursor: str | None = None) -> SimpleNamespace
 # scanner._bids_to_ask_levels. Buying side S on a market consumes that
 # market's OPPOSITE-side bids, so the opt-in time-series pair is the mirror
 # image: TS-EARLY (a YES buy) serves NO bids at 0.70 => YES asks 0.30 with an
-# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40.
-# TS-LATE also rests a NO bid at 0.40 => a YES ask of 0.60, its REFERENCE
-# quote (the scan pB): a time-series pair whose later book has no YES ask
-# fails closed in enrichment, and 0.60 sits exactly at LATE's 0.60 YES bid, so
-# the book is uncrossed and every pinned figure is unchanged. 100 contracts
-# each — the depth cap the replay pins.
+# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40,
+# and a NO bid at 0.40 => the reference YES ask of 0.60 enrichment needs (at its
+# own YES bid: uncrossed). 100 contracts each — the depth cap the replay pins.
 _ORDERBOOK_PAYLOADS = {
     _TICKER_SAME_EXP: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
     _TICKER_SAME_CHEAP: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
@@ -1664,10 +1597,8 @@ class TestRunDevLiveShapeReplay:
             for r in captured["results"] if r.status == "simulated"
         )
 
-        # Sized against the $1,000 sandbox balance at the shipped k of 0.80,
-        # f* ~ 0.1061, the pair would buy 151 contracts (231 at f* ~ 0.1620
-        # under k 0.75, config.py's value before the 2026-09-27 flip); the
-        # 100-contract book depth caps it either way, so x == y == 100. total_cost = 100 x (0.30 + 0.40) = 70.00 and profit
+        # Kelly on $1,000 (f* ~ 0.106 at config.py's k 0.80) outsizes the
+        # 100-contract book: x == y == 100. total_cost = 70.00 and profit
         # if won = 100 x (1 - 0.70) - exact fees (1.47 + 1.68) = 26.85.
         ts_result = next(
             r for r in captured["results"]
@@ -1761,8 +1692,7 @@ class TestRunProdDryRunLiveShapeReplay:
         assert results, "expected at least one result"
         assert all(r.status == "simulated" for r in results)
 
-        # The separator row names the run's live toggles — config.py's here,
-        # since the run was handed none — with no departure marks
+        # The separator row names config.py's toggles (the run was handed none)
         assert captured["run_note"].startswith("settings: ")
         assert captured["run_note"] == f"settings: {describe_live_settings(live_settings())}"
         assert "(config:" not in captured["run_note"]
@@ -2235,45 +2165,20 @@ class TestRunProdLiveV2Replay:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLiveSettingsReachEverySite:
-    """The runtime tripwire behind the AST pin
-    (tests/test_strategy.py::TestTimeSeriesKellyParity::
-    test_ast_live_path_reads_toggles_only_through_live_settings): a real
-    production dry run, and a real dev run, over the live-shape fixture — one
-    time-series pair (TS-EARLY / TS-LATE) and one same-title pair (SAME-EXP /
-    SAME-CHEAP) reaching sizing, both later books uncrossed — handed settings
-    that differ in EVERY field from the values pinned_config_toggles pins
-    config.py's toggles to, and an explicit reference (config.py's, read
-    before the tripwire is armed), while every module's live_settings raises.
-    A site that read config.py, re-resolved it, or was handed the reference
-    in place of the run's settings would either raise here or hand a spy a
-    value the run was not given. pre_execution_check swallows exceptions into
-    a WARNING, so that WARNING's absence is asserted too. A run that finds no
-    pair must name the run's rule too (_no_pairs_msg), in both modes.
-
-    The settings are chosen so both pairs still trade: with the tier floors
-    off the 0.30 time-series spread clears the band's 0.05 floor and its 0.9
-    ceiling, and the price-sum ceiling is 0.95; k 0.6 prices the time-series
-    pair at p = 0.82, f* about 0.33, between the 0.25 same-title cap and the
-    0.35 per-trade cap, and the same-title pair's f* of about 0.84 is capped at
-    0.25 — none of which the pinned config values produce. The category and
-    tag filters keep both pairs and only them: the cached /series listing
-    this test seeds (_LISTING) files TS-EARLY's series under Economics ·
-    Inflation and SAME-EXP's under Politics · Elections — matched
-    case-insensitively — and the fixture's other same-title pairs under a
-    category the filter does not name (TICK-A's) or none at all, so they are
-    dropped before enrichment, which must be handed exactly the pairs the
-    filter kept; main._filter_by_category must be handed the run's settings
-    (and, in dev, no listing client), and the listing, seeded fresh, must be
-    read without a /series request in either mode."""
+    """The runtime tripwire behind test_strategy.py's
+    test_ast_live_path_reads_toggles_only_through_live_settings: a prod dry run and a
+    dev run handed _SETTINGS (every field departing from the pinned config) and an
+    explicit reference while live_settings raises in config, scanner, strategy, trader
+    and main, so a site reading config.py or the reference raises or hands a spy the
+    wrong value. _SETTINGS keeps both pairs trading, the time-series f* between the
+    0.25 same-title and 0.35 per-trade caps."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
                              categories=("economics", "POLITICS"),
                              tags=("Inflation", "elections"))
 
-    # Kalshi's /series listing as the cached copy the filter reads: series
-    # ticker -> [category, tags]. SHARDAEVT and HELDAEVT are missing, so their
-    # pairs fall back to the ticker-prefix label ("Other") and "General"
+    # The cached /series listing (SHARDAEVT and HELDAEVT unlisted: filed as Other)
     _LISTING = {
         "EVT": ["Economics", ["Inflation", "Fed"]],
         "EXPEVT": ["Politics", ["Elections"]],
@@ -2291,18 +2196,16 @@ class TestLiveSettingsReachEverySite:
 
     def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str):
         """
-        Run one mode over the live-shape fixture on _SETTINGS, every
-        live_settings raising and every _SPIED binding recorded.
+        Run one mode on _SETTINGS under the tripwire, recording every _SPIED call.
 
         Returns:
-            tuple: (settings, reference, calls, captured) — calls maps
-                (module short name, function name) to the (args, kwargs) of
-                every call; captured holds execute_trades' "results" and, in
-                prod, the trade log's "run_note".
+            tuple: (settings, reference, calls, captured) — calls maps (module
+                short name, function name) to each call's (args, kwargs);
+                captured holds "results", "filter", "enriched" and, in prod,
+                "run_note".
         """
         settings = self._SETTINGS
-        # config.py's toggles, read BEFORE the tripwire is armed, and the
-        # precondition that makes every spy below meaningful
+        # config.py's toggles, read before the tripwire; every field must differ
         reference = live_settings()
         for field in dataclasses.fields(LiveSettings):
             assert getattr(settings, field.name) != getattr(reference, field.name), field.name
@@ -2311,9 +2214,7 @@ class TestLiveSettingsReachEverySite:
             monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
         )
         captured: dict = {}
-        # The cached /series listing the category/tag filter files pairs by,
-        # fresh, so a prod run makes no request for it (conftest points the
-        # cache at this test's tmp_path)
+        # A fresh cached listing, so a prod run makes no request for it
         _seed_series_listing(self._LISTING)
         real_filter = main._filter_by_category
 
@@ -2324,8 +2225,7 @@ class TestLiveSettingsReachEverySite:
             return kept
 
         monkeypatch.setattr(main, "_filter_by_category", filter_spy)
-        # The listing is fresh, so neither mode may request it. Recorded, not
-        # raised: load_series_categories turns a failed request into a WARNING
+        # Neither mode may request it (recorded: a raise there only WARNs)
         series_requests: list = []
 
         def no_series_request(client_, path, **params):
@@ -2333,8 +2233,7 @@ class TestLiveSettingsReachEverySite:
             raise AssertionError("the fresh /series listing was requested")
 
         monkeypatch.setattr(historical, "_historical_get", no_series_request)
-        # The filter runs BEFORE enrichment, so a dropped pair costs no
-        # order-book request: enrichment must be handed the filter's own list
+        # The filter runs first: enrichment must be handed exactly its kept pairs
         real_enrich = main.enrich_with_orderbook_prices
 
         def enrich_spy(client_, pairs, *args, **kwargs):
@@ -2393,8 +2292,7 @@ class TestLiveSettingsReachEverySite:
                     settings, reference,
                 )
         assert code == EXIT_OK
-        # The category/tag filter ran once, on the run's own settings, and
-        # kept both pairs — and only them — out of a longer candidate list
+        # The filter ran once, on the run's settings, keeping both pairs and only them
         ((pairs, filter_settings, listing_client, kept),) = captured["filter"]
         assert filter_settings is settings
         assert listing_client is (client if mode == "prod" else None)
@@ -2416,15 +2314,12 @@ class TestLiveSettingsReachEverySite:
         return kwargs[keyword] if keyword in kwargs else args[index]
 
     def _assert_every_site_read_the_runs_settings(self, settings, calls):
-        """Every spy was reached, each with the run's settings or its values,
-        and a time-series pair and a same-title pair both reached sizing."""
+        """Every spy got the run's settings (or values); both pair types reached sizing."""
         arg = self._arg
-        # Every spy was reached ...
         for module, names in self._SPIED:
             for name in names:
                 key = (module.__name__.rsplit(".", 1)[-1], name)
                 assert calls.get(key), f"{key} was never called"
-        # ... and every one was handed the run's settings, or its values
         for key, index in ((("scanner", "live_time_series_floor"), 1),
                            (("config", "live_time_series_floor"), 1),
                            (("scanner", "time_series_spread_refusal"), 2),
@@ -2447,7 +2342,6 @@ class TestLiveSettingsReachEverySite:
         assert all(0 < f <= settings.size_cap for f in fractions), fractions
         assert settings.same_title_size_cap in fractions
         assert any(settings.same_title_size_cap < f < settings.size_cap for f in fractions)
-        # A time-series pair and a same-title pair both reached sizing
         sized = {arg(c, 0, "pair_type") for c in calls[("strategy", "pair_size_cap")]}
         assert sized == {"time_series", "same_title"}
 
@@ -2456,7 +2350,6 @@ class TestLiveSettingsReachEverySite:
             monkeypatch, caplog, "prod")
         self._assert_every_site_read_the_runs_settings(settings, calls)
 
-        # execute_trades received both pairs, simulated
         results = captured["results"]
         assert {r.status for r in results} == {"simulated"}
         by_type = {r.spec.pair.pair_type: r.spec for r in results}
@@ -2469,8 +2362,7 @@ class TestLiveSettingsReachEverySite:
 
         # pre_execution_check swallows exceptions — so none may have happened
         assert "Pre-execution check raised" not in caplog.text
-        # The run named its rule, its settings (every field marked) and the
-        # two exposures they lift; a dry run gets no departure WARNING
+        # The run named its rule, its settings (all marked) and both lifted exposures
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
@@ -2478,14 +2370,11 @@ class TestLiveSettingsReachEverySite:
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
-        # The trade log's separator carries the same marked line: the workbook
-        # itself says which fields a flag moved, which the values alone cannot
+        # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
         assert captured["run_note"].count("(config:") == 7
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
-        # Dev's finder, enrichment and sizer read the run's object as prod's
-        # do — "in either mode", as the flags promise
         settings, reference, calls, captured = self._run_under_the_tripwire(
             monkeypatch, caplog, "dev")
         self._assert_every_site_read_the_runs_settings(settings, calls)
@@ -2498,7 +2387,6 @@ class TestLiveSettingsReachEverySite:
         assert ts.kelly_p == pytest.approx(1 - 0.6 * 0.30)
         assert settings.same_title_size_cap < ts.kelly_fraction < 0.35
         assert st.kelly_fraction == settings.same_title_size_cap
-        # Every same-title spec sits under the run's same-title cap
         assert all(r.spec.kelly_fraction <= settings.same_title_size_cap
                    for r in results if r.spec.pair.pair_type == "same_title")
         assert ("Time-series entry rule: "
@@ -2510,8 +2398,6 @@ class TestLiveSettingsReachEverySite:
 
     @pytest.mark.parametrize("mode", ["prod", "dev"])
     def test_a_run_with_no_pairs_names_its_own_rule(self, monkeypatch, caplog, mode):
-        # The no-pairs line names the rule the run APPLIED — the run's
-        # settings, never config.py's reference beside them
         settings = dataclasses.replace(live_settings(), tier_floors=False,
                                        spread_band=(0.0, 0.5))
         reference = live_settings()

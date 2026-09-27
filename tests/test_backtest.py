@@ -66,9 +66,8 @@ def _sweep(k: float | None = None, n_trades: int = 0) -> BacktestSweep:
 
     main() reads only `.profit` off each trade (the win-rate count), so a plain
     SimpleNamespace stands in for BacktestTrade without duplicating its fixture.
-    k None is the k a run given no --interval-discount resolves to: backtest's
-    binding of config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, read at call time so a
-    test that patches it (conftest's pre_toggle_defaults) is honoured.
+    k None reads backtest's binding of TIME_SERIES_INTERVAL_PROB_DISCOUNT at call
+    time, as a run given no --interval-discount does, so a patched value holds.
     """
     point = SweepPoint(
         k=backtest.TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k,
@@ -516,10 +515,8 @@ class TestLiveRuleEcho:
         assert "k=0.620" in text and "spread band=0.3-0.6" in text
 
     def test_it_fails_soft_on_an_invalid_config(self, cli, monkeypatch, caplog):
-        # A floor at or above the ceiling fails config.time_series_spread_band's
-        # own validation, so live_settings() raises — this must not abort the
-        # run over a reporting clause the way an invalid --spread-min/--spread-max
-        # combination (a real argument) correctly does.
+        # A floor above the ceiling makes live_settings() raise: a reporting
+        # clause fails soft, while an invalid --spread-min/--spread-max pair exits
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)

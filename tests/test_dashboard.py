@@ -145,8 +145,7 @@ class TestKellyFraction:
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at
-        # k 0.75 (config.py's k before the 2026-09-27 flip; pre_toggle_defaults).
+        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at k 0.75.
         # b's denominator carries the fee — the dollars at risk include it,
         # because a losing pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
@@ -204,10 +203,8 @@ class TestKellyFractionIntervalDiscount:
                                "time_series", k=1.0) == 0.0
 
     def test_explicit_k_wins_over_a_monkeypatched_constant(self, monkeypatch):
-        # The constant is set to the never-trade value; the explicit k 0.75
-        # must still produce test_time_series_flow_through_fixture's ~0.1620
-        # fraction (measured at k 0.75, config.py's k before the 2026-09-27
-        # flip).
+        # With the constant at the never-trade value, k=0.75 must still give
+        # test_time_series_flow_through_fixture's ~0.1620 fraction
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
                                "time_series", k=0.75) == pytest.approx(0.1620, abs=1e-4)
@@ -2086,13 +2083,10 @@ class TestRunSettingsHeader:
 
 
 class TestLiveRuleHeader:
-    """dashboard._live_rule_html(sweep, bar=...): config.py's OWN live rule —
-    backtester.run_backtest_sweep's one read of config.live_settings() before
-    its fetch, never main.py's per-run overrides, which a backtest cannot see
-    — and where this page shows it: backtester._live_rule_view (the verdict
-    the run's log states too) in the filter bar's own option texts. A
-    separate <p>, never touching _run_settings_html's own byte-identical
-    line (twelve tests pin its exact "</p>" suffix)."""
+    """dashboard._live_rule_html(sweep, bar=...): config.py's own live rule, as
+    run_backtest_sweep read it before its fetch, and where this page shows it
+    (backtester._live_rule_view's verdict, in the filter bar's option texts),
+    on a <p> of its own: _run_settings_html's exact "</p>" suffix is pinned."""
 
     _P = '<p style="color:#616161; font-size:14px;">'
     _CAP = "same-title trades capped at the size cap shown, like every pair (20% at this run's own cap)"
@@ -2120,8 +2114,7 @@ class TestLiveRuleHeader:
     @staticmethod
     def _bar(bands=((0.0, 1.0),), primary=(0.0, 1.0), off=True, categories=(),
              subcats=()) -> dict:
-        """The keys of _filter_payload's base block the line reads, labelled as
-        _filter_payload labels them."""
+        """The base-block keys _live_rule_html reads, labelled as _filter_payload labels them."""
         def mark(b):
             return " (primary)" if b == primary else ""
         return {
@@ -2186,12 +2179,10 @@ class TestLiveRuleHeader:
         assert self._text(sweep, bar) == (
             f"Live rule (config.py): {rule}; {self._CAP} — choose Spread band "
             "max(tier,0.3)-0.6 and Tier floors on in the filter bar")
-        # The bar's tier-on option for that band is exactly that text
         assert "max(tier,0.3)-0.6" in [e["option"] for e in bar["bands"]]
 
     def test_a_tier_off_band_is_chosen_after_the_tier_floors(self):
-        # The bar relabels its bands with the tiers off, so "off" comes first
-        # and the band is named by its bare tier-off label
+        # Tiers off relabel the bar's bands: "off" first, then the bare band label
         band = (0.0, 0.5)
         rule = config.describe_time_series_rule(False, band)
         sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
@@ -2216,15 +2207,14 @@ class TestLiveRuleHeader:
         assert self._text(sweep, self._bar()).endswith("— not simulated by this run")
 
     def test_tier_floors_off_needs_the_whole_family(self):
-        band = (0.0, 1.0)  # floor 0 binds a tier (backtester._tier_floors_bind)
+        band = (0.0, 1.0)
         assert backtester._tier_floors_bind(band) is True
         grid = {band: None, (0.2, 0.6): None}
         # On the grid, but no tier-off family ran at all
         sweep = self._sweep(live_tier_floors=False, calibrations_by_band=grid)
         assert self._text(sweep, self._bar()).endswith("— not simulated by this run")
-        # The family ran, but lacks ANOTHER band a tier binds at: the page
-        # withholds the whole off view (dashboard._tier_off_binds), so this
-        # band's off view is not shown either
+        # The family lacks ANOTHER binding band: the page withholds the whole
+        # off view (dashboard._tier_off_binds)
         assert backtester._tier_floors_bind((0.2, 0.6)) is True
         sweep = self._sweep(live_tier_floors=False, calibrations_by_band=grid,
                             tier_off_calibrations_by_band={band: None},
@@ -2239,7 +2229,7 @@ class TestLiveRuleHeader:
             "— choose Tier floors off and Spread band 0-1 (primary) in the filter bar")
 
     def test_tier_floors_off_where_no_tier_binds_is_the_tier_on_rule(self):
-        band = (0.35, 0.5)   # floor 0.35 sits above both tiers
+        band = (0.35, 0.5)
         assert backtester._tier_floors_bind(band) is False
         note = " (no tier floor binds at this band, so off and on are one rule)"
         # The primary at that band IS it
@@ -2270,7 +2260,7 @@ class TestLiveRuleHeader:
                             calibrations_by_band={(0.0, 1.0): None, band: None},
                             tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
                             tier_off_scenarios=[object()])
-        # No tier-off view on the page (grid_off null), then no such band
+        # No tier-off view on the page (bands_off null), then no such band
         for bar in (self._bar(bands=[band, (0.0, 1.0)], off=False), self._bar()):
             assert self._text(sweep, bar).endswith(
                 "— not shown: this page's filter bar does not offer that scenario")
@@ -2381,8 +2371,7 @@ class TestLiveRuleHeader:
                 < page.index(live_rule) < page.index("Portfolio Performance"))
 
     def test_the_page_names_its_own_bars_option(self, monkeypatch, tmp_path):
-        # A band the page's grid holds: the line names the Spread band option
-        # the rendered bar actually offers
+        # A band on the grid: the line names the Spread band option the bar offers
         band = (0.3, 0.6)
         points = [dataclasses.replace(_scn_point(b, 0.75), size_cap=0.2)
                   for b in ((0.0, 1.0), band)]
@@ -2952,8 +2941,7 @@ class TestReturnsByCategory:
         assert historical.series_ticker("") == ""
 
     def test_the_page_files_by_the_one_rule_the_live_filter_shares(self):
-        # historical.series_labels is the one filing rule: the page imports it,
-        # and main._filter_by_category files a live pair by it too
+        # The one filing rule, shared with main._filter_by_category
         assert dashboard._series_labels is historical.series_labels
 
     def test_the_section_charts_and_tabulates_each_category_tag(self):
@@ -5654,9 +5642,7 @@ class TestFilterKAndCap:
         # A real run_backtest_sweep over the backtester's golden fixture,
         # narrowed to one band and one k: every cap the page offers is the
         # scenario a fresh simulation at that cap produces, figure for figure.
-        # Run at config.py's toggles before the 2026-09-27 flip (a 20% run
-        # cap, no extra same-title cap; conftest's pre_toggle_defaults), so the
-        # primary sits at the 20% cap the assertions below index by
+        # The run's own cap is pre_toggle_defaults' 20%, which the primary index uses
         golden = _tb.TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))

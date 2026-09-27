@@ -169,8 +169,7 @@ def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
 class TestKellyP:
     """Probability-of-profit models: the discounted market gap for time-series
     (config.time_series_profit_prob) and the fixed co-resolution prior for
-    same-title. Priced at k 0.75, config.py's value before the 2026-09-27
-    flip (conftest's pre_toggle_defaults), which the figures were derived at."""
+    same-title, at k 0.75 (pre_toggle_defaults)."""
 
     def test_time_series_discounted_gap_model(self):
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
@@ -197,9 +196,7 @@ class TestKellyP:
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTrade:
-    """compute_trade's gates and caps under config.py's live toggles as they
-    stood before the 2026-09-27 flip (conftest's pre_toggle_defaults): a 20%
-    per-trade cap for every pair, no extra same-title cap, k 0.75."""
+    """compute_trade's gates and caps under pre_toggle_defaults (k 0.75, 20% cap)."""
 
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
@@ -324,9 +321,7 @@ class TestComputeTradeTimeSeries:
     earlier contract at 0.30 and NO on the later at 0.40 (later YES ask 0.60),
     $10,000 balance. Every expectation is derived from the config helpers in
     the test, not hardcoded, except the contract count and the dollar figures
-    the plan pins. Sized under config.py's toggles as they stood before the
-    2026-09-27 flip (conftest's pre_toggle_defaults: k 0.75, a 20% cap), which
-    those figures were derived at."""
+    the plan pins, all worked under pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     @staticmethod
     def _pair(**overrides) -> MagicMock:
@@ -417,22 +412,16 @@ class TestComputeTradeTimeSeries:
 
 
 def _live(k: float = 0.75, cap: float = 0.20, st_cap: float = 1.0) -> LiveSettings:
-    """A LiveSettings at the given k and caps, with the tier floors on and no
-    band otherwise; the defaults are config.py's values before the 2026-09-27
-    flip."""
+    """A LiveSettings at the given k and caps, tier floors on and no band."""
     return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
                         size_cap=cap, same_title_size_cap=st_cap)
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTradeSettings:
-    """compute_trade reads k and both per-pair caps from ONE LiveSettings,
-    hands it to every internal helper, and resolves config.py's only when
-    handed none. The two reference pairs: same-title nA 0.20 + pB 0.30, whose
-    uncapped f* is ~0.8945, and the wide time-series pair 0.30 -> 0.85 with a
-    0.15 NO ask, whose f* at k 0.75 is ~0.216. config.py is pinned to its
-    toggles before the 2026-09-27 flip (conftest's pre_toggle_defaults), so
-    "the default" below is a 20% cap for every pair and k 0.75."""
+    """compute_trade reads k and both caps from ONE LiveSettings, hands it to
+    every internal helper, and resolves config.py's only when handed none.
+    "The default" is pre_toggle_defaults' (k 0.75, a 20% cap)."""
 
     _ST = {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"}
     _TS_WIDE = {"pA": 0.30, "pB": 0.85, "nA": 0.70, "nB": 0.15, "pair_type": "time_series"}
@@ -455,8 +444,7 @@ class TestComputeTradeSettings:
         wider = compute_trade(st, 1_000_000, settings=_live(cap=0.35))
         assert wider.kelly_fraction == pytest.approx(0.35)
         assert wider.x > default.x
-        # The time-series pair's f* ~0.216 sits between the two caps: 0.20
-        # binds it, 0.35 does not
+        # The time-series f* (~0.216) sits between the caps: 0.20 binds, 0.35 does not
         ts = make_pair(**self._TS_WIDE)
         assert compute_trade(ts, 1_000_000, settings=_live(cap=0.20)).kelly_fraction == \
             pytest.approx(0.20)
@@ -475,8 +463,7 @@ class TestComputeTradeSettings:
         assert at_06.kelly_p == pytest.approx(1.0 - 0.6 * (_TS_PB - _TS_PA))
         assert at_06.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB, k=0.6))
         assert at_06.kelly_fraction > base.kelly_fraction
-        # The booked path (_solve_marginal_size -> _evaluate_size) prices at
-        # the run's k too; one flat level, so the price is the same at every n
+        # The booked path prices at the run's k too (one flat level: one price at every n)
         booked = make_booked_pair([(_TS_PA, _TS_NB, 1_000_000.0)], pB=_TS_PB)
         spec = compute_trade(booked, 1_000_000, settings=_live(k=0.6))
         assert spec is not None
@@ -522,12 +509,9 @@ class TestComputeTradeSettings:
         assert compute_trade(make_pair(**self._TS), 1_000_000).kelly_p == pytest.approx(0.82)
 
     def test_time_series_fraction_stays_under_one_minus_k(self):
-        # With the per-trade cap lifted (1.0), what bounds a time-series trade
-        # is 1 - k: f* = 1 - k*(pB - pA)/(1 - c), and a reference YES ask at or
-        # above the later market's own YES bid (1 - its best NO ask) makes
-        # 1 - c < pB - pA. Enrichment's fail-closed fallback and crossed-book
-        # guard keep that true of every pair it hands the sizer, and
-        # max_kelly_fraction (enrichment's affordability bound) relies on it.
+        # With no per-trade cap, 1 - k bounds a time-series f* whenever the
+        # reference YES ask is at or above the later book's YES bid (see
+        # config.max_kelly_fraction, which relies on it)
         rng = random.Random(20260927)
         balance = 1_000_000
         for k in (0.4, 0.6, 0.75, 0.8, 0.9):
@@ -588,8 +572,7 @@ def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     if net_spread <= 0:
         return -1.0
     b = net_spread / (price_a + price_b + fee)
-    # The shipped k, read the way live_settings() reads it (the sizer's
-    # compute_trade(settings=None) resolves the same value)
+    # config.py's k, as compute_trade(settings=None) resolves it
     p = strategy._kelly_p_at(pair, price_a, k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
     return p - (1.0 - p) / b
 
@@ -641,10 +624,9 @@ class TestMarginalFillPricing:
                 assert spec.x <= pair.max_contracts
 
     def test_small_balance_pays_the_best_level(self):
-        # At most $30 * 20% = $6.00 (the per-trade cap before the 2026-09-27
-        # flip; under 1 - k = 0.20 at the k shipped since) at 0.70 a pair ->
-        # 8 pairs, well inside the 20 resting at the top rung, so the fill is
-        # the best level outright.
+        # f* < 1 - k = 0.20 at config.py's k of 0.80 (no per-trade cap, pB 0.62 uncrossed):
+        # at most $6.00 at 0.70 a pair -> 8 pairs, well inside the 20 resting at the top
+        # rung, so the fill is the best level outright.
         spec = compute_trade(make_booked_pair(self.LEVELS), 3_000)
         assert spec is not None
         assert spec.x <= 20
@@ -760,8 +742,7 @@ class TestTimeSeriesKellyParity:
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_dashboard_fraction_uses_leg_prices_not_nA_pB(self):
         # On this fixture nA + pB = 1.30 — the old leg mapping would return 0.0
-        # (no spread), not the ~0.1620 the live sizer computes at k 0.75
-        # (config.py's k before the 2026-09-27 flip; pre_toggle_defaults)
+        # (no spread), not the ~0.1620 the live sizer computes at k 0.75 (pre_toggle_defaults)
         assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
     def test_dashboard_same_title_unchanged(self):
@@ -934,10 +915,8 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "pair_gap_days")
         assert not _function_calls(
             scanner, "enrich_with_orderbook_prices", "deadline_gap_days")
-        # validate_pair_price's band-ceiling test re-derives the floor through
-        # time_series_spread_refusal too: a close_time gap there would re-tier
-        # a one-instant ladder and misread an over-ceiling spread as below the
-        # floor, letting it through
+        # validate_pair_price's ceiling test too: a wider close_time gap could raise
+        # the floor, and its BELOW_FLOOR answer would let an over-ceiling spread pass
         assert _function_calls(scanner, "validate_pair_price", "pair_gap_days")
         assert not _function_calls(scanner, "validate_pair_price", "deadline_gap_days")
 
@@ -1013,9 +992,7 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
 
     # The live entry points that may resolve config.py's toggles when handed
-    # none, each in exactly ONE statement of exactly one form. Every other
-    # live function either requires a LiveSettings — declared with NO default,
-    # which the pin checks — or never reads a toggle at all.
+    # none, in one statement of one form; every other def taking `settings` requires it.
     _LIVE_SETTINGS_RESOLVERS = frozenset({
         ("scanner", "find_time_series_pairs"),
         ("scanner", "enrich_with_orderbook_prices"),
@@ -1027,65 +1004,26 @@ class TestTimeSeriesKellyParity:
         ("main", "_no_pairs_msg"),
     })
 
-    # The one live function that calls live_settings() DIRECTLY, exactly once,
-    # as a bare `live_settings()`: main._resolve_live_settings, which lays
-    # main.py's toggle flags over config.py's values and hands main() both the
-    # run's settings and config.py's reference. main() hands both on to its
-    # run modes, so no live call omits settings — there is no exemption.
+    # The one LIVE function that calls a bare live_settings(), once: it lays main.py's
+    # toggle flags over config.py's values for main() to hand on.
     _DIRECT_RESOLVERS = frozenset({
         ("main", "_resolve_live_settings"),
     })
 
     def test_ast_live_path_reads_toggles_only_through_live_settings(self):
-        # Every live toggle — the time-series entry rule (tier floors, spread
-        # band), k, both per-trade caps and the category/tag filter — is read
-        # through ONE frozen config.LiveSettings per run, so no site can apply
-        # a setting while another reads config.py: the finder, the category/
-        # tag filter (main._filter_by_category), enrichment (its spread rule
-        # and its affordability bound, max_kelly_fraction), the sizer
-        # (strategy.compute_trade: k through _kelly_p_at, the caps through
-        # config.pair_size_cap) and validate_pair_price all read the one
-        # object main.py hands them. The walk is
-        # DENY-BY-DEFAULT: every module of the package, the package root
-        # included, except config and the backtest-side band readers
-        # (backtester, backtest, dashboard) — so a live module added later is
-        # covered without editing any list here. In every walked module:
-        #   - no band or tier-floor helper or constant, and no toggle constant
-        #     (the two caps, k, TRADE_CATEGORIES and TRADE_TAGS included), is
-        #     referenced, by name, by string
-        #     (a getattr/__dict__ lookup), by shadowing def or parameter, or
-        #     by import — min_price_diff_for_gap included: the live path
-        #     reaches the entry floor only through
-        #     config.live_time_series_floor;
-        #   - no backtest-side band reader is imported, so none can be reached
-        #     transitively;
-        #   - live_settings appears only in the whitelisted entry points above,
-        #     each exactly once, as
-        #     `settings = live_settings() if settings is None else settings`,
-        #     and as one bare `live_settings()` call in
-        #     main._resolve_live_settings, the one direct resolver, where
-        #     main.py's toggle flags are laid over it (an ImportFrom alias of
-        #     it, not renamed, is the one exemption);
-        #   - every call to a function whose def (in a walked module or in
-        #     config) declares a `settings` parameter passes it explicitly, as
-        #     the bare name `settings`, positionally or as settings=settings —
-        #     never a literal None and never another expression, so the
-        #     `reference` each run mode holds beside it (config.py's own
-        #     toggles, for the "Live settings" marks) cannot be handed where
-        #     the run's settings belong; a pool.submit(f, ...) of such a
-        #     function included, which must carry settings=settings, and
-        #     main()'s calls to its two run modes too, with no exemption — and
-        #     no such function is passed around uncalled any other way;
-        #   - every such def outside the whitelist declares `settings` with NO
-        #     default, and every whitelisted one defaults it to None: a
-        #     default on an internal helper would let a caller that forgets
-        #     it half-apply the run's settings;
-        #   - k and the Kelly fraction are never left to a config default:
-        #     every time_series_profit_prob call passes k, every
-        #     strategy._kelly_p_at call passes its (required) k, and every
-        #     max_affordable_pairs call passes its fraction — never as a
-        #     literal None, which each helper would resolve to config.py's
-        #     constant — and none of the three is passed around uncalled.
+        # ONE frozen config.LiveSettings per run carries every live toggle, so
+        # no site applies a setting while another reads config.py. In every
+        # package module but config and the backtest-side band readers:
+        #   - no band/tier-floor helper or constant (min_price_diff_for_gap
+        #     included) or toggle constant is named, spelled, shadowed or
+        #     imported, and no band reader is imported;
+        #   - live_settings is read only by each whitelisted entry point's one
+        #     resolving statement and main._resolve_live_settings' one call;
+        #   - a def with a `settings` parameter is only ever called (pool.submit
+        #     too), with the bare name `settings`, never None or the `reference`,
+        #     and every whitelisted def, and only those, defaults it to None;
+        #   - time_series_profit_prob, _kelly_p_at and max_affordable_pairs always
+        #     get k / the fraction, never None, and are never passed around uncalled.
         # A toggle value hardcoded inline as a literal is outside this pin's
         # reach; the constants-live-in-config rule covers that.
         import importlib
@@ -1120,8 +1058,8 @@ class TestTimeSeriesKellyParity:
             "TRADE_TAGS",
         }
         resolver = "live_settings"
-        # Helpers whose k / fraction would silently read config.py when left
-        # out or passed as None: name -> (positional index, keyword name)
+        # Helpers that read config.py's k / fraction when handed None (or, where
+        # it is defaulted, nothing): name -> (positional index, keyword name)
         explicit_args = {
             "time_series_profit_prob": (2, "k"),
             "_kelly_p_at": (2, "k"),
@@ -1146,8 +1084,7 @@ class TestTimeSeriesKellyParity:
                     return True, default
             return False, None
 
-        # Every function that takes a `settings` parameter, in the walked
-        # modules and in config (whose helpers the live path calls):
+        # Every def with a `settings` parameter, walked modules and config:
         # name -> positional index, or None when it is keyword-only
         takes_settings: dict = {}
         for mod, tree in [*trees.items(), ("config", ast.parse(inspect.getsource(config)))]:
@@ -1164,8 +1101,7 @@ class TestTimeSeriesKellyParity:
                     continue
                 assert takes_settings.get(node.name, where) == where, node.name
                 takes_settings[node.name] = where
-                # A whitelisted entry point defaults settings to None (and
-                # resolves it once, checked below); everything else REQUIRES it
+                # A whitelisted entry point defaults settings to None; every other def requires it
                 _, default = param_default(node, "settings")
                 if (mod, node.name) in self._LIVE_SETTINGS_RESOLVERS:
                     assert isinstance(default, ast.Constant) and default.value is None, (
@@ -1183,8 +1119,7 @@ class TestTimeSeriesKellyParity:
                 "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
                 "describe_live_settings", "live_rule_warnings", "_filter_by_category",
                 "describe_trade_filter"} <= set(takes_settings)
-        # _kelly_p_at's k is required too: a default there would let a caller
-        # that forgets it price at config's k
+        # _kelly_p_at's k is required: a default would price at config's k
         kelly_p_at = next(n for n in ast.walk(trees["strategy"])
                           if isinstance(n, ast.FunctionDef) and n.name == "_kelly_p_at")
         declared, default = param_default(kelly_p_at, "k")
@@ -1202,11 +1137,8 @@ class TestTimeSeriesKellyParity:
             return not (isinstance(value, ast.Constant) and value.value is None)
 
         def passes_settings(call, fn_name, skip):
-            """Whether the call hands `fn_name` the run's settings: the bare
-            name `settings`, positionally or as settings=settings — never a
-            literal None and never any other expression, so the `reference`
-            each run mode holds beside it (config.py's own) cannot be handed
-            in its place; `skip` positional args precede the callee's own."""
+            """Whether the call hands `fn_name` the bare name `settings`,
+            positionally or by keyword; `skip` args precede the callee's own."""
             def is_the_runs(value):
                 return isinstance(value, ast.Name) and value.id == "settings"
 
@@ -1259,8 +1191,7 @@ class TestTimeSeriesKellyParity:
                         and body.func.id == resolver and not body.args and not body.keywords
                         and isinstance(orelse, ast.Name) and orelse.id == "settings"):
                     allowed[id(body.func)] = enclosing(node)
-            # The one direct form, a bare live_settings() call, recorded the
-            # same way; only a _DIRECT_RESOLVERS function may make it (below)
+            # The bare live_settings() call, checked against _DIRECT_RESOLVERS
             direct = {}
             for node in ast.walk(tree):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -1293,8 +1224,7 @@ class TestTimeSeriesKellyParity:
                         "name, never config.py's reference or another expression)")
 
             called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
-            # ast.walk visits an ImportFrom's alias nodes on their own too;
-            # they are checked with their ImportFrom and exempt below
+            # An ImportFrom's alias nodes are checked with it, so skipped below
             from_aliases = {id(a) for n in ast.walk(tree)
                             if isinstance(n, ast.ImportFrom) for a in n.names}
             for node in ast.walk(tree):
@@ -1308,8 +1238,7 @@ class TestTimeSeriesKellyParity:
                     for a in node.names:
                         assert a.name not in no_import, f"{mod} imports {a.name}"
                         assert a.name not in forbidden, f"{mod} imports {a.name}"
-                        # An alias of the resolver would let an unrecognised
-                        # name call it; the exemption covers the plain import
+                        # Only the plain import is exempt; an alias could call it
                         assert not (a.name == resolver and a.asname), mod
                     continue
                 if isinstance(node, ast.Constant):
@@ -1363,13 +1292,9 @@ class TestTimeSeriesKellyParity:
                         f"{where}: {name} is passed around uncalled, so its "
                         f"{explicit_args[name][1]} cannot be checked")
 
-        # Every whitelisted entry point resolves exactly once — none twice
-        # (two resolutions could straddle a monkeypatch), none never (a
-        # whitelist entry that no longer resolves must be removed)
+        # Each whitelisted entry point and the direct resolver resolves exactly
+        # once: two resolutions could straddle a monkeypatch
         assert resolutions == dict.fromkeys(self._LIVE_SETTINGS_RESOLVERS, 1), resolutions
-        # ... and the direct resolver calls live_settings() exactly once: a
-        # second call could straddle a monkeypatch and hand main() a
-        # reference that is not the base its flags were laid over
         assert direct_resolutions == dict.fromkeys(self._DIRECT_RESOLVERS, 1), (
             direct_resolutions)
         # main() hands both run modes the settings it resolved, positionally
@@ -1377,37 +1302,28 @@ class TestTimeSeriesKellyParity:
         main_fn = next(n for n in ast.walk(main_tree)
                        if isinstance(n, ast.FunctionDef) and n.name == "main")
         main_calls = {call_name(n.func) for n in ast.walk(main_fn) if isinstance(n, ast.Call)}
-        # (the settings argument of both dispatches is checked by the walk
-        # above; this only keeps that check from passing on a main() that no
-        # longer dispatches, or no longer resolves)
+        # (so the walk's check cannot pass on a main() missing a dispatch or the resolution)
         assert {"_run_dev", "_run_prod", "_resolve_live_settings"} <= main_calls, main_calls
-        # Non-vacuous: the sizer prices through the model with the run's k at
-        # two sites (_kelly_p and _evaluate_size), and both the sizer and
-        # enrichment turn a fraction into a count
+        # Non-vacuous: _kelly_p and _evaluate_size price at the run's k, and the
+        # sizer and enrichment each turn a fraction into a count
         assert explicit_calls.get("time_series_profit_prob", 0) >= 1, explicit_calls
         assert explicit_calls.get("_kelly_p_at", 0) >= 2, explicit_calls
         assert explicit_calls.get("max_affordable_pairs", 0) >= 2, explicit_calls
 
-        # The live sites that read a toggle each go through the one live
-        # definition of the rule, so the tests of that definition cover them
+        # Every live site of the spread rule (and enrichment's bound) goes through
+        # its one definition
         assert _function_calls(scanner, "find_time_series_pairs", "time_series_spread_refusal")
         assert _function_calls(scanner, "enrich_with_orderbook_prices",
                                "time_series_spread_refusal")
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "max_kelly_fraction")
         assert _function_calls(scanner, "validate_pair_price", "time_series_spread_refusal")
         assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
-        # ... and that definition reaches the floor through the helper the
-        # backtest's _find_entry uses, with the same keywords
+        # ... which reaches the floor through the helper _find_entry uses
         assert _function_calls(config, "live_time_series_floor", "min_price_diff_for_gap")
 
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
-        # config.pair_size_cap is the ONE definition of a pair's per-trade cap
-        # (the cap for every pair, plus the extra same-title cap). The live
-        # sizer, enrichment's affordability bound and the backtester all reach
-        # it, so the three can never cap a pair differently — a backtest that
-        # capped only at the general cap would size same-title pairs the live
-        # bot refuses to, the same live/backtest drift the Kelly-model pins
-        # above exist for.
+        # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
+        # so the live sizer, enrichment's bound and the backtester agree
         assert _function_calls(strategy, "_evaluate_size", "pair_size_cap")
         assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
         assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
@@ -1491,11 +1407,7 @@ class TestKellyRiskIncludesFees:
     charged. fee_per_pair_approx sits below fee_leg_exact, so a spec on the
     boundary can still be EV-negative on its own fields at single-digit n; that
     residual is pinned by test_small_n_can_still_be_ev_negative_on_exact_fees
-    rather than papered over.
-
-    Every figure was derived at k 0.75 and a 20% cap for every pair, config.py's
-    values before the 2026-09-27 flip, which conftest's pre_toggle_defaults
-    restores for each test."""
+    rather than papered over. Worked under pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     def test_the_headline_fixture_is_rejected(self):
         # THE pin. Accepted before DR-62, rejected now.
