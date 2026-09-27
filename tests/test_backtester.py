@@ -18,6 +18,7 @@ from decimal import Decimal
 from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
 
 from .conftest import apply_pre_toggle_defaults
+from .test_scheduler import _host_zone
 
 
 class _WeakrefDict(dict):
@@ -7331,6 +7333,34 @@ class TestRunBacktestSweep:
         # on/off.
         assert result.config_same_event_ladders is configured
 
+    @pytest.mark.parametrize("run", [
+        SCHEDULED_RUN,
+        # A Sunday run: the Tuesday-to-Friday window still holds no checkpoint
+        ScheduledRun(6, 9, 0, "Asia/Tokyo"),
+    ])
+    def test_feasibility_short_circuit_records_the_entry_checkpoint(self, monkeypatch, run):
+        # The infeasible branch names the schedule its window was checked
+        # against — this module's binding, read when the run is made.
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        result = self._infeasible(monkeypatch)
+        assert result.label_coverage is None      # the short-circuit path
+        assert result.entry_checkpoint == run.label()
+
+    def test_the_sweep_records_the_schedule_it_entered_at(self, monkeypatch):
+        # The feasible construction (_sweep_from_candidates) records the
+        # schedule its entry passes scanned at: a patched binding, not config's.
+        run = ScheduledRun(3, 9, 30, "Asia/Kolkata")
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None, same_event_ladders=None))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert sweep.entry_checkpoint == "Thursday 09:30 Asia/Kolkata"
+
 
 class TestSimulationsAreLabelledWithTheirDiscount:
     """
@@ -10252,6 +10282,21 @@ class TestBandSweep:
         assert res.same_title_point.population == "same_title"
         assert [t.pair_type for t in res.same_title_point.trades] == ["same_title"]
 
+    def test_the_sweep_records_its_entry_checkpoint(self, golden_band_sweep):
+        # Both the band sweep and the single-band run carry the schedule their
+        # checkpoints came from, for the dashboard header
+        label = backtester.SCHEDULED_RUN.label()
+        assert label == "Monday 09:00 America/Los_Angeles"
+        assert golden_band_sweep.result.entry_checkpoint == label
+        assert golden_band_sweep.single.entry_checkpoint == label
+        # ... and the log names it once
+        lines = [m for m in golden_band_sweep.messages
+                 if m.startswith("Entry checkpoint (backtest): ")]
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            f"Entry checkpoint (backtest): {label} (config.SCHEDULED_RUN, the live "
+            "scheduler's run time): ")
+
     def test_scenarios_are_ordered_band_then_k_then_population(self, golden_band_sweep):
         order = {"all": 0, "time_series": 1, "ladder": 2, "cross": 3}
         keys = [(p.spread_band, p.k, order[p.population])
@@ -12868,6 +12913,147 @@ class TestLiveRuleLine:
             "live bot's")
         self._infeasible(monkeypatch, caplog, same_event_ladders=configured)
         assert self._line(caplog).endswith("applies it")
+
+
+class TestEntryCheckpointLogging:
+    """run_backtest_sweep names the entry checkpoint — this module's
+    SCHEDULED_RUN, the live scheduler's run time — right after the size-cap
+    line, with the UTC times its checkpoints fall at over [start_date, today]
+    (two when the window spans a clock change). The line never raises: an
+    unresolvable zone still reaches _prepare_candidates' refusal, and a start
+    date at the end of date's range its OverflowError."""
+
+    _PREFIX = "Entry checkpoint (backtest): "
+    _SOURCE = " (config.SCHEDULED_RUN, the live scheduler's run time): "
+
+    @staticmethod
+    def _freeze(monkeypatch, today: date) -> None:
+        fixed = datetime(today.year, today.month, today.day, 12, tzinfo=UTC)
+        frozen = type("FrozenDateTime",
+                      (TestRunBacktestFeasibilityPreCheck._FrozenDateTime,),
+                      {"_fixed": fixed})
+        monkeypatch.setattr(backtester, "datetime", frozen)
+
+    def _line(self, monkeypatch, caplog, start: date, today: date) -> tuple[list[str], str]:
+        self._freeze(monkeypatch, today)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), start, 1000.0, sweep=False)
+        messages = [r.getMessage() for r in caplog.records]
+        lines = [m for m in messages if m.startswith(self._PREFIX)]
+        assert len(lines) == 1
+        return messages, lines[0]
+
+    def test_the_line_follows_the_cap_line(self, monkeypatch, caplog):
+        messages, line = self._line(monkeypatch, caplog, date(2026, 1, 1), date(2026, 9, 27))
+        cap = next(i for i, m in enumerate(messages)
+                   if m.startswith("Per-trade size cap (backtest):"))
+        assert messages.index(line) == cap + 1
+
+    @pytest.mark.parametrize("start, today, times", [
+        # Standard time (17:00 UTC) until the March change, daylight after
+        (date(2026, 1, 1), date(2026, 9, 27), "16:00/17:00"),
+        (date(2026, 6, 1), date(2026, 8, 28), "16:00"),
+        (date(2025, 12, 1), date(2026, 2, 27), "17:00"),
+        # The window's only checkpoint is on its first date, then on its last
+        # (today): both ends are inclusive
+        (date(2026, 11, 2), date(2026, 11, 6), "17:00"),
+        (date(2026, 10, 27), date(2026, 11, 2), "17:00"),
+    ])
+    def test_the_line_names_the_utc_times_in_the_window(
+        self, monkeypatch, caplog, start, today, times,
+    ):
+        _, line = self._line(monkeypatch, caplog, start, today)
+        assert line == (f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                        f"{times} UTC in this window")
+
+    def test_a_window_without_a_checkpoint_says_so(self, monkeypatch, caplog):
+        # Tuesday to Friday: no Monday. The real _prepare_candidates then
+        # short-circuits without a fetch.
+        self._freeze(monkeypatch, date(2026, 8, 28))
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must be skipped"))
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 8, 25), 1000.0,
+                                     sweep=False)
+        assert res.label_coverage is None
+        assert (f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                "no checkpoint in this window") in caplog.messages
+
+    def test_the_line_reads_this_module_s_schedule(self, monkeypatch, caplog):
+        # 09:00 in Kolkata (UTC+05:30) is 03:30 UTC: the minutes are printed
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(3, 9, 0, "Asia/Kolkata"))
+        _, line = self._line(monkeypatch, caplog, date(2026, 1, 1), date(2026, 9, 27))
+        assert line == (f"{self._PREFIX}Thursday 09:00 Asia/Kolkata{self._SOURCE}"
+                        "03:30 UTC in this window")
+
+    @pytest.mark.parametrize("zone", ["No/Such_Zone", "America", "/UTC", "../x"])
+    def test_an_unresolvable_zone_still_reaches_the_refusal(self, monkeypatch, caplog, zone):
+        run = ScheduledRun(0, 9, 0, zone)
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("the fetch must not be reached"))
+        with caplog.at_level(logging.INFO), \
+                pytest.raises(ValueError, match="cannot be resolved"):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               sweep=False)
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert len(lines) == 1
+        assert lines[0].startswith(f"{self._PREFIX}{run.label()}{self._SOURCE}"
+                                   "UTC times not computable (")
+
+    @pytest.mark.parametrize("error", [
+        ZoneInfoNotFoundError, ValueError, OSError, OverflowError,
+    ])
+    def test_every_error_the_times_can_raise_is_named(self, monkeypatch, caplog, error):
+        # Each exception _monday_timestamps documents is caught and named by
+        # its class; the run goes on to _prepare_candidates
+        def raise_error(*_a, **_k):
+            raise error("stand-in")
+
+        monkeypatch.setattr(backtester, "_checkpoint_utc_times", raise_error)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     sweep=False)
+        assert res.entry_checkpoint == SCHEDULED_RUN.label()
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert lines == [f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                         f"UTC times not computable ({error.__name__})"]
+
+    def test_a_start_date_at_the_end_of_date_s_range(self, monkeypatch, caplog):
+        # 9999-12-28 is a Tuesday: its next Monday lies past date.max. The
+        # line still logs; _prepare_candidates' own scan then overflows.
+        self._freeze(monkeypatch, date(2026, 9, 27))
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("the fetch must not be reached"))
+        with caplog.at_level(logging.INFO), pytest.raises(OverflowError):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(9999, 12, 28), 1000.0,
+                               sweep=False)
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert lines == [f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                         "UTC times not computable (OverflowError)"]
+
+    def test_the_utc_times_helper(self, monkeypatch):
+        # The week of the November change: 16:00 on 2026-10-26, 17:00 on 11-02
+        assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+            "16:00", "17:00"]
+        assert backtester._checkpoint_utc_times(date(2026, 11, 2), date(2026, 11, 2)) == [
+            "17:00"]
+        # Tuesday to Sunday: no Monday, no checkpoint
+        assert backtester._checkpoint_utc_times(date(2026, 10, 27), date(2026, 11, 1)) == []
+        # A run off the hour keeps its minutes
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(0, 9, 30, "America/Los_Angeles"))
+        assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+            "16:30", "17:30"]
+
+    def test_the_utc_times_ignore_the_host_clock(self):
+        # UTC whatever the process's local zone: in Kolkata (UTC+05:30) the
+        # same two checkpoints read 21:30 and 22:30 local
+        with _host_zone("Asia/Kolkata"):
+            assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+                "16:00", "17:00"]
 
 
 class TestCapSweepNeverSeedsTierOff:

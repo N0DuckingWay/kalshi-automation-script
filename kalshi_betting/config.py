@@ -877,7 +877,10 @@ class ScheduledRun:
 
     def label(self) -> str:
         """
-        Describe the schedule for log lines.
+        Describe the schedule for log lines and the backtest's recorded entry checkpoint.
+
+        The backtest stores it as BacktestSweep.entry_checkpoint, which the
+        dashboard header prints.
 
         Returns:
             str: e.g. "Monday 09:00 America/Los_Angeles".

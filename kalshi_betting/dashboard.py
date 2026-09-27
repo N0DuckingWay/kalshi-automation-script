@@ -314,7 +314,10 @@ Notes:
     than only the explorer. The ladder reading is itself read against the
     configured switch the run recorded
     (BacktestSweep.config_same_event_ladders), naming a departure from this
-    checkout's config rather than rendering a bare on/off.
+    checkout's config rather than rendering a bare on/off. The line under it
+    names the entry checkpoint every trade was entered at — the live
+    scheduler's weekly run time (BacktestSweep.entry_checkpoint), or "not
+    recorded".
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -4120,6 +4123,31 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
     return (f'<p style="{grey}">' + html.escape(
         text + f" Latest auction {last_day}: {last_rate:.3%} (downloaded {stamp}).",
         quote=False) + "</p>")
+
+
+def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
+    """
+    Render the page-header line naming the weekly instant the run entered its trades at.
+
+    Every entry is priced at the entry checkpoint, the live scheduler's
+    weekly run time (config.SCHEDULED_RUN), which the run records as
+    BacktestSweep.entry_checkpoint. Read by type: anything but a non-empty
+    str (no sweep, a hand-built sweep, a stand-in object) reads "not
+    recorded".
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+
+    Returns:
+        str: One grey <p> line: "Entry checkpoint: <label> — the live
+            scheduler's run time", or "Entry checkpoint: not recorded".
+    """
+    label = None if sweep is None else getattr(sweep, "entry_checkpoint", None)
+    if isinstance(label, str) and label:
+        text = f"{html.escape(label)} — the live scheduler's run time"
+    else:
+        text = "not recorded"
+    return f'<p style="color:#616161; font-size:14px;">Entry checkpoint: {text}</p>'
 
 
 def _corpus_provenance_html(sweep: BacktestSweep | None, *,
@@ -9425,8 +9453,9 @@ def generate_dashboard(
     the interval-discount and scenario-explorer sections each show the same
     kind of short placeholder every other builder emits for empty input, and
     the header's run-settings line reads "not recorded" for the spread band,
-    the ladder setting and the size cap — with no coverage line and no
-    strike-blind notice, since that path has no census to report.
+    the ladder setting and the size cap, as its entry-checkpoint line does
+    for the checkpoint — with no coverage line and no strike-blind notice,
+    since that path has no census to report.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
@@ -9455,8 +9484,9 @@ def generate_dashboard(
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
             splitting it would create copies that could disagree. It also
-            feeds the header's run-settings line (_run_settings_html) and
-            the live-rule line under it (_live_rule_html). None
+            feeds the header's run-settings line (_run_settings_html), the
+            live-rule line under it (_live_rule_html) and the entry-checkpoint
+            line (_entry_checkpoint_html). None
             (default) renders both sections' placeholders and the k-hat
             breakdown's "not recorded" notice — and therefore no coverage line
             either, which is honest: that path shows no k̂ card
@@ -9696,6 +9726,10 @@ def generate_dashboard(
     # The rate every ratio below subtracts, or its absence (DR-66)
     rf_note = _risk_free_html(risk_free, equity_df)
 
+    # The weekly instant every entry was priced at (the live scheduler's run
+    # time, BacktestSweep.entry_checkpoint), under the run-settings line
+    entry_checkpoint = _entry_checkpoint_html(sweep)
+
     # Each section is built as it is written, so only one is alive at a time
     sections = (
         # The two k-hat cards ride along (None without a sweep: no cards)
@@ -9755,6 +9789,7 @@ def generate_dashboard(
 {corpus_note}
 {run_settings}
 {live_rule}
+{entry_checkpoint}
 {rf_note}
 {header_note}
 {filter_bar}

@@ -1766,6 +1766,13 @@ class BacktestSweep:
         live_categories (tuple[str, ...] | None): config.py's TRADE_CATEGORIES;
             None means any category when live_tier_floors is recorded.
         live_tags (tuple[str, ...] | None): config.py's TRADE_TAGS, likewise.
+        entry_checkpoint (str | None): The weekly instant the run's entry
+            checkpoints fall at, as this module's SCHEDULED_RUN names it
+            (ScheduledRun.label(), e.g. "Monday 09:00 America/Los_Angeles")
+            — the live scheduler's run time. The dashboard header prints
+            it. None = not recorded (a hand-built sweep); both production
+            constructions pass it, the infeasible window included. Defaulted,
+            so a construction that omits it still builds.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -1789,6 +1796,7 @@ class BacktestSweep:
     live_spread_band: tuple[float, float] | None = None
     live_categories: tuple[str, ...] | None = None
     live_tags: tuple[str, ...] | None = None
+    entry_checkpoint: str | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -3420,6 +3428,30 @@ def _monday_timestamps(start_date: date, end_date: date) -> list[int]:
         ts_list.append(int(_checkpoint_datetime(d).timestamp()))
         d += timedelta(weeks=1)
     return ts_list
+
+
+def _checkpoint_utc_times(start_date: date, end_date: date) -> list[str]:
+    """
+    List the distinct UTC times of day the entry checkpoints in a date range fall at.
+
+    Reads the checkpoints _find_entry scans (_monday_timestamps), so a range
+    spanning a clock change lists both of the run's UTC times.
+
+    Args:
+        start_date (date): First date of the range (inclusive).
+        end_date (date): Last date of the range (inclusive).
+
+    Returns:
+        list[str]: Ascending "HH:MM" UTC times, e.g. ["16:00", "17:00"] for
+            Monday 09:00 America/Los_Angeles over a range spanning a clock
+            change; [] when the range holds no checkpoint.
+
+    Raises:
+        zoneinfo.ZoneInfoNotFoundError, ValueError, OSError, OverflowError:
+            As _monday_timestamps.
+    """
+    return sorted({datetime.fromtimestamp(ts, UTC).strftime("%H:%M")
+                   for ts in _monday_timestamps(start_date, end_date)})
 
 
 def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
@@ -7513,8 +7545,9 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap and the four
-            live_* fields — see BacktestSweep.
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the four
+            live_* fields and entry_checkpoint (this module's
+            SCHEDULED_RUN.label()) — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -7929,6 +7962,9 @@ def _sweep_from_candidates(
         same_title_size_cap=_resolve_same_title_size_cap(),
         # config.py's live rule and filter, from the one read above
         **_live_rule_fields(live),
+        # The schedule every entry pass above scanned at
+        # (config.ScheduledRun.label), for the dashboard header
+        entry_checkpoint=SCHEDULED_RUN.label(),
     )
 
 
@@ -8085,7 +8121,9 @@ def run_backtest_sweep(
             against (config_same_event_ladders), the corpus's provenance,
             None when not recorded, the tier-off family, empty unless
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep,
-            same_title_size_cap and the live_* fields — see BacktestSweep.
+            same_title_size_cap, the live_* fields and entry_checkpoint, the
+            label of the SCHEDULED_RUN its checkpoints were placed by — see
+            BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -8111,9 +8149,17 @@ def run_backtest_sweep(
         one), calibration=None, label_coverage=None, scenarios=[],
         calibrations_by_band={}, an empty tier-off family and the resolved
         same_event_ladders, with the configured switch
-        (config_same_event_ladders), same_title_size_cap and, when config.py's
-        toggles validate, the live_* fields recorded and the live-rule line
-        logged, so callers need no special case.
+        (config_same_event_ladders), same_title_size_cap, the entry checkpoint
+        and, when config.py's toggles validate, the live_* fields recorded and
+        the live-rule line logged, so callers need no special case.
+
+        Before the fetch, after the size-cap line, one INFO line names the
+        entry checkpoint (SCHEDULED_RUN's label) and the UTC times its
+        checkpoints fall at over [start_date, today], or that the window
+        holds none, or that they cannot be computed. The line never raises:
+        _prepare_candidates then refuses an unresolvable zone or an unsound
+        schedule with its ValueError, and raises OverflowError for a
+        start_date whose next run weekday lies past date.max.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -8177,6 +8223,25 @@ def run_backtest_sweep(
         same_title_clause,
         "on" if cap_sweep else "off",
     )
+    # And the entry checkpoint: the schedule every entry pass scans at (this
+    # module's SCHEDULED_RUN) and the UTC times its checkpoints fall at over
+    # [start_date, today], the feasibility window. Never raises: it catches
+    # everything _monday_timestamps can raise, and _prepare_candidates just
+    # below refuses an unresolvable zone or an unsound schedule with its
+    # ValueError (a start_date whose next run weekday lies past date.max
+    # raises OverflowError there).
+    try:
+        times = _checkpoint_utc_times(start_date, datetime.now(UTC).date())
+    except (ZoneInfoNotFoundError, ValueError, OSError, OverflowError) as exc:
+        where = f"UTC times not computable ({type(exc).__name__})"
+    else:
+        where = (f"{'/'.join(times)} UTC in this window" if times
+                 else "no checkpoint in this window")
+    logging.info(
+        "Entry checkpoint (backtest): %s (config.SCHEDULED_RUN, the live scheduler's "
+        "run time): %s",
+        SCHEDULED_RUN.label(), where,
+    )
     # config.py's own live toggles (never main.py's per-run overrides), read
     # ONCE before the fetch so an invalid config.py warns at the top of the run
     live = _live_settings_for_report()
@@ -8211,6 +8276,9 @@ def run_backtest_sweep(
                                corpus_provenance=None,
                                config_same_event_ladders=config_ladders,
                                same_title_size_cap=same_title_cap,
+                               # The schedule the window was checked against
+                               # (config.ScheduledRun.label), for the header
+                               entry_checkpoint=SCHEDULED_RUN.label(),
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list
