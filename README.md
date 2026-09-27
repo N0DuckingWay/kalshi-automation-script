@@ -167,8 +167,8 @@ backtest.py (CLI)
   │    │                                               each from the later of --start-date and the market's own
   │    │                                               open; a window over the 5,000-candle cap is paged)
   │    └─ _sweep_from_candidates()
-  │         ├─ _entries_for_band()            — k-independent; one time-series _find_entry() pass per band,
-  │         │                                    recording every qualifying Monday per pair:
+  │         ├─ _entries_for_band()            — k-independent; records every qualifying Monday of each
+  │         │                                    pair; one time-series _find_entry() pass per band:
   │         │                                    every band of SPREAD_BAND_SWEEP_FLOORS x CEILINGS (plus the
   │         │                                    primary if it is off-grid) by default — only the no-band pass
   │         │                                    scans every pair, the rest rescan the pairs that entered
@@ -577,7 +577,7 @@ population, when all of that cell's own entries fall on one side of it. A
 pair stays in the half its first qualifying Monday falls in, and a
 first-half pair is simulated on its Mondays before the split only, so no
 first-half trade is dated in the second period; a first-half pair whose
-only Kelly-passing Mondays come after the split trades in neither half.
+only Kelly-passing Mondays fall on or after the split trades in neither half.
 
 **Tier floors off (backtest only).** With the band sweep on, every band
 where a deadline-gap tier floor binds — a floor below a tier, which on the

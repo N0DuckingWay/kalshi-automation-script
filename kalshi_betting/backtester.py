@@ -91,29 +91,30 @@ Dependencies:
     plus run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
-    The backtester uses a two-pass approach: Pass 1 collects all potential entries
-    (prices, dates, Kelly fraction — no sizing; the Kelly gate picks each
-    pair's earliest qualifying Monday that passes at the simulated k, DR-75,
-    so a pair whose first qualifying Monday fails it can still enter later,
-    as the weekly live run would), keeps only the best entry per
-    title group (mirroring the live scanners' one-pair-per-group rule), and then
+    The backtester uses a two-pass approach: Pass 1 collects all potential
+    entries (prices, dates, Kelly fraction — no sizing; the Kelly gate picks
+    each pair's earliest qualifying Monday that passes at the simulated k,
+    DR-75, so a pair whose first qualifying Monday fails it can still enter
+    later, as the weekly live run would), keeps only the best entry per title
+    group (mirroring the live scanners' one-pair-per-group rule), and then
     drops any time-series candidate whose ticker pair was also found as a
     same-title candidate — the same preference main._dedup_pairs applies live,
     since the same-title co-resolution model (identical questions must
     co-resolve) is simpler than the directional time-series bet, whose edge
     rests on the operator-tuned interval discount behind
-    config.time_series_profit_prob. Pass 2 walks
-    entries in chronological order (priority-ordered within a date using the
-    ENTRY-TIME expected return, never realized results), maintains a running cash
-    balance — sizing every candidate of an entry date against that checkpoint's
-    opening balance, admitting them greedily against the running cash (mirroring
-    main._run_prod + strategy.select_portfolio) and releasing settlement receipts
-    on exit dates — and applies a greedy ticker-conflict filter
-    so each market ticker appears in at most one OPEN trade at a time (the ticker
-    is released on its trade's exit date, alongside the cash). This mirrors the
-    live bot's Kelly sizing against one per-run balance snapshot and its
-    one-active-position-per-ticker rule: get_held_tickers() reads positions with
-    count_filter="position", so a settled ticker leaves the blocked set live too.
+    config.time_series_profit_prob. Pass 2 walks entries in chronological order
+    (priority-ordered within a date using the ENTRY-TIME expected return, never
+    realized results), maintains a running cash balance — sizing every
+    candidate of an entry date against that checkpoint's opening balance,
+    admitting them greedily against the running cash (mirroring main._run_prod
+    + strategy.select_portfolio) and releasing settlement receipts on exit
+    dates — and applies a greedy ticker-conflict filter so each market ticker
+    appears in at most one OPEN trade at a time (the ticker is released on its
+    trade's exit date, alongside the cash). This mirrors the live bot's Kelly
+    sizing against one per-run balance snapshot and its
+    one-active-position-per-ticker rule: get_held_tickers() reads positions
+    with count_filter="position", so a settled ticker leaves the blocked set
+    live too.
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -823,7 +824,8 @@ class SweepPoint:
             largest summed profit on this point (by BacktestTrade.event_ticker,
             ignoring trades with no event ticker, ties to the alphabetically
             first) and the return of ONE re-simulation of this point's entries
-            without those whose market-A event ticker is that event. A
+            without those whose market-A event ticker is that event on any of
+            their qualifying Mondays (DR-75; see _ex_top_event). A
             re-simulation, never a subtraction of that event's P&L from this
             point's return: the survivors are re-sized against the cash the
             removed trades no longer consume, and a subtraction is not bounded
@@ -844,8 +846,8 @@ class SweepPoint:
             existing construction moves.
         peak_kelly_fraction (float | None): The largest UNCAPPED Kelly
             fraction f* any candidate reached after the Kelly gate, each at
-            the Monday it entered on (its earliest passing one — DR-75 —
-            never the largest over its Mondays) — counted before the
+            the Monday the Kelly gate chose for it (its earliest passing one —
+            DR-75 — never the largest over its Mondays) — counted before the
             settlement-outcome and premise checks, so a candidate those later
             drop still counts — and 0.0 when none passed. It does not depend
             on the cap (Pass 1b scores every entry, and picks its Monday,
@@ -1251,25 +1253,23 @@ class CapSweep:
     Sharing is exact, not approximate: the halves and the excluding-top-event
     re-simulation run over subsets of the point's entries, whose own peaks are
     no higher, so they too size identically at every cap at or above the
-    point's peak. That holds under DR-75's later Mondays too: the Monday a
-    pair enters on depends on k, never on the cap, and an H1 half keeps
-    only its pairs' Mondays before the split (_split_halves), so each of its
-    candidates is on the Monday the full run chose, or absent. A simulated
-    cap runs quiet — its completion line and its premise-violation WARNING
-    go to DEBUG, since the primary-cap run already reported the same count
-    and ~10 repeats per cell would flood the log (TS-02) — and it is pinned
-    to the eager point's end date
-    (_curve_end_date): _build_equity_curve otherwise runs every curve to
-    today (UTC) as read at simulation time, so a cell read after UTC
-    midnight (a dashboard walks every cell long after the run) would give
-    its simulated caps one more row than the eager point and the copies
-    sharing its curve, and neighbouring caps' Sharpe/Sortino would cover
-    different spans. The eager points themselves still read the clock as
-    they are simulated, exactly as before the cap sweep, so an eager phase
-    that straddles UTC midnight can end two cells' (or two populations')
-    curves on different days; every cap of ONE population ends on the same
-    day. A population with no eager point (a hand-built CapSweep) reads the
-    clock at simulation time.
+    point's peak. That holds under DR-75's later Mondays too: the Monday a pair
+    enters on depends on k, never on the cap, and an H1 half keeps only its
+    pairs' Mondays before the split (_split_halves), so each of its candidates
+    is on the Monday the full run chose, or absent. A simulated cap runs quiet
+    — its completion line and its premise-violation WARNING go to DEBUG, since
+    the primary-cap run already reported the same count and ~10 repeats per
+    cell would flood the log (TS-02) — and it is pinned to the eager point's
+    end date (_curve_end_date): _build_equity_curve otherwise runs every curve
+    to today (UTC) as read at simulation time, so a cell read after UTC
+    midnight (a dashboard walks every cell long after the run) would give its
+    simulated caps one more row than the eager point and the copies sharing its
+    curve, and neighbouring caps' Sharpe/Sortino would cover different spans.
+    The eager points themselves still read the clock as they are simulated,
+    exactly as before the cap sweep, so an eager phase that straddles UTC
+    midnight can end two cells' (or two populations') curves on different days;
+    every cap of ONE population ends on the same day. A population with no
+    eager point (a hand-built CapSweep) reads the clock at simulation time.
 
     Retention (TS-07's residency rule, declared): the sweep keeps
     entries_by_band alive for the reader: one small entry dict per band per
@@ -1310,34 +1310,33 @@ class CapSweep:
     tier-on sweep's same_title() serves both) and runs the band sweep's
     checks (its family exists only on a band sweep).
 
-    Retention of the tier-off one, declared the same way: it keeps the
-    family's entries_by_band — one entry dict per binding band per tier-off
-    entry, each band's tier-off time-series entries followed by the shared
-    same-title ones (the SAME dict objects the tier-on sweep holds), plus
-    each entry's later-Monday dicts, which add no market dict either: on the
-    365-day window from 2025-09-24 (measured 2026-09-27), 812 at the
-    tier-off no-band band (1,523 qualifying Mondays over its 711 entries),
-    at most as many at any other single binding band, and 6,778 across all
-    18. Its
-    market dicts are the corpus records the entries point at, shared with
-    the tier-on entries of any pair that also enters with the tiers on; with
-    the tiers off a binding band's floor alone gates the spread, so its
-    entered pairs are a superset of the same band's tier-on ones, all bounded
-    by the tier-off no-band band's. Measured 2026-09-26 on the golden fixture
-    (tests/test_backtester.py's TestPrepareEntriesGolden, 36 bands, 18
-    binding, ladders on): the tier-on sweep holds 108 entries over its 36
-    bands (73 distinct entry dicts, 10 distinct market dicts); the tier-off
-    one holds 63 over its 18 (46 distinct entry dicts, 45 of them new — the
-    one same-title entry is shared) and ZERO new market dicts, since every
-    pair the family enters also enters at some tier-on band there. On any
-    corpus the new market dicts are only those of pairs that enter with the
-    tiers off and at no tier-on band, so they are bounded by that corpus's
-    own tier-off-only pairs at the no-band band — a bound to re-measure per
-    corpus. On the DR-73 calibration corpus (start 2020-01-01, ladders on;
-    see CLAUDE.md's tier-off paragraph) that is 278 pairs, i.e. at most 556
-    new dicts (derived, not measured) beside at most 660 for its 330 tier-on
-    no-band entries, a few MB. The ~810 tier-on figure above is a different
-    corpus's (the 365-day run's), whose tier-off-only count was not measured.
+    Retention of the tier-off one, declared the same way: it keeps the family's
+    entries_by_band — one entry dict per binding band per tier-off entry, each
+    band's tier-off time-series entries followed by the shared same-title ones
+    (the SAME dict objects the tier-on sweep holds), plus each entry's
+    later-Monday dicts, which add no market dict either: on the 365-day window
+    from 2025-09-24 (measured 2026-09-27), 812 at the tier-off no-band band
+    (1,523 qualifying Mondays over its 711 entries), at most as many at any
+    other single binding band, and 6,778 across all 18. Its market dicts are
+    the corpus records the entries point at, shared with the tier-on entries of
+    any pair that also enters with the tiers on; with the tiers off a binding
+    band's floor alone gates the spread, so its entered pairs are a superset of
+    the same band's tier-on ones, all bounded by the tier-off no-band band's.
+    Measured 2026-09-26 on the golden fixture (tests/test_backtester.py's
+    TestPrepareEntriesGolden, 36 bands, 18 binding, ladders on): the tier-on
+    sweep holds 108 entries over its 36 bands (73 distinct entry dicts, 10
+    distinct market dicts); the tier-off one holds 63 over its 18 (46 distinct
+    entry dicts, 45 of them new — the one same-title entry is shared) and ZERO
+    new market dicts, since every pair the family enters also enters at some
+    tier-on band there. On any corpus the new market dicts are only those of
+    pairs that enter with the tiers off and at no tier-on band, so they are
+    bounded by that corpus's own tier-off-only pairs at the no-band band — a
+    bound to re-measure per corpus. On the DR-73 calibration corpus (start
+    2020-01-01, ladders on; see CLAUDE.md's tier-off paragraph) that is 278
+    pairs, i.e. at most 556 new dicts (derived, not measured) beside at most
+    660 for its 330 tier-on no-band entries, a few MB. The ~810 tier-on figure
+    above is a different corpus's (the 365-day run's), whose tier-off-only
+    count was not measured.
 
     BACKTEST-ONLY, like the band and k sweeps: live sizing reads
     config.BUDGET_FRACTION and never this module.
@@ -1640,13 +1639,13 @@ class BacktestSweep:
             halves) splits entries at — the median_low of the primary band's
             TIME-SERIES entries' dates, i.e. each pair's FIRST qualifying
             Monday, which is independent of k (the Monday a pair is traded on
-            depends on k through the Kelly gate — DR-75 — so a date read
-            there would differ from cell to cell); same-title entries are
-            left out, so they cannot move the split the time-series checks
-            are read at; the window's midpoint when that band has none. One
-            date for every scenario and both checked populations, so every
-            cell's halves cover the same two stretches of history. None when
-            the band sweep is off or the window was infeasible.
+            depends on k through the Kelly gate — DR-75 — so a date read there
+            would differ from cell to cell); same-title entries are left out,
+            so they cannot move the split the time-series checks are read at —
+            or the window's midpoint when that band has none. One date for
+            every scenario and both checked populations, so every cell's halves
+            cover the same two stretches of history. None when the band sweep
+            is off or the window was infeasible.
         corpus_provenance (CorpusProvenance | None): What this run's
             settled-market corpus covers (DR-13, M2/M3 of the 2026-09-24
             review): when it was assembled — it holds nothing settled after
@@ -3414,22 +3413,21 @@ def _find_entry(
     Why every qualifying Monday, not just the first: this function holds no
     probability model, which is what lets one entry pass per band serve every
     interval discount k and every size cap. The Kelly gate runs later, per k,
-    in _simulate_at_discount, and a first qualifying Monday can fail it at a
-    k where a later one passes (early: a thin spread on a wide book; later:
-    a wide spread). The later Mondays are recorded so the simulator can enter
-    the pair on the EARLIEST that passes at its own k, as the weekly live run
+    in _simulate_at_discount, and a first qualifying Monday can fail it at a k
+    where a later one passes (early: a thin spread on a wide book; later: a
+    wide spread). The later Mondays are recorded so the simulator can enter the
+    pair on the EARLIEST that passes at its own k, as the weekly live run
     would, without making this pass depend on k (DR-75). So the scan runs to
-    scan_end; a pair that never qualifies costs exactly what it did. Each
-    leg's candle at every Monday is looked up in one forward pass over the
-    window's Mondays, those max_horizon_days then skips included
-    (_candles_at_or_before, which returns _candle_at_or_before's answer at
-    each without that function's rescan from the first candle). Reading on
-    past the first qualifying Monday means a malformed candle there — a
-    missing price key (KeyError), or a "ts" that is missing or not comparable
-    with an int (KeyError, TypeError) — now raises where the first-hit scan
-    left it unread, the failure a pair that never qualified always had; the
-    candle cache holds none (0 malformed of 4,629,341 candles in 99,001
-    cached files, scanned 2026-09-27).
+    scan_end, the window a pair that never qualifies always scanned. Each leg's
+    candle at every Monday is looked up in one forward pass over the window's
+    Mondays, those max_horizon_days then skips included (_candles_at_or_before,
+    which returns _candle_at_or_before's answer at each without that function's
+    rescan from the first candle). Reading on past the first qualifying Monday
+    means a malformed candle there — a missing price key (KeyError), or a "ts"
+    that is missing or not comparable with an int (KeyError, TypeError) — now
+    raises where the first-hit scan left it unread, the failure a pair that
+    never qualified always had; the candle cache holds none (0 malformed of
+    4,629,341 candles in 99,001 cached files, scanned 2026-09-27).
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract —
@@ -3872,9 +3870,10 @@ def _find_entry(
         return None
     # The first qualifying Monday keeps the shape every k-independent reader
     # has always read (the calibration, the split date, the populations); the
-    # rest ride under "later", read only through _entry_mondays, for the
-    # Kelly gate (and cut to the Mondays before the split by _split_halves,
-    # the one other writer).
+    # rest ride under "later" — read through _entry_mondays by the Kelly gate,
+    # the excluding-top-event check, CapSweep.entry_events and the count line,
+    # and cut to the Mondays before the split by _split_halves, which writes
+    # the cut into a new entry dict and never edits this one.
     entry = mondays[0]
     entry["later"] = tuple(mondays[1:])
     return entry
@@ -3888,11 +3887,14 @@ def _entry_mondays(entry: dict) -> tuple[dict, ...]:
     prices and places the pair at (the calibration, the split date) — and
     "later" holds the rest (DR-75). An entry without "later" (hand-built, as
     several tests build them) reads as a pair that qualified on one Monday
-    only, which is how it was simulated before the key existed. The Kelly
-    gate (_simulate_at_discount), the excluding-top-event check
-    (_ex_top_event) and CapSweep.entry_events read the Mondays through here;
-    _split_halves, which cuts an H1 pair's later Mondays at the split, is the
-    one other function that spells the key.
+    only, which is how it was simulated before the key existed. The Kelly gate
+    (_simulate_at_discount), the excluding-top-event check (_ex_top_event),
+    CapSweep.entry_events and the count line (_log_qualifying_mondays) read the
+    Mondays through here; two other functions spell the key — _find_entry,
+    which writes it, and _split_halves, which reads it to cut an H1 pair's
+    later Mondays at the split and writes the cut into a NEW entry dict
+    (tests/test_strategy.py::TestTimeSeriesKellyParity::test_ast_later_mondays_have_one_reader
+    holds the package to these three).
 
     Args:
         entry (dict): A _find_entry() result — a record's "entry".
@@ -3925,6 +3927,9 @@ def _log_qualifying_mondays(entries: list[dict], band: tuple[float, float] | Non
             names the default band.
         tier_floors (bool): Keyword-only; False appends " with the tier
             floors off" after the band, as the completion lines do.
+
+    Returns:
+        None
     """
     counts = [len(_entry_mondays(rec["entry"])) for rec in entries]
     logging.info("Qualifying Mondays at band %s%s: %d over %d entries (%d qualify on more "
@@ -5675,8 +5680,8 @@ def _simulate_at_discount(
             RESOLVED k — never None — the resolved spread_band (None when None
             was passed), the population, tier_floors (False only when False
             was passed), the resolved size_cap and the peak_kelly_fraction
-            (the largest fraction at the Monday each candidate entered on;
-            0.0 when no candidate passed the Kelly gate).
+            (the largest fraction at the Monday the Kelly gate chose for
+            each candidate; 0.0 when no candidate passed the Kelly gate).
 
     Raises:
         ValueError: If population is not one of the labels above (a typo would
@@ -6861,7 +6866,7 @@ def _ex_top_event(
     by −100%. Measured 2026-09-23 on the DR-73 calibration corpus's same-event
     ladders alone (no band, k = 0.65, $10,000 from 2020-01-01, 71 trades,
     +157.3%): without its top event the subtraction reads +2.5% and the
-    re-simulation +14.3%.
+    re-simulation +14.3% (under the first-Monday rule, before DR-75).
 
     The any-Monday rule is deliberately WIDER than the trades it guards: it
     also drops a flipping same-title entry whose CHOSEN Monday at point.k
@@ -7116,24 +7121,22 @@ def _sweep_from_candidates(
 
     Phase 2 — simulations. The primary band's calibration is measured and
     logged exactly as a single-band run always logged it, and the primary
-    (band, k) point is simulated first, so its resolved k can be read back
-    off the point and unioned into the k grid (one resolution — the grid can
-    never disagree with the point it contains). Every band then gets its own
-    calibration (labelled with its own floor) and one "all" simulation per k
-    on the SAME k grid, so a band x k table is rectangular. On a band sweep
-    each (band, k) also gets a standalone "time_series" (ladders and
-    cross-event together, same-title excluded), "ladder" and "cross"
-    simulation for each of those populations that is non-empty at that band
-    (standalone, never sliced out of the "all" run, so return, drawdown and
-    Sharpe are defined for each), and both the "all" and the "time_series"
-    point get the split-half check (SweepPoint.halves, split at ONE date,
-    the median_low of the primary band's time-series entries' first
-    qualifying Mondays, which no k moves — a WARNING names it when it leaves
-    a half of those entries empty, since the check is then not measurable;
-    H1 keeps its pairs' Mondays before that date only, see _split_halves)
-    and the excluding-top-event check
-    (SweepPoint.ex_top_event). The same-title entries are then simulated
-    alone once (same_title_point).
+    (band, k) point is simulated first, so its resolved k can be read back off
+    the point and unioned into the k grid (one resolution — the grid can never
+    disagree with the point it contains). Every band then gets its own
+    calibration (labelled with its own floor) and one "all" simulation per k on
+    the SAME k grid, so a band x k table is rectangular. On a band sweep each
+    (band, k) also gets a standalone "time_series" (ladders and cross-event
+    together, same-title excluded), "ladder" and "cross" simulation for each of
+    those populations that is non-empty at that band (standalone, never sliced
+    out of the "all" run, so return, drawdown and Sharpe are defined for each),
+    and both the "all" and the "time_series" point get the split-half check
+    (SweepPoint.halves, split at ONE date, the median_low of the primary band's
+    time-series entries' first qualifying Mondays, which no k moves — a WARNING
+    names it when it leaves a half of those entries empty, since the check is
+    then not measurable; H1 keeps its pairs' Mondays before that date only, see
+    _split_halves) and the excluding-top-event check (SweepPoint.ex_top_event).
+    The same-title entries are then simulated alone once (same_title_point).
 
     The primary point is reused, never re-simulated: it is the same object in
     points and scenarios. With band_sweep False this is exactly the pre-band

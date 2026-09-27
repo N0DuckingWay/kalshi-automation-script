@@ -874,23 +874,23 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_later_mondays_have_one_reader(self):
         # DR-75: backtester._find_entry records a pair's every qualifying
-        # Monday after the first under "later", and _entry_mondays —
-        # (entry, *entry.get("later", ())) — is the one reader. Its .get
-        # default is load-bearing (hand-built entries, several in these tests,
-        # carry no "later"), and the readers that must see only the FIRST
-        # Monday — the interval calibration and the split date, where a later
-        # Monday chosen per k would make k-hat depend on k — must never reach
-        # the rest. So the key may be SPELLED — as a string ({"later": ...},
-        # e["later"], e.get("later")) or as a keyword argument
-        # (dict(e, later=...), the shape a writer that rewrites the key would
-        # take) — only in the writer, the reader and the one TRUNCATING
-        # writer, _split_halves (which cuts an H1 pair's later Mondays at the
-        # split, building a new entry dict), anywhere in the package
-        # (deny-by-default, like the band walk below). The accepted cost of
-        # scanning the whole package: an unrelated "later" key or keyword in
-        # any module fails this pin too — if one is ever needed, widen the
-        # allowed homes deliberately, naming it. A spelling built at run time
-        # ("lat" + "er", an f-string) is out of this pin's scope.
+        # Monday after the first under "later", and _entry_mondays — (entry,
+        # *entry.get("later", ())) — is the one reader. Its .get default is
+        # load-bearing (hand-built entries, several in these tests, carry no
+        # "later"), and the readers that must see only the FIRST Monday — the
+        # interval calibration and the split date, where a later Monday chosen
+        # per k would make k-hat, or the split date, depend on k — must never
+        # reach the rest. So the key may be SPELLED — as a string ({"later":
+        # ...}, e["later"], e.get("later")) or as a keyword argument (dict(e,
+        # later=...), the shape a writer that rewrites the key would take) —
+        # only in the writer, the reader and the one TRUNCATING writer,
+        # _split_halves (which cuts an H1 pair's later Mondays at the split,
+        # building a new entry dict), anywhere in the package (deny-by-default,
+        # like the band walk below). The accepted cost of scanning the whole
+        # package: an unrelated "later" key or keyword in any module fails this
+        # pin too — if one is ever needed, widen the allowed homes
+        # deliberately, naming it. A spelling built at run time ("lat" + "er",
+        # an f-string) is out of this pin's scope.
         import importlib
         import pkgutil
 

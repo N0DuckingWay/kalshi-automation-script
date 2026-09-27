@@ -7079,26 +7079,24 @@ class TestPrepareEntriesGolden:
     tautological. Each row's last field, the later qualifying Mondays' dates
     (DR-75), is a literal from an equally independent oracle: the pre-DR-75
     scan restarted the day after each hit. The fixture is the
-    TestRunBacktestSweep EA/EB time-series
-    pair; a same-event ladder whose rungs close at one instant (so the stated
-    gap, not close_time, orders the legs and picks the 0.30 tier — Monday 1's
-    0.25 spread would clear the 0.15 tier a close gap of 0 picks, so the
-    ladder entering on Monday 2 is what proves the stated gap was used), with
-    the later rung listed first; a same-title pair whose B leg is the pricier
-    one (canonicalized by price); a cross-event time-series pair that never
-    qualifies (a pricier earlier contract on both Mondays); and two short-gap
-    cross-event pairs at the two extremes a band can act on — TA/TB at a
-    spread of exactly the 0.15 short tier and WA/WB at 0.98, the widest two
-    live [0.01, 0.99] YES asks can make. Those two are what let the capture
-    SEE a band: without them every grid band with floor <= 0.30 and ceiling
-    >= 0.40 reproduced the rows, so _prepare_entries could have silently
-    started banding with the golden still green. With them, any floor above
-    the short tier or ceiling below 0.98 moves the rows — i.e. every band
-    that could change an entry on any data (the band tests below pin both
-    directions). Both are voided (result ""), so they never trade. It is run
-    with ladders
-    on AND off. The fetch and candle seams are mocked exactly as
-    TestRunBacktestSweep mocks them.
+    TestRunBacktestSweep EA/EB time-series pair; a same-event ladder whose
+    rungs close at one instant (so the stated gap, not close_time, orders the
+    legs and picks the 0.30 tier — Monday 1's 0.25 spread would clear the 0.15
+    tier a close gap of 0 picks, so the ladder entering on Monday 2 is what
+    proves the stated gap was used), with the later rung listed first; a
+    same-title pair whose B leg is the pricier one (canonicalized by price); a
+    cross-event time-series pair that never qualifies (a pricier earlier
+    contract on both Mondays); and two short-gap cross-event pairs at the two
+    extremes a band can act on — TA/TB at a spread of exactly the 0.15 short
+    tier and WA/WB at 0.98, the widest two live [0.01, 0.99] YES asks can make.
+    Those two are what let the capture SEE a band: without them every grid band
+    with floor <= 0.30 and ceiling >= 0.40 reproduced the rows, so
+    _prepare_entries could have silently started banding with the golden still
+    green. With them, any floor above the short tier or ceiling below 0.98
+    moves the rows — i.e. every band that could change an entry on any data
+    (the band tests below pin both directions). Both are voided (result ""), so
+    they never trade. It is run with ladders on AND off. The fetch and candle
+    seams are mocked exactly as TestRunBacktestSweep mocks them.
     """
 
     _START = date(2026, 1, 1)
@@ -7150,7 +7148,7 @@ class TestPrepareEntriesGolden:
 
     # (pair_type, canon, group_key, entry_date, pA, pB, nA, nB, gap_days,
     #  ticker_a, ticker_b, later_dates) — every field but the last captured
-    #  on main @ fe0a758. later_dates (DR-75) is the dates of the later
+    #  on main @ fe0a758. later_dates (DR-75) holds the dates of the later
     #  qualifying Mondays, from restarting the pre-DR-75 scan after each hit,
     #  2026-09-27: each pair's candles hold still after its last candle, so a
     #  pair keeps qualifying every Monday up to the day before its earlier
@@ -7799,8 +7797,8 @@ class TestCandlesAtOrBefore:
         # leg's "ts" must be read O(candles + Mondays) times. Looking each
         # Monday up with _candle_at_or_before instead rescans from the first
         # candle every time: 680,108 reads per leg here, about 19x the bound
-        # below (the pre-fix scan, measured 2026-09-27; the one pass reads
-        # 17,414).
+        # below (a per-Monday lookup over the whole scan, measured
+        # 2026-09-27; the one pass reads 17,414).
         reads = {"A": 0, "B": 0}
 
         def counting(leg: str) -> type:
@@ -7830,7 +7828,7 @@ class TestCandlesAtOrBefore:
             assert reads[leg] <= 2 * len(candles) + 2 * mondays, (leg, reads[leg])
 
 
-# ─── DR-75 (part 2): the Kelly gate enters a pair on its earliest passing Monday ──
+# ─── DR-75: the Kelly gate enters a pair on its earliest passing Monday ──
 
 
 def _without_later(rec: dict) -> dict:
@@ -7926,7 +7924,12 @@ class TestKellyPicksTheEarliestPassingMonday:
                 "entry": entry}
 
     def _sim(self, records, **kw):
-        return backtester._simulate_at_discount(records, self._START, 10_000.0, **kw)
+        # Pinned past every fixture's settlement (2026-03-23 is the latest close
+        # used in this class) so two back-to-back simulations compare equity
+        # curves that both end on the same day, rather than each ending on
+        # "today" (UTC) as read at its own simulation time.
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
 
     @staticmethod
     def _kelly(rec, k):
@@ -8183,7 +8186,7 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
             assert h2 == [r for r in recs if r["entry"]["entry_date"] >= split]
         assert [len(h) for h in backtester._split_halves(recs, self._SPLIT)] == [3, 1]
 
-    def test_a_first_half_pair_whose_only_passing_monday_is_after_the_split_trades_in_neither_half(
+    def test_a_first_half_pair_whose_only_passing_monday_is_on_or_after_the_split_trades_in_neither_half(
         self,
     ):
         # Monday 1 fails at k = 0.90 and Monday 2 passes; split AT Monday 2
@@ -9916,6 +9919,9 @@ class TestBandSweep:
                                       for r in own)))
             h1 = by_key[(p.spread_band, p.k, "all/H1")]
             h2 = by_key[(p.spread_band, p.k, "all/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < split]
             assert [id(r) for r in h2["entries"]] == [
@@ -10737,6 +10743,9 @@ class TestTimeSeriesPopulation:
             own = by_point[id(p)]["entries"]
             h1 = by_key[(p.spread_band, p.k, "time_series/H1")]
             h2 = by_key[(p.spread_band, p.k, "time_series/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < res.split_date]
             assert [id(r) for r in h2["entries"]] == [
@@ -10862,9 +10871,14 @@ class TestExactLabels:
 # ─── C1: the per-trade size cap as a parameter, and the lazy cap sweep ───────
 
 def _uncapped_kelly(rec: dict, k: float) -> float | None:
-    """Pass 1b's uncapped Kelly fraction for one prepared entry, rebuilt from
-    the config helpers — the independent oracle for peak_kelly_fraction.
-    None when the net spread leaves nothing to size."""
+    """Pass 1b's uncapped Kelly fraction at one prepared entry's FIRST
+    qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
+    that Monday), rebuilt from the config helpers — the oracle for
+    peak_kelly_fraction wherever each candidate enters on its first Monday
+    (TestPrepareEntriesGolden's tier-on entries, whose later Mondays repeat
+    the first's quotes); since DR-75 the peak is read at each candidate's
+    earliest Kelly-passing Monday. None when the net spread leaves nothing
+    to size."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -12111,7 +12125,8 @@ class TestTierOffSweep:
     gating the spread.
 
     On the golden fixture the ladder is the only pair the tiers hold back
-    (see TestTierFloorsOff): with them off it enters on Monday 1 at every
+    (see TestTierFloorsOff): with them off it enters on Monday 1 (its
+    recorded entry; at k = 0.90 it trades on Monday 2 — DR-75) at every
     binding band. EA/EB (0.30, 13 days), TA/TB (exactly 0.15, 9 days) and
     WA/WB (0.98, 9 days) are short-gap pairs whose 0.15 tier binds only at
     floor 0, where each clears it anyway, and FA/FB (a pricier earlier
@@ -12335,6 +12350,9 @@ class TestTierOffSweep:
             # Split at the ONE split date, like every tier-on cell
             h1 = by_key[(p.spread_band, p.k, f"{p.population}/H1")]
             h2 = by_key[(p.spread_band, p.k, f"{p.population}/H2")]
+            # These identity checks hold only because the golden split date
+            # (2026-01-05) leaves H1 empty; the DR-75 cut itself is pinned by
+            # TestSplitHalvesKeepEachHalfOnItsSide.
             assert [id(r) for r in h1["entries"]] == [
                 id(r) for r in own if r["entry"]["entry_date"] < res.split_date]
             assert [id(r) for r in h2["entries"]] == [
