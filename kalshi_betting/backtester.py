@@ -8,10 +8,11 @@ Purpose:
     directional time-series bet — on the full history of settled Kalshi markets.
     Groups settled markets into potential time-series and same-title pairs, fetches
     hourly candlestick price series for each involved market, then scans weekly
-    Monday snapshots to find the first date each pair was tradeable at the required
-    threshold. Applies Kelly sizing to compute trade size, records actual P&L from
-    settlement outcomes, deduplicates overlapping pairs by priority, and builds
-    a daily equity curve. Results feed into dashboard.py for visualization.
+    Monday snapshots to find the dates each pair was tradeable at the required
+    threshold (the first, and every later one under "later" — DR-75). Applies
+    Kelly sizing to compute trade size, records actual P&L from settlement
+    outcomes, deduplicates overlapping pairs by priority, and builds a daily
+    equity curve. Results feed into dashboard.py for visualization.
 
 Dependencies:
     Imports time_series_group_key (the single definition of the time-series
@@ -1260,7 +1261,17 @@ class CapSweep:
     36 bands) on the 2026-09-26 01:22 365-day run's log, hence at most ~810
     distinct market dicts — a few MB. Nothing else from the corpus is kept;
     the eager points it references are the ones BacktestSweep already
-    holds.
+    holds. DR-75 adds one small dict per later qualifying Monday of each
+    entry at each band, which references the pair's own two market dicts,
+    so no market dict is added. On the 365-day window from 2025-09-24
+    (measured 2026-09-27) that is 272 at the no-band band (677 qualifying
+    Mondays over its 405 entries), at most as many at any other single band
+    (a band's qualifying Mondays are a subset of the no-band band's, pair by
+    pair), and 4,930 across all 36 bands. With the tier-off sweep's 6,778
+    (below) they traced about +3.9 MB. Their quotes are the candles' own
+    float objects, shared by every band's dict for one Monday, so once the
+    candles are released they keep alive only 1,434 floats (34 KB) that no
+    first-Monday entry already holds.
 
     One Tier floors setting per CapSweep (tier_floors). The tier-on one
     (BacktestSweep.cap_sweep, tier_floors True) holds the tier-on
@@ -1283,7 +1294,12 @@ class CapSweep:
     Retention of the tier-off one, declared the same way: it keeps the
     family's entries_by_band — one entry dict per binding band per tier-off
     entry, each band's tier-off time-series entries followed by the shared
-    same-title ones (the SAME dict objects the tier-on sweep holds). Its
+    same-title ones (the SAME dict objects the tier-on sweep holds), plus
+    each entry's later-Monday dicts, which add no market dict either: on the
+    365-day window from 2025-09-24 (measured 2026-09-27), 812 at the
+    tier-off no-band band (1,523 qualifying Mondays over its 711 entries),
+    at most as many at any other single binding band, and 6,778 across all
+    18. Its
     market dicts are the corpus records the entries point at, shared with
     the tier-on entries of any pair that also enters with the tiers on; with
     the tiers off a binding band's floor alone gates the spread, so its
@@ -3256,8 +3272,11 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     derived from the API's end_period_ts when the candle is fetched — see
     historical.fetch_candlesticks — so this is equivalently "at or before the
     candle's period end", just read off the dict's own key rather than the
-    wire field name.) This is used to read the closing price on or before a
-    given Monday snapshot.
+    wire field name.) This is the rule for the closing price on or before a
+    given Monday snapshot, and it stays the reference rule: _find_entry reads
+    its Mondays through _candles_at_or_before, which returns exactly this
+    function's result for each checkpoint in one forward pass per leg, instead
+    of rescanning the list from its start at every Monday (DR-75).
 
     Args:
         candles (list[dict]): List of candle dicts with a "ts" key (unix timestamp).
@@ -3278,6 +3297,61 @@ def _candle_at_or_before(candles: list[dict], ts: int) -> dict | None:
     return result
 
 
+def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[dict | None]:
+    """
+    _candle_at_or_before's answer for each of several timestamps, in one forward pass.
+
+    _candle_at_or_before is the reference rule: it scans from the first candle,
+    stops at the first one whose "ts" is past its target, and returns the
+    candle just before that stop (None when the stop is the first candle).
+    This applies it to a whole sequence of targets at once. While the targets
+    do not decrease, the stop only moves forward: every candle before one
+    target's stop has a "ts" at or before that target, hence at or before
+    every later target too. So each target resumes where the previous one
+    stopped, instead of at the first candle, and still gets exactly the
+    reference's answer — even for an unsorted list, since the reference, too,
+    never looks past its first candle beyond the target. A target below its
+    predecessor restarts at the first candle, as the reference does, so ANY
+    sequence of targets gets the reference's answers; non-decreasing ones get
+    them in a single pass. Every comparison is the reference's own (a
+    candle's "ts" <= the target).
+
+    Why it exists: since DR-75, _find_entry reads each leg's candle at EVERY
+    Monday of its window rather than stopping at the first qualifying one, and
+    calling the reference once per Monday rescanned the list from the start
+    each time — O(Mondays x candles) per leg, which a long-lived pair that
+    qualifies week after week pays in full. This is O(candles + Mondays).
+
+    Args:
+        candles (list[dict]): Candle dicts with a "ts" key (unix timestamp),
+            in the order the reference would scan them (ascending by "ts" for
+            every caller).
+        timestamps (list[int]): The target Unix timestamps; non-decreasing
+            for the single pass (_monday_timestamps returns them ascending).
+
+    Returns:
+        list[dict | None]: One item per timestamp, in order: exactly
+            _candle_at_or_before(candles, ts) — the candle dict itself (never
+            a copy), or None.
+    """
+    found: list[dict | None] = []
+    i = 0
+    n = len(candles)
+    previous: int | None = None
+    for ts in timestamps:
+        if previous is not None and ts < previous:
+            # A target below its predecessor: its stop can lie behind the
+            # current one, so scan afresh from the first candle
+            i = 0
+        # Advance past every candle at or before this target; the stop is the
+        # first candle past it (or the end of the list)
+        while i < n and candles[i]["ts"] <= ts:
+            i += 1
+        found.append(candles[i - 1] if i else None)
+        previous = ts
+    return found
+
+
 def _find_entry(
     candles_a: list[dict],
     candles_b: list[dict],
@@ -3292,7 +3366,7 @@ def _find_entry(
     tier_floors: bool = True,
 ) -> dict | None:
     """
-    Find the first Monday where a potential pair was tradeable at the required threshold.
+    Find every Monday on which a potential pair was tradeable at the required threshold.
 
     Scans weekly Monday snapshots up to (not including) the day before the
     earlier of the two market close dates. The scan's start is the LATER of
@@ -3300,7 +3374,28 @@ def _find_entry(
     one-year figure bounds how far back the window can reach, it does not
     describe where the window ends. At each Monday, reads the candlestick
     prices, applies the price gap, price-sum, and fee filters from the live
-    trading logic, and returns the entry data for the first qualifying week.
+    trading logic, and returns the first qualifying week's entry data with
+    every LATER qualifying week under "later".
+
+    Why every qualifying Monday, not just the first: this function holds no
+    probability model, which is what lets one entry pass per band serve every
+    interval discount k and every size cap. The Kelly gate runs later, per k,
+    in _simulate_at_discount, and a first qualifying Monday can fail it at a
+    k where a later one passes (early: a thin spread on a wide book; later:
+    a wide spread). The later Mondays are recorded so the simulator can enter
+    the pair on the EARLIEST that passes at its own k, as the weekly live run
+    would, without making this pass depend on k (DR-75). So the scan runs to
+    scan_end; a pair that never qualifies costs exactly what it did. Each
+    leg's candle at every Monday is looked up in one forward pass over the
+    window's Mondays, those max_horizon_days then skips included
+    (_candles_at_or_before, which returns _candle_at_or_before's answer at
+    each without that function's rescan from the first candle). Reading on
+    past the first qualifying Monday means a malformed candle there — a
+    missing price key (KeyError), or a "ts" that is missing or not comparable
+    with an int (KeyError, TypeError) — now raises where the first-hit scan
+    left it unread, the failure a pair that never qualified always had; the
+    candle cache holds none (0 malformed of 4,629,341 candles in 99,001
+    cached files, scanned 2026-09-27).
 
     Direction rules mirror the live scanner exactly:
       - time_series: market A is fixed as the EARLIER-closing contract —
@@ -3421,7 +3516,8 @@ def _find_entry(
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
             (float), "nA" (float), "nB" (float), "mA" (dict), "mB" (dict),
-            "gap_days" (int | None) for the first qualifying Monday — all four
+            "gap_days" (int | None) for the first qualifying Monday, and
+            "later" (tuple[dict, ...]). pA, pB, nA and nB are all four
             quotes of the canonicalized A and B (YES ask and NO ask of each),
             of which _leg_prices_for picks the two that were actually traded.
             "gap_days" is the loop-invariant deadline gap the price tier and
@@ -3429,6 +3525,13 @@ def _find_entry(
             reporting so a report cannot bucket a pair under a gap it was not
             filtered by; it is None for same_title, which has no deadline-gap
             concept.
+            "later" holds one dict per LATER qualifying Monday, earliest
+            first, with every key above but "later": that Monday's date, its
+            four quotes, its own mA/mB (a same-title pair's canonical A is
+            decided per Monday, so it can differ from the first Monday's; a
+            time-series pair's never does — the same market dicts, never
+            copies) and the same gap_days. () when the pair qualified on one
+            Monday only. Read them through _entry_mondays().
             Returns None if no qualifying Monday was found in the scan window, or
             if either leg's close_time is missing or unparseable (no scan window
             can be derived, so the pair is simply not enterable).
@@ -3593,13 +3696,25 @@ def _find_entry(
         # the only branch where the name would otherwise be unbound below.
         gap_days = None
 
-    for ts in _monday_timestamps(scan_start, scan_end):
+    # Every qualifying Monday, earliest first (see Returns): the scan runs to
+    # scan_end rather than stopping at the first one (DR-75).
+    mondays: list[dict] = []
+    checkpoints = _monday_timestamps(scan_start, scan_end)
+    # Each leg's candle at or before every checkpoint, in ONE forward pass per
+    # leg: exactly what _candle_at_or_before returns Monday by Monday, but
+    # without rescanning the list from its first candle at each Monday, which
+    # a scan that runs to scan_end made O(Mondays x candles) per pair. After
+    # the time-series swap above, so each list is its own leg's.
+    candles_at_a = _candles_at_or_before(candles_a, checkpoints)
+    candles_at_b = _candles_at_or_before(candles_b, checkpoints)
+    for ts, ca, cb in zip(checkpoints, candles_at_a, candles_at_b, strict=True):
         entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
 
         # Optional opt-in bet-horizon cap: skip checkpoints where the
         # later-closing leg would close further out than max_horizon_days from
-        # THIS simulated checkpoint — a cheap comparison done before touching
-        # candle data. Deliberately max(close_a, close_b) rather than close_b:
+        # THIS simulated checkpoint — a cheap comparison, made before this
+        # Monday's quotes are read (its candles were looked up with every
+        # Monday's, above). Deliberately max(close_a, close_b) rather than close_b:
         # same_title has no ordering at all, and since DR-73 a same-event
         # LADDER is ordered by STATED deadline, so close_b >= close_a no longer
         # holds for every time_series pair either (in the archive 13 dated
@@ -3610,9 +3725,8 @@ def _find_entry(
         if max_horizon_days is not None and (max(close_a, close_b) - entry_date).days > max_horizon_days:
             continue
 
-        # Read the closing prices at this Monday snapshot
-        ca = _candle_at_or_before(candles_a, ts)
-        cb = _candle_at_or_before(candles_b, ts)
+        # The closing prices at this Monday snapshot (looked up above): a leg
+        # with no candle at or before it yet has no quote to test
         if ca is None or cb is None:
             continue
 
@@ -3707,18 +3821,80 @@ def _find_entry(
         if (1.0 - price_a - price_b) <= fee_per_pair_approx(price_a, price_b):
             continue
 
-        return {
+        mondays.append({
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA, "nB": nB,
+            # THIS Monday's legs: a same-title pair is canonicalized per
+            # Monday above, so a later Monday can hold them the other way round
             "mA": mA_i, "mB": mB_i,
             # The gap the tier above was selected from, carried out so the
             # calibration report buckets each pair under exactly the gap it
             # was filtered by. None for same_title. Reporting only — every
             # decision this value drives was already made above.
             "gap_days": gap_days,
-        }
+        })
 
-    return None
+    if not mondays:
+        return None
+    # The first qualifying Monday keeps the shape every k-independent reader
+    # has always read (the calibration, the split date, the populations); the
+    # rest ride under "later", read only through _entry_mondays, for the
+    # Kelly gate.
+    entry = mondays[0]
+    entry["later"] = tuple(mondays[1:])
+    return entry
+
+
+def _entry_mondays(entry: dict) -> tuple[dict, ...]:
+    """
+    Every qualifying Monday of one _find_entry() result, earliest first.
+
+    The entry itself is the first — the Monday every k-independent reader
+    prices and places the pair at (the calibration, the split date) — and
+    "later" holds the rest (DR-75). An entry without "later" (hand-built, as
+    several tests build them) reads as a pair that qualified on one Monday
+    only, which is how it was simulated before the key existed.
+
+    Args:
+        entry (dict): A _find_entry() result — a record's "entry".
+
+    Returns:
+        tuple[dict, ...]: (entry, *entry["later"]); never empty. Each item
+            carries "entry_date", "pA", "pB", "nA", "nB", "mA", "mB" and
+            "gap_days" for its own Monday.
+    """
+    return (entry, *entry.get("later", ()))
+
+
+def _log_qualifying_mondays(entries: list[dict], band: tuple[float, float] | None,
+                            *, tier_floors: bool = True) -> None:
+    """
+    Log how many qualifying Mondays one entry pass recorded (DR-75).
+
+    k-independent and nearly free — the lengths of lists _find_entry already
+    built — and logged on every pass, zero included, so a run shows whether
+    the later-Monday rule had anything to act on (DR-66: silence must never
+    be the only signal). Worded to share no prefix with the lines tests
+    filter on ("Prepared ", "Spread band ", "Tier floors off",
+    "Split-half check").
+
+    Args:
+        entries (list[dict]): One _entries_for_band() output (or a band's
+            time-series + same-title concatenation) — records carrying an
+            "entry".
+        band (tuple[float, float] | None): The band the pass ran at; None
+            names the default band.
+        tier_floors (bool): Keyword-only; False appends " with the tier
+            floors off" after the band, as the completion lines do.
+    """
+    counts = [len(_entry_mondays(rec["entry"])) for rec in entries]
+    logging.info("Qualifying Mondays at band %s%s: %d over %d entries (%d qualify on more "
+                 "than one)",
+                 # config resolves the band (None -> the default, no band), so
+                 # this line names the band exactly as the completion lines do
+                 _band_label(time_series_spread_band(band)),
+                 " with the tier floors off" if tier_floors is False else "",
+                 sum(counts), len(counts), sum(1 for n in counts if n > 1))
 
 
 # ─── Candlestick fetching ─────────────────────────────────────────────────────
@@ -5109,7 +5285,7 @@ def _entries_for_band(
     _pairs: list | None = None,
 ) -> list[dict]:
     """
-    Locate each candidate pair's first tradeable Monday under one spread band.
+    Locate each pair's tradeable Mondays (the first and every later one) under one spread band.
 
     The Pass-1a sweep: one _find_entry() call per pair in candidates.all_pairs
     (or in _pairs, when given) whose type is in pair_types, in scan order.
@@ -5169,9 +5345,11 @@ def _entries_for_band(
     Returns:
         list[dict]: One record per pair that produced an entry, in scan order,
             each shaped {"pair_type": str, "canon": str, "group_key": object,
-            "entry": dict} where "entry" is _find_entry()'s return dict (which
-            already carries the possibly-swapped mA/mB). Empty when no pair of
-            the requested types was ever tradeable under this band.
+            "entry": dict} where "entry" is _find_entry()'s return dict — the
+            pair's first tradeable Monday, and every later one under "later"
+            (DR-75; read them through _entry_mondays) — which already carries
+            the possibly-swapped mA/mB. Empty when no pair of the requested
+            types was ever tradeable under this band.
 
     Raises:
         ValueError: If pair_types is empty or names anything other than
@@ -5201,9 +5379,10 @@ def _entries_for_band(
         candles_a = candidates.candles_by_ticker.get(mA_orig["ticker"], [])
         candles_b = candidates.candles_by_ticker.get(mB_orig["ticker"], [])
 
-        # Find the first Monday where this pair was tradeable at the threshold
-        # prices — max_horizon_days (if set) restricts entries to checkpoints
-        # close enough to the legs' close dates, and spread_band narrows the
+        # Find the Mondays where this pair was tradeable at the threshold
+        # prices — the first, and every later one under "later" (DR-75) —
+        # max_horizon_days (if set) restricts entries to checkpoints close
+        # enough to the legs' close dates, and spread_band narrows the
         # time-series spread rule for this pass only
         entry = _find_entry(
             candles_a, candles_b, mA_orig, mB_orig, pair_type,
@@ -5292,9 +5471,10 @@ def _prepare_entries(
             Element 0 is one record per pair that produced an entry, in scan
             order (time-series pairs first, then same-title), each shaped
             {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
-            where "entry" is _find_entry()'s return dict (which already carries
-            the possibly-swapped mA/mB). An empty list means no pair was ever
-            tradeable. It is None — the codebase's
+            where "entry" is _find_entry()'s return dict — the pair's first
+            tradeable Monday, and every later one under "later" (DR-75) —
+            which already carries the possibly-swapped mA/mB. An empty list
+            means no pair was ever tradeable. It is None — the codebase's
             return-None-on-validation-failure convention — when the Monday
             feasibility pre-check fails, a "no simulation is possible in this
             window at all" signal distinct from "nothing entered". NOTE that
@@ -5325,7 +5505,8 @@ def _prepare_entries(
     if candidates is None:
         return None, None
 
-    # ── Pass 1a: locate each pair's first tradeable Monday (k-independent) ──
+    # ── Pass 1a: locate each pair's tradeable Mondays — the first, and every
+    # later one under "later" (k-independent) ──
     # _find_entry applies price and deadline thresholds only — it holds no
     # probability model — so this sweep yields identical entries at every
     # interval discount and is run exactly once, ahead of any sizing. At the
@@ -5334,6 +5515,7 @@ def _prepare_entries(
     raw_entries = _entries_for_band(candidates, spread_band=None)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
+    _log_qualifying_mondays(raw_entries, None)
     return raw_entries, candidates.label_coverage
 
 
@@ -6255,8 +6437,8 @@ def run_backtest(
       4. Fetch hourly candlesticks for every ticker appearing in a
          potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
          threads.                                                   [prepare]
-      5. Find the first Monday where the pair was tradeable at the
-         threshold.                                                 [prepare]
+      5. Find the Mondays where the pair was tradeable at the threshold
+         (the first, and every later one under "later").            [prepare]
       6. Kelly-gate each entry; exclude (and count, with one summary
          WARNING) any time-series candidate whose settlement was
          earlier-YES/later-NO — impossible for a cumulative-deadline
@@ -6315,8 +6497,9 @@ def run_backtest(
     """
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
-    # The k-independent half: fetch, group, pair and locate each pair's first
-    # tradeable Monday. None means the feasibility pre-check failed.
+    # The k-independent half: fetch, group, pair and locate each pair's
+    # tradeable Mondays (the first, and every later one under "later").
+    # None means the feasibility pre-check failed.
     #
     # The outcome-label census rides out alongside the entries (DR-66b), but
     # this entry point returns the historical two-tuple and feeds no dashboard,
@@ -6989,6 +7172,8 @@ def _sweep_from_candidates(
         else:
             # A single-band run keeps the pre-band wording byte-for-byte.
             logging.info("Prepared %d candidate entries for sizing", len(entries_by_band[band]))
+        # How many Mondays this band's entries qualified on (DR-75), zero included
+        _log_qualifying_mondays(entries_by_band[band], band)
 
     # ── Tier floors off (tier_off_sweep): the bands where a deadline-gap tier
     # binds, entered again with the tiers not applied. A band whose floor is
@@ -7030,6 +7215,7 @@ def _sweep_from_candidates(
             logging.info("Tier floors off: prepared %d candidate entries for sizing "
                          "(%d time-series, %d same-title)", len(tier_off_entries[band]),
                          len(ts_entries), len(st_entries))
+            _log_qualifying_mondays(tier_off_entries[band], band, tier_floors=False)
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the old
     # single-band path (whose pair list died with _prepare_entries' locals),

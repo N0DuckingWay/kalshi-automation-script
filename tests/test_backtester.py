@@ -2265,19 +2265,26 @@ class TestActiveTickerRelease:
              "settlement_ts": "2026-02-20T12:00:00+00:00"},
         ]
 
-    def _run(self, monkeypatch, tx_settlement):
-        candles = {
+    @classmethod
+    def _candles(cls) -> dict[str, list[dict]]:
+        # Also read by TestFindEntryRecordsEveryQualifyingMonday, whose TX/TY
+        # same-title pair flips its canonical A from TX to TY on the second
+        # Monday (DR-75).
+        return {
             # TX: pricier than TY (same-title gap) yet cheaper than the
             # later-closing TZ (time-series gap) — see the class docstring
             "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
             # TY: 0.30 at the first Monday (the same-title entry), then 0.60 —
             # keeps TY/TZ (18 days apart, like TX/TZ) under the 30% tier at the
             # second Monday; see the class docstring
-            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(self._M2, 0.60, 0.40)],
+            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(cls._M2, 0.60, 0.40)],
             # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
             # enter until then
-            "TZ": [_candle(self._M2, 0.75, 0.25)],
+            "TZ": [_candle(cls._M2, 0.75, 0.25)],
         }
+
+    def _run(self, monkeypatch, tx_settlement):
+        candles = self._candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: self._markets(tx_settlement))
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -7069,7 +7076,10 @@ class TestPrepareEntriesGolden:
     The expected rows below are LITERALS captured by running main's
     _prepare_entries (fe0a758, before the split existed) over this fixture —
     not re-derived from the code under test, which would make the check
-    tautological. The fixture is the TestRunBacktestSweep EA/EB time-series
+    tautological. Each row's last field, the later qualifying Mondays' dates
+    (DR-75), is a literal from an equally independent oracle: the pre-DR-75
+    scan restarted the day after each hit. The fixture is the
+    TestRunBacktestSweep EA/EB time-series
     pair; a same-event ladder whose rungs close at one instant (so the stated
     gap, not close_time, orders the legs and picks the 0.30 tier — Monday 1's
     0.25 spread would clear the 0.15 tier a close gap of 0 picks, so the
@@ -7139,18 +7149,30 @@ class TestPrepareEntriesGolden:
     }
 
     # (pair_type, canon, group_key, entry_date, pA, pB, nA, nB, gap_days,
-    #  ticker_a, ticker_b) — captured on main @ fe0a758.
+    #  ticker_a, ticker_b, later_dates) — every field but the last captured
+    #  on main @ fe0a758. later_dates (DR-75) is the dates of the later
+    #  qualifying Mondays, from restarting the pre-DR-75 scan after each hit,
+    #  2026-09-27: each pair's candles hold still after its last candle, so a
+    #  pair keeps qualifying every Monday up to the day before its earlier
+    #  leg closes.
+    # EA/EB, TA/TB, WA/WB and SB/SA (first Monday 1/5, earlier close 2/1):
+    _LATER_WEEKS = (date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26))
+    # The ladder with the tier floors on (first Monday 1/12, both rungs close 3/20):
+    _LADDER_LATER = (date(2026, 1, 19), date(2026, 1, 26), date(2026, 2, 2),
+                     date(2026, 2, 9), date(2026, 2, 16), date(2026, 2, 23),
+                     date(2026, 3, 2), date(2026, 3, 9), date(2026, 3, 16))
     _EA_EB = ("time_series", "ev | team wins by", "ev | team wins by",
-              date(2026, 1, 5), 0.3, 0.6, 0.7, 0.4, 13, "EA", "EB")
+              date(2026, 1, 5), 0.3, 0.6, 0.7, 0.4, 13, "EA", "EB", _LATER_WEEKS)
     _LADDER = ("time_series", "will spacex launch another starship by ?",
                "will spacex launch another starship by ?",
-               date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE")
+               date(2026, 1, 12), 0.2, 0.6, 0.8, 0.4, 19, "RUNG-EARLY", "RUNG-LATE",
+               _LADDER_LATER)
     _TA_TB = ("time_series", "snow | snow falls by", "snow | snow falls by",
-              date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB")
+              date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB", _LATER_WEEKS)
     _WA_WB = ("time_series", "hail | hail falls by", "hail | hail falls by",
-              date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB")
+              date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB", _LATER_WEEKS)
     _SAME_TITLE = ("same_title", "Q", ("EVS", "Q", ""),
-                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA")
+                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA", _LATER_WEEKS)
     _GOLDEN = {True: [_EA_EB, _LADDER, _TA_TB, _WA_WB, _SAME_TITLE],
                False: [_EA_EB, _TA_TB, _WA_WB, _SAME_TITLE]}
     # The census total main reported over the same fixture: every market is
@@ -7166,15 +7188,20 @@ class TestPrepareEntriesGolden:
 
     @staticmethod
     def _rows(entries: list[dict]) -> list[tuple]:
+        monday_keys = {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
         rows = []
         for rec in entries:
             # The record and entry shapes are part of the contract too.
             assert set(rec) == {"pair_type", "canon", "group_key", "entry"}
             e = rec["entry"]
-            assert set(e) == {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
+            assert set(e) == monday_keys | {"later"}
+            # Every later qualifying Monday carries every key but "later" (DR-75)
+            assert isinstance(e["later"], tuple)
+            assert all(set(m) == monday_keys for m in e["later"])
             rows.append((rec["pair_type"], rec["canon"], rec["group_key"],
                          e["entry_date"], e["pA"], e["pB"], e["nA"], e["nB"],
-                         e["gap_days"], e["mA"]["ticker"], e["mB"]["ticker"]))
+                         e["gap_days"], e["mA"]["ticker"], e["mB"]["ticker"],
+                         tuple(m["entry_date"] for m in e["later"])))
         return rows
 
     def _prepare(self, monkeypatch, ladders):
@@ -7288,6 +7315,519 @@ class TestPrepareEntriesGolden:
         assert calls[0]["spread_band"] is None
         assert calls[0]["pair_types"] == ("time_series", "same_title")
         assert self._rows(entries) == self._GOLDEN[True]
+
+    @pytest.mark.parametrize("ladders,prepared,line", [
+        (True, "Prepared 5 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
+        (False, "Prepared 4 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 16 over 4 entries (4 qualify on more than one)"),
+    ], ids=["ladders-on", "ladders-off"])
+    def test_the_entry_pass_logs_its_qualifying_mondays(
+        self, monkeypatch, caplog, ladders, prepared, line,
+    ):
+        # DR-75: one INFO line per entry pass counting every qualifying Monday
+        # its entries recorded — the rows' own: 1 + 3 for each short pair and
+        # SB/SA, 1 + 9 for the ladder
+        assert sum(1 + len(row[-1]) for row in self._GOLDEN[ladders]) == (26 if ladders else 16)
+        with caplog.at_level(logging.INFO):
+            self._prepare(monkeypatch, ladders)
+        messages = caplog.messages
+        assert [m for m in messages if m.startswith("Qualifying Mondays")] == [line]
+        # ... right after the line counting the same entries
+        assert messages[messages.index(line) - 1] == prepared
+
+
+# ─── DR-75: every qualifying Monday is recorded, not just the first ──────────
+
+# The third checkpoint a scan starting 2026-01-01 visits (2026-01-19 09:00 UTC)
+_MONDAY3_TS = _MONDAY2_TS + 7 * 86_400
+
+# One week between two checkpoints, in seconds
+_WEEK_SECONDS = 7 * 86_400
+
+
+def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
+    """Seeded pairs for the chain oracle, each (candles_a, candles_b, mA, mB,
+    pair_type, start_date, kwargs).
+
+    Every Monday of a pair's window is drawn as a qualifying quote or as one
+    refused by a single per-Monday filter — a dead or unparseable quote, the
+    tier, the band ceiling, a dead NO leg, the leg-price-sum ceiling, the
+    fee or a non-positive spread — whichever the pair's settings (tier floors
+    on or off, a band, a horizon cap) let fire first; a shape its settings
+    cannot produce is drawn as a qualifying quote instead. A same-title
+    pair's pricier side is drawn afresh every Monday, so its canonical A
+    flips. Legs start late, skip weeks (the last candle then carries), hold a
+    superseded candle earlier in a week and a candle just after a checkpoint
+    that only a later Monday can read, and are passed in either order.
+    Prices are drawn in whole cents (a dead quote in half cents)."""
+    rng = random.Random(seed)
+    ri = rng.randint
+    cases: list[tuple] = []
+
+    def ts_quotes(kind: str, tier: int, ceiling: int) -> list:
+        # (pA, nA, pB, nB) in cents for a time-series Monday; tier and
+        # ceiling are the pair's threshold and band ceiling, in cents
+        if kind == "tier" and tier >= 2:
+            pA = ri(5, 40)
+            pB = pA + ri(1, tier - 1)
+            return [pA, 100 - pA, pB, 100 - pB]
+        if kind == "band-ceiling" and ceiling < 100:
+            spread = ri(ceiling + 1, ceiling + 15)
+            pA = ri(5, 94 - spread)
+            return [pA, 100 - pA, pA + spread, 100 - pA - spread]
+        if kind == "non-positive-spread":
+            pA = ri(10, 60)
+            pB = pA - ri(0, 5)
+            return [pA, 100 - pA, pB, 100 - pB]
+        if kind == "fee" and tier <= 3:
+            # Legs summing to within 3c of $1, where the fee (>= 3.36c for
+            # legs near 0.5) takes what is left
+            pA = ri(40, 50)
+            pB = pA + ri(max(tier, 1), 5)
+            return [pA, 100 - pA, pB, 100 - pA - ri(tier, 3)]
+        # A qualifying Monday — a spread between the threshold (at least 6c,
+        # clear of the fee) and the ceiling, on a tight book — which the
+        # shapes below then break
+        pA = ri(5, 40)
+        pB = pA + ri(max(tier, 6), min(ceiling, 55))
+        quotes = [pA, 100 - pA, pB, 100 - pB]
+        if kind == "leg-sum-ceiling":
+            quotes[3] = min(99, 101 - tier - pA + ri(0, 4))
+        elif kind == "dead-no-leg":
+            quotes[3] = 0.5
+        elif kind == "dead-yes-quote":
+            quotes[rng.choice((0, 2))] = rng.choice((0.5, 99.5))
+        return quotes
+
+    def st_quotes(kind: str) -> tuple[list, list]:
+        # (yes, no) in cents for the pricier and the cheaper market
+        cheap = ri(5, 60)
+        rich = cheap + (ri(0, 4) if kind == "tier" else ri(6, 30))
+        rich_q, cheap_q = [rich, 100 - rich], [cheap, 100 - cheap]
+        if kind == "leg-sum-ceiling":
+            rich_q[1] = min(99, 96 - cheap + ri(0, 3))
+        elif kind == "dead-no-leg":
+            rich_q[1] = 0.5
+        elif kind == "dead-yes-quote":
+            rng.choice((rich_q, cheap_q))[0] = rng.choice((0.5, 99.5))
+        return rich_q, cheap_q
+
+    kinds = ["qualifying"] * 6 + ["dead-yes-quote", "unparseable-quote", "tier",
+                                  "band-ceiling", "dead-no-leg", "leg-sum-ceiling",
+                                  "fee", "non-positive-spread"]
+    for k in range(count):
+        pair_type = "same_title" if rng.random() < 0.35 else "time_series"
+        weeks = ri(4, 10)
+        last_checkpoint = datetime.fromtimestamp(_MONDAY_TS + (weeks - 1) * _WEEK_SECONDS, tz=UTC)
+        # The earlier leg closes 1-6 days after the last checkpoint, so the
+        # scan (to the day before its close) ends between the two
+        close_a = last_checkpoint + timedelta(days=ri(1, 6), hours=ri(0, 14))
+        band = rng.choice([None, None, (0.20, 0.50), (0.25, 0.40), (0.30, 0.60), (0.0, 0.50)])
+        kw: dict = {"tier_floors": rng.random() < 0.6, "spread_band": band}
+        if rng.random() < 0.15:
+            kw["max_horizon_days"] = ri(10, 7 * weeks + 30)
+        if pair_type == "time_series":
+            gap_days = rng.choice([1, 5, 9, 13, 15, 16, 20, 29, 30, 31])
+            close_b = close_a + timedelta(days=gap_days, hours=ri(0, 5))
+            lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
+            tier = round(100 * min_price_diff_for_gap(
+                gap_days, spread_min=lo, tier_floors=kw["tier_floors"]))
+            ceiling = round(100 * hi)
+        else:
+            close_b = close_a + timedelta(minutes=ri(0, 50))
+        mA = {"ticker": f"A{k}", "event_ticker": f"EA{k}-1", "close_time": close_a.isoformat()}
+        mB = {"ticker": f"B{k}", "event_ticker": f"EB{k}-1", "close_time": close_b.isoformat()}
+        late = (ri(0, 1) * ri(0, 2), ri(0, 1) * ri(0, 2))
+        candles: tuple[list, list] = ([], [])
+        for week in range(weeks):
+            kind = rng.choice(kinds)
+            if pair_type == "time_series":
+                pA, nA, pB, nB = ts_quotes(kind, tier, ceiling)
+                legs = [[pA, nA], [pB, nB]]
+            else:
+                rich_q, cheap_q = st_quotes(kind)
+                legs = [rich_q, cheap_q] if rng.random() < 0.5 else [cheap_q, rich_q]
+            if kind == "unparseable-quote":
+                rng.choice(legs)[ri(0, 1)] = rng.choice((None, "abc"))
+            checkpoint = _MONDAY_TS + week * _WEEK_SECONDS
+            for leg in (0, 1):
+                if week < late[leg] or (week > late[leg] and rng.random() < 0.1):
+                    continue          # not listed yet, or no candle this week
+                quote = [q / 100 if isinstance(q, (int, float)) else q for q in legs[leg]]
+                at = checkpoint - rng.choice((0, 0, 3600, 7200, 86_400))
+                if rng.random() < 0.3:
+                    # An earlier candle of the same week, which this one supersedes
+                    candles[leg].append({"ts": at - 3600 * ri(1, 20),
+                                         "yes_ask_close": ri(5, 95) / 100,
+                                         "no_ask_close": ri(5, 95) / 100})
+                candles[leg].append({"ts": at, "yes_ask_close": quote[0],
+                                     "no_ask_close": quote[1]})
+                if rng.random() < 0.15:
+                    # Just after this checkpoint: only a later Monday reads it
+                    candles[leg].append({"ts": checkpoint + 3600,
+                                         "yes_ask_close": ri(5, 95) / 100,
+                                         "no_ask_close": ri(5, 95) / 100})
+        start = date(2026, 1, 1) + timedelta(days=ri(0, 20) if rng.random() < 0.2 else 0)
+        if rng.random() < 0.5:
+            cases.append((candles[0], candles[1], mA, mB, pair_type, start, kw))
+        else:
+            cases.append((candles[1], candles[0], mB, mA, pair_type, start, kw))
+    return cases
+
+
+class TestFindEntryRecordsEveryQualifyingMonday:
+    """_find_entry used to return at the FIRST Monday that passed its price,
+    deadline and band filters. It now scans to scan_end and returns that
+    Monday's dict — the same eight keys and values — plus "later": one dict
+    per LATER qualifying Monday, earliest first, each carrying that Monday's
+    own date, quotes and legs (DR-75). _entry_mondays is the one reader.
+
+    The chain oracle restarts _find_entry ITSELF the day after each Monday it
+    returns, taking each restart's first hit. That makes it independent of how
+    one pass now COLLECTS the Mondays (the scan running on past a hit, the
+    "later" list), but not of what both sides share: the per-Monday filters
+    and the candle lookup (TestCandlesAtOrBefore pins the lookup to
+    _candle_at_or_before). The independent anchors for those are
+    TestPrepareEntriesGolden's later dates, computed by restarting the
+    PRE-change code, and the critics' cross-version checks: the pre-change
+    code, restarted, agreed with the new "later" on all 7,940 later Mondays of
+    four seeded random corpora and on 54,132 real calls (each entered pair,
+    passed both ways round) across the 365-day window's 54 band passes
+    (measured 2026-09-27)."""
+
+    _KEYS = ("entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days")
+
+    @staticmethod
+    def _restarted(candles_a, candles_b, mA, mB, pair_type, start, **kw) -> list[dict]:
+        """Every Monday the scan finds, by restarting it the day after each hit."""
+        found: list[dict] = []
+        while (entry := _find_entry(candles_a, candles_b, mA, mB, pair_type, start,
+                                    **kw)) is not None:
+            # Progress, so a scan that ignored its start date fails, not hangs
+            assert entry["entry_date"] >= start
+            found.append(entry)
+            start = entry["entry_date"] + timedelta(days=1)
+        return found
+
+    def _assert_later_is_the_restarted_scan(self, candles_a, candles_b, mA, mB, pair_type,
+                                            start, **kw) -> int:
+        """Assert (entry, *entry["later"]) is the restarted scan; return its length."""
+        entry = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+        restarted = self._restarted(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+        if entry is None:
+            assert restarted == []
+            return 0
+        recorded = (entry, *entry["later"])
+        assert len(recorded) == len(restarted)
+        values = [k for k in self._KEYS if k not in ("mA", "mB")]
+        for got, want in zip(recorded, restarted, strict=True):
+            assert {k: got[k] for k in values} == {k: want[k] for k in values}
+            # The legs by identity: this Monday's own, and never a copy
+            assert got["mA"] is want["mA"] and got["mB"] is want["mB"]
+        return len(recorded)
+
+    @staticmethod
+    def _tx_ty():
+        markets = {m["ticker"]: m
+                   for m in TestActiveTickerRelease._markets("2026-01-08T12:00:00+00:00")}
+        return markets, TestActiveTickerRelease._candles()
+
+    def test_later_is_the_scan_restarted_after_each_monday(self, monkeypatch):
+        # Every golden pair, at the default band and every grid band, with the
+        # tier floors on and off
+        c = TestBandSweepPhaseOneSubset._fresh(monkeypatch)
+        bands = [None] + [(lo, hi) for lo in SPREAD_BAND_SWEEP_FLOORS
+                          for hi in SPREAD_BAND_SWEEP_CEILINGS]
+        counts: dict = {}
+        for (mA, mB, _canon, _group_key), pair_type in c.all_pairs:
+            for band in bands:
+                for tier_floors in (True, False):
+                    counts[(mA["ticker"], band, tier_floors)] = \
+                        self._assert_later_is_the_restarted_scan(
+                            c.candles_by_ticker[mA["ticker"]],
+                            c.candles_by_ticker[mB["ticker"]], mA, mB, pair_type,
+                            c.start_date, max_horizon_days=c.max_horizon_days,
+                            same_event_ladders=c.same_event_ladders, spread_band=band,
+                            tier_floors=tier_floors)
+        # Not vacuous: at the default band EA/EB and SB/SA qualify on 4 Mondays,
+        # the ladder on 10 with the tiers on and 11 with them off (Monday 1
+        # too), and FA/FB (a pricier earlier contract) on none
+        assert counts[("EA", None, True)] == counts[("SA", None, True)] == 4
+        assert (counts[("RUNG-EARLY", None, True)],
+                counts[("RUNG-EARLY", None, False)]) == (10, 11)
+        assert counts[("FA", None, True)] == counts[("FA", None, False)] == 0
+        # ... and the same-title TX/TY pair, whose canonical A flips on Monday
+        # 2, passed either way round
+        markets, candles = self._tx_ty()
+        for first, second in (("TX", "TY"), ("TY", "TX")):
+            assert self._assert_later_is_the_restarted_scan(
+                candles[first], candles[second], markets[first], markets[second],
+                "same_title", date(2026, 1, 1)) == 4
+
+    def test_later_is_the_restarted_scan_on_random_pairs(self):
+        # The chain oracle over 300 seeded pairs whose Mondays are refused, one
+        # filter at a time, between qualifying ones — every per-Monday refusal,
+        # at both tier settings and under band ceilings, on time-series and
+        # same-title pairs (see _random_find_entry_cases)
+        entered = multi = stepped_past = flipped = 0
+        for candles_a, candles_b, mA, mB, pair_type, start, kw in _random_find_entry_cases(
+                20260927, 300):
+            recorded = self._assert_later_is_the_restarted_scan(
+                candles_a, candles_b, mA, mB, pair_type, start, **kw)
+            if not recorded:
+                continue
+            entry = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+            mondays = backtester._entry_mondays(entry)
+            dates = [m["entry_date"] for m in mondays]
+            entered += 1
+            multi += len(mondays) > 1
+            # A refused Monday between two recorded ones, which the scan had
+            # to step past
+            stepped_past += any((b - a).days > 7
+                                for a, b in zip(dates[:-1], dates[1:], strict=True))
+            flipped += len({m["mA"]["ticker"] for m in mondays}) > 1
+        # Not vacuous. This seed gives 269, 234, 150 and 78 (measured
+        # 2026-09-27); bounds rather than pins, since random's integer draws
+        # are not promised to repeat across Python versions
+        assert entered >= 200 and multi >= 150 and stepped_past >= 100 and flipped >= 50
+
+    def test_each_later_monday_carries_its_own_same_title_legs(self):
+        markets, candles = self._tx_ty()
+        entry = _find_entry(candles["TX"], candles["TY"], markets["TX"], markets["TY"],
+                            "same_title", date(2026, 1, 1))
+        # Monday 1: TX (YES 0.40) is the pricier side, so it is A
+        assert (entry["entry_date"], entry["mA"]["ticker"], entry["mB"]["ticker"]) == (
+            date(2026, 1, 5), "TX", "TY")
+        assert (entry["pA"], entry["pB"], entry["nA"], entry["nB"]) == (0.40, 0.30, 0.60, 0.70)
+        assert entry["gap_days"] is None
+        # From Monday 2 TY (YES 0.60) is: every later Monday holds the legs the
+        # other way round, with its own quotes
+        assert [m["entry_date"] for m in entry["later"]] == [
+            date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26)]
+        for monday in entry["later"]:
+            assert monday["mA"] is markets["TY"] and monday["mB"] is markets["TX"]
+            assert (monday["pA"], monday["pB"], monday["nA"], monday["nB"]) == (
+                0.60, 0.40, 0.40, 0.60)
+            assert monday["gap_days"] is None
+        # ... whichever way round the pair was passed in
+        assert _find_entry(candles["TY"], candles["TX"], markets["TY"], markets["TX"],
+                           "same_title", date(2026, 1, 1)) == entry
+
+    # Mondays 1 and 3 of the refusal cases below, ((A yes, A no), (B yes, B
+    # no)): a 0.40 spread on legs pA 0.20 + nB 0.40 = 0.60, well clear of the
+    # fee, which qualifies at every setting the cases run at
+    _QUALIFYING = ((0.20, 0.80), (0.60, 0.40))
+
+    # Monday 2 of each case, and the settings it runs at: refused by exactly
+    # ONE per-Monday filter, the one named, and passing every other (checked
+    # filter by filter when the quotes were chosen). The last field is a
+    # setting that relaxes the named filter, or None where none can. A scan
+    # that ENDED at the first refused Monday after a hit, rather than stepping
+    # past it, would lose Monday 3 in every case.
+    _REFUSED_MONDAY_2 = [
+        # Spread 0.70 over a 0.60 band ceiling (legs 0.20 + 0.10 = 0.30 sit
+        # under the band floor's 0.70 sum ceiling)
+        pytest.param(((0.20, 0.80), (0.90, 0.10)), {"spread_band": (0.30, 0.60)}, {},
+                     id="band-ceiling"),
+        # Spread 0.10 under the 13-day gap's 0.15 tier, legs 0.20 + 0.60 = 0.80
+        # under the 0.85 sum ceiling: a crossed B book (0.30 + 0.60 < 1), the
+        # only way the tier can refuse a Monday the sum ceiling passes
+        pytest.param(((0.20, 0.80), (0.30, 0.60)), {}, {"tier_floors": False}, id="tier"),
+        # Spread 0.40 clears the tier; legs 0.20 + 0.70 = 0.90 exceed the 0.85
+        # sum ceiling (the 0.10 left clears the fee)
+        pytest.param(((0.20, 0.80), (0.60, 0.70)), {}, {"tier_floors": False},
+                     id="leg-sum-ceiling"),
+        # B's YES ask 0.995 is a dead quote. B's YES ask is no leg price of a
+        # time-series pair, so nothing else refuses it; a dead YES on A (pA)
+        # would be refused again as a dead leg
+        pytest.param(((0.20, 0.80), (0.995, 0.40)), {}, None, id="dead-yes-quote"),
+        # A YES ask that does not parse
+        pytest.param(((None, 0.80), (0.60, 0.40)), {}, None, id="unparseable-quote"),
+        # Tiers off, no band: threshold 0 and a sum ceiling of 1. Spread 0.04 >
+        # 0, legs 0.48 + 0.50 = 0.98, and the 0.02 left does not clear the fee
+        # (0.07 x (0.48 x 0.52 + 0.50 x 0.50) = 0.035); with the tiers on the
+        # tier would refuse it first
+        pytest.param(((0.48, 0.52), (0.52, 0.50)), {"tier_floors": False}, None, id="fee"),
+        # Tiers off: a zero spread, refused as having nothing to dispute, while
+        # the floor-0 threshold, the sum (0.30 + 0.40) and the fee all pass —
+        # again only on a crossed B book (0.30 + 0.40 < 1)
+        pytest.param(((0.30, 0.70), (0.30, 0.40)), {"tier_floors": False}, None,
+                     id="non-positive-spread"),
+        # B's NO ask 0.005, the traded NO leg, is dead. Production candles never
+        # carry one (historical.fetch_candlesticks clamps no_ask_close into
+        # [0.01, 0.99]); _find_entry's input contract does
+        pytest.param(((0.20, 0.80), (0.60, 0.005)), {}, None, id="dead-no-leg"),
+    ]
+
+    @pytest.mark.parametrize("monday_2,settings,relaxed", _REFUSED_MONDAY_2)
+    def test_a_monday_the_filters_refuse_is_not_recorded(self, monday_2, settings, relaxed):
+        # Three Mondays in the window (the earlier leg closes 2026-01-21, so
+        # the scan ends 01-20) and a 13-day gap, the 0.15 tier: Mondays 1 and 3
+        # qualify and Monday 2 is refused, so "later" holds Monday 3 only
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-01-21T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-02-03T00:00:00+00:00"}
+
+        def scan(second, **kw):
+            (a_yes, a_no), (b_yes, b_no) = self._QUALIFYING
+            a = [_candle(_MONDAY_TS, a_yes, a_no), _candle(_MONDAY2_TS, *second[0]),
+                 _candle(_MONDAY3_TS, a_yes, a_no)]
+            b = [_candle(_MONDAY_TS, b_yes, b_no), _candle(_MONDAY2_TS, *second[1]),
+                 _candle(_MONDAY3_TS, b_yes, b_no)]
+            return _find_entry(a, b, mA, mB, "time_series", date(2026, 1, 1), **kw)
+
+        entry = scan(monday_2, **settings)
+        assert entry["entry_date"] == date(2026, 1, 5)
+        assert [m["entry_date"] for m in entry["later"]] == [date(2026, 1, 19)]
+        (monday_3,) = entry["later"]
+        assert (monday_3["pA"], monday_3["pB"], monday_3["nA"], monday_3["nB"]) == (
+            0.20, 0.60, 0.80, 0.40)
+        both = [date(2026, 1, 12), date(2026, 1, 19)]
+        # CONTROL: at the same settings a qualifying Monday 2 is recorded, so
+        # the refusal above is Monday 2's own quotes' doing
+        assert [m["entry_date"] for m in scan(self._QUALIFYING, **settings)["later"]] == both
+        # ... and where a setting relaxes the named filter, the same Monday 2
+        # is recorded under it: that filter refused it, and nothing else did
+        if relaxed is not None:
+            assert [m["entry_date"] for m in scan(monday_2, **relaxed)["later"]] == both
+
+    def test_a_single_qualifying_monday_leaves_later_empty(self):
+        # The earlier leg closes 2026-01-10: the scan ends 01-09, so 01-05 is
+        # the only checkpoint, and "later" is empty — but present
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-01-10T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-01-20T00:00:00+00:00"}
+        entry = _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)], [_candle(_MONDAY_TS, 0.60, 0.40)],
+                            mA, mB, "time_series", date(2026, 1, 1))
+        assert entry["entry_date"] == date(2026, 1, 5)
+        assert entry["later"] == ()
+        (only,) = backtester._entry_mondays(entry)
+        assert only is entry
+        # An entry built without the key, as several tests build them, reads
+        # the same: one Monday, itself
+        bare = {k: entry[k] for k in self._KEYS}
+        (only,) = backtester._entry_mondays(bare)
+        assert only is bare
+
+    def test_later_mondays_reference_the_same_market_dicts(self, monkeypatch):
+        # A memory guarantee as much as a correctness one: a later Monday adds
+        # one small dict and no market dict (CapSweep keeps every band's
+        # entries alive, TS-07)
+        c = TestBandSweepPhaseOneSubset._fresh(monkeypatch)
+        corpus = {id(m) for (mA, mB, _canon, _group_key), _pair_type in c.all_pairs
+                  for m in (mA, mB)}
+        seen = 0
+        for tier_floors in (True, False):
+            for rec in backtester._entries_for_band(c, tier_floors=tier_floors):
+                entry = rec["entry"]
+                legs = {id(entry["mA"]), id(entry["mB"])}
+                assert legs <= corpus
+                for monday in entry["later"]:
+                    assert monday is not entry and "later" not in monday
+                    # The pair's own two records — for a time-series pair in
+                    # the first Monday's order (a same-title pair's A is
+                    # decided per Monday; see the TX/TY test)
+                    assert {id(monday["mA"]), id(monday["mB"])} == legs
+                    if rec["pair_type"] == "time_series":
+                        assert monday["mA"] is entry["mA"] and monday["mB"] is entry["mB"]
+                    seen += 1
+        # 3 later Mondays for each short pair and SB/SA, plus the ladder's 9
+        # with the tiers on and 10 with them off
+        assert seen == (3 * 4 + 9) + (3 * 4 + 10)
+
+    def test_the_count_line_is_logged_at_zero_and_names_the_tier_setting(self, caplog):
+        # Logged on every pass, zero included (DR-66); an entry built without
+        # "later" counts as one Monday
+        one = {"entry": {"entry_date": date(2026, 1, 5)}}
+        three = {"entry": {"entry_date": date(2026, 1, 5), "later": ({}, {})}}
+        with caplog.at_level(logging.INFO):
+            backtester._log_qualifying_mondays([], None)
+            backtester._log_qualifying_mondays([one, three], (0.0, 1.0))
+            backtester._log_qualifying_mondays([], (0.25, 0.5), tier_floors=False)
+        assert caplog.messages == [
+            "Qualifying Mondays at band 0-1: 0 over 0 entries (0 qualify on more than one)",
+            "Qualifying Mondays at band 0-1: 4 over 2 entries (1 qualify on more than one)",
+            "Qualifying Mondays at band 0.25-0.5 with the tier floors off: 0 over 0 entries "
+            "(0 qualify on more than one)",
+        ]
+
+
+class TestCandlesAtOrBefore:
+    """_find_entry reads each leg's candle at every Monday of its window
+    through _candles_at_or_before: _candle_at_or_before — the reference rule,
+    unchanged — applied to all the Mondays in one forward pass, since DR-75's
+    scan to scan_end made a per-Monday rescan from the first candle
+    O(Mondays x candles). These pin the pass to the reference answer by
+    answer, and pin its cost."""
+
+    @staticmethod
+    def _candles(rng: random.Random, shape: str) -> list[dict]:
+        # Hourly-ish stamps with repeats; "sorted" keeps the repeats, "unique"
+        # drops them, "unsorted" leaves the draw order
+        stamps = [1_000_000 + 3600 * rng.randint(0, 40) for _ in range(rng.choice(
+            (0, 1, 2, 3, 5, 8, 20)))]
+        if shape == "sorted":
+            stamps.sort()
+        elif shape == "unique":
+            stamps = sorted(set(stamps))
+        return [{"ts": ts, "i": i} for i, ts in enumerate(stamps)]
+
+    def test_every_answer_is_the_reference_rules(self):
+        rng = random.Random(75)
+        compared = 0
+        for trial in range(600):
+            candles = self._candles(rng, ("sorted", "unique", "unsorted")[trial % 3])
+            stamps = [c["ts"] for c in candles]
+            # Targets before every candle, after every candle, on a candle
+            # exactly, and between — non-decreasing, repeats included
+            pool = [999_000, 1_000_000 + 3600 * 41] + stamps + [
+                1_000_000 + rng.randint(-3600, 3600 * 41) for _ in range(6)]
+            targets = sorted(rng.choice(pool) for _ in range(rng.randint(0, 12)))
+            if trial % 4 == 3:
+                # ... and in any order: a target below its predecessor rescans
+                rng.shuffle(targets)
+            got = backtester._candles_at_or_before(candles, targets)
+            want = [backtester._candle_at_or_before(candles, ts) for ts in targets]
+            assert len(got) == len(want) == len(targets)
+            # The candle objects themselves, or both None
+            assert all(g is w for g, w in zip(got, want, strict=True)), (candles, targets)
+            compared += len(targets)
+        assert compared > 3000
+
+    def test_the_pass_reads_each_candle_about_once(self):
+        # A long-lived pair qualifying on every Monday of its one-year window
+        # (the scan's cap), over two years of hourly candles per leg: each
+        # leg's "ts" must be read O(candles + Mondays) times. Looking each
+        # Monday up with _candle_at_or_before instead rescans from the first
+        # candle every time: 680,108 reads per leg here, about 19x the bound
+        # below (the pre-fix scan, measured 2026-09-27; the one pass reads
+        # 17,414).
+        reads = {"A": 0, "B": 0}
+
+        def counting(leg: str) -> type:
+            class Candle(dict):
+                def __getitem__(self, key):
+                    if key == "ts":
+                        reads[leg] += 1
+                    return super().__getitem__(key)
+            return Candle
+
+        close_a = datetime(2026, 6, 1, tzinfo=UTC)
+        first = int((close_a - timedelta(days=730)).timestamp())
+        last = int((close_a + timedelta(days=1)).timestamp())
+        a_candle, b_candle = counting("A"), counting("B")
+        candles_a = [a_candle(ts=ts, yes_ask_close=0.30, no_ask_close=0.70)
+                     for ts in range(first, last, 3600)]
+        candles_b = [b_candle(ts=ts, yes_ask_close=0.60, no_ask_close=0.40)
+                     for ts in range(first, last, 3600)]
+        mA = {"ticker": "A", "event_ticker": "EA-1", "close_time": close_a.isoformat()}
+        mB = {"ticker": "B", "event_ticker": "EB-1",
+              "close_time": (close_a + timedelta(days=14)).isoformat()}
+        entry = _find_entry(candles_a, candles_b, mA, mB, "time_series", date(2020, 1, 1))
+        mondays = len(backtester._entry_mondays(entry))
+        # Not vacuous: every Monday of the year qualified
+        assert mondays == 52
+        for leg, candles in (("A", candles_a), ("B", candles_b)):
+            assert reads[leg] <= 2 * len(candles) + 2 * mondays, (leg, reads[leg])
 
 
 class TestPrepareCandidates:
@@ -8860,6 +9400,23 @@ class TestBandSweep:
         assert "Spread band 6/36: 0-1 (primary)" in announced
         assert sum(m.endswith("(primary)") for m in announced) == 1
 
+    def test_every_band_logs_its_qualifying_mondays(self, golden_band_sweep):
+        # DR-75: one count per entry pass — one per band, none with the tiers
+        # off (this sweep has no tier-off family) — right after that band's
+        # own Prepared line
+        messages = golden_band_sweep.messages
+        lines = [m for m in messages if m.startswith("Qualifying Mondays at band ")]
+        assert sorted(m.split(":")[0] for m in lines) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}" for b in _GRID_BANDS)
+        assert all(messages[messages.index(m) - 1].startswith("Prepared ") for m in lines)
+        # The default band's is the golden rows' own count (1 + 3 for each
+        # short pair and SB/SA, 1 + 9 for the ladder) ...
+        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
+                "(5 qualify on more than one)") in lines
+        # ... and at a 0.35 floor with a 0.5 ceiling only the ladder and SB/SA enter
+        assert ("Qualifying Mondays at band 0.35-0.5: 14 over 2 entries "
+                "(2 qualify on more than one)") in lines
+
     def test_the_sweep_records_the_resolved_ladder_setting(self, golden_band_sweep):
         assert golden_band_sweep.result.same_event_ladders is True
         assert golden_band_sweep.single.same_event_ladders is True
@@ -8936,6 +9493,25 @@ class TestBandSweepEdges:
                        for m in messages)
         assert [m for m in messages if m.startswith("Spread band ")] == [
             "Spread band 1/1: 0-1 (primary)"]
+
+    @pytest.mark.parametrize("band,prepared,line", [
+        (None, "Prepared 5 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
+        # At 0.3-0.6 TA/TB (0.15) and WA/WB (0.98) no longer enter: EA/EB's 4,
+        # the ladder's 10 and SB/SA's 4
+        ((0.3, 0.6), "Prepared 3 candidate entries for sizing",
+         "Qualifying Mondays at band 0.3-0.6: 18 over 3 entries (3 qualify on more than one)"),
+    ], ids=["default-band", "band-0.3-0.6"])
+    def test_a_single_band_run_logs_its_qualifying_mondays(
+        self, monkeypatch, caplog, band, prepared, line,
+    ):
+        # DR-75: the single-band branch of the tier-on Prepared line gets the
+        # count too, right after it
+        with caplog.at_level(logging.INFO):
+            self._run(monkeypatch, sweep=False, spread_band=band)
+        messages = caplog.messages
+        assert [m for m in messages if m.startswith("Qualifying Mondays")] == [line]
+        assert messages[messages.index(line) - 1] == prepared
 
     def test_the_infeasible_window_has_no_scenarios(self, monkeypatch):
         res = TestRunBacktestSweep()._infeasible(monkeypatch, band_sweep=True,
@@ -9339,7 +9915,8 @@ class TestBandSweepPhaseOneSubset:
         subset = [candidates.all_pairs[3], candidates.all_pairs[0]]
         narrowed = backtester._entries_for_band(candidates, pair_types=("time_series",),
                                                 _pairs=subset)
-        assert [r[-2] for r in rows(narrowed)] == ["TA", "EA"]
+        # r[9] is ticker_a (its position from the front; DR-75 appended a column)
+        assert [r[9] for r in rows(narrowed)] == ["TA", "EA"]
         assert set(rows(narrowed)) <= set(rows(full))
         assert candidates.all_pairs == before
 
@@ -10955,9 +11532,13 @@ class TestTierOffSweep:
     floor 0, where each clears it anyway, and FA/FB (a pricier earlier
     contract) never enters."""
 
+    # Its later qualifying Mondays (DR-75) are Monday 2 and every one the
+    # tier-on ladder qualifies on after it — from restarting the pre-DR-75
+    # scan after each hit, 2026-09-27 (see TestPrepareEntriesGolden's rows)
     _LADDER_OFF = ("time_series", "will spacex launch another starship by ?",
                    "will spacex launch another starship by ?",
-                   date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE")
+                   date(2026, 1, 5), 0.2, 0.45, 0.8, 0.55, 19, "RUNG-EARLY", "RUNG-LATE",
+                   (date(2026, 1, 12), *TestPrepareEntriesGolden._LADDER_LATER))
 
     @staticmethod
     def _same_point(a, b):
@@ -11052,6 +11633,29 @@ class TestTierOffSweep:
 
         assert ladder(off_point).entry_date == date(2026, 1, 5)
         assert ladder(res.primary).entry_date == date(2026, 1, 12)
+
+    def test_every_band_logs_its_qualifying_mondays_with_the_tiers_on_and_off(
+        self, golden_tier_off_sweep,
+    ):
+        # DR-75: the 36 tier-on counts, plus one per binding band with the tiers
+        # off, each right after its own tier-off Prepared line
+        messages = golden_tier_off_sweep.messages
+        lines = [m for m in messages if m.startswith("Qualifying Mondays at band ")]
+        suffix = " with the tier floors off"
+        off = [m for m in lines if m.split(":")[0].endswith(suffix)]
+        on = [m for m in lines if m not in off]
+        assert sorted(m.split(":")[0] for m in on) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}" for b in _GRID_BANDS)
+        assert sorted(m.split(":")[0] for m in off) == sorted(
+            f"Qualifying Mondays at band {backtester._band_label(b)}{suffix}"
+            for b in _TIER_BOUND_BANDS)
+        assert all(messages[messages.index(m) - 1].startswith("Tier floors off: prepared ")
+                   for m in off)
+        # With the tiers off the ladder qualifies on Monday 1 too: 11, not 10
+        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
+                "(5 qualify on more than one)") in on
+        assert ("Qualifying Mondays at band 0-1 with the tier floors off: 27 over 5 entries "
+                "(5 qualify on more than one)") in off
 
     def test_every_completion_prefix_is_unique_across_both_families(self, golden_tier_off_sweep):
         prefixes = _completion_prefixes(golden_tier_off_sweep.messages)

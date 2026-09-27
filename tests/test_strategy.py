@@ -419,6 +419,35 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
+    """Where `key` is spelled in `tree` as a string or as a keyword argument:
+    every string ast.Constant EQUAL to it (a dict literal's key, a subscript,
+    a .get) and every ast.keyword NAMED it (dict(entry, later=...)), each as
+    the outermost enclosing function's name ("Class.method" for a method) and
+    the line, or None outside any function. Equality, not substring, so a
+    docstring that merely mentions the word — its own Constant — never
+    matches. A spelling built at run time ("lat" + "er", an f-string) is not
+    found."""
+    homes: list[tuple[str | None, int]] = []
+
+    def visit(node: ast.AST, owner: str | None, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if owner is None and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, scope + child.name, scope)
+            elif owner is None and isinstance(child, ast.ClassDef):
+                visit(child, None, f"{scope}{child.name}.")
+            elif isinstance(child, ast.Constant):
+                if type(child.value) is str and child.value == key:
+                    homes.append((owner, child.lineno))
+            else:
+                if isinstance(child, ast.keyword) and child.arg == key:
+                    homes.append((owner, child.lineno))
+                visit(child, owner, scope)
+
+    visit(tree, None, "")
+    return homes
+
+
 def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     """Uncapped Kelly fraction for a pair priced at (price_a, price_b).
 
@@ -842,6 +871,51 @@ class TestTimeSeriesKellyParity:
         # Which bands the tiers bind at is decided THROUGH the helper, asked
         # both ways, never from a copy of the tier constants
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
+
+    def test_ast_later_mondays_have_one_reader(self):
+        # DR-75: backtester._find_entry records a pair's every qualifying
+        # Monday after the first under "later", and _entry_mondays —
+        # (entry, *entry.get("later", ())) — is the one reader. Its .get
+        # default is load-bearing (hand-built entries, several in these tests,
+        # carry no "later"), and the readers that must see only the FIRST
+        # Monday — the interval calibration and the split date, where a later
+        # Monday chosen per k would make k-hat depend on k — must never reach
+        # the rest. So the key may be SPELLED — as a string ({"later": ...},
+        # e["later"], e.get("later")) or as a keyword argument
+        # (dict(e, later=...), the shape a writer that rewrites the key would
+        # take) — only in the writer and the reader, anywhere in the package
+        # (deny-by-default, like the band walk below). The accepted cost of
+        # scanning the whole package: an unrelated "later" key or keyword in
+        # any module fails this pin too — if one is ever needed, widen the
+        # allowed homes deliberately, naming it. A spelling built at run time
+        # ("lat" + "er", an f-string) is out of this pin's scope.
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        # The walk finds a keyword spelling, not only a string one
+        probe = ast.parse("def f(e):\n    return dict(e, later=())\n")
+        assert _key_homes(probe, "later") == [("f", 2)]
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        assert "backtester" in names
+        modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}")
+                                      for n in names]
+        homes = [(module.__name__, owner, line)
+                 for module in modules
+                 for owner, line in _key_homes(ast.parse(inspect.getsource(module)), "later")]
+        found = {(mod, owner) for mod, owner, _line in homes}
+        writer = ("kalshi_betting.backtester", "_find_entry")
+        reader = ("kalshi_betting.backtester", "_entry_mondays")
+        assert found <= {writer, reader}, homes
+        # Not vacuous: the writer spells it (a renamed key would otherwise
+        # leave nothing to check), and so does the one reader
+        assert writer in found and reader in found
+        # ... the count line reads the Mondays through that reader ...
+        assert _function_calls(backtester, "_log_qualifying_mondays", "_entry_mondays")
+        # ... and the two first-Monday readers never call it
+        assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
+        assert not _function_calls(backtester, "_split_date", "_entry_mondays")
 
     def test_ast_live_path_reads_no_band(self):
         # The time-series spread band is a BACKTEST knob. If a band is ever
