@@ -8218,6 +8218,64 @@ class TestFilterPageSize:
         assert out.stat().st_size <= budget, f"page was {out.stat().st_size} bytes"
 
 
+def _cal_trade(pA: float, pB: float, outcome_a: str, outcome_b: str,
+               pair_type: str = "time_series") -> BacktestTrade:
+    """make_trade with the entry YES asks, settlement sides and pair type the
+    calibration section reads."""
+    return dataclasses.replace(make_trade(), entry_pA=pA, entry_pB=pB,
+                               outcome_a=outcome_a, outcome_b=outcome_b,
+                               pair_type=pair_type)
+
+
+class TestSpreadCalibration:
+    """The Calibration Analysis section scores each time-series trade's entry
+    spread pB − pA against whether it settled A = NO, B = YES."""
+
+    # Spreads chosen off the 0.1-wide bin edges, which float noise can straddle
+    TRADES = [
+        _cal_trade(0.30, 0.65, "yes", "yes"),               # 0.35, event by A
+        _cal_trade(0.20, 0.65, "no", "yes"),                # 0.45, in between
+        _cal_trade(0.10, 0.35, "no", "no"),                 # 0.25, never
+        _cal_trade(0.70, 0.60, "no", "yes", "same_title"),  # left out
+    ]
+
+    def test_observations_are_the_spread_and_the_in_between_cell(self):
+        obs = dashboard._spread_observations(self.TRADES)
+        assert [p for p, _ in obs] == pytest.approx([0.35, 0.45, 0.25])
+        assert [a for _, a in obs] == [0, 1, 0]
+
+    def test_same_title_trades_contribute_nothing(self):
+        assert dashboard._spread_observations(self.TRADES[3:]) == []
+
+    def test_scores_match_a_hand_computation(self):
+        rel = dashboard._reliability(self.TRADES)
+        pairs = [(0.35, 0), (0.45, 1), (0.25, 0)]
+        brier = sum((p - a) ** 2 for p, a in pairs) / 3
+        ll = -sum(a * math.log(p) + (1 - a) * math.log(1 - p) for p, a in pairs) / 3
+        assert rel["brier"] == pytest.approx(brier)
+        assert rel["log_loss"] == pytest.approx(ll)
+        assert rel["labels"] == ["0.2–0.3", "0.3–0.4", "0.4–0.5"]
+        assert rel["mean_pred"] == pytest.approx([0.25, 0.35, 0.45])
+        assert rel["mean_act"] == [0, 0, 1]
+        assert rel["counts"] == [1, 1, 1]
+
+    def test_no_time_series_trade_reads_dash(self):
+        rel = dashboard._reliability(self.TRADES[3:])
+        assert rel["brier"] is None and rel["log_loss"] is None
+        assert rel["mean_pred"] == [] and rel["counts"] == []
+        assert dashboard._calibration_title(None, None) == (
+            "Calibration Curve (no time-series trades)")
+        section = dashboard._section_calibration(self.TRADES[3:])
+        assert 'id="kpi-brier"' in section and ">—</div>" in section
+        assert "Calibration Curve (no time-series trades)" in section
+
+    def test_the_section_names_its_axes(self):
+        section = dashboard._section_calibration(self.TRADES)
+        assert "Predicted probability: spread pB − pA" in section \
+            or "Predicted probability: spread pB \\u2212 pA" in section
+        assert "Time-series trades only" in section
+
+
 class TestFilterableSections:
     """A trade section renders its body whether or not it has trades — another
     band can have trades the primary does not — and swaps in "No trades."."""
