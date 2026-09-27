@@ -4,16 +4,18 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and one helper. An autouse guard points the
-    event-title accumulator and Kalshi's cached /series listing at a per-test
-    tmp_path, so no test can touch the operator's real event-title
-    accumulators or series_categories.json.
-    pre_toggle_defaults pins the live toggles for a test whose figures assume
-    fixed values (they pin arithmetic, not config.py's policy); its helper,
-    apply_pre_toggle_defaults, also serves class-scoped fixtures.
+    Suite-wide pytest fixtures and one helper. Two autouse guards: one points
+    the event-title accumulator and Kalshi's cached /series listing at a
+    per-test tmp_path, so no test can touch the operator's real event-title
+    accumulators or series_categories.json; the other keeps every test off the
+    Treasury API and the real rates cache. pre_toggle_defaults pins the live
+    toggles for a test whose figures assume fixed values (they pin arithmetic,
+    not config.py's policy); its helper, apply_pre_toggle_defaults, also
+    serves class-scoped fixtures.
 
 Dependencies:
-    Imports kalshi_betting.historical (the three cache paths), config, and
+    Imports kalshi_betting.historical (the three cache paths),
+    kalshi_betting.treasury (its _RATES_CACHE path and _get_json), config, and
     backtester and backtest (the by-value copies they bind). Imported by
     pytest, and by test modules for apply_pre_toggle_defaults.
 
@@ -36,7 +38,7 @@ Notes:
 """
 import pytest
 
-from kalshi_betting import backtest, backtester, config, historical
+from kalshi_betting import backtest, backtester, config, historical, treasury
 
 
 @pytest.fixture(autouse=True)
@@ -94,3 +96,25 @@ def pre_toggle_defaults(monkeypatch):
         monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
     """
     apply_pre_toggle_defaults(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_treasury_rates(tmp_path, monkeypatch):
+    """
+    Keep every test off the Treasury API and away from the real rates cache.
+
+    The stub raises a plain RuntimeError, which api_call_with_retry treats as
+    fatal, so a test that reaches the loader falls through at once instead of
+    sleeping through the retry backoff.
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the real path and function
+            afterwards.
+    """
+    monkeypatch.setattr(treasury, "_RATES_CACHE", tmp_path / "treasury_bill_rates.json")
+
+    def _offline(url):
+        raise RuntimeError("the Treasury API is not reachable from the test suite")
+
+    monkeypatch.setattr(treasury, "_get_json", _offline)

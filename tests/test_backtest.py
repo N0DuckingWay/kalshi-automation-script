@@ -22,11 +22,12 @@ And --no-cap-sweep: the per-trade size-cap sweep is on by default
 (cap_sweep=True), the flag threads cap_sweep=False, and the echo line names
 the setting.
 
-Fully offline: run_backtest_sweep, generate_dashboard and both client builders
-are monkeypatched, so no network call, no credential read and no real backtest
-happen. PROJECT_ROOT is redirected at tmp_path and logging.basicConfig is
-stubbed, so the run's RotatingFileHandler can neither write into the repo root
-nor leak a handler onto the root logger for the rest of the session.
+Fully offline: run_backtest_sweep, generate_dashboard, both client builders
+and load_risk_free_rates are monkeypatched, so no network call, no credential
+read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
+logging.basicConfig is stubbed, so the run's RotatingFileHandler can neither
+write into the repo root nor leak a handler onto the root logger for the rest
+of the session.
 """
 import dataclasses
 import logging
@@ -49,6 +50,7 @@ from kalshi_betting.config import (
     min_price_diff_for_gap,
     time_series_spread_too_wide,
 )
+from kalshi_betting.treasury import SOURCE_API, RiskFreeRates
 
 
 def _equity(final_value: float = 10_691.38) -> pd.DataFrame:
@@ -115,6 +117,11 @@ def cli(monkeypatch, tmp_path):
     calls["series_categories"] = {"KXTEST": ("Sports", ("Basketball",))}
     monkeypatch.setattr(backtest, "load_series_categories",
                         lambda client: calls["series_categories"])
+    # Never read the real backtest_cache or the network for the risk-free rate
+    calls["risk_free"] = RiskFreeRates(
+        ((date(2026, 1, 5), 0.04),), SOURCE_API, datetime(2026, 9, 27, tzinfo=UTC),
+    )
+    monkeypatch.setattr(backtest, "load_risk_free_rates", lambda: calls["risk_free"])
     return calls
 
 
@@ -764,6 +771,11 @@ class TestDashboardHandoff:
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
         assert kwargs["series_categories"] is cli["series_categories"]
+
+    def test_the_risk_free_rates_are_passed_through(self, cli, monkeypatch):
+        _run(monkeypatch)
+        _, kwargs = cli["dashboard"]
+        assert kwargs["risk_free"] is cli["risk_free"]
 
 
 class TestSummaryBlock:

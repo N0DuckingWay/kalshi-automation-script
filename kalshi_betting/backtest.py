@@ -22,9 +22,12 @@ Dependencies:
     closing corpus line tests a stamped post-cutoff verdict against the run's
     own trades with it — over the eager points; the dashboard header adds the
     size-cap points its filter walk simulates) from backtester.py,
-    generate_dashboard from dashboard.py, and build_historical_client /
+    generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
-    returns-by-category labels) from historical.py. Imports from config.py:
+    returns-by-category labels) from historical.py, and load_risk_free_rates
+    (the T-bill yields the page's Sharpe and Sortino subtract) from
+    treasury.py.
+    Imports from config.py:
     PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
@@ -152,6 +155,7 @@ from .config import (
 )
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client, load_series_categories
+from .treasury import load_risk_free_rates
 
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
@@ -607,9 +611,13 @@ def main() -> None:
     # tags for the Returns Decomposition breakdown: one cached read-only GET of
     # /series, which never raises (it falls back to a stale copy or to {})
     series_categories = load_series_categories(live_client)
+    # The T-bill yields every Sharpe and Sortino on the page subtracts; never
+    # raises (falls back to the saved copy, then "unavailable"), but an
+    # unresponsive single-address host can cost about 4 minutes first
+    risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,
-                       series_categories=series_categories)
+                       series_categories=series_categories, risk_free=risk_free)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
 
 
