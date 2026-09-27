@@ -11199,3 +11199,264 @@ class TestTierOffSweep:
                 candidates, 1000.0, interval_discount=None, sweep=False,
                 spread_band=None, band_sweep=False, tier_off_sweep=True)
         assert hasattr(candidates, "all_pairs") and hasattr(candidates, "candles_by_ticker")
+
+
+# ─── Tier floors off at every size cap (C5) ──────────────────────────────────
+
+
+@pytest.fixture(scope="class")
+def tier_off_cap_run():
+    """The golden band sweep with BOTH the tier-floors-off family and the
+    size-cap sweep on, over cap_sweep_run's NARROWED grid — floors (0, 0.35)
+    x ceilings (0.5, 1.0) x k (0.5, 1.0) plus the primary 0.75: the two
+    floor-0 bands bind, so the family (and its CapSweep) is 2 bands x 3 k =
+    6 cells, small enough to check every cap of every off cell against a
+    fresh tier-off simulation. Beside it: the same run without the cap sweep,
+    and runs without the family or without the band sweep. Every simulation
+    DURING the runs goes through a spy that records its keywords; the spy is
+    undone before any cell is read, so the cells run the real function."""
+    mp = pytest.MonkeyPatch()
+    try:
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        sims: list = []
+        real = backtester._simulate_at_discount
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all", **kw):
+            sims.append((spread_band, k, population, len(raw_entries), tuple(sorted(kw))))
+            return real(raw_entries, start_date, initial_balance, k=k,
+                        spread_band=spread_band, population=population, **kw)
+
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+
+        def run(**kw):
+            sims.clear()
+            res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                     start_date=golden._START, initial_balance=10_000.0,
+                                     same_event_ladders=True, **kw)
+            return res, list(sims)
+
+        handler = _LogCapture()
+        root = logging.getLogger()
+        old_level = root.level
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        try:
+            both, sims_both = run(band_sweep=True, tier_off_sweep=True, cap_sweep=True)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        no_cap, sims_no_cap = run(band_sweep=True, tier_off_sweep=True, cap_sweep=False)
+        no_off, _ = run(band_sweep=True, tier_off_sweep=False, cap_sweep=True)
+        single, _ = run(band_sweep=False, cap_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(both=both, no_cap=no_cap, no_off=no_off, single=single,
+                              sims_both=sims_both, sims_no_cap=sims_no_cap,
+                              messages=handler.messages, start=golden._START)
+    finally:
+        mp.undo()
+
+
+@pytest.mark.usefixtures("tier_off_cap_run")
+class TestTierOffCapSweep:
+    """run_backtest_sweep(band_sweep=True, tier_off_sweep=True, cap_sweep=True):
+    a SECOND lazy CapSweep, tier_floors False, over the tier-floors-off
+    family's binding bands, seeded from the family's own points only — so
+    every tier x band x k x cap scenario is a real simulation. Parity with a
+    fresh tier-off simulation at every cap is the gate."""
+
+    _POPS = ("all", "time_series", "ladder", "cross")
+    _BINDING = ((0.0, 0.5), (0.0, 1.0))
+
+    @staticmethod
+    def _cells(cs):
+        for band in cs.bands:
+            for k in cs.ks:
+                yield band, k, cs.cell(band, k)
+
+    def test_it_exists_only_with_both_sweeps_and_adds_no_simulation(self, tier_off_cap_run):
+        run = tier_off_cap_run
+        assert inspect.signature(
+            backtester.BacktestSweep).parameters["tier_off_cap_sweep"].default is None
+        assert run.both.tier_off_cap_sweep is not None
+        assert run.no_cap.tier_off_cap_sweep is None
+        assert run.no_off.tier_off_cap_sweep is None and run.no_off.cap_sweep is not None
+        assert run.single.tier_off_cap_sweep is None
+        # The flag simulates NOTHING during the run: the same simulations, in
+        # the same order and with the same keywords, with or without it
+        assert run.sims_both == run.sims_no_cap
+        # Not vacuous: the family's own simulations are among them (58 on
+        # this fixture: its cells, halves, ex-top runs and populations)
+        assert sum(1 for s in run.sims_both if "tier_floors" in s[4]) > 40
+
+    def test_its_shape(self, tier_off_cap_run):
+        both = tier_off_cap_run.both
+        off, on = both.tier_off_cap_sweep, both.cap_sweep
+        assert off.tier_floors is False and on.tier_floors is True
+        assert off.bands == self._BINDING
+        assert sorted(both.tier_off_calibrations_by_band) == list(self._BINDING)
+        assert off.caps == on.caps and off.ks == on.ks == (0.5, 0.75, 1.0)
+        assert off.primary_cap == on.primary_cap == BUDGET_FRACTION
+        assert off.primary_k == on.primary_k and off.split_date == on.split_date
+        assert off.checks is True and off.st_entries == [] and off.same_title_eager is None
+        assert off.same_title() == {}
+        assert sorted(off.entries_by_band) == list(self._BINDING)
+        # Nothing simulated yet — every cap cell is lazy
+        assert (off.simulated, off.reused) == (0, 0)
+        # Announced once, after the tier-on sweep's own summary line
+        lines = [m for m in tier_off_cap_run.messages
+                 if m.startswith("Tier floors off: size-cap sweep:")]
+        assert lines == ["Tier floors off: size-cap sweep: 20 caps x 2 binding band(s) x 3 k, "
+                         "simulated on demand, one (band, k) cell at a time, when a report "
+                         "reads them"]
+        messages = tier_off_cap_run.messages
+        assert messages.index(lines[0]) > next(
+            i for i, m in enumerate(messages) if m.startswith("Size-cap sweep:"))
+
+    def test_its_seeds_are_the_family_s_points_and_never_a_tier_on_one(self, tier_off_cap_run):
+        both = tier_off_cap_run.both
+        off, on = both.tier_off_cap_sweep, both.cap_sweep
+        family = {(p.spread_band, p.k, p.population): p for p in both.tier_off_scenarios}
+        assert off.eager.keys() == family.keys()
+        assert all(off.eager[key] is point for key, point in family.items())
+        assert all(p.tier_floors is False for p in off.eager.values())
+        # The two seed maps share keys but never an object
+        assert set(off.eager) <= set(on.eager)
+        assert not {id(p) for p in off.eager.values()} & {id(p) for p in on.eager.values()}
+        assert all(p.tier_floors is True for p in on.eager.values())
+        # The primary cap hands back the family's own objects
+        for band, k, cell in self._cells(off):
+            for pop, point in cell[off.primary_cap].items():
+                assert point is family[(band, k, pop)]
+
+    def test_every_cap_equals_a_fresh_tier_off_simulation(self, tier_off_cap_run):
+        both, start = tier_off_cap_run.both, tier_off_cap_run.start
+        off = both.tier_off_cap_sweep
+        checked = 0
+        for band, k, cell in self._cells(off):
+            subsets = _cap_sweep_subsets(off.entries_by_band[band])
+            for cap in off.caps:
+                assert set(cell[cap]) == {pop for pop in self._POPS if subsets[pop]}
+                for pop, point in cell[cap].items():
+                    end = backtester._curve_end_date(off.eager[(band, k, pop)])
+                    self._assert_parity(point, subsets[pop], start, k, band, pop, cap,
+                                        both.split_date, end_date=end)
+                    checked += 1
+        assert checked == 2 * 3 * 4 * len(off.caps)
+        # Not vacuous: caps were simulated and caps were shared
+        assert off.simulated > 0 and off.reused > 0
+
+    @staticmethod
+    def _assert_parity(point, subset, start, k, band, pop, cap, split_date, *, end_date):
+        fresh = backtester._simulate_at_discount(subset, start, 10_000.0, k=k,
+                                                 spread_band=band, population=pop,
+                                                 tier_floors=False, size_cap=cap, quiet=True,
+                                                 end_date=end_date)
+        assert (point.k, point.spread_band, point.population) == (k, band, pop)
+        assert point.size_cap == cap and point.tier_floors is False
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
+            (band, k, pop, cap)
+        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+        assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+        if pop in ("all", "time_series"):
+            halves = ([r for r in subset if r["entry"]["entry_date"] < split_date],
+                      [r for r in subset if r["entry"]["entry_date"] >= split_date])
+            assert point.halves == backtester._half_split(
+                halves, start, 10_000.0, k, band, population=pop, tier_floors=False,
+                size_cap=cap, quiet=True, end_date=end_date)
+            assert point.ex_top_event == backtester._ex_top_event(
+                fresh, subset, start, 10_000.0, band, population=pop, tier_floors=False,
+                quiet=True, end_date=end_date)
+        else:
+            assert point.halves is None and point.ex_top_event is None
+
+    def test_its_entries_are_the_family_s_and_differ_from_the_tier_on_ones(
+            self, tier_off_cap_run):
+        both = tier_off_cap_run.both
+        off, on = both.tier_off_cap_sweep, both.cap_sweep
+        rows = TestPrepareEntriesGolden._rows
+        # The family's ladder enters on Monday 1 with the tiers off (see
+        # TestTierOffSweep), so the entries a cell simulates are not the
+        # tier-on sweep's — the reason a tier-on seed can never stand in
+        ladder_off = TestTierOffSweep._LADDER_OFF
+        for band in self._BINDING:
+            assert ladder_off in rows(off.entries_by_band[band])
+            assert ladder_off not in rows(on.entries_by_band[band])
+        events = off.entry_events()
+        traded = {(t.event_ticker, t.category) for p in both.tier_off_scenarios for t in p.trades}
+        assert traded and traded <= events
+
+    def test_reading_every_off_cell_stays_out_of_the_info_log(self, tier_off_cap_run, caplog):
+        off = tier_off_cap_run.both.tier_off_cap_sweep
+        before = off.simulated
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            off.cell((0.0, 1.0), 0.75)
+        assert off.simulated > before
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO]
+        done = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Backtest complete")]
+        assert done and all(" with the tier floors off, " in m for m in done)
+
+
+class TestCapSweepTierSetting:
+    """CapSweep._by_cap on hand-built points: the sweep's tier_floors reaches
+    every simulation it runs (the cap point, both halves, the ex-top
+    re-simulation) only when False, and a cap equal to BUDGET_FRACTION is
+    still forwarded by name."""
+
+    _BAND = (0.0, 1.0)
+
+    def _run(self, monkeypatch, *, tier_floors, caps, sim_peak, checks=False):
+        seen: list = []
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all", **kw):
+            seen.append((population, dict(kw)))
+            return backtester.SweepPoint(
+                k=k, trades=[TestSweepHelpers._trade("E1", 5.0)],
+                equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
+                spread_band=spread_band, population=population,
+                size_cap=kw.get("size_cap"), tier_floors=kw.get("tier_floors", True),
+                peak_kelly_fraction=sim_peak)
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
+        entries = [{"pair_type": "same_title", "entry": {
+            "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
+            "entry_date": date(2026, 1, 5)}}]
+        cs = backtester.CapSweep(
+            caps=caps, primary_cap=0.2, bands=(self._BAND,), ks=(0.75,), primary_k=0.75,
+            start_date=date(2026, 1, 1), initial_balance=100.0,
+            split_date=date(2026, 1, 1), checks=checks,
+            entries_by_band={self._BAND: entries}, st_entries=[], eager={},
+            tier_floors=tier_floors)
+        cell = cs.cell(self._BAND, 0.75)
+        return cs, cell, seen
+
+    def test_a_tier_off_sweep_forwards_the_setting_to_every_run(self, monkeypatch):
+        cs, cell, seen = self._run(monkeypatch, tier_floors=False, caps=(0.1, 1.0),
+                                   sim_peak=0.9, checks=True)
+        # The cap point, its two halves and its ex-top run, at both caps
+        assert [pop for pop, _kw in seen] == ["all", "all/H1", "all/H2", "all/ex-top"] * 2
+        assert all(kw.get("tier_floors") is False for _pop, kw in seen)
+        assert all(point.tier_floors is False for by_pop in cell.values()
+                   for point in by_pop.values())
+
+    def test_a_tier_on_sweep_forwards_no_tier_setting(self, monkeypatch):
+        cs, cell, seen = self._run(monkeypatch, tier_floors=True, caps=(0.1, 1.0),
+                                   sim_peak=0.9, checks=True)
+        assert seen and not [kw for _pop, kw in seen if "tier_floors" in kw]
+
+    def test_a_cap_equal_to_the_budget_fraction_is_still_named(self, monkeypatch):
+        # No eager point, so the run's own cap is simulated too: it is passed
+        # as size_cap=0.2 by name, never dropped as _sim_options drops a
+        # default — the CapSweep's cap must be the one its caps tuple names
+        cs, cell, seen = self._run(monkeypatch, tier_floors=False,
+                                   caps=(0.1, BUDGET_FRACTION, 1.0), sim_peak=0.95)
+        assert [kw for _pop, kw in seen] == [
+            {"size_cap": cap, "quiet": True, "tier_floors": False}
+            for cap in (0.1, BUDGET_FRACTION, 1.0)]

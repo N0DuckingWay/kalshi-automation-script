@@ -7657,6 +7657,354 @@ class TestExplorerCapAndMetrics:
         assert [None if p is None else p.n for p in data.pooled_off] == [1, None]
 
 
+# ─── Tier floors off at every size cap (C5) ──────────────────────────────────
+
+
+def _off_small(event: str = "KXOTHER-1") -> list[BacktestTrade]:
+    """The one-trade list a binding band's tier-off run trades at the 5% cap
+    — a list no other scenario trades."""
+    return [_kc_resized(_ftrade(event, "time_series", date(2026, 1, 13), date(2026, 1, 16),
+                                3.0), 2)]
+
+
+def _kc_sweep_tiers_capped(*, raise_on=None, small_event: str = "KXOTHER-1",
+                           caps=(0.05, 0.2, 1.0)) -> BacktestSweep:
+    """_kc_sweep_tiers() plus a tier-floors-off size-cap sweep over its one
+    binding band (_KC_B0), as run_backtest_sweep builds one: at the run's own
+    20% cap the family's own eager points (the same objects), at no cap a
+    copy sharing their trades (the 20% cap already reached their peak), and
+    at 5% a smaller one-trade list. `raise_on` makes that off cell's read
+    raise, as a failed simulation would; `caps` sets its caps (a mismatch
+    with the tier-on grid's makes it unusable)."""
+    sweep = _kc_sweep_tiers()
+    small = _off_small(small_event)
+    curve = backtester._build_equity_curve(small, _FLT_START, 1000.0)
+    points = {}
+    for eager in sweep.tier_off_scenarios:
+        points[(_KC_B0, eager.k, 0.05)] = SweepPoint(
+            k=eager.k, trades=small, equity_df=curve, spread_band=_KC_B0, size_cap=0.05,
+            tier_floors=False)
+        points[(_KC_B0, eager.k, 0.2)] = eager
+        points[(_KC_B0, eager.k, 1.0)] = dataclasses.replace(eager, size_cap=1.0)
+    return dataclasses.replace(sweep, tier_off_cap_sweep=_FakeCapSweep(
+        points, bands=(_KC_B0,), caps=caps, raise_on=raise_on))
+
+
+def _ex_sweep_tiers_capped(*, raise_on=None) -> BacktestSweep:
+    """_ex_sweep_tiers() plus a tier-floors-off size-cap sweep over its one
+    binding band (_KC_B0) with the band sweep's checks, as
+    _kc_sweep_tiers_capped builds for the bar: the family's own "all" and
+    "time_series" points at 20%, copies at no cap, and a one-trade list at
+    5%."""
+    sweep = _ex_sweep_tiers()
+    small = _off_small("KXRAIN-1")
+    curve = backtester._build_equity_curve(small, _FLT_START, 1000.0)
+    by_k: dict = {}
+    for eager in sweep.tier_off_scenarios:
+        by_k.setdefault(eager.k, {})[eager.population] = eager
+    points = {}
+    for k, pops in by_k.items():
+        low = SweepPoint(k=k, trades=small, equity_df=curve, spread_band=_KC_B0,
+                         size_cap=0.05, tier_floors=False,
+                         halves=HalfSplit(0.001, 0.0, 1, 1), ex_top_event=("KXRAIN-1", 0.0))
+        points[(_KC_B0, k, 0.05)] = {"all": low,
+                                     "time_series": dataclasses.replace(
+                                         low, population="time_series")}
+        points[(_KC_B0, k, 0.2)] = dict(pops)
+        points[(_KC_B0, k, 1.0)] = {pop: dataclasses.replace(p, size_cap=1.0)
+                                    for pop, p in pops.items()}
+    return dataclasses.replace(sweep, tier_off_cap_sweep=_ExplorerCapSweep(
+        points, bands=(_KC_B0,), caps=_EX_CAPS, raise_on=raise_on))
+
+
+_OFF_UNUSED_CLAUSE = ("per-trade cap: 20% (size-cap sweep on, but its tier-floors-off half "
+                      "could not be used — with the tier floors off the filter bar offers the "
+                      "run's own cap only; the log names why)</p>")
+_OFF_WARNING = ("The tier-floors-off size-cap sweep could not be simulated; with the tier "
+                "floors off the page offers the run's own cap only")
+_ON_WARNING = "The size-cap sweep could not be simulated; the page offers the run's own cap only"
+
+
+def _referenced_heads(chunks: dict[int, dict]) -> set[int]:
+    """Every row-head index (into the base block's "rows" table) some
+    shipped chunk's best / worst table refers to (a view with no trade has
+    neither table)."""
+    return {head for chunk in chunks.values() for view in chunk["list"]["views"].values()
+            for which in ("best", "worst") for head, _tail in view.get(which, [])}
+
+
+def _resolved_chunk(data: dict, chunk: dict) -> dict:
+    """One chunk with every best / worst row resolved to its HTML (the page's
+    shared row head plus the chunk's own tail), so two pages' chunks of one
+    list compare equal whatever order their head tables were filled in."""
+    out = json.loads(json.dumps(chunk))
+    for view in out["list"]["views"].values():
+        for which in ("best", "worst"):
+            if which in view:
+                view[which] = [data["rows"][head] + chunk["strings"][tail]
+                               for head, tail in view[which]]
+    return out
+
+
+class TestTierOffAtEveryCap:
+    """With a tier-floors-off size-cap sweep (BacktestSweep.tier_off_cap_sweep)
+    the page's Tier floors off view covers every size cap: the grid reads a
+    binding band's off cells from it, the bar ships their chunks, the
+    explorer ships an off block per cap, and a failure costs the off view's
+    other caps only — never the page, never the tier-on cap axis."""
+
+    def test_the_grid_reads_its_off_cells_from_the_tier_off_cap_sweep(self):
+        sweep = _kc_sweep_tiers_capped()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        assert source.off_cap_sweep is sweep.tier_off_cap_sweep
+        cell = source.off_cell(_KC_B0, 0.75)
+        assert sorted(cell) == [0.05, 0.2, 1.0]
+        # The run's own cap is the family's own point, the object itself
+        assert cell[0.2]["all"] is sweep.tier_off_scenarios[1]
+        assert cell[0.05]["all"].trades == _off_small()
+        # A band the tiers never bind at has no off cell: its tier-on run stands in
+        assert source.off_cell(_KC_B1, 0.75) == {}
+        # The fallback reads the family's eager points at the run's own cap
+        # alone, keeping the tier-on cap axis and the bar's labels
+        fallback = source.off_fallback()
+        assert fallback.off_cap_sweep is None and fallback.off_fallback is None
+        assert sorted(fallback.off_cell(_KC_B0, 0.75)) == [0.2]
+        assert fallback.off_events == source.off_events
+        assert fallback.cap_sweep is source.cap_sweep and fallback.caps == source.caps
+        # Without the tier-on cap axis the off view stays at the run's own cap
+        eager = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                       0.75, use_cap_sweep=False)
+        assert eager.off_cap_sweep is None and sorted(eager.off_cell(_KC_B0, 0.75)) == [0.2]
+
+    def test_a_tier_off_cap_sweep_that_does_not_match_the_grid_is_set_aside(self, caplog):
+        sweep = _kc_sweep_tiers_capped(caps=(0.05, 0.2))
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.off_cap_sweep is None and source.off_fallback is None
+        assert sorted(source.off_cell(_KC_B0, 0.75)) == [0.2]
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "The tier-floors-off size-cap sweep does not match the page's grid (its caps, "
+            "ks, binding bands or primary cap); with the tier floors off the page offers "
+            "the run's own cap only"]
+
+    def test_the_bar_fills_every_cap_of_a_binding_band_with_the_tiers_off(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers_capped())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        grid, grid_off = data["grid"], data["grid_off"]
+        pc = data["primary"][2]
+        for ki in range(len(data["ks"])):
+            row = grid_off[0][ki]
+            assert None not in row, ki
+            # 5%: the one-trade list; no cap shares the 20% chunk (one list)
+            assert chunks[row[0]]["list"]["views"]["all"]["n"] == 1
+            assert row[2] == row[pc] and row[0] != row[pc]
+            assert row[0] not in grid[0][ki]
+        # The band the tiers never bind at: its tier-on run at every cap
+        assert grid_off[1] == grid[1]
+        # Every chunk shipped is one some scenario shows
+        shown = {cid for g in (grid, grid_off) for band in g for row in band for cid in row
+                 if cid is not None}
+        assert shown == set(chunks)
+        # A healthy run's header line is unchanged
+        assert "| per-trade cap: 20% (size-cap sweep on)</p>" in page
+
+    def test_a_tier_off_choice_at_another_cap_draws_that_scenario(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers_capped())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        pb, pk, _ = data["primary"]
+        cid = data["grid_off"][pb][pk][0]
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], ["snap", "off"]],
+            strict=True)["off"]
+        n = chunks[cid]["list"]["views"]["all"]["n"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase_off(data, pb, pk, 0), False, None, n, n)
+        assert not snap["text"]["flt-summary"].startswith("Showing nothing")
+        assert snap["text"]["hdr-trades"] == str(n)
+        assert f"dash-chunk-{cid}" in snap["inflated"]
+
+    def test_the_explorer_ships_an_off_block_per_cap_and_follows_the_bar_there(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _ex_sweep_tiers_capped())
+        blocks = _scn_blocks(_ex_section(page))
+        data = blocks["scn-data"]
+        assert data["off_caps"] == [True, True, True]
+        assert [f"scn-off-cap-{ci}" in blocks for ci in range(3)] == [True, True, True]
+        low = blocks["scn-off-cap-0"]
+        # A binding band's row at 5%: the one-trade list; the other band's row
+        # is read from the tier-on block
+        assert low["cells"][1] is None
+        assert low["cells"][0][1][0]["trades"] == 1                      # "all"
+        assert blocks["scn-off-cap-1"]["cells"][0][1][0]["trades"] == 2
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "bar"],
+            # The explorer's own cap select, with the tiers off: no refusal
+            ["set", "scn-cap-select", "2"], ["fire", "scn-cap-select"], ["settle"],
+            ["snap", "own"]], strict=True, explorer=True)
+        bar, own = snaps["bar"], snaps["own"]
+        assert _scn_values(bar) + [bar["selects"]["scn-tier-select"]["value"]] == [
+            "0", "1", "0", "off"]
+        assert bar["text"].get("scn-status", "") == ""
+        assert bar["html"]["scn-banner"] == low["banner"]
+        assert "scn-off-cap-0" in bar["inflated"]
+        assert _scn_values(own) == ["0", "1", "2"]
+        assert own["text"].get("scn-status", "") == ""
+        assert own["html"]["scn-banner"] == blocks["scn-off-cap-2"]["banner"]
+
+    def test_a_raising_off_cell_keeps_the_tier_on_cap_axis(
+            self, monkeypatch, tmp_path, caplog):
+        # The second off cell raises, after the first was packed at every cap:
+        # the page falls back to the family's eager points at the run's own
+        # cap for the off view alone — one WARNING, the tier-on caps kept, no
+        # chunk shipped that nothing shows, and the header says why
+        sweep = _ex_sweep_tiers_capped(raise_on=(_KC_B0, 0.75))
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "size-cap sweep could not be simulated" in r.getMessage()]
+        assert [r.getMessage() for r in warned] == [_OFF_WARNING]
+        assert warned[0].exc_info is not None
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        pc = data["primary"][2]
+        assert len(data["caps"]) == 3
+        assert all(cid is not None for row in data["grid"][0] for cid in row)
+        for row in data["grid_off"][0]:
+            assert row[pc] is not None
+            assert [row[ci] for ci in range(3) if ci != pc] == [None, None]
+        shown = {cid for g in (data["grid"], data["grid_off"]) for band in g for row in band
+                 for cid in row if cid is not None}
+        assert shown == set(chunks)
+        # ... nor a row head: the heads the dropped off cells packed went with them
+        assert _referenced_heads(chunks) == set(range(len(data["rows"])))
+        blocks = _scn_blocks(_ex_section(page))
+        assert blocks["scn-data"]["off_caps"] == [False, True, False]
+        assert sorted(b for b in blocks if b.startswith("scn-off-cap-")) == ["scn-off-cap-1"]
+        assert [f"scn-cap-{ci}" in blocks for ci in range(3)] == [True, True, True]
+        assert _OFF_UNUSED_CLAUSE in page and _KC_UNUSED_CLAUSE not in page
+        # The page is whole
+        assert "Trade-Level Diagnostics" in page and page.rstrip().endswith("</html>")
+
+    def test_the_off_fallback_ships_the_eager_off_chunks_and_nothing_else(
+            self, monkeypatch, tmp_path):
+        # The first off cell (k 0.60) is packed at every cap — its 20% list, a
+        # list no tier-on scenario trades, in a chunk packed AFTER the off
+        # mark — and the second (k 0.75) raises. The re-walk from the eager
+        # points must pack that 20% list again rather than reuse the id of
+        # the chunk reset_off dropped: each k's off chunk at the run's own cap
+        # is exactly the one a page without the tier-off size-cap sweep ships
+        # there, every id the grids name is shipped and every shipped chunk
+        # and row head is one some scenario shows
+        page = _kc_page(monkeypatch, tmp_path, _ex_sweep_tiers_capped(raise_on=(_KC_B0, 0.75)))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        eager_page = _kc_page(monkeypatch, tmp_path, _ex_sweep_tiers())
+        eager_data, eager_chunks = (TestFilterPage._data(eager_page),
+                                    TestFilterPage._chunks(eager_page))
+        pc = data["primary"][2]
+        assert eager_data["primary"][2] == pc
+        tier_on = {cid for band in data["grid"] for row in band for cid in row
+                   if cid is not None}
+        off_ids = [data["grid_off"][0][ki][pc] for ki in range(len(data["ks"]))]
+        # One chunk per k, neither of them a tier-on scenario's
+        assert len(set(off_ids)) == len(off_ids) and not set(off_ids) & tier_on
+        for ki, cid in enumerate(off_ids):
+            assert cid in chunks, ki
+            eager_cid = eager_data["grid_off"][0][ki][pc]
+            assert _resolved_chunk(data, chunks[cid]) == _resolved_chunk(
+                eager_data, eager_chunks[eager_cid]), ki
+        shown = {cid for g in (data["grid"], data["grid_off"]) for band in g for row in band
+                 for cid in row if cid is not None}
+        assert shown <= set(chunks)
+        assert set(chunks) <= shown
+        assert _referenced_heads(chunks) == set(range(len(data["rows"])))
+
+    def test_a_raising_tier_on_cell_still_falls_back_as_before(
+            self, monkeypatch, tmp_path, caplog):
+        sweep = _ex_sweep_tiers_capped()
+        sweep.cap_sweep.raise_on = (_KC_B1, 0.75)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path, sweep)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "size-cap sweep could not be simulated" in r.getMessage()]
+        assert warned == [_ON_WARNING]
+        data = TestFilterPage._data(page)
+        assert len(data["caps"]) == 1
+        assert all(len(row) == 1 and row[0] is not None for row in data["grid_off"][0])
+        assert _KC_UNUSED_CLAUSE in page and _OFF_UNUSED_CLAUSE not in page
+
+    def test_max_trades_counts_the_off_points_at_every_cap(self):
+        sweep = _kc_sweep_tiers_capped()
+        big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
+                                   date(2026, 1, 16), 1.0), 1) for i in range(9)]
+        curve = backtester._build_equity_curve(big, _FLT_START, 1000.0)
+        off = sweep.tier_off_cap_sweep
+        off.points[(_KC_B0, 0.6, 1.0)] = SweepPoint(
+            k=0.6, trades=big, equity_df=curve, spread_band=_KC_B0, size_cap=1.0,
+            tier_floors=False)
+        assert backtester.max_trades_simulated(sweep) < 9
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        _, _, counter, _ = dashboard._build_filter_grid(
+            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
+            _FLT_SERIES)
+        assert counter.most == 9 and not counter.failed
+
+    def test_a_count_the_off_fallback_drops_is_not_kept(self):
+        # The first off cell (k 0.6) holds 9 trades at no cap and is counted;
+        # the second raises. The walk then re-reads the off view from the
+        # family's eager points, which the page shows instead, so the 9 —
+        # a scenario the page no longer shows — is dropped with the rest of
+        # the off view (_MaxTrades.reset_off)
+        sweep = _kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.75))
+        big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
+                                   date(2026, 1, 16), 1.0), 1) for i in range(9)]
+        sweep.tier_off_cap_sweep.points[(_KC_B0, 0.6, 1.0)] = SweepPoint(
+            k=0.6, trades=big, equity_df=backtester._build_equity_curve(big, _FLT_START, 1000.0),
+            spread_band=_KC_B0, size_cap=1.0, tier_floors=False)
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        walked, _, counter, _ = dashboard._build_filter_grid(
+            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
+            _FLT_SERIES)
+        assert walked.off_cap_sweep is None and walked.cap_sweep is source.cap_sweep
+        most_eager = max(len(p.trades) for p in [*sweep.scenarios, *sweep.tier_off_scenarios])
+        assert counter.most == max(most_eager, max(
+            len(p.trades) for (_b, _k, _c), p in sweep.cap_sweep.points.items()))
+        assert counter.most < 9
+
+    def test_the_labels_include_every_tier_off_cap_event(self):
+        series = {**_FLT_SERIES, "KXSNOW": ("Climate", ("Snow",))}
+        sweep = _kc_sweep_tiers_capped(small_event="KXSNOW-1")
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        capped = dashboard._grid_source(sweep, trades, curve, 0.75)
+        eager = dashboard._grid_source(sweep, trades, curve, 0.75, use_cap_sweep=False)
+        cats, subs = dashboard._filter_labels(capped, trades, series)
+        assert "Climate" in cats and ("Climate", "Snow") in subs
+        # Only a tier-off cap point trades it: the eager grid never lists it
+        assert "Climate" not in dashboard._filter_labels(eager, trades, series)[0]
+
+    def test_the_run_settings_line_names_a_tier_off_cap_sweep_it_could_not_use(self):
+        pt = dataclasses.replace(_scn_point((0.3, 0.6), 0.75), size_cap=0.2)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_scn_coverage(), cap_sweep=object(),
+                              tier_off_cap_sweep=object(), same_event_ladders=True)
+        assert dashboard._run_settings_html(
+            sweep, tier_off_cap_sweep_unused=True).endswith(_OFF_UNUSED_CLAUSE)
+        # Every cap lost says so once, as before
+        assert dashboard._run_settings_html(
+            sweep, cap_sweep_unused=True, tier_off_cap_sweep_unused=True).endswith(
+            _KC_UNUSED_CLAUSE)
+        # Healthy, or without a tier-off cap sweep: the line is unchanged
+        healthy = dashboard._run_settings_html(sweep)
+        assert healthy.endswith("per-trade cap: 20% (size-cap sweep on)</p>")
+        without = dataclasses.replace(sweep, tier_off_cap_sweep=None)
+        assert dashboard._run_settings_html(without, tier_off_cap_sweep_unused=True) == healthy
+
+
 class TestExplorerFullGrid:
     """
     A full size-cap grid — 36 bands x 13 ks x 20 caps (9,360 scenarios, the

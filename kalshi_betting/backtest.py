@@ -113,8 +113,11 @@ Notes:
     the summary block included, is sized at the run's own cap,
     config.BUDGET_FRACTION. The dashboard reads every cell as it is built,
     for its filter bar's Size cap select, the Interval Discount section and
-    the scenario explorer's cap axis. The CapSweep covers the tier-on grid
-    only; the tier-floors-off runs are sized at the run's own cap alone.
+    the scenario explorer's cap axis. With the band sweep's tier-floors-off
+    runs on too (the default), a second lazy CapSweep
+    (BacktestSweep.tier_off_cap_sweep) covers them at every cap as well, so
+    every tier x band x k x cap scenario the page offers is a real
+    simulation.
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
@@ -252,9 +255,10 @@ def main() -> None:
     post-cutoff check; the tier-floors-off family is read by that check and
     by the dashboard's filter bar, k-hat breakdown and scenario explorer
     (their Tier floors choice), carried to generate_dashboard on the sweep;
-    and the lazily simulated size caps (result.cap_sweep) only by the
-    dashboard, which reads every cell as the page is built (its filter bar,
-    Interval Discount section and scenario explorer).
+    and the lazily simulated size caps (result.cap_sweep, and the
+    tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
+    by the dashboard, which reads every cell as the page is built (its filter
+    bar, Interval Discount section and scenario explorer).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -521,7 +525,7 @@ def main() -> None:
         # tier-bound bands simulated again with the tiers off (needs the grid)
         tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweep (cap_sweep) unless --no-cap-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points are read by the filter bar's k select
@@ -531,8 +535,9 @@ def main() -> None:
     # explorer too (their Tier floors choice), every kept point — the
     # tier-floors-off family's included — by max_trades_simulated's
     # post-cutoff check (_log_corpus_provenance below, and the dashboard's
-    # header), and the lazy size-cap sweep (result.cap_sweep, simulated only
-    # when a cell is read) only by the dashboard, whose one grid walk reads
+    # header), and the lazy size-cap sweeps (result.cap_sweep and, over the
+    # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
+    # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
     # and scenario explorer).
     trades, equity_df = result.primary.trades, result.primary.equity_df
@@ -567,9 +572,10 @@ def main() -> None:
     # sweep carries the calibration and every swept point for the k
     # selectors, the scenario explorer's band x k payload, the filter bar,
     # the k-hat breakdown, both Tier floors views (the bar's and the
-    # explorer's, from its tier-floors-off family), the lazy size-cap sweep
-    # (cap_sweep, None under --no-cap-sweep — every cell of it is simulated
-    # here, in the page's one grid walk) and the header's run-settings line;
+    # explorer's, from its tier-floors-off family), the lazy size-cap sweeps
+    # (cap_sweep and tier_off_cap_sweep, None under --no-cap-sweep — every
+    # cell of them is simulated here, in the page's one grid walk) and the
+    # header's run-settings line;
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

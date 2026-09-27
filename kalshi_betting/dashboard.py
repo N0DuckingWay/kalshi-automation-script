@@ -130,9 +130,14 @@ Notes:
     band whose floor sits at or above both tiers is never simulated again,
     because the tiers never bind there (backtester._tier_floors_bind): its
     off view IS its tier-on run (the same chunk), and the summary line says
-    so. The family is simulated at the run's own size cap only, so a binding
-    band's off view at any other cap is a scenario the run never simulated,
-    and the summary line says that too. A run without the family, or with
+    so. At the run's own size cap a binding band's off view is the family's
+    eager point; at any other cap it is the tier-floors-off size-cap sweep's
+    (BacktestSweep.tier_off_cap_sweep) point, simulated as the page is built,
+    so every tier x band x k x cap scenario is a genuine simulation. Only a
+    run without that sweep (a hand-built one) — or one the page could not
+    use, which the header's run-settings line says — leaves a binding band's
+    off view at another cap a scenario the run never simulated, and the
+    summary line then says that too. A run without the family, or with
     one missing a binding band, has no off view at all — never a relabelled
     tier-on run: the select stays disabled, with a note beside it
     (_tier_off_binds). Its category and tag choices show a
@@ -191,8 +196,9 @@ Notes:
     section), and the scenario explorer's visitor keeps every scenario's
     per-population figures and headline curve as JSON text — the
     tier-floors-off cells too, through its `off` method — and packs a block
-    per size cap, plus a tier-floors-off block per size cap the family was
-    simulated at (_ExplorerVisitor — one that fails costs only the
+    per size cap, plus a tier-floors-off block per size cap the grid has off
+    cells at — every cap, with the tier-floors-off size-cap sweep
+    (_ExplorerVisitor — one that fails costs only the
     explorer's cap axis: it is rebuilt from the sweep's own eager points,
     tier-floors-off family included, and a notice replaces it only if even
     that fails). The walk also reads
@@ -204,7 +210,11 @@ Notes:
     into one string or encoded whole. A size-cap cell (or the size-cap sweep
     itself) that cannot be read costs the cap axis (the eager points are
     walked instead, with one WARNING, and the header's run-settings line says
-    the sweep could not be used); a chunk that cannot be built,
+    the sweep could not be used); a tier-floors-off size-cap cell that
+    cannot be read costs only the off view's other caps (its off cells are
+    walked again from the family's eager points at the run's own cap, one
+    WARNING, the header saying so, the tier-on cap axis kept); a chunk that
+    cannot be built,
     or a base block that cannot be, costs the bar, never the page: the page
     is written without it, with a notice in its place and a WARNING in the
     log. The page as rendered IS the primary scenario's unfiltered view with
@@ -248,9 +258,10 @@ Notes:
     gzip-packed data blocks — a base block ("scn-data") and, only when that
     cap is chosen, one block per size cap ("scn-cap-<i>"), and, only when
     the tier floors are chosen off there, that cap's tier-floors-off block
-    ("scn-off-cap-<i>", present only at a cap the run simulated the family
-    at — in production the run's own; any other cap with the tiers off is
-    refused on the section's status line) — and drives Plotly.update (the
+    ("scn-off-cap-<i>", present at every cap the grid has tier-off cells at
+    — every cap of a run with the tier-floors-off size-cap sweep, the run's
+    own alone without it; a cap without one is refused with the tiers off on
+    the section's status line) — and drives Plotly.update (the
     heatmap: metric, matrix, colour scale, title, and its band labels when
     the Tier floors setting changes; the equity curve, autoranged and
     titled for the setting on every redraw), the display of the two k-hat
@@ -3106,7 +3117,8 @@ def _robustness_extras(point: SweepPoint) -> dict:
 # titles), all packed by _packed_json_script and unpacked here by unpack(el)
 # — the primary cap's as the page loads, any other only when chosen — and,
 # on a page with a tier-floors-off view, when that setting is chosen at a cap
-# the run simulated it at (id="scn-off-cap-<i>": the binding bands' rows and
+# the page has it at (every cap, with a tier-floors-off size-cap sweep;
+# id="scn-off-cap-<i>": the binding bands' rows and
 # that grid's banner, matrices and titles; every other band reads its
 # tier-on row there). A cap the run never simulated with the tier floors off
 # (the base block's "off_caps") is refused: every select goes back on the
@@ -3545,7 +3557,8 @@ def _scenario_explorer_empty_reason(sweep: BacktestSweep) -> str:
 
 
 def _run_settings_html(sweep: BacktestSweep | None, *,
-                       cap_sweep_unused: bool = False) -> str:
+                       cap_sweep_unused: bool = False,
+                       tier_off_cap_sweep_unused: bool = False) -> str:
     """
     Render the page-header line naming the run's primary spread band, ladder setting and size cap.
 
@@ -3563,7 +3576,12 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     this line AFTER the filter's walk and passes cap_sweep_unused when the
     run carried a size-cap sweep but the bar fell back to the run's own cap
     (a cell or the sweep itself could not be read — the log's WARNING names
-    why). "not recorded" is printed rather than a guess whenever the sweep
+    why), and tier_off_cap_sweep_unused when the tier-on cap axis was used
+    but the tier-floors-off size-cap sweep (BacktestSweep.tier_off_cap_sweep)
+    was not, so the bar's Tier floors off view offers the run's own cap
+    only — the tier-on fallback's clause already covers every cap, so the
+    tier-off one is said only when it alone was lost; a healthy run's line
+    is unchanged. "not recorded" is printed rather than a guess whenever the sweep
     does not carry the value (no sweep at all — the four-positional
     generate_dashboard call — or a hand-built sweep). The sweep reads "off,
     --no-cap-sweep" only when the run carries a census (label_coverage):
@@ -3586,11 +3604,17 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
         cap_sweep_unused (bool): Keyword-only. The sweep carries a size-cap
             sweep but the filter bar offers the run's own cap only (the walk
             fell back to the eager points). Ignored without a size-cap sweep.
+        tier_off_cap_sweep_unused (bool): Keyword-only. The sweep carries a
+            tier-floors-off size-cap sweep but the bar's off view offers the
+            run's own cap only (it could not be read, or an off cell could
+            not be simulated). Ignored without one, and when
+            cap_sweep_unused already says every cap was lost.
 
     Returns:
         str: One <p> line: "Primary spread band: <label> | same-event
             ladders: on / off / not recorded | per-trade cap: <cap>
-            (size-cap sweep on / on, but it could not be used — … / off,
+            (size-cap sweep on / on, but it could not be used — … / on, but
+            its tier-floors-off half could not be used — … / off,
             --no-cap-sweep / not recorded)", the cap as the bar's Size cap
             select names it (_cap_option), and an on/off ladder reading
             suffixed " (same as this checkout's config)", or " (departs from
@@ -3620,6 +3644,11 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
         if sweep.cap_sweep is not None and cap_sweep_unused:
             cap_sweep = ("on, but it could not be used — the filter bar offers the "
                          "run's own cap only; the log names why")
+        elif (sweep.cap_sweep is not None and tier_off_cap_sweep_unused
+              and getattr(sweep, "tier_off_cap_sweep", None) is not None):
+            cap_sweep = ("on, but its tier-floors-off half could not be used — with the "
+                         "tier floors off the filter bar offers the run's own cap only; "
+                         "the log names why")
         elif sweep.cap_sweep is not None:
             cap_sweep = "on"
         elif sweep.label_coverage is not None:
@@ -3783,8 +3812,9 @@ _SCENARIO_TIER_OFF_SUFFIX = " — tier floors off"
 _SCENARIO_TIER_OFF_PHRASE = " with the tier floors off"
 
 # The scenario explorer's status line when a size cap with the tier floors
-# off is chosen that the run never simulated (until a tier-floors-off size-cap
-# sweep exists, every cap but the run's own): {failed} is that cap and
+# off is chosen that the run never simulated (every cap but the run's own
+# when the page could not read a tier-floors-off size-cap sweep, or the run
+# carries none): {failed} is that cap and
 # setting, {shown} the one the section still shows — the script puts every
 # select back on it, as it does for a block that cannot be unpacked.
 _SCENARIO_TIER_OFF_MISSING = ("{failed} was not simulated by this run; the explorer "
@@ -3997,10 +4027,13 @@ def _section_scenario_explorer(
     _SCENARIO_TIER_OFF_SUFFIX, and the banner opens on
     _SCENARIO_TIER_OFF_LEAD and counts that grid — its "(N scenario points"
     included. A cell the family lacks reads "—", as a missing tier-on one
-    does, and so does a calibration it lacks. The family is simulated at the
-    run's own size cap only, so every other cap has no off view: choosing
-    one with the tiers off is refused, and the status line says so in
-    Python's words (_SCENARIO_TIER_OFF_MISSING). Without a complete family
+    does, and so does a calibration it lacks. A size cap has an off view
+    when the walk handed the visitor off cells there: every cap when the grid
+    reads them from the tier-floors-off size-cap sweep
+    (BacktestSweep.tier_off_cap_sweep), the run's own alone otherwise (no
+    such sweep, or one the page could not use). Choosing a cap without one
+    with the tiers off is refused, and the status line says so in Python's
+    words (_SCENARIO_TIER_OFF_MISSING). Without a complete family
     there is no select, no hidden table and no off block, and the section
     is exactly what a run without the family renders.
 
@@ -4021,7 +4054,7 @@ def _section_scenario_explorer(
     per-population figures — the headline one with its curve as change
     points on the explorer's axis (_equity_axis) — the same-title row, the
     banner, the cap's seven matrices and the nine heatmap titles) and one
-    tier-floors-off block per size cap the family was simulated at (id
+    tier-floors-off block per size cap the grid has off cells at (id
     "scn-off-cap-<i>": a binding band's row of off cells, null for every
     other band, and that grid's banner, seven matrices and nine titles; no
     same-title row, which no tier floor reaches). Only the base block and
@@ -5117,17 +5150,33 @@ class _GridSource:
             _tier_off_binds; None when the page has no tier-floors-off view
             at all (no family, an incomplete one, or an unrecorded band).
         off_cell: Callable (band, k) -> {cap: {population: SweepPoint}} — a
-            binding band's tier-floors-off points
-            (BacktestSweep.tier_off_scenarios, stamped tier_floors False),
-            filed under the run's own size cap, the one cap the family was
-            simulated at; {} for a cell the family never simulated. Read by
-            the walk for binding bands only (_walk_once).
+            binding band's tier-floors-off points (stamped tier_floors
+            False): at every cap of the grid, simulated on demand by the
+            tier-floors-off size-cap sweep (BacktestSweep.tier_off_cap_sweep,
+            off_cap_sweep below) when the grid is a size-cap grid that can
+            use it, else the family's eager points
+            (BacktestSweep.tier_off_scenarios) filed under the run's own
+            size cap alone; {} for a band the tiers never bind at or a cell
+            the family never simulated. Read by the walk for binding bands
+            only (_walk_once), and — like cell — may simulate and so may
+            raise.
         off_calibrations (dict): Binding band -> its tier-off
             IntervalCalibration (BacktestSweep.tier_off_calibrations_by_band);
             a non-binding band reads its tier-on calibration instead.
         off_events (frozenset): (event ticker, fallback category) of every
-            trade a tier-off cell can show, so the bar lists a category only
-            a tier-off run traded.
+            trade a tier-off cell can show — the tier-floors-off size-cap
+            sweep's entry events when it is used, and the family's eager
+            trades — so the bar lists a category only a tier-off run traded.
+            Kept by off_fallback's grid, so the bar's labels never move.
+        off_cap_sweep: The backtester.CapSweep the off cells come from (the
+            tier-floors-off one), or None — read for its simulated / reused
+            counters in the walk's log, and by generate_dashboard to say in
+            the header when a run's tier-off size-cap sweep could not be used.
+        off_fallback: Callable () -> _GridSource, or None: this grid with its
+            off cells read from the family's eager points at the run's own
+            cap (off_cap_sweep None) — what the walk falls back to when an
+            off cell cannot be simulated, keeping the tier-on cap axis
+            (_walk_once).
     """
     bands: tuple
     ks: tuple
@@ -5144,6 +5193,8 @@ class _GridSource:
     off_cell: Callable[[tuple[float, float] | None, float | None], dict] = _no_off_cell
     off_calibrations: dict = field(default_factory=dict)
     off_events: frozenset = frozenset()
+    off_cap_sweep: object | None = None
+    off_fallback: Callable[[], "_GridSource"] | None = None
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -5246,11 +5297,24 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
 
     Every point of BacktestSweep.tier_off_scenarios stamped tier_floors False
     (never a tier-on one) at a band the tiers bind at is filed by (band, k,
-    population) under the grid's primary size cap — the run's own, the one
-    cap the family was simulated at — the first point wins, as
+    population) under the grid's primary size cap — the run's own, the cap
+    the family's eager points were simulated at — the first point wins, as
     _eager_source files the tier-on ones. A band the tiers never bind at has
     no off cell: its tier-on scenarios stand in (the walk reuses their
     chunks), which is #68's rule that such a band's off view IS its run.
+
+    When the grid is a size-cap grid (source.cap_sweep set) and the sweep
+    carries a tier-floors-off size-cap sweep (BacktestSweep.
+    tier_off_cap_sweep) on the same caps and ks, holding every binding band
+    and the grid's primary cap, the off cells come from IT instead — every
+    cap of every binding band, simulated on demand as the walk reads them,
+    the primary cap's points being those same eager objects — and the eager
+    lookup becomes the grid's off_fallback, what the walk reads should an
+    off cell fail to simulate (the tier-on cap axis is kept). A tier-off
+    size-cap sweep that does not match the grid, or whose entry events
+    cannot be read, costs the off view's other caps only: one WARNING and
+    the eager lookup, and the header says it could not be used
+    (generate_dashboard, off_cap_sweep None).
 
     Args:
         source (_GridSource): The tier-on grid.
@@ -5260,7 +5324,8 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
         _GridSource: The source itself when _tier_off_binds says the page
             has no off view (no sweep, no or an incomplete family, an
             unrecorded band); else a copy carrying tier_binds, off_cell,
-            off_calibrations and off_events.
+            off_calibrations and off_events — and, with a usable tier-off
+            size-cap sweep, off_cap_sweep and off_fallback.
     """
     binds = _tier_off_binds(sweep, list(source.bands))
     if binds is None:
@@ -5273,7 +5338,7 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
             by_cell.setdefault((point.spread_band, point.k), {}).setdefault(
                 point.population, point)
 
-    def off_cell(band, k) -> dict:
+    def eager_off_cell(band, k) -> dict:
         """
         One binding (band, k)'s tier-floors-off points, at the run's own cap.
 
@@ -5288,12 +5353,61 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
         pops = by_cell.get((band, k))
         return {cap: dict(pops)} if pops else {}
 
-    return dataclasses.replace(
-        source, tier_binds=tuple(binds), off_cell=off_cell,
+    eager_events = _trade_events(point for pops in by_cell.values()
+                                 for point in pops.values())
+    eager = dataclasses.replace(
+        source, tier_binds=tuple(binds), off_cell=eager_off_cell,
         off_calibrations={band: sweep.tier_off_calibrations_by_band.get(band)
                           for band in binding},
-        off_events=_trade_events(point for pops in by_cell.values()
-                                 for point in pops.values()))
+        off_events=eager_events)
+    off_capped = getattr(sweep, "tier_off_cap_sweep", None)
+    if source.cap_sweep is None or off_capped is None:
+        return eager
+    try:
+        usable = (tuple(off_capped.caps) == tuple(source.caps)
+                  and tuple(off_capped.ks) == tuple(source.ks)
+                  and binding <= set(off_capped.bands)
+                  and off_capped.primary_cap == cap)
+        # Every entry's event, as its simulations file their trades — so the
+        # bar lists a category only a tier-off cap point could trade
+        events = (frozenset(off_capped.entry_events()) | eager_events) if usable else None
+    except Exception:
+        logging.warning("The tier-floors-off size-cap sweep could not be read; with the "
+                        "tier floors off the page offers the run's own cap only",
+                        exc_info=True)
+        return eager
+    if not usable:
+        logging.warning("The tier-floors-off size-cap sweep does not match the page's grid "
+                        "(its caps, ks, binding bands or primary cap); with the tier floors "
+                        "off the page offers the run's own cap only")
+        return eager
+
+    def capped_off_cell(band, k) -> dict:
+        """
+        One binding (band, k)'s tier-floors-off points, at every cap.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+
+        Returns:
+            dict: {cap: {population: point}} (backtester.CapSweep.cell,
+                simulated as it is read — it may raise), or {} for a band the
+                tiers never bind at.
+        """
+        if band not in binding:
+            return {}
+        # Simulates the cell's caps with the tier floors off (backtester's
+        # lazy tier-off CapSweep): a cap grid is never held in memory whole
+        return off_capped.cell(band, k)
+
+    capped = dataclasses.replace(eager, off_cell=capped_off_cell, off_events=events,
+                                 off_cap_sweep=off_capped)
+    # The eager lookup, keeping the capped grid's off_events so the bar's
+    # category and tag lists (built before the walk) never move
+    return dataclasses.replace(
+        capped, off_fallback=lambda: dataclasses.replace(
+            capped, off_cell=eager_off_cell, off_cap_sweep=None, off_fallback=None))
 
 
 def _trade_events(points) -> frozenset:
@@ -5751,47 +5865,26 @@ def _same_title_points(source: _GridSource) -> dict:
     return own
 
 
-def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
-               ) -> Exception | None:
+def _walk_cells(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
+                ) -> Exception | None:
     """
-    Hand every scenario of a grid to each visitor, one (band, k) cell at a time.
+    Hand every tier-on scenario of a grid to each visitor, one (band, k) cell at a time.
 
     The primary cell comes first, and within every cell the primary cap
     first, so the primary scenario's chunk is always chunk 0. A cell is read
     (source.cell — a size-cap sweep simulates it here), its curves are cut to
     the page's axis (_cut_to_axis), every cap of it is visited, and it is
     dropped before the next is read: only one cell's points are ever alive.
-    Then, when some visitor shows it (one with a same_title method), the
-    band- and k-independent same-title population is read once
-    (_same_title_points: source.same_title — a size-cap sweep simulates it
-    here too — or, if that raises, the run's own same-title point alone),
-    cut the same way, and handed to those visitors as {cap: point}. A
-    same-title failure costs only the same-title rows at the other caps,
-    never the cells already walked: it does not stop the walk.
-
-    After the tier-on cells, when the grid carries a tier-floors-off family
-    (source.tier_binds) and some visitor takes it (one with an `off`
-    method), every BINDING band's off cells are read (source.off_cell), cut
-    and handed to those visitors the same way, one (band, k) at a time, in
-    band and k order. A band the tiers never bind at is not walked again:
-    its tier-on scenarios stand in for its off view (each visitor reuses
-    what it built for them), so nothing is simulated twice. The primary
-    scenario's own trades are never substituted here — a tier-off run is
-    its own simulation. A visitor without an `off` method (the
-    interval-discount section's) stays tier-on.
 
     Args:
         source (_GridSource): The grid.
         visitors (list): Callables (band index, k index, cap index,
-            {population: SweepPoint}); one may also have a
-            same_title({cap: SweepPoint}) method, and an off(band index,
-            k index, cap index, {population: SweepPoint}) method taking the
-            tier-floors-off cells.
+            {population: SweepPoint}).
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
-        Exception | None: The exception source.cell (or source.off_cell)
-            raised, which stops the walk; None when every cell was visited.
+        Exception | None: The exception source.cell raised, which stops the
+            walk; None when every cell was visited.
     """
     pb, pk, pc = source.primary
     cells = [(pb, pk)] + [(bi, ki) for bi in range(len(source.bands))
@@ -5815,23 +5908,123 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             logging.info("Dashboard: %d/%d band x k cells read from the size-cap sweep "
                          "(%d cap points simulated, %d shared so far)", done, len(cells),
                          getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    return None
+
+
+def _walk_off_cells(source: _GridSource, off_takers: list, axis_end: pd.Timestamp | None
+                    ) -> Exception | None:
+    """
+    Hand every BINDING band's tier-floors-off scenarios to the visitors that take them.
+
+    Read (source.off_cell — the tier-floors-off size-cap sweep simulates it
+    here, when the grid has one), cut and handed to each visitor's `off`
+    method the same way as a tier-on cell, one (band, k) at a time, in band
+    and k order, the primary cap first. A band the tiers never bind at is
+    not walked: its tier-on scenarios stand in for its off view (each
+    visitor reuses what it built for them), so nothing is simulated twice.
+
+    Args:
+        source (_GridSource): The grid (its tier_binds is not None).
+        off_takers (list): The visitors with an `off` method.
+        axis_end (pd.Timestamp | None): The page's last date.
+
+    Returns:
+        Exception | None: The exception source.off_cell raised, which stops
+            this phase; None when every binding cell was visited.
+    """
+    pc = source.primary[2]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    cells = [(bi, ki) for bi, binds in enumerate(source.tier_binds) if binds
+             for ki in range(len(source.ks))]
+    capped = source.off_cap_sweep
+    every = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+    for done, (bi, ki) in enumerate(cells, 1):
+        try:
+            by_cap = source.off_cell(source.bands[bi], source.ks[ki])
+        except Exception as exc:
+            return exc
+        by_cap = _cut_to_axis(by_cap, axis_end)
+        for ci in caps:
+            pops = by_cap.get(source.caps[ci])
+            if pops:
+                for visit in off_takers:
+                    visit.off(bi, ki, ci, pops)
+        del by_cap
+        if capped is not None and (done % every == 0 or done == len(cells)):
+            logging.info("Dashboard: %d/%d binding band x k cells read from the "
+                         "tier-floors-off size-cap sweep (%d cap points simulated, %d shared "
+                         "so far)", done, len(cells), getattr(capped, "simulated", 0),
+                         getattr(capped, "reused", 0))
+    return None
+
+
+def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
+               ) -> tuple[Exception | None, _GridSource]:
+    """
+    Hand every scenario of a grid to each visitor: tier-on cells, tier-off cells, same-title.
+
+    First the tier-on cells (_walk_cells: the primary cell and cap first, so
+    the primary scenario's chunk is always chunk 0, one cell alive at a
+    time). Then, when the grid carries a tier-floors-off family
+    (source.tier_binds) and some visitor takes it (one with an `off`
+    method), every BINDING band's off cells (_walk_off_cells). The primary
+    scenario's own trades are never substituted there — a tier-off run is
+    its own simulation — and a visitor without an `off` method (the
+    interval-discount section's) stays tier-on. An off cell that raises
+    while the grid has an off_fallback (a tier-floors-off size-cap sweep it
+    could not simulate) costs the off view's other caps only: ONE WARNING
+    (with the traceback), every off-taker's tier-off state dropped
+    (`reset_off(grid)`, on the visitors that define it — each keeps its
+    tier-on state, so the tier-on cap axis survives), and the off cells
+    walked again from the family's eager points at the run's own cap; the
+    grid returned is that fallback, whose off_cap_sweep is None, which is
+    how generate_dashboard's header learns it. An off cell that raises
+    WITHOUT an off_fallback — or whose fallback raises too — stops the walk
+    like a tier-on cell (the caller falls back to the eager grid, as
+    before). Last, when some visitor shows it (one with a same_title
+    method), the band- and k-independent same-title population is read once
+    (_same_title_points: source.same_title — a size-cap sweep simulates it
+    here too — or, if that raises, the run's own same-title point alone),
+    cut the same way, and handed to those visitors as {cap: point}. A
+    same-title failure costs only the same-title rows at the other caps,
+    never the cells already walked: it does not stop the walk.
+
+    Args:
+        source (_GridSource): The grid.
+        visitors (list): Callables (band index, k index, cap index,
+            {population: SweepPoint}); one may also have a
+            same_title({cap: SweepPoint}) method, and an off(band index,
+            k index, cap index, {population: SweepPoint}) method taking the
+            tier-floors-off cells, with a reset_off(grid) method dropping
+            what off() built.
+        axis_end (pd.Timestamp | None): The page's last date.
+
+    Returns:
+        tuple[Exception | None, _GridSource]: The exception source.cell (or
+            an off cell with no fallback to recover it) raised, which stops
+            the walk, else None; and the grid walked — the source, or its
+            off_fallback when the tier-off size-cap sweep could not be read.
+    """
+    error = _walk_cells(source, visitors, axis_end)
+    if error is not None:
+        return error, source
     off_takers = [visit for visit in visitors if hasattr(visit, "off")]
     if source.tier_binds is not None and off_takers:
-        for bi, binds in enumerate(source.tier_binds):
-            if not binds:
-                continue
-            for ki in range(len(source.ks)):
-                try:
-                    by_cap = source.off_cell(source.bands[bi], source.ks[ki])
-                except Exception as exc:
-                    return exc
-                by_cap = _cut_to_axis(by_cap, axis_end)
-                for ci in caps:
-                    pops = by_cap.get(source.caps[ci])
-                    if pops:
-                        for visit in off_takers:
-                            visit.off(bi, ki, ci, pops)
-                del by_cap
+        error = _walk_off_cells(source, off_takers, axis_end)
+        if error is not None:
+            if source.off_fallback is None:
+                return error, source
+            logging.warning("The tier-floors-off size-cap sweep could not be simulated; with "
+                            "the tier floors off the page offers the run's own cap only",
+                            exc_info=error)
+            source = source.off_fallback()
+            for visit in off_takers:
+                reset_off = getattr(visit, "reset_off", None)
+                if reset_off is not None:
+                    reset_off(source)
+            error = _walk_off_cells(source, off_takers, axis_end)
+            if error is not None:
+                return error, source
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -5841,7 +6034,7 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
                            axis_end)
         for visit in takers:
             visit.same_title({cap: pops["same_title"] for cap, pops in cut.items()})
-    return None
+    return None, source
 
 
 def _walk_grid(source: _GridSource, visitors: list,
@@ -5854,12 +6047,15 @@ def _walk_grid(source: _GridSource, visitors: list,
     it is simulated costs the cap axis only — ONE WARNING (with the
     traceback), every visitor reset for the fallback grid, and a second walk
     over the eager points alone (source.fallback), whose cells are lookups.
-    (The size-cap sweep's same-title population costs less still: only the
-    same-title rows at the other caps — _same_title_points.) The fallback
-    grid carries the same tier-floors-off family (_grid_source attaches it
-    to every banded shape), so the second walk keeps the Tier floors choice. The other layer
-    is each visitor's own: it catches its own failure and marks itself
-    failed, costing only what it builds.
+    A tier-floors-off size-cap cell that raises costs less: only the off
+    view's other caps, recovered inside the walk (_walk_once, off_fallback),
+    with the tier-on cap axis kept. (The size-cap sweep's same-title
+    population costs less still: only the same-title rows at the other caps
+    — _same_title_points.) The fallback grid carries the same
+    tier-floors-off family, at the run's own cap (_grid_source attaches it
+    to every banded shape), so the second walk keeps the Tier floors choice.
+    The other layer is each visitor's own: it catches its own failure and
+    marks itself failed, costing only what it builds.
 
     Args:
         source (_GridSource): The grid to walk.
@@ -5867,15 +6063,16 @@ def _walk_grid(source: _GridSource, visitors: list,
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
-        _GridSource: The grid actually walked — the source, or its fallback.
+        _GridSource: The grid actually walked — the source, its off_fallback
+            (the tier-off size-cap sweep could not be read), or its fallback.
 
     Raises:
         Exception: What a cell raised when there is no fallback (an eager
             grid's lookup, never expected), or the fallback's own failure.
     """
-    error = _walk_once(source, visitors, axis_end)
+    error, walked = _walk_once(source, visitors, axis_end)
     if error is None:
-        return source
+        return walked
     if source.fallback is None:
         raise error
     logging.warning("The size-cap sweep could not be simulated; the page offers the "
@@ -5883,10 +6080,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     fallback = source.fallback()
     for visitor in visitors:
         visitor.reset(fallback)
-    error = _walk_once(fallback, visitors, axis_end)
+    error, walked = _walk_once(fallback, visitors, axis_end)
     if error is not None:
         raise error
-    return fallback
+    return walked
 
 
 class _MaxTrades:
@@ -5902,8 +6099,12 @@ class _MaxTrades:
     could not be simulated (_same_title_points), the run's own point alone,
     which is all the page then shows of it: the count covers what the page
     shows, so it is not marked failed for that. The tier-floors-off cells the
-    walk hands to `off` are counted too: the page shows them, and
-    backtester.max_trades_simulated counts the family's points as well.
+    walk hands to `off` are counted too, at every cap the page shows them
+    (the tier-floors-off size-cap sweep's points included): the page shows
+    them, and backtester.max_trades_simulated counts the family's eager
+    points as well. What `off` counted is kept apart from the tier-on count,
+    so the walk can drop it (reset_off) when it re-reads the off cells from
+    the family's eager points after an off cell failed.
 
     Attributes:
         most (int): The largest len(trades) over every point visited.
@@ -5912,18 +6113,51 @@ class _MaxTrades:
 
     def __init__(self) -> None:
         """Start at zero."""
-        self.most = 0
-        self.failed = False
+        self.reset(None)
 
-    def reset(self, source: _GridSource) -> None:
+    def reset(self, source: _GridSource | None) -> None:
         """
         Start again for another grid (the walk's fallback).
 
         Args:
-            source (_GridSource): The grid about to be walked.
+            source (_GridSource | None): The grid about to be walked (unused).
         """
         self.most = 0
         self.failed = False
+        # The tier-on count alone (tier-on cells and the same-title
+        # population): what reset_off returns to
+        self._on_most = 0
+        self._on_failed = False
+
+    def reset_off(self, source: _GridSource) -> None:
+        """
+        Drop what the tier-floors-off cells counted (the walk re-reads them).
+
+        Args:
+            source (_GridSource): The grid whose off cells are walked next
+                (unused).
+        """
+        self.most, self.failed = self._on_most, self._on_failed
+
+    def _count(self, pops, *, on: bool) -> None:
+        """
+        Fold some points' trade counts into the running maximum.
+
+        Args:
+            pops: SweepPoints.
+            on (bool): Keyword-only. Whether they are tier-on points (or the
+                same-title population), which reset_off keeps.
+        """
+        try:
+            for point in pops:
+                self.most = max(self.most, len(point.trades))
+                if on:
+                    self._on_most = max(self._on_most, len(point.trades))
+        except Exception:
+            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
+            self.failed = True
+            if on:
+                self._on_failed = True
 
     def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
         """
@@ -5935,12 +6169,7 @@ class _MaxTrades:
             ci (int): Cap index.
             pops (dict): Population -> SweepPoint.
         """
-        try:
-            for point in pops.values():
-                self.most = max(self.most, len(point.trades))
-        except Exception:
-            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
-            self.failed = True
+        self._count(pops.values(), on=True)
 
     def off(self, bi: int, ki: int, ci: int, pops: dict) -> None:
         """
@@ -5952,7 +6181,7 @@ class _MaxTrades:
             ci (int): Cap index.
             pops (dict): Population -> SweepPoint.
         """
-        self(bi, ki, ci, pops)
+        self._count(pops.values(), on=False)
 
     def same_title(self, by_cap: dict) -> None:
         """
@@ -5961,12 +6190,7 @@ class _MaxTrades:
         Args:
             by_cap (dict): Cap -> the same-title SweepPoint at that cap.
         """
-        try:
-            for point in by_cap.values():
-                self.most = max(self.most, len(point.trades))
-        except Exception:
-            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
-            self.failed = True
+        self._count(by_cap.values(), on=True)
 
 
 class _KdVisitor:
@@ -6192,8 +6416,10 @@ class _ExplorerVisitor:
     nothing: the section is then its placeholder, whatever the walk produced.
 
     It also takes the tier-floors-off cells the walk hands its `off` method
-    (the bands the tiers bind at, at the cap the family was simulated at)
-    and keeps them the same way, in a grid of their own: _assemble then
+    (the bands the tiers bind at — at every cap when the grid reads them
+    from the tier-floors-off size-cap sweep, at the run's own otherwise) and
+    keeps them the same way, in a grid of their own (dropped by reset_off
+    when the walk re-reads them after an off cell failed): _assemble then
     packs, for each cap that has any, an off block over the grid with the
     tier floors off — those bands' own cells, every other band's tier-on
     ones — whose banner and matrices are computed over that combined grid.
@@ -6236,7 +6462,7 @@ class _ExplorerVisitor:
             source (_GridSource): The grid about to be walked.
         """
         self.source = source
-        nb, nk, nc = len(source.bands), len(source.ks), len(source.caps)
+        nc = len(source.caps)
         # Per Tier floors setting (False: on, True: off), per cap:
         # cells[cap][band][k] — the scenario's JSON text, or None; the
         # headline population's cap-dependent matrices; which cells have an
@@ -6245,14 +6471,7 @@ class _ExplorerVisitor:
         # grids are filled only at the bands the tiers bind at (the walk
         # hands those to off(); every other band's off view is its tier-on
         # one, which _assemble reads there)
-        self.grids = {tier: {
-            "cells": [[[None] * nk for _ in range(nb)] for _ in range(nc)],
-            "matrices": [{key: [[None] * nk for _ in range(nb)]
-                          for key in _EXPLORER_CAP_METRICS} for _ in range(nc)],
-            "has_all": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
-            "checked": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
-            "points": [[[0] * nk for _ in range(nb)] for _ in range(nc)],
-        } for tier in (False, True)}
+        self.grids = {tier: self._empty_grid(source) for tier in (False, True)}
         # Whether the walk handed off() any cell at each cap: a cap with none
         # at a band the tiers bind at has no tier-floors-off view
         self.off_seen = [False] * nc
@@ -6266,6 +6485,46 @@ class _ExplorerVisitor:
         self._cell: tuple[bool, int, int] | None = None
         self._cache: dict = {}
         self._joined: dict = {}
+
+    @staticmethod
+    def _empty_grid(source: _GridSource) -> dict:
+        """
+        One Tier floors setting's empty figures over a grid's axes.
+
+        Args:
+            source (_GridSource): The grid.
+
+        Returns:
+            dict: "cells", "matrices", "has_all", "checked" and "points",
+                each per cap, then [band][k] — None, False or 0 throughout.
+        """
+        nb, nk, nc = len(source.bands), len(source.ks), len(source.caps)
+        return {
+            "cells": [[[None] * nk for _ in range(nb)] for _ in range(nc)],
+            "matrices": [{key: [[None] * nk for _ in range(nb)]
+                          for key in _EXPLORER_CAP_METRICS} for _ in range(nc)],
+            "has_all": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
+            "checked": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
+            "points": [[[0] * nk for _ in range(nb)] for _ in range(nc)],
+        }
+
+    def reset_off(self, source: _GridSource) -> None:
+        """
+        Drop every tier-floors-off figure kept so far (the walk re-reads the off cells).
+
+        The tier-on figures, the same-title rows and the primary curve are
+        kept: only what off() built goes, so the off cells can be walked
+        again from another source (the grid's off_fallback — its axes are
+        the same).
+
+        Args:
+            source (_GridSource): The grid whose off cells are walked next.
+        """
+        self.source = source
+        self.grids[True] = self._empty_grid(source)
+        self.off_seen = [False] * len(source.caps)
+        # The memo may hold an off cell's rows, keyed by objects now dropped
+        self._cell, self._cache, self._joined = None, {}, {}
 
     def _entry(self, point: SweepPoint, population: str) -> tuple[dict, str]:
         """
@@ -6324,9 +6583,9 @@ class _ExplorerVisitor:
         Args:
             bi (int): Band index (a band the tiers bind at).
             ki (int): k index.
-            ci (int): Cap index — the run's own, the one cap the family is
-                simulated at, until a tier-floors-off size-cap sweep fills
-                the others.
+            ci (int): Cap index — every cap, when the grid reads its off
+                cells from the tier-floors-off size-cap sweep; the run's own
+                alone otherwise.
             pops (dict): Population -> SweepPoint (stamped tier_floors False).
         """
         self._visit(bi, ki, ci, pops, True)
@@ -6493,9 +6752,10 @@ class _ExplorerVisitor:
         # ── The tier-floors-off view: per band, whether the tiers bind there
         # (its own tier-off cells and calibration) or not (its tier-on ones
         # stand in, #68's rule); None without a family. A size cap has an off
-        # view when the walk handed off() a cell there — in production only
-        # the run's own cap, the one the family is simulated at — or when no
-        # band binds at all, where every cap's off view IS its tier-on one ─
+        # view when the walk handed off() a cell there — in production every
+        # cap, from the tier-floors-off size-cap sweep, or the run's own alone
+        # without it — or when no band binds at all, where every cap's off
+        # view IS its tier-on one ─
         binds = source.tier_binds
         off_caps = (None if binds is None else
                     [self.off_seen[ci] or not any(binds) for ci in range(len(caps))])
@@ -6798,6 +7058,34 @@ class _ChunkVisitor:
         # objects, whose ids may reuse those of the tier-on cell walked last
         self._cell: tuple[bool, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
+        # (chunks, row heads) held when the first off cell was packed, so
+        # reset_off can drop exactly what the off cells added
+        self._off_mark: tuple[int, int] | None = None
+
+    def reset_off(self, source: _GridSource) -> None:
+        """
+        Drop every tier-floors-off chunk and grid entry (the walk re-reads the off cells).
+
+        Every chunk and row head packed since the first off cell is dropped
+        (with its dedup key), so the page ships none an off cell walked
+        again from another source no longer needs; the tier-on chunks — ids
+        before that mark — and grid are kept, as are the labels.
+
+        Args:
+            source (_GridSource): The grid whose off cells are walked next
+                (the same axes).
+        """
+        self.source = source
+        if self._off_mark is not None and not self.failed:
+            n_chunks, n_heads = self._off_mark
+            del self.chunks[n_chunks:]
+            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
+            self.heads.truncate(n_heads)
+        self._off_mark = None
+        self.grid_off = (None if source.tier_binds is None else
+                         [[[None] * len(source.caps) for _ in source.ks]
+                          for _ in source.bands])
+        self._cell, self._keys = None, {}
 
     def _key(self, bi: int, ki: int, k: float | None, listed: list, *,
              off: bool = False) -> str:
@@ -6865,6 +7153,8 @@ class _ChunkVisitor:
         point = pops.get(_ALL_VIEW)
         if point is None or self.failed or self.grid_off is None:
             return
+        if self._off_mark is None:
+            self._off_mark = (len(self.chunks), len(self.heads.items))
         try:
             # Its own run, priced at the cell's k: never the page's trades
             self.grid_off[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
@@ -6878,10 +7168,12 @@ class _ChunkVisitor:
 
         Returns:
             list | None: [band][k][cap] -> chunk id or None: a binding band's
-                own off chunks (None where the family has no point, e.g. a
-                size cap other than the run's own), every other band's the
-                tier-on grid's ids — its off view IS its run; None when the
-                grid has no family (or a chunk failed).
+                own off chunks (None where the family has no point — a size
+                cap other than the run's own when the grid could not read the
+                tier-floors-off size-cap sweep, or a cell a ragged family
+                lacks), every other band's the tier-on grid's ids — its off
+                view IS its run; None when the grid has no family (or a chunk
+                failed).
         """
         if self.grid_off is None or self.failed:
             return None
@@ -7126,6 +7418,16 @@ class _StringTable:
             i = self._index[text] = len(self.items)
             self.items.append(text)
         return i
+
+    def truncate(self, n: int) -> None:
+        """
+        Forget every fragment stored after the first n.
+
+        Args:
+            n (int): How many fragments to keep, in [0, len(self.items)].
+        """
+        del self.items[n:]
+        self._index = {text: i for text, i in self._index.items() if i < n}
 
 
 def _view_payload(
@@ -7765,7 +8067,7 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     and does not carry over to this page, which packs the explorer's blocks
     too and has not been re-measured on that corpus. The explorer's own
     tier-floors-off view (its Tier floors select, hidden k-hat table and an
-    "scn-off-cap-<i>" block per cap the family was simulated at) then took
+    "scn-off-cap-<i>" block per cap it has off cells at) then took
     the same fixture's page to 815,777 bytes without the family and
     1,098,598 with it (its off block 3,712 bytes of base64), and
     TestScenarioExplorerPageSize's 468-cell page to 1,736,090 and 2,632,657
@@ -8537,10 +8839,12 @@ def generate_dashboard(
     (_FILTER_JS). The filter's grid — every spread band x k x per-trade size
     cap the run offers (_grid_source) — is walked ONCE before anything is
     written (_build_filter_grid), because the header needs its result: a
-    size-cap sweep's cells are simulated during that walk, the busiest of
-    them feeds the header's stale-cutoff test (_MaxTrades), a size-cap
-    sweep the walk could not use is named on the run-settings line
-    (_run_settings_html's cap_sweep_unused), the interval-discount
+    size-cap sweep's cells are simulated during that walk (the
+    tier-floors-off size-cap sweep's too), the busiest of them feeds the
+    header's stale-cutoff test (_MaxTrades), a size-cap sweep the walk could
+    not use is named on the run-settings line (_run_settings_html's
+    cap_sweep_unused, and tier_off_cap_sweep_unused for the tier-floors-off
+    one alone), the interval-discount
     section's rows and curves at every k and cap of the primary band are
     collected for it and for the script (_KdVisitor, "kd"), and so are the
     scenario explorer's figures at every band x k x cap (_ExplorerVisitor,
@@ -8597,8 +8901,9 @@ def generate_dashboard(
             band x k scenario and every band's calibration, and — when it
             carries one — the lazy size-cap sweep, whose cells the filter's
             walk simulates, and the tier-floors-off family, whose binding
-            bands' cells the walk reads at the run's own cap, via
-            _grid_source).
+            bands' cells the walk reads at the run's own cap — and, from its
+            lazy tier-floors-off size-cap sweep (tier_off_cap_sweep), at
+            every other cap — via _grid_source).
             Passed whole rather than unpacked — it already carries the
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
@@ -8809,9 +9114,17 @@ def generate_dashboard(
     # single option, whose reason must be on the page, not only in the log
     # (DR-66). Only when the bar exists: without it the notice in its place
     # says what was lost.
+    # Likewise the tier-floors-off size-cap sweep: a grid that carries the off
+    # view on the size-cap axis but reads its off cells without it (it could
+    # not be read, or an off cell could not be simulated — _walk_once's
+    # off_fallback) leaves the off view at the run's own cap only
     run_settings = _run_settings_html(
         sweep, cap_sweep_unused=(filter_data is not None and walked is not None
-                                 and walked.cap_sweep is None))
+                                 and walked.cap_sweep is None),
+        tier_off_cap_sweep_unused=(filter_data is not None and walked is not None
+                                   and walked.cap_sweep is not None
+                                   and walked.tier_binds is not None
+                                   and walked.off_cap_sweep is None))
 
     # Directly under the Period line, which it qualifies: the corpus holds
     # nothing settled after its assembly even though the period runs to today,

@@ -173,9 +173,13 @@ Notes:
     keeping every band x k x cap x population point would hold gigabytes.
     Each cell is seeded from the eager point: every cap at or above a point's
     (cap-independent) peak_kelly_fraction sizes identically, so those caps
-    share one simulation. The CapSweep covers the tier-on grid only; the
-    tier-floors-off family above is simulated at the run's own cap alone, and
-    none of its points ever seeds a cell. Live sizing never reads any of it.
+    share one simulation. With tier_off_sweep too, a SECOND CapSweep
+    (BacktestSweep.tier_off_cap_sweep, tier_floors False) does the same over
+    the tier-floors-off family's binding bands, seeded from that family's own
+    points — so every tier x band x k x cap scenario is a real simulation.
+    The two never share a seed: the tier-on CapSweep is seeded from tier-on
+    points only and the tier-off one from tier-off points only. Live sizing
+    never reads any of it.
 
     Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
@@ -476,10 +480,17 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
     that marks a tier-off simulation — so a tier-on call never carries it.
     _half_split, _ex_top_event and _band_sweep_cell build their keywords
     here, and so do CapSweep's split-half and excluding-top-event checks
-    (through those two helpers). CapSweep._by_cap's own cap simulation does
-    NOT: it passes size_cap, quiet=True and its pinned end_date directly, and
-    forwards no tier_floors — a CapSweep is tier-on only until it carries a
-    tier axis of its own.
+    (through those two helpers) and CapSweep._by_cap's own cap simulation —
+    which builds quiet, end_date and tier_floors here (as
+    _sim_options(None, True, end_date=..., tier_floors=...)) but passes
+    size_cap EXPLICITLY beside them: dropping a cap equal to BUDGET_FRACTION
+    would hand the simulation None, which resolves BUDGET_FRACTION again at
+    call time — the same value unless that binding moved after the run, when
+    the cell would silently size at a cap its caps tuple does not name — and
+    would change the keywords TestCapSweepSeeding's stand-ins record. So a
+    tier-on CapSweep calls the simulator with exactly the keywords it always
+    did (size_cap, quiet, and end_date when pinned), and a tier-off one adds
+    tier_floors=False.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -1251,11 +1262,47 @@ class CapSweep:
     the eager points it references are the ones BacktestSweep already
     holds.
 
-    TIER-ON only: entries_by_band and eager are the tier-on sweep's, and
-    _sweep_from_candidates never records a tier-floors-off point
-    (BacktestSweep.tier_off_scenarios) as a seed, so a cell can never hand a
-    tier-off simulation back under a tier-on (band, k, population) key. The
-    tier-floors-off family is simulated at the run's own cap alone.
+    One Tier floors setting per CapSweep (tier_floors). The tier-on one
+    (BacktestSweep.cap_sweep, tier_floors True) holds the tier-on
+    entries_by_band and is seeded from tier-on points only; the tier-off one
+    (BacktestSweep.tier_off_cap_sweep, tier_floors False, built only when the
+    tier-floors-off family ran) holds the family's entries at the bands a
+    deadline-gap tier binds at, and is seeded from the family's own points
+    (BacktestSweep.tier_off_scenarios) only — _sweep_from_candidates keeps
+    the two seed maps apart, so a cell can never hand one setting's
+    simulation back under the other's (band, k, population) key. Every
+    simulation it runs, and its split-half and excluding-top-event checks,
+    carry its tier_floors (forwarded through _sim_options, so only a False is
+    ever forwarded), and every point it returns is stamped with it: a
+    simulated one by _simulate_at_discount, a shared copy by the point it
+    copies. The tier-off one has no same-title population of its own
+    (st_entries is [] — the same-title entries never read the tiers, so the
+    tier-on sweep's same_title() serves both) and runs the band sweep's
+    checks (its family exists only on a band sweep).
+
+    Retention of the tier-off one, declared the same way: it keeps the
+    family's entries_by_band — one entry dict per binding band per tier-off
+    entry, each band's tier-off time-series entries followed by the shared
+    same-title ones (the SAME dict objects the tier-on sweep holds). Its
+    market dicts are the corpus records the entries point at, shared with
+    the tier-on entries of any pair that also enters with the tiers on; with
+    the tiers off a binding band's floor alone gates the spread, so its
+    entered pairs are a superset of the same band's tier-on ones, all bounded
+    by the tier-off no-band band's. Measured 2026-09-26 on the golden fixture
+    (tests/test_backtester.py's TestPrepareEntriesGolden, 36 bands, 18
+    binding, ladders on): the tier-on sweep holds 108 entries over its 36
+    bands (73 distinct entry dicts, 10 distinct market dicts); the tier-off
+    one holds 63 over its 18 (46 distinct entry dicts, 45 of them new — the
+    one same-title entry is shared) and ZERO new market dicts, since every
+    pair the family enters also enters at some tier-on band there. On any
+    corpus the new market dicts are only those of pairs that enter with the
+    tiers off and at no tier-on band, so they are bounded by that corpus's
+    own tier-off-only pairs at the no-band band — a bound to re-measure per
+    corpus. On the DR-73 calibration corpus (start 2020-01-01, ladders on;
+    see CLAUDE.md's tier-off paragraph) that is 278 pairs, i.e. at most 556
+    new dicts (derived, not measured) beside at most 660 for its 330 tier-on
+    no-band entries, a few MB. The ~810 tier-on figure above is a different
+    corpus's (the 365-day run's), whose tier-off-only count was not measured.
 
     BACKTEST-ONLY, like the band and k sweeps: live sizing reads
     config.BUDGET_FRACTION and never this module.
@@ -1286,10 +1333,15 @@ class CapSweep:
         st_entries (list): The same-title entries (band-independent). Not in
             repr.
         eager (dict): (band, k, population) -> the eager primary-cap point
-            of that cell, recorded by _sweep_from_candidates — always a
-            tier-on point. Not in repr.
-        same_title_eager (SweepPoint | None): BacktestSweep.same_title_point.
-            Not in repr.
+            of that cell, recorded by _sweep_from_candidates — always a point
+            of this sweep's own Tier floors setting (tier_floors). Not in
+            repr.
+        same_title_eager (SweepPoint | None): BacktestSweep.same_title_point
+            (None on the tier-off sweep). Not in repr.
+        tier_floors (bool): Whether this sweep's entries were detected with
+            the deadline-gap tier floors applied (True, default) or not
+            (False: the tier-floors-off family's). Forwarded to every
+            simulation and check it runs, only when False.
         simulated (int): Simulations this object has run (each cap point
             counts once; its halves and top-event re-simulations are not
             counted separately).
@@ -1309,6 +1361,7 @@ class CapSweep:
     st_entries: list = field(repr=False)
     eager: dict = field(repr=False)               # (band, k, population) -> primary-cap point
     same_title_eager: SweepPoint | None = field(default=None, repr=False)
+    tier_floors: bool = True
     simulated: int = 0
     reused: int = 0
 
@@ -1327,9 +1380,10 @@ class CapSweep:
         eager object itself; then the eager seed (only when the primary cap
         is at or above the eager point's peak — see the class docstring);
         then a point this call simulated at a cap at or above its own peak;
-        else a quiet simulation, pinned to the eager point's end date, with
-        the split-half and top-event checks when the band sweep ran and the
-        population carries them.
+        else a quiet simulation, pinned to the eager point's end date and run
+        at this sweep's Tier floors setting (tier_floors), with the
+        split-half and top-event checks — at that setting too — when the
+        band sweep ran and the population carries them.
 
         Args:
             subset (list[dict]): The population's entries.
@@ -1343,7 +1397,8 @@ class CapSweep:
 
         Returns:
             dict[float, SweepPoint]: cap -> point, one per self.caps entry,
-                each stamped with its own size_cap.
+                each stamped with its own size_cap (and, simulated or copied,
+                with this sweep's tier_floors).
         """
         out: dict[float, SweepPoint] = {}
         # The peak is cap-independent, so the eager point's is this subset's
@@ -1351,7 +1406,6 @@ class CapSweep:
         # Every simulated cap ends its curve where the eager point's ended, not
         # on whatever day (UTC) this cell happens to be read
         end_date = _curve_end_date(eager_point)
-        pin = {} if end_date is None else {"end_date": end_date}
         # The eager point sizes as every cap at or above the seed ONLY if its
         # own cap is at or above it too — a capped eager point does not
         eager_seeds = seed is not None and self.primary_cap >= seed
@@ -1368,18 +1422,26 @@ class CapSweep:
                 self.reused += 1
                 continue
             else:
+                # size_cap explicit (see _sim_options: a cap equal to
+                # BUDGET_FRACTION must still name itself); quiet, the pinned
+                # end date and this sweep's tier setting through _sim_options,
+                # so a tier-on sweep forwards no tier_floors at all
                 point = _simulate_at_discount(
                     subset, self.start_date, self.initial_balance, k=k, spread_band=band,
-                    population=population, size_cap=cap, quiet=True, **pin)
+                    population=population, size_cap=cap,
+                    **_sim_options(None, True, end_date=end_date,
+                                   tier_floors=self.tier_floors))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
                         _split_halves(subset, self.split_date), self.start_date,
                         self.initial_balance, k, band, population=population,
-                        size_cap=cap, quiet=True, end_date=end_date)
+                        tier_floors=self.tier_floors, size_cap=cap, quiet=True,
+                        end_date=end_date)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
-                        population=population, quiet=True, end_date=end_date)
+                        population=population, tier_floors=self.tier_floors, quiet=True,
+                        end_date=end_date)
                 # The first simulated point whose cap reaches its own peak
                 # sizes as every larger cap (never set while the eager point
                 # seeds, whose peak every simulated cap here sits below)
@@ -1588,6 +1650,15 @@ class BacktestSweep:
             (config.BUDGET_FRACTION) whether or not this is set; setting it
             simulates nothing during the run itself. Appended with a
             default, so no construction moves.
+        tier_off_cap_sweep (CapSweep | None): The same lazy size-cap sweep
+            over the tier-floors-off family (tier_floors False): its binding
+            bands, every k, every cap, seeded from tier_off_scenarios' own
+            points (never a tier-on one, and cap_sweep is never seeded from
+            one of these). None unless BOTH cap_sweep and tier_off_sweep ran
+            on a feasible window with at least one binding band; like
+            cap_sweep it simulates nothing during the run. Its primary-cap
+            points ARE the tier_off_scenarios objects. Appended with a
+            default, so no construction moves.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -1605,6 +1676,7 @@ class BacktestSweep:
     tier_off_calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = field(
         default_factory=dict)
     cap_sweep: CapSweep | None = None
+    tier_off_cap_sweep: CapSweep | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -1633,8 +1705,9 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     could trade. Zero proves nothing either way: an entry that Kelly then
     rejected at every k also shows the window could trade.
 
-    A size-cap sweep (sweep.cap_sweep) simulates its other caps only when a
-    reader asks for a cell, never here, and a larger cap can turn an n < 1
+    A size-cap sweep (sweep.cap_sweep, and sweep.tier_off_cap_sweep over the
+    tier-floors-off family) simulates its other caps only when a reader asks
+    for a cell, never here, and a larger cap can turn an n < 1
     skip into a trade. The dashboard adds the trade counts of the cap points
     it simulates (dashboard._corpus_provenance_html's traded argument), while
     the log's closing line, written before the dashboard is built, sees the
@@ -6752,8 +6825,15 @@ def _sweep_from_candidates(
     TIER-ON points only: a tier-off point (tier_floors False) is never
     recorded as one, because
     the CapSweep's entries are the tier-on entries_by_band and a tier-off
-    seed would stand in for a simulation of different entries — the
-    tier-off family is simulated at the run's own cap alone.
+    seed would stand in for a simulation of different entries. With
+    tier_off_sweep too (and at least one binding band), every point of the
+    tier-off family's cells is recorded instead as a seed of a SECOND
+    CapSweep (tier_floors False, over the binding bands' tier-off entries,
+    no same-title population of its own), returned on
+    BacktestSweep.tier_off_cap_sweep and announced by one INFO line
+    ("Tier floors off: size-cap sweep: …") — so every tier x band x k x cap
+    scenario is a real simulation, and neither sweep ever holds the other's
+    seeds. It too simulates nothing here.
 
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
@@ -6788,8 +6868,11 @@ def _sweep_from_candidates(
             scenario and the same-title point; never a tier_off_scenarios
             point) and keeping entries_by_band alive for it; its cells carry the
             populations and checks this run computed (all four populations
-            and the checks with band_sweep, "all" alone without). False
-            (default) returns cap_sweep=None.
+            and the checks with band_sweep, "all" alone without). With
+            tier_off_sweep as well, also a tier-floors-off CapSweep on
+            BacktestSweep.tier_off_cap_sweep, seeded from the family's own
+            points only and keeping its entries alive. False (default)
+            returns cap_sweep=None and tier_off_cap_sweep=None.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -6798,8 +6881,8 @@ def _sweep_from_candidates(
             same_event_ladders (resolved), split_date, corpus_provenance
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
-            resolution), tier_off_scenarios, tier_off_calibrations_by_band
-            and cap_sweep — see BacktestSweep.
+            resolution), tier_off_scenarios, tier_off_calibrations_by_band,
+            cap_sweep and tier_off_cap_sweep — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -7116,6 +7199,12 @@ def _sweep_from_candidates(
     # in for a tier-on one like for like.
     tier_off_scenarios: list[SweepPoint] = []
     tier_off_calibrations: dict[tuple[float, float], IntervalCalibration | None] = {}
+    # (band, k, population) -> the family's own point at the run's own cap —
+    # the seed of the TIER-OFF size-cap sweep below. Kept apart from `eager`
+    # (the tier-on seeds) because the two share keys: a tier-off point filed
+    # there would stand in for a simulation of the tier-on entries. Filled
+    # only with cap_sweep; references to points already kept, never copies.
+    off_eager: dict[tuple, SweepPoint] = {}
     for bi, band in enumerate(tier_off_bands, start=1):
         entries = tier_off_entries[band]
         # Labelled with the floor alone: the only floor these entries cleared
@@ -7127,13 +7216,19 @@ def _sweep_from_candidates(
         for point_k in grid:
             point = _simulate_at_discount(entries, start_date, initial_balance, k=point_k,
                                           spread_band=band, population="all", tier_floors=False)
-            # Never recorded in eager: the CapSweep below re-simulates the
-            # TIER-ON entries_by_band, so a tier-off seed would stand in for
-            # a simulation of different entries. The tier-off family exists
-            # at the run's own cap only.
-            tier_off_scenarios.extend(_band_sweep_cell(
+            # Never recorded in eager: the tier-on CapSweep below re-simulates
+            # the TIER-ON entries_by_band, so a tier-off seed would stand in
+            # for a simulation of different entries. Recorded in off_eager
+            # instead, the seeds of the tier-off CapSweep over these entries.
+            cell = _band_sweep_cell(
                 point, entries, populations, halves_by_population, start_date,
-                initial_balance, point_k, band, tier_floors=False))
+                initial_balance, point_k, band, tier_floors=False)
+            tier_off_scenarios.extend(cell)
+            if cap_sweep:
+                # Every point of the cell — "all" first — seeds its own
+                # (band, k, population), exactly as the tier-on loop records
+                for off_point in cell:
+                    off_eager[(band, point_k, off_point.population)] = off_point
 
     capped = None
     if cap_sweep:
@@ -7141,7 +7236,8 @@ def _sweep_from_candidates(
         # run's own cap (every point above carries it, resolved at simulation
         # time) is unioned in, as the k grid unions its primary, so the eager
         # points are always exact members. Built after the tier-off family
-        # and over the tier-on entries and seeds alone.
+        # and over the tier-on entries and seeds alone (the family gets its
+        # own, below).
         caps = tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
         capped = CapSweep(caps=caps, primary_cap=primary.size_cap, bands=tuple(bands),
                           ks=tuple(grid), primary_k=effective_k, start_date=start_date,
@@ -7153,6 +7249,25 @@ def _sweep_from_candidates(
                      "demand, one (band, k) cell at a time, when a report reads them",
                      len(caps),
                      ", ".join(_cap_label(c) for c in caps), len(bands), len(grid))
+
+    off_capped = None
+    if cap_sweep and tier_off_bands:
+        # The same caps over the tier-floors-off family: its binding bands'
+        # tier-off entries (a same-title population of its own would repeat
+        # the tier-on one's — the same entries, which never read the tiers —
+        # so st_entries is []), seeded from the family's own points only,
+        # with the band sweep's checks (the family exists only on one). It
+        # keeps tier_off_entries alive for the reader — see CapSweep's
+        # retention note.
+        off_capped = CapSweep(caps=caps, primary_cap=primary.size_cap,
+                              bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
+                              start_date=start_date, initial_balance=initial_balance,
+                              split_date=split_date, checks=True,
+                              entries_by_band=tier_off_entries, st_entries=[], eager=off_eager,
+                              same_title_eager=None, tier_floors=False)
+        logging.info("Tier floors off: size-cap sweep: %d caps x %d binding band(s) x %d k, "
+                     "simulated on demand, one (band, k) cell at a time, when a report "
+                     "reads them", len(caps), len(tier_off_bands), len(grid))
 
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
@@ -7169,6 +7284,7 @@ def _sweep_from_candidates(
         tier_off_scenarios=tier_off_scenarios,
         tier_off_calibrations_by_band=tier_off_calibrations,
         cap_sweep=capped,
+        tier_off_cap_sweep=off_capped,
     )
 
 
@@ -7301,8 +7417,12 @@ def run_backtest_sweep(
             reader asks for a (band, k) cell. Every point this function
             returns is still sized at the run's own cap
             (config.BUDGET_FRACTION), and the flag adds no simulation to the
-            run itself. False (default) returns cap_sweep=None, as does the
-            infeasible window. Backtest-only: live sizing never reads it.
+            run itself. With tier_off_sweep too, also
+            BacktestSweep.tier_off_cap_sweep — the same over the
+            tier-floors-off family, seeded from its own points. False
+            (default) returns cap_sweep=None and tier_off_cap_sweep=None, as
+            does the infeasible window. Backtest-only: live sizing never reads
+            either.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -7315,8 +7435,9 @@ def run_backtest_sweep(
             resolved same_event_ladders, the configured switch it is judged
             against (config_same_event_ladders), the corpus's provenance,
             None when not recorded, the tier-off family, empty unless
-            tier_off_sweep, and the lazy cap_sweep, None unless cap_sweep
-            (see BacktestSweep).
+            tier_off_sweep, and the lazy cap_sweep, None unless cap_sweep,
+            and tier_off_cap_sweep, None unless both cap_sweep and
+            tier_off_sweep (see BacktestSweep).
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
