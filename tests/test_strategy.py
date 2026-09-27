@@ -883,7 +883,9 @@ class TestTimeSeriesKellyParity:
         # the rest. So the key may be SPELLED — as a string ({"later": ...},
         # e["later"], e.get("later")) or as a keyword argument
         # (dict(e, later=...), the shape a writer that rewrites the key would
-        # take) — only in the writer and the reader, anywhere in the package
+        # take) — only in the writer, the reader and the one TRUNCATING
+        # writer, _split_halves (which cuts an H1 pair's later Mondays at the
+        # split, building a new entry dict), anywhere in the package
         # (deny-by-default, like the band walk below). The accepted cost of
         # scanning the whole package: an unrelated "later" key or keyword in
         # any module fails this pin too — if one is ever needed, widen the
@@ -907,12 +909,18 @@ class TestTimeSeriesKellyParity:
         found = {(mod, owner) for mod, owner, _line in homes}
         writer = ("kalshi_betting.backtester", "_find_entry")
         reader = ("kalshi_betting.backtester", "_entry_mondays")
-        assert found <= {writer, reader}, homes
+        truncator = ("kalshi_betting.backtester", "_split_halves")
+        assert found <= {writer, reader, truncator}, homes
         # Not vacuous: the writer spells it (a renamed key would otherwise
-        # leave nothing to check), and so does the one reader
-        assert writer in found and reader in found
-        # ... the count line reads the Mondays through that reader ...
-        assert _function_calls(backtester, "_log_qualifying_mondays", "_entry_mondays")
+        # leave nothing to check), and so do the one reader and the truncator
+        assert writer in found and reader in found and truncator in found
+        # ... the count line, the Kelly gate (which enters a pair on its
+        # earliest passing Monday), the excluding-top-event check and the
+        # cap sweep's event census (market A's event on ANY Monday) read the
+        # Mondays through that reader ...
+        for function in ("_log_qualifying_mondays", "_simulate_at_discount",
+                         "_ex_top_event", "entry_events"):
+            assert _function_calls(backtester, function, "_entry_mondays"), function
         # ... and the two first-Monday readers never call it
         assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
         assert not _function_calls(backtester, "_split_date", "_entry_mondays")
