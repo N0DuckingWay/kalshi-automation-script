@@ -52,6 +52,14 @@ Dependencies:
     SAME_TITLE_SIZE_CAP (both bound by value, the per-trade caps every
     simulation sizes under) and pair_size_cap (the one definition of a
     pair's cap, shared with live sizing, so the two paths cap a pair alike),
+    LiveSettings, live_settings (called only by _live_settings_for_report,
+    the one place this module reads config.live_settings() at all: a
+    fail-soft read of config.py's own live toggles, recorded on
+    BacktestSweep.live_tier_floors/live_spread_band/live_categories/
+    live_tags — reporting only), describe_time_series_rule and _names_text
+    (the "Live time-series rule" log line's rule and, through
+    _live_filter_text, its category/tag filter, worded as
+    config.describe_trade_filter words it),
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
     grid _candle_window_open floors a market's open onto),
     LARGE_GROUP_WARN_THRESHOLD,
@@ -305,8 +313,12 @@ from .config import (
     SPREAD_BAND_SWEEP_FLOORS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
+    LiveSettings,
+    _names_text,
+    describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
+    live_settings,
     min_price_diff_for_gap,
     pair_size_cap,
     time_series_profit_prob,
@@ -1756,6 +1768,30 @@ class BacktestSweep:
             means for same-title pairs: "no cap" there is this cap. None when
             not recorded (a hand-built sweep). Appended with a default, so no
             construction moves; both production constructions record it.
+        live_tier_floors (bool | None): config.py's live
+            TIME_SERIES_TIER_FLOORS, from ONE read of config.live_settings()
+            that run_backtest_sweep takes before anything is fetched
+            (_live_settings_for_report) — so a report can say whether THIS
+            run's primary scenario, some other cell of its own grid, or
+            nothing on it is the rule the live bot trades
+            (_live_rule_view). main.py's per-run overrides are not visible
+            here: they never reach config.py. Reporting only — nothing this
+            run enters or sizes reads it. None when config.py's live
+            toggles do not validate (one WARNING is logged and the run still
+            completes) or when not recorded (a hand-built sweep); the other
+            three live_* fields are then None too, from the same read.
+            Appended with a default, so no construction moves; both
+            production constructions record it.
+        live_spread_band (tuple[float, float] | None): config.py's live
+            TIME_SERIES_SPREAD_BAND, validated and resolved by
+            config.LiveSettings, from the same read; None exactly when
+            live_tier_floors is.
+        live_categories (tuple[str, ...] | None): config.py's live
+            TRADE_CATEGORIES, from the same read. None means ANY category
+            when live_tier_floors is recorded, and not recorded when it is
+            None.
+        live_tags (tuple[str, ...] | None): config.py's live TRADE_TAGS,
+            from the same read, read like live_categories.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -1775,6 +1811,10 @@ class BacktestSweep:
     cap_sweep: CapSweep | None = None
     tier_off_cap_sweep: CapSweep | None = None
     same_title_size_cap: float | None = None
+    live_tier_floors: bool | None = None
+    live_spread_band: tuple[float, float] | None = None
+    live_categories: tuple[str, ...] | None = None
+    live_tags: tuple[str, ...] | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -5104,6 +5144,272 @@ def _band_label(band: tuple[float, float]) -> str:
     return f"{_exact_label(lo, 'g')}-{_exact_label(hi, 'g')}"
 
 
+# _sweep_from_candidates' default for its live keyword: "read config.py's live
+# toggles yourself" (a direct caller), as distinct from None, which is a read
+# run_backtest_sweep took and found invalid.
+_LIVE_NOT_READ = object()
+
+
+def _live_settings_for_report() -> LiveSettings | None:
+    """
+    Read config.py's live toggles for this run's report, failing soft.
+
+    One call to config.live_settings(), at CALL time, so a test that
+    monkeypatches config.py's own constants is reflected. live_settings()
+    never reads this module's by-value bindings of BUDGET_FRACTION,
+    SAME_TITLE_SIZE_CAP and TIME_SERIES_INTERVAL_PROB_DISCOUNT, so patching
+    those moves what this run simulates, never what it reports as live.
+    run_backtest_sweep calls it once, before anything is fetched, and hands
+    the result to whichever construction builds the sweep; a direct caller of
+    _sweep_from_candidates that hands nothing gets one read of its own.
+
+    The result is reporting only (BacktestSweep.live_*, the "Live time-series
+    rule" log line, dashboard._live_rule_html): nothing this run enters or
+    sizes reads it. A config.py toggle that fails config.LiveSettings' own
+    validation must therefore not abort a backtest over a reporting line, so
+    this fails soft where config.LiveSettings itself, and
+    _resolve_same_title_size_cap, deliberately raise.
+
+    Returns:
+        LiveSettings | None: config.live_settings(); or None, with one
+            WARNING logged, when config.py's live toggles do not validate.
+    """
+    try:
+        return live_settings()
+    except ValueError as e:
+        logging.warning(
+            "config.py's live toggles do not validate (%s) — the live rule is not "
+            "recorded on this run's report", e)
+        return None
+
+
+def _live_rule_fields(live: LiveSettings | None) -> dict:
+    """
+    Name the BacktestSweep keywords that record config.py's live rule.
+
+    Both production constructions (run_backtest_sweep's Monday-infeasible
+    branch and _sweep_from_candidates) spread this into BacktestSweep, so the
+    four fields are always recorded together, from one read, or not at all.
+
+    Args:
+        live (LiveSettings | None): _live_settings_for_report()'s result.
+
+    Returns:
+        dict: live_tier_floors, live_spread_band, live_categories and
+            live_tags from live; empty when live is None, which leaves all
+            four at their None default ("not recorded").
+    """
+    if live is None:
+        return {}
+    return {"live_tier_floors": live.tier_floors, "live_spread_band": live.spread_band,
+            "live_categories": live.categories, "live_tags": live.tags}
+
+
+def _live_filter_text(categories: tuple[str, ...] | None,
+                      tags: tuple[str, ...] | None) -> str:
+    """
+    Name a recorded category/tag filter as config.describe_trade_filter does.
+
+    describe_trade_filter takes a whole LiveSettings, and a report holds only
+    the recorded fields, so this spells the same words from the two fields
+    through the same config._names_text (pinned equal to
+    describe_trade_filter by tests/test_backtester.py::TestLiveRuleLine).
+
+    Args:
+        categories (tuple[str, ...] | None): BacktestSweep.live_categories.
+        tags (tuple[str, ...] | None): BacktestSweep.live_tags.
+
+    Returns:
+        str: e.g. "categories Economics, Sports; tags any".
+    """
+    return f"categories {_names_text(categories)}; tags {_names_text(tags)}"
+
+
+def _live_filter_is_one_slice(categories: tuple[str, ...] | None,
+                              tags: tuple[str, ...] | None) -> bool:
+    """
+    Say whether a live category/tag filter is ONE of the filter bar's options.
+
+    The bar shows one Category (every tag under it) or one Tag option ("C · T",
+    one category's tag) at a time. A filter naming exactly one category, and
+    at most one tag, is one such option; anything else — several categories
+    or tags, or a tag with any category, which the bar lists once per
+    category that carries it — can only be read one slice at a time.
+
+    Args:
+        categories (tuple[str, ...] | None): The live categories, None for any.
+        tags (tuple[str, ...] | None): The live tags, None for any.
+
+    Returns:
+        bool: True when the filter is one Category or one Tag option.
+    """
+    return categories is not None and len(categories) == 1 and len(tags or ()) <= 1
+
+
+# Where THIS run's own grid holds config.py's live time-series rule
+# (_LiveRuleView.where): the primary scenario itself, another cell of the
+# grid, or nowhere.
+_LIVE_RULE_PRIMARY = "primary"
+_LIVE_RULE_GRID = "grid"
+_LIVE_RULE_NOT_SIMULATED = "not simulated"
+
+
+@dataclass(frozen=True)
+class _LiveRuleView:
+    """
+    Where a run's own grid holds config.py's live time-series rule.
+
+    Attributes:
+        where (str): _LIVE_RULE_PRIMARY, _LIVE_RULE_GRID or
+            _LIVE_RULE_NOT_SIMULATED.
+        tier_floors (bool): The Tier floors setting of the cell that holds it
+            — the live setting, except that the tier floors off at a band no
+            tier binds at is the tier-on rule (backtester._tier_floors_bind
+            False: that band was never simulated again, and its tier-on cells
+            ARE its tier-off ones), so it is True there.
+    """
+    where: str
+    tier_floors: bool
+
+
+def _live_rule_view(sweep: BacktestSweep) -> _LiveRuleView | None:
+    """
+    Say where a run's own grid holds config.py's live time-series rule.
+
+    The ONE definition, read by the "Live time-series rule" log line
+    (_live_rule_line) and by dashboard._live_rule_html, so the log and the
+    page can never disagree. It reads only what the sweep RECORDED, never
+    the run's flags, so a Monday-infeasible run (nothing simulated beyond
+    its empty primary) and a hand-built sweep are judged on what they carry:
+      - the primary scenario is the rule when the live band is its band and
+        the live rule is tier-on (or tier-off at a band no tier binds at);
+      - another cell holds it when the live band is a band this run
+        simulated (every one is a key of calibrations_by_band, the primary's
+        included) and, with the tier floors off at a band a tier binds at,
+        the run carries the tier-floors-off view the dashboard can show —
+        dashboard._tier_off_binds' rule: the family ran and names EVERY band
+        of the grid a tier binds at, since the page withholds the whole off
+        view rather than one band's;
+      - otherwise nothing on this run's grid is the live rule.
+    Only the time-series rule is judged; the category/tag filter is a slice
+    of whichever cell this names, and the ladder switch is read beside it by
+    the renderers.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        _LiveRuleView | None: The verdict, or None when the sweep does not
+            record the live rule (live_tier_floors or live_spread_band None).
+    """
+    tier_floors, band = sweep.live_tier_floors, sweep.live_spread_band
+    if tier_floors is None or band is None:
+        return None
+    shown_on = bool(tier_floors) or not _tier_floors_bind(band)
+    if shown_on and band == sweep.primary.spread_band:
+        return _LiveRuleView(_LIVE_RULE_PRIMARY, True)
+    bands = sweep.calibrations_by_band
+    if band not in bands:
+        reachable = False
+    elif shown_on:
+        reachable = True
+    else:
+        reachable = bool(sweep.tier_off_scenarios) and all(
+            b is not None and (b in sweep.tier_off_calibrations_by_band
+                               or not _tier_floors_bind(b))
+            for b in bands)
+    return _LiveRuleView(_LIVE_RULE_GRID if reachable else _LIVE_RULE_NOT_SIMULATED,
+                         shown_on)
+
+
+def _live_rule_ladder_note(sweep: BacktestSweep) -> str:
+    """
+    Qualify a live-rule verdict whose run departs from config.py's ladder switch.
+
+    The live rule names the time-series ENTRY rule; which pairs exist is the
+    ladder switch's (DR-73), which the run-settings line reads against
+    config.py. A run whose recorded ladder setting departs from the switch it
+    recorded beside it does not replay the live bot's pairs even where its
+    entry rule is the live one, and the verdict must say so rather than sit
+    under a line saying "not a replay" unqualified.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: "" when the two agree or either is not recorded, otherwise a
+            clause beginning with "; ".
+    """
+    run, configured = sweep.same_event_ladders, sweep.config_same_event_ladders
+    if run is None or configured is None or bool(run) == bool(configured):
+        return ""
+    return (f"; this run's same-event ladders are {'on' if run else 'off'} and "
+            f"config.py's {'on' if configured else 'off'}, so its pairs are not the "
+            "live bot's")
+
+
+def _live_rule_line(sweep: BacktestSweep) -> str | None:
+    """
+    Word the "Live time-series rule (config.py): ..." log line from a built sweep.
+
+    Logged once by run_backtest_sweep, on every run, once the sweep exists
+    (the Monday-infeasible branch included), from the fields the sweep
+    records and the verdict _live_rule_view gives them — the verdict
+    dashboard._live_rule_html renders under the page's run-settings line,
+    which names the filter bar's own options where this names the grid's
+    cell. A live category/tag filter is named after the rule, and the tail
+    says the dashboard's filter bar shows it as one Category or Tag option
+    of that cell, or (_live_filter_is_one_slice False: several categories or
+    tags, or a tag under any category) one option at a time — each offered
+    only where this run filed a pair under it, which the page, knowing the
+    options its bar offers, names.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str | None: The line; None when the sweep records no live rule
+            (config.py's toggles did not validate — that WARNING was logged
+            when they were read).
+    """
+    view = _live_rule_view(sweep)
+    if view is None:
+        return None
+    rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
+    categories, tags = sweep.live_categories, sweep.live_tags
+    filtered = categories is not None or tags is not None
+    if filtered:
+        rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
+    if view.where == _LIVE_RULE_NOT_SIMULATED:
+        return f"Live time-series rule (config.py): {rule} — not simulated by this run"
+    # Tier floors off at a band no tier binds at: the tier-on cell holds it
+    never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
+                   " (no tier floor binds at this band, so off and on are one rule)")
+    if view.where == _LIVE_RULE_PRIMARY:
+        tail = ("this run's primary scenario applies " + ("its time-series rule" if filtered
+                                                          else "it") + never_binds)
+        subject = "it"
+    else:
+        primary = sweep.primary.spread_band
+        tail = (f"this run's primary scenario does not (tier floors on, band "
+                f"{'not recorded' if primary is None else _band_label(primary)}); its "
+                f"grid simulated the live rule as band {_band_label(sweep.live_spread_band)} "
+                f"with the tier floors {'on' if view.tier_floors else 'off'}{never_binds}, "
+                "which the dashboard's filter bar shows")
+        subject = "that scenario"
+    if filtered:
+        # Which options the bar offers depends on what this run filed pairs
+        # under, which only the page knows: the page names them
+        tail += ("; the dashboard's filter bar shows the live category/tag filter as one "
+                 f"Category or Tag option of {subject} (offered where this run filed a "
+                 "pair under it)"
+                 if _live_filter_is_one_slice(categories, tags) else
+                 "; the dashboard's filter bar shows the live category/tag filter one "
+                 f"Category or Tag option of {subject} at a time (each offered where this "
+                 "run filed a pair under it), never as their union")
+    return f"Live time-series rule (config.py): {rule} — {tail}{_live_rule_ladder_note(sweep)}"
+
+
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
     """
     Report whether a deadline-gap tier floor ever sits above a band's floor.
@@ -6850,6 +7156,7 @@ def _sweep_from_candidates(
     band_sweep: bool,
     tier_off_sweep: bool = False,
     cap_sweep: bool = False,
+    live: LiveSettings | None | object = _LIVE_NOT_READ,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -6993,6 +7300,13 @@ def _sweep_from_candidates(
             either sweep is the cap for every pair; a same-title candidate
             also stays under SAME_TITLE_SIZE_CAP at every one
             (config.pair_size_cap).
+        live (LiveSettings | None): Keyword-only. config.py's live toggles
+            as run_backtest_sweep read them before the fetch
+            (_live_settings_for_report — None when they do not validate),
+            recorded on the returned sweep and never read by any entry pass
+            or simulation. Left out, this function reads them itself, once,
+            so a direct caller still records them (and a bad config.py
+            still logs its one WARNING).
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -7002,9 +7316,10 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep and same_title_size_cap (this
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap (this
             module's binding of config.SAME_TITLE_SIZE_CAP, as every
-            simulation resolved it) — see BacktestSweep.
+            simulation resolved it) and the four live_* fields (from live —
+            see _live_rule_fields) — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -7022,6 +7337,11 @@ def _sweep_from_candidates(
                          "re-runs the band sweep's binding bands")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
+    # config.py's live toggles, recorded on the sweep this returns: the read
+    # run_backtest_sweep took before the fetch, or one of its own for a
+    # direct caller that handed none (reporting only; fails soft)
+    if live is _LIVE_NOT_READ:
+        live = _live_settings_for_report()
     # The ladder setting this sweep's pairs were extracted under, resolved the
     # way _extract_pairs and _find_entry resolve the unresolved flag carried on
     # candidates (see _Candidates for when those can disagree), for the report.
@@ -7412,6 +7732,9 @@ def _sweep_from_candidates(
         # every lazy cap cell will), resolved and validated as they resolved
         # it, so a report can say what the cap axis means for same-title pairs
         same_title_size_cap=_resolve_same_title_size_cap(),
+        # config.py's live rule and category/tag filter, from the one read
+        # above (every field None when config.py's toggles did not validate)
+        **_live_rule_fields(live),
     )
 
 
@@ -7490,6 +7813,14 @@ def run_backtest_sweep(
     bot reads its own toggles (config.TIME_SERIES_SPREAD_BAND,
     config.TIME_SERIES_TIER_FLOORS, each overridable for one run by a main.py
     flag) only through config.LiveSettings.
+
+    It does REPORT them. config.py's live toggles are read once, before the
+    fetch (_live_settings_for_report — one WARNING, and nothing recorded,
+    when they do not validate), recorded on the result (the four live_*
+    fields), and named by one INFO line logged once the result exists, on
+    every path: "Live time-series rule (config.py): <rule>[; category/tag
+    filter (...)] — <where this run's grid holds it>" (_live_rule_line, over
+    _live_rule_view, the verdict dashboard._live_rule_html renders too).
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -7570,9 +7901,14 @@ def run_backtest_sweep(
             None when not recorded, the tier-off family, empty unless
             tier_off_sweep, the lazy cap_sweep, None unless cap_sweep,
             tier_off_cap_sweep, None unless both cap_sweep and
-            tier_off_sweep, and same_title_size_cap (this module's binding
+            tier_off_sweep, same_title_size_cap (this module's binding
             of config.SAME_TITLE_SIZE_CAP, the extra same-title cap every
-            simulation sized under) — see BacktestSweep.
+            simulation sized under), and live_tier_floors,
+            live_spread_band, live_categories and live_tags (config.py's own
+            live rule and category/tag filter, from the one read taken
+            before the fetch — reporting only, never what this run itself
+            simulated; all four None when config.py's live toggles do not
+            validate) — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -7596,9 +7932,11 @@ def run_backtest_sweep(
         one), calibration=None, label_coverage=None, scenarios=[],
         calibrations_by_band={}, an empty tier-off family and the resolved
         same_event_ladders, with the configured switch
-        (config_same_event_ladders) and the same-title cap
-        (same_title_size_cap) still recorded. Callers therefore need no
-        special case for that path.
+        (config_same_event_ladders), the same-title cap
+        (same_title_size_cap) and config.py's live rule and filter (the
+        four live_* fields, all None if they do not validate) still
+        recorded, and the live-rule line still logged. Callers therefore
+        need no special case for that path.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
@@ -7668,6 +8006,14 @@ def run_backtest_sweep(
         same_title_clause,
         "on" if cap_sweep else "off",
     )
+    # config.py's own LIVE toggles — never main.py's per-run overrides, which
+    # this module cannot see — read ONCE, here, before anything is fetched
+    # (so an invalid config.py logs its one WARNING at the top of the run),
+    # and handed to whichever construction below builds the sweep. Reporting
+    # only: no entry pass or simulation reads them. The "Live time-series
+    # rule" line is logged from the built sweep instead (_live_rule_line),
+    # because what it says of THIS run's grid is only known once the grid is.
+    live = _live_settings_for_report()
 
     # The band- and k-independent half — one fetch, one pairing, one candle
     # fetch, reused by every band and every point below. None means the
@@ -7692,23 +8038,33 @@ def run_backtest_sweep(
         # empty scenarios list here apart from a band sweep that was off. No
         # corpus was fetched either, so there is no provenance to report: the
         # header says "not recorded" rather than inventing one.
-        return BacktestSweep(primary=empty, points=[empty], calibration=None,
-                             label_coverage=None, scenarios=[],
-                             calibrations_by_band={},
-                             same_event_ladders=bool(ladders),
-                             corpus_provenance=None,
-                             config_same_event_ladders=config_ladders,
-                             same_title_size_cap=same_title_cap)
-
-    # Every entry pass and every simulation. It deletes the candle series and
-    # the pair list itself once the last entry pass is done (before any
-    # simulation), so holding `candidates` here pins neither.
-    return _sweep_from_candidates(
-        candidates, initial_balance,
-        interval_discount=interval_discount, sweep=sweep,
-        spread_band=primary_band, band_sweep=band_sweep,
-        tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
-    )
+        result = BacktestSweep(primary=empty, points=[empty], calibration=None,
+                               label_coverage=None, scenarios=[],
+                               calibrations_by_band={},
+                               same_event_ladders=bool(ladders),
+                               corpus_provenance=None,
+                               config_same_event_ladders=config_ladders,
+                               same_title_size_cap=same_title_cap,
+                               **_live_rule_fields(live))
+    else:
+        # Every entry pass and every simulation. It deletes the candle series
+        # and the pair list itself once the last entry pass is done (before
+        # any simulation), so holding `candidates` here pins neither.
+        result = _sweep_from_candidates(
+            candidates, initial_balance,
+            interval_discount=interval_discount, sweep=sweep,
+            spread_band=primary_band, band_sweep=band_sweep,
+            tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep, live=live,
+        )
+    # The live rule, and where THIS run's grid holds it, read off the sweep
+    # just built — the one verdict (_live_rule_view) dashboard._live_rule_html
+    # renders too, so the log and the page agree on every path, the
+    # Monday-infeasible one included. No line when config.py's toggles did
+    # not validate (their WARNING was logged when they were read).
+    line = _live_rule_line(result)
+    if line is not None:
+        logging.info("%s", line)
+    return result
 
 
 # ─── Equity curve construction ────────────────────────────────────────────────

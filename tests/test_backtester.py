@@ -10922,6 +10922,326 @@ class TestCapSweepLogging:
         assert not [r for r in caplog.records if r.levelno >= logging.INFO]
 
 
+class TestLiveRuleLine:
+    """"Live time-series rule (config.py): ..." — config.py's own live rule and
+    category/tag filter (never main.py's per-run overrides, which this module
+    cannot see), read ONCE before the fetch (_live_settings_for_report),
+    recorded on BacktestSweep.live_* by both constructions, and logged once
+    the sweep exists (_live_rule_line) with where THIS run's grid holds it —
+    backtester._live_rule_view, the one verdict dashboard._live_rule_html
+    renders too, so the log and the page never disagree."""
+
+    # A narrowed band grid (4 bands: floors 0 and 0.35, ceilings 0.5 and 1),
+    # one k: the golden fixture's feasible band sweep in about a second
+    _FLOORS, _CEILINGS = (0.0, 0.35), (0.5, 1.0)
+
+    @staticmethod
+    def _lines(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Live time-series rule (config.py):")]
+
+    def _line(self, caplog) -> str:
+        lines = self._lines(caplog)
+        assert len(lines) == 1, lines
+        return lines[0]
+
+    @staticmethod
+    def _live(monkeypatch, tier_floors, band, categories=None, tags=None):
+        from kalshi_betting import config
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
+        monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
+        monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        return config.describe_time_series_rule(tier_floors, band)
+
+    def _feasible(self, monkeypatch, caplog, **kw):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", self._FLOORS)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", self._CEILINGS)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            return run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                      sweep=False, **kw)
+
+    @staticmethod
+    def _infeasible(monkeypatch, caplog, **kw):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            return run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, **kw)
+
+    # ── Where the line sits, and one read ────────────────────────────────────
+
+    def test_the_line_follows_the_cap_line_on_both_paths(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0))
+        for run in (self._infeasible, self._feasible):
+            run(monkeypatch, caplog)
+            messages = [r.getMessage() for r in caplog.records]
+            cap = next(i for i, m in enumerate(messages) if m.startswith("Per-trade size cap"))
+            line = self._line(caplog)
+            assert messages.index(line) > cap
+            assert line == (f"Live time-series rule (config.py): {rule} — this run's "
+                            "primary scenario applies it")
+
+    def test_the_feasible_line_is_the_last_the_sweep_logs(self, monkeypatch, caplog):
+        # Logged from the BUILT sweep: after the size-cap summary and every
+        # completion line, so what it says of the grid is what the grid holds
+        self._live(monkeypatch, True, (0.0, 1.0))
+        self._feasible(monkeypatch, caplog, band_sweep=True, cap_sweep=True)
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages[-1].startswith("Live time-series rule (config.py):")
+        assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
+
+    @pytest.mark.parametrize("feasible", [False, True])
+    def test_an_invalid_live_config_records_none_and_warns_once(
+        self, monkeypatch, caplog, feasible,
+    ):
+        from kalshi_betting import config
+        # A floor at or above the ceiling fails LiveSettings' own validation
+        # (config.time_series_spread_band), so live_settings() raises — once
+        # per run, on the feasible path too, where _sweep_from_candidates is
+        # handed the one read rather than taking its own
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
+        res = (self._feasible if feasible else self._infeasible)(monkeypatch, caplog)
+        assert (res.live_tier_floors, res.live_spread_band, res.live_categories,
+                res.live_tags) == (None, None, None, None)
+        assert not self._lines(caplog)
+        warned = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.WARNING and "do not validate" in r.getMessage()]
+        assert len(warned) == 1
+        assert warned[0].startswith("config.py's live toggles do not validate (")
+        # The run itself went ahead: a feasible one simulated its band
+        assert bool(res.calibrations_by_band) is feasible
+
+    def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
+        # Handed nothing, _sweep_from_candidates takes one read of its own
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        self._live(monkeypatch, False, (0.1, 0.8), ("Economics",), ("Fed", "CPI"))
+        candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), golden._START,
+                                                    True, None)
+        res = backtester._sweep_from_candidates(
+            candidates, 10_000.0, interval_discount=None, sweep=False,
+            spread_band=None, band_sweep=False)
+        assert res.live_tier_floors is False
+        assert res.live_spread_band == (0.1, 0.8)
+        assert res.live_categories == ("Economics",)
+        assert res.live_tags == ("Fed", "CPI")
+        # ... and a read handed in is recorded as it is, None included
+        candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), golden._START,
+                                                    True, None)
+        res = backtester._sweep_from_candidates(
+            candidates, 10_000.0, interval_discount=None, sweep=False,
+            spread_band=None, band_sweep=False, live=None)
+        assert res.live_tier_floors is None and res.live_categories is None
+
+    # ── The verdict, on each path ───────────────────────────────────────────
+
+    def test_the_primary_scenario_is_named_when_it_is_the_rule(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            "applies it")
+        assert (res.live_tier_floors, res.live_spread_band) == (True, (0.0, 1.0))
+        assert (res.live_categories, res.live_tags) == (None, None)
+
+    def test_a_primary_other_than_no_band_is_matched_by_its_own_band(self, monkeypatch, caplog):
+        # The primary's own band, not the default one, is what "primary" tests
+        rule = self._live(monkeypatch, True, (0.35, 0.5))
+        self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5))
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            "applies it")
+        # ... and a live band equal to the DEFAULT band is then elsewhere
+        rule = self._live(monkeypatch, True, (0.0, 1.0))
+        self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5), band_sweep=True)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0.35-0.5); its grid simulated the live rule as band "
+            "0-1 with the tier floors on, which the dashboard's filter bar shows")
+
+    def test_a_primary_off_the_shipped_grid_still_holds_a_tier_off_rule(
+        self, monkeypatch, caplog,
+    ):
+        # --spread-min 0.1 --spread-max 0.6: a binding band off the grid, which
+        # the tier-off family re-runs because it is the primary
+        rule = self._live(monkeypatch, False, (0.1, 0.6))
+        res = self._feasible(monkeypatch, caplog, spread_band=(0.1, 0.6), band_sweep=True,
+                             tier_off_sweep=True)
+        assert (0.1, 0.6) in res.tier_off_calibrations_by_band
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0.1-0.6); its grid simulated the live rule as band "
+            "0.1-0.6 with the tier floors off, which the dashboard's filter bar shows")
+
+    def test_a_tier_on_live_band_on_the_grid_is_elsewhere_and_off_it_not_simulated(
+        self, monkeypatch, caplog,
+    ):
+        rule = self._live(monkeypatch, True, (0.35, 0.5))
+        self._feasible(monkeypatch, caplog, band_sweep=True)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0-1); its grid simulated the live rule as band "
+            "0.35-0.5 with the tier floors on, which the dashboard's filter bar shows")
+        # Without the band sweep only the primary band was simulated
+        self._feasible(monkeypatch, caplog, band_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+        # A band the (narrowed) grid never held
+        rule = self._live(monkeypatch, True, (0.2, 0.6))
+        self._feasible(monkeypatch, caplog, band_sweep=True)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+
+    def test_tier_floors_off_needs_the_tier_off_family(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, False, (0.0, 0.5))
+        self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=True)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0-1); its grid simulated the live rule as band "
+            "0-0.5 with the tier floors off, which the dashboard's filter bar shows")
+        self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+
+    def test_tier_floors_off_where_no_tier_binds_is_the_tier_on_rule(
+        self, monkeypatch, caplog,
+    ):
+        # Floor 0.35 sits above both tiers: off and on are one rule there, so
+        # the primary at that band IS it, and a grid band needs no family
+        assert backtester._tier_floors_bind((0.35, 0.5)) is False
+        rule = self._live(monkeypatch, False, (0.35, 0.5))
+        self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5))
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            "applies it (no tier floor binds at this band, so off and on are one rule)")
+        self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            "not (tier floors on, band 0-1); its grid simulated the live rule as band "
+            "0.35-0.5 with the tier floors on (no tier floor binds at this band, so off and "
+            "on are one rule), which the dashboard's filter bar shows")
+
+    def test_the_infeasible_path_holds_only_its_empty_primary(self, monkeypatch, caplog):
+        # Nothing but the empty primary was built: a flag that WOULD have put
+        # the rule on the grid cannot, and the page agrees (the plan's V4 run)
+        from kalshi_betting import dashboard
+        for tier_floors, band in ((False, (0.0, 0.5)), (True, (0.3, 0.6))):
+            rule = self._live(monkeypatch, tier_floors, band)
+            res = self._infeasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=True,
+                                   cap_sweep=True)
+            assert self._line(caplog) == (
+                f"Live time-series rule (config.py): {rule} — not simulated by this run")
+            assert dashboard._live_rule_html(res, bar=None).endswith(
+                "— not simulated by this run</p>")
+
+    @pytest.mark.parametrize("tier_floors, band, page_tail", [
+        (True, (0.0, 1.0), "this run's primary"),
+        (True, (0.35, 0.5), "choose Spread band max(tier,0.35)-0.5 and Tier floors on in "
+                            "the filter bar"),
+        (False, (0.0, 0.5), "choose Tier floors off and Spread band 0-0.5 in the filter "
+                            "bar"),
+        (True, (0.2, 0.6), "not simulated by this run"),
+    ])
+    def test_the_page_says_what_the_log_says(
+        self, monkeypatch, caplog, tmp_path, tier_floors, band, page_tail,
+    ):
+        # One feasible band sweep with its tier-off family, then the real
+        # dashboard over it: the header line names the cell the log names, in
+        # the rendered bar's own option texts
+        import base64
+        import gzip
+        import html
+        import json
+
+        from kalshi_betting import dashboard
+        rule = self._live(monkeypatch, tier_floors, band)
+        res = self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=True)
+        line = self._line(caplog)
+        assert line == backtester._live_rule_line(res)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            res.primary.trades, res.primary.equity_df, TestPrepareEntriesGolden._START,
+            10_000.0, sweep=res).read_text(encoding="utf-8")
+        found = re.findall(r"Live rule \(config\.py\): ([^<]*)</p>", page)
+        assert len(found) == 1
+        assert found[0].startswith(html.escape(rule, quote=False) + "; ")
+        assert found[0].endswith(" — " + page_tail)
+        # The log's verdict and the page's are the one verdict
+        where = backtester._live_rule_view(res).where
+        assert line.endswith("— not simulated by this run") == (
+            where == backtester._LIVE_RULE_NOT_SIMULATED) == page_tail.startswith("not ")
+        assert ("primary scenario applies it" in line) == (page_tail == "this run's primary")
+        # ... and the option it names is one the page's bar offers
+        body = re.search(r'<script type="text/plain" id="dash-data" '
+                         r'data-encoding="gzip\+base64">([^<]*)</script>', page).group(1)
+        payload = json.loads(gzip.decompress(base64.b64decode(body)))
+        if page_tail.startswith("choose Spread band"):
+            assert "max(tier,0.35)-0.5" in [b["option"] for b in payload["bands"]]
+        if page_tail.startswith("choose Tier floors off"):
+            assert payload["grid_off"] is not None
+            assert "0-0.5" in [b["option"] for b in payload["bands_off"]]
+
+    # ── The category/tag filter ─────────────────────────────────────────────
+
+    def test_no_filter_says_nothing_about_one(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0))
+        self._infeasible(monkeypatch, caplog)
+        assert "categor" not in self._line(caplog)
+
+    @pytest.mark.parametrize("categories, tags, one", [
+        (("Economics",), None, True),
+        (("Economics",), ("Fed",), True),
+        (None, ("Fed",), False),
+        (("Economics", "Sports"), None, False),
+        (("Economics",), ("Fed", "CPI"), False),
+    ])
+    def test_a_filter_is_named_and_never_called_the_primary(
+        self, monkeypatch, caplog, categories, tags, one,
+    ):
+        from kalshi_betting import config
+        rule = self._live(monkeypatch, True, (0.0, 1.0), categories, tags)
+        res = self._infeasible(monkeypatch, caplog)
+        words = config.describe_trade_filter(config.live_settings())
+        slices = ("; the dashboard's filter bar shows the live category/tag filter as one "
+                  "Category or Tag option of it (offered where this run filed a pair under "
+                  "it)" if one else
+                  "; the dashboard's filter bar shows the live category/tag filter one "
+                  "Category or Tag option of it at a time (each offered where this run filed "
+                  "a pair under it), never as their union")
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule}; category/tag filter ({words}) — "
+            f"this run's primary scenario applies its time-series rule{slices}")
+        assert (res.live_categories, res.live_tags) == (categories, tags)
+
+    def test_the_filter_words_are_describe_trade_filters(self):
+        from kalshi_betting import config
+        for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
+                                 (("Oil, Gas", "Sports"), ("a|b",))]:
+            settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+                                           categories=categories, tags=tags)
+            assert backtester._live_filter_text(categories, tags) == \
+                config.describe_trade_filter(settings)
+
+    # ── The ladder switch ───────────────────────────────────────────────────
+
+    def test_a_ladder_departure_is_named_beside_the_verdict(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0))
+        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
+        self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
+        assert self._line(caplog) == (
+            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            f"applies it; this run's same-event ladders are {'off' if configured else 'on'} "
+            f"and config.py's {'on' if configured else 'off'}, so its pairs are not the "
+            "live bot's")
+        self._infeasible(monkeypatch, caplog, same_event_ladders=configured)
+        assert self._line(caplog).endswith("applies it")
+
+
 class TestCapSweepNeverSeedsTierOff:
     """With BOTH the tier-floors-off family and the size-cap sweep on, the
     CapSweep is built over the tier-on entries and seeded from tier-on points
