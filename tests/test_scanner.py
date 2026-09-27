@@ -2387,13 +2387,15 @@ class TestSameEventDeadlineLadders:
     single event, and every previous version of this finder refused them as
     "multi-choice options". The branch orders and tiers such a pair on its two
     STATED deadlines, never on close_time — a settled or single-instant event
-    closes every rung together. The switch ships OFF, so every test that wants
-    the branch turns it on explicitly and every test here has a control.
+    closes every rung together. _scan sets the switch EXPLICITLY, on or off, so
+    no test here depends on the value the switch ships with, and every test
+    here has a control.
     """
 
     def _scan(self, markets, monkeypatch, *, on=True):
-        if on:
-            monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        # Both ways: an "off" row that merely left the switch alone would test
+        # its shipped value, and change meaning the day that value flips.
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", on)
         return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
 
     def _two_rungs(self, *, pA=0.20, pB=0.60, nB=0.40,
@@ -3833,9 +3835,11 @@ class TestTimeSeriesTieredThreshold:
         )
         return mA, mB
 
-    def test_same_event_ticker_never_pairs(self):
-        # Two markets inside one event must not form a time-series pair while
-        # config.TIME_SERIES_SAME_EVENT_LADDERS is off — the shipped default.
+    def test_same_event_ticker_never_pairs(self, monkeypatch):
+        # Two markets inside one event must not form a time-series pair with
+        # the ladder switch off — scanner's own by-value binding, set here, so
+        # this row holds whatever value the switch ships with.
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", False)
         mA, mB = self._same_event_markets()
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 

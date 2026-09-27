@@ -17,25 +17,31 @@ Purpose:
     scenario explorer (a fragility banner, a spread-band x k heatmap with a
     nine-metric <select> — Sharpe and k-hat − k among them — and a
     per-population KPI table over every band x k x per-trade size cap
-    scenario, with band, k and size-cap <select>s and a short inline script
-    driving Plotly.update / Plotly.restyle — a native updatemenus dropdown
-    cannot express independent axes of selection), trade-level diagnostics
+    scenario — and, when the run carries the band sweep's tier-floors-off
+    family, over the same grid with the deadline-gap tier floors off — with
+    band, Tier floors (only with that family), k and size-cap <select>s and a
+    short inline script driving Plotly.update — a native updatemenus
+    dropdown cannot express independent axes of selection), trade-level
+    diagnostics
     (distribution, slippage, best/worst trades), risk metrics (Kelly sizing
     scatter, capital deployment), and benchmark comparison (S&P 500 via
     yfinance) — into a single HTML file with embedded Plotly charts. The file
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
-    A sticky filter bar at the top of the page — Spread band, k, Size cap,
-    Category, Tag — re-scopes every trade-derived section (performance,
-    decomposition, calibration, diagnostics, risk, the benchmark's strategy
-    row) to the run at another spread band, interval discount k and per-trade
-    size cap, and/or one Kalshi category or category · tag of it, and moves
-    the k-hat breakdown and the performance section's k-hat cards to the same
-    band and selection (the breakdown's reference line to the same k), the
-    interval-discount section to the same k and size cap (at the primary
-    spread band), and the scenario explorer's band, k and size-cap selects to
-    the same scenario (they stay usable on their own). Every figure a
-    selection shows is computed here in
+    A sticky filter bar at the top of the page — Spread band, Tier floors, k,
+    Size cap, Category, Tag — re-scopes every trade-derived section
+    (performance, decomposition, calibration, diagnostics, risk, the
+    benchmark's strategy row) to the run at another spread band, with the
+    deadline-gap tier floors on (the run as simulated) or off (the band
+    sweep's tier-floors-off run of that band), interval discount k and
+    per-trade size cap, and/or one Kalshi category or category · tag of it,
+    and moves the k-hat breakdown and the performance section's k-hat cards
+    to the same band, tier setting and selection (the breakdown's reference
+    line to the same k), the interval-discount section to the same k and
+    size cap (at the primary spread band, tier floors on), and the scenario
+    explorer's band, Tier floors, k and size-cap selects to the same
+    scenario (they stay usable on their own). Every figure a selection shows
+    is computed here in
     Python by the helpers the sections themselves render with, packed into
     gzip + base64 data blocks — one base block (_filter_payload) and one
     chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
@@ -54,13 +60,22 @@ Dependencies:
     category's or tag's trades alone for that slice's attributed curve),
     _leg_prices_for(), max_trades_simulated() (the one test of a carried
     post-cutoff verdict against the run's own trades, shared with
-    backtest.py's closing line) and _cap_percent() (the injective size-cap
+    backtest.py's closing line), _cap_percent() (the injective size-cap
     formatter the completion lines use, so no two Size cap options can read
-    alike) — and reads BacktestSweep.cap_sweep (a backtester.CapSweep) by
-    its attributes — and BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
-    PROJECT_ROOT,
+    alike), _band_label() (the bare "floor-ceiling" a tier-floors-off run is
+    labelled with, since its floor alone gated it) and _tier_floors_bind()
+    (the one test of whether a deadline-gap tier sits above a band's floor:
+    for a band ABSENT from the tier-off family it decides whether that
+    band's tier-on run may stand in for its tier-floors-off view, or the
+    whole off view is withheld — the family's calibration keys, never this
+    test, decide which bands were simulated again) — and reads
+    BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
-    fee_per_pair_approx() and
+    MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
+    and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
+    tier-off banner name the tier floors and their deadline-gap bounds from
+    config, never as literals), fee_per_pair_approx() and
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
@@ -95,8 +110,9 @@ Notes:
     k and size cap move them (_KdVisitor's data, "kd" in the base block) —
     its category and tag never do, since the section's k-hat population and
     per-k runs are the whole primary band's. The scenario-explorer section
-    (below) has band, k and size-cap selectors of its own, which the bar
-    moves but which never move the bar.
+    (below) has band, k and size-cap selectors of its own — and a Tier
+    floors selector when the run carries the tier-floors-off family — which
+    the bar moves but which never move the bar.
 
     The page-wide filter bar (_filter_bar_html) is a third, separate set of
     controls, and the only one that reaches beyond its own section. Its
@@ -104,7 +120,22 @@ Notes:
     at that k and per-trade cap, a standalone simulation, so every figure is
     genuine: the band sweep's "all" point at the run's own cap, or, for any
     other cap, the lazy size-cap sweep's (BacktestSweep.cap_sweep) point,
-    simulated as the page is built. Its category and tag choices show a
+    simulated as the page is built. Its Tier floors choice switches every
+    band between that run (on: the deadline-gap tier floors applied, as the
+    run simulated it) and, when the run carries the band sweep's
+    tier-floors-off family (BacktestSweep.tier_off_scenarios), the band's
+    run with the tier floors NOT applied (off: the band's own floor alone —
+    its tier-off "all" point, also a standalone simulation, named with the
+    bare floor-ceiling since that floor alone gated it; _tier_off_where). A
+    band whose floor sits at or above both tiers is never simulated again,
+    because the tiers never bind there (backtester._tier_floors_bind): its
+    off view IS its tier-on run (the same chunk), and the summary line says
+    so. The family is simulated at the run's own size cap only, so a binding
+    band's off view at any other cap is a scenario the run never simulated,
+    and the summary line says that too. A run without the family, or with
+    one missing a binding band, has no off view at all — never a relabelled
+    tier-on run: the select stays disabled, with a note beside it
+    (_tier_off_binds). Its category and tag choices show a
     SLICE of that run, whose figures drawn from an equity curve (return,
     drawdown, Sharpe, Sortino, the median monthly return, the benchmark's
     strategy row) come from the attributed curve — the starting balance
@@ -113,21 +144,30 @@ Notes:
     the bar's summary line says so. The header's trade count follows the
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
     so every breakdown partitions. Its k and size cap also move the
-    interval-discount section (at the primary spread band); its band,
-    category and tag never do. Its band, k and size cap move the scenario
-    explorer's selects (window.dashScenarioSelect, which the explorer's own
-    script defines and the bar's calls after every redraw, matched by option
-    label) — each axis only when the bar's label on it changes, so a choice
-    made in the explorer survives a bar change on another axis; its category
-    and tag never do. The bar's summary line says what it reaches on THIS
+    interval-discount section (at the primary spread band, always with the
+    tier floors on); its band, Tier floors choice, category and tag never
+    do. Its band, Tier floors choice, k and size cap move the scenario
+    explorer's selects (window.dashScenarioSelect(band, k, cap, tier), which
+    the explorer's own script defines and the bar's calls after every
+    redraw, matched by option label and, for the tier, by "on" / "off") —
+    each axis only when the bar's label on it changes, so a choice made in
+    the explorer survives a bar change on another axis, and an axis the
+    explorer refused (a size cap it holds no tier-floors-off block for, or
+    a block it could not unpack) is applied again on the bar's next change
+    to any axis; its category and tag never do. The bar's summary line says what it reaches on THIS
     page (_bar_reach: _BAR_REACH when both follow it, a band-and-k variant
-    when the explorer shows the run's own size cap only, and other sentences
-    when the interval-discount section cannot follow the bar or the page has
-    no explorer grid). The performance section's two k-hat
-    cards (_khat_kpis) follow the bar's band, category or tag and k: they
-    read the k-hat breakdown's own group for the selection, and the card
-    rendered for the primary view comes from the primary calibration itself,
-    so it is there even when the bar cannot be built. Every view is computed
+    when the explorer shows the run's own size cap only, _BAR_REACH_NO_
+    EXPLORER_TIERS' sentences when the explorer renders no Tier floors
+    select of its own — every page whose run carries no complete
+    tier-floors-off family — and other sentences when the interval-discount
+    section cannot follow
+    the bar or the page has no explorer grid — each saying that the Interval
+    Discount section does not follow the Tier floors choice). The performance section's two k-hat
+    cards (_khat_kpis) follow the bar's band, Tier floors choice, category
+    or tag and k: they read the k-hat breakdown's own group for the
+    selection, and the card rendered for the primary view comes from the
+    primary calibration itself, so it is there even when the bar cannot be
+    built. Every view is computed
     by the same helpers the sections render with (_performance_kpis,
     _performance_series, _decomposition_aggregates, _category_table,
     _reliability, _best_and_worst, _kelly_points, _capital_deployed,
@@ -136,7 +176,11 @@ Notes:
     The scenarios are one grid (_grid_source: bands x ks x caps, from the
     sweep's eager points, or from its size-cap sweep when it carries one),
     walked ONCE (_walk_grid) — one (band, k) cell at a time, primary cell and
-    primary cap first — by visitors that keep only what they build: the chunk
+    primary cap first, then the tier-floors-off cells of the bands the tiers
+    bind at (_GridSource.off_cell, handed to the visitors that define an
+    `off` method; a band the tiers never bind at reuses its tier-on chunks,
+    so nothing is simulated twice) — by visitors that keep only what they
+    build: the chunk
     visitor packs one chunk per distinct (k, trade list), sharing it between
     the scenarios that traded equal lists at one k (every cap at or above a
     cell's peak Kelly fraction does), a counter records the busiest
@@ -145,10 +189,13 @@ Notes:
     equity curves at every k and cap (_KdVisitor — a visitor that fails
     costs only that section's k and cap selection, with a notice in the
     section), and the scenario explorer's visitor keeps every scenario's
-    per-population figures and headline curve as JSON text and packs a
-    block per size cap (_ExplorerVisitor — one that fails costs only the
+    per-population figures and headline curve as JSON text — the
+    tier-floors-off cells too, through its `off` method — and packs a block
+    per size cap, plus a tier-floors-off block per size cap the family was
+    simulated at (_ExplorerVisitor — one that fails costs only the
     explorer's cap axis: it is rebuilt from the sweep's own eager points,
-    and a notice replaces it only if even that fails). The walk also reads
+    tier-floors-off family included, and a notice replaces it only if even
+    that fails). The walk also reads
     the same-title population once, at every cap, for the visitors that show
     or count it. Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
@@ -160,7 +207,8 @@ Notes:
     the sweep could not be used); a chunk that cannot be built,
     or a base block that cannot be, costs the bar, never the page: the page
     is written without it, with a notice in its place and a WARNING in the
-    log. The page as rendered IS the primary scenario's unfiltered view: the
+    log. The page as rendered IS the primary scenario's unfiltered view with
+    the tier floors on: the
     script inflates the base block and the primary scenario's chunk as the
     page loads, sets the bar back to that view (a browser can restore a stale
     choice on reload) and keeps its selects disabled until both are ready,
@@ -179,8 +227,10 @@ Notes:
     market A's event ticker by _series_labels, the rule trades are filed by,
     so a category's k-hat and its trades describe the same events. Its own
     "Group by" <select> picks the axis (category, tag or spread band); the
-    filter bar picks the band and the category or tag, and grouping by one of
-    them shows every value of it with the selection highlighted. Each bar
+    filter bar picks the band, its tier floors setting (a tier-off band
+    regroups its tier-off run's calibration) and the category or tag, and
+    grouping by one of them shows every value of it with the selection
+    highlighted. Each bar
     states its entries and the distinct events behind them. Every figure and
     word it shows comes from Python (_khat_stat's pre-formatted cells, bar
     labels and hover figures, the _KHAT_TEXT templates), so neither the script
@@ -196,11 +246,20 @@ Notes:
     cap its matrices were never baked for. It therefore carries its own
     small inline vanilla-JS script (_SCENARIO_EXPLORER_JS) that unpacks
     gzip-packed data blocks — a base block ("scn-data") and, only when that
-    cap is chosen, one block per size cap ("scn-cap-<i>") — and drives
-    Plotly.update (the heatmap: metric, matrix, colour scale, title),
-    Plotly.restyle (the equity curve) and plain HTML table re-renders — no
-    new dependency, and no hand-rolled charting: Plotly still owns every
-    pixel that gets drawn.
+    cap is chosen, one block per size cap ("scn-cap-<i>"), and, only when
+    the tier floors are chosen off there, that cap's tier-floors-off block
+    ("scn-off-cap-<i>", present only at a cap the run simulated the family
+    at — in production the run's own; any other cap with the tiers off is
+    refused on the section's status line) — and drives Plotly.update (the
+    heatmap: metric, matrix, colour scale, title, and its band labels when
+    the Tier floors setting changes; the equity curve, autoranged and
+    titled for the setting on every redraw), the display of the two k-hat
+    tables Python drew (tier floors on, and off) and plain HTML table
+    re-renders — no new dependency, and no hand-rolled charting: Plotly
+    still owns every pixel that gets drawn. With the tier floors off, a band
+    they bind at reads its own tier-off cells and calibration and every
+    other band its tier-on ones (#68's rule: the tiers never bind there, so
+    that run IS its off view), so no cell ships twice.
 
     Directly under the Period line the header says what settled-market corpus
     the run read (BacktestSweep.corpus_provenance): when it was assembled (a
@@ -220,7 +279,10 @@ Notes:
     run passed no sweep: the ladder setting decides which pairs exist, the
     band which of them are ever entered and the cap how big each trade is,
     so, like DR-66b's strike-blind notice, they qualify every section rather
-    than only the explorer.
+    than only the explorer. The ladder reading is itself read against the
+    configured switch the run recorded
+    (BacktestSweep.config_same_event_ladders), naming a departure from this
+    checkout's config rather than rendering a bare on/off.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -256,18 +318,24 @@ from .backtester import (
     IntervalCalibration,
     OutcomeLabelCoverage,
     SweepPoint,
+    _band_label,
     _build_equity_curve,
     _calibration_bucket,
     _cap_percent,
     _exact_label,
     _leg_prices_for,
+    _tier_floors_bind,
     max_trades_simulated,
 )
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
+    MAX_DEADLINE_GAP_DAYS,
+    MIN_PRICE_DIFF_LONG_GAP,
+    MIN_PRICE_DIFF_SHORT_GAP,
     PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB,
+    SHORT_DEADLINE_GAP_DAYS,
     TRADING_DAYS_PER_YEAR,
     fee_per_pair_approx,
     time_series_profit_prob,
@@ -730,8 +798,9 @@ def _fig_html(fig: go.Figure, height: int = 400, div_id: str | None = None) -> s
             lets Plotly generate its usual random UUID id — the same behaviour
             every pre-existing caller of this helper still gets. A caller that
             needs to drive the figure from separate client-side JS (the
-            scenario-explorer section's Plotly.restyle calls) passes a fixed
-            id here instead of scraping a random one out of the rendered HTML.
+            scenario-explorer section's Plotly calls on its curve and
+            heatmaps, the page-wide filter's redraws) passes a fixed id here
+            instead of scraping a random one out of the rendered HTML.
 
     Returns:
         str: HTML string fragment (no <html>/<body> wrapper, no Plotly.js script tag).
@@ -2131,6 +2200,14 @@ def _section_interval_discount(
 # The k-hat chart's "Group by" choices, in menu order: (value, label).
 _KHAT_GROUPS = (("category", "Category"), ("tag", "Tag"), ("band", "Spread band"))
 
+# The two deadline-gap tier floors as the page names them ("0.15/0.30"), read
+# from config — never a literal — so the page cannot name a tier the backtest
+# did not apply: the filter bar's tier-floors-off views (_tier_off_where), the
+# k-hat chart's title for them (_KHAT_TEXT) and the scenario explorer's
+# tier-off banner (_SCENARIO_TIER_OFF_LEAD) all read it.
+_TIER_FLOORS = (f"{_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')}/"
+                f"{_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')}")
+
 # The k-hat chart's words — its title, its "whole population" rows and the
 # notice shown when there is nothing to draw — as templates the page's script
 # fills too (D.text), like the filter bar's summary line, so the chart Python
@@ -2142,13 +2219,22 @@ _KHAT_TEXT = {
     "khat_all_tags": "All tags",
     "khat_all_in": "All {category}",
     "khat_every_category": "all categories",
+    # Grouped by spread band with the tier floors off, the title's scope says
+    # so (grouped by category or tag, its scope is a tier-off band's own
+    # _tier_off_where phrase, which already does)
+    "khat_scope_tier_off": f"{{scope}}, with the {_TIER_FLOORS} tier floors off",
     "khat_none": ("No time-series candidate entry counts toward k̂ for this selection: "
                   "none was entered at this band, or every one settled in the excluded "
                   "earlier-YES / later-NO cell. With same-event ladders off, a run can form "
                   "none at all."),
+    # No calibration behind the band: either the run measured none there
+    # (backtester._interval_calibration returns None when no time-series
+    # candidate entry at the band had a readable settlement), or the page has
+    # no sweep to read one from
     "khat_not_recorded": ("k̂ was not recorded for this spread band: the run carries no "
-                          "calibration for it (a dashboard built without a sweep, or from a "
-                          "hand-built one)."),
+                          "calibration for it — either no time-series candidate entry at the "
+                          "band had a readable settlement to measure, or the dashboard was "
+                          "built without a sweep (or from a hand-built one)."),
     # The reference line's label: {k} is a _k_label ("k = 0.75"). The line
     # marks the k the page is showing — the run's own on the page as
     # rendered, the filter bar's k after a choice.
@@ -2452,16 +2538,19 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
     gap (pB − pA), over every time-series candidate ENTRY at a band — the
     population backtester._interval_calibration pools (k-independent, before
     the Kelly gate, premise violations excluded), regrouped here. One chart
-    and one table, driven by the page-wide filter bar and a "Group by"
-    <select>: by Category shows every category at the selected band, by Tag
+    and one table, driven by the page-wide filter bar — its band, its Tier
+    floors choice (with the tiers off, each band's tier-off calibration, or
+    its own where the tiers never bind), its category and tag — and a "Group
+    by" <select>: by Category shows every category at the selected band, by Tag
     every tag at the selected band (within the selected category, if any),
     and by Spread band every band for the selected category or tag — the
     grouping's own filter is ignored and its selected value highlighted. Each
     bar states the entries it pools and the distinct events behind them, and
     a dashed line marks the k the page shows (the run's own here; the filter
     bar's k once one is chosen). Rendered here for the
-    default (by category, primary band, no filter); the filter script
-    redraws it for every other choice from the same payload. The "Group by"
+    default (by category, primary band, no filter, tier floors on); the
+    filter script redraws it for every other choice from the same payload.
+    The "Group by"
     <select> sits outside the chart's body, so it stays reachable when a
     selection has nothing to draw. The Portfolio Performance section's two
     k-hat cards (_khat_kpis) show the figure of the group the bar selects —
@@ -2491,7 +2580,8 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
         "k&#770; = realised in-between rate ÷ mean market-implied gap (pB − pA), over "
         "every time-series candidate entry at the band — measured before the Kelly gate, "
         "so it covers entries the run never traded, and independent of k; premise "
-        "violations (earlier YES, later NO) are excluded. Follows the filter bar above: "
+        "violations (earlier YES, later NO) are excluded. Follows the filter bar above, "
+        "its Tier floors choice included: "
         "grouping by category shows every category at the selected band, by tag every "
         "tag (within the selected category), by spread band every band for the selected "
         "category or tag — the selection is highlighted. The dashed line marks the k the "
@@ -2618,13 +2708,15 @@ _HEADLINE_POPULATION = "time_series"
 
 # Every population's label on the page, spelled once so the KPI rows, the
 # banner, the heatmap title and the curve title can never name one
-# population two ways.
+# population two ways. Same-title is simulated once, and no band, k or
+# deadline-gap tier floor reaches a same-title pair, so its row reads the
+# same under both Tier floors settings — and its label says so.
 _POPULATION_LABELS = {
     "time_series": "Time-series (ladders + cross-event; same-title excluded)",
     "all": "All (time-series + same-title)",
     "ladder": "Ladders (same-event)",
     "cross": "Cross-event",
-    "same_title": "Same-title (independent of band and k)",
+    "same_title": "Same-title (independent of band, k and the tier floors)",
 }
 
 # The scenario explorer's heatmap hovers, one per kind of figure. A percent
@@ -2692,10 +2784,16 @@ def _row_label(band: tuple[float, float]) -> str:
     Render a resolved spread band as a heatmap row / band <select> label.
 
     Spells the floor as "max(tier,<floor>)" rather than the bare floor,
-    because the band's floor only ever applies ON TOP OF the deadline-gap tier
+    because on a run simulated with the deadline-gap tier floors applied —
+    every run's primary scenario and every point of BacktestSweep.scenarios —
+    the band's floor only ever applies ON TOP OF the tier
     (config.min_price_diff_for_gap(gap_days, spread_min=...)): a floor at or
     below both tiers (0.15, 0.30) is inert for every pair, and a bare
-    "0.2-0.6" would hide that. Each bound goes through
+    "0.2-0.6" would hide that. A tier-floors-off run
+    (BacktestSweep.tier_off_scenarios) is gated on the floor alone, so the
+    page labels its bands with backtester._band_label's bare "0.2-0.6"
+    instead (the filter bar's tier-floors-off band options and summary
+    phrase, _tier_off_where), never with this. Each bound goes through
     backtester._exact_label — the same injective formatter the completion
     lines use — so two DIFFERENT bands can never share a label. That matters
     here more than in a log: the heatmap's y axis is categorical, and Plotly
@@ -3006,22 +3104,38 @@ def _robustness_extras(point: SweepPoint) -> dict:
 # size cap is chosen, that cap's block (id="scn-cap-<i>": every cell's
 # figures, the same-title row, the banner, the cap's matrices and the heatmap
 # titles), all packed by _packed_json_script and unpacked here by unpack(el)
-# — the primary cap's as the page loads, any other only when chosen. It draws
+# — the primary cap's as the page loads, any other only when chosen — and,
+# on a page with a tier-floors-off view, when that setting is chosen at a cap
+# the run simulated it at (id="scn-off-cap-<i>": the binding bands' rows and
+# that grid's banner, matrices and titles; every other band reads its
+# tier-on row there). A cap the run never simulated with the tier floors off
+# (the base block's "off_caps") is refused: every select goes back on the
+# scenario shown and the status line says so, in Python's words. It draws
 # nothing of its own: it writes only through textContent-escaped HTML,
-# Python's own escaped fragments (the banner), Plotly.update (the heatmap, at
-# the metric and cap chosen) and Plotly.restyle (the equity curve). The blocks
-# are packed by _packed_json_script (the base block) and _packed_text_script
-# (each cap's, built as text) — one encoding. It also
-# defines window.dashScenarioSelect(band, k, cap), which the page-wide filter
+# Python's own escaped fragments (the banner), option texts from the base
+# block, Plotly.update (the heatmap, at the metric, cap and setting chosen —
+# its band labels too when the setting changes — and the equity curve, which
+# every redraw autoranges and titles for the setting) and the display of the
+# two k-hat tables Python drew. The blocks are packed by _packed_json_script
+# (the base block) and _packed_text_script (each cap's and each off block,
+# built as text) — one encoding. It also defines
+# window.dashScenarioSelect(band, k, cap, tier), which the page-wide filter
 # bar's script calls after every redraw with the option labels of the
 # scenario it shows (Python's _band_option, _k_option and _cap_option name
-# both grids), so the explorer's selects follow the bar: an axis moves only
-# when the bar's label on it CHANGED since the bar's last call (the first
-# call is measured against the run's primary scenario, which the bar shows on
-# load), so a redraw for a category or tag — or a bar change on another axis —
-# never throws away a choice the reader made in the explorer itself. A label
-# this grid does not carry leaves that select as it is, and a call made
-# before the explorer's data is unpacked is applied once it is.
+# both grids) and its Tier floors choice ("on" / "off", the values of this
+# section's own Tier floors select), so the explorer's selects follow the
+# bar: an axis moves only when the bar's label on it CHANGED since the bar's
+# last call (the first call is measured against the run's primary scenario
+# with the tier floors on, which the bar shows on load), so a redraw for a
+# category or tag — or a bar change on another axis — never throws away a
+# choice the reader made in the explorer itself. A label this grid does not
+# carry (or a setting on a page whose explorer has no Tier floors select)
+# leaves that select as it is, and a call made before the explorer's data is
+# unpacked is applied once it is. A move the explorer refuses (a cap never
+# simulated with the tier floors off) or cannot load leaves the bar's label
+# on each axis it moved pending: the bar's next call that changes any axis
+# applies it again, so the two never stay apart after a refusal, while a
+# call that changes no axis re-attempts nothing.
 _SCENARIO_EXPLORER_JS = r"""
 <script>
 (function() {
@@ -3031,18 +3145,27 @@ _SCENARIO_EXPLORER_JS = r"""
   var capSel = document.getElementById('scn-cap-select');
   var metricSel = document.getElementById('scn-metric');
   if (!dataEl || !bandSel || !kSel || !capSel || !metricSel) { return; }
+  // The Tier floors select, which Python renders only when the section has a
+  // view with the tiers off — read once the base block says so (D.tier_labels),
+  // so a page without that view never reaches for it
+  var tierSel = null;
   var SELECTS = [bandSel, kSel, capSel, metricSel];
   // D: the base block. P: population name -> its index in every cell's
-  // array. CAPS: each size cap's block, by cap index, unpacked or unpacking.
-  // SHOWN: the [band, k, cap] indexes on screen. SEQ numbers the choices, so
-  // a block arriving after a later choice is never drawn over it. READY: the
+  // array. CAPS: each size cap's block, by cap index, unpacked or unpacking;
+  // OFFS: each cap's block with the tiers off, likewise. SHOWN: the [band, k,
+  // cap, tier] on screen (tier "on" or "off"). SEQ numbers the choices, so a
+  // block arriving after a later choice is never drawn over it. READY: the
   // base block and the primary cap's block are unpacked and the selects
   // enabled. WANTED: the filter bar's last call made before that. LAST: the
-  // [band, k, cap] labels of the bar's last call — the run's primary
-  // scenario's until it first calls (the bar shows that scenario on load) —
-  // so a call moves only the axes whose label changed.
-  var D = null, P = {}, CAPS = {}, SHOWN = null, SEQ = 0, READY = false, WANTED = null;
-  var LAST = null;
+  // [band, k, cap, tier] labels of the bar's last call — the run's primary
+  // scenario's, tiers on, until it first calls (the bar shows that scenario
+  // on load) — so a call moves only the axes whose label changed. PENDING:
+  // per axis, whether the explorer refused (or could not load) the bar's
+  // label on it, so the bar's next call that changes any axis applies it
+  // again — without it LAST would name a label the explorer never showed,
+  // and the two would stay apart for good.
+  var D = null, P = {}, CAPS = {}, OFFS = {}, SHOWN = null, SEQ = 0, READY = false;
+  var WANTED = null, LAST = null, PENDING = [false, false, false, false];
 
   function byId(id) { return document.getElementById(id); }
   function isNum(x) { return typeof x === 'number' && isFinite(x); }
@@ -3126,59 +3249,102 @@ _SCENARIO_EXPLORER_JS = r"""
   function bandIndex() { return parseInt(bandSel.value, 10); }
   function kIndex() { return parseInt(kSel.value, 10); }
   function capIndex() { return parseInt(capSel.value, 10); }
-  function block() { return CAPS[SHOWN[2]].data; }
+  // The Tier floors setting the select names: "on" on a page without one
+  function tierValue() { return tierSel ? tierSel.value : 'on'; }
+  function offShown() { return SHOWN[3] === 'off'; }
+  // The cap's block on screen, and the block the setting on screen is drawn
+  // from — with the tiers off, that cap's off block (its banner, matrices,
+  // titles and the binding bands' rows)
+  function capData() { return CAPS[SHOWN[2]].data; }
+  function view() { return offShown() ? OFFS[SHOWN[2]].data : capData(); }
+  // Whether a band reads its own row with the tiers off: only where they
+  // bind (D.tier_binds) — every other band's off view IS its tier-on one
+  function ownOff(bi) { return offShown() && D.tier_binds[bi]; }
+  function cellAt(bi, ki) {
+    var row = (ownOff(bi) ? view() : capData()).cells[bi];
+    return (row && row[ki]) || [];
+  }
+  function calAt(bi) {
+    return ownOff(bi) ? D.calibration_by_band_off[bi] : D.calibration_by_band[bi];
+  }
+  // A cap and setting in the status line's words: the cap's text, then the
+  // setting's phrase (Python's, from the base block; none with the tiers on)
+  function blockText(ci, tier) {
+    return D.cap_text[ci] + (D.tier_phrases ? D.tier_phrases[tier] : '');
+  }
   function setStatus(text) { var el = byId('scn-status'); if (el) { el.textContent = text; } }
 
   // The KPI table, the band's calibration table and the curve, for the band,
-  // k and cap ON SCREEN. The headline (time-series) population first — the
-  // one the heatmap and banner read — then its two parts, then All and
-  // Same-title, each row named by its own label so no two populations can
-  // be mistaken. A cell the run never simulated at this cap reads "—".
+  // k, cap and setting ON SCREEN. The headline (time-series) population
+  // first — the one the heatmap and banner read — then its two parts, then
+  // All and Same-title, each row named by its own label so no two
+  // populations can be mistaken. A cell the run never simulated at this cap
+  // reads "—". Same-title is read from the cap's block under both settings:
+  // no tier floor reaches a same-title pair.
   function renderTables() {
-    var row = block().cells[SHOWN[0]], cell = (row && row[SHOWN[1]]) || [];
+    var cell = cellAt(SHOWN[0], SHOWN[1]);
     var L = D.labels;
     var ts = cell[P.time_series];
     byId('scn-kpi-body').innerHTML =
       kpiRow(esc(L.time_series), ts) + extrasRow(ts)
       + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
       + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
-      + kpiRow(esc(L.same_title), block().same_title);
-    byId('scn-cal-body').innerHTML = calRows(D.calibration_by_band[SHOWN[0]]);
+      + kpiRow(esc(L.same_title), capData().same_title);
+    byId('scn-cal-body').innerHTML = calRows(calAt(SHOWN[0]));
     // The headline population's curve, like the heatmap, on the explorer's
-    // own date axis (D.dates)
+    // own date axis (D.dates). An update, not a restyle: both axes are
+    // autoranged on every redraw, so a reader's zoom on one scenario's curve
+    // never carries into another's, and the title names the setting drawn
     var values = (ts && ts.equity && ts.equity.length) ? expand(ts.equity) : [];
     if (window.Plotly && byId('scn-equity')) {
-      Plotly.restyle('scn-equity', {x: [values.length ? D.dates : []], y: [values]});
+      Plotly.update('scn-equity', {x: [values.length ? D.dates : []], y: [values]},
+                    {'xaxis.autorange': true, 'yaxis.autorange': true,
+                     'title.text': D.curve_titles[offShown() ? 1 : 0]});
     }
   }
-  // A metric's matrix: the cap's own (a figure of the trades) or the base
-  // block's (k-hat, measured before the Kelly gate, the same at every cap)
+  // A metric's matrix: the view's own (a figure of the trades) or the base
+  // block's (k-hat, measured before the Kelly gate, the same at every cap —
+  // with the tiers off, over the tier-off calibrations where they bind)
   function matrix(name) {
-    var M = block().matrices;
-    return (name in M) ? M[name] : D.matrices[name];
+    var M = view().matrices;
+    return (name in M) ? M[name] : (offShown() ? D.matrices_off : D.matrices)[name];
   }
-  // The heatmap at the metric chosen and the cap on screen: its matrix,
-  // colour scale, centre, hover, hover data and title, all Python's
-  function renderHeatmap() {
+  // The heatmap at the metric chosen and the cap and setting on screen: its
+  // matrix, colour scale, centre, hover, hover data and title, all Python's;
+  // with rows, the band labels too (they change with the setting)
+  function renderHeatmap(rows) {
     if (!window.Plotly || !byId('scn-heatmap')) { return; }
     var mi = parseInt(metricSel.value, 10), m = D.metrics[mi];
-    Plotly.update('scn-heatmap',
-                  {z: [matrix(m.key)], colorscale: [m.colorscale], zmid: [m.zmid],
-                   hovertemplate: [m.hover], customdata: [matrix(m.custom)]},
-                  {'title.text': block().titles[mi]});
+    var trace = {z: [matrix(m.key)], colorscale: [m.colorscale], zmid: [m.zmid],
+                 hovertemplate: [m.hover], customdata: [matrix(m.custom)]};
+    if (rows) { trace.y = [offShown() ? D.band_labels_off : D.band_labels]; }
+    Plotly.update('scn-heatmap', trace, {'title.text': view().titles[mi]});
   }
-  // The banner is the cap's own, as Python wrote (and escaped) it
+  // The banner is the view's own, as Python wrote (and escaped) it
   function renderBanner() {
     var el = byId('scn-banner');
-    if (el) { el.innerHTML = block().banner; }
+    if (el) { el.innerHTML = view().banner; }
+  }
+  // The setting on screen changed: the band options named for it and the
+  // k-hat table Python drew for it shown (every text Python's)
+  function showTier() {
+    var off = offShown(), names = off ? D.band_options_off : D.band_options;
+    for (var i = 0; i < bandSel.options.length; i++) {
+      bandSel.options[i].text = names[parseInt(bandSel.options[i].value, 10)];
+    }
+    var on = byId('scn-khat-on'), offBox = byId('scn-khat-off');
+    if (on) { on.style.display = off ? 'none' : ''; }
+    if (offBox) { offBox.style.display = off ? '' : 'none'; }
   }
   // Draw what the selects name: the banner and the heatmap only when the cap
-  // changed (they do not depend on the band or k), the tables always
+  // or the setting changed (they do not depend on the band or k), the tables
+  // always
   function draw() {
-    var capChanged = SHOWN[2] !== capIndex();
-    SHOWN = [bandIndex(), kIndex(), capIndex()];
+    var capChanged = SHOWN[2] !== capIndex(), tierChanged = SHOWN[3] !== tierValue();
+    SHOWN = [bandIndex(), kIndex(), capIndex(), tierValue()];
     setStatus('');
-    if (capChanged) { renderBanner(); renderHeatmap(); }
+    if (tierChanged) { showTier(); }
+    if (capChanged || tierChanged) { renderBanner(); renderHeatmap(tierChanged); }
     renderTables();
   }
 
@@ -3191,61 +3357,108 @@ _SCENARIO_EXPLORER_JS = r"""
     var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
     return new Response(stream).text().then(function(text) { return JSON.parse(text); });
   }
-  // One size cap's block, unpacked once and kept (a page has one per cap).
-  // Started from a resolved promise, so a synchronous throw (a damaged block,
-  // a missing element) lands in the rejection handler; a failed entry is
-  // dropped, so a later choice can try again.
-  function capBlock(ci) {
-    var entry = CAPS[ci];
+  // One block, unpacked once and kept (a page has one per cap, and one per
+  // cap with the tiers off where the run simulated them). Started from a
+  // resolved promise, so a synchronous throw (a damaged block, a missing
+  // element) lands in the rejection handler; a failed entry is dropped, so a
+  // later choice can try again.
+  function block(store, prefix, ci) {
+    var entry = store[ci];
     if (!entry) {
-      entry = CAPS[ci] = {data: null};
+      entry = store[ci] = {data: null};
       entry.promise = Promise.resolve().then(function() {
-        return unpack(byId('scn-cap-' + ci));
+        return unpack(byId(prefix + ci));
       }).then(function(data) {
         entry.data = data;
         return data;
-      }, function(err) { delete CAPS[ci]; throw err; });
+      }, function(err) { delete store[ci]; throw err; });
     }
     return entry.promise;
   }
-  // The band, k or cap changed: draw it — at once when its cap's block is
-  // unpacked, else once it is; a later choice supersedes it, and a block that
-  // cannot be unpacked puts every select back on the scenario still shown
-  function choose() {
-    var seq = ++SEQ, ci = capIndex(), entry = CAPS[ci];
-    if (entry && entry.data) { draw(); return; }
-    setStatus('Loading ' + D.cap_text[ci] + '…');
-    capBlock(ci).then(function() {
+  // The blocks a cap and setting are drawn from: the cap's, and with the
+  // tiers off its off block too
+  function loaded(ci, tier) {
+    return !!(CAPS[ci] && CAPS[ci].data && (tier !== 'off' || (OFFS[ci] && OFFS[ci].data)));
+  }
+  function load(ci, tier) {
+    var wanted = [block(CAPS, 'scn-cap-', ci)];
+    if (tier === 'off') { wanted.push(block(OFFS, 'scn-off-cap-', ci)); }
+    return Promise.all(wanted);
+  }
+  // Every select back on the scenario still shown
+  function revert() {
+    bandSel.value = String(SHOWN[0]);
+    kSel.value = String(SHOWN[1]);
+    capSel.value = String(SHOWN[2]);
+    if (tierSel) { tierSel.value = SHOWN[3]; }
+  }
+  // The bar's labels on these axes were not applied: the bar's next call
+  // that changes any axis applies them again (see follow)
+  function pend(axes) {
+    (axes || []).forEach(function(axis) { PENDING[axis] = true; });
+  }
+  // The band, k, cap or setting changed: draw it — at once when its blocks
+  // are unpacked, else once they are; a later choice supersedes it. A cap
+  // the run never simulated with the tiers off (D.off_caps) is refused, and
+  // a block that cannot be unpacked too: every select goes back on the
+  // scenario still shown, and the status line says why. `axes`, given only
+  // by follow, names the axes the filter bar moved: a refusal marks them
+  // PENDING, so the explorer follows the bar again on its next move.
+  function choose(axes) {
+    var seq = ++SEQ, ci = capIndex(), tier = tierValue();
+    if (tier === 'off' && !D.off_caps[ci]) {
+      var missing = blockText(ci, tier);
+      revert();
+      pend(axes);
+      setStatus(D.off_missing.split('{failed}').join(missing)
+        .split('{shown}').join(blockText(SHOWN[2], SHOWN[3])));
+      return;
+    }
+    if (loaded(ci, tier)) { draw(); return; }
+    setStatus('Loading ' + blockText(ci, tier) + '…');
+    load(ci, tier).then(function() {
       if (seq === SEQ) { draw(); }
     }, function(err) {
       if (seq !== SEQ) { return; }
-      bandSel.value = String(SHOWN[0]);
-      kSel.value = String(SHOWN[1]);
-      capSel.value = String(SHOWN[2]);
-      setStatus('The explorer could not load ' + D.cap_text[ci] + ' (' + err
-        + '); it still shows ' + D.cap_text[SHOWN[2]] + '.');
+      var failed = blockText(ci, tier);
+      revert();
+      pend(axes);
+      setStatus('The explorer could not load ' + failed + ' (' + err
+        + '); it still shows ' + blockText(SHOWN[2], SHOWN[3]) + '.');
     });
   }
   function labelIndex(labels, label) {
     for (var i = 0; i < labels.length; i++) { if (labels[i] === label) { return i; } }
     return -1;
   }
-  // The filter bar's scenario, by its option labels: a select moves only when
-  // the bar's label on its axis changed since the bar's last call (LAST), so a
-  // redraw that kept the bar's band, k and cap — a category or tag change —
-  // moves nothing, and a band change moves the band alone, leaving a k or cap
-  // the reader chose here as it is; a label this grid does not carry leaves
-  // that select as it is. Drawn only when something moved.
-  function follow(band, k, cap) {
-    var moved = false, labels = [band, k, cap];
-    [[bandSel, D.band_labels], [kSel, D.k_labels], [capSel, D.cap_labels]]
-      .forEach(function(t, axis) {
-        if (labels[axis] === LAST[axis]) { return; }
-        var i = labelIndex(t[1], labels[axis]);
-        if (i >= 0 && t[0].value !== String(i)) { t[0].value = String(i); moved = true; }
-      });
+  // The filter bar's scenario, by its option labels and its Tier floors
+  // choice ("on" / "off", the values of this section's own Tier floors
+  // select): a select moves only when the bar's label on its axis changed
+  // since the bar's last call (LAST), so a redraw that kept the bar's band,
+  // k, cap and setting — a category or tag change — moves nothing, and a
+  // band change moves the band alone, leaving a k, cap or setting the reader
+  // chose here as it is; a label this grid does not carry (or a setting on a
+  // page with no Tier floors select) leaves that select as it is. A call
+  // that changes any axis also applies the bar's label on every axis the
+  // explorer refused before (PENDING) — so after a refused tier-off move the
+  // bar's next band, k, cap or setting change brings the two back together
+  // — while a call that changes none re-attempts nothing. Drawn only when
+  // something moved.
+  function follow(band, k, cap, tier) {
+    var moved = false, axes = [], labels = [band, k, cap, tier];
+    var changed = labels.some(function(label, axis) { return label !== LAST[axis]; });
+    if (!changed) { return; }
+    [[bandSel, D.band_labels], [kSel, D.k_labels], [capSel, D.cap_labels],
+     [tierSel, D.tier_labels]].forEach(function(t, axis) {
+      if (!t[0] || !t[1] || (labels[axis] === LAST[axis] && !PENDING[axis])) { return; }
+      var i = labelIndex(t[1], labels[axis]);
+      // The Tier floors select's values are its labels; every other's its index
+      var value = axis === 3 ? labels[axis] : String(i);
+      if (i >= 0 && t[0].value !== value) { t[0].value = value; moved = true; axes.push(axis); }
+    });
     LAST = labels;
-    if (moved) { choose(); }
+    PENDING = [false, false, false, false];
+    if (moved) { choose(axes); }
   }
   // The explorer cannot work: its base block, or the primary cap's, could
   // not be unpacked. Its selects stay disabled and its table says why; the
@@ -3259,43 +3472,51 @@ _SCENARIO_EXPLORER_JS = r"""
   }
 
   // A browser can restore a <select>'s last choice on a reload; the page as
-  // rendered is the primary scenario at the first metric, so every select is
-  // set back to it. Python renders them disabled: they are enabled once the
-  // base block and the primary cap's block are unpacked.
-  SELECTS.forEach(function(s) {
+  // rendered is the primary scenario at the first metric, tiers on, so every
+  // select is set back to it. Python renders them disabled: they are enabled
+  // once the base block and the primary cap's block are unpacked.
+  function reset(s) {
     s.selectedIndex = 0;
     for (var i = 0; i < s.options.length; i++) {
       if (s.options[i].defaultSelected) { s.selectedIndex = i; }
     }
-  });
+  }
+  SELECTS.forEach(reset);
   if (!window.DecompressionStream || !window.Response || !window.Blob) {
     unavailable('this browser cannot decompress it');
     return;
   }
-  window.dashScenarioSelect = function(band, k, cap) {
-    if (!READY) { WANTED = [band, k, cap]; return; }
-    follow(band, k, cap);
+  window.dashScenarioSelect = function(band, k, cap, tier) {
+    if (!READY) { WANTED = [band, k, cap, tier]; return; }
+    follow(band, k, cap, tier);
   };
   Promise.resolve().then(function() { return unpack(dataEl); }).then(function(data) {
     D = data;
     D.populations.forEach(function(name, i) { P[name] = i; });
-    // What the bar shows on load: the run's primary scenario, which both
-    // grids name by the same option labels
+    if (D.tier_labels) {
+      // Disabled, like the rest, until the primary cap's block is unpacked
+      tierSel = byId('scn-tier-select');
+      reset(tierSel);
+      SELECTS.push(tierSel);
+      tierSel.addEventListener('change', function() { if (READY) { choose(); } });
+    }
+    // What the bar shows on load: the run's primary scenario with the tiers
+    // on, which both grids name by the same option labels
     LAST = [D.band_labels[D.primary[0]], D.k_labels[D.primary[1]],
-            D.cap_labels[D.primary[2]]];
-    return capBlock(D.primary[2]);
+            D.cap_labels[D.primary[2]], 'on'];
+    return block(CAPS, 'scn-cap-', D.primary[2]);
   }).then(function() {
-    SHOWN = D.primary.slice();
+    SHOWN = D.primary.concat(['on']);
     renderTables();
     SELECTS.forEach(function(s) { s.disabled = false; });
     READY = true;
-    if (WANTED) { var w = WANTED; WANTED = null; follow(w[0], w[1], w[2]); }
+    if (WANTED) { var w = WANTED; WANTED = null; follow(w[0], w[1], w[2], w[3]); }
   }, function(err) { unavailable(String(err)); });
 
   [bandSel, kSel, capSel].forEach(function(sel) {
     sel.addEventListener('change', function() { if (READY) { choose(); } });
   });
-  metricSel.addEventListener('change', function() { if (READY) { renderHeatmap(); } });
+  metricSel.addEventListener('change', function() { if (READY) { renderHeatmap(false); } });
 })();
 </script>
 """
@@ -3350,6 +3571,16 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     no cap sweep either (the rule _scenario_explorer_empty_reason applies to
     the band sweep).
 
+    A run's resolved ladder setting can depart from the switch this
+    checkout's config sets (a --same-event-ladders/--no-same-event-ladders
+    override the other way), and that departure means the run does not
+    replay what the live finder trades. When both the resolved setting and
+    the configured switch (BacktestSweep.config_same_event_ladders) are
+    carried as real bools, the ladders reading is suffixed to say whether
+    they agree or, naming the configured value, that they do not; a sweep
+    that carries no configured value (an older caller, a hand-built sweep)
+    renders the bare on/off/not-recorded reading unchanged.
+
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
         cap_sweep_unused (bool): Keyword-only. The sweep carries a size-cap
@@ -3361,7 +3592,11 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
             ladders: on / off / not recorded | per-trade cap: <cap>
             (size-cap sweep on / on, but it could not be used — … / off,
             --no-cap-sweep / not recorded)", the cap as the bar's Size cap
-            select names it (_cap_option).
+            select names it (_cap_option), and an on/off ladder reading
+            suffixed " (same as this checkout's config)", or " (departs from
+            this checkout's config.TIME_SERIES_SAME_EVENT_LADDERS, which was
+            on|off: not a replay of its live rule)", whenever both
+            same_event_ladders and config_same_event_ladders are real bools.
     """
     band = ladders = cap = cap_sweep = "not recorded"
     if sweep is not None:
@@ -3371,6 +3606,16 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
             ladders = "on"
         elif sweep.same_event_ladders is False:
             ladders = "off"
+        config_ladders = sweep.config_same_event_ladders
+        # By TYPE: both must be real bools, or there is nothing to compare
+        if type(sweep.same_event_ladders) is bool and type(config_ladders) is bool:
+            if sweep.same_event_ladders == config_ladders:
+                ladders += " (same as this checkout's config)"
+            else:
+                ladders += (" (departs from this checkout's "
+                            "config.TIME_SERIES_SAME_EVENT_LADDERS, which was "
+                            f"{'on' if config_ladders else 'off'}: not a replay of its "
+                            "live rule)")
         cap = _cap_option(sweep.primary.size_cap)
         if sweep.cap_sweep is not None and cap_sweep_unused:
             cap_sweep = ("on, but it could not be used — the filter bar offers the "
@@ -3512,6 +3757,39 @@ def _corpus_provenance_html(sweep: BacktestSweep | None, *,
     )
 
 
+# The scenario explorer's tier-floors-off banner opens on this HTML, so none
+# of its figures can be read as the run's own: what "off" replaces (the entry
+# threshold max(tier, floor), and nothing else — backtester._find_entry with
+# tier_floors False), what still applies, where it changes nothing, and that
+# live trading never runs this way — the tiers and the gap cap named from
+# config (_TIER_FLOORS, MAX_DEADLINE_GAP_DAYS), never as literals.
+_SCENARIO_TIER_OFF_LEAD = (
+    "<b>Tier floors off:</b> each band's own floor replaces max(tier, floor) as the "
+    f"time-series entry threshold, without the {_TIER_FLOORS} deadline-gap tier floors: "
+    "pB − pA of at least the floor, and pA + nB of at most 1 − the floor. The band's "
+    f"ceiling, the {MAX_DEADLINE_GAP_DAYS}-day deadline-gap cap, the positive-spread rule "
+    "(pB above pA), the fee check and the Kelly gate still apply. A band whose floor sits "
+    "at or above both tiers was not simulated again, since they never bind there: its "
+    "cells are its run with them on. A backtest what-if: live trading always applies the "
+    "tier floors. ")
+
+# The scenario explorer's tier-floors-off heatmap title (on every metric) and
+# k-hat table title end on this.
+_SCENARIO_TIER_OFF_SUFFIX = " — tier floors off"
+
+# The scenario explorer's status line names a size cap with the tier floors
+# off as the cap's _cap_text followed by this phrase (and with them on, by
+# nothing): the script words none of it, reading both from the base block.
+_SCENARIO_TIER_OFF_PHRASE = " with the tier floors off"
+
+# The scenario explorer's status line when a size cap with the tier floors
+# off is chosen that the run never simulated (until a tier-floors-off size-cap
+# sweep exists, every cap but the run's own): {failed} is that cap and
+# setting, {shown} the one the section still shows — the script puts every
+# select back on it, as it does for a block that cannot be unpacked.
+_SCENARIO_TIER_OFF_MISSING = ("{failed} was not simulated by this run; the explorer "
+                              "still shows {shown}.")
+
 # Shown in the explorer's place when neither the page's walk nor the sweep's
 # own eager points could build its data (DR-66: a lost section says so)
 _EXPLORER_UNAVAILABLE_HTML = (
@@ -3530,7 +3808,7 @@ _EXPLORER_OWN_CAP_HTML = (
 
 
 def _explorer_banner(n_cells: int, n_points: int, returns: list, halves: list,
-                     cap: float | None) -> str:
+                     cap: float | None, *, lead: str = "") -> str:
     """
     Build the scenario explorer's fragility banner for one size cap.
 
@@ -3541,7 +3819,10 @@ def _explorer_banner(n_cells: int, n_points: int, returns: list, halves: list,
     a return — and the sentence this section exists to put on the page: the
     best of that many correlated cells overstates what a reader should
     expect, where "that many" counts the cells the heatmap shows a value in
-    at this cap, never the whole grid.
+    at this cap, never the whole grid. The same function builds the
+    tier-floors-off banner, over the grid with the tier floors off (a binding
+    band's tier-off cells, every other band's tier-on ones), opening on
+    _SCENARIO_TIER_OFF_LEAD.
 
     Args:
         n_cells (int): Cells of the grid with an "all" point at this cap.
@@ -3554,6 +3835,9 @@ def _explorer_banner(n_cells: int, n_points: int, returns: list, halves: list,
             split-half check, row-major; a half is None when it had no entries.
         cap (float | None): The size cap (named as its select names it,
             _cap_option).
+        lead (str): Keyword-only. HTML the banner opens on — Python's own
+            (_SCENARIO_TIER_OFF_LEAD for the tier-floors-off banner), never
+            data. "" (default) for the tier-on banner.
 
     Returns:
         str: The banner's <div>, every name escaped.
@@ -3589,6 +3873,7 @@ def _explorer_banner(n_cells: int, n_points: int, returns: list, halves: list,
         "<div style='background:#FFF3E0;border:1px solid #FFB74D;border-radius:8px;"
         "padding:12px 16px;margin:12px 0;font-family:sans-serif;font-size:14px;"
         "color:#5D4037;'>"
+        + lead
         + f"<b>{n_cells} band x k cells computed</b> ({n_points} scenario "
         "points across the time-series, all, ladder and cross-event populations, at "
         f"size cap {html.escape(_cap_option(cap))}{coverage_txt}). Every figure in this banner, the "
@@ -3666,12 +3951,16 @@ def _section_scenario_explorer(
          sized too big, red ("RdBu_r"); the k-hat view uses the same scale,
          so a band whose k-hat sits above the run's k is red in both views
          (the heatmap's negative side is blue where a card is green). A band
-         with no calibration reads null in both. The same pooled figures follow as a static one-row-per-band
-         table ("Empirical k-hat by spread band").
+         with no calibration reads null in both. The same pooled figures
+         follow as a static one-row-per-band table ("Empirical k-hat by
+         spread band", in div "scn-khat-on").
       3. Three <select>s (band, k, size cap — ids "scn-band-select",
          "scn-k-select", "scn-cap-select"), preselected to the primary
-         scenario and marked "(primary)", rendered disabled until the script
-         has unpacked its data, driving — through the small inline script
+         scenario and marked "(primary)" — and, when the grid carries a
+         tier-floors-off view (below), a fourth after the band's, "Tier
+         floors" (id "scn-tier-select", the filter bar's options, title and
+         "on" / "off" values) — rendered disabled until the script has
+         unpacked its data, driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
          its H1/H2 and top-event figures; Ladders; Cross-event; All —
@@ -3679,14 +3968,41 @@ def _section_scenario_explorer(
          sub-row; Same-title, which is independent of band and k but not of
          the cap), the selected band's own calibration table, and the
          time-series equity curve (rendered once for the primary scenario via
-         _fig_html(div_id="scn-equity") and restyled in place). The page-wide
-         filter bar's script moves these three selects to the scenario it
-         shows (window.dashScenarioSelect, matched by option label) — each
-         only when the bar's label on its axis changes, so a choice made
-         here survives a category or tag change and a bar change on another
-         axis; they stay usable on their own. A native updatemenus dropdown cannot
-         express independent axes of selection, which is why this part is
-         scripted.
+         _fig_html(div_id="scn-equity") and redrawn in place by a
+         Plotly.update that autoranges both axes and titles it for the Tier
+         floors setting, so a zoom never carries into another view). The
+         page-wide filter bar's script moves these selects to the scenario
+         it shows (window.dashScenarioSelect, matched by option label, and by
+         its Tier floors choice) — each only when the bar's label on its axis
+         changes, so a choice made here survives a category or tag change
+         and a bar change on another axis, and an axis whose bar label the
+         explorer refused (a cap never simulated with the tiers off) is
+         applied again on the bar's next change to any axis; they stay
+         usable on their own. A
+         native updatemenus dropdown cannot express independent axes of
+         selection, which is why this part is scripted.
+
+    The tier-floors-off view (#68's, re-expressed on this grid): when the
+    walk's grid carries the band sweep's tier-floors-off family
+    (_GridSource.tier_binds — the test the filter bar starts from, so the
+    two classify every band alike) and a size cap has off cells, the
+    section offers the Tier floors select above. With it off, a band the
+    tiers bind at reads its own tier-off points (BacktestSweep.
+    tier_off_scenarios, only points stamped tier_floors False) and its
+    tier-off calibration, and every other band its tier-on cells and
+    calibration, since the tiers never bind there; the heatmap's rows are
+    labelled with backtester._band_label's bare "<floor>-<ceiling>" (the
+    floor alone gated those runs), its titles, the curve's title and the
+    hidden k-hat table's title ("scn-khat-off") end on
+    _SCENARIO_TIER_OFF_SUFFIX, and the banner opens on
+    _SCENARIO_TIER_OFF_LEAD and counts that grid — its "(N scenario points"
+    included. A cell the family lacks reads "—", as a missing tier-on one
+    does, and so does a calibration it lacks. The family is simulated at the
+    run's own size cap only, so every other cap has no off view: choosing
+    one with the tiers off is refused, and the status line says so in
+    Python's words (_SCENARIO_TIER_OFF_MISSING). Without a complete family
+    there is no select, no hidden table and no off block, and the section
+    is exactly what a run without the family renders.
 
     Every number the script reads comes from packed blocks
     (_packed_json_script for the base block, _packed_text_script for each
@@ -3696,13 +4012,22 @@ def _section_scenario_explorer(
     strict JSON, a non-finite value shipped as null and rendered "—"): one
     base block (id "scn-data": the axes, their labels, the populations, the
     date axis, each band's calibration rows, the metric specs and the two
-    cap-independent k-hat matrices, the primary [band, k, cap] indexes) and
-    one block per size cap (id "scn-cap-<i>": every cell's per-population
-    figures — the headline one with its curve as change points on the
-    explorer's axis (_equity_axis) — the same-title row, the banner, the
-    cap's seven matrices and the nine heatmap titles). Only the base block
-    and the primary cap's are unpacked as the page loads; another cap's
-    when it is chosen. The run's primary band and ladder setting are not
+    cap-independent k-hat matrices, the primary [band, k, cap] indexes, the
+    band select's texts and the curve's titles under each Tier floors
+    setting, and — with a tier-floors-off view — which bands the tiers bind
+    at, which caps have an off block, the off band labels, calibrations and
+    k-hat matrices and the status line's words; each of those null
+    without one), one block per size cap (id "scn-cap-<i>": every cell's
+    per-population figures — the headline one with its curve as change
+    points on the explorer's axis (_equity_axis) — the same-title row, the
+    banner, the cap's seven matrices and the nine heatmap titles) and one
+    tier-floors-off block per size cap the family was simulated at (id
+    "scn-off-cap-<i>": a binding band's row of off cells, null for every
+    other band, and that grid's banner, seven matrices and nine titles; no
+    same-title row, which no tier floor reaches). Only the base block and
+    the primary cap's are unpacked as the page loads; another cap's when it
+    is chosen, and an off block when the tier floors are chosen off at its
+    cap. The run's primary band and ladder setting are not
     repeated here — they are on the page header (_run_settings_html), since
     they shape every section.
 
@@ -3805,30 +4130,54 @@ def _section_scenario_explorer(
         """
         return "—" if value is None or not math.isfinite(value) else format(value, spec)
 
-    td = "<td style='padding:4px 12px;'>"
-    khat_rows = "".join(
-        "<tr style='border-bottom:1px solid #E0E0E0'>"
-        + td + html.escape(label) + "</td>"
-        + td + ("—" if p is None else str(p.n)) + "</td>"
-        + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
-        + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
-        + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
-        for label, p in zip(base["band_labels"], data.pooled, strict=True)
-    )
-    khat_table = (
-        "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
-        f"<summary><b>Empirical k&#770; by spread band</b> (pooled over each band's "
-        f"time-series entries; the same at every k and size cap — compare with the "
-        f"primary k = {sweep.primary.k:.3f})</summary>"
-        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
-        "<tr style='background:#E8F5E9;font-weight:bold;'>"
-        "<th style='padding:6px 12px;'>Spread band</th>"
-        "<th style='padding:6px 12px;'>n</th>"
-        "<th style='padding:6px 12px;'>Realised in-between rate</th>"
-        "<th style='padding:6px 12px;'>Mean implied gap</th>"
-        "<th style='padding:6px 12px;'>Pooled k&#770;</th></tr>"
-        + khat_rows + "</table></details>"
-    )
+    def khat_table(labels: list[str], pooled_rows: tuple, suffix: str = "") -> str:
+        """
+        One Tier floors setting's "Empirical k-hat by spread band" table.
+
+        Args:
+            labels (list[str]): Each band's row label under that setting.
+            pooled_rows (tuple): Each band's pooled k-hat row, or None.
+            suffix (str): Appended to the table's title ("" with the tier
+                floors on, _SCENARIO_TIER_OFF_SUFFIX off).
+
+        Returns:
+            str: The table, in an open <details>.
+        """
+        td = "<td style='padding:4px 12px;'>"
+        khat_rows = "".join(
+            "<tr style='border-bottom:1px solid #E0E0E0'>"
+            + td + html.escape(label) + "</td>"
+            + td + ("—" if p is None else str(p.n)) + "</td>"
+            + td + fmt(None if p is None else p.realised_rate, ".4f") + "</td>"
+            + td + fmt(None if p is None else p.mean_implied, ".4f") + "</td>"
+            + td + fmt(None if p is None else p.empirical_k, ".3f") + "</td></tr>"
+            for label, p in zip(labels, pooled_rows, strict=True)
+        )
+        return (
+            "<details open style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+            f"<summary><b>Empirical k&#770; by spread band{html.escape(suffix)}</b> "
+            "(pooled over each band's "
+            f"time-series entries; the same at every k and size cap — compare with the "
+            f"primary k = {sweep.primary.k:.3f})</summary>"
+            "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+            "<tr style='background:#E8F5E9;font-weight:bold;'>"
+            "<th style='padding:6px 12px;'>Spread band</th>"
+            "<th style='padding:6px 12px;'>n</th>"
+            "<th style='padding:6px 12px;'>Realised in-between rate</th>"
+            "<th style='padding:6px 12px;'>Mean implied gap</th>"
+            "<th style='padding:6px 12px;'>Pooled k&#770;</th></tr>"
+            + khat_rows + "</table></details>"
+        )
+
+    # The tier-on table, and — with a tier-floors-off view — the tier-off
+    # one, hidden: the script shows the one for the Tier floors setting drawn
+    khat_tables = ('<div id="scn-khat-on">'
+                   + khat_table(base["band_labels"], data.pooled) + "</div>")
+    if data.tier_select:
+        khat_tables += ('<div id="scn-khat-off" style="display:none">'
+                        + khat_table(base["band_labels_off"], data.pooled_off,
+                                     _SCENARIO_TIER_OFF_SUFFIX)
+                        + "</div>")
 
     # ── The <select>s, preselected to (and marking) the primary scenario ─────
     def options(labels: list[str], primary: int) -> str:
@@ -3848,18 +4197,35 @@ def _section_scenario_explorer(
             for i, lbl in enumerate(labels)
         )
 
+    # The Tier floors select, beside the band's as on the filter bar — only
+    # when the section has a tier-floors-off view (a page without the family
+    # renders none, and the bar's summary line then says the explorer does
+    # not follow its Tier floors choice). Its options, title and values are
+    # the bar's (_TIER_OPTION_ON / _OFF, _TIER_SELECT_TITLE; "on" / "off",
+    # the values the bar hands window.dashScenarioSelect)
+    tier_select = ""
+    if data.tier_select:
+        tier_select = (
+            "&nbsp;&nbsp;"
+            '<label>Tier floors: <select id="scn-tier-select" disabled autocomplete="off" '
+            f'title="{html.escape(_TIER_SELECT_TITLE)}">'
+            f'<option value="on" selected>{html.escape(_TIER_OPTION_ON)}</option>'
+            f'<option value="off">{html.escape(_TIER_OPTION_OFF)}</option>'
+            "</select></label>")
     selects = (
         "<div style='font-family:sans-serif;font-size:14px;margin:16px 0;'>"
         '<label>Spread band: <select id="scn-band-select" disabled autocomplete="off">'
         + options(base["band_labels"], pb) + "</select></label>"
-        "&nbsp;&nbsp;"
+        + tier_select
+        + "&nbsp;&nbsp;"
         '<label>k: <select id="scn-k-select" disabled autocomplete="off">'
         + options(base["k_labels"], pk) + "</select></label>"
         "&nbsp;&nbsp;"
         '<label>Size cap: <select id="scn-cap-select" disabled autocomplete="off">'
         + options(base["cap_labels"], pc) + "</select></label>"
         "</div>"
-        # A cap's block loading, or one that could not be (the script's words)
+        # A cap's block loading, or one that could not be (the script's words),
+        # or a cap not simulated with the tier floors off (Python's template)
         "<div id='scn-status' style='font-family:sans-serif;font-size:13px;"
         "color:#616161;'></div>"
     )
@@ -3885,18 +4251,21 @@ def _section_scenario_explorer(
 """
 
     # ── The headline population's equity curve: rendered once for the
-    # primary scenario, then restyled in place by the inline script. Every
-    # curve is on the explorer's axis, decided once from the primary
-    # (_equity_axis); only the headline population ships a curve per cell:
-    # the curves are the dominant term, and a second population's would
-    # roughly double it. ──────────────────────────────────────────────────────
+    # primary scenario, then redrawn in place by the inline script (a
+    # Plotly.update that autoranges both axes and retitles it for the Tier
+    # floors setting). Every curve is on the explorer's axis, decided once
+    # from the primary (_equity_axis); only the headline population ships a
+    # curve per cell: the curves are the dominant term, and a second
+    # population's would roughly double it. ───────────────────────────────────
     efig = go.Figure()
     efig.add_trace(go.Scatter(
         x=base["dates"] if data.primary_curve else [], y=data.primary_curve,
         name=headline_label,
         line={"color": _COLORS["strategy"], "width": 2},
     ))
-    efig.update_layout(title=f"Equity curve — selected band, k and size cap — {headline_label}",
+    # The title with the tier floors on, as the base block carries it for
+    # the script to retitle the curve with
+    efig.update_layout(title=base["curve_titles"][0],
                        yaxis_title="Portfolio Value ($)", xaxis_title="Date")
 
     return (
@@ -3906,14 +4275,16 @@ def _section_scenario_explorer(
         + f'<div id="scn-banner">{data.banner}</div>'
         + metric_select
         + _fig_html(hfig, height=450, div_id="scn-heatmap")
-        + khat_table
+        + khat_tables
         + selects
         + kpi_table
         + _fig_html(efig, height=400, div_id="scn-equity")
-        # The base block, then every cap's block, before the script that
-        # unpacks them: an element a script reaches exists when it runs
+        # The base block, then every cap's block and every tier-floors-off
+        # block, before the script that unpacks them: an element a script
+        # reaches exists when it runs
         + _packed_json_script("scn-data", base)
         + "".join(data.blocks)
+        + "".join(data.off_blocks)
         + _SCENARIO_EXPLORER_JS
     )
 
@@ -4480,24 +4851,50 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     )
 
 
-# ─── Page-wide filter: spread band x k x size cap x Kalshi category x tag ───
+# ─── Page-wide filter: spread band x tier floors x k x size cap x Kalshi category x tag ───
 
 # The view every trade list carries: all of its trades, no category or tag.
 _ALL_VIEW = "all"
 
+# The filter bar's "Tier floors" options: each band's run as simulated (the
+# tiers applied, config.min_price_diff_for_gap's rule) or its run with them
+# off, where the band's own floor alone gates the spread (BacktestSweep's
+# tier-off family). Kept short, so the sticky bar is less likely to wrap; the
+# select's title (_TIER_SELECT_TITLE) spells the rule out. Both read the tiers
+# from config (as _TIER_FLOORS, above, does), never as literals.
+_TIER_OPTION_ON = (f"on ({_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} / "
+                   f"{_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')} by deadline gap)")
+_TIER_OPTION_OFF = "off (each band's own floor alone)"
+
+# The Tier floors select's tooltip (its title attribute, escaped where the bar
+# renders it): what each setting admits, and that the choice is a backtest
+# what-if — every number in it read from config.
+_TIER_SELECT_TITLE = (
+    "on — a time-series pair needs pB − pA of at least "
+    f"{_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} when its deadlines are up to "
+    f"{SHORT_DEADLINE_GAP_DAYS} days apart and {_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')} "
+    f"for {SHORT_DEADLINE_GAP_DAYS + 1}–{MAX_DEADLINE_GAP_DAYS} days, and at least the "
+    "band's floor; off — the band's floor alone (the spread must still be positive); a "
+    "backtest what-if: live trading always applies the tier floors.")
+
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
 # section follows its k and size cap alone, always at the primary spread band
-# (its k-hat and per-k runs are the whole primary band's), and the scenario
-# explorer's band, k and size-cap selects follow the bar's scenario (the
-# explorer's script defines window.dashScenarioSelect, which the bar's calls
-# after every redraw; an axis moves when the bar's label on it changes) while
-# staying usable on their own. Category and tag reach neither: the explorer
-# compares whole runs, and the interval-discount section's population is the
-# whole primary band.
+# and always with the tier floors on (its k-hat and per-k runs are the whole
+# primary band's run as simulated), and the scenario explorer's selects
+# follow the bar's scenario on each axis it has a select for (the explorer's
+# script defines window.dashScenarioSelect, which the bar's calls after every
+# redraw; an axis moves when the bar's label on it changes) while staying
+# usable on their own. _BAR_REACH and the other sentences that name a Tier
+# floors choice in the explorer's reach are for an explorer with a Tier
+# floors select of its own; an explorer without one reads one of
+# _BAR_REACH_NO_EXPLORER_TIERS. Category and tag reach neither: the explorer compares
+# whole runs, and the interval-discount section's population is the whole
+# primary band.
 _BAR_REACH = ("The Interval Discount section follows only the bar's k and size cap (at the "
-              "primary spread band), and the Scenario Explorer's selects follow its band, k "
-              "and size cap; category and tag reach neither.")
+              "primary spread band, tier floors on — never its Tier floors choice), and the "
+              "Scenario Explorer's selects follow its band, Tier floors choice, k and size "
+              "cap; category and tag reach neither.")
 
 # The same sentence for each page that lacks one of the two: the summary line
 # never claims a reach the page does not have. The interval-discount section
@@ -4510,32 +4907,62 @@ _BAR_REACH = ("The Interval Discount section follows only the bar's k and size c
 # visitor failed) while the bar offers more caps — it then has the run's own
 # cap alone, so the bar's other caps name nothing in it. The base block
 # carries whichever applies (_filter_payload, through _bar_reach), so the line
-# Python renders and the one the script fills say the same.
+# Python renders and the one the script fills say the same. Every variant
+# says the Interval Discount section does not follow the Tier floors choice:
+# either it follows the bar with the tier floors on, or the bar does not
+# reach it at all.
 _BAR_REACH_NO_EXPLORER = ("The Interval Discount section follows only the bar's k and size "
-                          "cap (at the primary spread band), not its category or tag; this "
-                          "page has no Scenario Explorer grid for the bar to reach.")
+                          "cap (at the primary spread band, tier floors on — never its Tier "
+                          "floors choice), not its category or tag; this page has no "
+                          "Scenario Explorer grid for the bar to reach.")
 _BAR_REACH_OWN_CAP = ("The Interval Discount section follows only the bar's k and size cap "
-                      "(at the primary spread band), and the Scenario Explorer's selects "
-                      "follow its band and k but not its size cap — the explorer shows the "
+                      "(at the primary spread band, tier floors on — never its Tier floors "
+                      "choice), and the Scenario Explorer's selects follow its band, Tier "
+                      "floors choice and k but not its size cap — the explorer shows the "
                       "run's own size cap only on this page; category and tag reach neither.")
-_BAR_REACH_EXPLORER_ONLY = ("The Scenario Explorer's selects follow the bar's band, k and size "
-                            "cap (not its category or tag); the bar does not reach the "
-                            "Interval Discount section on this page.")
+_BAR_REACH_EXPLORER_ONLY = ("The Scenario Explorer's selects follow the bar's band, Tier floors "
+                            "choice, k and size cap (not its category or tag); the bar does "
+                            "not reach the Interval Discount section on this page.")
 _BAR_REACH_EXPLORER_ONLY_OWN_CAP = (
-    "The Scenario Explorer's selects follow the bar's band and k (not its size cap — the "
-    "explorer shows the run's own size cap only on this page — nor its category or tag); "
-    "the bar does not reach the Interval Discount section on this page.")
+    "The Scenario Explorer's selects follow the bar's band, Tier floors choice and k (not its "
+    "size cap — the explorer shows the run's own size cap only on this page — nor its "
+    "category or tag); the bar does not reach the Interval Discount section on this page.")
 _BAR_REACH_STATIC = ("The bar reaches neither the Interval Discount section on this page nor "
                      "a Scenario Explorer grid.")
 
+# The four sentences with an explorer grid, for a page whose explorer has no
+# Tier floors select of its own: the explorer then shows the tier floors on
+# whatever the bar's choice (a page without a tier-floors-off family offers
+# only "on"), and the line says so. Keyed by (kd_follows, explorer_caps).
+_BAR_REACH_NO_EXPLORER_TIERS = {
+    (True, True): ("The Interval Discount section follows only the bar's k and size cap (at "
+                   "the primary spread band, tier floors on — never its Tier floors choice), "
+                   "and the Scenario Explorer's selects follow its band, k and size cap but "
+                   "not its Tier floors choice; category and tag reach neither."),
+    (True, False): ("The Interval Discount section follows only the bar's k and size cap (at "
+                    "the primary spread band, tier floors on — never its Tier floors "
+                    "choice), and the Scenario Explorer's selects follow its band and k but "
+                    "neither its size cap nor its Tier floors choice — the explorer shows the "
+                    "run's own size cap only on this page; category and tag reach neither."),
+    (False, True): ("The Scenario Explorer's selects follow the bar's band, k and size cap "
+                    "(not its Tier floors choice, category or tag); the bar does not reach "
+                    "the Interval Discount section on this page."),
+    (False, False): ("The Scenario Explorer's selects follow the bar's band and k (not its "
+                     "size cap — the explorer shows the run's own size cap only on this page "
+                     "— nor its Tier floors choice, category or tag); the bar does not reach "
+                     "the Interval Discount section on this page."),
+}
 
-def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool = True) -> str:
+
+def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool = True,
+               explorer_tiers: bool = True) -> str:
     """
     Say what the filter bar reaches beyond the sections it re-scopes whole.
 
     Args:
         kd_follows (bool): Whether the interval-discount section follows the
-            bar's k and size cap (its data, "kd", was built).
+            bar's k and size cap (its data, "kd", was built). It never
+            follows the Tier floors choice, and every sentence says so.
         explorer_follows (bool): Whether the page carries the scenario
             explorer's grid and script, whose selects follow the bar.
         explorer_caps (bool): Keyword-only. Whether the explorer's size-cap
@@ -4543,14 +4970,22 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
             when the explorer shows the run's own cap only while the bar
             offers more (its data rebuilt from the sweep's own eager points);
             ignored when explorer_follows is False. True (default).
+        explorer_tiers (bool): Keyword-only. Whether the explorer follows the
+            bar's Tier floors choice, i.e. has a Tier floors select of its
+            own. False when it has none (it then shows the tier floors on
+            whatever the bar's choice); ignored when explorer_follows is
+            False. True (default).
 
     Returns:
         str: _BAR_REACH, _BAR_REACH_OWN_CAP, _BAR_REACH_NO_EXPLORER,
-            _BAR_REACH_EXPLORER_ONLY, _BAR_REACH_EXPLORER_ONLY_OWN_CAP or
-            _BAR_REACH_STATIC.
+            _BAR_REACH_EXPLORER_ONLY, _BAR_REACH_EXPLORER_ONLY_OWN_CAP,
+            _BAR_REACH_STATIC, or (explorer_tiers False) one of
+            _BAR_REACH_NO_EXPLORER_TIERS.
     """
     if not explorer_follows:
         return _BAR_REACH_NO_EXPLORER if kd_follows else _BAR_REACH_STATIC
+    if not explorer_tiers:
+        return _BAR_REACH_NO_EXPLORER_TIERS[(kd_follows, explorer_caps)]
     if kd_follows:
         return _BAR_REACH if explorer_caps else _BAR_REACH_OWN_CAP
     return _BAR_REACH_EXPLORER_ONLY if explorer_caps else _BAR_REACH_EXPLORER_ONLY_OWN_CAP
@@ -4558,19 +4993,24 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # The filter bar's summary line, as templates: _filter_summary_text fills them
 # for the page as rendered and the page's script fills them (D.text) for every
 # other selection, so the two can never word one selection differently.
-# {scenario} is "scenario" filled (_scenario_phrase: a band's _band_where, a
-# k's text and a size cap's _cap_text), {count} and {band_count} a
-# _trade_count, {n} a bare count and {selection} a category or
-# "Category · Tag". "missing" is a scenario the run never simulated (a cell a
-# hand-built sweep left out), "loading" the line shown while a scenario's
-# chunk is inflated, and "unavailable" a chunk that could not be loaded:
-# {failed} is the scenario asked for, {reason} the error and {scenario} the
-# one the sections still show.
+# {scenario} is "scenario" filled (_scenario_phrase: a band's _band_where —
+# with the tier floors off, its _tier_off_where — a k's text and a size cap's
+# _cap_text), {count} and {band_count} a _trade_count, {n} a bare count and
+# {selection} a category or "Category · Tag". "other_scenario" closes the
+# whole-run view of any scenario but the primary, and "other_run" the primary
+# band, k and size cap with the tier floors off at a band where they bind
+# (its own simulation too). "missing" is a scenario the run never simulated
+# (a cell a hand-built sweep left out, or a binding band's tier-floors-off
+# view at a size cap other than the run's own), "loading" the line shown
+# while a scenario's chunk is inflated, and "unavailable" a chunk that could
+# not be loaded: {failed} is the scenario asked for, {reason} the error and
+# {scenario} the one the sections still show.
 _SUMMARY_TEMPLATES = {
     "scenario": "{where}, {k}, {cap}",
     "all": "Showing every trade of the run at {scenario}: {count}.",
     "other_scenario": (" This spread band, k and size cap is its own simulation, "
                        "not a slice of the primary run."),
+    "other_run": " This is its own simulation, not a slice of the primary run.",
     "missing": "Showing nothing: {scenario} was not simulated by this run.",
     "loading": "Loading {scenario}…",
     "unavailable": ("The filter could not load the data for {failed} ({reason}); "
@@ -4607,6 +5047,20 @@ _WALK_PROGRESS_LINES = 20
 def _no_same_title() -> dict:
     """
     The same-title population of a grid with none: no point at any cap.
+
+    Returns:
+        dict: {}.
+    """
+    return {}
+
+
+def _no_off_cell(band: tuple[float, float] | None, k: float | None) -> dict:
+    """
+    The tier-floors-off cell of a grid with no tier-off family: no point at any cap.
+
+    Args:
+        band (tuple[float, float] | None): Ignored.
+        k (float | None): Ignored.
 
     Returns:
         dict: {}.
@@ -4657,6 +5111,23 @@ class _GridSource:
             read only for its simulated / reused counters in the walk's log.
         fallback: Callable () -> _GridSource, or None: the eager-only source
             the walk falls back to when a size-cap cell cannot be simulated.
+        tier_binds (tuple | None): Per band, whether the run simulated it
+            again with the deadline-gap tier floors off (True) or the tiers
+            never bind there, so its tier-on run stands in (False) —
+            _tier_off_binds; None when the page has no tier-floors-off view
+            at all (no family, an incomplete one, or an unrecorded band).
+        off_cell: Callable (band, k) -> {cap: {population: SweepPoint}} — a
+            binding band's tier-floors-off points
+            (BacktestSweep.tier_off_scenarios, stamped tier_floors False),
+            filed under the run's own size cap, the one cap the family was
+            simulated at; {} for a cell the family never simulated. Read by
+            the walk for binding bands only (_walk_once).
+        off_calibrations (dict): Binding band -> its tier-off
+            IntervalCalibration (BacktestSweep.tier_off_calibrations_by_band);
+            a non-binding band reads its tier-on calibration instead.
+        off_events (frozenset): (event ticker, fallback category) of every
+            trade a tier-off cell can show, so the bar lists a category only
+            a tier-off run traded.
     """
     bands: tuple
     ks: tuple
@@ -4669,6 +5140,10 @@ class _GridSource:
     checks: bool = False
     cap_sweep: object | None = None
     fallback: Callable[[], "_GridSource"] | None = None
+    tier_binds: tuple | None = None
+    off_cell: Callable[[tuple[float, float] | None, float | None], dict] = _no_off_cell
+    off_calibrations: dict = field(default_factory=dict)
+    off_events: frozenset = frozenset()
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -4712,6 +5187,113 @@ def _band_calibrations(sweep: BacktestSweep, bands: tuple) -> dict:
     return {band: (_primary_calibration(sweep) if band == primary_band
                    else sweep.calibrations_by_band.get(band))
             for band in bands}
+
+
+def _tier_off_binds(sweep: BacktestSweep | None, bands: list) -> list[bool] | None:
+    """
+    Say, per band, whether its tier-floors-off view is a simulation of its own.
+
+    The band sweep's tier-off family (BacktestSweep.tier_off_scenarios)
+    simulates again exactly the bands where a deadline-gap tier floor binds,
+    and its calibrations' keys (tier_off_calibrations_by_band) are exactly
+    those bands. A band outside them whose floor sits at or above both tiers
+    (backtester._tier_floors_bind False) enters the same pairs on the same
+    Mondays either way, so its tier-on run IS its tier-off run. Anything else
+    fails CLOSED — the whole off view is withheld rather than one band's
+    guessed: a view the run did not simulate is never shown as if it had
+    been.
+
+    The page's grid reads it over its bands (_with_tier_off), so the filter
+    bar and everything the walk builds classify every band alike: simulated
+    again, its tier-on run standing in, or cause to withhold the whole off
+    view. A binding band whose family lacks a point at some k (never from
+    run_backtest_sweep, whose family names every binding band at every k)
+    is not cause to withhold it: that one scenario is shown as never
+    simulated ("missing"), like any cell a ragged sweep left out.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep, or None.
+        bands (list): Each offered band's resolved (floor, ceiling), in the
+            caller's order (the grid's bands) — None for an unrecorded band.
+
+    Returns:
+        list[bool] | None: Per band, True when the run simulated it again with
+            the tier floors off, False when the tiers never bind there.
+            Returns None — no off view anywhere — when there is no sweep, it
+            carries no tier-off family, a band is unrecorded, or a band the
+            tiers bind at is missing from the family.
+    """
+    if sweep is None or not sweep.tier_off_scenarios:
+        return None
+    binds = []
+    for band in bands:
+        if band is None:
+            return None
+        if band in sweep.tier_off_calibrations_by_band:
+            binds.append(True)
+        # The one test of "a tier sits above this floor", shared with the
+        # backtester that decided which bands to simulate again
+        elif _tier_floors_bind(band):
+            return None
+        else:
+            binds.append(False)
+    return binds
+
+
+def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
+    """
+    Attach a sweep's tier-floors-off family to a grid, when it can be shown.
+
+    Every point of BacktestSweep.tier_off_scenarios stamped tier_floors False
+    (never a tier-on one) at a band the tiers bind at is filed by (band, k,
+    population) under the grid's primary size cap — the run's own, the one
+    cap the family was simulated at — the first point wins, as
+    _eager_source files the tier-on ones. A band the tiers never bind at has
+    no off cell: its tier-on scenarios stand in (the walk reuses their
+    chunks), which is #68's rule that such a band's off view IS its run.
+
+    Args:
+        source (_GridSource): The tier-on grid.
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        _GridSource: The source itself when _tier_off_binds says the page
+            has no off view (no sweep, no or an incomplete family, an
+            unrecorded band); else a copy carrying tier_binds, off_cell,
+            off_calibrations and off_events.
+    """
+    binds = _tier_off_binds(sweep, list(source.bands))
+    if binds is None:
+        return source
+    binding = {band for band, own in zip(source.bands, binds, strict=True) if own}
+    cap = source.caps[source.primary[2]]
+    by_cell: dict = {}
+    for point in sweep.tier_off_scenarios:
+        if point.tier_floors is False and point.spread_band in binding:
+            by_cell.setdefault((point.spread_band, point.k), {}).setdefault(
+                point.population, point)
+
+    def off_cell(band, k) -> dict:
+        """
+        One binding (band, k)'s tier-floors-off points, at the run's own cap.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+
+        Returns:
+            dict: {cap: {population: point}}, or {} for a cell the family
+                never simulated.
+        """
+        pops = by_cell.get((band, k))
+        return {cap: dict(pops)} if pops else {}
+
+    return dataclasses.replace(
+        source, tier_binds=tuple(binds), off_cell=off_cell,
+        off_calibrations={band: sweep.tier_off_calibrations_by_band.get(band)
+                          for band in binding},
+        off_events=_trade_events(point for pops in by_cell.values()
+                                 for point in pops.values()))
 
 
 def _trade_events(points) -> frozenset:
@@ -4789,7 +5371,9 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
     axes are the bands and ks of the "all" points, and a (band, k) the sweep
     never simulated is an empty cell. There is one cap: the primary's (the
     run's own, config.BUDGET_FRACTION in production, or None when a
-    hand-built point records none).
+    hand-built point records none). A point stamped tier_floors False (the
+    tier-floors-off family's, which _with_tier_off files apart) is never
+    filed here, wherever it sits: a tier-off run is never a tier-on cell.
 
     Args:
         sweep (BacktestSweep): A sweep whose primary records a band.
@@ -4799,7 +5383,7 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
     """
     eager: dict = {}
     for point in (sweep.primary, *sweep.points, *sweep.scenarios):
-        if point.spread_band is not None:
+        if point.spread_band is not None and point.tier_floors is not False:
             eager.setdefault((point.spread_band, point.k, point.population), point)
     alls = [(band, k) for band, k, population in eager if population == _ALL_VIEW]
     bands = tuple(sorted({band for band, _ in alls}))
@@ -4871,7 +5455,10 @@ def _grid_source(
     the header's "could not be used" clause always has its reason in the log.
     In every shape the primary scenario's chunk is built from the page's own
     trades and curve (the visitors substitute them), and the primary band's
-    calibration falls back to sweep.calibration.
+    calibration falls back to sweep.calibration. A banded shape also carries
+    the sweep's tier-floors-off family when the page can show it
+    (_with_tier_off: its binding bands' off cells at the run's own cap), so
+    the walk's fallback keeps the Tier floors choice too.
 
     The k axis is the sweep's own: its primary entry is sweep.primary.k,
     never k_used, which names the one k only without a sweep. An
@@ -4889,7 +5476,8 @@ def _grid_source(
             the walk's fallback.
 
     Returns:
-        _GridSource: The grid.
+        _GridSource: The grid (with its tier-floors-off family, when the
+            page can show one).
     """
     if sweep is None or sweep.primary.spread_band is None:
         if use_cap_sweep and sweep is not None and sweep.cap_sweep is not None:
@@ -4902,7 +5490,8 @@ def _grid_source(
         try:
             bands, ks, caps = tuple(capped.bands), tuple(capped.ks), tuple(capped.caps)
             if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
-                return _GridSource(
+                # The tier-floors-off family rides along (_with_tier_off)
+                return _with_tier_off(_GridSource(
                     bands=bands, ks=ks, caps=caps,
                     primary=(bands.index(primary.spread_band), ks.index(primary.k),
                              caps.index(capped.primary_cap)),
@@ -4915,18 +5504,18 @@ def _grid_source(
                     events=frozenset(capped.entry_events()),
                     checks=bool(capped.checks), cap_sweep=capped,
                     fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
-                                                  use_cap_sweep=False))
+                                                  use_cap_sweep=False)), sweep)
         except Exception:
             # The cap axis alone is lost, as when a cell cannot be simulated
             # in the walk: the eager points still give the bar every band and k
             logging.warning("The size-cap sweep could not be simulated; the page offers "
                             "the run's own cap only", exc_info=True)
-            return _eager_source(sweep)
+            return _with_tier_off(_eager_source(sweep), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
             "k %s, cap %s); the dashboard offers the run's own cap only",
             primary.spread_band, primary.k, capped.primary_cap)
-    return _eager_source(sweep)
+    return _with_tier_off(_eager_source(sweep), sweep)
 
 
 def _filter_labels(
@@ -4937,10 +5526,14 @@ def _filter_labels(
     """
     Every Kalshi category and category · tag the filter bar offers.
 
-    The union of every trade any cell can show (source.events), the page's
-    own trades, and every band's k-hat observations (the k-hat breakdown
-    shows a category even where no trade was made), each filed by
-    _series_labels — the rule the sections file trades by.
+    The union of every trade any cell can show (source.events, and a
+    tier-floors-off cell's, source.off_events), the page's own trades, and
+    every band's k-hat observations, tier-off ones included (the k-hat
+    breakdown shows a category even where no trade was made), each filed by
+    _series_labels — the rule the sections file trades by. One list serves
+    both Tier floors settings, so the options keep their indices across a
+    toggle — a category only a tier-off run traded is offered (at 0) with
+    the tiers on too.
 
     Args:
         source (_GridSource): The grid.
@@ -4952,11 +5545,13 @@ def _filter_labels(
             the (category, tag) pairs, sorted.
     """
     pairs = {_series_labels(ticker, category, series_categories)
-             for ticker, category in source.events}
+             for ticker, category in source.events | source.off_events}
     pairs.update(_series_labels(t.event_ticker, t.category, series_categories)
                  for t in trades)
     pairs.update(_series_labels(o.event_ticker, o.category, series_categories)
-                 for calibration in source.calibrations.values() if calibration is not None
+                 for calibration in (*source.calibrations.values(),
+                                     *source.off_calibrations.values())
+                 if calibration is not None
                  for o in calibration.observations)
     return sorted({category for category, _ in pairs}), sorted(pairs)
 
@@ -5174,16 +5769,29 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     same-title failure costs only the same-title rows at the other caps,
     never the cells already walked: it does not stop the walk.
 
+    After the tier-on cells, when the grid carries a tier-floors-off family
+    (source.tier_binds) and some visitor takes it (one with an `off`
+    method), every BINDING band's off cells are read (source.off_cell), cut
+    and handed to those visitors the same way, one (band, k) at a time, in
+    band and k order. A band the tiers never bind at is not walked again:
+    its tier-on scenarios stand in for its off view (each visitor reuses
+    what it built for them), so nothing is simulated twice. The primary
+    scenario's own trades are never substituted here — a tier-off run is
+    its own simulation. A visitor without an `off` method (the
+    interval-discount section's) stays tier-on.
+
     Args:
         source (_GridSource): The grid.
         visitors (list): Callables (band index, k index, cap index,
             {population: SweepPoint}); one may also have a
-            same_title({cap: SweepPoint}) method.
+            same_title({cap: SweepPoint}) method, and an off(band index,
+            k index, cap index, {population: SweepPoint}) method taking the
+            tier-floors-off cells.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
-        Exception | None: The exception source.cell raised, which stops the
-            walk; None when every cell was visited.
+        Exception | None: The exception source.cell (or source.off_cell)
+            raised, which stops the walk; None when every cell was visited.
     """
     pb, pk, pc = source.primary
     cells = [(pb, pk)] + [(bi, ki) for bi in range(len(source.bands))
@@ -5207,6 +5815,23 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             logging.info("Dashboard: %d/%d band x k cells read from the size-cap sweep "
                          "(%d cap points simulated, %d shared so far)", done, len(cells),
                          getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    off_takers = [visit for visit in visitors if hasattr(visit, "off")]
+    if source.tier_binds is not None and off_takers:
+        for bi, binds in enumerate(source.tier_binds):
+            if not binds:
+                continue
+            for ki in range(len(source.ks)):
+                try:
+                    by_cap = source.off_cell(source.bands[bi], source.ks[ki])
+                except Exception as exc:
+                    return exc
+                by_cap = _cut_to_axis(by_cap, axis_end)
+                for ci in caps:
+                    pops = by_cap.get(source.caps[ci])
+                    if pops:
+                        for visit in off_takers:
+                            visit.off(bi, ki, ci, pops)
+                del by_cap
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -5230,7 +5855,9 @@ def _walk_grid(source: _GridSource, visitors: list,
     traceback), every visitor reset for the fallback grid, and a second walk
     over the eager points alone (source.fallback), whose cells are lookups.
     (The size-cap sweep's same-title population costs less still: only the
-    same-title rows at the other caps — _same_title_points.) The other layer
+    same-title rows at the other caps — _same_title_points.) The fallback
+    grid carries the same tier-floors-off family (_grid_source attaches it
+    to every banded shape), so the second walk keeps the Tier floors choice. The other layer
     is each visitor's own: it catches its own failure and marks itself
     failed, costing only what it builds.
 
@@ -5274,7 +5901,9 @@ class _MaxTrades:
     and the walk therefore reads (same_title) — or, when that population
     could not be simulated (_same_title_points), the run's own point alone,
     which is all the page then shows of it: the count covers what the page
-    shows, so it is not marked failed for that.
+    shows, so it is not marked failed for that. The tier-floors-off cells the
+    walk hands to `off` are counted too: the page shows them, and
+    backtester.max_trades_simulated counts the family's points as well.
 
     Attributes:
         most (int): The largest len(trades) over every point visited.
@@ -5312,6 +5941,18 @@ class _MaxTrades:
         except Exception:
             logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
             self.failed = True
+
+    def off(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Count one tier-floors-off scenario's points, as a tier-on one's.
+
+        Args:
+            bi (int): Band index (a band the tiers bind at).
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint.
+        """
+        self(bi, ki, ci, pops)
 
     def same_title(self, by_cap: dict) -> None:
         """
@@ -5460,7 +6101,16 @@ class _ExplorerData:
             colorscale, zmid, hover, custom} per _EXPLORER_METRICS entry, the
             colour scale as plotly.py coerced it) and "matrices" (the
             cap-independent "empirical_k", "khat_minus_k" and
-            "empirical_k_n", [band][k]).
+            "empirical_k_n", [band][k]), "band_options" (the band select's
+            texts, " (primary)" included) and "curve_titles" ([tier floors
+            on, off]); then the tier-floors-off keys, each null without an
+            off view: "tier_binds" (per band), "off_caps" (per cap: has an
+            off block), "tier_labels" (["on", "off"], the Tier floors
+            select's values), "band_labels_off" / "band_options_off"
+            (backtester._band_label's), "calibration_by_band_off" (a binding
+            band's tier-off rows, null elsewhere), "matrices_off" (the k-hat
+            matrices over the tier-off calibrations where the tiers bind),
+            "tier_phrases" and "off_missing" (the status line's words).
         blocks (tuple[str, ...]): Each size cap's packed "scn-cap-<i>" block,
             by cap index: "cells" ([band][k] -> one entry per population, or
             null for a scenario never simulated), "same_title", "banner",
@@ -5473,6 +6123,23 @@ class _ExplorerData:
             per axis date (_curve_on_axis); [] when it has none.
         pooled (tuple): Each band's pooled IntervalCalibrationBucket (or
             None), for the static k-hat table.
+        tier_select (bool): Whether the section offers a tier-floors-off
+            view — its own "Tier floors" <select> (id "scn-tier-select"),
+            which the filter bar moves too. True only when the grid walked
+            carries a tier-floors-off family (_GridSource.tier_binds) and at
+            least one size cap has an off block.
+        off_blocks (tuple[str, ...]): Each packed "scn-off-cap-<i>" block,
+            for the size caps that have a tier-floors-off view only
+            (base["off_caps"]): "cells" (a binding band's row of tier-off
+            cells; null for every other band, whose tier-on cells in
+            "scn-cap-<i>" stand in), "banner" (over the grid with the tier
+            floors off, opening on _SCENARIO_TIER_OFF_LEAD), "matrices" (the
+            seven cap-dependent ones over that same grid) and "titles" (each
+            ending on _SCENARIO_TIER_OFF_SUFFIX).
+        pooled_off (tuple): Each band's pooled k-hat row with the tier floors
+            off (a binding band's tier-off calibration's, every other band's
+            tier-on one), for the hidden tier-off k-hat table; () without a
+            tier-floors-off view.
     """
     checks: bool
     base: dict = field(default_factory=dict)
@@ -5482,6 +6149,9 @@ class _ExplorerData:
     titles: tuple = ()
     primary_curve: list = field(default_factory=list)
     pooled: tuple = ()
+    tier_select: bool = False
+    off_blocks: tuple = ()
+    pooled_off: tuple = ()
 
 
 class _ExplorerVisitor:
@@ -5520,6 +6190,13 @@ class _ExplorerVisitor:
 
     Without the band sweep (the grid's cells carry "all" only) it collects
     nothing: the section is then its placeholder, whatever the walk produced.
+
+    It also takes the tier-floors-off cells the walk hands its `off` method
+    (the bands the tiers bind at, at the cap the family was simulated at)
+    and keeps them the same way, in a grid of their own: _assemble then
+    packs, for each cap that has any, an off block over the grid with the
+    tier floors off — those bands' own cells, every other band's tier-on
+    ones — whose banner and matrices are computed over that combined grid.
 
     A failure is caught here: one WARNING, and the visitor marks itself
     failed — the section is then built from the sweep's own eager points at
@@ -5560,20 +6237,33 @@ class _ExplorerVisitor:
         """
         self.source = source
         nb, nk, nc = len(source.bands), len(source.ks), len(source.caps)
-        # cells[cap][band][k]: the scenario's JSON text, or None
-        self.cells = [[[None] * nk for _ in range(nb)] for _ in range(nc)]
-        self.matrices = [{key: [[None] * nk for _ in range(nb)] for key in _EXPLORER_CAP_METRICS}
-                         for _ in range(nc)]
-        # Which cells have an "all" point, and which headline points carry a
-        # split-half check, per cap — the banner's counts
-        self.has_all = [[[False] * nk for _ in range(nb)] for _ in range(nc)]
-        self.checked = [[[False] * nk for _ in range(nb)] for _ in range(nc)]
-        self.n_points = [0] * nc
+        # Per Tier floors setting (False: on, True: off), per cap:
+        # cells[cap][band][k] — the scenario's JSON text, or None; the
+        # headline population's cap-dependent matrices; which cells have an
+        # "all" point, which headline points carry a split-half check, and
+        # how many points each cell holds — the banner's counts. The off
+        # grids are filled only at the bands the tiers bind at (the walk
+        # hands those to off(); every other band's off view is its tier-on
+        # one, which _assemble reads there)
+        self.grids = {tier: {
+            "cells": [[[None] * nk for _ in range(nb)] for _ in range(nc)],
+            "matrices": [{key: [[None] * nk for _ in range(nb)]
+                          for key in _EXPLORER_CAP_METRICS} for _ in range(nc)],
+            "has_all": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
+            "checked": [[[False] * nk for _ in range(nb)] for _ in range(nc)],
+            "points": [[[0] * nk for _ in range(nb)] for _ in range(nc)],
+        } for tier in (False, True)}
+        # Whether the walk handed off() any cell at each cap: a cap with none
+        # at a band the tiers bind at has no tier-floors-off view
+        self.off_seen = [False] * nc
         self.same_titles: list[str | None] = [None] * nc
         self.primary_curve: list = []
         self.failed = False
         self._data = None
-        self._cell: tuple[int, int] | None = None
+        # (tier, band, k) of the cell whose rows are memoised: an off cell's
+        # objects are new ones, whose ids may reuse those of the tier-on cell
+        # walked before it
+        self._cell: tuple[bool, int, int] | None = None
         self._cache: dict = {}
         self._joined: dict = {}
 
@@ -5620,11 +6310,46 @@ class _ExplorerVisitor:
             pops (dict): Population -> SweepPoint; a population the cell does
                 not carry is null in its row.
         """
+        self._visit(bi, ki, ci, pops, False)
+
+    def off(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Keep one tier-floors-off scenario's figures (a band the tiers bind at).
+
+        The walk (_walk_once) hands these after every tier-on cell, only at
+        the bands the tiers bind at: every other band's off view is its
+        tier-on one, which _assemble reads there. A tier-off run is its own
+        simulation, so the primary scenario's curve is never taken from it.
+
+        Args:
+            bi (int): Band index (a band the tiers bind at).
+            ki (int): k index.
+            ci (int): Cap index — the run's own, the one cap the family is
+                simulated at, until a tier-floors-off size-cap sweep fills
+                the others.
+            pops (dict): Population -> SweepPoint (stamped tier_floors False).
+        """
+        self._visit(bi, ki, ci, pops, True)
+
+    def _visit(self, bi: int, ki: int, ci: int, pops: dict, off: bool) -> None:
+        """
+        Keep one scenario's figures under one Tier floors setting.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint.
+            off (bool): Whether the scenario is a tier-floors-off one.
+        """
         if self.failed or not self.source.checks:
             return
         try:
-            if self._cell != (bi, ki):
-                self._cell, self._cache, self._joined = (bi, ki), {}, {}
+            if self._cell != (off, bi, ki):
+                self._cell, self._cache, self._joined = (off, bi, ki), {}, {}
+            grid = self.grids[off]
+            if off:
+                self.off_seen[ci] = True
             parts = []
             for population in _SCENARIO_POPULATIONS:
                 point = pops.get(population)
@@ -5633,19 +6358,19 @@ class _ExplorerVisitor:
                     continue
                 kpis, text = self._entry(point, population)
                 parts.append(text)
-                self.n_points[ci] += 1
+                grid["points"][ci][bi][ki] += 1
                 if population == _ALL_VIEW:
-                    self.has_all[ci][bi][ki] = True
+                    grid["has_all"][ci][bi][ki] = True
                 if population == _HEADLINE_POPULATION:
-                    matrices = self.matrices[ci]
+                    matrices = grid["matrices"][ci]
                     for key in _EXPLORER_CAP_METRICS:
                         matrices[key][bi][ki] = kpis[key]
                     # A flat curve's Sharpe of 0.0 is not a measurement: a
                     # cell with no trade is blank in the Sharpe view
                     if not kpis["trades"]:
                         matrices["sharpe"][bi][ki] = None
-                    self.checked[ci][bi][ki] = point.halves is not None
-                    if (bi, ki, ci) == self.source.primary:
+                    grid["checked"][ci][bi][ki] = point.halves is not None
+                    if not off and (bi, ki, ci) == self.source.primary:
                         # Python draws the primary scenario's curve itself
                         self.primary_curve = _curve_on_axis(point.equity_df, self.axis)
             # Caps whose rows are the same texts (every cap at or above the
@@ -5653,7 +6378,7 @@ class _ExplorerVisitor:
             joined = tuple(id(part) for part in parts)
             if joined not in self._joined:
                 self._joined[joined] = "[" + ",".join(parts) + "]"
-            self.cells[ci][bi][ki] = self._joined[joined]
+            grid["cells"][ci][bi][ki] = self._joined[joined]
         except Exception:
             logging.warning("The Scenario Explorer's figures could not be built from the "
                             "page's grid; it shows the run's own size cap only",
@@ -5708,10 +6433,11 @@ class _ExplorerVisitor:
 
     def _assemble(self) -> _ExplorerData:
         """
-        Build the base block, every cap's packed block and the primary cap's render data.
+        Build the base block, every cap's packed block, every tier-floors-off block and the primary cap's render data.
 
         Returns:
-            _ExplorerData: The section's data.
+            _ExplorerData: The section's data (with its tier-floors-off view
+                when the grid carries a family and a cap has off cells).
         """
         source = self.source
         if not source.checks:
@@ -5721,19 +6447,40 @@ class _ExplorerVisitor:
         headline_label = _POPULATION_LABELS[_HEADLINE_POPULATION]
         pooled = tuple(None if self.calibrations.get(band) is None
                        else self.calibrations[band].pooled for band in bands)
-        khat = [None if p is None else p.empirical_k for p in pooled]
 
-        def cal_rows(band) -> list[dict] | None:
+        def khat_matrices(rows: tuple) -> dict:
+            """
+            The cap-independent k-hat matrices of one grid's pooled rows.
+
+            Args:
+                rows (tuple): Each band's pooled IntervalCalibrationBucket, or None.
+
+            Returns:
+                dict: "empirical_k", "khat_minus_k" (rounded as the cards round
+                    it, _khat_delta_value) and "empirical_k_n", [band][k].
+            """
+            khat = [None if p is None else p.empirical_k for p in rows]
+            return _json_safe({
+                "empirical_k": [[value] * len(ks) for value in khat],
+                "khat_minus_k": [[_khat_delta_value(value, k) for k in ks] for value in khat],
+                "empirical_k_n": [[None if p is None else p.n] * len(ks) for p in rows],
+            })
+
+        def cal_rows(cal: IntervalCalibration | None) -> list[dict] | None:
             """
             One band's calibration table rows (its buckets, then its pooled row).
 
+            A bucket's tier of 0 or less ships as null (rendered "—"): the
+            pooled row's tier is always 0.0 (no floor to print), and so is
+            every bucket of a tier-off calibration at a floor of 0, which
+            labels its buckets with that floor alone.
+
             Args:
-                band: The band.
+                cal (IntervalCalibration | None): The band's calibration.
 
             Returns:
                 list[dict] | None: The rows; None without a calibration.
             """
-            cal = self.calibrations.get(band)
             if cal is None:
                 return None
             return [
@@ -5742,6 +6489,49 @@ class _ExplorerVisitor:
                  "empirical_k": b.empirical_k}
                 for b in [*cal.buckets, cal.pooled]
             ]
+
+        # ── The tier-floors-off view: per band, whether the tiers bind there
+        # (its own tier-off cells and calibration) or not (its tier-on ones
+        # stand in, #68's rule); None without a family. A size cap has an off
+        # view when the walk handed off() a cell there — in production only
+        # the run's own cap, the one the family is simulated at — or when no
+        # band binds at all, where every cap's off view IS its tier-on one ─
+        binds = source.tier_binds
+        off_caps = (None if binds is None else
+                    [self.off_seen[ci] or not any(binds) for ci in range(len(caps))])
+        tier_select = bool(off_caps and any(off_caps))
+        if not tier_select:
+            binds = off_caps = None
+        pooled_off: tuple = ()
+        if binds is not None:
+            off_cal = {band: source.off_calibrations.get(band)
+                       for band, own in zip(bands, binds, strict=True) if own}
+            pooled_off = tuple(
+                (None if off_cal[band] is None else off_cal[band].pooled) if own
+                else pooled[bi]
+                for bi, (band, own) in enumerate(zip(bands, binds, strict=True)))
+        # The curve's title under each setting — the off one names the setting,
+        # as the off heatmap's titles do — for the script to retitle it with
+        curve_title = f"Equity curve — selected band, k and size cap — {headline_label}"
+
+        def band_options(labels: list[str]) -> list[str]:
+            """
+            The band select's option texts, as the script writes them back.
+
+            Args:
+                labels (list[str]): Each band's label under one tier setting.
+
+            Returns:
+                list[str]: The labels, " (primary)" on the primary band — the
+                    text the section renders, unescaped (the script sets an
+                    option's text, which the browser escapes itself).
+            """
+            return [lbl + (" (primary)" if i == pb else "") for i, lbl in enumerate(labels)]
+
+        band_labels = [_band_option(band) for band in bands]
+        # The backtester's own band text with the tiers off: the floor alone
+        # gated those runs, so _row_label's "max(tier,<floor>)" would misname them
+        band_labels_off = None if binds is None else [_band_label(band) for band in bands]
 
         metrics = [
             {"key": key, "label": label,
@@ -5755,7 +6545,7 @@ class _ExplorerVisitor:
             "bands": [None if band is None else [band[0], band[1]] for band in bands],
             "ks": list(ks),
             "caps": list(caps),
-            "band_labels": [_band_option(band) for band in bands],
+            "band_labels": band_labels,
             "k_labels": [_k_option(k) for k in ks],
             "cap_labels": [_cap_option(cap) for cap in caps],
             "cap_text": [_cap_text(cap) for cap in caps],
@@ -5765,52 +6555,145 @@ class _ExplorerVisitor:
             "labels": dict(_POPULATION_LABELS),
             "primary": [pb, pk, pc],
             "dates": [d.date().isoformat() for d in self.axis],
-            "calibration_by_band": [cal_rows(band) for band in bands],
+            "calibration_by_band": [cal_rows(self.calibrations.get(band)) for band in bands],
             "metrics": metrics,
             # k-hat is measured per band, before the Kelly gate: the same at
             # every k and every cap. k-hat − k is rounded as the cards round it
-            "matrices": _json_safe({
-                "empirical_k": [[value] * len(ks) for value in khat],
-                "khat_minus_k": [[_khat_delta_value(value, k) for k in ks] for value in khat],
-                "empirical_k_n": [[None if p is None else p.n] * len(ks) for p in pooled],
-            }),
+            "matrices": khat_matrices(pooled),
+            # The band select's texts with the tier floors on, as the script
+            # writes them back after a Tier floors change
+            "band_options": band_options(band_labels),
+            "curve_titles": [curve_title,
+                             None if binds is None else curve_title + _SCENARIO_TIER_OFF_SUFFIX],
+            # ── The tier-floors-off view, or null throughout without one.
+            # "tier_binds": per band, whether the tiers bind there (the script
+            # then reads the "scn-off-cap-<i>" block's row and the off
+            # calibration) or not (its tier-on cells and calibration stand
+            # in, so none ships twice); "off_caps": per cap, whether it has an
+            # off block (a cap without one was not simulated with the tiers
+            # off — the script says so on the status line and draws nothing
+            # new). Every text the off view shows is here, Python's: the band
+            # labels and options, the curve's title (above), and the words the
+            # status line fills in (the setting's phrase, and the template
+            # for a cap not simulated with the tiers off).
+            "tier_binds": binds,
+            "off_caps": off_caps,
+            "tier_labels": None if binds is None else ["on", "off"],
+            "band_labels_off": band_labels_off,
+            "band_options_off": None if binds is None else band_options(band_labels_off),
+            "calibration_by_band_off": (
+                None if binds is None else
+                [cal_rows(source.off_calibrations.get(band)) if own else None
+                 for band, own in zip(bands, binds, strict=True)]),
+            "matrices_off": None if binds is None else khat_matrices(pooled_off),
+            "tier_phrases": None if binds is None else {
+                "on": "", "off": _SCENARIO_TIER_OFF_PHRASE},
+            "off_missing": None if binds is None else _SCENARIO_TIER_OFF_MISSING,
         }
+        titles_on = [
+            (key, f"{label} by spread band x k, {{cap}} — {headline_label}"
+             if key in _EXPLORER_CAP_METRICS
+             else f"{label} by spread band x k — {headline_label}")
+            for key, label, *_ in _EXPLORER_METRICS]
         blocks: list[str] = []
+        off_blocks: list[str] = []
         primary: tuple = ("", {}, ())
+        on, off = self.grids[False], self.grids[True]
+        nb = len(bands)
         for ci, cap in enumerate(caps):
-            matrices = _json_safe(self.matrices[ci])
-            trades = matrices["trades"]
-            # The headline cells, row-major: those the heatmap shows a value in
-            headline = [(bi, ki) for bi in range(len(bands)) for ki in range(len(ks))
-                        if trades[bi][ki] is not None]
-            banner = _explorer_banner(
-                sum(row.count(True) for row in self.has_all[ci]), self.n_points[ci],
-                [matrices["total_return"][bi][ki] for bi, ki in headline],
-                [(matrices["h1_return"][bi][ki], matrices["h2_return"][bi][ki])
-                 for bi, ki in headline if self.checked[ci][bi][ki]],
-                cap)
             # A cap-dependent figure names its cap; k-hat does not depend on it
-            titles = tuple(
-                f"{label} by spread band x k, {_cap_text(cap)} — {headline_label}"
-                if key in _EXPLORER_CAP_METRICS
-                else f"{label} by spread band x k — {headline_label}"
-                for key, label, *_ in _EXPLORER_METRICS)
+            titles = tuple(title.format(cap=_cap_text(cap)) for _, title in titles_on)
+            matrices = _json_safe(on["matrices"][ci])
+            banner = self._banner(on, ci, matrices, cap, [False] * nb)
             cells = "[" + ",".join("[" + ",".join(text or "null" for text in row) + "]"
-                                   for row in self.cells[ci]) + "]"
+                                   for row in on["cells"][ci]) + "]"
             raw = ('{"cells":' + cells
                    + ',"same_title":' + (self.same_titles[ci] or "null")
                    + ',"banner":' + _strict_json(banner)
                    + ',"matrices":' + _strict_json(matrices)
                    + ',"titles":' + _strict_json(list(titles)) + "}")
             blocks.append(_packed_text_script(f"scn-cap-{ci}", raw))
+            if off_caps is not None and off_caps[ci]:
+                # The grid with the tier floors off: a binding band's own
+                # off cells and figures, every other band's tier-on ones
+                matrices_off = _json_safe({
+                    key: [off["matrices"][ci][key][bi] if binds[bi]
+                          else on["matrices"][ci][key][bi] for bi in range(nb)]
+                    for key in _EXPLORER_CAP_METRICS})
+                banner_off = self._banner(off, ci, matrices_off, cap, binds,
+                                          lead=_SCENARIO_TIER_OFF_LEAD)
+                # A binding band's row only: the script reads every other
+                # band's tier-on row, from "scn-cap-<i>", so no cell ships twice
+                cells_off = "[" + ",".join(
+                    ("[" + ",".join(text or "null" for text in off["cells"][ci][bi]) + "]")
+                    if binds[bi] else "null" for bi in range(nb)) + "]"
+                raw_off = ('{"cells":' + cells_off
+                           + ',"banner":' + _strict_json(banner_off)
+                           + ',"matrices":' + _strict_json(matrices_off)
+                           + ',"titles":' + _strict_json(
+                               [title + _SCENARIO_TIER_OFF_SUFFIX for title in titles]) + "}")
+                off_blocks.append(_packed_text_script(f"scn-off-cap-{ci}", raw_off))
             # Packed: the texts are not needed again
-            self.cells[ci] = None
+            on["cells"][ci] = off["cells"][ci] = None
             if ci == pc:
                 primary = (banner, matrices, titles)
         banner, matrices, titles = primary
         return _ExplorerData(checks=True, base=base, blocks=tuple(blocks), banner=banner,
                              matrices=matrices, titles=titles,
-                             primary_curve=self.primary_curve, pooled=pooled)
+                             primary_curve=self.primary_curve, pooled=pooled,
+                             tier_select=tier_select, off_blocks=tuple(off_blocks),
+                             pooled_off=pooled_off)
+
+    def _banner(self, grid: dict, ci: int, matrices: dict, cap: float | None,
+                own: list, *, lead: str = "") -> str:
+        """
+        One cap's fragility banner over one grid (_explorer_banner).
+
+        Args:
+            grid (dict): The Tier floors setting's figures (self.grids[...]).
+            ci (int): Cap index.
+            matrices (dict): The banner's grid's cap-dependent matrices (with
+                the tier floors off, a binding band's off rows and every other
+                band's tier-on ones).
+            cap (float | None): The size cap.
+            own (list): Per band, whether its counts come from `grid` (True)
+                or from the tier-on grid (False) — the tier-on banner reads
+                the tier-on grid at every band; the off banner reads the off
+                grid only at the bands the tiers bind at.
+            lead (str): Keyword-only. HTML the banner opens on ("" for the
+                tier-on banner).
+
+        Returns:
+            str: The banner's <div>.
+        """
+        on = self.grids[False]
+        nb, nk = len(self.source.bands), len(self.source.ks)
+
+        def at(name: str, bi: int, ki: int):
+            """
+            One cell's count or flag, from the grid its band reads.
+
+            Args:
+                name (str): "has_all", "checked" or "points".
+                bi (int): Band index.
+                ki (int): k index.
+
+            Returns:
+                The value.
+            """
+            return (grid if own[bi] else on)[name][ci][bi][ki]
+
+        trades = matrices["trades"]
+        # The headline cells, row-major: those the heatmap shows a value in
+        headline = [(bi, ki) for bi in range(nb) for ki in range(nk)
+                    if trades[bi][ki] is not None]
+        return _explorer_banner(
+            sum(1 for bi in range(nb) for ki in range(nk) if at("has_all", bi, ki)),
+            sum(at("points", bi, ki) for bi in range(nb) for ki in range(nk)),
+            [matrices["total_return"][bi][ki] for bi, ki in headline],
+            [(matrices["h1_return"][bi][ki], matrices["h2_return"][bi][ki])
+             for bi, ki in headline if at("checked", bi, ki)],
+            cap, lead=lead)
 
 
 class _ChunkVisitor:
@@ -5830,6 +6713,13 @@ class _ChunkVisitor:
     trade's size, go in one table shared by every chunk (heads, shipped in the
     base block), the tails in the chunk's own strings.
 
+    A tier-floors-off cell the walk hands to `off` is packed the same way
+    (never substituting the page's own trades: it is its own run) and filed
+    in grid_off; it shares a chunk with any scenario, tier-on or off, that
+    traded an equal list at an equal k. off_grid() fills the rows of the
+    bands the tiers never bind at with their tier-on chunk ids, so their off
+    view is their tier-on run without a second chunk.
+
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
     written without the bar, as when the filter's data cannot be built.
@@ -5842,6 +6732,9 @@ class _ChunkVisitor:
         chunks (list[str]): The packed chunks, by id.
         grid (list): [band][k][cap] -> chunk id, or None for a scenario
             never simulated.
+        grid_off (list | None): The same for the tier-floors-off cells of
+            the bands the tiers bind at (other rows stay None until
+            off_grid() aliases them); None when the grid has no family.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         failed (bool): Whether building a chunk raised.
@@ -5894,14 +6787,20 @@ class _ChunkVisitor:
         self.chunks: list[str | None] = []
         self.seen: dict[str, int] = {}
         self.grid = [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+        self.grid_off = (None if source.tier_binds is None else
+                         [[[None] * len(source.caps) for _ in source.ks]
+                          for _ in source.bands])
         self.primary_views: dict | None = None
         self.failed = False
-        # (band, k) of the cell whose list keys are memoised: a cell's caps
-        # at or above its peak share one trade list, so its key is computed once
-        self._cell: tuple[int, int] | None = None
+        # (tier, band, k) of the cell whose list keys are memoised: a cell's
+        # caps at or above its peak share one trade list, so its key is
+        # computed once. The tier is part of it: an off cell's lists are new
+        # objects, whose ids may reuse those of the tier-on cell walked last
+        self._cell: tuple[bool, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
 
-    def _key(self, bi: int, ki: int, k: float | None, listed: list) -> str:
+    def _key(self, bi: int, ki: int, k: float | None, listed: list, *,
+             off: bool = False) -> str:
         """
         The chunk key of one list, memoised within the cell being walked.
 
@@ -5910,12 +6809,15 @@ class _ChunkVisitor:
             ki (int): k index.
             k (float | None): The k the list is priced at.
             listed (list): The trade list.
+            off (bool): Keyword-only. Whether the cell is a tier-floors-off
+                one (a separate memo from the tier-on cell of the same band
+                and k). False (default).
 
         Returns:
             str: _list_key(k, listed).
         """
-        if self._cell != (bi, ki):
-            self._cell, self._keys = (bi, ki), {}
+        if self._cell != (off, bi, ki):
+            self._cell, self._keys = (off, bi, ki), {}
         # By object: the cell holds its lists alive, and k is one per cell
         # except at the primary scenario, whose list is the page's own
         memo = (id(listed), k)
@@ -5945,24 +6847,89 @@ class _ChunkVisitor:
             listed, curve = ((self.trades, self.equity_df) if primary
                              else (point.trades, point.equity_df))
             k = self.k_used if primary else self.source.ks[ki]
-            key = self._key(bi, ki, k, listed)
-            if key not in self.seen:
-                strings = _StringTable()
-                lst = _list_payload(listed, curve, self.axis, self.start_date,
-                                    self.initial_balance, self.series_categories, k,
-                                    self.cat_index, self.sub_index, strings, heads=self.heads)
-                cid = len(self.chunks)
-                self.chunks.append(_packed_json_script(
-                    f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
-                if primary:
-                    self.primary_views = {view_key: {"n": view["n"]}
-                                          for view_key, view in lst["views"].items()}
-                self.seen[key] = cid
-            self.grid[bi][ki][ci] = self.seen[key]
+            self.grid[bi][ki][ci] = self._chunk(bi, ki, k, listed, curve, primary)
         except Exception:
-            logging.warning("A page-wide filter chunk could not be built; the dashboard "
-                            "is written without the bar", exc_info=True)
-            self.failed, self.chunks, self.seen = True, [], {}
+            self._fail()
+
+    def off(self, bi: int, ki: int, ci: int, pops: dict) -> None:
+        """
+        Build (or share) the chunk of one tier-floors-off scenario's "all" point.
+
+        Args:
+            bi (int): Band index (a band the tiers bind at).
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a scenario with no "all"
+                point stays a null cell of grid_off.
+        """
+        point = pops.get(_ALL_VIEW)
+        if point is None or self.failed or self.grid_off is None:
+            return
+        try:
+            # Its own run, priced at the cell's k: never the page's trades
+            self.grid_off[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
+                                                    point.equity_df, False, off=True)
+        except Exception:
+            self._fail()
+
+    def off_grid(self) -> list | None:
+        """
+        The tier-floors-off grid, every non-binding band's row its tier-on row.
+
+        Returns:
+            list | None: [band][k][cap] -> chunk id or None: a binding band's
+                own off chunks (None where the family has no point, e.g. a
+                size cap other than the run's own), every other band's the
+                tier-on grid's ids — its off view IS its run; None when the
+                grid has no family (or a chunk failed).
+        """
+        if self.grid_off is None or self.failed:
+            return None
+        return [[list(row) for row in (self.grid_off[bi] if binds else self.grid[bi])]
+                for bi, binds in enumerate(self.source.tier_binds)]
+
+    def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
+               curve: pd.DataFrame, primary: bool, *, off: bool = False) -> int:
+        """
+        The id of the chunk holding one list priced at k, packing it if new.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            k (float | None): The k the list's Kelly scatter is priced at.
+            listed (list): The trade list.
+            curve (pd.DataFrame): Its equity curve.
+            primary (bool): Whether this is the primary scenario (its views'
+                counts are kept for the bar's options).
+            off (bool): Keyword-only. Whether the cell is a tier-floors-off
+                one (_key's memo). False (default).
+
+        Returns:
+            int: The chunk id — an existing one when an equal list at an
+                equal k was packed before.
+        """
+        key = self._key(bi, ki, k, listed, off=off)
+        if key not in self.seen:
+            strings = _StringTable()
+            lst = _list_payload(listed, curve, self.axis, self.start_date,
+                                self.initial_balance, self.series_categories, k,
+                                self.cat_index, self.sub_index, strings, heads=self.heads)
+            cid = len(self.chunks)
+            self.chunks.append(_packed_json_script(
+                f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
+            if primary:
+                self.primary_views = {view_key: {"n": view["n"]}
+                                      for view_key, view in lst["views"].items()}
+            self.seen[key] = cid
+        return self.seen[key]
+
+    def _fail(self) -> None:
+        """
+        Give up on the bar: one WARNING, and every chunk dropped.
+        """
+        logging.warning("A page-wide filter chunk could not be built; the dashboard "
+                        "is written without the bar", exc_info=True)
+        self.failed, self.chunks, self.seen = True, [], {}
 
 
 def _build_filter_grid(
@@ -6060,9 +7027,11 @@ def _explorer_from_sweep(sweep: BacktestSweep) -> _ExplorerData:
     The section's own path when the page's walk did not build its data — the
     direct call, a walk whose explorer visitor failed, or a filter whose grid
     could not be read at all: the eager grid (_grid_source without the
-    size-cap sweep: every band x k the run simulated, at the run's own cap)
-    walked with an explorer visitor alone, curves ending on the primary
-    curve's last date.
+    size-cap sweep: every band x k the run simulated, at the run's own cap,
+    with the tier-floors-off family attached when the page can show it —
+    _with_tier_off — so the rebuilt section keeps its Tier floors view)
+    walked with an explorer visitor alone, which takes the off cells through
+    its `off` method, curves ending on the primary curve's last date.
 
     Args:
         sweep (BacktestSweep): A sweep with scenarios.
@@ -6366,6 +7335,7 @@ def _filter_payload(
     tainted: bool = False,
     explorer: bool = False,
     explorer_caps: bool = True,
+    explorer_tiers: bool = True,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -6376,7 +7346,11 @@ def _filter_payload(
     the labels, the templates, the drawing styles, the shared trade-row heads
     and the k-hat breakdown per band (with every group's k-hat − k per k,
     which the performance section's k-hat cards read), and the
-    interval-discount section's data at every k and cap. The lists themselves
+    interval-discount section's data at every k and cap — and, when the
+    grid carries a tier-floors-off family (source.tier_binds), the same for
+    the Tier floors choice: the off grid (chunks.off_grid(): a binding band's
+    own off chunks, every other band's tier-on ones), each band's off name
+    and phrase, and its off k-hat breakdown. The lists themselves
     are the chunks, each its own packed block the script inflates only when
     a reader chooses that scenario, so the page's load cost does not grow
     with the grid.
@@ -6406,10 +7380,20 @@ def _filter_payload(
             axis is this grid's, so its cap select follows the bar's too;
             False says the explorer follows the bar's band and k only (its
             data was rebuilt at the run's own cap). True (default).
+        explorer_tiers (bool): Keyword-only. Whether the explorer follows the
+            bar's Tier floors choice; False says it does not (_bar_reach).
+            True (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
-            where}] — _band_option's label and _band_where's phrase), "ks"
+            option, where}] — _band_option's label, the Spread band select's
+            option text (" (primary)" on the primary) and _band_where's
+            phrase), "bands_off" (null without a tier-floors-off family, else
+            [{label, option, where}] per band — backtester._band_label's bare
+            "floor-ceiling", its option text and _tier_off_where's phrase),
+            "tier_binds" (null, or per band whether the tiers bind there),
+            "grid_off" (null, or [band][k][cap] -> chunk id or null — the
+            tier-off grid, chunks.off_grid()), "ks"
             and "caps" ([{label, text, value}]: the select's option, the
             summary phrase's words and the value itself), "primary" ([band,
             k, cap] indexes of the page as rendered), "grid" ([band][k][cap]
@@ -6422,7 +7406,9 @@ def _filter_payload(
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
             known k-hat's card colour), "khat" (_khat_band per band, in band
-            order, every group carrying "delta" per k), "khat_blank" (the
+            order, every group carrying "delta" per k), "khat_off" (null, or
+            the same per band with the tier floors off: a binding band's
+            tier-off calibration, every other band's own), "khat_blank" (the
             table cells of a group with no k-hat) and "kd" (above).
     """
     axis = chunks.axis
@@ -6430,11 +7416,25 @@ def _filter_payload(
     # A selection with no trade: the flat curve backtester draws for no trade
     empty = _view_payload([], [], _build_equity_curve([], start_date, initial_balance),
                           axis, initial_balance, series_categories, [], None, _StringTable())
+    binds = source.tier_binds
+    grid_off = chunks.off_grid()
+    # Without an off grid (no family, or no chunk for it) there is no off view
+    off_view = binds is not None and grid_off is not None
     return {
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
+                   "option": _band_option(band) + (" (primary)" if i == pb else ""),
                    "where": _band_where(_band_option(band), i == pb, band is not None)}
                   for i, band in enumerate(source.bands)],
+        # Each band as the Tier floors choice "off" names it: with the tiers
+        # off its floor alone gated it, so backtester's bare "floor-ceiling"
+        "bands_off": (None if not off_view else
+                      [{"label": _band_label(band),
+                        "option": _band_label(band) + (" (primary)" if i == pb else ""),
+                        "where": _tier_off_where(_band_label(band), i == pb, not binds[i])}
+                       for i, band in enumerate(source.bands)]),
+        "tier_binds": None if not off_view else list(binds),
+        "grid_off": grid_off if off_view else None,
         "ks": [{"label": _k_option(k), "text": _k_text(k), "value": k} for k in source.ks],
         "caps": [{"label": _cap_option(cap), "text": _cap_text(cap), "value": cap}
                  for cap in source.caps],
@@ -6451,7 +7451,8 @@ def _filter_payload(
         # select only when its cap axis is this grid's (explorer_caps)
         "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
-                                                explorer_caps=explorer_caps)},
+                                                explorer_caps=explorer_caps,
+                                                explorer_tiers=explorer_tiers)},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -6474,6 +7475,14 @@ def _filter_payload(
         "khat": [_khat_band(source.calibrations.get(band), series_categories,
                             chunks.cat_index, chunks.sub_index, ks=source.ks)
                  for band in source.bands],
+        # The same with the tier floors off: a binding band regroups its
+        # tier-off run's calibration, every other band its own
+        "khat_off": (None if not off_view else
+                     [_khat_band(source.off_calibrations.get(band) if binds[i]
+                                 else source.calibrations.get(band),
+                                 series_categories, chunks.cat_index, chunks.sub_index,
+                                 ks=source.ks)
+                      for i, band in enumerate(source.bands)]),
         "khat_blank": _khat_cells(None),
         # The interval-discount section at every k and cap (the page's axis
         # is "dates" above, so the section's own copy of it is not shipped)
@@ -6535,8 +7544,33 @@ def _scenario_phrase(where: str, k_text: str, cap_text: str) -> str:
     return _SUMMARY_TEMPLATES["scenario"].format(where=where, k=k_text, cap=cap_text)
 
 
+def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
+    """
+    Name a spread band's tier-floors-off run, as _band_where names its run.
+
+    Args:
+        label (str): The band's tier-off label (backtester._band_label's
+            "0.2-0.6": with the tiers off, the floor is the only floor).
+        primary (bool): Whether it is the run's primary band.
+        same_as_tier_on (bool): Whether the tiers never bind at this band, so
+            its tier-off run IS its tier-on run (_GridSource.tier_binds False
+            there).
+
+    Returns:
+        str: "spread band 0.2-0.6 with the 0.15/0.30 tier floors off" ("the
+            primary spread band ..." on the primary), plus " (they never bind
+            at this band: its run with them on)" where the tiers never bind.
+    """
+    which = "the primary spread band" if primary else "spread band"
+    where = f"{which} {label} with the {_TIER_FLOORS} tier floors off"
+    if same_as_tier_on:
+        where += " (they never bind at this band: its run with them on)"
+    return where
+
+
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
-                         selection: str | None, n: int, n_band: int) -> str:
+                         selection: str | None, n: int, n_band: int, *,
+                         note: str | None = None) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -6548,21 +7582,30 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     Args:
         text (dict): The templates (_SUMMARY_TEMPLATES, as the payload
             carries them).
-        scenario (str): The scenario's _scenario_phrase.
+        scenario (str): The scenario's _scenario_phrase (with the tier
+            floors off, its band's _tier_off_where in it).
         primary (bool): Whether it is the run's primary scenario (band, k
-            and size cap all the run's own).
+            and size cap all the run's own, with the tier floors on — or off
+            at a band where they never bind).
         selection (str | None): "Sports" or "Sports · Basketball", or None for
             the whole run.
         n (int): Trades in the selection.
         n_band (int): Trades in the whole run at that scenario.
+        note (str | None): Keyword-only. The whole-run view's closing note —
+            the key of a template, as the script picks it: "other_scenario"
+            for another band, k or size cap, "other_run" for the primary
+            band, k and cap with the tier floors off where they bind. None
+            (default) applies the tier-on rule: "other_scenario" on every
+            scenario but the primary, nothing on it.
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
     """
     if selection is None:
         out = text["all"].format(scenario=scenario, count=_trade_count(n))
-        if not primary:
-            out += text["other_scenario"]
+        closing = note if note is not None else (None if primary else "other_scenario")
+        if closing is not None:
+            out += text[closing]
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
@@ -6571,11 +7614,17 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: five <select>s and a summary line.
+    Render the sticky filter bar: six <select>s and a summary line.
 
-    Spread band, k and Size cap choose the scenario — each option one of the
-    grid's axes, the run's own marked " (primary)" — and Category and Tag a
-    slice of it. Category and tag options carry the primary scenario's trade
+    Spread band, Tier floors, k and Size cap choose the scenario — each
+    option one of the grid's axes, the run's own marked " (primary)" (a
+    band's option text is the payload's "option", which the script swaps for
+    its tier-off one when the Tier floors choice changes) — and Category and
+    Tag a slice of it. The Tier floors select offers each band's run as
+    simulated ("on", selected) or its tier-floors-off run ("off"), its title
+    spelling out both rules (_TIER_SELECT_TITLE); a payload with no
+    tier-floors-off view ("grid_off" null) puts a grey "(not simulated for
+    this run)" note beside it, and the script never enables it. Category and tag options carry the primary scenario's trade
     counts; the script rewrites them whenever the scenario changes. Tag
     options list every "Category · Tag" while the category is "All";
     choosing one sets the category to match. The selects are rendered
@@ -6613,7 +7662,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         One scenario select's options, the run's own selected and marked.
 
         Args:
-            entries (list): The axis' [{label, ...}] entries.
+            entries (list): The axis' [{label, ...}] entries; an entry with
+                an "option" (the bands') is shown as that text as it stands.
             chosen (int): The primary index on that axis.
 
         Returns:
@@ -6621,8 +7671,20 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         """
         return "".join(
             f'<option value="{i}"{" selected" if i == chosen else ""}>'
-            f'{html.escape(e["label"])}{" (primary)" if i == chosen else ""}</option>'
+            + html.escape(e["option"] if "option" in e
+                          else e["label"] + (" (primary)" if i == chosen else ""))
+            + "</option>"
             for i, e in enumerate(entries))
+
+    # Each band's run as simulated, or with the deadline-gap tier floors off
+    tier_opts = (f'<option value="on" selected>{html.escape(_TIER_OPTION_ON)}</option>'
+                 f'<option value="off">{html.escape(_TIER_OPTION_OFF)}</option>')
+    # A run with no tier-off view says so beside the select it keeps shut
+    tier_note = ("" if payload.get("grid_off") is not None else
+                 '&nbsp;<span id="flt-tier-note" style="color:#9E9E9E; font-size:13px;">'
+                 "(not simulated for this run)</span>")
+    # Escaped whole, quotes included, so the attribute can never end early
+    tier_title = html.escape(_TIER_SELECT_TITLE)
 
     cat_opts = '<option value="">All categories</option>' + "".join(
         f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
@@ -6641,6 +7703,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         ' font-size:14px;">'
         f'<label>Spread band: <select id="flt-band" disabled autocomplete="off">'
         f'{options(payload["bands"], pb)}</select></label>&nbsp;&nbsp;'
+        f'<label>Tier floors: <select id="flt-tier" disabled autocomplete="off" '
+        f'title="{tier_title}">{tier_opts}</select></label>{tier_note}&nbsp;&nbsp;'
         f'<label>k: <select id="flt-k" disabled autocomplete="off">'
         f'{options(payload["ks"], pk)}</select></label>&nbsp;&nbsp;'
         f'<label>Size cap: <select id="flt-cap" disabled autocomplete="off">'
@@ -6685,9 +7749,29 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     carry the band sweep's populations so the explorer ships its 21 blocks
     (249 KB of base64) as well, is a 1.21 MB page built in about 6.7 s — the
     1.23 MB / 5.0 s above were measured before, without the explorer's
-    blocks or its walk. The script inflates each block
-    with the browser's own DecompressionStream, so nothing is added to the
-    page but the bytes.
+    blocks or its walk. Re-measured 2026-09-26 at the merge of #68 (the
+    tier-floors-off family), same fixture and environment: without a family
+    3.88 MB of JSON in 37 blocks packed to 509 KB of base64 (the base block
+    67 KB of it), an 809 KB page — about 5 KB up on the 804 KB, for the Tier
+    floors select, its title and note and each band's option text; with the
+    family (#68's worst case: the 18 bands a tier binds at each traded yet
+    another list, with its own 300-entry k-hat population) 5.89 MB of JSON
+    in 55 blocks (54 chunks and the base block) packed to 776 KB (the base
+    block 111 KB: its off grid, off band names and off k-hat breakdown), a
+    1.08 MB page (1,077,022 bytes). Main measured the family on the DR-73
+    calibration corpus's own band sweep at 4,071,051 → 5,489,336 bytes of
+    page, 1.19 MB of that the scenario explorer's tier-off view, whose data
+    block main did not pack; that figure describes main's unpacked explorer
+    and does not carry over to this page, which packs the explorer's blocks
+    too and has not been re-measured on that corpus. The explorer's own
+    tier-floors-off view (its Tier floors select, hidden k-hat table and an
+    "scn-off-cap-<i>" block per cap the family was simulated at) then took
+    the same fixture's page to 815,777 bytes without the family and
+    1,098,598 with it (its off block 3,712 bytes of base64), and
+    TestScenarioExplorerPageSize's 468-cell page to 1,736,090 and 2,632,657
+    (its off block 56,340), re-measured the same day. The script inflates
+    each block with the browser's own DecompressionStream, so nothing is
+    added to the page but the bytes.
 
     Non-finite floats become null first (_json_safe) and allow_nan=False
     makes a missed one raise instead of shipping unparseable JSON. The block
@@ -6758,7 +7842,14 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # hold where the primary holds none, and the k-hat chart's reference line, from
 # the styles Python drew them with, D.styles), and it writes only through
 # textContent, the options API and Python-escaped HTML fragments (a trade row
-# is two of them joined: its head from D.rows, its tail from the chunk). It
+# is two of them joined: its head from D.rows, its tail from the chunk; a band
+# option's text from D.bands / D.bands_off, as the Tier floors choice reads
+# it). The Tier floors select picks between two grids of chunks — D.grid (the
+# runs as simulated) and D.grid_off (with the deadline-gap tier floors off:
+# a binding band's own off chunks, every other band's tier-on ones) — and the
+# k-hat breakdown and cards between D.khat and D.khat_off; it is enabled only
+# when the base block carries an off grid, and the interval-discount section
+# never follows it (renderKd reads D.kd, tier-on). It
 # also rewrites the performance section's two k-hat cards (renderKhatCards,
 # from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
@@ -6766,8 +7857,9 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # without them, and after each redraw hands the scenario on screen to the
 # scenario explorer (window.dashScenarioSelect, by option label — defined by
 # the explorer's own script, _SCENARIO_EXPLORER_JS, only on a page carrying
-# its grid, and called only when it is; the explorer moves only the axes whose
-# label changed). On load it inflates the base block and the primary scenario's
+# its grid, and called only when it is — with the Tier floors choice as a
+# fourth argument; the explorer moves only the axes whose label changed, and
+# again any axis it refused on an earlier call). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a scenario needs it and
 # kept while among the last KEEP drawn (the primary's always); a choice made
@@ -6780,8 +7872,11 @@ _FILTER_JS = r"""
   var bandSel = document.getElementById('flt-band'), kSel = document.getElementById('flt-k');
   var capSel = document.getElementById('flt-cap'), catSel = document.getElementById('flt-cat');
   var tagSel = document.getElementById('flt-tag');
-  if (!dataEl || !bandSel || !kSel || !capSel || !catSel || !tagSel) { return; }
-  var SELECTS = [bandSel, kSel, capSel, catSel, tagSel];
+  // "Tier floors": each band's run as simulated (on), or its run with the
+  // deadline-gap tier floors not applied (off, D.grid_off)
+  var tierSel = document.getElementById('flt-tier');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !catSel || !tagSel) { return; }
+  var SELECTS = [bandSel, tierSel, kSel, capSel, catSel, tagSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -6790,7 +7885,9 @@ _FILTER_JS = r"""
   // KEPT: the drawn chunks other than the primary's, least recently drawn
   // first. SEQ numbers the choices, so a chunk arriving after a later choice
   // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
-  // indexes and the category and tag selects' values.
+  // indexes, the category and tag selects' values and the Tier floors
+  // choice ("on" / "off"), appended last so the other indexes keep their
+  // meaning.
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var KEEP = 16;                     // drawn chunks kept besides the primary
 
@@ -6812,12 +7909,25 @@ _FILTER_JS = r"""
   function bandIndex() { return parseInt(bandSel.value, 10); }
   function kIndex() { return parseInt(kSel.value, 10); }
   function capIndex() { return parseInt(capSel.value, 10); }
-  function chunkAt(b, k, c) { return D.grid[b][k][c]; }
-  function cellChunk() { return chunkAt(bandIndex(), kIndex(), capIndex()); }
-  function primaryChunk() { var p = D.primary; return chunkAt(p[0], p[1], p[2]); }
-  function isPrimary() {
+  // The Tier floors choice reads "off" only on a page whose base block
+  // carries an off grid (the select stays disabled on any other)
+  function offAt(t) { return !!(D.grid_off && t === 'off'); }
+  function tiersOff() { return offAt(tierSel.value); }
+  // The bands and k-hat breakdown as a Tier floors choice reads them
+  function bandsAt(t) { return offAt(t) ? D.bands_off : D.bands; }
+  function khatAt(t) { return offAt(t) ? D.khat_off : D.khat; }
+  function chunkAt(b, k, c, t) { return (offAt(t) ? D.grid_off : D.grid)[b][k][c]; }
+  function cellChunk() { return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value); }
+  // The page as rendered: the primary scenario with the tier floors on
+  function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
+  function isPrimaryCell() {
     var p = D.primary;
     return bandIndex() === p[0] && kIndex() === p[1] && capIndex() === p[2];
+  }
+  // The run's own scenario: its cell, with the tiers on — or off at a band
+  // the tiers do not reach (D.tier_binds false), whose off view IS that run
+  function isPrimary() {
+    return isPrimaryCell() && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
   function viewKey() {
@@ -6844,12 +7954,15 @@ _FILTER_JS = r"""
       return name in values ? String(values[name]) : field;
     });
   }
-  // A scenario in the summary's words: Python's _scenario_phrase
-  function scenarioAt(b, k, c) {
-    return fill(D.text.scenario, {where: D.bands[b].where, k: D.ks[k].text,
+  // A scenario in the summary's words: Python's _scenario_phrase, its band
+  // named as the Tier floors choice t reads it (_band_where, _tier_off_where)
+  function scenarioAt(b, k, c, t) {
+    return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
                                   cap: D.caps[c].text});
   }
-  function scenario() { return scenarioAt(bandIndex(), kIndex(), capIndex()); }
+  function scenario() {
+    return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value);
+  }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one
   function summary(v) {
@@ -6858,7 +7971,9 @@ _FILTER_JS = r"""
       text = fill(T.missing, {scenario: scenario()});
     } else if (key === 'all') {
       text = fill(T.all, {scenario: scenario(), count: trades(v.n)});
-      if (!isPrimary()) { text += T.other_scenario; }
+      // Any other scenario closes on Python's other_scenario note — and the
+      // primary cell with the tiers off at a binding band on other_run
+      if (!isPrimary()) { text += isPrimaryCell() ? T.other_run : T.other_scenario; }
     } else {
       text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
                             n: v.n, band_count: trades(count('all'))});
@@ -7005,19 +8120,21 @@ _FILTER_JS = r"""
   // (the grouping's whole population), "selected" (the filter's choice on
   // screen) or "bar". By category or tag: every group at the band shown
   // (tags within the category shown); by band: every band for the category
-  // or tag shown. _section_khat renders the same rows for the default (by
-  // category, primary band, no filter), from the same payload.
+  // or tag shown — every band as the Tier floors choice shown reads it.
+  // _section_khat renders the same rows for the default (by category,
+  // primary band, tier floors on, no filter), from the same payload.
   function khatRows(group) {
     var bi = SHOWN[0], cat = SHOWN[3], tag = SHOWN[4], T = D.text, out = [];
+    var B = bandsAt(SHOWN[5]), K = khatAt(SHOWN[5]);
     if (group === 'band') {
       var key = shownKey();
-      D.khat.forEach(function(b, i) {
-        out.push({label: D.bands[i].label, st: (b && b.groups[key]) || null,
+      K.forEach(function(b, i) {
+        out.push({label: B[i].label, st: (b && b.groups[key]) || null,
                   kind: i === bi ? 'selected' : 'bar'});
       });
       return out;
     }
-    var band = D.khat[bi];
+    var band = K[bi];
     if (!band) { return out; }
     if (group === 'tag') {
       out.push({label: cat === '' ? T.khat_all_tags
@@ -7040,14 +8157,18 @@ _FILTER_JS = r"""
     });
     return out;
   }
-  // The title _section_khat renders for the default, from the same template
+  // The title _section_khat renders for the default, from the same template.
+  // Grouped by band while the tiers shown are off, Python's
+  // khat_scope_tier_off names that setting (grouped otherwise, the scope is
+  // the band's own "where", which already names it)
   function khatTitle(group) {
     var T = D.text, scope;
     if (group === 'band') {
       var key = shownKey();
       scope = key === 'all' ? T.khat_every_category : selectionName(key);
+      if (offAt(SHOWN[5])) { scope = fill(T.khat_scope_tier_off, {scope: scope}); }
     } else {
-      scope = D.bands[SHOWN[0]].where;
+      scope = bandsAt(SHOWN[5])[SHOWN[0]].where;
     }
     return fill(T.khat_title, {group: T.khat_group_words[group], scope: scope});
   }
@@ -7078,8 +8199,9 @@ _FILTER_JS = r"""
     var group = groupSel.value, list_ = khatRows(group);
     var has = list_.some(function(r) { return r.st && r.st.n > 0; });
     // "Not recorded" (no calibration behind the rows) is not "none measured"
-    var recorded = group === 'band' ? D.khat.some(function(b) { return b !== null; })
-                                    : D.khat[SHOWN[0]] !== null;
+    var K = khatAt(SHOWN[5]);
+    var recorded = group === 'band' ? K.some(function(b) { return b !== null; })
+                                    : K[SHOWN[0]] !== null;
     setText('khat-empty', recorded ? D.text.khat_none : D.text.khat_not_recorded);
     show('khat', has);
     if (!has) { return; }
@@ -7105,14 +8227,16 @@ _FILTER_JS = r"""
 
   // The Portfolio Performance section's k-hat cards, for what is ON SCREEN
   // (SHOWN, like the k-hat chart): the k-hat breakdown's own group for the
-  // band and the category or tag shown — its table cell — and its k-hat − k
-  // at the k shown, text and colour as Python formatted them (_khat_kpis).
+  // band, Tier floors choice and category or tag shown — its table cell —
+  // and its k-hat − k at the k shown, text and colour as Python formatted
+  // them (_khat_kpis).
   // Nothing to show is the blank cell in the default colour. None of it is
   // on a page without the cards (no sweep): then nothing is done.
   function renderKhatCards() {
     var khat = byId('kpi-khat'), delta = byId('kpi-khat_delta');
     if (!khat || !delta) { return; }
-    var band = D.khat[SHOWN[0]], st = band ? (band.groups[shownKey()] || null) : null;
+    var band = khatAt(SHOWN[5])[SHOWN[0]];
+    var st = band ? (band.groups[shownKey()] || null) : null;
     var blank = [D.khat_blank[4], D.styles.kpi_default];
     var known = st !== null && st.k !== null;
     khat.textContent = st ? st.cells[4] : blank[0];
@@ -7138,7 +8262,8 @@ _FILTER_JS = r"""
   // The interval-discount section, at the primary spread band, for the k and
   // size cap ON SCREEN (SHOWN): its two cards, its equity curve and title,
   // and its per-k table at that cap — all from D.kd, which Python built
-  // (_KdVisitor). Its band, category and tag never reach it. A page whose
+  // (_KdVisitor). Its band, Tier floors choice, category and tag never
+  // reach it: it is the primary band's run with the tier floors on. A page whose
   // section is static (no kd: no recorded band, or its data could not be
   // built) is left as Python drew it.
   function renderKd() {
@@ -7176,6 +8301,15 @@ _FILTER_JS = r"""
     tagSel.value = keep;
     if (tagSel.value !== keep) { tagSel.value = ''; }
   }
+  // Each band option named as the Tier floors select reads it (Python's
+  // "option" text: "max(tier,0.2)-0.6 (primary)" with the tiers on,
+  // "0.2-0.6 (primary)" off)
+  function relabelBands() {
+    var B = bandsAt(tierSel.value);
+    for (var i = 0; i < bandSel.options.length; i++) {
+      bandSel.options[i].text = B[parseInt(bandSel.options[i].value, 10)].option;
+    }
+  }
 
   function render() {
     var v = currentView(), L = list(), has = v.n > 0;
@@ -7198,13 +8332,15 @@ _FILTER_JS = r"""
     renderKd();
     // The Scenario Explorer's selects follow the scenario ON SCREEN (SHOWN),
     // named by its option labels (Python's _band_option, _k_option and
-    // _cap_option name both grids); the explorer moves an axis only when the
-    // label on it changed since the last call, so this call after a category
-    // or tag redraw moves nothing. A page without the explorer's grid has no
-    // such function, and nothing is called
+    // _cap_option name both grids — the band always by its tier-on label,
+    // stable across a Tier floors change — and the choice itself, "on" or
+    // "off"); the explorer moves an axis only when the label on it changed
+    // since the last call, so this call after a category or tag redraw
+    // moves nothing. A page without the explorer's grid has no such
+    // function, and nothing is called
     if (typeof window.dashScenarioSelect === 'function') {
       window.dashScenarioSelect(D.bands[SHOWN[0]].label, D.ks[SHOWN[1]].label,
-                                D.caps[SHOWN[2]].label);
+                                D.caps[SHOWN[2]].label, SHOWN[5]);
     }
   }
 
@@ -7252,7 +8388,7 @@ _FILTER_JS = r"""
   // (after the tag list is rebuilt, so the tag recorded is the one kept)
   function draw() {
     refreshOptions();
-    SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value];
+    SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value];
     render();
   }
   // The selects changed: draw their scenario — at once when its chunk is
@@ -7274,16 +8410,20 @@ _FILTER_JS = r"""
       // included — it reads SHOWN): every select goes back to it, the
       // category and tag too, since one chosen while the chunk was loading
       // was never drawn either — the tag list rebuilt for the category shown
-      // — and the line says which scenario could not be loaded
+      // — and the line says which scenario could not be loaded; the Tier
+      // floors choice goes back too, with the band options named for it
       var tried = scenario();
       bandSel.value = String(SHOWN[0]);
+      tierSel.value = SHOWN[5];
+      relabelBands();
       kSel.value = String(SHOWN[1]);
       capSel.value = String(SHOWN[2]);
       catSel.value = SHOWN[3];
       refreshOptions();
       tagSel.value = SHOWN[4];
       setText('flt-summary', fill(D.text.unavailable, {
-        failed: tried, reason: String(err), scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2])}));
+        failed: tried, reason: String(err),
+        scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5])}));
     });
   }
   // The bar cannot work: the base block, or the primary scenario's chunk,
@@ -7293,7 +8433,7 @@ _FILTER_JS = r"""
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
     if (D) {
-      var p = D.primary, here = scenarioAt(p[0], p[1], p[2]);
+      var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -7302,8 +8442,8 @@ _FILTER_JS = r"""
       + '); every section shows the primary spread band’s full run.');
   }
   // A browser can restore a <select>'s last choice on a reload, or on going
-  // back; the page as rendered is the primary scenario's unfiltered view, so
-  // the bar is set back to it. Python renders the selects disabled: they are
+  // back; the page as rendered is the primary scenario's unfiltered view with
+  // the tier floors on, so the bar is set back to it. Python renders the selects disabled: they are
   // enabled once the base block and the primary scenario's chunk are
   // inflated, so no choice can be made (or lost) before it can be drawn — and
   // a category or tag change never meets an unloaded chunk.
@@ -7325,8 +8465,12 @@ _FILTER_JS = r"""
     N = D.dates.length;
     return load(primaryChunk());
   }).then(function(chunk) {
-    if (SEQ === 0) { C = chunk; SHOWN = D.primary.concat([catSel.value, tagSel.value]); }
-    SELECTS.forEach(function(s) { s.disabled = false; });
+    if (SEQ === 0) {
+      C = chunk;
+      SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value]);
+    }
+    // A run with no tier-off view keeps the Tier floors select disabled
+    SELECTS.forEach(function(s) { s.disabled = s === tierSel && !D.grid_off; });
   }, function(err) { unavailable(String(err)); });
 
   [bandSel, kSel, capSel].forEach(function(sel) {
@@ -7334,6 +8478,12 @@ _FILTER_JS = r"""
       if (!D) { return; }
       choose();
     });
+  });
+  tierSel.addEventListener('change', function() {
+    // Nothing to switch to without a tier-off view (the select stays shut)
+    if (!D || !D.grid_off) { return; }
+    relabelBands();
+    choose();
   });
   catSel.addEventListener('change', function() {
     if (!D) { return; }
@@ -7380,7 +8530,8 @@ def generate_dashboard(
     Calls each _section_*() builder in order and streams the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
-    (_filter_bar_html), one packed chunk per distinct scenario trade list and
+    (_filter_bar_html), one packed chunk per distinct scenario trade list
+    (tier-floors-off scenarios included, when the run carries that family) and
     the packed base block after the sections (_ChunkVisitor, _filter_payload,
     _packed_json_script), and the script that swaps a selection in
     (_FILTER_JS). The filter's grid — every spread band x k x per-trade size
@@ -7439,11 +8590,15 @@ def generate_dashboard(
             return calculations and benchmark normalization.
         sweep (BacktestSweep | None): The full sweep payload from
             backtester.run_backtest_sweep(), rendered by the
-            interval-discount section and the scenario-explorer section, and
+            interval-discount section and the scenario-explorer section (with
+            its tier-floors-off block when it carries that family and the
+            filter bar offers a tier-floors-off view to follow), and
             read by the page-wide filter and the k-hat breakdown (every
             band x k scenario and every band's calibration, and — when it
             carries one — the lazy size-cap sweep, whose cells the filter's
-            walk simulates, via _grid_source).
+            walk simulates, and the tier-floors-off family, whose binding
+            bands' cells the walk reads at the run's own cap, via
+            _grid_source).
             Passed whole rather than unpacked — it already carries the
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
@@ -7623,7 +8778,11 @@ def generate_dashboard(
                 source, chunker, start_date, initial_balance, series_categories, kd=kd,
                 tainted=tainted, explorer=explorer_grid,
                 explorer_caps=explorer_grid and explorer_data.base["cap_labels"]
-                == [_cap_option(cap) for cap in source.caps])
+                == [_cap_option(cap) for cap in source.caps],
+                # Exactly whether the explorer renders a Tier floors select
+                # (it has a tier-floors-off view): only then does the line
+                # say its selects follow the bar's Tier floors choice
+                explorer_tiers=explorer_grid and explorer_data.tier_select)
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks

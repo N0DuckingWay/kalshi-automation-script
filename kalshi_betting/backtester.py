@@ -36,8 +36,10 @@ Dependencies:
     prints, read from the same scanner binding the gate reads, so the line
     stays the live one's verbatim twin), from
     scanner.py; fee/model helpers
-    (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap,
-    time_series_profit_prob), the backtest-only spread-band helpers
+    (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
+    backtest-only spread_min and tier_floors keywords only this module, of
+    the pipeline, passes — and time_series_profit_prob), the backtest-only
+    spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
     and resolves a band up front in _entries_for_band, run_backtest_sweep,
@@ -74,12 +76,18 @@ Dependencies:
     dashboard.py, which also imports the private helpers _exact_label,
     _leg_prices_for, _build_equity_curve — the one definition of an equity
     curve, which its page-wide filter runs over a category's or tag's trades
-    for that slice's curve — and _calibration_bucket; an IntervalCalibration
-    carries the CalibrationObservations its pooled row was reduced from, so a
-    report can regroup that population through _calibration_bucket, the one
-    definition of the k-hat arithmetic, as dashboard.py's k-hat breakdown
-    does by category, tag and spread band) plus run_backtest() and
-    run_backtest_sweep() (called by backtest.py).
+    for that slice's curve — _calibration_bucket, _band_label (the bare
+    "floor-ceiling" its filter bar and scenario explorer name a band's
+    tier-floors-off run with, so the page and the log spell that run alike)
+    and _tier_floors_bind (the one test of whether a deadline-gap tier binds
+    at a band, which the page's Tier floors views — the filter bar's and the
+    scenario explorer's — read to decide whether a band absent from the
+    tier-off family may show its tier-on run, or no off view is shown); an
+    IntervalCalibration carries the CalibrationObservations its pooled row
+    was reduced from, so a report can regroup that population through
+    _calibration_bucket, the one definition of the k-hat arithmetic, as
+    dashboard.py's k-hat breakdown does by category, tag and spread band)
+    plus run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
     The backtester uses a two-pass approach: Pass 1 collects all potential entries
@@ -111,7 +119,8 @@ Notes:
     no probability model, so its entries are k-independent).
     _simulate_at_discount() is everything that reads k — the Kelly gate, the
     dedups, Pass 2 and the equity curve — and returns a SweepPoint stamped
-    with the resolved discount, band and population. run_backtest() is a thin
+    with the resolved discount, band, population and tier-floor setting.
+    run_backtest() is a thin
     wrapper over _prepare_entries() (_prepare_candidates() plus one
     _entries_for_band() pass at the default band, which is no band at all)
     and one _simulate_at_discount() call with k=None, which
@@ -140,6 +149,19 @@ Notes:
     run_backtest() is untouched by it — same signature, same two-tuple — so
     every existing caller keeps working.
 
+    With tier_off_sweep as well (backtest.py turns it on with the band
+    sweep), every band where a deadline-gap tier floor binds
+    (_tier_floors_bind: a floor below a tier — on the shipped grid floors 0,
+    0.20 and 0.25, 18 of the 36 bands) is entered and simulated a second
+    time with the tiers not applied — config.min_price_diff_for_gap's
+    backtest-only tier_floors=False, so that band's floor alone gates pB − pA
+    (which must still be strictly positive) and sets the leg-price-sum
+    ceiling — through the same scenario block, and returned beside the
+    tier-on grid as BacktestSweep.tier_off_scenarios /
+    tier_off_calibrations_by_band. Every tier-on figure is exactly what the
+    run returns without it; a band at or above both tiers is not re-run,
+    since it enters the same pairs either way.
+
     The per-trade Kelly size cap is a simulation parameter too:
     _simulate_at_discount(..., size_cap=None) sizes every candidate at
     min(cap, f*), where None resolves this module's BUDGET_FRACTION at call
@@ -151,7 +173,9 @@ Notes:
     keeping every band x k x cap x population point would hold gigabytes.
     Each cell is seeded from the eager point: every cap at or above a point's
     (cap-independent) peak_kelly_fraction sizes identically, so those caps
-    share one simulation. Live sizing never reads any of it.
+    share one simulation. The CapSweep covers the tier-on grid only; the
+    tier-floors-off family above is simulated at the run's own cap alone, and
+    none of its points ever seeds a cell. Live sizing never reads any of it.
 
     Before grouping, _prepare_candidates() filters markets through _can_ever_enter(),
     a necessary-condition prefilter: _find_entry() can only open a trade at a
@@ -429,18 +453,33 @@ def _cap_label(cap: float) -> str:
 
 
 def _sim_options(size_cap: float | None, quiet: bool, *,
-                 end_date: date | None = None) -> dict:
+                 end_date: date | None = None,
+                 tier_floors: bool = True) -> dict:
     """
     Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
 
     ONLY the options that differ from _simulate_at_discount's defaults are
-    included, so every default-cap call is made with exactly the keywords it
-    carried before the size cap existed — the test stand-ins with fixed
-    six-parameter signatures (tests/test_backtester.py's golden_band_sweep
-    simulate_spy and three fake_simulate functions) and the verbatim kwargs
-    assertion in TestSweepHelpers::test_ex_top_event_picks_the_largest_summed_profit
-    keep working. A cap equal to this module's BUDGET_FRACTION (read at call
-    time) means the same as None and is dropped too.
+    included, so every default call is made with exactly the keywords it
+    carried before the size cap and the tier-floors-off family existed — the
+    test stand-ins with fixed six-parameter signatures (tests/test_backtester.py's
+    golden_band_sweep and cap_sweep_run simulate_spy, and the fake_simulate of
+    TestBandSweepSplitAndPopulationWiring, TestTimeSeriesPopulation and
+    TestBandSweepPhaseOneSubset's tier-on sweep) and the verbatim kwargs
+    assertions in
+    TestSweepHelpers::test_ex_top_event_picks_the_largest_summed_profit keep
+    working. The other stand-ins accept only the options their runs forward:
+    the tier-off sweeps' take tier_floors, while TestCapSweepSeeding's and
+    TestCapSweepEndDate's take only size_cap/quiet[/end_date], so a stray
+    tier_floors raises there too. A cap equal to this module's BUDGET_FRACTION
+    (read at call time) means the same as None and is dropped too, and
+    tier_floors is forwarded only when it is exactly False — the one value
+    that marks a tier-off simulation — so a tier-on call never carries it.
+    _half_split, _ex_top_event and _band_sweep_cell build their keywords
+    here, and so do CapSweep's split-half and excluding-top-event checks
+    (through those two helpers). CapSweep._by_cap's own cap simulation does
+    NOT: it passes size_cap, quiet=True and its pinned end_date directly, and
+    forwards no tier_floors — a CapSweep is tier-on only until it carries a
+    tier axis of its own.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -451,10 +490,13 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
             equity curve must end on (a lazy size-cap run pins its eager
             point's); None (default) leaves _build_equity_curve reading
             today (UTC) and is not forwarded.
+        tier_floors (bool): Keyword-only. Whether the entries were detected
+            with the deadline-gap tier floors applied; forwarded (as False)
+            only when it is exactly False. Default True, not forwarded.
 
     Returns:
-        dict: {} on a default call; otherwise "size_cap", "quiet" and/or
-            "end_date".
+        dict: {} on a default call; otherwise "size_cap", "quiet",
+            "end_date" and/or "tier_floors" (always False when present).
     """
     out: dict = {}
     if size_cap is not None and size_cap != BUDGET_FRACTION:
@@ -463,6 +505,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         out["quiet"] = True
     if end_date is not None:
         out["end_date"] = end_date
+    if tier_floors is False:
+        out["tier_floors"] = False
     return out
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -761,6 +805,12 @@ class SweepPoint:
             below by −100%. Set only on the "all" and "time_series" points of
             a band sweep, and None there too when no trade names an event
             (there is no event to drop).
+        tier_floors (bool): False only for a tier-off sweep's points
+            (BacktestSweep.tier_off_scenarios), whose entries were detected at
+            the band floor alone with the deadline-gap tier floors not
+            applied. A label; the entries already reflect it. Appended with a
+            default of True, so every existing construction still builds as a
+            tier-on point.
         size_cap (float | None): The RESOLVED per-trade Kelly size cap this
             point was sized under — config.BUDGET_FRACTION unless a size-cap
             sweep simulated another; 1.0 means no cap (full Kelly). None only
@@ -784,6 +834,7 @@ class SweepPoint:
     population: str = "all"
     halves: HalfSplit | None = None
     ex_top_event: tuple[str, float] | None = None
+    tier_floors: bool = True
     size_cap: float | None = None
     peak_kelly_fraction: float | None = None
 
@@ -853,10 +904,14 @@ class IntervalCalibrationBucket:
             returns for this band — its deadline-gap tier (0.15 or 0.30), or
             the backtest spread band's floor where that is higher, since the
             report labels each band with the floor its entries were actually
-            detected under (_interval_calibration's spread_min). The pooled
-            row spans every band and therefore has no single tier: it carries
-            0.0, which the report renders as "-". Read `tier <= 0` as "not a
-            single band", never as a real threshold.
+            detected under (_interval_calibration's spread_min) — or, in a
+            tier-off sweep's calibration (_interval_calibration's
+            tier_floors=False), the band's floor alone. The pooled row spans
+            every band and therefore has no single tier: it carries 0.0,
+            which the report renders as "-". Read `tier <= 0` as "no floor to
+            print" — the pooled row, or a tier-off bucket at a band floor of
+            0, whose entries cleared no floor at all — never as a real
+            threshold.
         n (int): Candidates in the bucket. Can be 0 on the pooled row when
             every time-series candidate was a premise violation (empty gap
             bands are omitted from IntervalCalibration.buckets entirely).
@@ -890,9 +945,10 @@ class IntervalCalibration:
     output inside a sweep), so it is INDEPENDENT of the interval discount k:
     it is computed once per band and is valid for every k at that band,
     which is why it hangs off BacktestSweep (the primary band's as
-    `calibration`, every band's in `calibrations_by_band`) rather than off
-    any single SweepPoint. It is NOT band-independent: a band changes which
-    pairs enter, and when.
+    `calibration`, every band's in `calibrations_by_band`, and each binding
+    band's tier-floors-off entries' in `tier_off_calibrations_by_band`)
+    rather than off any single SweepPoint. It is NOT band-independent: a
+    band changes which pairs enter, and when — and so do the tier floors.
 
     Attributes:
         pooled (IntervalCalibrationBucket): The all-bands row, labelled
@@ -1195,6 +1251,12 @@ class CapSweep:
     the eager points it references are the ones BacktestSweep already
     holds.
 
+    TIER-ON only: entries_by_band and eager are the tier-on sweep's, and
+    _sweep_from_candidates never records a tier-floors-off point
+    (BacktestSweep.tier_off_scenarios) as a seed, so a cell can never hand a
+    tier-off simulation back under a tier-on (band, k, population) key. The
+    tier-floors-off family is simulated at the run's own cap alone.
+
     BACKTEST-ONLY, like the band and k sweeps: live sizing reads
     config.BUDGET_FRACTION and never this module.
 
@@ -1224,7 +1286,8 @@ class CapSweep:
         st_entries (list): The same-title entries (band-independent). Not in
             repr.
         eager (dict): (band, k, population) -> the eager primary-cap point
-            of that cell, recorded by _sweep_from_candidates. Not in repr.
+            of that cell, recorded by _sweep_from_candidates — always a
+            tier-on point. Not in repr.
         same_title_eager (SweepPoint | None): BacktestSweep.same_title_point.
             Not in repr.
         simulated (int): Simulations this object has run (each cap point
@@ -1397,11 +1460,14 @@ class CapSweep:
 class BacktestSweep:
     """
     Everything one backtest run produces across every interval discount — and,
-    when the spread-band sweep is on, across every band of the grid.
+    when the spread-band sweep is on, across every band of the grid (and, with
+    tier_off_sweep, again with the deadline-gap tier floors off at every band
+    they bind).
 
     Returned by run_backtest_sweep(). One preparation pass (the expensive,
     network-bound half, _prepare_candidates) feeds every point here, so the
-    whole aggregate costs one fetch, one _find_entry pass per band, and one
+    whole aggregate costs one fetch, one _find_entry pass per band (and a
+    second at each band the tier floors bind, on a tier-off sweep), and one
     sizing/selection pass per simulated scenario.
 
     Attributes:
@@ -1488,6 +1554,32 @@ class BacktestSweep:
             label_coverage, so no existing construction breaks; the one
             production construction that has a corpus
             (_sweep_from_candidates) always passes it.
+        config_same_event_ladders (bool | None): The ladder switch as this
+            process's config set it (backtester's binding of
+            config.TIME_SERIES_SAME_EVENT_LADDERS) — the value this
+            checkout's live finder would run with — so a report can say
+            whether the run replays that rule. None = not recorded (a
+            hand-built sweep). DEFAULTED like label_coverage; both
+            production constructions must pass it.
+        tier_off_scenarios (list[SweepPoint]): The tier-off family: every
+            tier-bound band x k cell (_tier_floors_bind — on the shipped grid
+            the bands with a floor below 0.30) simulated again with the
+            deadline-gap tier floors off, i.e. at the band floor alone, in the
+            same order and shape as scenarios — the "all" point, then its
+            non-empty "time_series", "ladder" and "cross" points, the "all"
+            and "time_series" points carrying halves split at the ONE
+            split_date and, where they traded an event, ex_top_event. Every
+            point here has tier_floors False. A band whose floor is at or
+            above both tiers has no twin: its tier-on cells ARE its tier-off
+            cells. [] unless run_backtest_sweep(tier_off_sweep=True) — which
+            the CLI turns on together with the band sweep — ran on a feasible
+            window (the Monday-feasibility short-circuit returns it empty).
+        tier_off_calibrations_by_band (dict): Band -> the tier-off entries'
+            own IntervalCalibration (or None), each bucket labelled with the
+            floor alone. Its keys are exactly the tier-bound bands, and the
+            dashboard reads them as "simulated again": a band that is absent
+            AND where _tier_floors_bind is False counts as its own tier-on
+            run. {} unless tier_off_sweep ran on a feasible window.
         cap_sweep (CapSweep | None): Every other per-trade size cap of
             SIZE_CAP_SWEEP, simulated lazily, one (band, k) cell at a time,
             by whoever reads it (see CapSweep). None when the size-cap sweep
@@ -1508,6 +1600,10 @@ class BacktestSweep:
     same_event_ladders: bool | None = None
     split_date: date | None = None
     corpus_provenance: CorpusProvenance | None = None
+    config_same_event_ladders: bool | None = None
+    tier_off_scenarios: list[SweepPoint] = field(default_factory=list)
+    tier_off_calibrations_by_band: dict[tuple[float, float], IntervalCalibration | None] = field(
+        default_factory=dict)
     cap_sweep: CapSweep | None = None
 
 
@@ -1524,10 +1620,18 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     at ANY simulated point disproves that sentence, so this is the one
     definition both renderers (dashboard._corpus_provenance_html and
     backtest._log_corpus_provenance) test a True verdict against. It counts
-    every EAGER point — the primary, each swept k, each band-sweep scenario
-    and the same-title point, every one simulated at the run's own size cap.
-    Zero proves nothing either way: an entry that Kelly then rejected at
-    every k also shows the window could trade.
+    every EAGER point the run keeps — the primary, each swept k, each
+    band-sweep scenario, each tier-off scenario
+    (BacktestSweep.tier_off_scenarios) and the same-title point, every one
+    simulated at the run's own size cap; the split-half and ex-top
+    re-simulations are not kept as points (only their figures are) and are
+    not counted. Every point it counts can reach the same page: the tier-on
+    ones through the filter bar's k select and the scenario explorer, the
+    tier-off ones through the Tier floors choice's off view in the filter bar
+    and the scenario explorer — and a trade at a tier-off point proves just
+    as well that the window's markets had candlesticks, i.e. that the window
+    could trade. Zero proves nothing either way: an entry that Kelly then
+    rejected at every k also shows the window could trade.
 
     A size-cap sweep (sweep.cap_sweep) simulates its other caps only when a
     reader asks for a cell, never here, and a larger cap can turn an n < 1
@@ -1536,17 +1640,18 @@ def max_trades_simulated(sweep: BacktestSweep) -> int:
     the log's closing line, written before the dashboard is built, sees the
     eager points alone — so on a run where ONLY a non-default cap traded, the
     page calls the verdict stale while the log still repeats it. Every eager
-    point agrees between the two.
+    point, tier-on and tier-off, agrees between the two.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
         int: The largest len(trades) over sweep.primary, sweep.points,
-            sweep.scenarios and sweep.same_title_point (when present); 0 when
-            none of them traded.
+            sweep.scenarios, sweep.tier_off_scenarios and
+            sweep.same_title_point (when present); 0 when none of them
+            traded.
     """
-    points = [sweep.primary, *sweep.points, *sweep.scenarios]
+    points = [sweep.primary, *sweep.points, *sweep.scenarios, *sweep.tier_off_scenarios]
     if sweep.same_title_point is not None:
         points.append(sweep.same_title_point)
     return max(len(point.trades) for point in points)
@@ -2022,9 +2127,10 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
       a Nov/Dec rung pair whose subtitle "Before November" states no year).
 
     So a ladder-enabled backtest's pair population is NOT a subset of the live
-    one on a subtitle-blank corpus, and the k-hat the flip gate demands is
-    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual list and
-    the plan's own "prove the corpus before spending on it" step).
+    one on a subtitle-blank corpus, and the k-hat of the rule the switch
+    shipped behind (not met — see config.TIME_SERIES_SAME_EVENT_LADDERS) was
+    measured on exactly such a corpus (see CLAUDE.md's DR-67 residual
+    list and the plan's own "prove the corpus before spending on it" step).
 
     Args:
         m (dict): A market dict in the compact historical._market_to_dict form.
@@ -2416,10 +2522,10 @@ def _extract_pairs(
     the measurement is small: on that same 2026-05-01 slice the whole
     615,266-pair sub-pass costs +0.3 to +0.5 s against a ~19 s switch-off call
     (measured 2026-09-23, two runs each way), and it is paid only with the
-    switch on. A per-call aggregate guard is the alternative and is
-    deliberately not built; if the cost ever stops being negligible, sum
-    len(idxs)*(len(idxs)-1)//2 across buckets here and warn past a second
-    threshold.
+    switch on — every default run since the 2026-09-26 decision. A per-call aggregate guard
+    is the alternative and is deliberately not built; if the cost ever stops
+    being negligible, sum len(idxs)*(len(idxs)-1)//2 across buckets here and
+    warn past a second threshold.
 
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
@@ -3109,6 +3215,8 @@ def _find_entry(
     max_horizon_days: int | None = None,
     same_event_ladders: bool | None = None,
     spread_band: tuple[float, float] | None = None,
+    *,
+    tier_floors: bool = True,
 ) -> dict | None:
     """
     Find the first Monday where a potential pair was tradeable at the required threshold.
@@ -3182,6 +3290,20 @@ def _find_entry(
     floor of 0 is inert under every tier and no spread exceeds 1 — so the
     default reproduces the live rule. same_title pairs never read the band.
 
+    tier_floors (BACKTEST-only, like the band) switches the deadline-gap tier
+    itself off: the threshold is then the band floor alone, which drives the
+    gap test and the leg-price-sum ceiling exactly as max(tier, floor) does,
+    so the sum ceiling stays tied to the floor. Nothing else reads it — the
+    30-day gap cap, the ceiling, the live-quote and fee checks, the ladder
+    rule and every same-title pair are the same either way. At a floor of 0
+    what is left of the gap test is that pB must EXCEED pA: a time-series
+    Monday whose spread is not strictly positive (pB − pA <= PRICE_EPSILON)
+    is refused whatever the tiers, because a pair with no in-between mass
+    has nothing to dispute and time_series_profit_prob would model it as
+    riskless (p = 1). That refusal is inert with the tiers on, where every
+    tier already demands more; at a floor of 0 with them off it is the one
+    gap condition left, beside a sum ceiling of 1 the fee check implies.
+
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
 
@@ -3216,6 +3338,12 @@ def _find_entry(
             time — (0.0, 1.0), no band. Resolved and validated once per call,
             before anything else, so an invalid band is refused whatever the
             pair's data. Ignored by same_title pairs.
+        tier_floors (bool): Keyword-only, BACKTEST-only. False enters
+            time-series pairs at the band floor alone, the deadline-gap tier
+            not applied (the band sweep's tier-floors-off family) — still
+            only at a strictly positive spread; True (the default) is the
+            live rule, the tier with the floor layered on it. Ignored by
+            same_title pairs.
 
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
@@ -3376,11 +3504,14 @@ def _find_entry(
         # same gap arithmetic, as scanner.find_time_series_pairs — and layer
         # the backtest band's floor on top of it: config returns
         # max(tier, band_lo), so the default floor of 0 leaves the live tier
-        # untouched. This one threshold drives BOTH the gap test and the
-        # leg-price-sum ceiling below, which is what keeps the sum ceiling at
-        # 1 - floor when the band raises the floor (the live pairing of the
-        # two, applied to the raised floor rather than to the tier alone).
-        threshold = min_price_diff_for_gap(gap_days, spread_min=band_lo)
+        # untouched — and, with tier_floors False (backtest-only), drops the
+        # tier and returns band_lo alone. This one threshold drives BOTH the
+        # gap test and the leg-price-sum ceiling below, which is what keeps
+        # the sum ceiling at 1 - floor when the band raises the floor (the
+        # live pairing of the two, applied to the raised floor rather than to
+        # the tier alone), and at 1 - floor when the tier is dropped too.
+        threshold = min_price_diff_for_gap(gap_days, spread_min=band_lo,
+                                           tier_floors=tier_floors)
     else:
         # same_title pairs have no deadline-gap concept — flat 5% threshold
         threshold = SAME_TITLE_MIN_PRICE_DIFF
@@ -3433,6 +3564,17 @@ def _find_entry(
             mA_i, mB_i = mA, mB
             pA, pB, nA, nB = p_a_raw, p_b_raw, n_a_raw, n_b_raw
             gap = pB - pA
+            # A Monday with no in-between mass (pB - pA not strictly positive)
+            # has nothing to dispute, and time_series_profit_prob would model
+            # it as riskless (p = 1, Kelly at the cap). Inert with the tiers
+            # on, since every tier > 0 already demands more; it keeps the
+            # tier-floors-off family, whose floor-0 threshold is 0.0, from
+            # entering such a pair. PRICE_EPSILON sits on the REJECT side here
+            # and TIGHTENS, like scanner's pA + nB guard: a zero spread that
+            # evaluates a hair above 0 is still refused, while a genuine
+            # one-tick spread (>= $0.0001) is two orders of magnitude clear.
+            if gap <= PRICE_EPSILON:
+                continue
         else:
             # same_title: canonicalize per iteration so the swap never leaks to
             # the next Monday. Market A is the more expensive side this week,
@@ -3483,7 +3625,8 @@ def _find_entry(
         # contracts whose combined LEG price leaves the required gap
         # (price_a + price_b <= 1 - threshold) — apply the same cut to candle
         # entries. For time_series `threshold` already carries the band's
-        # floor, so under a raised floor this is 1 - max(tier, floor).
+        # floor, so under a raised floor this is 1 - max(tier, floor) (and
+        # 1 - floor with the tier floors off).
         if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
@@ -4766,11 +4909,14 @@ def _exact_label(value: float, spec: str) -> str:
 
 def _band_label(band: tuple[float, float]) -> str:
     """
-    Render a resolved spread band as the "floor-ceiling" text every log line uses.
+    Render a resolved spread band as "floor-ceiling" (log lines, the dashboard's tier-off labels).
 
     One definition, so the Phase-1 announcement of a band sweep and the
     completion line of every simulation at that band spell it identically —
-    a reader can match them by text. Each bound is formatted with :g, which
+    a reader can match them by text. dashboard.py labels a band's
+    tier-floors-off view with it too (that run was gated on its floor alone,
+    so the page's own "max(tier,<floor>)" would misname it), so the page and
+    the log name that run alike. Each bound is formatted with :g, which
     drops trailing zeros, so the default band reads "0-1" and the plan's
     30-60% band "0.3-0.6" — unless :g would lose precision, when the bound is
     printed exactly (_exact_label), so a primary band of (0.3000001, 0.6) is
@@ -4785,6 +4931,38 @@ def _band_label(band: tuple[float, float]) -> str:
     """
     lo, hi = band
     return f"{_exact_label(lo, 'g')}-{_exact_label(hi, 'g')}"
+
+
+def _tier_floors_bind(band: tuple[float, float]) -> bool:
+    """
+    Report whether a deadline-gap tier floor ever sits above a band's floor.
+
+    With the tiers on, a time-series entry at this band must clear
+    min_price_diff_for_gap(gap, spread_min=floor) = max(tier, floor); with
+    them off, the floor alone. The two differ for some gap exactly when the
+    floor is below a tier — on the shipped grid floors 0, 0.20 and 0.25 (both
+    tiers at 0, the 0.30 tier alone at the other two). A band whose floor is
+    at or above both tiers enters the same pairs on the same Mondays either
+    way, so a tier-off sweep simulates only the binding bands again and the
+    dashboard reuses the tier-on run for the rest (dashboard.py imports this
+    one test to decide which bands may). Decided through
+    min_price_diff_for_gap itself, over every gap _find_entry admits, so it
+    cannot disagree with the rule it names.
+
+    Args:
+        band (tuple[float, float]): A (floor, ceiling) resolved by
+            config.time_series_spread_band.
+
+    Returns:
+        bool: True when some gap in 0..MAX_DEADLINE_GAP_DAYS has a tier above
+            the floor.
+    """
+    floor = band[0]
+    # The one threshold helper, asked both ways at every admissible gap: the
+    # tiers bind at this band exactly where the two answers differ
+    return any(min_price_diff_for_gap(gap, spread_min=floor)
+               != min_price_diff_for_gap(gap, spread_min=floor, tier_floors=False)
+               for gap in range(MAX_DEADLINE_GAP_DAYS + 1))
 
 
 def _is_ladder_pair(pair_type: str, mA: dict, mB: dict) -> bool:
@@ -4820,7 +4998,8 @@ def _population_subsets(entries: list[dict]) -> list[tuple[str, list[dict]]]:
     Split one band's entries into the band sweep's standalone time-series populations.
 
     The ONE definition of those subsets, read by both _sweep_from_candidates'
-    eager loop and CapSweep.cell, so a size-cap cell simulates exactly the
+    eager loops (through _band_populations, tier-on and tier-off) and
+    CapSweep.cell, so a size-cap cell simulates exactly the
     populations the eager scenarios did. Split on _is_ladder_pair — the rule
     each trade's same_event_ladder label follows — so a trade and the
     population it was simulated in always agree. "time_series" is ladders and
@@ -4853,6 +5032,7 @@ def _entries_for_band(
     spread_band: tuple[float, float] | None = None,
     *,
     pair_types: tuple[str, ...] = _PAIR_TYPES,
+    tier_floors: bool = True,
     _pairs: list | None = None,
 ) -> list[dict]:
     """
@@ -4862,9 +5042,10 @@ def _entries_for_band(
     (or in _pairs, when given) whose type is in pair_types, in scan order.
     _find_entry applies price,
     deadline and band thresholds only — it holds no probability model — so
-    the result is identical at every interval discount; only the band can
-    change it, and only for time-series pairs (a same-title pair never reads
-    the band). A caller sweeping many bands can therefore compute the
+    the result is identical at every interval discount; only the band (and
+    the backtest-only tier_floors switch) can change it, and only for
+    time-series pairs (a same-title pair reads neither). A caller sweeping
+    many bands can therefore compute the
     same-title entries once (pair_types=("same_title",)) and the time-series
     entries once per band (pair_types=("time_series",)); concatenating the two
     in that order reproduces the default call exactly, since the default
@@ -4896,6 +5077,11 @@ def _entries_for_band(
             i.e. the live rule.
         pair_types (tuple[str, ...]): Which pair types to scan — any subset
             of ("time_series", "same_title"). Keyword-only. Defaults to both.
+        tier_floors (bool): Keyword-only, BACKTEST-only; handed to every
+            _find_entry() call. False enters time-series pairs at the band
+            floor alone, the deadline-gap tier not applied (the tier-off
+            family of _sweep_from_candidates); True (the default) is the live
+            rule. A same-title pair never reads it.
         _pairs (list | None): PRIVATE, keyword-only. The
             [((mA, mB, canon, group_key), pair_type), ...] items to scan in
             place of candidates.all_pairs — in practice a subsequence of it,
@@ -4955,6 +5141,8 @@ def _entries_for_band(
             # that admitted it (DR-73).
             same_event_ladders=candidates.same_event_ladders,
             spread_band=spread_band,
+            # Backtest-only: False drops the deadline-gap tier for this pass
+            tier_floors=tier_floors,
         )
         if entry is None:
             continue
@@ -5084,6 +5272,7 @@ def _simulate_at_discount(
     spread_band: tuple[float, float] | None = None,
     population: str = "all",
     *,
+    tier_floors: bool = True,
     size_cap: float | None = None,
     quiet: bool = False,
     end_date: date | None = None,
@@ -5109,12 +5298,15 @@ def _simulate_at_discount(
     runs after the Kelly gate, so a different k can change which candidate wins
     its group. Both are intended; do not reorder or hoist them.
 
-    spread_band and population change NOTHING about the simulation: the band
-    has already acted by the time entries reach here (inside _find_entry,
-    through _entries_for_band), and the population is whichever subset of
-    entries the caller chose to hand over. Both only name the run on its
-    completion line — so each of a band sweep's thousands of simulations is
-    distinguishable in the log (TS-21) — and stamp the returned point.
+    spread_band, population and tier_floors change NOTHING about the
+    simulation: the band and the tier floors have already acted by the time
+    entries reach here (inside _find_entry, through _entries_for_band), and
+    the population is whichever subset of entries the caller chose to hand
+    over. All three only name the run on its completion line — so each of a
+    band sweep's thousands of simulations is distinguishable in the log
+    (TS-21) — and stamp the returned point; tier_floors also labels the
+    premise-violation WARNING, the one summary line a simulation can emit
+    beside its completion line.
 
     size_cap DOES change the simulation: it is the per-trade Kelly cap, the
     `min(cap, kelly_f)` every candidate is sized under — config.BUDGET_FRACTION
@@ -5149,6 +5341,12 @@ def _simulate_at_discount(
             "all/ex-top", "time_series/H1", "time_series/H2" and
             "time_series/ex-top" a band sweep gives its split-half and
             excluding-top-event runs.
+        tier_floors (bool): Keyword-only. Whether the entries were detected
+            with the deadline-gap tier floors applied — a label, never
+            applied here. False (a tier-off sweep's simulations) appends
+            " with the tier floors off" to the band on the completion line, so
+            the two families never share a prefix, and " [tier floors off]"
+            to the premise-violation WARNING; True (default) adds nothing.
         size_cap (float | None): Keyword-only. The per-trade Kelly size cap,
             in (0, 1]; 1.0 sizes at full Kelly (no cap). None (default)
             resolves this module's BUDGET_FRACTION at call time — the live
@@ -5170,8 +5368,9 @@ def _simulate_at_discount(
         SweepPoint: The trades (in entry-date order, empty if none entered) and
             the daily equity curve produced at this discount, stamped with the
             RESOLVED k — never None — the resolved spread_band (None when None
-            was passed), the population, the resolved size_cap and the
-            peak_kelly_fraction (0.0 when no candidate passed the Kelly gate).
+            was passed), the population, tier_floors (False only when False
+            was passed), the resolved size_cap and the peak_kelly_fraction
+            (0.0 when no candidate passed the Kelly gate).
 
     Raises:
         ValueError: If population is not one of the labels above (a typo would
@@ -5371,6 +5570,11 @@ def _simulate_at_discount(
         # DR-72 widens the named CAUSES beyond the single "mixed snapshot
         # family" guess this line used to make — see the cause list below,
         # and CLAUDE.md's strategy-change gotcha for what each one means.
+        # A tier-floors-off simulation (a label, like the band — its entries
+        # were detected with the deadline-gap tiers not applied) appends
+        # " [tier floors off]", so a count from that backtest-only family is
+        # never read as one from the run's tier-on scenarios; the tier-on
+        # text is unchanged.
         # The count is cap-independent (taken after the Kelly gate, before any
         # sizing), so a quiet size-cap re-run only repeats what the
         # primary-cap run already warned: it goes to DEBUG, text unchanged.
@@ -5386,8 +5590,9 @@ def _simulate_at_discount(
             "deadline, which is possible for CROSS-EVENT pairs only, since a "
             "same-event ladder is ordered on its stated deadlines; or "
             "strike-blind grouping on a cache without subtitles (see the "
-            "outcome-label coverage line)",
+            "outcome-label coverage line)%s",
             premise_violations,
+            " [tier floors off]" if tier_floors is False else "",
         )
 
     # Keep only the single best candidate per title group — mirrors the live
@@ -5607,15 +5812,20 @@ def _simulate_at_discount(
     # one sweep — k and band are printed through _exact_label, so an off-grid
     # value that rounds onto a grid member still prints distinctly.
     # effective_k and the resolved band, never the arguments, so the None
-    # sentinels are never printed. A cap other than BUDGET_FRACTION is named
-    # BEFORE the colon (", cap 35%" / ", no cap" — injective, so the prefix
-    # stays unique across caps too); the default cap adds nothing, so every
-    # pre-cap line is byte-identical. The lazy size-cap runs are quiet (DEBUG).
+    # sentinels are never printed. A tier-off sweep's simulation carries
+    # " with the tier floors off" after the band, so the two families never
+    # share a prefix — no colon in it (the prefix ends at the first ':'). A
+    # cap other than BUDGET_FRACTION is named after the population, BEFORE
+    # the colon (", cap 35%" / ", no cap" — injective, so the prefix stays
+    # unique across caps too); the default cap adds nothing, so every pre-cap
+    # line is byte-identical and the population stays the last ", "-separated
+    # field of a default-cap prefix. The lazy size-cap runs are quiet (DEBUG).
     logging.log(
         logging.DEBUG if quiet else logging.INFO,
-        "Backtest complete at k=%s, band %s, %s%s: %d trades, %d profitable",
+        "Backtest complete at k=%s, band %s%s, %s%s: %d trades, %d profitable",
         _exact_label(effective_k, ".3f"),
         _band_label((band_lo, band_hi)),
+        " with the tier floors off" if tier_floors is False else "",
         population,
         "" if cap == BUDGET_FRACTION else f", {_cap_label(cap)}",
         len(trades),
@@ -5631,6 +5841,8 @@ def _simulate_at_discount(
         # stamp the same scenario; None stays None ("given no band").
         spread_band=None if spread_band is None else (band_lo, band_hi),
         population=population,
+        # A label, like the band: only an explicit False marks a tier-off point
+        tier_floors=tier_floors is not False,
         size_cap=cap, peak_kelly_fraction=peak_kelly,
     )
 
@@ -5695,6 +5907,8 @@ def _calibration_bucket(
 def _interval_calibration(
     raw_entries: list[dict],
     spread_min: float | None = None,
+    *,
+    tier_floors: bool = True,
 ) -> IntervalCalibration | None:
     """
     Measure the empirical interval discount k over the prepared entries.
@@ -5757,6 +5971,18 @@ def _interval_calibration(
             (default) labels the deadline-gap tiers alone, which is also what
             the default band's floor of 0.0 labels. Labelling only: it filters
             nothing, since the band already acted inside _find_entry.
+        tier_floors (bool): Keyword-only, labelling only, like spread_min:
+            whether the entries were detected with the deadline-gap tiers
+            applied. False (a tier-off sweep's calibrations) labels each gap
+            band with the floor alone — the only floor those entries cleared —
+            so at a floor of 0.0 every bucket's tier is 0.0. A renderer that
+            follows IntervalCalibrationBucket.tier's `tier <= 0` sentinel —
+            _log_interval_calibration's "-", the dashboard's calibration
+            tables — would print such a bucket's tier like the pooled row's,
+            because there is no floor to print: that is the documented
+            reading of the sentinel. No tier-off calibration is logged today
+            (only the primary band's tier-on calibration is). True (default)
+            labels max(tier, spread_min).
 
     Returns:
         IntervalCalibration | None: The report — carrying, on `observations`,
@@ -5840,8 +6066,9 @@ def _interval_calibration(
             # never straddles the tier boundary (see _CALIBRATION_GAP_BANDS),
             # so its upper edge names the whole band's tier. spread_min is the
             # same band floor _find_entry layered on that tier, so the label
-            # is the floor these entries were actually detected under.
-            min_price_diff_for_gap(hi, spread_min=spread_min),
+            # is the floor these entries were actually detected under — the
+            # floor alone when they were detected with the tiers off.
+            min_price_diff_for_gap(hi, spread_min=spread_min, tier_floors=tier_floors),
             band,
         ))
 
@@ -5904,8 +6131,9 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
                  "bucket", "tier", "n", "realised", "implied", "k_hat")
 
     for b in [*calibration.buckets, calibration.pooled]:
-        # tier <= 0 marks the pooled row, which spans every tier and so has no
-        # single one to print (IntervalCalibrationBucket.tier).
+        # tier <= 0 marks a row with no floor to print: the pooled row, which
+        # spans every tier, or a tier-off bucket at a band floor of 0
+        # (IntervalCalibrationBucket.tier).
         tier_txt = "-" if b.tier <= 0 else f"{b.tier:.2f}"
         k_txt = "-" if b.empirical_k is None else f"{b.empirical_k:.3f}"
         logging.info("  %-14s%4s%9d%12.4f%11.4f%10s",
@@ -6025,9 +6253,10 @@ def run_backtest(
     # exact pre-DR-73 signature for every existing caller, and omitting the
     # keyword leaves _prepare_entries' None sentinel to resolve this module's
     # TIME_SERIES_SAME_EVENT_LADDERS (bound from config at import) at call
-    # time — the value live sizing uses. A harness that wants ladders here must
-    # patch backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config
-    # attribute, which this module never reads; the supported lever is
+    # time — the value the live finder uses. A harness that wants ladders on or
+    # off here (they follow the switch, on by the 2026-09-26 decision) must patch
+    # backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config attribute, which
+    # this module never reads; the supported lever is
     # run_backtest_sweep(same_event_ladders=...), which needs no patching.
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days
@@ -6131,6 +6360,7 @@ def _half_split(
     band: tuple[float, float],
     population: str = "all",
     *,
+    tier_floors: bool = True,
     size_cap: float | None = None,
     quiet: bool = False,
     end_date: date | None = None,
@@ -6138,10 +6368,10 @@ def _half_split(
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
 
-    Both halves are simulated at the scenario's own size cap, forwarded
-    through _sim_options — which forwards NOTHING on a default call, so the
-    eager band sweep calls _simulate_at_discount with exactly the keywords it
-    always did.
+    Both halves are simulated at the scenario's own size cap and tier-floor
+    setting, forwarded through _sim_options — which forwards NOTHING on a
+    default call, so the eager tier-on band sweep calls _simulate_at_discount
+    with exactly the keywords it always did.
 
     Args:
         halves (tuple[list[dict], list[dict]]): The scenario's entries split
@@ -6156,6 +6386,10 @@ def _half_split(
             "all" (default) or "time_series" — which names the two runs
             "<population>/H1" and "<population>/H2" on their completion lines,
             so the two populations' split-half runs never share a prefix.
+        tier_floors (bool): Keyword-only. The scenario's tier-floor setting
+            (a label, like band — the entries already reflect it), handed to
+            both halves' simulations so a tier-off scenario's halves are
+            named as tier-off runs.
         size_cap (float | None): Keyword-only. The scenario's per-trade size
             cap; None (default) or BUDGET_FRACTION for the run's own.
         quiet (bool): Keyword-only. Log both halves' completion lines (and
@@ -6172,7 +6406,7 @@ def _half_split(
     first, second = halves
     # Only the options that differ from the defaults, so a default call is
     # byte-for-byte the call it always was
-    options = _sim_options(size_cap, quiet, end_date=end_date)
+    options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
                                spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
@@ -6195,6 +6429,7 @@ def _ex_top_event(
     band: tuple[float, float],
     population: str = "all",
     *,
+    tier_floors: bool = True,
     quiet: bool = False,
     end_date: date | None = None,
 ) -> tuple[str, float] | None:
@@ -6215,9 +6450,10 @@ def _ex_top_event(
     +157.3%): without its top event the subtraction reads +2.5% and the
     re-simulation +14.3%.
 
-    The re-simulation runs at the point's own size cap (point.size_cap),
-    forwarded through _sim_options — nothing extra on the run's own cap, so
-    the eager band sweep's call is unchanged.
+    The re-simulation runs at the point's own size cap (point.size_cap) and
+    the caller's tier_floors, forwarded through _sim_options — nothing extra
+    on the run's own cap with the tiers on, so the eager tier-on band sweep's
+    call is unchanged.
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
@@ -6228,6 +6464,9 @@ def _ex_top_event(
         population (str): The point's population — "all" (default) or
             "time_series" — naming the re-simulation "<population>/ex-top" on
             its completion line.
+        tier_floors (bool): Keyword-only. The point's tier-floor setting (a
+            label, like band), handed to the re-simulation so a tier-off
+            point's ex-top run is named as a tier-off run.
         quiet (bool): Keyword-only. Log the re-simulation's completion line
             (and any premise WARNING) at DEBUG — the lazy size-cap runs.
         end_date (date | None): Keyword-only. The day the re-simulation's
@@ -6257,8 +6496,158 @@ def _ex_top_event(
     without = _simulate_at_discount(rest, start_date, initial_balance, k=point.k,
                                     spread_band=band, population=f"{population}/ex-top",
                                     **_sim_options(point.size_cap, quiet,
-                                                   end_date=end_date))
+                                                   end_date=end_date,
+                                                   tier_floors=tier_floors))
     return top, _total_return(without, initial_balance)
+
+
+def _entered_pairs(candidates: _Candidates, entries: list[dict]) -> list:
+    """
+    The time-series candidate pairs that produced one of these entries.
+
+    The rescan list of a band sweep's no-band pre-pass (the tier-on one, or
+    the tier-floors-off family's own — the subset holds per tier setting,
+    never across them): every band's accepted Mondays are a subset of the
+    no-band band's at the same tier setting (see _sweep_from_candidates),
+    so a pair that entered nowhere there can enter at no band of that
+    setting, and every other band of it rescans only what this returns.
+    Matched on the legs' TICKERS,
+    not on object identity: whatever _find_entry hands back (the legs it was
+    given, possibly swapped), the two tickers name the pair, and a ticker
+    pair can only ever OVER-include a pair here (a duplicate is rescanned,
+    never lost).
+
+    Args:
+        candidates (_Candidates): The sweep's candidates, before its pair
+            list is released.
+        entries (list[dict]): A pre-pass's _entries_for_band() output.
+
+    Returns:
+        list: The time-series items of candidates.all_pairs whose ticker pair
+            produced one of the entries, in all_pairs' order. A new list;
+            all_pairs is never mutated.
+    """
+    entered = {frozenset((rec["entry"]["mA"]["ticker"], rec["entry"]["mB"]["ticker"]))
+               for rec in entries}
+    return [item for item in candidates.all_pairs
+            if item[1] == "time_series"
+            and frozenset((item[0][0]["ticker"], item[0][1]["ticker"])) in entered]
+
+
+def _band_populations(
+    entries: list[dict],
+    split_date: date,
+) -> tuple[list[tuple[str, list[dict]]], dict[str, tuple[list[dict], list[dict]]]]:
+    """
+    Split one band's entries into its standalone populations and their halves.
+
+    The populations are k-independent subsets, so a band sweep splits them
+    once per band through _population_subsets — the ONE definition of the
+    split, on _is_ladder_pair, the same rule that labels each trade's
+    same_event_ladder, so a trade and the population it was simulated in
+    always agree, and a lazy CapSweep cell simulates exactly these subsets.
+    "time_series" is ladders + cross-event together, same-title excluded: the
+    population the band and k actually act on, and the one the dashboard's
+    heatmap and fragility banner read, so a same-title result (band- and
+    k-independent) can never dilute them. The two checked populations'
+    halves are split at the ONE split date.
+
+    Args:
+        entries (list[dict]): One band's entries — its time-series entries
+            then the shared same-title ones.
+        split_date (date): BacktestSweep.split_date.
+
+    Returns:
+        tuple: (populations, halves_by_population). populations is
+            [("time_series", ...), ("ladder", ...), ("cross", ...)], each an
+            ordered subset of entries (possibly empty — the caller skips an
+            empty one rather than simulating an empty scenario);
+            halves_by_population maps "all" and "time_series" to their
+            _split_halves at split_date.
+    """
+    # The one split CapSweep.cell also reads, so an eager band sweep cell and
+    # a lazy size-cap cell always simulate the same populations
+    populations = _population_subsets(entries)
+    ts_only = populations[0][1]
+
+    # Both checked populations' halves, at the ONE split date.
+    halves_by_population = {"all": _split_halves(entries, split_date),
+                            "time_series": _split_halves(ts_only, split_date)}
+    return populations, halves_by_population
+
+
+def _band_sweep_cell(
+    point: SweepPoint,
+    entries: list[dict],
+    populations: list[tuple[str, list[dict]]],
+    halves_by_population: dict[str, tuple[list[dict], list[dict]]],
+    start_date: date,
+    initial_balance: float,
+    point_k: float,
+    band: tuple[float, float],
+    *,
+    tier_floors: bool = True,
+) -> list[SweepPoint]:
+    """
+    Run one band x k cell's robustness checks and population simulations.
+
+    The two robustness checks are set on the "all" point itself (the primary
+    included — same object everywhere it is held) and on the "time_series"
+    point: the dashboard reads the latter's, and keeps the former's for its
+    own "All" row. Every other population gets a standalone simulation from
+    the initial balance, never a slice of the "all" run, so its return,
+    drawdown and Sharpe are defined. A population with no entry at this band
+    is skipped rather than simulated as an empty scenario.
+
+    Args:
+        point (SweepPoint): The cell's "all" point, already simulated.
+            MUTATED: its halves and ex_top_event are set here.
+        entries (list[dict]): The entries the "all" point was simulated from.
+        populations (list[tuple[str, list[dict]]]): _band_populations' first
+            element for this band.
+        halves_by_population (dict[str, tuple[list[dict], list[dict]]]):
+            _band_populations' second element for this band.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance every simulation here starts
+            from, in dollars.
+        point_k (float): The cell's resolved interval discount.
+        band (tuple[float, float]): The cell's resolved band (a label; the
+            entries already reflect it).
+        tier_floors (bool): Keyword-only. The cell's tier-floor setting (a
+            label; the entries already reflect it), handed to every
+            simulation here through _sim_options — so only an explicit False
+            is ever forwarded. The tier-on sweep never passes it.
+
+    Returns:
+        list[SweepPoint]: [point, *population points] — the order
+            BacktestSweep.scenarios has always held them in.
+    """
+    cell = [point]
+    point.halves = _half_split(halves_by_population["all"], start_date,
+                               initial_balance, point_k, band, population="all",
+                               tier_floors=tier_floors)
+    point.ex_top_event = _ex_top_event(point, entries, start_date,
+                                       initial_balance, band, population="all",
+                                       tier_floors=tier_floors)
+    for label, subset in populations:
+        if not subset:
+            continue
+        # tier_floors through _sim_options: forwarded only when False, so a
+        # tier-on cell calls the simulator with exactly its old keywords
+        pop_point = _simulate_at_discount(
+            subset, start_date, initial_balance, k=point_k,
+            spread_band=band, population=label,
+            **_sim_options(None, False, tier_floors=tier_floors),
+        )
+        if label in _CHECKED_POPULATIONS:
+            pop_point.halves = _half_split(
+                halves_by_population[label], start_date, initial_balance,
+                point_k, band, population=label, tier_floors=tier_floors)
+            pop_point.ex_top_event = _ex_top_event(
+                pop_point, subset, start_date, initial_balance, band,
+                population=label, tier_floors=tier_floors)
+        cell.append(pop_point)
+    return cell
 
 
 def _sweep_from_candidates(
@@ -6269,6 +6658,7 @@ def _sweep_from_candidates(
     sweep: bool,
     spread_band: tuple[float, float] | None,
     band_sweep: bool,
+    tier_off_sweep: bool = False,
     cap_sweep: bool = False,
 ) -> BacktestSweep:
     """
@@ -6321,13 +6711,49 @@ def _sweep_from_candidates(
     the band-source line), with the band and population on each completion
     line.
 
-    With cap_sweep, every point above is recorded as the eager seed of its
-    (band, k, population) as it is simulated — the "all" point before the
-    band-sweep-only work, so a single-band run records its points too — and
-    a CapSweep over the same entries is returned on BacktestSweep.cap_sweep.
-    It simulates NOTHING here: every other size cap is simulated only when a
-    reader asks for a cell, so this function's cost and every point it
-    returns are unchanged by the flag.
+    The tier-off family (tier_off_sweep, backtest-only; a band sweep is
+    required) runs every band where a deadline-gap tier floor binds
+    (_tier_floors_bind — on the shipped grid the 18 bands with a floor below
+    0.30) a second time with the tiers not applied, so that band's floor
+    alone gates the spread and sets the leg-price-sum ceiling (1 − floor).
+    In Phase 1, after the tier-on band loop and before the candles are
+    released, it runs its own no-band pre-pass at (0, 1) with the tiers off
+    and rescans only the pairs that entered there at every other binding
+    band (17 of them on the shipped grid) — the pre-pass argument holds
+    unchanged, since with the tiers off the threshold is the floor alone,
+    which still only rises from the no-band band's 0.0, the ceiling still
+    only drops, and the refusal of a spread that is not strictly positive
+    reads no band. The tier-ON pre-pass cannot serve here: a pair the tiers
+    refuse everywhere can still enter with them off. In Phase 2, after
+    the same-title point, every binding band gets its own tier-off
+    calibration (labelled with the floor alone) and, at every k of the same
+    grid, the same scenario block as the tier-on sweep (_band_sweep_cell:
+    populations, halves at the ONE split date, the excluding-top-event
+    check), returned as BacktestSweep.tier_off_scenarios and
+    tier_off_calibrations_by_band. A band whose floor sits at or above both
+    tiers enters the same pairs on the same Mondays either way, so it is
+    neither entered nor simulated twice. The tier-on payload — primary,
+    points, scenarios, every calibration, same_title_point, split_date — is
+    exactly what the run returns without it. Its announcement lines begin
+    "Tier floors off", never "Spread band " or "Split-half check: split
+    date"; its simulations' completion lines carry " with the tier floors
+    off" after the band, and a premise-violation WARNING from one of them
+    ends " [tier floors off]".
+
+    With cap_sweep, every TIER-ON point simulated above (never a
+    tier_off_scenarios point) is recorded as the eager seed of its (band, k,
+    population) as it is simulated — the "all" point before the
+    band-sweep-only work, so a single-band run records its points too, then
+    each population point of _band_sweep_cell, and the same-title point —
+    and a CapSweep over the same entries is returned on
+    BacktestSweep.cap_sweep. It simulates NOTHING here: every other size cap
+    is simulated only when a reader asks for a cell, so this function's cost
+    and every point it returns are unchanged by the flag. Its seeds are
+    TIER-ON points only: a tier-off point (tier_floors False) is never
+    recorded as one, because
+    the CapSweep's entries are the tier-on entries_by_band and a tier-off
+    seed would stand in for a simulation of different entries — the
+    tier-off family is simulated at the run's own cap alone.
 
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
@@ -6351,10 +6777,16 @@ def _sweep_from_candidates(
             (unioned with the primary band) and compute the population,
             split-half and concentration scenarios; when False, the primary
             band alone and none of those.
+        tier_off_sweep (bool): When True (a band sweep required), also run
+            the tier-off family described above. False (default) runs none
+            of it: tier_off_scenarios is [] and tier_off_calibrations_by_band
+            is {}.
         cap_sweep (bool): When True, return a lazy CapSweep over
             SIZE_CAP_SWEEP (unioned with the run's own cap) on
-            BacktestSweep.cap_sweep, seeded from every point simulated here
-            and keeping entries_by_band alive for it; its cells carry the
+            BacktestSweep.cap_sweep, seeded from every TIER-ON point
+            simulated here (the primary, each swept k, each band-sweep
+            scenario and the same-title point; never a tier_off_scenarios
+            point) and keeping entries_by_band alive for it; its cells carry the
             populations and checks this run computed (all four populations
             and the checks with band_sweep, "all" alone without). False
             (default) returns cap_sweep=None.
@@ -6364,15 +6796,24 @@ def _sweep_from_candidates(
             calibration (the primary band's), label_coverage (carried from
             candidates), scenarios, same_title_point, calibrations_by_band,
             same_event_ladders (resolved), split_date, corpus_provenance
-            (carried from candidates) and cap_sweep — see BacktestSweep.
+            (carried from candidates), config_same_event_ladders (the
+            configured switch, read beside same_event_ladders's
+            resolution), tier_off_scenarios, tier_off_calibrations_by_band
+            and cap_sweep — see BacktestSweep.
 
     Raises:
-        ValueError: From config.time_series_spread_band, if spread_band is not
-            a valid band.
+        ValueError: If tier_off_sweep is set without band_sweep (the tier-off
+            family is a band-sweep family: its split date, rescans and cells
+            are the band sweep's), checked before anything else runs; or,
+            from config.time_series_spread_band, if spread_band is not a
+            valid band.
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
     """
+    if tier_off_sweep and not band_sweep:
+        raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
+                         "re-runs the band sweep's binding bands")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
     # The ladder setting this sweep's pairs were extracted under, resolved the
@@ -6380,6 +6821,9 @@ def _sweep_from_candidates(
     # candidates (see _Candidates for when those can disagree), for the report.
     ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS if candidates.same_event_ladders is None
                    else candidates.same_event_ladders)
+    # The configured switch this run is judged against — read beside the
+    # resolution above so one pass reads both (see BacktestSweep.config_same_event_ladders).
+    config_ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS)
     if band_sweep:
         # Each grid band through config.time_series_spread_band, so it is
         # validated and normalised exactly like the primary and a grid band
@@ -6408,8 +6852,9 @@ def _sweep_from_candidates(
     #   * the spread ceiling only drops (1.0, the no-band ceiling, never fires:
     #     both YES asks are banded into [0.01, 0.99]);
     #   * everything else — the leg order, the deadline gap and its cap, the
-    #     horizon, the candle lookups, the live-quote checks and the fee check
-    #     — never reads the band.
+    #     horizon, the candle lookups, the refusal of a spread that is not
+    #     strictly positive, the live-quote checks and the fee check — never
+    #     reads the band.
     # Float arithmetic keeps each comparison monotone in the threshold, so no
     # float edge can admit at a band what no band refused. A pair that
     # produced NO entry at (0.0, 1.0) therefore produces none at any band, and
@@ -6426,16 +6871,10 @@ def _sweep_from_candidates(
         logging.info("No-band pre-pass: scanning all %d time-series pairs at %s",
                      n_ts_pairs, _band_label(no_band))
         no_band_entries = _entries_for_band(candidates, no_band, pair_types=("time_series",))
-        # Matched on the legs' TICKERS, not on object identity: whatever
-        # _find_entry hands back (the legs it was given, possibly swapped),
-        # the two tickers name the pair, and a ticker pair can only ever
-        # OVER-include a pair here (a duplicate is rescanned, never lost).
-        entered = {frozenset((rec["entry"]["mA"]["ticker"], rec["entry"]["mB"]["ticker"]))
-                   for rec in no_band_entries}
-        # A new list — candidates.all_pairs itself is never mutated.
-        rescan = [item for item in candidates.all_pairs
-                  if item[1] == "time_series"
-                  and frozenset((item[0][0]["ticker"], item[0][1]["ticker"])) in entered]
+        # The pairs that entered at the no-band band, matched on the legs'
+        # TICKERS (a duplicate is rescanned, never lost) — a new list;
+        # candidates.all_pairs itself is never mutated.
+        rescan = _entered_pairs(candidates, no_band_entries)
         logging.info(
             "No-band pre-pass: %d of %d time-series pairs produced an entry; every "
             "other band rescans only those", len(rescan), n_ts_pairs)
@@ -6467,17 +6906,58 @@ def _sweep_from_candidates(
         else:
             # A single-band run keeps the pre-band wording byte-for-byte.
             logging.info("Prepared %d candidate entries for sizing", len(entries_by_band[band]))
+
+    # ── Tier floors off (tier_off_sweep): the bands where a deadline-gap tier
+    # binds, entered again with the tiers not applied. A band whose floor is
+    # at or above both tiers enters the same pairs on the same Mondays either
+    # way (_tier_floors_bind), so it is not entered twice; the dashboard reuses
+    # its tier-on run. The pre-pass argument above holds unchanged with the
+    # tiers off — the threshold is the floor alone, which still only rises from
+    # the no-band band's 0.0, and the ceiling still only drops — so the tier-off
+    # no-band band's entries bound every tier-off band's. They need a pre-pass
+    # of their OWN: the tier-on one cannot serve, since a pair the tiers refuse
+    # at every band can still enter with them off (off_rescan, never rescan).
+    tier_off_bands = [band for band in bands if _tier_floors_bind(band)] if tier_off_sweep else []
+    tier_off_entries: dict[tuple[float, float], list[dict]] = {}
+    off_rescan = off_no_band_entries = None
+    if tier_off_bands:
+        logging.info(
+            "Tier floors off (backtest only): %d of %d spread bands have a floor below a "
+            "deadline-gap tier and are entered again without the tiers; the other %d enter "
+            "the same pairs either way", len(tier_off_bands), len(bands),
+            len(bands) - len(tier_off_bands))
+        logging.info("Tier floors off: no-band pre-pass: scanning all %d time-series pairs at %s",
+                     n_ts_pairs, _band_label(no_band))
+        # The one full tier-off scan, at (0, 1): with the tiers off its
+        # threshold is 0.0, no higher than any other band's floor
+        off_no_band_entries = _entries_for_band(candidates, no_band, pair_types=("time_series",),
+                                                tier_floors=False)
+        off_rescan = _entered_pairs(candidates, off_no_band_entries)
+        logging.info("Tier floors off: no-band pre-pass: %d of %d time-series pairs produced an "
+                     "entry; every other tier-off band rescans only those",
+                     len(off_rescan), n_ts_pairs)
+        for i, band in enumerate(tier_off_bands, start=1):
+            logging.info("Tier floors off: spread band %d/%d: %s", i, len(tier_off_bands),
+                         _band_label(band))
+            ts_entries = (off_no_band_entries if band == no_band
+                          else _entries_for_band(candidates, band, pair_types=("time_series",),
+                                                 tier_floors=False, _pairs=off_rescan))
+            # The same-title entries never read the tiers: shared, as above
+            tier_off_entries[band] = ts_entries + st_entries
+            logging.info("Tier floors off: prepared %d candidate entries for sizing "
+                         "(%d time-series, %d same-title)", len(tier_off_entries[band]),
+                         len(ts_entries), len(st_entries))
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the old
     # single-band path (whose pair list died with _prepare_entries' locals),
     # holds no pair tuple through the simulations: the entry dicts carry the
     # market records they need (mA/mB) and never a candle. Only the scalar
     # fields — label_coverage, start_date, same_event_ladders,
-    # corpus_provenance — are read after this point. The pre-pass's rescan
-    # list is a list of pair tuples too, so it goes with them (its entries
-    # already live on in entries_by_band).
+    # corpus_provenance — are read after this point. The pre-passes' rescan
+    # lists are lists of pair tuples too, so they go with them (their entries
+    # already live on in entries_by_band and tier_off_entries).
     del candidates.candles_by_ticker, candidates.all_pairs
-    del rescan, no_band_entries
+    del rescan, no_band_entries, off_rescan, off_no_band_entries
 
     # ── Phase 2: simulations ───────────────────────────────────────────────
     primary_entries = entries_by_band[primary_band]
@@ -6569,22 +7049,12 @@ def _sweep_from_candidates(
         )
         if band_sweep:
             # Standalone populations, split once per band (they are
-            # k-independent subsets) on _is_ladder_pair — the same rule that
-            # labels each trade's same_event_ladder, so a trade and the
-            # population it was simulated in always agree. "time_series" is
-            # ladders + cross-event together, same-title excluded: the
-            # population the band and k actually act on, and the one the
-            # dashboard's heatmap and fragility banner read, so a same-title
-            # result (band- and k-independent) can never dilute them. A
-            # population with no entry at this band is skipped rather than
-            # simulated as an empty scenario. _population_subsets is the one
-            # definition, shared with CapSweep.cell.
-            populations = _population_subsets(entries)
-            ts_only = populations[0][1]
-
-            # Both checked populations' halves, at the ONE split date.
-            halves_by_population = {"all": _split_halves(entries, split_date),
-                                    "time_series": _split_halves(ts_only, split_date)}
+            # k-independent subsets) through _population_subsets — the one
+            # definition, shared with CapSweep.cell — and both checked
+            # populations' halves at the ONE split date. A population with no
+            # entry at this band is skipped rather than simulated as an empty
+            # scenario.
+            populations, halves_by_population = _band_populations(entries, split_date)
             if len(bands) > 1:
                 logging.info("Simulating spread band %d/%d: %s%s (%d entries)",
                              bi, len(bands), _band_label(band),
@@ -6615,32 +7085,19 @@ def _sweep_from_candidates(
             if not band_sweep:
                 continue
 
-            scenarios.append(point)
-            # The two robustness checks, set on the "all" point itself (the
-            # primary included — same object everywhere it is held) and, below,
-            # on the "time_series" point: the dashboard reads the latter's,
-            # and keeps the former's for its own "All" row.
-            point.halves = _half_split(halves_by_population["all"], start_date,
-                                       initial_balance, point_k, band, population="all")
-            point.ex_top_event = _ex_top_event(point, entries, start_date,
-                                               initial_balance, band, population="all")
-            for label, subset in populations:
-                if not subset:
-                    continue
-                pop_point = _simulate_at_discount(
-                    subset, start_date, initial_balance, k=point_k,
-                    spread_band=band, population=label,
-                )
-                if label in _CHECKED_POPULATIONS:
-                    pop_point.halves = _half_split(
-                        halves_by_population[label], start_date, initial_balance,
-                        point_k, band, population=label)
-                    pop_point.ex_top_event = _ex_top_event(
-                        pop_point, subset, start_date, initial_balance, band,
-                        population=label)
-                scenarios.append(pop_point)
-                if cap_sweep:
-                    eager[(band, point_k, label)] = pop_point
+            # The robustness checks on the "all" point (the primary included —
+            # same object everywhere it is held), then its population
+            # simulations with theirs: [point, *population points], the
+            # order scenarios has always held them in
+            cell = _band_sweep_cell(
+                point, entries, populations, halves_by_population, start_date,
+                initial_balance, point_k, band)
+            scenarios.extend(cell)
+            if cap_sweep:
+                # Each population point is its (band, k, population) cell's
+                # size-cap seed; cell[0] is the "all" point, recorded above
+                for pop_point in cell[1:]:
+                    eager[(band, point_k, pop_point.population)] = pop_point
 
     same_title_point = None
     if band_sweep and st_entries:
@@ -6653,12 +7110,38 @@ def _sweep_from_candidates(
             spread_band=None, population="same_title",
         )
 
+    # ── Tier floors off: every binding band at every k of the SAME grid, the
+    # same scenario block as above — populations, halves at the ONE split date,
+    # the excluding-top-event check — so the dashboard can swap a tier-off cell
+    # in for a tier-on one like for like.
+    tier_off_scenarios: list[SweepPoint] = []
+    tier_off_calibrations: dict[tuple[float, float], IntervalCalibration | None] = {}
+    for bi, band in enumerate(tier_off_bands, start=1):
+        entries = tier_off_entries[band]
+        # Labelled with the floor alone: the only floor these entries cleared
+        tier_off_calibrations[band] = _interval_calibration(entries, spread_min=band[0],
+                                                            tier_floors=False)
+        populations, halves_by_population = _band_populations(entries, split_date)
+        logging.info("Tier floors off: simulating spread band %d/%d: %s (%d entries)",
+                     bi, len(tier_off_bands), _band_label(band), len(entries))
+        for point_k in grid:
+            point = _simulate_at_discount(entries, start_date, initial_balance, k=point_k,
+                                          spread_band=band, population="all", tier_floors=False)
+            # Never recorded in eager: the CapSweep below re-simulates the
+            # TIER-ON entries_by_band, so a tier-off seed would stand in for
+            # a simulation of different entries. The tier-off family exists
+            # at the run's own cap only.
+            tier_off_scenarios.extend(_band_sweep_cell(
+                point, entries, populations, halves_by_population, start_date,
+                initial_balance, point_k, band, tier_floors=False))
+
     capped = None
     if cap_sweep:
         # Every other cap, simulated only when a reader asks for a cell. The
         # run's own cap (every point above carries it, resolved at simulation
         # time) is unioned in, as the k grid unions its primary, so the eager
-        # points are always exact members.
+        # points are always exact members. Built after the tier-off family
+        # and over the tier-on entries and seeds alone.
         caps = tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
         capped = CapSweep(caps=caps, primary_cap=primary.size_cap, bands=tuple(bands),
                           ks=tuple(grid), primary_k=effective_k, start_date=start_date,
@@ -6682,6 +7165,9 @@ def _sweep_from_candidates(
         # One fact about the one corpus, like label_coverage: the header's
         # corpus line and post-cutoff banner read it (DR-13, M2)
         corpus_provenance=candidates.corpus_provenance,
+        config_same_event_ladders=config_ladders,
+        tier_off_scenarios=tier_off_scenarios,
+        tier_off_calibrations_by_band=tier_off_calibrations,
         cap_sweep=capped,
     )
 
@@ -6698,6 +7184,7 @@ def run_backtest_sweep(
     same_event_ladders: bool | None = None,
     spread_band: tuple[float, float] | None = None,
     band_sweep: bool = False,
+    tier_off_sweep: bool = False,
     cap_sweep: bool = False,
 ) -> BacktestSweep:
     """
@@ -6738,10 +7225,24 @@ def run_backtest_sweep(
     scenarios), never a re-simulated copy. The primary band is likewise
     unioned into the band grid.
 
+    With tier_off_sweep (a band sweep required) every band where a
+    deadline-gap tier floor binds — on the shipped grid the 18 bands with a
+    floor below 0.30 — is entered and simulated a second time with the tiers
+    not applied: that band's floor alone gates pB − pA (which must still be
+    strictly positive) and sets the leg-price-sum ceiling (1 − floor), and
+    nothing else moves (the 30-day gap cap, the band ceiling, the live-quote
+    and fee checks, the Kelly gate, ladders, same-title pairs and the primary
+    scenario). The family comes
+    back as BacktestSweep.tier_off_scenarios and
+    tier_off_calibrations_by_band — backtest-only reporting data, like the
+    band sweep's own — and leaves every tier-on figure exactly as it is
+    without it. It is opt-in here (False by default, the band_sweep
+    pattern); backtest.py turns it on together with the band sweep.
+
     This function never writes config.py. The calibration it reports is a
     recommendation for a human to act on, live sizing keeps reading
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here,
-    and no live module reads a spread band at all.
+    and no live module reads a spread band or the tier-floor switch at all.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -6775,7 +7276,10 @@ def run_backtest_sweep(
             priced, and therefore applies identically to every scenario.
             Like --interval-discount, it never reaches live sizing: nothing
             here writes config.py. Its resolved value is recorded on
-            BacktestSweep.same_event_ladders.
+            BacktestSweep.same_event_ladders, alongside the configured switch
+            itself (BacktestSweep.config_same_event_ladders) — the ladder log
+            line below names whether this run's resolved value replays that
+            switch or departs from it.
         spread_band (tuple[float, float] | None): The primary scenario's
             BACKTEST-only time-series spread band (floor, ceiling) on pB − pA.
             None (default) resolves config.BACKTEST_DEFAULT_SPREAD_BAND —
@@ -6786,6 +7290,11 @@ def run_backtest_sweep(
             grid and compute BacktestSweep.scenarios, same_title_point,
             split_date and every band's calibration. False (default) keeps
             this the single-band k sweep it always was.
+        tier_off_sweep (bool): When True (band_sweep required), also compute
+            the tier-off family above — BacktestSweep.tier_off_scenarios and
+            tier_off_calibrations_by_band. False (default) computes none of
+            it. Validated at the TOP of this function, beside the band,
+            before anything is logged or fetched.
         cap_sweep (bool): When True, also return BacktestSweep.cap_sweep — a
             lazy CapSweep over SIZE_CAP_SWEEP (the per-trade Kelly size caps
             5%..95% and no cap) that simulates each other cap only when a
@@ -6803,12 +7312,15 @@ def run_backtest_sweep(
             outcome-label census, None when the feasibility short-circuit
             skipped the fetch), and the band-sweep payload — scenarios,
             same_title_point, calibrations_by_band, split_date — plus the
-            resolved same_event_ladders, the corpus's provenance, None when
-            not recorded, and the lazy cap_sweep, None unless cap_sweep (see
-            BacktestSweep).
+            resolved same_event_ladders, the configured switch it is judged
+            against (config_same_event_ladders), the corpus's provenance,
+            None when not recorded, the tier-off family, empty unless
+            tier_off_sweep, and the lazy cap_sweep, None unless cap_sweep
+            (see BacktestSweep).
 
     Raises:
-        ValueError: From config.time_series_spread_band, before any fetch, if
+        ValueError: Before any fetch or log line, if tier_off_sweep is set
+            without band_sweep; or, from config.time_series_spread_band, if
             spread_band is not a valid band (0 <= floor < ceiling <= 1).
         TypeError: From config.time_series_spread_band, before any fetch, if
             spread_band is not a pair of numbers.
@@ -6824,13 +7336,20 @@ def run_backtest_sweep(
         call every other point comes from, over an empty entry list, so its
         shape, its resolved k and its band stamp cannot drift from a real
         one), calibration=None, label_coverage=None, scenarios=[],
-        calibrations_by_band={} and the resolved same_event_ladders. Callers
-        therefore need no special case for that path.
+        calibrations_by_band={}, an empty tier-off family and the resolved
+        same_event_ladders, with the configured switch
+        (config_same_event_ladders) still recorded. Callers therefore need
+        no special case for that path.
     """
     # Resolved and validated FIRST — before anything is logged or fetched: an
     # invalid band is a caller bug, and it must surface in milliseconds, not
     # after a multi-hour fetch. config owns the default and the rule.
     primary_band = time_series_spread_band(spread_band)
+    # The same for the tier-off family, a band-sweep family: without the band
+    # sweep there is no grid, split date or rescan for it to re-run
+    if tier_off_sweep and not band_sweep:
+        raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
+                         "re-runs the band sweep's binding bands")
 
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -6843,11 +7362,20 @@ def run_backtest_sweep(
     # so there is exactly one resolution that the run actually depends on.
     ladders = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
                else same_event_ladders)
+    # ... and judged against the switch this checkout's live finder runs with:
+    # an override the other way does not replay that rule, and the line says so.
+    config_ladders = bool(TIME_SERIES_SAME_EVENT_LADDERS)
+    if same_event_ladders is None:
+        source = "config.TIME_SERIES_SAME_EVENT_LADDERS"
+    elif bool(ladders) == config_ladders:
+        source = "run-level override, same as this checkout's config"
+    else:
+        source = ("run-level override; config.TIME_SERIES_SAME_EVENT_LADDERS is "
+                  f"{'on' if config_ladders else 'off'} in this "
+                  "checkout, so this run does not replay its live rule")
     logging.info(
         "Same-event deadline ladders (DR-73): %s (%s)",
-        "on" if ladders else "off",
-        "config.TIME_SERIES_SAME_EVENT_LADDERS" if same_event_ladders is None
-        else "run-level override",
+        "on" if ladders else "off", source,
     )
     # The same idiom for the band: the resolved value and where it came from,
     # so a report can never be read as the default band when it was not.
@@ -6895,7 +7423,8 @@ def run_backtest_sweep(
                              label_coverage=None, scenarios=[],
                              calibrations_by_band={},
                              same_event_ladders=bool(ladders),
-                             corpus_provenance=None)
+                             corpus_provenance=None,
+                             config_same_event_ladders=config_ladders)
 
     # Every entry pass and every simulation. It deletes the candle series and
     # the pair list itself once the last entry pass is done (before any
@@ -6903,7 +7432,8 @@ def run_backtest_sweep(
     return _sweep_from_candidates(
         candidates, initial_balance,
         interval_discount=interval_discount, sweep=sweep,
-        spread_band=primary_band, band_sweep=band_sweep, cap_sweep=cap_sweep,
+        spread_band=primary_band, band_sweep=band_sweep,
+        tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
     )
 
 

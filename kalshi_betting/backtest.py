@@ -27,7 +27,7 @@ Dependencies:
     returns-by-category labels) from historical.py. Imports from config.py:
     PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
-    (the pre-fetch echo), the deadline-gap tier constants
+    (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
     MAX_DEADLINE_GAP_DAYS and PRICE_EPSILON (the spread-band tier WARNING),
     and the backtest band helpers time_series_spread_band and
@@ -52,19 +52,27 @@ Notes:
     reaches the live finder — scanner.py binds that constant at import. Unlike
     k, it changes WHICH PAIRS EXIST rather than how they are priced, so it
     applies identically to every swept discount and a run with it on is not
-    comparable to a baseline taken without it. It is the way to measure the
-    ladder strategy the switch gates before flipping the switch.
+    comparable to a baseline taken without it. The switch is on by the
+    operator's 2026-09-26 decision, so a default run pairs ladders and
+    --no-same-event-ladders replays the rule as it stood before it.
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
     header: dashboard._run_settings_html(sweep) prints "same-event ladders:
-    on / off / not recorded" (BacktestSweep.same_event_ladders) beside the
+    on / off / not recorded" (BacktestSweep.same_event_ladders), a recorded
+    on/off followed by its reading against the configured switch, beside the
     primary spread band, under the "Period:" line, above every section — so a
     ladder-enabled run's dashboard is no longer indistinguishable from a
     switch-off one and needs no hand labelling. Unlike DR-66b's
     subtitle-coverage caveat, this setting is chosen by the operator on the
     command line rather than discovered by the run, which is why it is named
-    rather than banner-flagged.
+    rather than banner-flagged. When a run's resolved setting departs from
+    the switch this checkout's config sets, all three places say so: the
+    echo below appends " (config: on|off)" from this module's binding,
+    run_backtest_sweep's own ladder line names the departure in its source
+    clause from backtester's, and the header reads backtester's binding
+    through BacktestSweep.config_same_event_ladders beside
+    same_event_ladders.
 
     --spread-min/--spread-max set the PRIMARY scenario's backtest-only
     time-series spread band (floor, ceiling) on pB - pA. Once
@@ -87,9 +95,16 @@ Notes:
     logged after logging is configured. The band sweep is ON by default, so
     a default run also simulates every band of the
     config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS grid (no
-    grid ceiling sits at or below either tier); --no-band-sweep skips that
-    grid (band_sweep=False): the primary scenario still runs, but the
-    dashboard's scenario explorer has no scenarios to show.
+    grid ceiling sits at or below either tier) — and, with it, every band
+    whose floor sits below a deadline-gap tier a second time with the tier
+    floors off (tier_off_sweep=band_sweep: the band's floor alone gates the
+    spread and sets the leg-price-sum ceiling, 1 − floor, backtest only);
+    --no-band-sweep skips that grid and those
+    tier-floors-off runs (band_sweep=False, tier_off_sweep=False): the
+    primary scenario still runs, but the dashboard's scenario explorer has no
+    scenarios to show, and its filter bar offers the primary band only, with
+    the Tier floors select disabled. There is no separate flag for the
+    tier-off runs.
 
     The per-trade size-cap sweep is ON by default too (cap_sweep=True): the
     result carries a lazy backtester.CapSweep over backtester.SIZE_CAP_SWEEP
@@ -98,11 +113,12 @@ Notes:
     the summary block included, is sized at the run's own cap,
     config.BUDGET_FRACTION. The dashboard reads every cell as it is built,
     for its filter bar's Size cap select, the Interval Discount section and
-    the scenario explorer's cap axis. --no-cap-sweep returns
-    cap_sweep=None, and the dashboard then offers the run's own cap only — a
-    far smaller page, built far faster. Like the band and k sweeps it is
-    backtest-only: live sizing reads config.BUDGET_FRACTION and nothing here
-    writes config.py.
+    the scenario explorer's cap axis. The CapSweep covers the tier-on grid
+    only; the tier-floors-off runs are sized at the run's own cap alone.
+    --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
+    run's own cap only — a far smaller page, built far faster. Like the band
+    and k sweeps it is backtest-only: live sizing reads
+    config.BUDGET_FRACTION and nothing here writes config.py.
 """
 import argparse
 import logging
@@ -230,12 +246,15 @@ def main() -> None:
     effective interval discount, the primary spread band and the run's own
     per-trade size cap — so a default run's summary block reads exactly as
     the plain run_backtest() path's did. The other swept discounts and bands
-    exist only for the dashboard's page-wide filter bar (whose k select the
-    Interval Discount section follows), its scenario explorer and the
-    calibration report, and the lazily simulated size caps
-    (result.cap_sweep) only for the dashboard, which reads every cell as the
-    page is built (its filter bar, Interval Discount section and scenario
-    explorer).
+    exist for the dashboard (its page-wide filter bar, whose k select the
+    Interval Discount section follows, its scenario explorer and k-hat
+    breakdown), the calibration report and max_trades_simulated's
+    post-cutoff check; the tier-floors-off family is read by that check and
+    by the dashboard's filter bar, k-hat breakdown and scenario explorer
+    (their Tier floors choice), carried to generate_dashboard on the sweep;
+    and the lazily simulated size caps (result.cap_sweep) only by the
+    dashboard, which reads every cell as the page is built (its filter bar,
+    Interval Discount section and scenario explorer).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -280,8 +299,9 @@ def main() -> None:
         "--same-event-ladders", action=argparse.BooleanOptionalAction, default=None,
         help="Pair two dated cumulative rungs of ONE event as a time-series "
              "ladder for this backtest (default: config."
-             "TIME_SERIES_SAME_EVENT_LADDERS). Affects the backtest only — the "
-             "live finder binds that constant at import.",
+             "TIME_SERIES_SAME_EVENT_LADDERS, currently "
+             f"{'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'}). Affects the "
+             "backtest only — the live finder binds that constant at import.",
     )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
@@ -305,8 +325,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-band-sweep", action="store_true",
-        help="Skip the spread-band grid; the dashboard's scenario explorer "
-             "is not computed",
+        help="Skip the spread-band grid (and its tier-floors-off runs); the "
+             "dashboard's scenario explorer is not computed, and its filter "
+             "bar offers the primary band only, with the Tier floors select "
+             "disabled",
     )
     parser.add_argument(
         "--no-cap-sweep", action="store_true",
@@ -403,6 +425,11 @@ def main() -> None:
     # the wrong way round.
     effective_ladders = (TIME_SERIES_SAME_EVENT_LADDERS if args.same_event_ladders is None
                          else args.same_event_ladders)
+    # Named against the config when the run departs from it, so the line read
+    # before a multi-hour fetch says the run will not replay the live rule.
+    ladders_echo = "on" if effective_ladders else "off"
+    if bool(effective_ladders) != bool(TIME_SERIES_SAME_EVENT_LADDERS):
+        ladders_echo += f" (config: {'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -424,7 +451,7 @@ def main() -> None:
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
-        "on" if effective_ladders else "off", echo_floor, echo_ceiling,
+        ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
@@ -490,16 +517,24 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         spread_band=spread_band,
         band_sweep=band_sweep,
+        # The dashboard's "Tier floors: off" view: the band sweep's
+        # tier-bound bands simulated again with the tiers off (needs the grid)
+        tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweep (cap_sweep) unless --no-cap-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweep (cap_sweep) unless --no-cap-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
-    # existed. The remaining k points and the band-sweep payload are consumed
-    # only by the dashboard's filter bar (whose k select the Interval Discount
-    # section follows) and its scenario explorer, and the lazy size-cap sweep
-    # (result.cap_sweep, simulated only when a cell is read) only by the
-    # dashboard, whose one grid walk reads every cell as the page is built
-    # (filter bar, Interval Discount section and scenario explorer).
+    # existed. The remaining k points are read by the filter bar's k select
+    # (which the Interval Discount section follows), the band-sweep payload by
+    # the dashboard's scenario explorer, filter bar and k-hat breakdown, the
+    # tier-floors-off family by that filter bar, k-hat breakdown and scenario
+    # explorer too (their Tier floors choice), every kept point — the
+    # tier-floors-off family's included — by max_trades_simulated's
+    # post-cutoff check (_log_corpus_provenance below, and the dashboard's
+    # header), and the lazy size-cap sweep (result.cap_sweep, simulated only
+    # when a cell is read) only by the dashboard, whose one grid walk reads
+    # every cell as the page is built (filter bar, Interval Discount section
+    # and scenario explorer).
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -530,11 +565,13 @@ def main() -> None:
     # don't duplicate that line here, just point the user at the file.
     #
     # sweep carries the calibration and every swept point for the k
-    # selectors, the scenario explorer's band x k payload, the lazy size-cap
-    # sweep (cap_sweep, None under --no-cap-sweep — every cell of it is
-    # simulated here, in the page's one grid walk) and the
-    # header's run-settings line; interval_discount is the resolved k these
-    # trades were sized at, which the Risk section's Kelly scatter must price on
+    # selectors, the scenario explorer's band x k payload, the filter bar,
+    # the k-hat breakdown, both Tier floors views (the bar's and the
+    # explorer's, from its tier-floors-off family), the lazy size-cap sweep
+    # (cap_sweep, None under --no-cap-sweep — every cell of it is simulated
+    # here, in the page's one grid walk) and the header's run-settings line;
+    # interval_discount is the resolved k these trades were sized at, which
+    # the Risk section's Kelly scatter must price on
     #
     # series_categories files each trade under Kalshi's own series category and
     # tags for the Returns Decomposition breakdown: one cached read-only GET of

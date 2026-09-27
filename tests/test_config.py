@@ -1,7 +1,9 @@
 """Tests for config.py fee helpers, the time-series probability model, the
-leg-side tuples, and PROJECT_ROOT."""
+leg-side tuples, the deadline-gap tier (with the backtest's spread band and
+tier-floors switch), and PROJECT_ROOT."""
 import math
 import pathlib
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -360,6 +362,54 @@ class TestTimeSeriesSpreadBand:
         assert min(ceilings) > max(MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP)
 
 
+class TestTierFloorsOff:
+    """min_price_diff_for_gap's BACKTEST-only tier_floors keyword.
+
+    Only an explicit False drops the deadline-gap tier, leaving the band floor
+    alone — the rule the backtest's tier-floors-off family is simulated under.
+    Every existing call, the live path's included (which may pass no keyword
+    at all), keeps its value, its type and its very object.
+    """
+
+    def test_the_default_and_an_explicit_true_are_the_pre_band_tier(self):
+        # Every gap the live path can hand in (and some it cannot), by
+        # omission AND by an explicit True: the very same constant object
+        for g in range(-5, 400):
+            expected = _pre_band_tier(g)
+            for got in (min_price_diff_for_gap(g),
+                        min_price_diff_for_gap(g, tier_floors=True),
+                        min_price_diff_for_gap(g, spread_min=None, tier_floors=True)):
+                assert got is expected
+            # ... and a band floor still layers on the tier exactly as before
+            for floor in config.SPREAD_BAND_SWEEP_FLOORS:
+                assert min_price_diff_for_gap(g, spread_min=floor, tier_floors=True) == max(
+                    expected, floor)
+
+    def test_off_is_the_band_floor_alone(self):
+        # Every grid floor at every tier boundary: the floor itself, whether
+        # it sits below a tier (0, 0.20, 0.25) or above one — never the tier
+        for g in (0, SHORT_DEADLINE_GAP_DAYS, SHORT_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS):
+            for floor in config.SPREAD_BAND_SWEEP_FLOORS:
+                got = min_price_diff_for_gap(g, spread_min=floor, tier_floors=False)
+                assert got == floor and type(got) is float
+            # No floor at all is a 0.0 floor, as a float
+            got = min_price_diff_for_gap(g, tier_floors=False)
+            assert got == 0.0 and type(got) is float
+
+    @pytest.mark.parametrize("not_false", [None, 0, MagicMock()])
+    def test_only_false_drops_the_tier(self, not_false):
+        # A 20-day gap takes the 0.30 tier; a 0.20 floor sits below it. Any
+        # value but False itself falls back to the live rule.
+        assert min_price_diff_for_gap(20, spread_min=0.2, tier_floors=not_false) == (
+            MIN_PRICE_DIFF_LONG_GAP)
+        assert min_price_diff_for_gap(20, spread_min=0.2, tier_floors=False) == 0.2
+
+    def test_tier_floors_is_keyword_only(self):
+        # A third positional argument cannot throw the switch by accident
+        with pytest.raises(TypeError):
+            min_price_diff_for_gap(20, 0.2, False)
+
+
 class TestMaxAffordablePairs:
     """max_affordable_pairs is the single budget -> contracts definition shared
     by the scanner's depth cap and strategy.compute_trade's sizing. The upper-
@@ -443,13 +493,27 @@ class TestCreateNewOutput:
 
 
 class TestSameEventLadderSwitch:
-    """DR-73: same-event deadline ladders ship OFF.
+    """DR-73: same-event deadline ladders ship ON (operator decision,
+    2026-09-26; they shipped OFF with DR-73).
 
     The switch changes which pairs exist, and turning it on was measured to
     deploy 98% of a $10,000 balance into 6 trades at -31% market-implied EV
-    (see the constant's own comment). It must not be flipped by accident, and
-    a default flip must fail a test rather than reach a Monday prod run.
+    (see the constant's own comment). It must not change by accident in either
+    direction: a change to the shipped value must fail a test rather than
+    silently change what the next prod run trades.
     """
 
-    def test_same_event_ladders_ship_off(self):
-        assert config.TIME_SERIES_SAME_EVENT_LADDERS is False
+    def test_same_event_ladders_ship_on(self):
+        assert config.TIME_SERIES_SAME_EVENT_LADDERS is True
+
+    def test_every_module_binding_matches_the_config(self):
+        # scanner, backtester and backtest each bind the constant BY VALUE at
+        # import, and they are what actually run: the live finder, the
+        # backtest's pair extraction and entry, and the CLI echo. A stray
+        # re-binding in any of them would change what trades or what a
+        # backtest measures while the pin above stays green. Value-independent,
+        # so a change to the shipped value still fails only that pin.
+        from kalshi_betting import backtest, backtester, scanner
+        for module in (scanner, backtester, backtest):
+            assert module.TIME_SERIES_SAME_EVENT_LADDERS is \
+                config.TIME_SERIES_SAME_EVENT_LADDERS, module.__name__

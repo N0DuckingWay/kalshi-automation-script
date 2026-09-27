@@ -8,8 +8,13 @@
 // each script's own inflate / unpack is replaced by __inflate below), the
 // scripts themselves and a list of steps. It checks the scripts' own logic —
 // what they draw, write, load and enable for each choice — not a browser's
-// rendering or layout (Plotly.Plots.resize does nothing here). ES5 plus
-// Promise and Object.assign, which both runtimes have.
+// rendering or layout: Plotly.react redraws a chart, and Plotly.update,
+// restyle and relayout apply their changes to the chart's data and layout
+// the way Plotly does (restyle and update honouring their traces argument)
+// and are recorded apart from the redraws (an axis set to autorange keeps
+// its last range here, where Plotly would recompute it); Plotly.Plots.resize
+// does nothing here. ES5 plus Promise and Object.assign, which both runtimes
+// have.
 //
 // Strict mode (page.strict): getElementById returns null for an id the page
 // does not hold, as a browser's does, so a script that dereferences a missing
@@ -43,14 +48,22 @@ function __escape(text) {
 }
 
 function __element(id, tag) {
-  var el = {id: id, tagName: tag || 'div', style: {}, innerHTML: '', disabled: false,
+  var el = {id: id, tagName: tag || 'div', style: {}, disabled: false,
             parentElement: {style: {}}, data: null, layout: null, children: [],
-            _text: '', _listeners: {}};
+            _text: '', _html: '', _listeners: {}};
+  // A page element's markup is a plain backing field a script may set; a
+  // created element redefines it (createElement, below)
+  Object.defineProperty(el, 'innerHTML', {
+    configurable: true,
+    get: function() { return el._html; },
+    set: function(v) { el._html = String(v); }
+  });
   // As a browser's: setting textContent replaces the children and makes the
-  // markup the text, escaped
+  // markup the text, escaped — written to the backing field, so a created
+  // element (whose innerHTML setter throws) takes textContent too
   Object.defineProperty(el, 'textContent', {
     get: function() { return el._text; },
-    set: function(v) { el._text = String(v); el.children = []; el.innerHTML = __escape(v); }
+    set: function(v) { el._text = String(v); el.children = []; el._html = __escape(v); }
   });
   el.addEventListener = function(type, fn) {
     (el._listeners[type] = el._listeners[type] || []).push(fn);
@@ -108,10 +121,63 @@ var document = {
     }
     return __elements[id];
   },
-  createElement: function(tag) { return __element('', tag); }
+  createElement: function(tag) {
+    var el = __element('', tag);
+    // A browser serialises an element's text escaped (&, <, > and the
+    // no-break space), which is what the explorer's esc() reads back; the
+    // filter script never reads it. Neither script WRITES a created
+    // element's innerHTML — both write its textContent — and this stand-in
+    // could not parse one, so a write is an error rather than a silent no-op
+    Object.defineProperty(el, 'innerHTML', {
+      set: function() {
+        throw new Error('filter_harness: a script set a created element\'s innerHTML, '
+          + 'which this stand-in cannot parse (write its textContent)');
+      },
+      get: function() {
+        return el._text.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;').replace(/ /g, '&nbsp;');
+      }
+    });
+    return el;
+  }
 };
 
 function __target(gd) { return typeof gd === 'string' ? gd : gd.id; }
+// A chart named by its id, as Plotly accepts one, or the chart itself
+function __chart(gd) { return typeof gd === 'string' ? document.getElementById(gd) : gd; }
+// One Plotly attribute string ("title.text", "xaxis.autorange") set on an
+// object, as Plotly sets it
+function __assign(obj, path, value) {
+  var parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
+  for (var i = 0; i < parts.length - 1; i++) {
+    if (obj[parts[i]] === undefined || obj[parts[i]] === null) {
+      obj[parts[i]] = /^\d+$/.test(parts[i + 1]) ? [] : {};
+    }
+    obj = obj[parts[i]];
+  }
+  obj[parts[parts.length - 1]] = value;
+}
+// A restyle's changes, trace by trace, as Plotly applies them: to the traces
+// named (one index or an array of them), or every trace when none are; an
+// array value holds one entry per trace changed, in that order, cycling
+function __restyle(gd, update, traces) {
+  var data = gd.data || [];
+  var which = (traces === undefined || traces === null)
+    ? data.map(function(_, i) { return i; })
+    : (Array.isArray(traces) ? traces : [traces]);
+  which.forEach(function(ti, j) {
+    var trace = data[ti];
+    if (!trace) { return; }
+    Object.keys(update || {}).forEach(function(key) {
+      var v = update[key];
+      __assign(trace, key, Array.isArray(v) ? v[j % v.length] : v);
+    });
+  });
+}
+function __relayout(gd, update) {
+  gd.layout = gd.layout || {};
+  Object.keys(update || {}).forEach(function(key) { __assign(gd.layout, key, update[key]); });
+}
 
 var Plotly = {
   react: function(gd, data, layout) {
@@ -119,14 +185,24 @@ var Plotly = {
     gd.layout = layout;
     __reacts.push({id: gd.id, data: data, layout: layout});
   },
-  // Recorded apart from the redraws: an update or a restyle changes a chart
-  // in place, and a test reads them separately
+  // Recorded apart from the redraws: an update, a restyle or a relayout
+  // changes a chart in place — and here, as in Plotly, its data and layout —
+  // and a test reads them separately
   update: function(gd, dataUpdate, layoutUpdate, traces) {
     __updates.push({id: __target(gd), kind: 'update', data: dataUpdate,
                     layout: layoutUpdate, traces: traces});
+    gd = __chart(gd);
+    if (gd) { __restyle(gd, dataUpdate, traces); __relayout(gd, layoutUpdate); }
   },
   restyle: function(gd, update, traces) {
     __updates.push({id: __target(gd), kind: 'restyle', data: update, traces: traces});
+    gd = __chart(gd);
+    if (gd) { __restyle(gd, update, traces); }
+  },
+  relayout: function(gd, update) {
+    __updates.push({id: __target(gd), kind: 'relayout', layout: update});
+    gd = __chart(gd);
+    if (gd) { __relayout(gd, update); }
   },
   Plots: {resize: function() {}}
 };
@@ -150,8 +226,9 @@ function __inflate(el) {
   return Promise.resolve(JSON.parse(JSON.stringify(__BLOCKS[el.id])));
 }
 
-// The page as Python rendered it: its selects and the charts the script
-// redraws, and, in strict mode, which ids it holds at all
+// The page as Python rendered it: its selects, the charts the scripts drive,
+// the text of any element a test sets (page.texts) and, in strict mode
+// (page.strict), which ids it holds at all
 function __setup(page) {
   __STRICT = !!page.strict;
   (page.ids || []).forEach(function(id) { __IDS[id] = true; });
@@ -164,21 +241,27 @@ function __setup(page) {
     gd.layout = page.charts[id].layout;
     __elements[id] = gd;
   });
+  Object.keys(page.texts || {}).forEach(function(id) {
+    document.getElementById(id).textContent = page.texts[id];
+  });
 }
 
-// Everything the script has drawn since the last snapshot, and the state of
-// every element it has touched: its text, markup, display, heights and
-// colour, a select's value and options, and a table body's rows (each cell's
-// text, and each cell's font weight where the script set one)
+// Everything the scripts have drawn and changed since the last snapshot, and
+// the state of every element they have touched: its text, markup, display,
+// heights and colour, a select's value and options, a table body's rows
+// (each cell's text, and each cell's font weight where the script set one),
+// and a chart's layout copied as it stands now, since a later step can still
+// change it
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
-              colors: {}, selects: {}, rows: {}, weights: {},
+              colors: {}, selects: {}, rows: {}, weights: {}, layouts: {},
               pending: Object.keys(__PENDING)};
   __reacts = [];
   __updates = [];
   Object.keys(__elements).forEach(function(id) {
     var el = __elements[id];
+    if (el.layout) { snap.layouts[id] = JSON.parse(JSON.stringify(el.layout)); }
     if (el._text !== '') { snap.text[id] = el._text; }
     if (el.innerHTML !== '') { snap.html[id] = el.innerHTML; }
     if (el.style.display !== undefined) { snap.display[id] = el.style.display; }
@@ -206,9 +289,13 @@ function __snapshot() {
 // chunk are loaded), or a bounded number of ticks — and, when the explorer's
 // script runs too (__WAIT_EXPLORER), until the explorer's selects the page
 // holds are enabled as well (once its base block and primary cap's block are
-// unpacked)
+// unpacked; the explorer's Tier floors select only on a page that renders
+// it, which it enables with the others). The bar's Tier floors select
+// (flt-tier) is not among them: a run with no tier-floors-off view keeps it
+// disabled by design, and waiting on it would stall every such run.
 var __BAR = ['flt-band', 'flt-k', 'flt-cap', 'flt-cat', 'flt-tag'];
-var __EXPLORER = ['scn-band-select', 'scn-k-select', 'scn-cap-select', 'scn-metric'];
+var __EXPLORER = ['scn-band-select', 'scn-k-select', 'scn-cap-select', 'scn-metric',
+                  'scn-tier-select'];
 var __WAIT_EXPLORER = false;
 
 function __barEnabled() {
@@ -235,18 +322,19 @@ function __spin(ticks, next) {
   })();
 }
 
-// Steps: ["wait"] (above), ["settle"] (let every pending promise run — a
-// bounded number of microtask ticks), ["set", id, value], ["fire", id] (a
-// change event), ["zoom", id] (a reader zooming that chart's x axis),
-// ["hide", id] (a reader hiding its first trace from the legend), ["select",
-// id] (a reader box-selecting two of its first trace's points), ["repair",
-// id] (a damaged block reads again), ["resolve", id] / ["reject", id] (a
-// deferred block's waiting inflates finish, or fail as a damaged block's
-// would — after a settle, so every load already started has reached its
-// inflate, and followed by one; nothing waiting is an error), ["call", name,
-// args] (a page script's window function, called as another script would —
-// the filter's window.dashScenarioSelect call, with any labels), ["snap",
-// name]. Emits every snapshot, as JSON, once the steps are done.
+// Steps: ["wait"] (above; at once on a page with no bar), ["settle"] (let
+// every pending promise run — a bounded number of microtask ticks), ["set",
+// id, value], ["fire", id] (a change event), ["zoom", id] (a reader zooming
+// that chart's x axis), ["hide", id] (a reader hiding its first trace from
+// the legend), ["select", id] (a reader box-selecting two of its first
+// trace's points), ["repair", id] (a damaged block reads again), ["resolve",
+// id] / ["reject", id] (a deferred block's waiting inflates finish, or fail as
+// a damaged block's would — after a settle, so every load already started has
+// reached its inflate, and followed by one; nothing waiting is an error),
+// ["call", name, args] (a page script's window function, called as another
+// script would — the filter's window.dashScenarioSelect call, with any
+// labels), ["snap", name]. Emits every snapshot, as JSON, once the steps are
+// done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
