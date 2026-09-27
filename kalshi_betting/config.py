@@ -25,7 +25,9 @@ Notes:
     registered at demo.kalshi.co — the production API key will return 401 there.
 """
 import math
+import numbers
 import pathlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
@@ -65,6 +67,8 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # Hard cap on the Kelly fraction allocated to any single trade. Even if the
 # mathematical Kelly says to bet more, we never exceed 20% of the balance on one pair.
+# It must be a multiple of SIZE_CAP_STEP from 5% to 100%: live_settings()
+# validates it, as LiveSettings.size_cap, before any live run makes a request.
 BUDGET_FRACTION               = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
@@ -97,14 +101,16 @@ SHORT_DEADLINE_GAP_DAYS       = 15
 
 # The BACKTEST's default time-series spread band (floor, ceiling) on pB - pA —
 # (0.0, 1.0) is "no band": the floor is the deadline-gap tier alone and there
-# is no ceiling, i.e. exactly the rule the live finder applies. Read ONLY by
-# time_series_spread_band(). No module outside config, backtester, backtest
-# and dashboard may reference a band helper or band constant, import one of
-# those three modules, or hand min_price_diff_for_gap more than the gap
-# (pinned by tests/test_strategy.py::TestTimeSeriesKellyParity::
-# test_ast_live_path_reads_no_band). If a band is ever applied live, its live
-# constants (TIME_SERIES_MIN/MAX_SPREAD) must land in the same commit as live
-# ceiling enforcement, so a band can never go live half-wired.
+# is no ceiling. It is the backtest's primary band; the LIVE band is
+# TIME_SERIES_SPREAD_BAND below, a separate constant with its own ceiling
+# enforcement (the live-toggles block), which landed in one commit so a band
+# could never go live half-wired. Read ONLY by time_series_spread_band(). No
+# module outside config, backtester, backtest and dashboard may reference a
+# band helper or band constant, import one of those three modules, or call
+# min_price_diff_for_gap at all — the live path reaches the floor only through
+# live_time_series_floor (pinned by tests/test_strategy.py::
+# TestTimeSeriesKellyParity::
+# test_ast_live_path_reads_toggles_only_through_live_settings).
 BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 
 # Band grid for the backtest's band x k scenario sweep, crossed with
@@ -410,6 +416,53 @@ TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.75
 # total); the market fetch and candlestick fetch happen once regardless.
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
                            0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
+# ── Live trading toggles ──────────────────────────────────────────────────────
+#
+# The live time-series entry rule is these two constants. A live run resolves
+# them ONCE, together with TIME_SERIES_INTERVAL_PROB_DISCOUNT (k) and
+# BUDGET_FRACTION (the per-trade Kelly cap) above, through live_settings()
+# into one frozen LiveSettings. main.py hands that one object to the
+# time-series finder, to enrichment and to pre_execution_check, which hands it
+# to every validate_pair_price it runs. Its k and cap reach only enrichment's
+# affordability bound (max_kelly_fraction): strategy.compute_trade still
+# reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and BUDGET_FRACTION from this
+# module, which is the same value on every run main.py makes, since both come
+# from here. scheduler.py passes main.py no toggle flags (only --mode prod),
+# so a weekly run trades exactly what this file says.
+#
+# No live module reads these two constants directly, and every live call to a
+# function that takes a LiveSettings must hand it one explicitly; only a live
+# entry point handed none may resolve config.py's, once. Pinned by
+# tests/test_strategy.py::TestTimeSeriesKellyParity::
+# test_ast_live_path_reads_toggles_only_through_live_settings, so the rule can
+# never be applied at one site and read from config at another.
+
+# Whether the live time-series entry rule applies the deadline-gap tier floors
+# (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP).
+#   True  -> pB - pA must clear max(tier, band floor).
+#   False -> the band floor alone. pB - pA must still be strictly positive,
+#            because a pair with no in-between mass has nothing to dispute.
+# Either way, the entry floor also sets the order-book leg-price-sum ceiling to
+# 1 - floor, exactly as backtester._find_entry applies it. The backtest
+# dashboard's "Tier floors: off" view simulates this rule.
+TIME_SERIES_TIER_FLOORS = True
+
+# The live time-series spread band (floor, ceiling) on pB - pA. It is
+# validated like the backtest's band: 0 <= floor < ceiling <= 1. The floor is
+# layered on the tier (max(tier, floor)), or stands alone with the tier floors
+# off. A spread above the ceiling is refused three times:
+#   - at scan time, on the two YES asks;
+#   - in enrichment, on the top of the refreshed book;
+#   - before submission, on the top of a freshly fetched book.
+# (0.0, 1.0) means no band.
+TIME_SERIES_SPREAD_BAND = (0.0, 1.0)
+
+# The size caps' grid. BUDGET_FRACTION, read live as LiveSettings.size_cap,
+# must be a multiple of it from 5% to 100%, so every live cap is float-equal to
+# a cell of backtester.SIZE_CAP_SWEEP. It has the same value as
+# SAME_TITLE_MIN_PRICE_DIFF, but it is a different constant.
+SIZE_CAP_STEP = 0.05
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1282,44 +1335,39 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
     gap_days <= MAX_DEADLINE_GAP_DAYS — this helper only selects the tier and
     does not reject over-cap gaps itself.
 
-    spread_min is a BACKTEST-only band floor, layered ON TOP of the tier: the
-    result is max(tier, spread_min), so a floor at or below the tier is inert.
-    None — what every live caller passes, by omission — returns the tier alone
-    and reads no band value at all, so the live finder, enrichment and
-    validate_pair_price get exactly the object they got before this keyword
-    existed. The only live calls are scanner's three — the finder's floor,
-    _pair_max_sum (which validate_pair_price reaches through) and
-    enrichment's ref_yes-is-None fallback — and every call in a module
-    outside config, backtester, backtest and dashboard is pinned to one
-    positional argument by tests/test_strategy.py::TestTimeSeriesKellyParity::
-    test_ast_live_path_reads_no_band. This helper does not validate
-    spread_min: a caller that passes one resolves it through
+    spread_min is a band floor, layered ON TOP of the tier: the result is
+    max(tier, spread_min), so a floor at or below the tier is inert. None
+    returns the tier alone and reads no band value at all. The live path
+    passes a floor only through live_time_series_floor, with the run's
+    LiveSettings.spread_band floor — no live module calls this helper itself
+    (tests/test_strategy.py::TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_toggles_only_through_live_settings). This helper
+    does not validate spread_min: a caller that passes one resolves it through
     time_series_spread_band() first, which does — as backtester._find_entry,
-    the one caller that filters on it, does (backtester's other two,
+    the one backtest caller that filters on it, does (backtester's other two,
     _interval_calibration's labels and _tier_floors_bind, are handed bands
-    already resolved that way).
+    already resolved that way), and as LiveSettings does for the live band.
 
-    tier_floors is a second BACKTEST-only switch, and only an explicit False
-    throws it: the deadline-gap tier is then not applied at all and the
-    result is the band floor alone — spread_min, or 0.0 when there is none —
-    the rule the dashboard's "Tier floors: off" view is simulated under
-    (backtester._sweep_from_candidates' tier-off family). Anything but False,
-    the default every live caller gets by omission included, keeps the tier,
-    so a stray value can only fall back to the live rule. No live module can
-    pass it: test_ast_live_path_reads_no_band refuses any keyword argument to
-    this helper outside config, backtester, backtest and dashboard.
+    tier_floors is a second switch, and only an explicit False throws it: the
+    deadline-gap tier is then not applied at all and the result is the band
+    floor alone — spread_min, or 0.0 when there is none. It is the rule the
+    dashboard's "Tier floors: off" view is simulated under
+    (backtester._sweep_from_candidates' tier-off family), and the live rule
+    with LiveSettings.tier_floors False (live_time_series_floor hands the
+    setting on by keyword, exactly as _find_entry does). Anything but False
+    keeps the tier, so a stray value can only fall back to the tiered rule.
 
     Args:
         gap_days (int): Calendar days between the two legs' deadlines —
             their close_times for a cross-event pair, their stated deadlines
             for a same-event ladder. Range: 0..MAX_DEADLINE_GAP_DAYS
             (caller-enforced).
-        spread_min (float | None): Backtest-only band floor on pB - pA,
-            dollars in [0, 1) — the first element of a band resolved by
+        spread_min (float | None): Band floor on pB - pA, dollars in
+            [0, 1) — the first element of a band resolved by
             time_series_spread_band(). None (default) means "the tier alone".
-        tier_floors (bool): Keyword-only, BACKTEST-only. False drops the
-            deadline-gap tier and returns the band floor alone; anything else
-            (default True) applies it.
+        tier_floors (bool): Keyword-only. False drops the deadline-gap tier
+            and returns the band floor alone; anything else (default True)
+            applies it.
 
     Returns:
         float: The minimum required YES ask price difference (dollars, 0-1)
@@ -1331,7 +1379,7 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
     """
     if tier_floors is False:
         # The band floor alone, as a float even when there is no floor: the
-        # tier is not consulted at all (backtest-only; see above)
+        # tier is not consulted at all (see above)
         return 0.0 if spread_min is None else spread_min
     tier = (MIN_PRICE_DIFF_SHORT_GAP if gap_days <= SHORT_DEADLINE_GAP_DAYS
             else MIN_PRICE_DIFF_LONG_GAP)
@@ -1340,17 +1388,20 @@ def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
 
 def time_series_spread_band(band: tuple[float, float] | None = None) -> tuple[float, float]:
     """
-    Resolve and validate a backtest time-series spread band (floor, ceiling).
+    Resolve and validate a time-series spread band (floor, ceiling).
 
     The band bounds the YES-ask spread pB - pA at which
     backtester._find_entry may enter a time-series candidate: its floor is
     layered on the deadline-gap tier through min_price_diff_for_gap's
     spread_min (so it also sets that pass's leg-price-sum ceiling, 1 minus
     the raised floor), and its ceiling is tested per Monday by
-    time_series_spread_too_wide. It is a BACKTEST knob —
-    no module outside config, backtester, backtest and dashboard may call
-    this function (pinned by tests/test_strategy.py::
-    TestTimeSeriesKellyParity::test_ast_live_path_reads_no_band).
+    time_series_spread_too_wide. It validates the backtest's bands and
+    LiveSettings.spread_band, the live band (LiveSettings.__post_init__
+    calls it) — and no module outside config, backtester, backtest and
+    dashboard may call it (pinned by tests/test_strategy.py::
+    TestTimeSeriesKellyParity::
+    test_ast_live_path_reads_toggles_only_through_live_settings): the live
+    path reaches the validated band only through its LiveSettings.
 
     Validation is deliberately TIER-AGNOSTIC: it guarantees floor < ceiling,
     not a non-empty EFFECTIVE band. The effective floor is max(tier, floor)
@@ -1410,11 +1461,13 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling — a pair
     sitting exactly on the documented bound is never dropped for float noise.
     This is the ONE place the ceiling's epsilon lives; callers test the
-    result and add no tolerance of their own. Backtest-only, like
-    time_series_spread_band(). It has two callers: backtester._find_entry,
-    which tests it on time-series pairs only, and backtest.main, which tests
-    a spread sitting exactly on each deadline-gap tier so it can warn when
-    an operator-typed ceiling empties that tier.
+    result and add no tolerance of their own. It has three callers:
+    backtester._find_entry, which tests it on time-series pairs only;
+    backtest.main, which tests a spread sitting exactly on each deadline-gap
+    tier so it can warn when an operator-typed ceiling empties that tier; and
+    time_series_spread_refusal, the one live definition of the spread rule,
+    through which the live finder, enrichment and validate_pair_price reach
+    it. No live module calls it directly.
 
     Args:
         spread (float): pB - pA, dollars.
@@ -1537,17 +1590,19 @@ def max_affordable_pairs(
     The single definition of the budget -> contracts step, called from both ends
     of the sizing pipeline so the two can never drift:
 
-      * scanner.enrich_with_orderbook_prices() passes the default
-        BUDGET_FRACTION and the BEST qualifying level's price sum, to bound how
-        much order-book depth it averages into the pair's fill price.
+      * scanner.enrich_with_orderbook_prices() passes max_kelly_fraction(pair
+        type, the run's LiveSettings) and the BEST qualifying level's price
+        sum, to bound how much order-book depth it averages into the pair's
+        fill price.
       * strategy.compute_trade() passes the capped Kelly fraction and the actual
         prefix-average price sum, to size the trade itself.
 
     The scanner's call is therefore an UPPER BOUND on the sizer's: its fraction
-    is the maximum any Kelly result can be capped to, and its price sum the
-    minimum any prefix average can reach (levels are ascending, so every deeper
-    prefix costs at least as much per pair). That bound is what lets enrichment
-    price a pair at a size the sizer can never exceed.
+    is the largest capped Kelly fraction the sizer can return for that pair
+    type, and its price sum the minimum any prefix average can reach (levels
+    are ascending, so every deeper prefix costs at least as much per pair).
+    That bound is what lets enrichment price a pair at a size the sizer can
+    never exceed.
 
     fraction is resolved at CALL time rather than bound as a default argument,
     so a test that monkeypatches BUDGET_FRACTION still takes effect — the same
@@ -1574,6 +1629,277 @@ def max_affordable_pairs(
     # Same expression order as the sizing this replaced, so the float result is
     # identical: dollars first, then the fraction, then the division.
     return int((balance_cents / 100.0) * f / price_sum)
+
+
+# Why time_series_spread_refusal refused a spread; None means it was admitted.
+# Compare these with ==, like scanner's REFUSED_* reasons (scanner.SAME_DAY
+# alone is compared with `is`).
+SPREAD_NOT_POSITIVE = "not positive"
+SPREAD_BELOW_FLOOR = "below floor"
+SPREAD_ABOVE_CEILING = "above ceiling"
+
+
+def _step_cap(value, name: str) -> float:
+    """
+    Validate a size cap and normalise it onto the SIZE_CAP_STEP grid.
+
+    The value is normalised with round(SIZE_CAP_STEP * steps, 2), the same
+    expression backtester.SIZE_CAP_SWEEP builds its grid with. That makes a cap
+    from any source float-equal to one of the grid's cells.
+
+    Args:
+        value: The cap, a real number in (0, 1].
+        name (str): The field's name, used in the error message.
+
+    Returns:
+        float: The cap on the grid.
+
+    Raises:
+        ValueError: If the value is not a real number, is outside (0, 1], or is
+            not a multiple of SIZE_CAP_STEP from one step up. A positive value
+            within PRICE_EPSILON of 0 is refused too: it rounds to zero steps,
+            which would pass the multiple test and return a cap of 0.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not 0.0 < value <= 1.0:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    steps = round(value / SIZE_CAP_STEP)
+    # steps < 1 catches a positive cap too small to be a whole step: within
+    # PRICE_EPSILON of 0 it would otherwise pass the multiple test below as
+    # zero steps and return 0.0, a cap on no cell of the grid
+    if steps < 1 or abs(value - steps * SIZE_CAP_STEP) > PRICE_EPSILON:
+        raise ValueError(f"{name} must be a multiple of {SIZE_CAP_STEP:.0%} "
+                         f"from {SIZE_CAP_STEP:.0%} to 100%, got {value!r}")
+    return round(SIZE_CAP_STEP * steps, 2)
+
+
+@dataclass(frozen=True)
+class LiveSettings:
+    """
+    One live run's strategy toggles, validated and normalised on construction.
+
+    live_settings() builds one from this module's constants at call time, and
+    main.py's two run modes hand that one object to the time-series finder,
+    to enrichment and to pre_execution_check. The tier floors and the band
+    reach every live site that reads them. k and the cap reach only
+    enrichment's affordability bound (max_kelly_fraction):
+    strategy.compute_trade still reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and
+    BUDGET_FRACTION from this module, the same values live_settings() puts
+    here, so every run main.py makes sizes under the k and cap its bound
+    assumes. dataclasses.replace re-runs __post_init__, so an override is
+    validated too. The object is frozen, so it states one rule for the whole
+    run.
+
+    Attributes:
+        tier_floors (bool): Whether to apply the deadline-gap tier floors to
+            time-series pairs. It must be a real bool, checked by type, because
+            min_price_diff_for_gap drops the tier only on an explicit False.
+        spread_band (tuple[float, float]): The time-series (floor, ceiling) on
+            pB - pA, with 0 <= floor < ceiling <= 1, as floats.
+        interval_discount (float): k, in (0, 1]. This is a range check only.
+            k = 0 is refused: it models no in-between loss (p = 1), so every
+            pair would size at the per-trade cap. A k just above 0 is accepted
+            and sizes nearly every pair at the cap too; choosing k is the
+            operator's call.
+        size_cap (float): The per-trade Kelly cap for every pair, on the
+            SIZE_CAP_STEP grid. 1.0 means no cap, since f* <= p <= 1.
+
+    Raises:
+        ValueError: If any field is out of range or of the wrong type.
+    """
+    tier_floors: bool
+    spread_band: tuple[float, float]
+    interval_discount: float
+    size_cap: float
+
+    def __post_init__(self) -> None:
+        """
+        Validate every field and normalise it in place (the object is frozen).
+
+        Raises:
+            ValueError: If any field is out of range or of the wrong type.
+        """
+        if type(self.tier_floors) is not bool:
+            raise ValueError(f"tier_floors must be True or False, got {self.tier_floors!r}")
+        # The backtest band's own validator: 0 <= floor < ceiling <= 1, as
+        # floats. None is refused first: that validator reads None as "the
+        # backtest's default band", a backtest constant the live band must
+        # never fall back to. Its TypeError (a band that is not a pair of
+        # comparable numbers) and ValueError (the wrong length, or out of
+        # range) are re-raised as one ValueError naming the field, so a caller
+        # reports every bad field the same way.
+        if self.spread_band is None:
+            raise ValueError("spread_band must be (floor, ceiling), got None")
+        try:
+            band = time_series_spread_band(self.spread_band)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"spread_band must be (floor, ceiling) with 0 <= floor < ceiling <= 1, "
+                f"got {self.spread_band!r}: {exc}"
+            ) from exc
+        object.__setattr__(self, "spread_band", band)
+        k = self.interval_discount
+        if isinstance(k, bool) or not isinstance(k, numbers.Real) or not 0.0 < k <= 1.0:
+            raise ValueError(f"interval_discount (k) must be in (0, 1], got {k!r}")
+        object.__setattr__(self, "interval_discount", float(k))
+        object.__setattr__(self, "size_cap", _step_cap(self.size_cap, "size_cap"))
+
+
+def live_settings() -> LiveSettings:
+    """
+    Return the live toggles exactly as this module sets them, validated.
+
+    The constants are read at CALL time, never bound at import, so a test that
+    monkeypatches one ON THIS MODULE takes effect everywhere the live path reads
+    it. This follows the time_series_profit_prob(k=None) idiom, not the by-value
+    TIME_SERIES_SAME_EVENT_LADDERS one. Only a live entry point handed no
+    settings calls this, once, in the one statement
+    `settings = live_settings() if settings is None else settings`.
+
+    Returns:
+        LiveSettings: Built from this module's toggle constants.
+
+    Raises:
+        ValueError: If any constant is out of range.
+    """
+    return LiveSettings(
+        tier_floors=TIME_SERIES_TIER_FLOORS,
+        spread_band=TIME_SERIES_SPREAD_BAND,
+        interval_discount=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+        size_cap=BUDGET_FRACTION,
+    )
+
+
+def live_time_series_floor(gap_days: int, settings: LiveSettings) -> float:
+    """
+    Return the live time-series entry floor on pB - pA for a deadline gap.
+
+    With the tier floors on, the floor is max(tier, band floor). With them off,
+    it is the band floor alone. This calls min_price_diff_for_gap with the
+    keywords backtester._find_entry passes, so the two paths cannot disagree
+    about a floor. The floor also sets the price-sum ceiling, 1 - floor
+    (scanner._pair_max_sum).
+
+    Args:
+        gap_days (int): The deadline gap, from scanner.pair_gap_days. Range:
+            0..MAX_DEADLINE_GAP_DAYS.
+        settings (LiveSettings): The run's toggles.
+
+    Returns:
+        float: The floor, in dollars.
+    """
+    return min_price_diff_for_gap(gap_days, spread_min=settings.spread_band[0],
+                                  tier_floors=settings.tier_floors)
+
+
+def time_series_spread_refusal(
+    spread: float, gap_days: int, settings: LiveSettings,
+) -> str | None:
+    """
+    Apply the live time-series spread rule: return why a spread pB - pA is refused, or None.
+
+    This is the one live definition; the finder, enrichment and
+    validate_pair_price all call it. It applies the checks in the order, and
+    with the PRICE_EPSILON placement, of backtester._find_entry's per-Monday
+    tests:
+      1. The spread must be strictly positive. The epsilon sits on the REJECT
+         side here, so it tightens the test.
+      2. The spread must be at or above the entry floor. The epsilon sits on the
+         KEEP side, so a spread exactly on the floor is kept (TS-09).
+      3. The spread must be at or under the band's ceiling. This goes through
+         time_series_spread_too_wide, where the ceiling's epsilon lives.
+
+    Args:
+        spread (float): pB - pA, in dollars.
+        gap_days (int): The deadline gap (scanner.pair_gap_days).
+        settings (LiveSettings): The run's toggles.
+
+    Returns:
+        str | None: SPREAD_NOT_POSITIVE, SPREAD_BELOW_FLOOR,
+            SPREAD_ABOVE_CEILING, or None when the spread is admitted.
+    """
+    if spread <= PRICE_EPSILON:
+        return SPREAD_NOT_POSITIVE
+    if spread < live_time_series_floor(gap_days, settings) - PRICE_EPSILON:
+        return SPREAD_BELOW_FLOOR
+    if time_series_spread_too_wide(spread, settings.spread_band[1]):
+        return SPREAD_ABOVE_CEILING
+    return None
+
+
+def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
+    """
+    Return the largest capped Kelly fraction a pair of this type sizes at under settings.
+
+    Enrichment uses this to bound how much book depth it averages into a pair's
+    price. That way a lifted cap never averages depth that no trade can use
+    (#51). It bounds strategy.compute_trade's fraction when the sizer prices
+    with the same k and cap. Until the sizer takes a LiveSettings of its own,
+    it reads TIME_SERIES_INTERVAL_PROB_DISCOUNT and BUDGET_FRACTION from this
+    module, the values live_settings() hands every run main.py makes, so the
+    two agree on every such run. A caller that hands enrichment other settings
+    gets them in this bound alone.
+
+    time_series: f* = 1 - k*(pB - pA)/(1 - c), with c = pA + nB + fee. When
+        the later market's YES ask is at or above its own YES bid, up to
+        PRICE_EPSILON, f* <= 1 - k - k*(fee - PRICE_EPSILON)/(1 - c) < 1 - k.
+        Enrichment drops every pair whose later book is crossed, and every
+        pair with no current ask. The bound is 1 - k rounded to 12 places,
+        because 1.0 - 0.8 is 0.19999999999999996, which shifts max_contracts
+        down by one on round-number books ($10,000 at a 0.80 best level
+        affords 2499 pairs instead of 2500). The round moves 1 - k by at most
+        5e-13, either way. Up, it stays an upper bound. Down, it stays one
+        while f*'s margin under 1 - k, k*(fee - PRICE_EPSILON)/(1 - c),
+        exceeds 5e-13: for any k above about 4e-8, even at the smallest fee on
+        the finest grid. Below that it can undercount max_contracts by one,
+        which only sizes smaller. At k = 1 the bound is 0, and no time-series
+        trade can size.
+
+    same_title: f* = (p - c)/(1 - c) < p = SAME_TITLE_CO_RESOLVE_PROB.
+
+    Anything but the exact string "time_series" reads as same-title
+    (scanner.leg_sides' rule).
+
+    Args:
+        pair_type (str): The pair's type.
+        settings (LiveSettings): The run's toggles.
+
+    Returns:
+        float: The run's cap for this pair type, capped further by the bound above.
+    """
+    if pair_type == "time_series":
+        return min(settings.size_cap, round(1.0 - settings.interval_discount, 12))
+    return min(settings.size_cap, SAME_TITLE_CO_RESOLVE_PROB)
+
+
+def describe_time_series_rule(tier_floors: bool, spread_band: tuple[float, float]) -> str:
+    """
+    Describe the time-series entry rule in words.
+
+    Used for the time-series finder's always-logged rule line and the entry
+    floor refusal lines. It takes the two fields rather than a LiveSettings,
+    so a report built from recorded values need not invent the other fields.
+
+    Args:
+        tier_floors (bool): Whether the deadline-gap tier floors apply.
+        spread_band (tuple[float, float]): The band, already validated.
+
+    Returns:
+        str: For example "tier floors off (pB - pA must still be positive),
+            spread band 0-0.5 on pB - pA", or "tier floors on (≥15% up to 15
+            days apart, ≥30% for 16-30), no spread band".
+    """
+    lo, hi = spread_band
+    if tier_floors:
+        tiers = (f"tier floors on (≥{MIN_PRICE_DIFF_SHORT_GAP:.0%} up to "
+                 f"{SHORT_DEADLINE_GAP_DAYS} days apart, ≥{MIN_PRICE_DIFF_LONG_GAP:.0%} "
+                 f"for {SHORT_DEADLINE_GAP_DAYS + 1}-{MAX_DEADLINE_GAP_DAYS})")
+    else:
+        tiers = "tier floors off (pB - pA must still be positive)"
+    if (lo, hi) == (0.0, 1.0):
+        band = "no spread band"
+    else:
+        band = f"spread band {lo:g}-{hi:g} on pB - pA"
+    return f"{tiers}, {band}"
 
 
 def create_new_output(path: Path) -> tuple[Path, BinaryIO]:

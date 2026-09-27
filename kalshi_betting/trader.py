@@ -83,7 +83,9 @@ Dependencies:
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
-    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py. Called by
+    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py, with
+    LiveSettings and live_settings (pre_execution_check hands every
+    validate_pair_price it runs the run's one LiveSettings). Called by
     main.py after select_portfolio() selects the final trade list. Depends on
     the KalshiClient produced by auth.py.
 
@@ -183,6 +185,8 @@ from .config import (
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
+    LiveSettings,
+    live_settings,
 )
 from .reporter import TradeResult
 from .scanner import (
@@ -1290,20 +1294,28 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
     return TradeResult(spec=spec, status="rolled_back", error=reason)
 
 
-def pre_execution_check(client: Any, portfolio: list) -> list:
+def pre_execution_check(client: Any, portfolio: list, *,
+                        settings: LiveSettings | None = None) -> list:
     """
     Re-validate order book prices for all specs concurrently before execution.
 
     Fetches both order books for each spec in parallel and drops any whose gap
     threshold is no longer met or whose available depth is less than the intended
-    contract count. This reduces the window between price observation and order
-    submission, lowering the chance of submitting against a stale price. Each
-    drop is logged once, with its reason, by validate_pair_price (or by the
-    exception handler here); this function adds only a summary count.
+    contract count — and, for a time-series pair, any whose later book has no
+    YES ask now or whose fresh spread sits above the run's band ceiling (see
+    scanner.validate_pair_price). This reduces the window between price
+    observation and order submission, lowering the chance of submitting
+    against a stale price. Each drop is logged once, with its reason, by
+    validate_pair_price (or by the exception handler here); this function adds
+    only a summary count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         portfolio (list): List of TradeSpec objects selected by select_portfolio().
+        settings (LiveSettings | None): Keyword-only. The run's live toggles,
+            handed to every validate_pair_price call so each spec is
+            re-checked under the one rule it was selected under. None resolves
+            config.py's once.
 
     Returns:
         list: Filtered list of TradeSpec objects that still pass the price check.
@@ -1312,10 +1324,16 @@ def pre_execution_check(client: Any, portfolio: list) -> list:
     if not portfolio:
         return []
 
+    # One rule for every spec's re-check: the run's LiveSettings, or config's
+    settings = live_settings() if settings is None else settings
+
     valid = []
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(portfolio))) as pool:
         future_to_spec = {
-            pool.submit(validate_pair_price, client, spec): spec for spec in portfolio
+            # Re-check each spec's books under the run's settings, the same
+            # object every other live site of this run was handed
+            pool.submit(validate_pair_price, client, spec, settings=settings): spec
+            for spec in portfolio
         }
         # Iterate as futures complete so one raising thread does not swallow the others;
         # a raised exception is caught per-spec and the spec is dropped like a False check.

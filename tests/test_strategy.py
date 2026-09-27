@@ -771,6 +771,12 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "pair_gap_days")
         assert not _function_calls(
             scanner, "enrich_with_orderbook_prices", "deadline_gap_days")
+        # validate_pair_price's band-ceiling test re-derives the floor through
+        # time_series_spread_refusal too: a close_time gap there would re-tier
+        # a one-instant ladder and misread an over-ceiling spread as below the
+        # floor, letting it through
+        assert _function_calls(scanner, "validate_pair_price", "pair_gap_days")
+        assert not _function_calls(scanner, "validate_pair_price", "deadline_gap_days")
 
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror
@@ -843,26 +849,62 @@ class TestTimeSeriesKellyParity:
         # both ways, never from a copy of the tier constants
         assert _function_calls(backtester, "_tier_floors_bind", "min_price_diff_for_gap")
 
-    def test_ast_live_path_reads_no_band(self):
-        # The time-series spread band is a BACKTEST knob. If a band is ever
-        # applied live, its live constants must land in the same commit as
-        # live ceiling enforcement, so a band can never go live half-wired;
-        # until then only the band's backtest-side readers may reach it. The
-        # walk is DENY-BY-DEFAULT: every module of the package, the package
-        # root included, except those readers — so a live module added later
-        # is covered without editing any list here. In every walked module:
-        #   - every min_price_diff_for_gap call passes the gap alone (one
-        #     positional argument, no keyword, no */** splat) — the call that
-        #     returns the deadline-gap tier and reads no band value;
-        #   - the helper is never aliased, shadowed by a local def or
-        #     parameter, spelled as a string (a getattr/__dict__ lookup) or
-        #     passed around uncalled, any of which could hand a later
-        #     indirect call a floor;
-        #   - no band helper or band constant is referenced, by name or by
-        #     string;
-        #   - no band-reading module other than config is imported, so the
-        #     band cannot be reached transitively through one either.
-        # A band value hardcoded inline as a literal is outside this pin's
+    # The live entry points that may resolve config.py's toggles when handed
+    # none, each in exactly ONE statement of exactly one form. Every other
+    # live function either requires a LiveSettings or never reads the tier
+    # floors or the band; the sizer still reads k and BUDGET_FRACTION from
+    # config.py (see the pin's own comment).
+    _LIVE_SETTINGS_RESOLVERS = frozenset({
+        ("scanner", "find_time_series_pairs"),
+        ("scanner", "enrich_with_orderbook_prices"),
+        ("scanner", "validate_pair_price"),
+        ("trader", "pre_execution_check"),
+        ("main", "_run_dev"),
+        ("main", "_run_prod"),
+    })
+
+    # (module, calling function, callee) calls that may omit settings. main()
+    # hands its two run modes none yet — each resolves config.py's once, in
+    # its own whitelisted statement — because main.py has no per-run toggle
+    # flags. The pin also asserts each exemption is USED: once main() resolves
+    # settings of its own and hands them on, the exemption must be deleted
+    # here, so it cannot silently cover a later unthreaded call.
+    _UNTHREADED_CALLS = frozenset({
+        ("main", "main", "_run_dev"),
+        ("main", "main", "_run_prod"),
+    })
+
+    def test_ast_live_path_reads_toggles_only_through_live_settings(self):
+        # The live time-series entry rule (tier floors, spread band) and
+        # enrichment's affordability bound (k, per-trade cap) are read through
+        # ONE frozen config.LiveSettings per run, so none of those sites can
+        # apply a setting while another of them reads config.py. The sizer,
+        # strategy.compute_trade, still reads k and BUDGET_FRACTION from
+        # config.py, and this pin does not forbid those two names; main()
+        # hands its run modes no settings, so on every run it makes the
+        # sizer and the bound read the same values. The walk is
+        # DENY-BY-DEFAULT: every module of the package, the package root
+        # included, except config and the backtest-side band readers
+        # (backtester, backtest, dashboard) — so a live module added later is
+        # covered without editing any list here. In every walked module:
+        #   - no band or tier-floor helper or constant is referenced, by name,
+        #     by string (a getattr/__dict__ lookup), by shadowing def or
+        #     parameter, or by import — min_price_diff_for_gap included: the
+        #     live path reaches the entry floor only through
+        #     config.live_time_series_floor;
+        #   - no backtest-side band reader is imported, so none can be reached
+        #     transitively;
+        #   - live_settings appears only in the whitelisted entry points above,
+        #     each exactly once, as
+        #     `settings = live_settings() if settings is None else settings`
+        #     (an ImportFrom alias of it, not renamed, is the one exemption);
+        #   - every call to a function whose def (in a walked module or in
+        #     config) declares a `settings` parameter passes it explicitly,
+        #     positionally or by keyword, and never as a literal None — a
+        #     pool.submit(f, ...) of such a function included, which must
+        #     carry settings= — and no such function is passed around
+        #     uncalled any other way.
+        # A toggle value hardcoded inline as a literal is outside this pin's
         # reach; the constants-live-in-config rule covers that.
         import importlib
         import pkgutil
@@ -880,46 +922,149 @@ class TestTimeSeriesKellyParity:
         modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}") for n in walked]
         no_import = band_readers - {"config"}
 
-        helper = "min_price_diff_for_gap"
         forbidden = {
+            "min_price_diff_for_gap",
             "time_series_spread_band",
             "time_series_spread_too_wide",
             "BACKTEST_DEFAULT_SPREAD_BAND",
             "SPREAD_BAND_SWEEP_FLOORS",
             "SPREAD_BAND_SWEEP_CEILINGS",
+            "TIME_SERIES_TIER_FLOORS",
+            "TIME_SERIES_SPREAD_BAND",
         }
-        tier_calls = 0
-        for module in modules:
-            mod = module.__name__
-            tree = ast.parse(inspect.getsource(module))
-            called = set()
+        resolver = "live_settings"
+
+        def short(module):
+            return module.__name__.rsplit(".", 1)[-1]
+
+        trees = {short(m): ast.parse(inspect.getsource(m)) for m in modules}
+
+        # Every function that takes a `settings` parameter, in the walked
+        # modules and in config (whose helpers the live path calls):
+        # name -> positional index, or None when it is keyword-only
+        takes_settings: dict = {}
+        for tree in [*trees.values(), ast.parse(inspect.getsource(config))]:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                positional = [a.arg for a in node.args.posonlyargs + node.args.args]
+                kwonly = [a.arg for a in node.args.kwonlyargs]
+                if "settings" in positional:
+                    where = positional.index("settings")
+                elif "settings" in kwonly:
+                    where = None
+                else:
+                    continue
+                assert takes_settings.get(node.name, where) == where, node.name
+                takes_settings[node.name] = where
+        # Non-vacuous: the helpers and entry points this rule exists for
+        assert {"find_time_series_pairs", "enrich_with_orderbook_prices",
+                "validate_pair_price", "pre_execution_check", "_pair_max_sum",
+                "live_time_series_floor", "time_series_spread_refusal",
+                "max_kelly_fraction", "_run_dev", "_run_prod"} <= set(takes_settings)
+
+        def passes_settings(call, fn_name, skip):
+            """Whether the call hands `fn_name` a settings argument that is not
+            a literal None; `skip` positional args precede the callee's own."""
+            for kw in call.keywords:
+                if kw.arg == "settings":
+                    return not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            index = takes_settings[fn_name]
+            args = call.args[skip:]
+            if index is None or any(isinstance(a, ast.Starred) for a in args):
+                return False
+            if len(args) <= index:
+                return False
+            value = args[index]
+            return not (isinstance(value, ast.Constant) and value.value is None)
+
+        def call_name(func):
+            return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+        resolutions: dict = {}
+        used_exemptions = set()
+        for mod, tree in trees.items():
+            parents = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[id(child)] = node
+
+            def enclosing(node, parents=parents):
+                cur = parents.get(id(node))
+                while cur is not None and not isinstance(
+                        cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cur = parents.get(id(cur))
+                return cur.name if cur is not None else None
+
+            # The one allowed form, recorded by the id of its live_settings Name
+            allowed = {}
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id == "settings"
+                        and isinstance(node.value, ast.IfExp)):
+                    continue
+                ifexp = node.value
+                test, body, orelse = ifexp.test, ifexp.body, ifexp.orelse
+                if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                        and test.left.id == "settings" and len(test.ops) == 1
+                        and isinstance(test.ops[0], ast.Is)
+                        and isinstance(test.comparators[0], ast.Constant)
+                        and test.comparators[0].value is None
+                        and isinstance(body, ast.Call) and isinstance(body.func, ast.Name)
+                        and body.func.id == resolver and not body.args and not body.keywords
+                        and isinstance(orelse, ast.Name) and orelse.id == "settings"):
+                    allowed[id(body.func)] = enclosing(node)
+
+            # Callees handed as pool.submit's first argument, checked below
+            submitted = set()
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                fn = node.func
-                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-                if name != helper:
-                    continue
-                called.add(id(fn))
-                tier_calls += 1
+                name = call_name(node.func)
                 where = f"{mod}:{node.lineno}"
-                assert len(node.args) == 1, where
-                assert not isinstance(node.args[0], ast.Starred), where
-                assert not node.keywords, where
+                if (name == "submit" and node.args
+                        and call_name(node.args[0]) in takes_settings):
+                    target = call_name(node.args[0])
+                    submitted.add(id(node.args[0]))
+                    assert passes_settings(node, target, 1), (
+                        f"{where} submits {target} without settings=")
+                    continue
+                if name in takes_settings:
+                    if passes_settings(node, name, 0):
+                        continue
+                    key = (mod, enclosing(node), name)
+                    assert key in self._UNTHREADED_CALLS, f"{where} calls {name} without settings"
+                    used_exemptions.add(key)
+
+            called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+            # ast.walk visits an ImportFrom's alias nodes on their own too;
+            # they are checked with their ImportFrom and exempt below
+            from_aliases = {id(a) for n in ast.walk(tree)
+                            if isinstance(n, ast.ImportFrom) for a in n.names}
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for a in node.names:
                         assert a.name.split(".")[-1] not in no_import, f"{mod} imports {a.name}"
                     continue
                 if isinstance(node, ast.ImportFrom):
-                    assert (node.module or "").split(".")[-1] not in no_import, f"{mod} imports {node.module}"
+                    assert (node.module or "").split(".")[-1] not in no_import, (
+                        f"{mod} imports {node.module}")
+                    for a in node.names:
+                        assert a.name not in no_import, f"{mod} imports {a.name}"
+                        assert a.name not in forbidden, f"{mod} imports {a.name}"
+                        # An alias of the resolver would let an unrecognised
+                        # name call it; the exemption covers the plain import
+                        assert not (a.name == resolver and a.asname), mod
                     continue
                 if isinstance(node, ast.Constant):
                     if isinstance(node.value, str):
-                        assert node.value not in forbidden | {helper}, f"{mod}:{node.lineno} spells {node.value!r}"
+                        assert node.value not in forbidden | {resolver}, (
+                            f"{mod}:{node.lineno} spells {node.value!r}")
                     continue
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    assert node.name not in forbidden | {helper}, f"{mod}:{node.lineno} shadows {node.name}"
+                    assert node.name not in forbidden | {resolver}, (
+                        f"{mod}:{node.lineno} shadows {node.name}")
                     continue
                 if isinstance(node, ast.Name):
                     name = node.id
@@ -928,20 +1073,48 @@ class TestTimeSeriesKellyParity:
                 elif isinstance(node, ast.arg):
                     name = node.arg
                 elif isinstance(node, ast.alias):
-                    # `from . import backtester` names the module here, not
-                    # in ImportFrom.module
+                    if id(node) in from_aliases:
+                        continue
+                    # `import x as y` alias nodes
                     name = node.name
                     assert name not in no_import, f"{mod} imports {name}"
-                    assert not (name == helper and node.asname), mod
                 else:
                     continue
-                assert name not in forbidden, f"{mod} references {name}"
-                if name == helper and not isinstance(node, ast.alias):
-                    assert id(node) in called, f"{mod}:{node.lineno} uncalled reference"
-        # Non-vacuous: the live finder, the pair ceiling and enrichment's
-        # fallback all call it, so a rename that hid every call from this walk
-        # must fail rather than pass with nothing checked.
-        assert tier_calls > 0
+                where = f"{mod}:{node.lineno}"
+                assert name not in forbidden, f"{where} references {name}"
+                if name == resolver:
+                    assert id(node) in allowed, (
+                        f"{where} reads live_settings outside the one allowed "
+                        "`settings = live_settings() if settings is None else settings`")
+                    func = allowed[id(node)]
+                    assert (mod, func) in self._LIVE_SETTINGS_RESOLVERS, (
+                        f"{where}: {mod}.{func} may not resolve config.py's settings")
+                    resolutions[(mod, func)] = resolutions.get((mod, func), 0) + 1
+                elif (name in takes_settings and isinstance(node, (ast.Name, ast.Attribute))
+                        and id(node) not in called and id(node) not in submitted):
+                    raise AssertionError(
+                        f"{where}: {name} takes settings and is passed around uncalled")
+
+        # Every whitelisted entry point resolves exactly once — none twice
+        # (two resolutions could straddle a monkeypatch), none never (a
+        # whitelist entry that no longer resolves must be removed)
+        assert resolutions == dict.fromkeys(self._LIVE_SETTINGS_RESOLVERS, 1), resolutions
+        # Every exemption is still needed (see _UNTHREADED_CALLS)
+        assert used_exemptions == set(self._UNTHREADED_CALLS), (
+            "main() now hands its run modes their settings: delete the matching "
+            f"entries of _UNTHREADED_CALLS (unused: {self._UNTHREADED_CALLS - used_exemptions})")
+
+        # The live sites that read a toggle each go through the one live
+        # definition of the rule, so the tests of that definition cover them
+        assert _function_calls(scanner, "find_time_series_pairs", "time_series_spread_refusal")
+        assert _function_calls(scanner, "enrich_with_orderbook_prices",
+                               "time_series_spread_refusal")
+        assert _function_calls(scanner, "enrich_with_orderbook_prices", "max_kelly_fraction")
+        assert _function_calls(scanner, "validate_pair_price", "time_series_spread_refusal")
+        assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
+        # ... and that definition reaches the floor through the helper the
+        # backtest's _find_entry uses, with the same keywords
+        assert _function_calls(config, "live_time_series_floor", "min_price_diff_for_gap")
 
 
 # ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────

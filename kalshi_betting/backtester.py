@@ -37,14 +37,18 @@ Dependencies:
     stays the live one's verbatim twin), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
-    backtest-only spread_min and tier_floors keywords only this module, of
-    the pipeline, passes — and time_series_profit_prob), the backtest-only
+    spread_min and tier_floors keywords this module passes to apply its
+    bands and its tier-floors-off family, as config.live_time_series_floor
+    passes them for the live rule — and time_series_profit_prob), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
     and resolves a band up front in _entries_for_band, run_backtest_sweep,
     _sweep_from_candidates and _simulate_at_discount's completion line; no
-    live module reads either), plus BUDGET_FRACTION,
+    live module calls either — the live rule reaches them only through
+    config.LiveSettings and config.time_series_spread_refusal, whose
+    per-Monday parity with _find_entry is pinned by tests/test_backtester.py::
+    TestLiveBacktestSpreadParity), plus BUDGET_FRACTION,
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
     grid _candle_window_open floors a market's open onto),
     LARGE_GROUP_WARN_THRESHOLD,
@@ -144,8 +148,9 @@ Notes:
     band of config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS with
     that k grid and adds standalone time-series (ladders + cross-event),
     ladder, cross-event and same-title populations, a split-half check and an
-    excluding-top-event check — the backtest-only scenario explorer; no live
-    module reads a band.
+    excluding-top-event check — the backtest-only scenario explorer, whose
+    grid bands no live module reads (the live band is
+    config.TIME_SERIES_SPREAD_BAND, read only through config.LiveSettings).
     run_backtest() is untouched by it — same signature, same two-tuple — so
     every existing caller keeps working.
 
@@ -7358,7 +7363,9 @@ def run_backtest_sweep(
     This function never writes config.py. The calibration it reports is a
     recommendation for a human to act on, live sizing keeps reading
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT no matter what is passed here,
-    and no live module reads a spread band or the tier-floor switch at all.
+    and no band or tier-floors setting passed here reaches the live path: the
+    live bot reads its own toggles (config.TIME_SERIES_SPREAD_BAND,
+    config.TIME_SERIES_TIER_FLOORS) only through config.LiveSettings.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.

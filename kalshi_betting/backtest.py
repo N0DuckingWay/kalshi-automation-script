@@ -30,10 +30,10 @@ Dependencies:
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
     MAX_DEADLINE_GAP_DAYS and PRICE_EPSILON (the spread-band tier WARNING),
-    and the backtest band helpers time_series_spread_band and
+    and the band helpers time_series_spread_band and
     time_series_spread_too_wide — backtest is one of the four band readers
     tests/test_strategy.py::TestTimeSeriesKellyParity::
-    test_ast_live_path_reads_no_band allows. Entry point for
+    test_ast_live_path_reads_toggles_only_through_live_settings allows. Entry point for
     `python3 -m kalshi_betting.backtest`.
 
 Notes:
@@ -79,8 +79,10 @@ Notes:
     config.time_series_spread_band() has resolved and validated it,
     backtester._find_entry layers the floor on the deadline-gap tier through
     config.min_price_diff_for_gap(spread_min=) and refuses a spread above the
-    ceiling through config.time_series_spread_too_wide(). Live trading never
-    reads a band — it filters on the tier alone. Either flag may be given
+    ceiling through config.time_series_spread_too_wide(). These flags never
+    reach live trading, which reads its own band,
+    config.TIME_SERIES_SPREAD_BAND, only through config.LiveSettings (the
+    same helpers apply it: config.time_series_spread_refusal). Either flag may be given
     alone; the omitted side comes from config.BACKTEST_DEFAULT_SPREAD_BAND,
     read through config.time_series_spread_band(None) at call time. Both
     omitted passes spread_band=None, the no-override sentinel, which
@@ -310,15 +312,16 @@ def main() -> None:
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
-    # rather than a number. Backtest-only — nothing on the live path reads a
-    # spread band at all.
+    # rather than a number. Backtest-only — the live path never reads these
+    # flags; its own band is config.TIME_SERIES_SPREAD_BAND, read through
+    # config.LiveSettings.
     parser.add_argument(
         "--spread-min", type=float, default=None, metavar="X",
         help="Time-series spread-band FLOOR (0-1) for the primary scenario; "
              "default: config.BACKTEST_DEFAULT_SPREAD_BAND's floor (the "
              "deadline-gap tier alone while that floor is 0). Given alone, "
              "the ceiling comes from that default. Backtest only — live "
-             "trading never reads it.",
+             "trading never reads it (its band is config.TIME_SERIES_SPREAD_BAND).",
     )
     parser.add_argument(
         "--spread-max", type=float, default=None, metavar="Y",

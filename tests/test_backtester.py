@@ -1770,6 +1770,76 @@ class TestFindEntryDirection:
         assert entry["nB"] == pytest.approx(0.47)
 
 
+class TestLiveBacktestSpreadParity:
+    """The live time-series spread rule (config.time_series_spread_refusal,
+    what the finder, enrichment and validate_pair_price apply) and the
+    backtest's per-Monday tests in _find_entry must agree on every spread.
+
+    _find_entry is NOT modified by the live toggles, so this calls it: one
+    Monday, one candle per leg, leg prices far inside the price-sum ceiling
+    and the fee check at every threshold on the grid, so the only thing
+    either path decides on is pB - pA. The spread handed to the live rule is
+    computed from the candle floats exactly as _find_entry computes its gap,
+    including the float-noise neighbours of every boundary."""
+
+    _MONDAY = datetime(2026, 1, 5, 9, 0, tzinfo=UTC)
+    # Leg prices: YES on A at pA, NO on B at 0.05 — the sum is at most 0.35
+    # (pA 0.30 on the float-noise rows), under 1 - 0.40 (the largest
+    # threshold on the grid), and leaves an edge
+    # far above any fee, so neither test ever decides a row
+    _NB = 0.05
+    _BOUNDARIES = (0.0, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+    _NUDGES = (-2e-6, -5e-7, 0.0, 5e-7, 2e-6)
+
+    def _entered(self, pA, pB, gap_days, band, tier_floors):
+        close_a = self._MONDAY + timedelta(days=1, hours=3)
+        close_b = close_a + timedelta(days=gap_days)
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": close_a.isoformat()}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": close_b.isoformat()}
+        ts = int(self._MONDAY.timestamp())
+        entry = _find_entry(
+            [_candle(ts, pA, round(1.0 - pA, 4))], [_candle(ts, pB, self._NB)],
+            mA, mB, "time_series", self._MONDAY.date(),
+            spread_band=band, tier_floors=tier_floors,
+        )
+        return entry is not None
+
+    def _rows(self):
+        rows = []
+        for pA in (0.05, 0.20):
+            for b in self._BOUNDARIES:
+                for d in self._NUDGES:
+                    pB = pA + b + d
+                    if 0.01 <= pB <= 0.99:
+                        rows.append((pA, pB))
+        # The documented float-noise pairs (TS-09): 0.35 - 0.20 sits a hair
+        # under 0.15, 0.90 - 0.30 a hair over 0.60
+        rows += [(0.20, 0.35), (0.30, 0.90), (0.30, 0.45), (0.10, 0.60)]
+        return rows
+
+    def test_the_live_rule_admits_exactly_what_find_entry_enters(self):
+        from kalshi_betting import config
+        bands = [(0.0, 1.0)] + [(lo, hi) for lo in SPREAD_BAND_SWEEP_FLOORS
+                                for hi in SPREAD_BAND_SWEEP_CEILINGS]
+        rows = self._rows()
+        verdicts = set()
+        for tier_floors in (True, False):
+            for band in bands:
+                settings = config.LiveSettings(
+                    tier_floors=tier_floors, spread_band=band,
+                    interval_discount=0.75, size_cap=0.2)
+                for gap in (0, 15, 16, 30):
+                    for pA, pB in rows:
+                        refusal = config.time_series_spread_refusal(pB - pA, gap, settings)
+                        entered = self._entered(pA, pB, gap, band, tier_floors)
+                        assert entered == (refusal is None), (
+                            tier_floors, band, gap, pA, pB, pB - pA, refusal)
+                        verdicts.add(refusal)
+        # Non-vacuous: every verdict the live rule can return was exercised
+        assert verdicts == {None, config.SPREAD_NOT_POSITIVE, config.SPREAD_BELOW_FLOOR,
+                            config.SPREAD_ABOVE_CEILING}
+
+
 class TestFindEntryTieredThreshold:
     """_find_entry mirrors the scanner's deadline-gap-tiered price threshold:
     15% for deadline gaps <= 15 days, 30% for 16-30 days, nothing beyond 30."""

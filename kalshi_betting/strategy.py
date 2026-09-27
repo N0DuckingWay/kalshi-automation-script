@@ -125,11 +125,15 @@ def _kelly_p(pair: CandidatePair) -> float:
     conservative estimate of that mass.
 
     The helper clamps pB - pA at zero, which would model a pair as riskless.
-    Enrichment drops a pair whose reference is not above the YES fill at its
-    affordability-capped size (the full tier when it falls back to the
-    scan-time quote), and compute_trade rejects non-tradeable pairs first. With
-    a fresh reference on an uncrossed book every qualifying level sits below
-    pB, so the clamp can only fire on a crossed book or a stale reference.
+    Enrichment refreshes pB from the later book and drops a time-series pair
+    that has no fresh reference (fail closed — the scan-time quote no longer
+    stands in), whose later book is crossed (its YES ask below its own YES
+    bid), or whose spread the run's rule refuses (config.
+    time_series_spread_refusal: not strictly positive at the YES fill's
+    affordability-capped size, under the entry floor, or over the band's
+    ceiling at the top of the book); compute_trade rejects non-tradeable pairs
+    first. Every qualifying level then sits below the fresh pB, so the clamp
+    cannot fire on an enriched pair.
 
     Returns:
         float: p in (0, 1], the "p" in compute_trade's Kelly formula.

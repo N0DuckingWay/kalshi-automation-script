@@ -520,13 +520,18 @@ def _raw_events_page(events: list, cursor: str | None = None) -> SimpleNamespace
 # scanner._bids_to_ask_levels. Buying side S on a market consumes that
 # market's OPPOSITE-side bids, so the opt-in time-series pair is the mirror
 # image: TS-EARLY (a YES buy) serves NO bids at 0.70 => YES asks 0.30 with an
-# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40
-# with an empty no side. 100 contracts each — the depth cap the replay pins.
+# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40.
+# TS-LATE also rests a NO bid at 0.40 => a YES ask of 0.60, its REFERENCE
+# quote (the scan pB): a time-series pair whose later book has no YES ask
+# fails closed in enrichment, and 0.60 sits exactly at LATE's 0.60 YES bid, so
+# the book is uncrossed and every pinned figure is unchanged. 100 contracts
+# each — the depth cap the replay pins.
 _ORDERBOOK_PAYLOADS = {
     _TICKER_SAME_EXP: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
     _TICKER_SAME_CHEAP: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
     _TICKER_TS_EARLY: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.70", "100"]]}},
-    _TICKER_TS_LATE: {"orderbook_fp": {"yes_dollars": [["0.60", "100"]], "no_dollars": []}},
+    _TICKER_TS_LATE: {"orderbook_fp": {"yes_dollars": [["0.60", "100"]],
+                                       "no_dollars": [["0.40", "100"]]}},
 }
 
 
@@ -1673,7 +1678,7 @@ class TestRunProdExitCodes:
         mock_enrich.return_value = [spec.pair]
         mock_compute.return_value = spec
         mock_select.return_value = [spec]
-        mock_pre_exec.side_effect = lambda client, portfolio: portfolio
+        mock_pre_exec.side_effect = lambda client, portfolio, *, settings: portfolio
         mock_execute.return_value = [
             TradeResult(spec=spec, status="manual_review", error="position lookup failed"),
         ]
@@ -1727,7 +1732,7 @@ class TestRunProdExitCodes:
         mock_enrich.return_value = [spec.pair]
         mock_compute.return_value = spec
         mock_select.return_value = [spec]
-        mock_pre_exec.side_effect = lambda client, portfolio: portfolio
+        mock_pre_exec.side_effect = lambda client, portfolio, *, settings: portfolio
         mock_execute.return_value = [TradeResult(spec=spec, status="simulated")]
         mock_append_log.return_value = "trade_log.xlsx"
 

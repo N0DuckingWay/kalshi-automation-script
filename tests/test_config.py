@@ -1,8 +1,11 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
-tier-floors switch), and PROJECT_ROOT."""
+tier-floors switch), the live toggles (LiveSettings, the live spread rule and
+the per-pair Kelly bound), and PROJECT_ROOT."""
+import dataclasses
 import math
 import pathlib
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,18 +16,34 @@ from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
+    PRICE_EPSILON,
     PROJECT_ROOT,
     SAME_TITLE_LEG_SIDES,
     SHORT_DEADLINE_GAP_DAYS,
+    SPREAD_ABOVE_CEILING,
+    SPREAD_BELOW_FLOOR,
+    SPREAD_NOT_POSITIVE,
     TAKER_FEE_RATE,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_LEG_SIDES,
+    LiveSettings,
     fee_leg_exact,
     fee_per_pair_approx,
+    live_settings,
     max_affordable_pairs,
+    max_kelly_fraction,
     min_price_diff_for_gap,
     time_series_profit_prob,
+    time_series_spread_refusal,
 )
+from kalshi_betting.scanner import leg_prices
+from kalshi_betting.strategy import compute_trade
+
+
+def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20):
+    """A LiveSettings with every field named, defaulting to today's values."""
+    return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
+                        interval_discount=interval_discount, size_cap=size_cap)
 
 
 class TestProjectRoot:
@@ -298,8 +317,9 @@ class TestTimeSeriesSpreadBand:
         assert config.time_series_spread_band(None) == (0.30, 0.60)
         # ...an explicit band still wins over it...
         assert config.time_series_spread_band((0.20, 0.90)) == (0.20, 0.90)
-        # ...and the tier helper never reads it: the live path sees no band
-        # even when the backtest's default is not "no band"
+        # ...and the tier helper never reads it: the live path never sees the
+        # backtest's band, even when its default is not "no band" (the live
+        # band is config.TIME_SERIES_SPREAD_BAND, read through LiveSettings)
         assert min_price_diff_for_gap(7) is MIN_PRICE_DIFF_SHORT_GAP
         assert min_price_diff_for_gap(20) is MIN_PRICE_DIFF_LONG_GAP
         # A patched default is validated like an override
@@ -442,15 +462,54 @@ class TestMaxAffordablePairs:
     def test_budget_too_small_for_one_pair(self):
         assert max_affordable_pairs(100, 0.90, 0.20) == 0
 
-    def test_scanner_cap_bounds_the_sizer(self):
-        # The invariant the whole design rests on: the scanner calls with the
-        # MAXIMUM fraction and the MINIMUM (best-level) price sum, so its answer
-        # can never be smaller than the sizer's, whatever Kelly returns.
-        balance, best_sum = 250_000, 0.82
-        cap = max_affordable_pairs(balance, best_sum)
-        for kelly_f in (0.01, 0.06, 0.13, BUDGET_FRACTION):
-            for prefix_sum in (best_sum, 0.85, 0.90, 0.94):
-                assert max_affordable_pairs(balance, prefix_sum, kelly_f) <= cap
+    @pytest.mark.parametrize("k, cap", [(0.75, 0.20), (0.40, 1.0), (0.80, 1.0), (0.60, 0.35)])
+    def test_scanner_cap_bounds_the_sizer(self, monkeypatch, k, cap):
+        # The invariant the whole design rests on: enrichment bounds its
+        # average at max_kelly_fraction(pair type, settings) over the MINIMUM
+        # (best-level) price sum, so its count can never be smaller than the
+        # sizer's, whatever Kelly returns. Checked against the capped f* that
+        # compute_trade actually returns, for both pair types. compute_trade
+        # still reads k from config (TIME_SERIES_INTERVAL_PROB_DISCOUNT, at
+        # call time) and its cap from strategy's BUDGET_FRACTION binding, so
+        # both are patched to the settings under test.
+        from kalshi_betting import strategy
+
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", k)
+        monkeypatch.setattr(strategy, "BUDGET_FRACTION", cap)
+        settings = config.LiveSettings(
+            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k, size_cap=cap)
+        balance = 1_000_000
+        now = datetime.now(UTC)
+
+        def pair(pair_type, pA, pB, nA, nB):
+            p = MagicMock()
+            p.pA, p.pB, p.nA, p.nB = pA, pB, nA, nB
+            p.pair_type, p.tradeable, p.max_contracts = pair_type, True, 0
+            p.canonical_title = f"{pair_type} {pA}/{pB}"
+            p.market_a.close_time = now + timedelta(days=15)
+            p.market_b.close_time = now + timedelta(days=30)
+            return p
+
+        # Time-series books are UNCROSSED — the later YES ask pB at or above
+        # its own YES bid (1 - nB) — which enrichment's fail-closed fallback
+        # and crossed-book guard enforce on every pair it keeps
+        ts = [pair("time_series", pA, pB, 1 - pA, nB)
+              for pA, pB, nB in [(0.10, 0.70, 0.30), (0.05, 0.85, 0.15), (0.20, 0.50, 0.50),
+                                 (0.30, 0.60, 0.40), (0.12, 0.33, 0.70)]]
+        st = [pair("same_title", pA, pB, nA, 0.70)
+              for pA, pB, nA in [(0.70, 0.30, 0.20), (0.60, 0.31, 0.44), (0.55, 0.30, 0.45)]]
+        sized = {"time_series": 0, "same_title": 0}
+        for p in ts + st:
+            spec = compute_trade(p, balance)
+            if spec is None:
+                continue
+            sized[p.pair_type] += 1
+            bound = config.max_kelly_fraction(p.pair_type, settings)
+            assert spec.kelly_fraction <= bound, (p.canonical_title, spec.kelly_fraction, bound)
+            # ... and so the scanner's count bounds the sizer's
+            assert spec.x <= max_affordable_pairs(balance, sum(leg_prices(p)), bound)
+        # Non-vacuous for both types at every setting
+        assert sized["time_series"] > 0 and sized["same_title"] > 0, sized
 
 
 class TestCreateNewOutput:
@@ -517,3 +576,243 @@ class TestSameEventLadderSwitch:
         for module in (scanner, backtester, backtest):
             assert module.TIME_SERIES_SAME_EVENT_LADDERS is \
                 config.TIME_SERIES_SAME_EVENT_LADDERS, module.__name__
+
+
+class TestLiveSettings:
+    """LiveSettings is one run's live toggles, validated and normalised on
+    construction. It is frozen, and dataclasses.replace re-runs __post_init__,
+    so an override is validated exactly as config.py's values are."""
+
+    @pytest.mark.parametrize("bad", [1, 0, None, "True", "false", 1.0])
+    def test_tier_floors_must_be_exactly_a_bool(self, bad):
+        # min_price_diff_for_gap drops the tier only on an explicit False, so
+        # a truthy/falsy stand-in would silently read as "on"
+        with pytest.raises(ValueError, match="tier_floors"):
+            _settings(tier_floors=bad)
+
+    @pytest.mark.parametrize("band", [
+        (0.5, 0.5), (0.6, 0.5), (-0.1, 0.5), (0.2, 1.1), (float("nan"), 0.5),
+        (0.1,), (0.1, 0.2, 0.3), "ab", 0.5, None,
+    ])
+    def test_band_is_validated_by_the_backtest_band_validator(self, band):
+        # None is refused too, never read as "no band": the backtest band's
+        # validator would resolve it to BACKTEST_DEFAULT_SPREAD_BAND, a
+        # backtest constant the live path must never read
+        with pytest.raises(ValueError, match="spread"):
+            _settings(spread_band=band)
+
+    @pytest.mark.parametrize("k", [0, 0.0, -0.1, 1.01, float("nan"), float("inf"),
+                                   True, False, "0.8", None])
+    def test_k_outside_zero_one_is_refused(self, k):
+        # k = 0 would price every time-series pair as riskless (p = 1)
+        with pytest.raises(ValueError, match="interval_discount"):
+            _settings(interval_discount=k)
+
+    @pytest.mark.parametrize("k", [1, 1.0, 0.75, 0.8, 1e-9])
+    def test_k_in_range_is_accepted_as_a_float(self, k):
+        s = _settings(interval_discount=k)
+        assert s.interval_discount == k and type(s.interval_discount) is float
+
+    # 1e-7 and 1e-6 are positive but within PRICE_EPSILON of 0: they round to
+    # zero steps, and would otherwise normalise to a cap of 0.0, on no cell
+    @pytest.mark.parametrize("cap", [0, 0.0, 0.37, 1.01, -0.05, float("nan"),
+                                     float("inf"), True, False, "0.2", None, 0.051,
+                                     1e-7, 1e-6, 0.02])
+    def test_cap_off_the_grid_or_out_of_range_is_refused(self, cap):
+        with pytest.raises(ValueError, match="size_cap"):
+            _settings(size_cap=cap)
+
+    @pytest.mark.parametrize("cap", [0.05, 0.2, 0.35, 0.95, 1.0, 1])
+    def test_cap_on_the_grid_is_accepted(self, cap):
+        assert _settings(size_cap=cap).size_cap == cap
+
+    def test_the_cap_is_normalised_onto_the_sweep_grid(self):
+        # 0.35 is 0.35000000000000003 as 0.05 * 7; normalised with the very
+        # expression backtester.SIZE_CAP_SWEEP builds its grid with, so a live
+        # cap is float-equal to one of the grid's cells
+        from kalshi_betting.backtester import SIZE_CAP_SWEEP
+        assert _settings(size_cap=0.35).size_cap == round(0.05 * 7, 2)
+        for cap in SIZE_CAP_SWEEP:
+            assert _settings(size_cap=cap).size_cap in SIZE_CAP_SWEEP
+        assert _settings(size_cap=0.05 * 7).size_cap == 0.35
+        assert type(_settings(size_cap=1).size_cap) is float
+
+    def test_the_band_comes_back_as_floats(self):
+        s = _settings(spread_band=(0, 1))
+        assert s.spread_band == (0.0, 1.0)
+        assert all(type(x) is float for x in s.spread_band)
+        # -0.0 is normalised to +0.0 by the backtest band's validator
+        assert str(_settings(spread_band=(-0.0, 0.5)).spread_band[0]) == "0.0"
+
+    def test_replace_re_validates(self):
+        s = _settings()
+        with pytest.raises(ValueError):
+            dataclasses.replace(s, size_cap=0.37)
+        with pytest.raises(ValueError):
+            dataclasses.replace(s, interval_discount=0)
+        with pytest.raises(ValueError):
+            dataclasses.replace(s, spread_band=(0.6, 0.5))
+        assert dataclasses.replace(s, size_cap=1.0).size_cap == 1.0
+
+    def test_it_is_frozen(self):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _settings().size_cap = 1.0
+
+    def test_live_settings_reads_config_at_call_time(self, monkeypatch):
+        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 0.5))
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.8)
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 1.0)
+        assert live_settings() == _settings(False, (0.0, 0.5), 0.8, 1.0)
+
+    def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
+        with pytest.raises(ValueError, match="size_cap"):
+            live_settings()
+
+    def test_the_shipped_values_resolve(self):
+        s = live_settings()
+        assert s == LiveSettings(
+            tier_floors=config.TIME_SERIES_TIER_FLOORS,
+            spread_band=config.TIME_SERIES_SPREAD_BAND,
+            interval_discount=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
+            size_cap=config.BUDGET_FRACTION,
+        )
+        assert type(s.tier_floors) is bool
+
+
+class TestTimeSeriesSpreadRefusal:
+    """config.time_series_spread_refusal is the one live definition of the
+    time-series spread rule: positivity, then the entry floor, then the band's
+    ceiling, with backtester._find_entry's PRICE_EPSILON placement."""
+
+    def test_positivity_epsilon_sits_on_the_reject_side(self):
+        s = _settings(tier_floors=False)
+        assert time_series_spread_refusal(PRICE_EPSILON, 5, s) == SPREAD_NOT_POSITIVE
+        assert time_series_spread_refusal(0.0, 5, s) == SPREAD_NOT_POSITIVE
+        assert time_series_spread_refusal(-0.01, 5, s) == SPREAD_NOT_POSITIVE
+        assert time_series_spread_refusal(2 * PRICE_EPSILON, 5, s) is None
+        assert time_series_spread_refusal(0.0001, 5, s) is None
+
+    def test_floor_epsilon_sits_on_the_keep_side(self):
+        s = _settings()  # tiers on: 0.15 up to 15 days
+        assert time_series_spread_refusal(0.15 - 2 * PRICE_EPSILON, 5, s) == SPREAD_BELOW_FLOOR
+        assert time_series_spread_refusal(0.15 - PRICE_EPSILON / 2, 5, s) is None
+        # 0.35 - 0.20 == 0.14999999999999997: kept on the 0.15 floor (TS-09)
+        assert 0.35 - 0.20 < 0.15
+        assert time_series_spread_refusal(0.35 - 0.20, 5, s) is None
+
+    def test_ceiling_epsilon_sits_on_the_keep_side(self):
+        s = _settings(spread_band=(0.0, 0.6))
+        assert time_series_spread_refusal(0.6 + PRICE_EPSILON / 2, 5, s) is None
+        assert time_series_spread_refusal(0.6 + 2 * PRICE_EPSILON, 5, s) == SPREAD_ABOVE_CEILING
+        # 0.90 - 0.30 == 0.6000000000000001: kept at a 0.60 ceiling
+        assert 0.90 - 0.30 > 0.6
+        assert time_series_spread_refusal(0.90 - 0.30, 5, s) is None
+
+    @pytest.mark.parametrize("spread, gap, verdict", [
+        (0.18, 5, SPREAD_BELOW_FLOOR),     # the band's 0.20 floor, above the tier
+        (0.20, 5, None),                   # exactly on it (TS-09)
+        (0.25, 16, SPREAD_BELOW_FLOOR),    # the 0.30 long tier, above the floor
+        (0.60, 5, None),                   # exactly on the ceiling
+        (0.61, 5, SPREAD_ABOVE_CEILING),
+    ])
+    def test_tiers_on_band_020_060(self, spread, gap, verdict):
+        s = _settings(spread_band=(0.2, 0.6))
+        assert time_series_spread_refusal(spread, gap, s) == verdict
+
+    def test_tiers_off_floor_zero(self):
+        s = _settings(tier_floors=False)
+        assert time_series_spread_refusal(0.0001, 20, s) is None
+        assert time_series_spread_refusal(0.0, 20, s) == SPREAD_NOT_POSITIVE
+        assert time_series_spread_refusal(-0.01, 20, s) == SPREAD_NOT_POSITIVE
+
+    def test_the_floor_is_tested_before_the_ceiling(self):
+        # A ceiling under a tier: a 0.12 spread at 5 days is BOTH under the
+        # 0.15 tier and over the 0.10 ceiling. _find_entry tests the floor
+        # first, and so must the live rule, or its counts would disagree
+        s = _settings(spread_band=(0.0, 0.10))
+        assert time_series_spread_refusal(0.12, 5, s) == SPREAD_BELOW_FLOOR
+        # ... and positivity before both
+        assert time_series_spread_refusal(-0.2, 5, s) == SPREAD_NOT_POSITIVE
+
+    def test_the_floor_is_live_time_series_floor(self):
+        for tiers in (True, False):
+            for band in ((0.0, 1.0), (0.2, 0.6), (0.35, 0.9)):
+                s = _settings(tier_floors=tiers, spread_band=band)
+                for gap in (0, 15, 16, 30):
+                    floor = config.live_time_series_floor(gap, s)
+                    assert floor == min_price_diff_for_gap(
+                        gap, spread_min=band[0], tier_floors=tiers)
+                    if floor > PRICE_EPSILON:
+                        assert time_series_spread_refusal(
+                            floor - 2 * PRICE_EPSILON, gap, s) == SPREAD_BELOW_FLOOR
+
+
+class TestMaxKellyFraction:
+    """max_kelly_fraction is enrichment's affordability bound: the largest
+    capped Kelly fraction a sizer pricing with the same k and cap can return
+    for a pair type. Compared with
+    ==, deliberately: 1 - 0.8 is 0.19999999999999996, and the bound must be
+    exactly 0.20 or max_contracts shifts by one on round-number books."""
+
+    def test_today_both_types_are_the_cap(self):
+        s = _settings()
+        assert max_kelly_fraction("time_series", s) == 0.20
+        assert max_kelly_fraction("same_title", s) == 0.20
+
+    def test_no_cap_time_series_is_one_minus_k_rounded(self):
+        s = _settings(interval_discount=0.8, size_cap=1.0)
+        assert 1.0 - 0.8 != 0.2
+        assert max_kelly_fraction("time_series", s) == 0.2
+
+    def test_no_cap_same_title_is_the_co_resolution_prior(self):
+        s = _settings(size_cap=1.0)
+        assert max_kelly_fraction("same_title", s) == 0.95
+        assert max_kelly_fraction("same_title", s) == config.SAME_TITLE_CO_RESOLVE_PROB
+
+    def test_k_of_one_bounds_time_series_at_zero(self):
+        s = _settings(interval_discount=1.0, size_cap=1.0)
+        assert max_kelly_fraction("time_series", s) == 0
+        # same-title never reads k
+        assert max_kelly_fraction("same_title", s) == 0.95
+
+    @pytest.mark.parametrize("pair_type", [None, "bogus", "Time_Series", MagicMock().pair_type])
+    def test_anything_but_time_series_reads_as_same_title(self, pair_type):
+        s = _settings(interval_discount=0.8, size_cap=1.0)
+        assert max_kelly_fraction(pair_type, s) == 0.95
+
+    def test_the_round_is_what_keeps_the_count(self):
+        s = _settings(interval_discount=0.8, size_cap=1.0)
+        assert max_affordable_pairs(1_000_000, 0.8, max_kelly_fraction("time_series", s)) == 2500
+        # the unrounded bound loses a contract on this round-number book
+        assert max_affordable_pairs(1_000_000, 0.8, 1.0 - 0.8) == 2499
+
+
+class TestDescribeTimeSeriesRule:
+    """describe_time_series_rule words the finder's always-logged
+    "Time-series entry rule" line and its floor-refusal lines: it must say
+    "no spread band" for (0, 1) alone, and name any band with a floor or a
+    ceiling of its own."""
+
+    def test_only_the_no_band_band_reads_as_no_band(self):
+        assert config.describe_time_series_rule(True, (0.0, 1.0)).endswith(", no spread band")
+        assert config.describe_time_series_rule(False, (0.0, 1.0)).endswith(", no spread band")
+
+    @pytest.mark.parametrize("band, text", [
+        ((0.2, 1.0), "spread band 0.2-1 on pB - pA"),   # a floor alone
+        ((0.0, 0.6), "spread band 0-0.6 on pB - pA"),   # a ceiling alone
+        ((0.0, 0.5), "spread band 0-0.5 on pB - pA"),
+        ((0.25, 0.9), "spread band 0.25-0.9 on pB - pA"),
+    ])
+    def test_a_band_with_a_floor_or_a_ceiling_is_named(self, band, text):
+        for tier_floors in (True, False):
+            line = config.describe_time_series_rule(tier_floors, band)
+            assert line.endswith(", " + text), line
+            assert "no spread band" not in line
+
+    def test_the_tier_clause_follows_the_switch(self):
+        on = config.describe_time_series_rule(True, (0.0, 1.0))
+        off = config.describe_time_series_rule(False, (0.0, 1.0))
+        assert on.startswith("tier floors on (≥15% up to 15 days apart, ≥30% for 16-30)")
+        assert off.startswith("tier floors off (pB - pA must still be positive)")

@@ -23,7 +23,10 @@ Purpose:
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
     (balance threshold, exit-code contract, price-gap thresholds, the
-    same-title close-gap bound the no-pairs message names, and file paths),
+    same-title close-gap bound the no-pairs message names, file paths, and
+    LiveSettings/live_settings — each run mode resolves the run's live toggles
+    once and hands that one object to the time-series finder, enrichment and
+    pre_execution_check),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
     leg_sides — the only source of truth for which side each leg buys — and
     close_gap_bound_text, which renders that close-gap bound in the same
@@ -74,6 +77,8 @@ from .config import (
     PROJECT_ROOT,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
+    LiveSettings,
+    live_settings,
 )
 from .reporter import append_to_prod_log, write_dev_simulation
 from .scanner import (
@@ -199,9 +204,13 @@ def _no_pairs_msg(sandbox: bool = False) -> str:
     Build the "no qualifying pairs found" log message with live threshold values.
 
     Formats the deadline-gap-tiered time-series thresholds and the same-title
-    threshold straight from config.py so this message can never drift out of
-    sync with the values `min_price_diff_for_gap()` and the pair-finders
-    actually enforce. Names the cumulative-deadline requirement too: since
+    threshold straight from config.py, so their VALUES can never drift out of
+    sync with the tier constants and the same-title finder. It names the
+    tiers only: it does not describe the live toggles
+    (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND) that
+    decide whether the tiers apply and where a band sits — the time-series
+    finder's always-logged "Time-series entry rule" line names the rule the
+    run actually applied. Names the cumulative-deadline requirement too: since
     that rule landed, price is no longer the only reason a time-series
     candidate can be absent, and an operator reading this line would otherwise
     go looking at the thresholds for a result the WORDING decided. Names the
@@ -492,7 +501,7 @@ def _blind_run_reason(markets: list, shard_statuses, inactive_shards: set) -> st
     return None
 
 
-def _run_dev(client, args) -> int:
+def _run_dev(client, args, settings: LiveSettings | None = None) -> int:
     """
     Execute a full dev/sandbox mode scan and simulation.
 
@@ -507,6 +516,9 @@ def _run_dev(client, args) -> int:
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
+        settings (LiveSettings | None): The run's live toggles, handed to the
+            time-series finder and enrichment. None resolves config.py's
+            once, at the top of the run, so both see one rule.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -525,6 +537,11 @@ def _run_dev(client, args) -> int:
             since main() dispatches to either and passes the result to
             sys.exit().
     """
+    # The run's live toggles, resolved ONCE and handed to the time-series
+    # finder and enrichment, so neither reads config.py on its own. The sizer,
+    # compute_trade, still reads k and the per-trade cap from config.py; main()
+    # hands no settings, so the two agree on every run it makes
+    settings = live_settings() if settings is None else settings
     sandbox_balance_cents = int(args.sandbox_balance * 100)
     logging.info(
         "DEV mode: using real sandbox market data | virtual balance $%.2f",
@@ -563,15 +580,18 @@ def _run_dev(client, args) -> int:
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
-    time_series_pairs = find_time_series_pairs(client, held_tickers=set(), markets=markets)
+    # The run's settings decide the time-series entry rule (tier floors, band)
+    time_series_pairs = find_time_series_pairs(
+        client, held_tickers=set(), markets=markets, settings=settings,
+    )
     # Detect same-title pairs separately — uses a different grouping key (exact title match)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity
+    # balance could actually buy, and validate liquidity under the run's rule
     candidate_pairs   = enrich_with_orderbook_prices(
-        client, candidate_pairs, sandbox_balance_cents,
+        client, candidate_pairs, sandbox_balance_cents, settings=settings,
     )
 
     if not candidate_pairs:
@@ -625,7 +645,7 @@ def _run_dev(client, args) -> int:
     return EXIT_OK
 
 
-def _run_prod(client, args) -> int:
+def _run_prod(client, args, settings: LiveSettings | None = None) -> int:
     """
     Execute a full production run using the real Kalshi account.
 
@@ -644,6 +664,10 @@ def _run_prod(client, args) -> int:
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
+        settings (LiveSettings | None): The run's live toggles, handed to the
+            time-series finder, enrichment and pre_execution_check. None
+            resolves config.py's once, at the top of the run, so all three see
+            one rule.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -662,6 +686,12 @@ def _run_prod(client, args) -> int:
             other path, including dry-run, no candidate pairs, no executable
             trades, and all-pairs-failed-pre-execution-check.
     """
+    # The run's live toggles, resolved ONCE and before any request, and handed
+    # to the time-series finder, enrichment and pre_execution_check, so none of
+    # them reads config.py on its own. The sizer, compute_trade, still reads k
+    # and the per-trade cap from config.py; main() hands no settings, so the
+    # two agree on every run it makes
+    settings = live_settings() if settings is None else settings
     logging.warning("Running in PRODUCTION mode — real money will be used!")
 
     # Confirm auth works and read the pre-trade balance broken out by shard
@@ -725,14 +755,17 @@ def _run_prod(client, args) -> int:
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (deadline-gap) and same-title
-    time_series_pairs = find_time_series_pairs(client, held_tickers, markets)
+    # Run both pair detection paths: time-series (deadline-gap, under the
+    # run's entry rule) and same-title
+    time_series_pairs = find_time_series_pairs(client, held_tickers, markets, settings=settings)
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity
-    candidate_pairs   = enrich_with_orderbook_prices(client, candidate_pairs, balance_cents)
+    # balance could actually buy, and validate liquidity under the run's rule
+    candidate_pairs   = enrich_with_orderbook_prices(
+        client, candidate_pairs, balance_cents, settings=settings,
+    )
 
     if not candidate_pairs:
         logging.info(_no_pairs_msg())
@@ -759,8 +792,9 @@ def _run_prod(client, args) -> int:
 
     _print_portfolio(portfolio, "Selected")
 
-    # Re-fetch order books for each pair concurrently and drop any whose prices moved
-    portfolio = pre_execution_check(client, portfolio)
+    # Re-fetch order books for each pair concurrently and drop any whose prices
+    # moved, re-checked under the same settings the pairs were selected under
+    portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
         return EXIT_OK
