@@ -19,7 +19,11 @@ Purpose:
     the floor (the red banner and the recoloured k-hat card) and above it
     (the healthy coverage line); and _section_benchmark with a deterministic
     ^GSPC frame (the S&P row and its trading-day Sharpe) and with a failing
-    download (the strategy-only degradation).
+    download (the strategy-only degradation). _section_interval_discount is
+    called with the sweep alone, as main called it: that is the section's
+    static form (kd=None — its sweep's own points, at the run's own size
+    cap), whose single trace and per-k table the page-wide filter bar then
+    redraws for another k and cap on a real page.
 
 Dependencies:
     kalshi_betting.backtester, kalshi_betting.config and
@@ -55,6 +59,20 @@ Notes:
     editable install that otherwise imports the primary checkout. The script
     prints the tree it actually imported and that tree's commit into the
     JSON, so a capture from the wrong tree is visible in the fixture itself.
+
+    That whole-fixture recipe rewrites every key, and so DROPS the fixture's
+    "amended" notes — the record of each deliberate re-capture since
+    fe0a758 and its previous digest. For an intended change to one or two
+    sections, amend by hand instead: render them from the tree under test
+    (section_digests(render_sections()), run with that tree on PYTHONPATH),
+    replace ONLY those digests under "hashes", keep source_sha, source_tree
+    and every other digest, and add or append to each changed section's
+    "amended" note what changed and its previous digest — after diffing the
+    section's normalised render before and after, so the note says exactly
+    what moved. Re-dumping the JSON with indent=2 and ensure_ascii=True
+    reproduces the file's own formatting. The interval-discount sections'
+    re-capture for the page-wide filter's k and size cap (C3) was made this
+    way.
 """
 import base64
 import hashlib
