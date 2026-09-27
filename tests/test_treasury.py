@@ -4,26 +4,20 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Tests for treasury.py: parsing the Treasury Fiscal Data API's auction
-    records, paging the download, the never-raising load/cache-fallback
-    contract of load_risk_free_rates(), the per-day lookup in
-    RiskFreeRates.annual_on() and its day-number form (annual_on_days over
-    day_numbers, which the dashboard's deployed-capital hurdle shares), and
-    that no live-trading module can import this reporting-only module.
+    Tests for treasury.py: parsing the auction records, paging the download,
+    load_risk_free_rates()'s never-raising cache fallback, the per-day lookup
+    (annual_on, annual_on_days, day_numbers), and that no live-trading module
+    imports this reporting-only module.
 
 Dependencies:
-    Imports kalshi_betting.treasury. Runs fully offline: tests/conftest.py's
-    autouse _isolate_treasury_rates fixture redirects treasury._RATES_CACHE
-    into a per-test tmp_path and stubs treasury._get_json to raise, so no
-    test here reaches the real Treasury API or a real backtest_cache/ file
-    unless it explicitly re-patches _get_json itself.
+    Imports kalshi_betting.treasury. Fully offline: tests/conftest.py's
+    autouse _isolate_treasury_rates redirects the cache into tmp_path and
+    stubs _get_json to raise, unless a test re-patches it.
 
 Notes:
-    A fake failure passed to _get_json must be a non-transient exception
-    (RuntimeError, ValueError, ...), never ConnectionError/TimeoutError or an
-    HTTP 429/500/502/503/504 status — _http.api_call_with_retry retries
-    those (and only those: any other status is fatal at once) and sleeps
-    through ~62s of exponential backoff before giving up.
+    A fake _get_json failure must be non-transient (RuntimeError,
+    ValueError, ...): api_call_with_retry retries a transient transport error
+    or a 429/500/502/503/504 status through ~62 s of backoff.
 """
 import ast
 import importlib
@@ -244,8 +238,7 @@ class TestLoad:
                                        "0001-01-01T00:30:00+01:00"])
     def test_a_stamp_with_no_utc_instant_is_no_usable_copy(self, monkeypatch, stamp):
         # Aware, but within a day of datetime's range: astimezone(UTC)
-        # overflows. Served, it raised OverflowError out of the dashboard's
-        # header after a finished backtest; now it is no usable copy
+        # overflows, so it is no usable copy
         treasury._RATES_CACHE.write_text(json.dumps({
             "fetched_at": stamp, "term": treasury.RISK_FREE_BILL_TERM,
             "field": treasury.RISK_FREE_RATE_FIELD, "records": GOOD_ROWS}))
@@ -276,7 +269,7 @@ class TestLoad:
             "field": treasury.RISK_FREE_RATE_FIELD, "records": records}))
 
     def test_a_cached_yield_too_large_for_a_float_never_raises(self, monkeypatch):
-        # Reproduced: this raised OverflowError out of the loader
+        # float() of it raises OverflowError
         _stub_fetch(monkeypatch, RuntimeError("offline"))
         huge = {"auction_date": "2026-01-01", treasury.RISK_FREE_RATE_FIELD: int("9" * 400)}
         self._save_copy([huge])
@@ -288,8 +281,7 @@ class TestLoad:
         assert got.auctions == ((date(2026, 9, 24), pytest.approx(0.04071)),)
 
     def test_a_cache_nested_too_deep_to_parse_never_raises(self, monkeypatch, caplog):
-        # Reproduced: json.loads raised RecursionError, which _load_json_cache
-        # does not catch
+        # json.loads raises RecursionError, which _load_json_cache does not catch
         _stub_fetch(monkeypatch, RuntimeError("offline"))
         treasury._RATES_CACHE.write_text("[" * 100_000 + "]" * 100_000)
         with caplog.at_level(logging.WARNING):
@@ -298,8 +290,7 @@ class TestLoad:
         assert "Could not read the saved 8-Week bill yields" in caplog.text
 
     def test_an_unreadable_cache_directory_never_raises(self, monkeypatch, caplog):
-        # Reproduced with an unsearchable directory: path.exists() raises
-        # PermissionError out of _load_json_cache
+        # An unsearchable directory: path.exists() raises PermissionError
         _stub_fetch(monkeypatch, RuntimeError("offline"))
         monkeypatch.setattr(treasury, "_load_json_cache",
                             MagicMock(side_effect=PermissionError("denied")))

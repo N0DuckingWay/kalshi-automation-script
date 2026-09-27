@@ -318,8 +318,7 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   11:06 UTC; k 0.75, default band; run 2026-09-26 on main @ ba00633) with
 #   ladders on: 61 trades, 45.9% won, +111.8% ($10,000 -> $21,181.24), pooled
 #   k-hat 0.889 (over this corpus's 399 entries, all ladders — not the
-#   calibration runs above), Sharpe 0.90 (at rf = 0: measured before the
-#   dashboard subtracted the 8-week T-bill yield). It rests on one trade: YES on
+#   calibration runs above), Sharpe 0.90 (at rf = 0). It rests on one trade: YES on
 #   KXFISAEXTEND-26MAY "before Jun 1" at $0.04 and NO on "before Jun 15" at
 #   $0.06 (27,347 contracts, $2,916.18, entered 2026-05-04) made +$24,430.82,
 #   2.2x the run's whole net gain; that event is 41% of the run's POSITIVE
@@ -974,13 +973,8 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # of tests/test_dashboard.py's _RETURNS: sharpe@252 = -2.4820064 vs
 # sharpe@365 = -2.9870951, ratio 1.2035002. At rf != 0 it is not a constant
 # rescale at all, because the per-period hurdle rf/periods_per_year moves too —
-# and rf is not 0 on a page built with rates (dashboard.generate_dashboard's
-# risk_free): every dashboard ratio then subtracts the 8-week Treasury bill's
-# yield in force on each day (treasury.py, the risk-free block below; rf / 365
-# per calendar day on a strategy curve, charged on its capital in open trades
-# only, and rf / 252 per trading day, in full, on the fully invested ^GSPC
-# row), so the sqrt(365/252) identity holds only for a page built without
-# rates (rf = 0).
+# and a page built with rates (the risk-free block below) has rf != 0, so the
+# identity holds only on a page built without them.
 #
 # dashboard._sharpe/_sortino default to the CALENDAR base: every call site but
 # one consumes _build_equity_curve output, and the single trading-day
@@ -992,39 +986,27 @@ TRADING_DAYS_PER_YEAR: int  = 252
 CALENDAR_DAYS_PER_YEAR: int = 365
 
 # ─── Risk-free rate (backtest dashboard only) ─────────────────────────────────
-# The backtest dashboard's Sharpe and Sortino ratios subtract, on each day of a
-# curve, the yield of the most recent auction of this Treasury bill on or before
-# that day (treasury.RiskFreeRates.annual_on) — not one fixed hurdle, because a
-# multi-year window spans very different rates (near 0% in 2020-21, above 5% in
-# 2023). A strategy curve is charged it only on its capital in open trades
-# (dashboard._rf_hurdle: idle cash is taken to earn the yield, since the
-# backtester books it at 0%); the ^GSPC row, fully invested, in full.
-# treasury.load_risk_free_rates() downloads them from the Treasury's
-# Fiscal Data API ("Treasury Securities Auctions Data": open, no key, GET only,
-# every value a string); backtest.py calls it beside the series-category read.
-# REPORTING ONLY: nothing sizes, prices or settles on it, and the live bot never
-# imports it.
+# The dashboard's Sharpe and Sortino subtract, on each day, the yield of this
+# Treasury bill's latest auction on or before it (treasury.py) — per day, since
+# a multi-year window spans very different rates. A strategy curve is charged
+# it only on its capital in open trades (dashboard._rf_hurdle); the ^GSPC row in
+# full. REPORTING ONLY: the live bot never imports it.
 TREASURY_AUCTIONS_URL: str = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
     "/v1/accounting/od/auctions_query"
 )
-# auctions_query's security_term for the bill. The 8-week bill was first
-# auctioned on 2018-10-16; its 416 regular auctions to 2026-09-24 fit one page.
+# auctions_query's security_term for the bill (first auctioned 2018-10-16).
 RISK_FREE_BILL_TERM: str = "8-Week"
 # The auction's stop-out yield on the investment-rate (bond-equivalent) basis, in
 # percent: the yield a winning bidder earns. The discount rate (high_discnt_rate)
 # is a bank-discount quote that understates it.
 RISK_FREE_RATE_FIELD: str = "high_investment_rate"
-# Per socket operation, per resolved address — it bounds each connect or read,
-# not the whole request. _http.api_call_with_retry retries a
-# 429/500/502/503/504 or a transient transport failure around it, so a host
-# that swallows packets costs each of its 6 attempts at least this (30 s per
-# resolved address) plus 62 s of backoff: about 4 minutes for a
-# single-address host, before treasury.load_risk_free_rates falls back to the
-# saved copy
+# Per socket operation, per resolved address — not per request. With
+# api_call_with_retry's 6 attempts and 62 s of backoff, an unresponsive host
+# with one address costs about 4 minutes before the fallback to the saved copy
 TREASURY_API_TIMEOUT_SECONDS: int = 30
-# Records per page, and the most pages one download reads — a bound, not an
-# expectation: the whole 8-week history is one page
+# Records per page, and the most pages one download reads (a bound: the whole
+# history fits one page)
 TREASURY_API_PAGE_SIZE: int = 1000
 TREASURY_API_MAX_PAGES: int = 20
 

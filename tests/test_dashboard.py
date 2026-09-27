@@ -3,10 +3,7 @@ the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
 annualization base and its per-row use in the benchmark table (DR-56), the
 interval-discount (k) section, whose curve and per-k table follow the page-wide
 filter bar's k and size cap, and the risk-free rate every Sharpe and Sortino
-subtracts day by day, on a strategy curve's capital in open trades only
-(TestRiskFreeHurdle, TestRiskFreeOnDeployedCapital, TestCapitalDeployedParity,
-TestRiskFreeReachesEveryRatio, TestRiskFreeHeader, and the AST pin
-TestRiskFreeIsThreaded).
+subtracts (the TestRiskFree* classes and TestCapitalDeployedParity).
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -8365,13 +8362,9 @@ def _rates(source: str = SOURCE_API,
 
 
 def _steep_rates() -> RiskFreeRates:
-    """_rates()'s two auctions at 60% and 95%, for whole-page tests. The page
-    fixtures hold at most about 1% of their balance in open trades, so at a
-    real bill yield — charged on that capital only — their ratios move in the
-    third decimal and read the same as at rf = 0 where the page shows them
-    (two decimals). A steep yield makes every rate-adjusted figure on the page
-    differ visibly from its rf = 0 value, so a dropped pass-through cannot
-    hide behind the rounding."""
+    """_rates()'s two auctions at 60% and 95%, for whole-page tests: the page
+    fixtures hold about 1% of their balance in open trades, so a real yield
+    would round away at two decimals and a dropped pass-through could hide."""
     return RiskFreeRates(((date(2026, 1, 1), 0.60), (date(2026, 1, 8), 0.95)), SOURCE_API,
                          datetime(2026, 9, 27, 6, 30, tzinfo=UTC))
 
@@ -8421,7 +8414,7 @@ def _hand_hurdle(eq: pd.DataFrame, trades: list[BacktestTrade],
 class TestRiskFreeHurdle:
     """_sharpe / _sortino subtract rf POSITIONALLY — one scalar, or one annual
     yield per row (_rf_hurdle's) — and read 0.0 on a curve that never moves,
-    whatever the rate. At rf = 0 nothing changed."""
+    whatever the rate. At rf = 0 they are the textbook expressions."""
 
     # Four days at 3%, then four at 5%, one per row of _RETURNS
     _VARYING = np.array([0.03] * 4 + [0.05] * 4)
@@ -8445,8 +8438,8 @@ class TestRiskFreeHurdle:
                 != pytest.approx(dashboard._sharpe(_RETURNS, flat, periods_per_year=periods))
 
     def test_rf_zero_is_bit_identical_to_the_old_expression(self):
-        # The pre-change bodies, verbatim: no rate (the default, None's 0.0
-        # hurdle, or unavailable rates' zeros) must reproduce them exactly
+        # The textbook bodies at rf = 0: no rate (the default, None's 0.0
+        # hurdle, or unavailable rates' zeros) reproduces them bit for bit
         excess = _RETURNS - 0.0 / 365
         old_sharpe = float(excess.mean() / excess.std() * np.sqrt(365))
         downside = np.minimum(excess, 0.0)
@@ -8462,11 +8455,8 @@ class TestRiskFreeHurdle:
     @pytest.mark.parametrize("rf", [0.05, np.full(300, 0.05), np.linspace(0.01, 0.05, 300)],
                              ids=["scalar", "constant array", "varying array"])
     def test_a_flat_curve_reads_zero_at_any_rate(self, rf):
-        # A curve with no trade. Without the guard a constant nonzero rate
-        # makes every flat day the same negative excess return: Sharpe came
-        # out -9.6e16 (a float std of ~1e-20, not 0) and Sortino exactly
-        # -sqrt(365); a rate that changes inside the window gives a large
-        # finite negative instead. 0.0 either way
+        # A curve with no trade. Without the guard a nonzero rate makes every
+        # flat day a negative excess return (a float std of ~1e-20, not 0)
         flat = pd.Series([0.0] * 300)
         assert dashboard._sharpe(flat, rf=rf) == 0.0
         assert dashboard._sortino(flat, rf=rf) == 0.0
@@ -8542,9 +8532,8 @@ class TestRiskFreeHurdle:
 
 
 def _old_capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> list[float]:
-    """dashboard._capital_deployed's body before it was vectorized
-    (49deade), verbatim but for names: the oracle its delegation to
-    _deployed_on_days must match bit for bit."""
+    """A per-row dict loop over the curve's dates: the reference
+    _capital_deployed must match bit for bit."""
     entry_by_date: dict[date, float] = {}
     exit_by_date: dict[date, float] = {}
     for t in trades:
@@ -8572,15 +8561,11 @@ def _held(entry: date, exit_: date, cost: float, fees: float = 0.0) -> BacktestT
 
 
 class TestCapitalDeployedParity:
-    """_capital_deployed now returns _deployed_on_days with the fees included
-    (vectorized, one definition the risk-free hurdle reads without them). It
-    must be bit-identical to the per-row loop it replaced for datetime.date
-    trade dates (BacktestTrade's type) — the Risk section's chart and every
-    filter view's redraw of it read it, and TestGoldenSections' Risk digest
-    pins the rendered chart — on every shape a curve and its trades can
-    take. A trade dated with a datetime or Timestamp now matches its
-    calendar day, where the loop's dict lookup matched nothing; a None date
-    matches nothing, as before."""
+    """_capital_deployed (_deployed_on_days with fees) is bit-identical to the
+    per-row loop reference for datetime.date trade dates (BacktestTrade's
+    type), on every shape a curve and its trades can take. It departs from
+    the loop only on a datetime or Timestamp trade date, which it matches to
+    its calendar day; a None date matches nothing."""
 
     _D = date(2026, 1, 5)
 
@@ -8670,10 +8655,9 @@ class TestCapitalDeployedParity:
                 == _float_bits(_old_capital_deployed(trades, eq))
 
     def test_a_timestamp_trade_date_matches_its_calendar_day(self):
-        # The one departure from the loop: a trade dated with a datetime or a
-        # Timestamp now matches its calendar day, as a row's date does
-        # (treasury.day_numbers); the loop's dict, keyed on the Timestamp
-        # itself, matched no datetime.date row, so only the exit subtracted
+        # A trade dated with a datetime or a Timestamp matches its calendar
+        # day, as a row's date does (treasury.day_numbers); the loop's dict,
+        # keyed on the Timestamp itself, matches no datetime.date row
         d = self._D
         eq = self._curve(6)
         plain = _held(d + timedelta(days=1), d + timedelta(days=4), 10.0, 0.5)
@@ -8686,9 +8670,8 @@ class TestCapitalDeployedParity:
             assert _old_capital_deployed([dated], eq) == [0.0] * 6
 
     def test_a_none_trade_date_never_raises(self):
-        # A hand-built trade with no dates: the loop matched nothing for it,
-        # and C4's vectorized helper raised AttributeError from toordinal —
-        # the Risk section (never given rates) with it, and the hurdle
+        # A hand-built trade with no dates matches no row, in the Risk section
+        # (never given rates) and in the hurdle alike
         eq = make_equity([1000.0, 1004.0, 998.0, 1010.0, 1007.0, 1015.0, 1012.0, 1020.0])
         dated = make_trade()
         undated = dataclasses.replace(dated, entry_date=None, exit_date=None)
@@ -8833,7 +8816,7 @@ class TestRiskFreeOnDeployedCapital:
 
     def test_without_rates_no_date_or_trade_is_read(self):
         # The strategy row on a frame with no date column: rf = None must not
-        # touch it (C2's _rf_hurdle read equity_df["date"] and raised KeyError)
+        # touch it
         eq = make_equity([1000.0, 1010.0, 1004.0]).drop(columns="date")
         assert dashboard._strategy_row(eq, 1000.0)["sharpe"] \
             == f"{dashboard._sharpe(eq['daily_return']):.2f}"
@@ -9039,7 +9022,7 @@ class TestRiskFreeReachesEveryRatio:
         assert same_title["sharpe"] == pytest.approx(
             dashboard._point_kpis(sweep.cap_sweep.same_title()[0.2], risk_free=rates)["sharpe"])
         assert same_title["sharpe"] != pytest.approx(rows["zero"][3]["sharpe"])
-        # ... and a cell that traded nothing still reads 0.0, not -1e16
+        # ... and a cell that traded nothing still reads 0.0 (_varies)
         assert flat["trades"] == 0 and flat["sharpe"] == 0.0 and flat["sortino"] == 0.0
 
     @staticmethod
@@ -9053,9 +9036,9 @@ class TestRiskFreeReachesEveryRatio:
         return pages
 
     def test_the_explorer_fallback_through_the_page(self, monkeypatch, tmp_path):
-        # A path a risk_free=None mutant slipped past: the explorer's visitor
-        # cannot be made, and generate_dashboard rebuilds the section from the
-        # sweep's own eager points (_explorer_fallback) — with the rates
+        # The explorer's visitor cannot be made, so generate_dashboard rebuilds
+        # the section from the sweep's own eager points (_explorer_fallback) —
+        # with the rates
         monkeypatch.setattr(dashboard, "_new_explorer_visitor", lambda *a, **k: None)
         sweep, rates = _ex_sweep(), _steep_rates()
         pages = self._page_without(monkeypatch, tmp_path, sweep, rates)
@@ -9083,10 +9066,9 @@ class TestRiskFreeReachesEveryRatio:
         assert same_title["sharpe"] != pytest.approx(cells["zero"][1]["sharpe"])
 
     def test_the_static_interval_discount_through_the_page(self, monkeypatch, tmp_path):
-        # The other path a risk_free=None mutant slipped past: the filter
-        # cannot be built, so the Interval Discount section renders
-        # statically from the sweep's own points (_kd_from_points) — with
-        # the rates, as the cards and the benchmark row beside it do
+        # The filter cannot be built, so the Interval Discount section renders
+        # statically from the sweep's own points (_kd_from_points) — with the
+        # rates, as the cards and the benchmark row beside it do
         def broken(*_a, **_k):
             raise ValueError("boom")
         monkeypatch.setattr(dashboard, "_filter_payload", broken)
@@ -9399,7 +9381,7 @@ class TestRiskFreeIsThreaded:
         assert missing == ["f (line 9)", "V (line 9)"]
 
     def test_the_rule_catches_a_risk_free_none_mutant(self):
-        # The mutant a keyword-only check let through: risk_free passed, as None
+        # risk_free passed, but as None (or as another name)
         source = ("def f(x, *, risk_free=None):\n"
                   "    return x\n"
                   "class V:\n"
@@ -9425,9 +9407,8 @@ class TestRiskFreeIsThreaded:
         assert sorted(missing) == ["row trades (line 5)", "row trades (line 6)"]
 
     def test_the_rule_catches_an_rf_mutant(self):
-        # The mutant a keyword-only check let through: rf passed, as 0.0 —
-        # and its cousins: a name bound from something else, rebound after a
-        # hurdle, or a hurdle not fed the page's rates
+        # rf passed as 0.0, a name bound from something else, a name rebound
+        # after a hurdle, or a hurdle not fed the page's rates
         source = ("def a(d, eq, t, risk_free):\n"
                   "    return _sharpe(d, rf=_rf_hurdle(risk_free, eq, t))\n"
                   "def b(d, eq, t, risk_free):\n"

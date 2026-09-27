@@ -25,8 +25,8 @@ Dependencies:
     generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
     returns-by-category labels) from historical.py, and load_risk_free_rates
-    (the 8-week Treasury bill yields every Sharpe and Sortino on the page
-    subtracts — one open, no-key GET that never raises) from treasury.py.
+    (the T-bill yields the page's Sharpe and Sortino subtract) from
+    treasury.py.
     Imports from config.py:
     PROJECT_ROOT,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
@@ -587,15 +587,9 @@ def main() -> None:
     # tags for the Returns Decomposition breakdown: one cached read-only GET of
     # /series, which never raises (it falls back to a stale copy or to {})
     series_categories = load_series_categories(live_client)
-    # risk_free: the 8-week Treasury bill's auction yields, which every Sharpe
-    # and Sortino ratio on the page subtracts day by day — one open GET to the
-    # Treasury's Fiscal Data API that never raises (it falls back to the last
-    # saved download, then to "unavailable", which the page's header names).
-    # Its worst case is time: a host that swallows packets costs each of
-    # api_call_with_retry's 6 attempts at least TREASURY_API_TIMEOUT_SECONDS
-    # (30 s per resolved address — the timeout bounds each socket operation,
-    # not the whole request) plus 62 s of backoff between them: about 4
-    # minutes for a single-address host, before the fallback
+    # The T-bill yields every Sharpe and Sortino on the page subtracts; never
+    # raises (falls back to the saved copy, then "unavailable"), but an
+    # unresponsive single-address host can cost about 4 minutes first
     risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,

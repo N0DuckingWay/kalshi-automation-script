@@ -8,13 +8,12 @@ Purpose:
     the backtester's event-title accumulator at a per-test temporary directory,
     so no test can read, rewrite, migrate or delete the operator's real
     backtest_cache/event_titles_v2.json or its legacy event_titles.json; and a
-    guard that keeps every test off the real Treasury Fiscal Data API and its
-    backtest_cache/treasury_bill_rates.json cache.
+    guard that keeps every test off the Treasury API and the real rates cache.
 
 Dependencies:
     Imports kalshi_betting.historical (its _EVENT_TITLES_CACHE and
     _LEGACY_EVENT_TITLES_CACHE module paths) and kalshi_betting.treasury (its
-    _RATES_CACHE path and _get_json network call). Imported by pytest only.
+    _RATES_CACHE path and _get_json). Imported by pytest only.
 
 Notes:
     Before DR-51 four tests in test_historical.py (TestFetchAllSettledMarkets'
@@ -29,14 +28,6 @@ Notes:
     which a test must never do to real data. Tests that seed the accumulator
     still use test_historical.py's isolated_cache fixture, which patches the
     same two names to the same tmp_path and returns the v2 path.
-
-    _isolate_treasury_rates's stub raises a plain RuntimeError rather than a
-    network error: api_call_with_retry only retries an HTTP 429 or
-    500/502/503/504 status (any other status is fatal) or a recognized
-    transient transport failure (ConnectionError, TimeoutError, ...), so a
-    RuntimeError is treated as fatal on the first attempt and a test that
-    reaches treasury.load_risk_free_rates falls straight through to "no saved
-    copy" instead of sleeping through ~62s of backoff.
 """
 import pytest
 
@@ -63,10 +54,9 @@ def _isolate_treasury_rates(tmp_path, monkeypatch):
     """
     Keep every test off the Treasury API and away from the real rates cache.
 
-    The stub raises a plain RuntimeError, which api_call_with_retry does not
-    retry (it retries only a 429/500/502/503/504 status or a transient
-    transport failure), so a test that reaches the loader falls through to
-    "no saved copy" at once instead of sleeping through ~62 s of backoff.
+    The stub raises a plain RuntimeError, which api_call_with_retry treats as
+    fatal, so a test that reaches the loader falls through at once instead of
+    sleeping through the retry backoff.
 
     Args:
         tmp_path (Path): pytest's per-test temporary directory.

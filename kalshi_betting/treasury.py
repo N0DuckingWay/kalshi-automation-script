@@ -4,39 +4,24 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Downloads the 8-week U.S. Treasury bill's auction yields from the Treasury's
-    Fiscal Data API and turns them into the risk-free rate the backtest
-    dashboard's Sharpe and Sortino ratios subtract: on each day of a curve, the
-    yield of the most recent auction on or before that day
-    (RiskFreeRates.annual_on). Every successful download is saved under
-    backtest_cache/; when the download fails the last saved copy is used, and
-    with no copy the rate is reported unavailable (the dashboard then
-    subtracts 0% and its header says so). The dashboard charges a strategy
-    curve that yield on its capital in open trades only. Reporting only:
-    nothing sizes, prices or settles on it, and no live-trading module imports
-    this one.
+    Downloads the 8-week Treasury bill's auction yields from the Treasury's
+    Fiscal Data API: the risk-free rate the backtest dashboard's Sharpe and
+    Sortino subtract, on each day the yield of the latest auction on or
+    before it. A download is saved under backtest_cache/; if it fails, the
+    saved copy is used, and with none the rate is unavailable (the dashboard
+    subtracts 0% and says so). Reporting only: no live-trading module
+    imports this one.
 
 Dependencies:
-    Imports TREASURY_AUCTIONS_URL, RISK_FREE_BILL_TERM, RISK_FREE_RATE_FIELD and
-    the TREASURY_API_* bounds from config.py, api_call_with_retry from _http.py
-    (the retried read-only GET wrapper), and CACHE_DIR, _load_json_cache,
-    _save_json_cache and _exception_summary from historical.py. Imported by
-    backtest.py (load_risk_free_rates) and dashboard.py (RiskFreeRates,
-    SOURCE_CACHE and day_numbers — the last so the dashboard's
-    deployed-capital hurdle reads a curve's dates on the same day numbering
-    as the yield lookup, converting them once).
+    config (URL, bill term, rate field, TREASURY_API_* bounds), _http
+    (api_call_with_retry) and historical (cache helpers). Imported by
+    backtest (load_risk_free_rates) and dashboard (RiskFreeRates,
+    SOURCE_CACHE, day_numbers).
 
 Notes:
-    The endpoint is "Treasury Securities Auctions Data"
-    (v1/accounting/od/auctions_query), paged by page[number]/page[size] with
-    meta["total-pages"]. The rate read is high_investment_rate (see config).
-    Cash-management bills are filtered out, so the series is the regular
-    weekly bill. A date before the first auction (2018-10-16) takes that
-    auction's yield. The cache stores the API's own records, so the one
-    parser (_parse_auctions) reads a download and a cached copy alike.
-    Dates are looked up as day numbers (day_numbers: date.toordinal,
-    vectorized); annual_on converts and looks up, annual_on_days looks up
-    day numbers a caller already converted.
+    Cash-management bills are filtered out. A date before the first auction
+    takes its yield. The cache stores the API's own records, so one parser
+    (_parse_auctions) reads a download and a cached copy alike.
 """
 import json
 import logging
@@ -110,14 +95,11 @@ class RiskFreeRates:
         """
         The annual yield in force on each date: the latest auction on or before it.
 
-        A date before the first auction takes the first auction's yield. The
-        result is positional — element i belongs to dates[i] — so a caller
-        subtracts it from a returns Series by position, never by index.
+        The result is positional — element i belongs to dates[i] — so a caller
+        subtracts it by position, never by index.
 
         Args:
-            dates: Dates, one per return row — a column of datetime.date
-                (_build_equity_curve's), or a DatetimeIndex (the ^GSPC series'
-                trading days; a tz-aware one is read on its own calendar date).
+            dates: Dates, one per return row (anything day_numbers reads).
 
         Returns:
             np.ndarray: One annual decimal yield per date; all zeros when the
@@ -127,11 +109,7 @@ class RiskFreeRates:
 
     def annual_on_days(self, days: np.ndarray) -> np.ndarray:
         """
-        annual_on, for dates already converted to day numbers (day_numbers).
-
-        For a caller that reads the same dates twice — the dashboard's
-        deployed-capital hurdle converts a curve's dates once and looks up
-        both the yield and the capital in open trades on them.
+        annual_on, for dates already converted by day_numbers.
 
         Args:
             days (np.ndarray): Proleptic Gregorian ordinals (day_numbers'),
@@ -151,18 +129,12 @@ def day_numbers(dates) -> np.ndarray:
     """
     Dates as proleptic Gregorian ordinals (date.toordinal), vectorized.
 
-    The one day numbering RiskFreeRates' lookups use, and the one the
-    dashboard's capital-deployed helper matches trades' entry and exit dates
-    against (dashboard._deployed_on_days), so the yield and the capital a
-    curve's row is charged on are read on the same calendar day.
-
-    A datetime64 column or a DatetimeIndex is converted in numpy; anything
-    else — _build_equity_curve's column of datetime.date, or datetimes and
-    pd.Timestamps — by each value's own toordinal(), which reads a timestamp's
-    calendar date exactly as datetime.date() does (a tz-aware one on its own
-    wall clock) and costs about 60% of a pd.to_datetime pass over the same
-    column. A value without a toordinal (a date string) falls back to
-    pd.to_datetime.
+    The one day numbering the yield lookup and dashboard._deployed_on_days
+    share, so a row's yield and capital are read on the same calendar day.
+    A datetime64 Series or a DatetimeIndex is converted in numpy; anything
+    else by each value's own toordinal() (a tz-aware timestamp on its own
+    wall clock), falling back to pd.to_datetime when a value has none (a
+    string, or a numpy datetime64 array's elements).
 
     Args:
         dates: Dates — a column of datetime.date, of datetimes or
@@ -257,11 +229,9 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
     """
     Read (auction date, annual decimal yield) pairs out of the API's records.
 
-    A record without a readable date or yield — a yield too large for a float
-    included (a JSON integer of hundreds of digits in a hand-edited cache
-    raises OverflowError), and a JSON true or false, which float() would read
-    as 1% or 0% since bool is an int subclass — or with a yield outside
-    [0%, 100%), is skipped and counted. Two records on one date are averaged.
+    A record without a readable date or yield (a boolean, or a number too
+    large for a float, included) or with a yield outside [0%, 100%) is
+    skipped and counted. Two records on one date are averaged.
 
     Args:
         rows: The API's records (a download's, or a cached copy's).
@@ -301,19 +271,13 @@ def _read_cache() -> RiskFreeRates | None:
     """
     The copy an earlier run saved, or None when there is none usable.
 
-    A copy saved for another bill term or rate field is not used: it describes
-    a different rate from the one config names. Nor is one whose download
-    time is naive, or aware but without a UTC instant: the stamp is returned
-    in UTC, and an aware stamp within a day of datetime's range (a
-    hand-edited "9999-12-31T23:30:00-01:00" or "0001-01-01T00:30:00+01:00")
-    overflows there — the dashboard's header renders it in UTC, after the
-    backtest has finished.
+    A copy for another bill term or rate field is not used, nor one whose
+    download time is naive or has no UTC instant (it is returned in UTC, for
+    the dashboard header).
 
     Returns:
-        RiskFreeRates | None: source SOURCE_CACHE, stamped with the copy's own
-            download time in UTC; None when the file is absent, unreadable, for
-            another term or field, stamped naive or out of range, or holds no
-            readable auction.
+        RiskFreeRates | None: source SOURCE_CACHE, stamped with the copy's
+            download time in UTC; None when there is no usable copy.
     """
     cached = _load_json_cache(_RATES_CACHE)
     if not isinstance(cached, dict) or cached.get("term") != RISK_FREE_BILL_TERM \
@@ -327,8 +291,7 @@ def _read_cache() -> RiskFreeRates | None:
     if fetched_at.tzinfo is None:
         return None
     try:
-        # Normalized here, so no later reader can overflow converting it: an
-        # aware stamp within a day of datetime's range has no UTC instant
+        # Normalized here so no later reader can overflow converting it
         fetched_at = fetched_at.astimezone(UTC)
     except OverflowError:
         return None
@@ -339,24 +302,12 @@ def load_risk_free_rates() -> RiskFreeRates:
     """
     The bill's auction yields for the dashboard's Sharpe and Sortino, never raising.
 
-    Downloads every auction from the Fiscal Data API and saves the records
-    under backtest_cache/. On any failure — the API unreachable, an error
-    status after retries, a body that cannot be read — it falls back to the
-    last saved copy, and with none to SOURCE_UNAVAILABLE (no auctions: the
-    dashboard subtracts 0% and says so). Always tries the API first: a saved
-    copy is only a fallback, never served in preference to a fresh download.
-
-    Nothing escapes: a download that fails, a saved copy that cannot be read
-    (an unsearchable directory's PermissionError, a deeply nested file's
-    RecursionError, a yield no float can hold) and a save that fails (any
-    exception, not only OSError) each degrade with a WARNING, and a saved
-    copy stamped with a time that has no UTC instant is passed over as no
-    usable copy (_read_cache). The worst case is time, not an exception: a
-    host that swallows packets costs each of api_call_with_retry's 6
-    attempts at least TREASURY_API_TIMEOUT_SECONDS (30 s per resolved
-    address — the timeout bounds each socket operation, not the whole
-    request) plus its 62 s of backoff between them: about 4 minutes for a
-    single-address host, before the fallback.
+    Always tries the API first and saves what it downloads; on any failure
+    falls back to the saved copy, then to SOURCE_UNAVAILABLE. It never
+    raises — it runs after a multi-hour backtest — so a failed download,
+    cache read or save each degrade with a WARNING. The worst case is time:
+    an unresponsive host costs 6 attempts of TREASURY_API_TIMEOUT_SECONDS per
+    resolved address plus 62 s of backoff — about 4 minutes for one address.
 
     Returns:
         RiskFreeRates: The yields, with their source and download time.
@@ -368,9 +319,8 @@ def load_risk_free_rates() -> RiskFreeRates:
         try:
             cached = _read_cache()
         except Exception as read_exc:
-            # _load_json_cache catches a corrupt file, not an unsearchable
-            # directory (PermissionError from path.exists) or a nesting too
-            # deep for the parser (RecursionError)
+            # _load_json_cache catches a corrupt file, not e.g. a
+            # PermissionError or RecursionError
             logging.warning("Could not read the saved %s bill yields at %s (%s)",
                             RISK_FREE_BILL_TERM, _RATES_CACHE, _exception_summary(read_exc))
             cached = None
