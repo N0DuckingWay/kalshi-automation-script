@@ -9,10 +9,12 @@ Purpose:
     dashboard's Sharpe and Sortino ratios subtract: on each day of a curve, the
     yield of the most recent auction on or before that day
     (RiskFreeRates.annual_on). Every successful download is saved under
-    backtest_cache/; when the API cannot be reached the last saved copy is used,
-    and with no copy the rate is reported unavailable (the dashboard then
-    subtracts 0% and its header says so). Reporting only: nothing sizes, prices
-    or settles on it, and no live-trading module imports this one.
+    backtest_cache/; when the download fails the last saved copy is used, and
+    with no copy the rate is reported unavailable (the dashboard then
+    subtracts 0% and its header says so). The dashboard charges a strategy
+    curve that yield on its capital in open trades only. Reporting only:
+    nothing sizes, prices or settles on it, and no live-trading module imports
+    this one.
 
 Dependencies:
     Imports TREASURY_AUCTIONS_URL, RISK_FREE_BILL_TERM, RISK_FREE_RATE_FIELD and
@@ -81,7 +83,7 @@ class RiskFreeRates:
             annual decimal — 0.04071 for 4.071%), one per date, ascending.
             Empty when source is SOURCE_UNAVAILABLE.
         source (str): SOURCE_API (downloaded by this run), SOURCE_CACHE (the
-            API could not be reached: the copy an earlier run saved) or
+            download failed: the copy an earlier run saved) or
             SOURCE_UNAVAILABLE (neither).
         fetched_at (datetime | None): When the yields were downloaded, in UTC
             (an earlier run's time for a cached copy); None when unavailable.
@@ -255,8 +257,10 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
     """
     Read (auction date, annual decimal yield) pairs out of the API's records.
 
-    A record without a readable date or yield, or with a yield outside
-    [0%, 100%), is skipped and counted. Two records on one date are averaged.
+    A record without a readable date or yield — a yield too large for a float
+    included (a JSON integer of hundreds of digits in a hand-edited cache
+    raises OverflowError) — or with a yield outside [0%, 100%), is skipped and
+    counted. Two records on one date are averaged.
 
     Args:
         rows: The API's records (a download's, or a cached copy's).
@@ -273,7 +277,7 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
         try:
             day = date.fromisoformat(row["auction_date"])
             rate = float(row[RISK_FREE_RATE_FIELD]) / 100.0
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             skipped += 1
             continue
         if not (math.isfinite(rate) and 0.0 <= rate < 1.0):
@@ -281,7 +285,8 @@ def _parse_auctions(rows) -> tuple[tuple[date, float], ...]:
             continue
         by_date.setdefault(day, []).append(rate)
     if skipped:
-        logging.info("Treasury %s bill auctions: %d record(s) without a readable %s skipped",
+        logging.info("Treasury %s bill auctions: %d record(s) skipped — an unreadable "
+                     "auction_date, an unreadable %s, or a yield outside [0%%, 100%%)",
                      RISK_FREE_BILL_TERM, skipped, RISK_FREE_RATE_FIELD)
     if not by_date:
         raise ValueError(f"no {RISK_FREE_BILL_TERM} auction with a readable {RISK_FREE_RATE_FIELD}")
@@ -325,6 +330,15 @@ def load_risk_free_rates() -> RiskFreeRates:
     dashboard subtracts 0% and says so). Always tries the API first: a saved
     copy is only a fallback, never served in preference to a fresh download.
 
+    Nothing escapes: a download that fails, a saved copy that cannot be read
+    (an unsearchable directory's PermissionError, a deeply nested file's
+    RecursionError, a yield no float can hold) and a save that fails (any
+    exception, not only OSError) each degrade with a WARNING. The worst case
+    is time, not an exception: a host that swallows packets costs each of
+    api_call_with_retry's 6 attempts the full TREASURY_API_TIMEOUT_SECONDS
+    (30 s) plus its 62 s of backoff between them — about 4 minutes — before
+    the fallback.
+
     Returns:
         RiskFreeRates: The yields, with their source and download time.
     """
@@ -332,7 +346,15 @@ def load_risk_free_rates() -> RiskFreeRates:
         rows = _fetch_rows()
         auctions = _parse_auctions(rows)
     except Exception as exc:  # reporting only — never end a backtest over it
-        cached = _read_cache()
+        try:
+            cached = _read_cache()
+        except Exception as read_exc:
+            # _load_json_cache catches a corrupt file, not an unsearchable
+            # directory (PermissionError from path.exists) or a nesting too
+            # deep for the parser (RecursionError)
+            logging.warning("Could not read the saved %s bill yields at %s (%s)",
+                            RISK_FREE_BILL_TERM, _RATES_CACHE, _exception_summary(read_exc))
+            cached = None
         if cached is not None:
             logging.warning(
                 "Treasury Fiscal Data unavailable (%s) — using the %s bill yields downloaded "
@@ -349,7 +371,7 @@ def load_risk_free_rates() -> RiskFreeRates:
             "fetched_at": now.isoformat(), "term": RISK_FREE_BILL_TERM,
             "field": RISK_FREE_RATE_FIELD, "records": rows,
         })
-    except OSError as exc:
+    except Exception as exc:  # a failed save must not cost the run its fresh yields
         logging.warning("Could not save the %s bill yields to %s (%s) — a run that cannot "
                         "reach the API will not find them", RISK_FREE_BILL_TERM, _RATES_CACHE,
                         _exception_summary(exc))

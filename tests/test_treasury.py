@@ -20,9 +20,10 @@ Dependencies:
 
 Notes:
     A fake failure passed to _get_json must be a non-transient exception
-    (RuntimeError, ValueError, ...), never ConnectionError/TimeoutError or a
-    real HTTP status — _http.api_call_with_retry treats those as retryable
-    and sleeps through ~62s of exponential backoff before giving up.
+    (RuntimeError, ValueError, ...), never ConnectionError/TimeoutError or an
+    HTTP 429/500/502/503/504 status — _http.api_call_with_retry retries
+    those (and only those: any other status is fatal at once) and sleeps
+    through ~62s of exponential backoff before giving up.
 """
 import ast
 import importlib
@@ -107,7 +108,16 @@ class TestParseAuctions:
         with caplog.at_level(logging.INFO):
             out = treasury._parse_auctions([bad_row, good])
         assert out == ((date(2020, 1, 1), pytest.approx(0.01)),)
-        assert "1 record(s) without a readable" in caplog.text
+        assert "1 record(s) skipped — an unreadable auction_date, an unreadable " \
+            "high_investment_rate, or a yield outside [0%, 100%)" in caplog.text
+
+    def test_a_yield_too_large_for_a_float_is_skipped(self):
+        # A JSON integer of 400 digits (a hand-edited cache) parses to an int
+        # that float() cannot hold: OverflowError, not ValueError
+        huge = {"auction_date": "2026-09-24", treasury.RISK_FREE_RATE_FIELD: int("9" * 400)}
+        good = {"auction_date": "2020-01-01", treasury.RISK_FREE_RATE_FIELD: "1.0"}
+        assert treasury._parse_auctions([huge, good]) == ((date(2020, 1, 1),
+                                                          pytest.approx(0.01)),)
 
     def test_all_records_unreadable_raises(self):
         with pytest.raises(ValueError):
@@ -231,6 +241,57 @@ class TestLoad:
         _stub_fetch(monkeypatch, RuntimeError("offline"))
         got = treasury.load_risk_free_rates()
         assert got.source == treasury.SOURCE_UNAVAILABLE
+
+    def _save_copy(self, records: list) -> None:
+        treasury._RATES_CACHE.write_text(json.dumps({
+            "fetched_at": "2026-09-01T00:00:00+00:00", "term": treasury.RISK_FREE_BILL_TERM,
+            "field": treasury.RISK_FREE_RATE_FIELD, "records": records}))
+
+    def test_a_cached_yield_too_large_for_a_float_never_raises(self, monkeypatch):
+        # Reproduced: this raised OverflowError out of the loader
+        _stub_fetch(monkeypatch, RuntimeError("offline"))
+        huge = {"auction_date": "2026-01-01", treasury.RISK_FREE_RATE_FIELD: int("9" * 400)}
+        self._save_copy([huge])
+        assert treasury.load_risk_free_rates().source == treasury.SOURCE_UNAVAILABLE
+        # ... and beside a readable record, the copy is still served
+        self._save_copy([huge, GOOD_ROWS[1]])
+        got = treasury.load_risk_free_rates()
+        assert got.source == treasury.SOURCE_CACHE
+        assert got.auctions == ((date(2026, 9, 24), pytest.approx(0.04071)),)
+
+    def test_a_cache_nested_too_deep_to_parse_never_raises(self, monkeypatch, caplog):
+        # Reproduced: json.loads raised RecursionError, which _load_json_cache
+        # does not catch
+        _stub_fetch(monkeypatch, RuntimeError("offline"))
+        treasury._RATES_CACHE.write_text("[" * 100_000 + "]" * 100_000)
+        with caplog.at_level(logging.WARNING):
+            got = treasury.load_risk_free_rates()
+        assert got.source == treasury.SOURCE_UNAVAILABLE
+        assert "Could not read the saved 8-Week bill yields" in caplog.text
+
+    def test_an_unreadable_cache_directory_never_raises(self, monkeypatch, caplog):
+        # Reproduced with an unsearchable directory: path.exists() raises
+        # PermissionError out of _load_json_cache
+        _stub_fetch(monkeypatch, RuntimeError("offline"))
+        monkeypatch.setattr(treasury, "_load_json_cache",
+                            MagicMock(side_effect=PermissionError("denied")))
+        with caplog.at_level(logging.WARNING):
+            got = treasury.load_risk_free_rates()
+        assert got == treasury.RiskFreeRates((), treasury.SOURCE_UNAVAILABLE, None)
+        assert "Could not read the saved 8-Week bill yields" in caplog.text
+        assert "no copy is saved" in caplog.text
+
+    def test_any_error_saving_still_returns_source_api(self, monkeypatch, caplog):
+        # Not only OSError: a TypeError out of the serializer must not cost the
+        # run the yields it just downloaded
+        _stub_fetch(monkeypatch, GOOD_ROWS)
+        monkeypatch.setattr(treasury, "_save_json_cache",
+                            MagicMock(side_effect=TypeError("not serializable")))
+        with caplog.at_level(logging.WARNING):
+            got = treasury.load_risk_free_rates()
+        assert got.source == treasury.SOURCE_API
+        assert len(got.auctions) == 2
+        assert "Could not save" in caplog.text
 
     def test_an_oserror_saving_still_returns_source_api(self, monkeypatch, caplog):
         _stub_fetch(monkeypatch, GOOD_ROWS)

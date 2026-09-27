@@ -590,7 +590,10 @@ def main() -> None:
     # risk_free: the 8-week Treasury bill's auction yields, which every Sharpe
     # and Sortino ratio on the page subtracts day by day — one open GET to the
     # Treasury's Fiscal Data API that never raises (it falls back to the last
-    # saved download, then to "unavailable", which the page's header names)
+    # saved download, then to "unavailable", which the page's header names).
+    # Its worst case is time: a host that swallows packets costs each of
+    # api_call_with_retry's 6 attempts the 30 s TREASURY_API_TIMEOUT_SECONDS
+    # plus 62 s of backoff between them — about 4 minutes before the fallback
     risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,

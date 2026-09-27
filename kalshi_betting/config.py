@@ -318,7 +318,8 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   11:06 UTC; k 0.75, default band; run 2026-09-26 on main @ ba00633) with
 #   ladders on: 61 trades, 45.9% won, +111.8% ($10,000 -> $21,181.24), pooled
 #   k-hat 0.889 (over this corpus's 399 entries, all ladders — not the
-#   calibration runs above), Sharpe 0.90. It rests on one trade: YES on
+#   calibration runs above), Sharpe 0.90 (at rf = 0: measured before the
+#   dashboard subtracted the 8-week T-bill yield). It rests on one trade: YES on
 #   KXFISAEXTEND-26MAY "before Jun 1" at $0.04 and NO on "before Jun 15" at
 #   $0.06 (27,347 contracts, $2,916.18, entered 2026-05-04) made +$24,430.82,
 #   2.2x the run's whole net gain; that event is 41% of the run's POSITIVE
@@ -1013,8 +1014,10 @@ RISK_FREE_BILL_TERM: str = "8-Week"
 # percent: the yield a winning bidder earns. The discount rate (high_discnt_rate)
 # is a bank-discount quote that understates it.
 RISK_FREE_RATE_FIELD: str = "high_investment_rate"
-# Per page request; _http.api_call_with_retry retries a 429/5xx or a transient
-# transport failure around it
+# Per page request; _http.api_call_with_retry retries a 429/500/502/503/504 or
+# a transient transport failure around it, so a host that swallows packets
+# costs up to 6 x 30 s plus 62 s of backoff — about 4 minutes — before
+# treasury.load_risk_free_rates falls back to the saved copy
 TREASURY_API_TIMEOUT_SECONDS: int = 30
 # Records per page, and the most pages one download reads — a bound, not an
 # expectation: the whole 8-week history is one page

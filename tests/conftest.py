@@ -31,11 +31,12 @@ Notes:
     same two names to the same tmp_path and returns the v2 path.
 
     _isolate_treasury_rates's stub raises a plain RuntimeError rather than a
-    network error: api_call_with_retry only retries a status-carrying error or
-    a recognized transient transport failure (ConnectionError, TimeoutError,
-    ...), so a RuntimeError is treated as fatal on the first attempt and a
-    test that reaches treasury.load_risk_free_rates falls straight through to
-    "no saved copy" instead of sleeping through ~62s of backoff.
+    network error: api_call_with_retry only retries an HTTP 429 or
+    500/502/503/504 status (any other status is fatal) or a recognized
+    transient transport failure (ConnectionError, TimeoutError, ...), so a
+    RuntimeError is treated as fatal on the first attempt and a test that
+    reaches treasury.load_risk_free_rates falls straight through to "no saved
+    copy" instead of sleeping through ~62s of backoff.
 """
 import pytest
 
@@ -63,8 +64,9 @@ def _isolate_treasury_rates(tmp_path, monkeypatch):
     Keep every test off the Treasury API and away from the real rates cache.
 
     The stub raises a plain RuntimeError, which api_call_with_retry does not
-    retry, so a test that reaches the loader falls through to "no saved copy"
-    at once instead of sleeping through ~62 s of backoff.
+    retry (it retries only a 429/500/502/503/504 status or a transient
+    transport failure), so a test that reaches the loader falls through to
+    "no saved copy" at once instead of sleeping through ~62 s of backoff.
 
     Args:
         tmp_path (Path): pytest's per-test temporary directory.

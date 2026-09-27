@@ -8403,9 +8403,11 @@ class TestRiskFreeHurdle:
     @pytest.mark.parametrize("rf", [0.05, np.full(300, 0.05), np.linspace(0.01, 0.05, 300)],
                              ids=["scalar", "constant array", "varying array"])
     def test_a_flat_curve_reads_zero_at_any_rate(self, rf):
-        # A curve with no trade. Without the guard a nonzero rate makes every
-        # flat day the same negative excess return: Sharpe came out -9.6e16
-        # (a float std of ~1e-20, not 0) and Sortino exactly -sqrt(365)
+        # A curve with no trade. Without the guard a constant nonzero rate
+        # makes every flat day the same negative excess return: Sharpe came
+        # out -9.6e16 (a float std of ~1e-20, not 0) and Sortino exactly
+        # -sqrt(365); a rate that changes inside the window gives a large
+        # finite negative instead. 0.0 either way
         flat = pd.Series([0.0] * 300)
         assert dashboard._sharpe(flat, rf=rf) == 0.0
         assert dashboard._sortino(flat, rf=rf) == 0.0
@@ -8430,6 +8432,13 @@ class TestRiskFreeHurdle:
             dashboard._sharpe(_RETURNS, rf=short)
         with pytest.raises(ValueError):
             dashboard._sortino(_RETURNS, rf=short)
+        # ... but only on a series that varies (a flat one returns 0.0 before
+        # rf is read), and a length-1 array broadcasts like the scalar
+        flat = pd.Series([0.0] * 5)
+        assert dashboard._sharpe(flat, rf=short) == dashboard._sortino(flat, rf=short) == 0.0
+        one = np.array([0.05])
+        assert dashboard._sharpe(_RETURNS, rf=one) == dashboard._sharpe(_RETURNS, 0.05)
+        assert dashboard._sortino(_RETURNS, rf=one) == dashboard._sortino(_RETURNS, 0.05)
 
     def test_the_hurdle(self):
         dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(6)]
@@ -8880,6 +8889,70 @@ class TestRiskFreeReachesEveryRatio:
         # ... and a cell that traded nothing still reads 0.0, not -1e16
         assert flat["trades"] == 0 and flat["sharpe"] == 0.0 and flat["sortino"] == 0.0
 
+    @staticmethod
+    def _page_without(monkeypatch, tmp_path, sweep, rates) -> dict[str, str]:
+        """{"rf": the page with `rates`, "zero": without}, each in its own
+        directory under tmp_path, with whatever the test broke still broken."""
+        pages = {}
+        for name, rf in (("rf", rates), ("zero", None)):
+            (tmp_path / name).mkdir()
+            pages[name] = _rf_page(monkeypatch, tmp_path / name, sweep, rf)
+        return pages
+
+    def test_the_explorer_fallback_through_the_page(self, monkeypatch, tmp_path):
+        # A path a risk_free=None mutant slipped past: the explorer's visitor
+        # cannot be made, and generate_dashboard rebuilds the section from the
+        # sweep's own eager points (_explorer_fallback) — with the rates
+        monkeypatch.setattr(dashboard, "_new_explorer_visitor", lambda *a, **k: None)
+        sweep, rates = _ex_sweep(), _steep_rates()
+        pages = self._page_without(monkeypatch, tmp_path, sweep, rates)
+        cells = {}
+        for name, page in pages.items():
+            section = _ex_section(page)
+            assert dashboard._EXPLORER_OWN_CAP_HTML in section
+            data, cap = _scn_data(section), _scn_cap(section)
+            ts = data["populations"].index("time_series")
+            pb, pk, _ = data["primary"]
+            cells[name] = (cap["cells"][pb][pk][ts], cap["same_title"])
+        point = next(p for p in sweep.scenarios if p.population == "time_series"
+                     and p.spread_band == _KC_B0 and p.k == 0.75)
+        daily = point.equity_df["daily_return"]
+        hurdle = _hand_hurdle(point.equity_df, point.trades, rates)
+        row, same_title = cells["rf"]
+        assert row["sharpe"] == pytest.approx(dashboard._sharpe(daily, rf=hurdle))
+        assert row["sortino"] == pytest.approx(dashboard._sortino(daily, rf=hurdle))
+        assert row["sharpe"] != pytest.approx(cells["zero"][0]["sharpe"])
+        assert row["sortino"] != pytest.approx(cells["zero"][0]["sortino"])
+        # The same-title row, the run's own point, takes them too
+        st = sweep.same_title_point
+        assert same_title["sharpe"] == pytest.approx(dashboard._sharpe(
+            st.equity_df["daily_return"], rf=_hand_hurdle(st.equity_df, st.trades, rates)))
+        assert same_title["sharpe"] != pytest.approx(cells["zero"][1]["sharpe"])
+
+    def test_the_static_interval_discount_through_the_page(self, monkeypatch, tmp_path):
+        # The other path a risk_free=None mutant slipped past: the filter
+        # cannot be built, so the Interval Discount section renders
+        # statically from the sweep's own points (_kd_from_points) — with
+        # the rates, as the cards and the benchmark row beside it do
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        sweep, rates = _ex_sweep(), _steep_rates()
+        pages = self._page_without(monkeypatch, tmp_path, sweep, rates)
+        sharpes = {}
+        for name, page in pages.items():
+            assert html.escape(dashboard._KD_TEXT["no_bar"]) in page
+            sharpes[name] = [row[-1] for row in _kd_table(page)[0]]
+        assert sharpes["rf"] == [self._expected(pt.equity_df, pt.trades, rates)[0]
+                                 for pt in sweep.points]
+        assert sharpes["zero"] == [f"{dashboard._sharpe(pt.equity_df['daily_return']):.2f}"
+                                   for pt in sweep.points]
+        assert all(a != b for a, b in zip(sharpes["rf"], sharpes["zero"], strict=True))
+        primary = sweep.primary
+        assert _page_kpi(pages["rf"], "sharpe")[0] \
+            == self._expected(primary.equity_df, primary.trades, rates)[0] \
+            != _page_kpi(pages["zero"], "sharpe")[0]
+
     def test_the_explorer_built_from_the_sweep_takes_the_rates(self):
         # The section's own fallback (_explorer_from_sweep), as a direct call
         sweep, rates = _ex_sweep(), _rates()
@@ -8916,7 +8989,8 @@ class TestRiskFreeHeader:
         line = dashboard._risk_free_html(RiskFreeRates((), SOURCE_UNAVAILABLE, None), self._EQ)
         assert line.startswith('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
                                "Risk-free rate unavailable:")
-        assert ("could not be reached and no earlier download is saved, so every Sharpe and "
+        assert ("the download from the Treasury's Fiscal Data API failed and no earlier "
+                "download is saved, so every Sharpe and "
                 "Sortino ratio on this page subtracts 0% instead of the 8-week bill's yield."
                 ) in line
 
@@ -8942,7 +9016,7 @@ class TestRiskFreeHeader:
         assert ("charged on the capital each day had in open trades: idle cash is taken to "
                 "earn the same yield. The S&amp;P 500 row is fully invested") in line
         assert line.endswith(
-            " The API could not be reached: these are the yields downloaded 2026-09-27 06:30 "
+            " The download failed: these are the yields downloaded 2026-09-27 06:30 "
             "UTC, whose latest auction (2026-01-08, 5.000%) stands for every day after it.</p>")
 
     def test_the_download_time_is_shown_in_utc(self):
@@ -8981,12 +9055,18 @@ class TestRiskFreeHeader:
 
 
 class TestRiskFreeIsThreaded:
-    """AST pin over dashboard.py: every _sharpe / _sortino call passes rf, and
-    every in-module call to a function (or class) taking a keyword-only
-    `risk_free` passes it. Without this, a dropped pass-through computes that
-    path at 0% silently and the page disagrees with itself."""
+    """AST pin over dashboard.py, on VALUES, not just keywords: every
+    _sharpe / _sortino call passes an rf that is a hurdle helper's result
+    (_rf_hurdle, _rf_hurdle_invested) — called directly, or a name bound only
+    from one in the same function — and every hurdle helper call is fed the
+    page's risk_free; every `risk_free=` keyword passes a name or attribute
+    spelled risk_free (so `risk_free=None` fails); every in-module call to a
+    function (or class) taking a keyword-only `risk_free` passes it; and every
+    call that passes risk_free to a taker that also takes a keyword-only
+    `trades` passes trades (never None). Without this, a dropped pass-through
+    computes that path at 0% silently and the page disagrees with itself."""
 
-    # What the rule must find, so a refactor cannot make it vacuous
+    # What the rules must find, so a refactor cannot make them vacuous
     _EXPECTED = {
         "_performance_kpis", "_section_performance", "_kd_cells", "_kd_from_points",
         "_section_interval_discount", "_point_kpis", "_section_scenario_explorer",
@@ -8994,13 +9074,17 @@ class TestRiskFreeIsThreaded:
         "_explorer_fallback", "_explorer_from_sweep", "_view_payload", "_list_payload",
         "generate_dashboard", "_KdVisitor", "_ExplorerVisitor", "_ChunkVisitor",
     }
+    # The functions that compute a Sharpe or Sortino
+    _RATIO_SITES = {"_performance_kpis", "_kd_cells", "_point_kpis", "_strategy_row",
+                    "_section_benchmark"}
+    _HURDLES = {"_rf_hurdle", "_rf_hurdle_invested"}
 
     @staticmethod
-    def _kw_only_risk_free(tree: ast.Module) -> set[str]:
+    def _kw_only(tree: ast.Module, param: str) -> set[str]:
         """Names of the functions — and classes, by their __init__ — with a
-        keyword-only parameter named risk_free."""
+        keyword-only parameter named `param`."""
         def takes_it(fn) -> bool:
-            return any(a.arg == "risk_free" for a in fn.args.kwonlyargs)
+            return any(a.arg == param for a in fn.args.kwonlyargs)
 
         found = set()
         for node in ast.walk(tree):
@@ -9015,38 +9099,118 @@ class TestRiskFreeIsThreaded:
         return found
 
     @staticmethod
-    def _calls(tree: ast.Module, names: set[str]) -> list[tuple[str, ast.Call]]:
+    def _name(call: ast.Call) -> str | None:
+        fn = call.func
+        return fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+
+    @classmethod
+    def _calls(cls, tree: ast.AST, names: set[str]) -> list[tuple[str, ast.Call]]:
         """Every call to one of `names`, by bare name or attribute."""
-        out = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                fn = node.func
-                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-                if name in names:
-                    out.append((name, node))
-        return out
+        return [(cls._name(node), node) for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and cls._name(node) in names]
+
+    @staticmethod
+    def _spelled_risk_free(node: ast.AST | None) -> bool:
+        """A name or an attribute spelled risk_free (risk_free, self.risk_free,
+        chunks.risk_free) — never a constant, never another name."""
+        return (isinstance(node, ast.Name) and node.id == "risk_free") \
+            or (isinstance(node, ast.Attribute) and node.attr == "risk_free")
+
+    @staticmethod
+    def _own_nodes(fn: ast.FunctionDef):
+        """The nodes of a function's own body, not of functions or classes
+        nested in it (a nested def's names are its own)."""
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                stack.extend(ast.iter_child_nodes(node))
+
+    def _is_fed_hurdle(self, node: ast.AST) -> bool:
+        """A call to a hurdle helper whose first argument is the page's
+        risk_free."""
+        if not (isinstance(node, ast.Call) and self._name(node) in self._HURDLES):
+            return False
+        given = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "risk_free"), None)
+        return self._spelled_risk_free(given)
+
+    def _rf_violations(self, source: str) -> tuple[set[str], list[str]]:
+        """(the functions with a ratio call, each ratio call whose rf is not a
+        fed hurdle — directly, or through a name bound only from one)."""
+        tree = ast.parse(source)
+        sites, bad = set(), []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            nodes = list(self._own_nodes(fn))
+            # name -> whether EVERY binding of it in this function is a fed hurdle
+            bound: dict[str, bool] = {}
+            for node in nodes:
+                if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    ok = not isinstance(node, ast.AugAssign) and self._is_fed_hurdle(node.value)
+                    for target in targets:
+                        for leaf in ast.walk(target):
+                            if isinstance(leaf, ast.Name):
+                                bound[leaf.id] = bound.get(leaf.id, True) and ok
+            for node in nodes:
+                if not (isinstance(node, ast.Call)
+                        and self._name(node) in {"_sharpe", "_sortino"}):
+                    continue
+                sites.add(fn.name)
+                rf = next((kw.value for kw in node.keywords if kw.arg == "rf"),
+                          node.args[1] if len(node.args) > 1 else None)
+                if not (self._is_fed_hurdle(rf)
+                        or (isinstance(rf, ast.Name) and bound.get(rf.id, False))):
+                    bad.append(f"{self._name(node)} in {fn.name} (line {node.lineno})")
+        return sites, bad
 
     def _violations(self, source: str) -> tuple[set[str], list[str]]:
+        """(the risk_free takers, each call that drops risk_free, passes it a
+        value not spelled risk_free, or passes it without trades where the
+        taker takes trades)."""
         tree = ast.parse(source)
-        takers = self._kw_only_risk_free(tree)
-        missing = [f"{name} (line {call.lineno})"
-                   for name, call in self._calls(tree, takers)
-                   if not any(kw.arg == "risk_free" for kw in call.keywords)]
+        takers = self._kw_only(tree, "risk_free")
+        with_trades = takers & self._kw_only(tree, "trades")
+        missing = []
+        for name, call in self._calls(tree, takers):
+            given = next((kw.value for kw in call.keywords if kw.arg == "risk_free"), None)
+            if not self._spelled_risk_free(given):
+                missing.append(f"{name} (line {call.lineno})")
+            elif name in with_trades:
+                trades = next((kw.value for kw in call.keywords if kw.arg == "trades"), None)
+                if trades is None or (isinstance(trades, ast.Constant)
+                                      and trades.value is None):
+                    missing.append(f"{name} trades (line {call.lineno})")
+        # Any other call passing a risk_free keyword passes the page's too
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and self._name(node) not in takers:
+                for kw in node.keywords:
+                    if kw.arg == "risk_free" and not self._spelled_risk_free(kw.value):
+                        missing.append(f"{self._name(node)} (line {node.lineno})")
         return takers, missing
 
-    def test_every_ratio_call_passes_rf(self):
-        tree = ast.parse(inspect.getsource(dashboard))
-        calls = self._calls(tree, {"_sharpe", "_sortino"})
+    def test_every_ratio_call_passes_a_fed_hurdle(self):
+        source = inspect.getsource(dashboard)
+        calls = self._calls(ast.parse(source), {"_sharpe", "_sortino"})
         assert sum(name == "_sharpe" for name, _ in calls) >= 5
         assert sum(name == "_sortino" for name, _ in calls) >= 2
-        missing = [f"{name} (line {call.lineno})" for name, call in calls
-                   if len(call.args) < 2 and not any(kw.arg == "rf" for kw in call.keywords)]
-        assert missing == []
+        sites, bad = self._rf_violations(source)
+        assert self._RATIO_SITES <= sites, sorted(self._RATIO_SITES - sites)
+        assert bad == []
+        # Both hurdle helpers are used, each fed the page's risk_free
+        hurdles = self._calls(ast.parse(source), self._HURDLES)
+        assert {name for name, _ in hurdles} == self._HURDLES
+        assert all(self._is_fed_hurdle(call) for _, call in hurdles)
 
     def test_every_risk_free_taker_is_passed_it(self):
         source = inspect.getsource(dashboard)
         takers, missing = self._violations(source)
         assert self._EXPECTED <= takers, sorted(self._EXPECTED - takers)
+        assert {"_strategy_row", "_section_benchmark"} <= self._kw_only(
+            ast.parse(source), "trades")
         assert missing == []
         # Every taker but the entry point is actually called in the module,
         # so the rule above checked something for each
@@ -9066,3 +9230,57 @@ class TestRiskFreeIsThreaded:
         takers, missing = self._violations(source)
         assert takers == {"V", "f"}
         assert missing == ["f (line 9)", "V (line 9)"]
+
+    def test_the_rule_catches_a_risk_free_none_mutant(self):
+        # The mutant a keyword-only check let through: risk_free passed, as None
+        source = ("def f(x, *, risk_free=None):\n"
+                  "    return x\n"
+                  "class V:\n"
+                  "    def __init__(self, *, risk_free=None):\n"
+                  "        self.risk_free = risk_free\n"
+                  "    def go(self):\n"
+                  "        return f(1, risk_free=self.risk_free), f(2, risk_free=None)\n"
+                  "def g(risk_free, other):\n"
+                  "    return V(risk_free=other), f(3, risk_free=risk_free)\n"
+                  "def h(risk_free):\n"
+                  "    return helper(risk_free=None)\n")
+        _, missing = self._violations(source)
+        assert sorted(missing) == sorted(["f (line 7)", "V (line 9)", "helper (line 11)"])
+
+    def test_the_rule_catches_trades_dropped_beside_the_rates(self):
+        source = ("def row(eq, *, risk_free=None, trades=None):\n"
+                  "    return eq\n"
+                  "def g(eq, risk_free, sel):\n"
+                  "    return (row(eq, risk_free=risk_free, trades=sel),\n"
+                  "            row(eq, risk_free=risk_free),\n"
+                  "            row(eq, risk_free=risk_free, trades=None))\n")
+        _, missing = self._violations(source)
+        assert sorted(missing) == ["row trades (line 5)", "row trades (line 6)"]
+
+    def test_the_rule_catches_an_rf_mutant(self):
+        # The mutant a keyword-only check let through: rf passed, as 0.0 —
+        # and its cousins: a name bound from something else, rebound after a
+        # hurdle, or a hurdle not fed the page's rates
+        source = ("def a(d, eq, t, risk_free):\n"
+                  "    return _sharpe(d, rf=_rf_hurdle(risk_free, eq, t))\n"
+                  "def b(d, eq, t, risk_free):\n"
+                  "    h = _rf_hurdle(risk_free, eq, t)\n"
+                  "    return _sharpe(d, rf=h), _sortino(d, rf=h)\n"
+                  "def c(d, risk_free):\n"
+                  "    return _sharpe(d, rf=0.0)\n"
+                  "def e(d, risk_free):\n"
+                  "    h = 0.0\n"
+                  "    return _sortino(d, rf=h)\n"
+                  "def f(d, eq, t, risk_free):\n"
+                  "    h = _rf_hurdle(risk_free, eq, t)\n"
+                  "    h = 0.0\n"
+                  "    return _sharpe(d, rf=h)\n"
+                  "def g(d, eq, t, risk_free):\n"
+                  "    return _sharpe(d, rf=_rf_hurdle(None, eq, t)), _sharpe(d)\n"
+                  "def k(d, idx, risk_free):\n"
+                  "    return _sharpe(d, rf=_rf_hurdle_invested(risk_free, idx))\n")
+        sites, bad = self._rf_violations(source)
+        assert sites == {"a", "b", "c", "e", "f", "g", "k"}
+        assert sorted(bad) == ["_sharpe in c (line 7)", "_sharpe in f (line 14)",
+                               "_sharpe in g (line 16)", "_sharpe in g (line 16)",
+                               "_sortino in e (line 10)"]

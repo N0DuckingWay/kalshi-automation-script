@@ -80,8 +80,10 @@ config.py (constants), _http.py (retry + raw-response fetch)
                                      the live bot never imports it.
                                      treasury.py → dashboard.py: every
                                      Sharpe/Sortino subtracts its per-day
-                                     yield; the backtest.py → treasury.py
-                                     wiring is a later commit)
+                                     yield — a strategy curve's on its capital
+                                     in open trades only; treasury.py →
+                                     backtest.py: load_risk_free_rates() hands
+                                     the yields to generate_dashboard)
 
     (historical.py also imports auth.py's build_client for its own client
      builders, _http.py directly for its raw signed GETs, and scanner.py's
@@ -208,7 +210,9 @@ backtest.py (CLI)
   ├─ treasury.load_risk_free_rates()         — 8-week T-bill auction yields from Treasury Fiscal
   │                                             Data (one open, no-key GET that never raises —
   │                                             falls back to the last saved download, then to
-  │                                             "unavailable"); passed to generate_dashboard(risk_free=)
+  │                                             "unavailable"; a host that swallows packets can
+  │                                             hold it ~4 min: 6 x 30 s timeouts + 62 s of
+  │                                             backoff); passed to generate_dashboard(risk_free=)
   └─ dashboard.generate_dashboard()          — write HTML report: a k section and two k̂ cards
                                                 that follow the filter bar, a k̂ breakdown by
                                                 category / tag / band (regrouped from each band's
@@ -325,6 +329,9 @@ falls back to `kalshi_private_key.pem` when it's absent.
   backtest_dashboard.html         ← Backtest HTML dashboard (rewritten by every run)
   backtest_cache/                ← Disk cache for historical data
     series_categories.json        ← Kalshi's category + tags per series (dashboard breakdown; refreshed weekly)
+    treasury_bill_rates.json      ← The 8-week T-bill's auction yields (Treasury Fiscal Data), the
+                                    dashboard's Sharpe/Sortino risk-free rate; rewritten by every
+                                    successful download and read only when the next one fails
     settled_markets_*.jsonl.gz    ← Assembled market corpus (gzipped JSON lines, streamed —
                                     never loaded whole), keyed by start date (and by
                                     eligibility-filter tag when the backtester filters

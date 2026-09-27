@@ -124,8 +124,10 @@ Notes:
     exactly as before rates existed, and reads no date or trade. Both ratios
     read 0.0 on a curve that never moves (_varies), which a nonzero rate
     would otherwise turn into -9.6e16 (Sharpe) and exactly -sqrt(365)
-    (Sortino). The header says which rate was subtracted, and on what, or
-    that none was (_risk_free_html), on every page.
+    (Sortino) at a constant rate, and into a large finite negative at a rate
+    that changes inside the window. The header says which rate was
+    subtracted, and on what, or that none was (_risk_free_html), on every
+    page.
 
     Every section but the scenario explorer is rendered at the run's primary
     scenario — its primary k (the CLI's --interval-discount, or
@@ -401,8 +403,11 @@ def _varies(returns: pd.Series) -> bool:
     already returned 0.0 there (a zero standard deviation, no downside), but a
     nonzero rf turns every flat day into the same small negative excess
     return, whose float standard deviation can come out ~1e-20 rather than 0
-    (measured: _sharpe -9.6e16 over 300 flat rows at rf = 0.05), and which
-    _sortino reads as exactly -sqrt(periods_per_year).
+    (measured: _sharpe -9.6e16 over 300 flat rows at a constant rf = 0.05),
+    and which _sortino reads as exactly -sqrt(periods_per_year) — both at a
+    constant rate; with a per-day rate that changes inside the window the
+    excess is no longer constant and each ratio comes out a large finite
+    negative instead. The guard returns 0.0 either way.
 
     Args:
         returns (pd.Series): Per-period returns.
@@ -626,14 +631,17 @@ def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
     Returns:
         float: Annualized Sharpe ratio. 0.0 when daily_returns never varies (a
             curve with no trade) or the excess return's standard deviation is
-            zero. The first guard matters once rf is nonzero: a flat curve's
-            excess return is then a constant whose float standard deviation
-            can come out ~1e-20 rather than 0 (measured: -9.6e16 over 300 flat
-            rows at rf = 0.05).
+            zero. The first guard matters once rf is nonzero: at a constant
+            rate a flat curve's excess return is a constant whose float
+            standard deviation can come out ~1e-20 rather than 0 (measured:
+            -9.6e16 over 300 flat rows at rf = 0.05); at a rate that changes
+            inside the window it is a large finite negative. 0.0 either way.
 
     Raises:
         ValueError: If rf is an array whose length differs from daily_returns
-            (the positional subtraction cannot broadcast).
+            and is not 1 (the positional subtraction cannot broadcast; a
+            length-1 array broadcasts like a scalar) — only on a series that
+            varies, since a flat one returns 0.0 before rf is read.
     """
     if not _varies(daily_returns):
         return 0.0
@@ -674,12 +682,15 @@ def _sortino(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
     Returns:
         float: Annualized Sortino ratio. 0.0 when daily_returns never varies —
             with a nonzero rf every flat day would otherwise be a downside day,
-            and a flat curve reads exactly -sqrt(periods_per_year) — or when
-            there are no negative excess returns.
+            and a flat curve reads exactly -sqrt(periods_per_year) at a
+            constant rate (a large finite negative at one that changes inside
+            the window) — or when there are no negative excess returns.
 
     Raises:
         ValueError: If rf is an array whose length differs from daily_returns
-            (the positional subtraction cannot broadcast).
+            and is not 1 (the positional subtraction cannot broadcast; a
+            length-1 array broadcasts like a scalar) — only on a series that
+            varies, since a flat one returns 0.0 before rf is read.
     """
     if not _varies(daily_returns):
         return 0.0
@@ -3950,9 +3961,9 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
 
     Always renders a line (DR-66: absence must never be the only signal).
     Grey when the yields were downloaded this run, or when the caller
-    supplied none (every ratio at 0%). Amber when the API could not be
-    reached and an earlier download stands in. Red when neither was
-    available (every ratio at 0%). With rates it says what the yield is
+    supplied none (every ratio at 0%). Amber when the download failed and an
+    earlier download stands in. Red when neither was available (every ratio
+    at 0%). With rates it says what the yield is
     charged on: a strategy curve's capital in open trades (idle cash is
     taken to earn the same yield — _rf_hurdle), the S&P 500 row's whole
     value (_rf_hurdle_invested).
@@ -3973,8 +3984,8 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
                 "Sortino ratio on this page subtracts 0%.</p>")
     if risk_free.latest is None:
         return ('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
-                "Risk-free rate unavailable: the Treasury's Fiscal Data API could not be "
-                "reached and no earlier download is saved, so every Sharpe and Sortino "
+                "Risk-free rate unavailable: the download from the Treasury's Fiscal Data "
+                "API failed and no earlier download is saved, so every Sharpe and Sortino "
                 f"ratio on this page subtracts 0% instead of the {term} bill's yield.</p>")
     first_day = risk_free.auctions[0][0]
     last_day, last_rate = risk_free.latest
@@ -4003,7 +4014,7 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
              if fetched_at is not None else "at a time not recorded")
     if risk_free.source == SOURCE_CACHE:
         return ('<p style="color:#E65100; font-size:14px; font-weight:700;">'
-                + html.escape(text + " The API could not be reached: these are the yields "
+                + html.escape(text + " The download failed: these are the yields "
                               f"downloaded {stamp}, whose latest auction ({last_day}, "
                               f"{last_rate:.3%}) stands for every day after it.",
                               quote=False) + "</p>")
