@@ -976,7 +976,8 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # and rf is not 0 on a page built with rates (dashboard.generate_dashboard's
 # risk_free): every dashboard ratio then subtracts the 8-week Treasury bill's
 # yield in force on each day (treasury.py, the risk-free block below; rf / 365
-# per calendar day on a strategy curve, rf / 252 per trading day on the ^GSPC
+# per calendar day on a strategy curve, charged on its capital in open trades
+# only, and rf / 252 per trading day, in full, on the fully invested ^GSPC
 # row), so the sqrt(365/252) identity holds only for a page built without
 # rates (rf = 0).
 #
@@ -994,7 +995,9 @@ CALENDAR_DAYS_PER_YEAR: int = 365
 # curve, the yield of the most recent auction of this Treasury bill on or before
 # that day (treasury.RiskFreeRates.annual_on) — not one fixed hurdle, because a
 # multi-year window spans very different rates (near 0% in 2020-21, above 5% in
-# 2023). treasury.load_risk_free_rates() downloads them from the Treasury's
+# 2023). A strategy curve is charged it only on its capital in open trades
+# (dashboard._rf_hurdle: idle cash is taken to earn the yield, since the
+# backtester books it at 0%); the ^GSPC row, fully invested, in full. treasury.load_risk_free_rates() downloads them from the Treasury's
 # Fiscal Data API ("Treasury Securities Auctions Data": open, no key, GET only,
 # every value a string); backtest.py calls it beside the series-category read.
 # REPORTING ONLY: nothing sizes, prices or settles on it, and the live bot never

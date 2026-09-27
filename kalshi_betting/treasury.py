@@ -19,7 +19,10 @@ Dependencies:
     the TREASURY_API_* bounds from config.py, api_call_with_retry from _http.py
     (the retried read-only GET wrapper), and CACHE_DIR, _load_json_cache,
     _save_json_cache and _exception_summary from historical.py. Imported by
-    backtest.py (load_risk_free_rates) and dashboard.py (RiskFreeRates).
+    backtest.py (load_risk_free_rates) and dashboard.py (RiskFreeRates,
+    SOURCE_CACHE and day_numbers — the last so the dashboard's
+    deployed-capital hurdle reads a curve's dates on the same day numbering
+    as the yield lookup, converting them once).
 
 Notes:
     The endpoint is "Treasury Securities Auctions Data"
@@ -29,6 +32,9 @@ Notes:
     weekly bill. A date before the first auction (2018-10-16) takes that
     auction's yield. The cache stores the API's own records, so the one
     parser (_parse_auctions) reads a download and a cached copy alike.
+    Dates are looked up as day numbers (day_numbers: date.toordinal,
+    vectorized); annual_on converts and looks up, annual_on_days looks up
+    day numbers a caller already converted.
 """
 import json
 import logging
@@ -115,14 +121,66 @@ class RiskFreeRates:
             np.ndarray: One annual decimal yield per date; all zeros when the
                 rates are unavailable.
         """
-        idx = pd.DatetimeIndex(pd.to_datetime(dates))
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
+        return self.annual_on_days(day_numbers(dates))
+
+    def annual_on_days(self, days: np.ndarray) -> np.ndarray:
+        """
+        annual_on, for dates already converted to day numbers (day_numbers).
+
+        For a caller that reads the same dates twice — the dashboard's
+        deployed-capital hurdle converts a curve's dates once and looks up
+        both the yield and the capital in open trades on them.
+
+        Args:
+            days (np.ndarray): Proleptic Gregorian ordinals (day_numbers'),
+                one per return row.
+
+        Returns:
+            np.ndarray: One annual decimal yield per day, positional; all
+                zeros when the rates are unavailable.
+        """
         if not self.auctions:
-            return np.zeros(len(idx))
-        days = idx.normalize().values.astype("datetime64[D]").astype(np.int64) + _EPOCH_ORDINAL
+            return np.zeros(len(days))
         pos = np.searchsorted(self._days, days, side="right") - 1
         return self._rates[np.maximum(pos, 0)]
+
+
+def day_numbers(dates) -> np.ndarray:
+    """
+    Dates as proleptic Gregorian ordinals (date.toordinal), vectorized.
+
+    The one day numbering RiskFreeRates' lookups use, and the one the
+    dashboard's capital-deployed helper matches trades' entry and exit dates
+    against (dashboard._deployed_on_days), so the yield and the capital a
+    curve's row is charged on are read on the same calendar day.
+
+    A datetime64 column or a DatetimeIndex is converted in numpy; anything
+    else — _build_equity_curve's column of datetime.date, or datetimes and
+    pd.Timestamps — by each value's own toordinal(), which reads a timestamp's
+    calendar date exactly as datetime.date() does (a tz-aware one on its own
+    wall clock) and costs about 60% of a pd.to_datetime pass over the same
+    column. A value without a toordinal (a date string) falls back to
+    pd.to_datetime.
+
+    Args:
+        dates: Dates — a column of datetime.date, of datetimes or
+            pd.Timestamps, or a DatetimeIndex (a tz-aware one is read on its
+            own calendar date).
+
+    Returns:
+        np.ndarray: One int64 ordinal per date, positional.
+    """
+    if isinstance(dates, pd.DatetimeIndex | pd.Series) and dates.dtype.kind == "M":
+        idx = pd.DatetimeIndex(dates)
+    else:
+        values = dates if hasattr(dates, "__len__") else list(dates)
+        try:
+            return np.fromiter((d.toordinal() for d in values), np.int64, len(values))
+        except (AttributeError, TypeError, ValueError):
+            idx = pd.DatetimeIndex(pd.to_datetime(values))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize().values.astype("datetime64[D]").astype(np.int64) + _EPOCH_ORDINAL
 
 
 def _page_url(page: int) -> str:

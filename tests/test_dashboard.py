@@ -3,8 +3,10 @@ the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
 annualization base and its per-row use in the benchmark table (DR-56), the
 interval-discount (k) section, whose curve and per-k table follow the page-wide
 filter bar's k and size cap, and the risk-free rate every Sharpe and Sortino
-subtracts day by day (TestRiskFreeHurdle, TestRiskFreeReachesEveryRatio,
-TestRiskFreeHeader, and the AST pin TestRiskFreeIsThreaded).
+subtracts day by day, on a strategy curve's capital in open trades only
+(TestRiskFreeHurdle, TestRiskFreeOnDeployedCapital, TestCapitalDeployedParity,
+TestRiskFreeReachesEveryRatio, TestRiskFreeHeader, and the AST pin
+TestRiskFreeIsThreaded).
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -8303,6 +8305,18 @@ def _rates(source: str = SOURCE_API,
                          fetched_at)
 
 
+def _steep_rates() -> RiskFreeRates:
+    """_rates()'s two auctions at 60% and 95%, for whole-page tests. The page
+    fixtures hold at most about 1% of their balance in open trades, so at a
+    real bill yield — charged on that capital only — their ratios move in the
+    third decimal and read the same as at rf = 0 where the page shows them
+    (two decimals). A steep yield makes every rate-adjusted figure on the page
+    differ visibly from its rf = 0 value, so a dropped pass-through cannot
+    hide behind the rounding."""
+    return RiskFreeRates(((date(2026, 1, 1), 0.60), (date(2026, 1, 8), 0.95)), SOURCE_API,
+                         datetime(2026, 9, 27, 6, 30, tzinfo=UTC))
+
+
 def _hand_ratios(returns: pd.Series, rf, periods: int) -> tuple[float, float]:
     """(Sharpe, Sortino) of a returns series against a per-period rf array,
     computed by hand from the textbook definitions — never through the
@@ -8312,6 +8326,37 @@ def _hand_ratios(returns: pd.Series, rf, periods: int) -> tuple[float, float]:
     downside = np.minimum(excess, 0.0)
     sortino = excess.mean() / math.sqrt(float(np.mean(downside ** 2))) * math.sqrt(periods)
     return float(sharpe), float(sortino)
+
+
+def _hand_annual(rates: RiskFreeRates, day: date) -> float:
+    """The yield in force on a day, by hand: the latest auction on or before
+    it, or the first auction's before the first (0.0 with none)."""
+    if not rates.auctions:
+        return 0.0
+    in_force = [rate for auction_day, rate in rates.auctions if auction_day <= day]
+    return in_force[-1] if in_force else rates.auctions[0][1]
+
+
+def _hand_hurdle(eq: pd.DataFrame, trades: list[BacktestTrade],
+                 rates: RiskFreeRates) -> np.ndarray:
+    """
+    A strategy curve's per-row annual hurdle by hand, never through the
+    helpers under test: row t is charged the yield in force on its date times
+    the share of the previous row's portfolio in open trades — every trade
+    with entry <= previous date < exit, fee-inclusive — and row 0 nothing.
+
+    The rule a trade whose entry and exit fall on the curve's axis (or its
+    exit after the axis's end) follows; every fixture's does.
+    """
+    days = [d.date() if isinstance(d, datetime) else d for d in eq["date"]]
+    values = [float(v) for v in eq["portfolio_value"]]
+    out = [0.0] if days else []
+    for row in range(1, len(days)):
+        prev = days[row - 1]
+        deployed = sum(t.total_cost + t.fees for t in trades
+                       if t.entry_date <= prev < t.exit_date)
+        out.append(_hand_annual(rates, days[row]) * deployed / values[row - 1])
+    return np.array(out, dtype=float)
 
 
 class TestRiskFreeHurdle:
@@ -8350,7 +8395,8 @@ class TestRiskFreeHurdle:
                             * np.sqrt(365))
         zeros = RiskFreeRates((), SOURCE_UNAVAILABLE, None).annual_on(
             [date(2026, 1, 5) + timedelta(days=i) for i in range(len(_RETURNS))])
-        for rf in (0.0, dashboard._rf_hurdle(None, []), zeros):
+        # _rf_hurdle without rates reads neither the frame nor the trades
+        for rf in (0.0, dashboard._rf_hurdle(None, None, None), zeros):
             assert dashboard._sharpe(_RETURNS, rf=rf) == old_sharpe
             assert dashboard._sortino(_RETURNS, rf=rf) == old_sortino
 
@@ -8387,27 +8433,261 @@ class TestRiskFreeHurdle:
 
     def test_the_hurdle(self):
         dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(6)]
-        assert dashboard._rf_hurdle(None, dates) == 0.0
-        assert list(dashboard._rf_hurdle(_rates(), dates)) == [0.03, 0.03, 0.03, 0.05, 0.05,
-                                                               0.05]
+        eq = make_equity([1000.0] * 6)
+        assert dashboard._rf_hurdle(None, eq, [make_trade()]) == 0.0
+        # Fully invested (the ^GSPC row): the whole yield on every date
+        assert dashboard._rf_hurdle_invested(None, dates) == 0.0
+        assert list(dashboard._rf_hurdle_invested(_rates(), dates)) == [
+            0.03, 0.03, 0.03, 0.05, 0.05, 0.05]
         unavailable = RiskFreeRates((), SOURCE_UNAVAILABLE, None)
-        assert list(dashboard._rf_hurdle(unavailable, dates)) == [0.0] * 6
+        assert list(dashboard._rf_hurdle_invested(unavailable, dates)) == [0.0] * 6
+        assert list(dashboard._rf_hurdle(unavailable, eq, [make_trade()])) == [0.0] * 6
+        # A strategy curve: the yield on the previous close's capital in open
+        # trades — make_trade's $3.50 + fees from 2026-01-05, on $1,000
+        t = make_trade()
+        share = (t.total_cost + t.fees) / 1000.0
+        assert list(dashboard._rf_hurdle(_rates(), eq, [t])) == pytest.approx(
+            [0.0, 0.03 * share, 0.03 * share, 0.05 * share, 0.05 * share, 0.05 * share])
 
     def test_a_filtered_frame_is_read_by_position(self):
         # _view_payload cuts a curve to the page's axis without resetting its
-        # index: the hurdle must follow the rows, not the index labels
+        # index: the hurdle must follow the rows, not the index labels. The
+        # trade is held 2026-01-08 to 01-11, inside the cut
         eq = make_equity([1000.0, 1000.0, 1010.0, 1004.0, 1020.0, 1015.0, 1030.0, 1025.0])
         cut = eq[eq.index >= 2]
         assert cut.index[0] == 2
         rates = _rates()
-        on_cut = dashboard._performance_kpis(cut, [make_trade()], 1000.0, risk_free=rates)
-        on_reset = dashboard._performance_kpis(cut.reset_index(drop=True), [make_trade()],
+        held = [dataclasses.replace(make_trade(), entry_date=date(2026, 1, 8),
+                                    exit_date=date(2026, 1, 11))]
+        on_cut = dashboard._performance_kpis(cut, held, 1000.0, risk_free=rates)
+        on_reset = dashboard._performance_kpis(cut.reset_index(drop=True), held,
                                                1000.0, risk_free=rates)
         assert on_cut == on_reset
         cards = {key: value for key, _, value, _ in on_cut}
-        sharpe, sortino = _hand_ratios(cut["daily_return"], rates.annual_on(cut["date"]), 365)
+        hurdle = _hand_hurdle(cut, held, rates)
+        assert np.count_nonzero(hurdle) == 3
+        sharpe, sortino = _hand_ratios(cut["daily_return"], hurdle, 365)
         assert (cards["sharpe"], cards["sortino"]) == (f"{sharpe:.2f}", f"{sortino:.2f}")
         assert cards["sharpe"] != "nan"
+
+
+def _old_capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> list[float]:
+    """dashboard._capital_deployed's body before it was vectorized
+    (49deade), verbatim but for names: the oracle its delegation to
+    _deployed_on_days must match bit for bit."""
+    entry_by_date: dict[date, float] = {}
+    exit_by_date: dict[date, float] = {}
+    for t in trades:
+        cost = t.total_cost + t.fees
+        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + cost
+        exit_by_date[t.exit_date] = exit_by_date.get(t.exit_date, 0.0) + cost
+    invested_by_date: list[float] = []
+    running_invested = 0.0
+    for d in equity_df["date"]:
+        d = d.date() if isinstance(d, datetime) else d
+        running_invested += entry_by_date.get(d, 0.0) - exit_by_date.get(d, 0.0)
+        invested_by_date.append(max(0.0, running_invested))
+    return invested_by_date
+
+
+def _float_bits(values: list[float]) -> list[str]:
+    """Each value's exact IEEE-754 bits (float.hex keeps -0.0 apart from 0.0)."""
+    return [float(v).hex() for v in values]
+
+
+def _held(entry: date, exit_: date, cost: float, fees: float = 0.0) -> BacktestTrade:
+    """make_trade held from `entry` to `exit_` at `cost` (+ `fees`)."""
+    return dataclasses.replace(make_trade(), entry_date=entry, exit_date=exit_,
+                               total_cost=cost, fees=fees)
+
+
+class TestCapitalDeployedParity:
+    """_capital_deployed now returns _deployed_on_days (vectorized, one
+    definition shared with the risk-free hurdle). It must be BIT-identical to
+    the per-row loop it replaced — the Risk section's chart and every filter
+    view's redraw of it read it, and TestGoldenSections' Risk digest pins the
+    rendered chart — on every shape a curve and its trades can take."""
+
+    _D = date(2026, 1, 5)
+
+    @classmethod
+    def _curve(cls, rows: int, *, stamped: bool = False, tz: str | None = None) -> pd.DataFrame:
+        eq = make_equity([1000.0 + 3.0 * (i % 5) for i in range(rows)], start=cls._D)
+        if stamped:
+            eq = eq.assign(date=pd.to_datetime(eq["date"]))
+        if tz is not None:
+            eq = eq.assign(date=pd.to_datetime(eq["date"]).dt.tz_localize(tz))
+        return eq
+
+    @classmethod
+    def _fixtures(cls) -> dict[str, tuple[list[BacktestTrade], pd.DataFrame]]:
+        d = cls._D
+        day = timedelta(days=1)
+        return {
+            "no trade": ([], cls._curve(10)),
+            "one trade": ([make_trade()], cls._curve(10)),
+            "same-day entry and exit": ([_held(d + 2 * day, d + 2 * day, 50.0, 1.5)],
+                                        cls._curve(10)),
+            "overlapping": ([_held(d, d + 6 * day, 120.0, 2.1),
+                             _held(d + 2 * day, d + 4 * day, 33.3, 0.7),
+                             _held(d + 2 * day, d + 9 * day, 0.1, 0.07),
+                             _held(d + 4 * day, d + 4 * day, 7.0, 0.3)], cls._curve(12)),
+            # Before the axis: its exit subtracts with nothing added, and the
+            # running sum stays below zero (floored per row, not in the sum)
+            "entry before the axis": ([_held(d - 3 * day, d + 2 * day, 40.0, 1.0),
+                                       _held(d + 1 * day, d + 5 * day, 25.0, 0.5)],
+                                      cls._curve(8)),
+            # After the axis: its exit never subtracts
+            "exit after the axis": ([_held(d + 2 * day, d + 30 * day, 60.0, 1.2)],
+                                    cls._curve(8)),
+            "entirely off the axis": ([_held(d + 40 * day, d + 45 * day, 9.0, 0.1)],
+                                      cls._curve(8)),
+            "a Timestamp date column": ([make_trade(), _held(d + 1 * day, d + 3 * day, 5.0)],
+                                        cls._curve(10, stamped=True)),
+            "a tz-aware Timestamp column": ([make_trade()],
+                                            cls._curve(10, tz="America/New_York")),
+            "an empty curve": ([make_trade()], cls._curve(0)),
+            "float noise": ([_held(d, d + 3 * day, 0.1, 0.2), _held(d, d + 5 * day, 0.7, 0.1),
+                             _held(d + 1 * day, d + 3 * day, 1e-9, 0.3),
+                             _held(d + 1 * day, d + 5 * day, 123.456, 0.0)], cls._curve(8)),
+        }
+
+    @pytest.mark.parametrize("name", [
+        "no trade", "one trade", "same-day entry and exit", "overlapping",
+        "entry before the axis", "exit after the axis", "entirely off the axis",
+        "a Timestamp date column", "a tz-aware Timestamp column", "an empty curve",
+        "float noise"])
+    def test_bit_identical_to_the_loop(self, name):
+        trades, eq = self._fixtures()[name]
+        new = dashboard._capital_deployed(trades, eq)
+        old = _old_capital_deployed(trades, eq)
+        assert _float_bits(new) == _float_bits(old)
+        assert all(type(v) is float for v in new)
+
+    def test_bit_identical_on_randomized_trades(self):
+        # 400 random curves and trade sets: entries and exits on, before and
+        # after the axis, same-day trades, repeated dates, costs of every size
+        rng = np.random.default_rng(20260927)
+        for _ in range(400):
+            rows = int(rng.integers(0, 40))
+            eq = self._curve(rows, stamped=bool(rng.integers(0, 2)))
+            trades = []
+            for _ in range(int(rng.integers(0, 10))):
+                entry = self._D + timedelta(days=int(rng.integers(-8, rows + 8)))
+                exit_ = entry + timedelta(days=int(rng.integers(0, 15)))
+                cost = float(rng.choice([rng.random() * 800, 3.5, 0.1, 1e-9]))
+                trades.append(_held(entry, exit_, cost, float(rng.random() * 5)))
+            assert _float_bits(dashboard._capital_deployed(trades, eq)) \
+                == _float_bits(_old_capital_deployed(trades, eq))
+
+
+class TestRiskFreeOnDeployedCapital:
+    """A strategy curve is charged the bill's yield only on its capital in
+    open trades (idle cash is taken to earn it): row t's hurdle is the yield
+    in force on its date times deployed[t-1] / portfolio_value[t-1]. The
+    ^GSPC row stays fully invested."""
+
+    _START = date(2026, 1, 5)
+
+    @pytest.mark.parametrize("days_held", [0, 1, 7])
+    def test_a_trade_held_n_days_is_charged_exactly_n_days(self, days_held):
+        entry = date(2026, 1, 9)
+        trade = _held(entry, entry + timedelta(days=days_held), 2_000.0, 12.0)
+        eq = backtester._build_equity_curve([trade], self._START, 10_000.0,
+                                            end_date=date(2026, 1, 25))
+        hurdle = dashboard._rf_hurdle(_rates(), eq, [trade])
+        charged = [eq["date"].iloc[i] for i in np.flatnonzero(hurdle)]
+        # The days after the entry, through the settlement day
+        assert charged == [entry + timedelta(days=i) for i in range(1, days_held + 1)]
+        assert hurdle == pytest.approx(_hand_hurdle(eq, [trade], _rates()))
+
+    def test_an_idle_curve_equals_rf_zero_exactly(self):
+        # No trade: a curve that moves but holds nothing overnight is charged
+        # nothing, bit for bit — whatever the rate
+        eq = make_equity([1000.0, 1000.0, 1010.0, 1004.0, 1020.0, 1015.0, 1030.0, 1025.0])
+        for trades in ([], [_held(date(2026, 1, 7), date(2026, 1, 7), 400.0, 3.0)]):
+            hurdle = dashboard._rf_hurdle(_rates(), eq, trades)
+            assert not hurdle.any()
+            for helper in (dashboard._sharpe, dashboard._sortino):
+                assert helper(eq["daily_return"], rf=hurdle) == helper(eq["daily_return"])
+            assert dashboard._performance_kpis(eq, trades, 1000.0, risk_free=_rates()) \
+                == dashboard._performance_kpis(eq, trades, 1000.0)
+        # A whole run's curve with one same-day trade: every ratio as at 0%
+        same_day = [_held(date(2026, 1, 7), date(2026, 1, 7), 400.0, 3.0)]
+        curve = backtester._build_equity_curve(same_day, self._START, 1000.0,
+                                               end_date=date(2026, 1, 20))
+        assert dashboard._varies(curve["daily_return"])
+        assert dashboard._strategy_row(curve, 1000.0, risk_free=_rates(), trades=same_day) \
+            == dashboard._strategy_row(curve, 1000.0)
+
+    def test_a_fully_deployed_curve_equals_the_full_hurdle(self):
+        # Each close's whole value is in a trade held to the next close, with
+        # no fee: f = 1 on every row after the first, so the hurdle is the
+        # whole yield there (row 0 has no previous close and is charged 0)
+        eq = make_equity([1000.0, 1004.0, 998.0, 1010.0, 1007.0, 1015.0, 1012.0, 1020.0])
+        days = list(eq["date"])
+        values = list(eq["portfolio_value"])
+        trades = [_held(days[i], days[i + 1], values[i]) for i in range(len(days) - 1)]
+        hurdle = dashboard._rf_hurdle(_rates(), eq, trades)
+        full = dashboard._rf_hurdle_invested(_rates(), eq["date"])
+        assert hurdle[0] == 0.0
+        assert list(hurdle[1:]) == list(full[1:])
+        full_but_row_0 = np.concatenate([[0.0], full[1:]])
+        assert dashboard._sharpe(eq["daily_return"], rf=hurdle) \
+            == dashboard._sharpe(eq["daily_return"], rf=full_but_row_0)
+        assert dashboard._sharpe(eq["daily_return"], rf=hurdle) \
+            < dashboard._sharpe(eq["daily_return"])
+
+    def test_each_slice_is_charged_on_its_own_trades(self):
+        # _view_payload's slices: each its own curve (_build_equity_curve over
+        # its trades alone) and its own trades. The DOLLARS each is charged a
+        # day — hurdle x previous value — sum to the whole run's, because
+        # deployed capital adds up and a slice is never charged on another's
+        trades = _flt_trades()
+        slices = [trades[:2], trades[2:]]
+        end = date(2026, 1, 25)
+
+        def charged(listed):
+            curve = backtester._build_equity_curve(listed, _FLT_START, 1000.0, end_date=end)
+            hurdle = dashboard._rf_hurdle(_rates(), curve, listed)
+            assert hurdle == pytest.approx(_hand_hurdle(curve, listed, _rates()))
+            previous = np.concatenate([[0.0], curve["portfolio_value"].to_numpy()[:-1]])
+            return hurdle * previous
+
+        whole = charged(trades)
+        assert whole.any()
+        assert charged(slices[0]) + charged(slices[1]) == pytest.approx(whole)
+        assert charged(slices[0]).any() and charged(slices[1]).any()
+
+    def test_rates_without_trades_raise(self, monkeypatch):
+        monkeypatch.setattr(dashboard.yf, "download", lambda *a, **k: pd.DataFrame())
+        eq = make_equity([1000.0, 1010.0, 1004.0])
+        with pytest.raises(TypeError, match="without the curve's trades"):
+            dashboard._rf_hurdle(_rates(), eq, None)
+        with pytest.raises(TypeError, match="without the curve's trades"):
+            dashboard._strategy_row(eq, 1000.0, risk_free=_rates())
+        with pytest.raises(TypeError, match="without the curve's trades"):
+            dashboard._section_benchmark(eq, date(2026, 1, 5), 1000.0, risk_free=_rates())
+
+    def test_without_rates_no_date_or_trade_is_read(self):
+        # The strategy row on a frame with no date column: rf = None must not
+        # touch it (C2's _rf_hurdle read equity_df["date"] and raised KeyError)
+        eq = make_equity([1000.0, 1010.0, 1004.0]).drop(columns="date")
+        assert dashboard._strategy_row(eq, 1000.0)["sharpe"] \
+            == f"{dashboard._sharpe(eq['daily_return']):.2f}"
+        assert dashboard._rf_hurdle(None, eq, None) == 0.0
+
+    def test_the_sp_row_is_still_charged_the_whole_yield(self, monkeypatch):
+        monkeypatch.setattr(dashboard.yf, "download", lambda *a, **k: pd.DataFrame(
+            {"Close": _RF_SP_CLOSE}, index=_RF_SP_INDEX))
+        eq = backtester._build_equity_curve([], _FLT_START, 1000.0, end_date=date(2026, 1, 14))
+        out = dashboard._section_benchmark(eq, _FLT_START, 1000.0, risk_free=_rates(),
+                                           trades=[])
+        sp_daily = pd.Series(_RF_SP_CLOSE, index=_RF_SP_INDEX).pct_change().dropna()
+        whole = np.array([_hand_annual(_rates(), d.date()) for d in sp_daily.index])
+        assert _RF_SP_ROW.search(out).group(2) == f"{_hand_ratios(sp_daily, whole, 252)[0]:.2f}"
+        # ... while the strategy row, holding nothing, is charged nothing
+        assert re.search(r'<td id="bench-sharpe"[^>]*>([^<]*)</td>', out).group(1) == "0.00"
 
 
 # ^GSPC closes for the risk-free page: eight trading days around the second
@@ -8438,8 +8718,8 @@ def _rf_page(monkeypatch, tmp_path, sweep: BacktestSweep,
 def rf_pages(tmp_path_factory):
     """(sweep, rates, {"rf": page with the rates, "zero": page without}) —
     one _ex_sweep (a band sweep with a size-cap sweep: every section that
-    shows a ratio has data) rendered both ways."""
-    sweep, rates = _ex_sweep(), _rates()
+    shows a ratio has data) rendered both ways, at _steep_rates()."""
+    sweep, rates = _ex_sweep(), _steep_rates()
     pages = {}
     with pytest.MonkeyPatch.context() as mp:
         for name, rf in (("rf", rates), ("zero", None)):
@@ -8451,19 +8731,22 @@ class TestRiskFreeReachesEveryRatio:
     """generate_dashboard(risk_free=...) reaches every Sharpe and Sortino on
     the page: the performance cards, both benchmark rows, the per-k table
     (static and walked), every filter-bar chunk and the scenario explorer.
-    Each figure is checked against its own curve's rf-adjusted value AND
-    against the same page built without rates, so a dropped pass-through —
-    which would silently compute at 0% — fails here."""
+    Each figure is checked against its own curve's rf-adjusted value — the
+    yield on that curve's own trades' open capital, computed by hand
+    (_hand_hurdle) — AND against the same page built without rates, so a
+    dropped pass-through — which would silently compute at 0% — fails here."""
 
     @staticmethod
-    def _expected(eq: pd.DataFrame, rates: RiskFreeRates) -> tuple[str, str]:
-        return (f"{dashboard._sharpe(eq['daily_return'], rf=rates.annual_on(eq['date'])):.2f}",
-                f"{dashboard._sortino(eq['daily_return'], rf=rates.annual_on(eq['date'])):.2f}")
+    def _expected(eq: pd.DataFrame, trades: list[BacktestTrade],
+                  rates: RiskFreeRates) -> tuple[str, str]:
+        hurdle = _hand_hurdle(eq, trades, rates)
+        return (f"{dashboard._sharpe(eq['daily_return'], rf=hurdle):.2f}",
+                f"{dashboard._sortino(eq['daily_return'], rf=hurdle):.2f}")
 
     def test_the_performance_cards(self, rf_pages):
         sweep, rates, pages = rf_pages
         eq = sweep.primary.equity_df
-        sharpe, sortino = self._expected(eq, rates)
+        sharpe, sortino = self._expected(eq, sweep.primary.trades, rates)
         assert _page_kpi(pages["rf"], "sharpe")[0] == sharpe
         assert _page_kpi(pages["rf"], "sortino")[0] == sortino
         assert _page_kpi(pages["zero"], "sharpe")[0] == f"{dashboard._sharpe(eq['daily_return']):.2f}"
@@ -8476,12 +8759,13 @@ class TestRiskFreeReachesEveryRatio:
         sweep, rates, pages = rf_pages
         strategy = {name: re.search(r'<td id="bench-sharpe"[^>]*>([^<]*)</td>', page).group(1)
                     for name, page in pages.items()}
-        assert strategy["rf"] == self._expected(sweep.primary.equity_df, rates)[0]
+        assert strategy["rf"] == self._expected(sweep.primary.equity_df,
+                                                sweep.primary.trades, rates)[0]
         assert strategy["rf"] != strategy["zero"]
-        # The S&P row: the same bill's yield on its own TRADING days, per
-        # trading day (rf / 252), by hand
+        # The S&P row: fully invested — the same bill's WHOLE yield on its own
+        # TRADING days, per trading day (rf / 252), by hand
         sp_daily = pd.Series(_RF_SP_CLOSE, index=_RF_SP_INDEX).pct_change().dropna()
-        hurdle = rates.annual_on(sp_daily.index)
+        hurdle = np.array([_hand_annual(rates, d.date()) for d in sp_daily.index])
         assert len(set(hurdle)) == 2
         sp = {name: _RF_SP_ROW.search(page).group(2) for name, page in pages.items()}
         assert sp["rf"] == f"{_hand_ratios(sp_daily, hurdle, 252)[0]:.2f}"
@@ -8490,7 +8774,7 @@ class TestRiskFreeReachesEveryRatio:
 
     def test_the_per_k_table_static_and_walked(self, rf_pages):
         sweep, rates, pages = rf_pages
-        expected = [self._expected(pt.equity_df, rates)[0] for pt in sweep.points]
+        expected = [self._expected(pt.equity_df, pt.trades, rates)[0] for pt in sweep.points]
         # Static: the section's own form, from the sweep's points
         static_rf, _ = _kd_table(_section_interval_discount(sweep, risk_free=rates))
         static_zero, _ = _kd_table(_section_interval_discount(sweep))
@@ -8509,7 +8793,8 @@ class TestRiskFreeReachesEveryRatio:
         for ci, cap in enumerate(_EX_CAPS):
             for ki, k in enumerate((0.6, 0.75)):
                 point = sweep.cap_sweep.points[(_KC_B0, k, cap)]["all"]
-                assert kd["rows"][ci][ki][-1] == self._expected(point.equity_df, rates)[0]
+                assert kd["rows"][ci][ki][-1] == self._expected(point.equity_df, point.trades,
+                                                                rates)[0]
                 assert kd["rows"][ci][ki][-1] != kd_zero["rows"][ci][ki][-1]
 
     def test_every_chunk(self, rf_pages):
@@ -8523,7 +8808,8 @@ class TestRiskFreeReachesEveryRatio:
         view = _view(base, chunks, pb, pk, pc, "all")
         assert view["kpi"]["sharpe"] == _page_kpi(pages["rf"], "sharpe")[0]
         assert view["kpi"]["sortino"] == _page_kpi(pages["rf"], "sortino")[0]
-        assert view["bench"]["sharpe"] == self._expected(sweep.primary.equity_df, rates)[0]
+        assert view["bench"]["sharpe"] == self._expected(sweep.primary.equity_df,
+                                                         sweep.primary.trades, rates)[0]
         # Every other scenario's chunk: its own curve's rf-adjusted figures.
         # Not (no cap, k 0.75): _ex_sweep books that cell's curve on a 1,100
         # balance under the 20% cell's very trades, which a chunk never sees —
@@ -8535,14 +8821,33 @@ class TestRiskFreeReachesEveryRatio:
                 point = sweep.cap_sweep.points[(_KC_B0, k, cap)]["all"]
                 view = _view(base, chunks, 0, ki, ci, "all")
                 assert (view["kpi"]["sharpe"], view["kpi"]["sortino"]) \
-                    == self._expected(point.equity_df, rates)
+                    == self._expected(point.equity_df, point.trades, rates)
                 assert view["kpi"]["sharpe"] \
                     != _view(base_zero, chunks_zero, 0, ki, ci, "all")["kpi"]["sharpe"]
-        # A category slice: its attributed curve, on its own dates
-        key = next(k for k in _view_keys(chunks[base["grid"][pb][pk][pc]]) if k != "all")
-        sliced = _view(base, chunks, pb, pk, pc, key)
-        sliced_zero = _view(base_zero, chunks_zero, pb, pk, pc, key)
-        assert sliced["kpi"]["sharpe"] != sliced_zero["kpi"]["sharpe"]
+        # Every category and tag slice: its attributed curve, on its own
+        # dates, charged on its OWN trades' open capital (never the run's).
+        # A slice holding little for a day or two can round to its rf = 0
+        # figure even at the steep yield, so the by-hand expectation — never
+        # the rf = 0 one — is what each view must equal, and most must move
+        primary = sweep.primary
+        none = RiskFreeRates((), SOURCE_UNAVAILABLE, None)
+        moved = 0
+        for key in _view_keys(chunks[base["grid"][pb][pk][pc]]):
+            if key == "all":
+                continue
+            sliced = _view(base, chunks, pb, pk, pc, key)
+            own = [primary.trades[i] for i in sliced["idx"]]
+            curve = backtester._build_equity_curve(own, _FLT_START, 1000.0)
+            curve = curve[pd.to_datetime(curve["date"])
+                          <= pd.Timestamp(primary.equity_df["date"].iloc[-1])]
+            assert (sliced["kpi"]["sharpe"], sliced["kpi"]["sortino"]) \
+                == self._expected(curve, own, rates)
+            assert sliced["bench"]["sharpe"] == sliced["kpi"]["sharpe"]
+            sliced_zero = _view(base_zero, chunks_zero, pb, pk, pc, key)
+            assert (sliced_zero["kpi"]["sharpe"], sliced_zero["kpi"]["sortino"]) \
+                == self._expected(curve, own, none)
+            moved += sliced["kpi"] != sliced_zero["kpi"]
+        assert moved >= 3
         # The empty view (a selection with no trade) stays 0.00 at any rate
         assert base["empty"]["kpi"]["sharpe"] == base["empty"]["kpi"]["sortino"] == "0.00"
 
@@ -8558,6 +8863,10 @@ class TestRiskFreeReachesEveryRatio:
                           cap["cells"][1][0][ts], cap["same_title"])
         point = sweep.cap_sweep.points[(_KC_B0, 0.75, 0.2)]["time_series"]
         expected = dashboard._point_kpis(point, risk_free=rates)
+        # ... which is the point's own trades' open capital, by hand
+        assert expected["sharpe"] == pytest.approx(dashboard._sharpe(
+            point.equity_df["daily_return"],
+            rf=_hand_hurdle(point.equity_df, point.trades, rates)))
         row, sharpe, flat, same_title = rows["rf"]
         assert row["sharpe"] == pytest.approx(expected["sharpe"])
         assert row["sortino"] == pytest.approx(expected["sortino"])
@@ -8620,14 +8929,18 @@ class TestRiskFreeHeader:
             '<p style="color:#616161; font-size:14px;">Risk-free rate: the 8-week Treasury '
             "bill's auction yield (high_investment_rate, Treasury Fiscal Data) in force on "
             "each day — the latest auction on or before it — is subtracted in every Sharpe "
-            "and Sortino ratio on this page. It averaged 4.25% over this window. Latest "
-            "auction 2026-01-08: 5.000% (downloaded 2026-09-27 06:30 UTC).</p>")
+            "and Sortino ratio on this page, charged on the capital each day had in open "
+            "trades: idle cash is taken to earn the same yield. The S&amp;P 500 row is fully "
+            "invested and is charged the whole yield. The yield averaged 4.25% over this "
+            "window. Latest auction 2026-01-08: 5.000% (downloaded 2026-09-27 06:30 UTC).</p>")
 
     def test_cached(self):
         line = dashboard._risk_free_html(_rates(SOURCE_CACHE), self._EQ)
         assert line.startswith('<p style="color:#E65100; font-size:14px; font-weight:700;">'
                                "Risk-free rate: the 8-week Treasury bill's auction yield")
-        assert "It averaged 4.25% over this window." in line
+        assert "The yield averaged 4.25% over this window." in line
+        assert ("charged on the capital each day had in open trades: idle cash is taken to "
+                "earn the same yield. The S&amp;P 500 row is fully invested") in line
         assert line.endswith(
             " The API could not be reached: these are the yields downloaded 2026-09-27 06:30 "
             "UTC, whose latest auction (2026-01-08, 5.000%) stands for every day after it.</p>")
@@ -8649,7 +8962,7 @@ class TestRiskFreeHeader:
         assert note in line
         # Before the first auction a day takes that auction's yield: 3% from
         # 2025-12-29 to 2026-01-03
-        assert "It averaged 3.00% over this window." in line
+        assert "The yield averaged 3.00% over this window." in line
         # An empty curve: no average, no note
         assert "averaged" not in dashboard._risk_free_html(_rates(), self._EQ.iloc[:0])
 

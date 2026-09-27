@@ -81,9 +81,11 @@ Dependencies:
     time_series_profit_prob() from config.py — the latter is the single
     definition of the time-series Kelly probability shared with strategy.py
     and backtester.py, so the Kelly scatter here shows the same fraction the
-    live sizer computes. Imports RiskFreeRates and SOURCE_CACHE from
-    treasury.py: generate_dashboard's risk_free is a RiskFreeRates, whose
-    per-day yields (annual_on) every Sharpe and Sortino subtracts. Uses
+    live sizer computes. Imports RiskFreeRates, SOURCE_CACHE and
+    day_numbers from treasury.py: generate_dashboard's risk_free is a
+    RiskFreeRates, whose per-day yields every Sharpe and Sortino subtracts,
+    and day_numbers is the one day numbering both its lookup and the
+    capital-deployed lookup (_deployed_on_days) read a curve's dates on. Uses
     plotly, numpy, pandas, and yfinance (all external). Called by
     backtest.py after run_backtest_sweep() completes.
 
@@ -102,24 +104,28 @@ Notes:
     magnitude (at rf != 0 it is not a constant rescale).
 
     Every Sharpe and Sortino on the page subtracts the 8-week Treasury bill's
-    auction yield in force on each row's date — _rf_hurdle, over
-    treasury.RiskFreeRates.annual_on, one annual yield per row, subtracted by
-    POSITION (a date-indexed Series would align on the index and turn every
-    ratio into NaN), per period (rf / 365 on a strategy curve, rf / 252 on
-    the ^GSPC row's trading days). The rates come from generate_dashboard's
-    risk_free, which every function and visitor between it and a ratio takes
-    keyword-only and passes on — pinned by
+    auction yield in force on each row's date, one annual rate per row,
+    subtracted by POSITION (a date-indexed Series would align on the index
+    and turn every ratio into NaN), per period (rf / 365 on a strategy curve,
+    rf / 252 on the ^GSPC row's trading days). A strategy curve is charged
+    that yield only on the capital in open trades (_rf_hurdle: the yield
+    times deployed[t-1] / portfolio_value[t-1], deployed being
+    _capital_deployed's definition, so a trade is charged exactly exit -
+    entry days): idle cash is taken to earn the yield itself, since the
+    backtester books it at 0%. Every strategy site therefore hands _rf_hurdle
+    the curve's own trades — a filter view's slice its own selection — and
+    rates without trades raise. The ^GSPC row is fully invested and is
+    charged the whole yield (_rf_hurdle_invested). The rates come from
+    generate_dashboard's risk_free, which every function and visitor between
+    it and a ratio takes keyword-only and passes on — pinned by
     tests/test_dashboard.py::TestRiskFreeIsThreaded, since a dropped
     pass-through would compute that path at 0% with no error. None — what
     every direct section call and the golden harness pass — subtracts 0%,
-    exactly as before rates existed. Both ratios read 0.0 on a curve that
-    never moves (_varies), which a nonzero rate would otherwise turn into
-    -9.6e16 (Sharpe) and exactly -sqrt(365) (Sortino). The backtester's idle
-    cash earns nothing, so a mostly idle run is now charged the bill's yield
-    on uninvested capital and its ratios can go strongly negative — the
-    honest reading.
-    The header says which rate was subtracted, or that none was
-    (_risk_free_html), on every page.
+    exactly as before rates existed, and reads no date or trade. Both ratios
+    read 0.0 on a curve that never moves (_varies), which a nonzero rate
+    would otherwise turn into -9.6e16 (Sharpe) and exactly -sqrt(365)
+    (Sortino). The header says which rate was subtracted, and on what, or
+    that none was (_risk_free_html), on every page.
 
     Every section but the scenario explorer is rendered at the run's primary
     scenario — its primary k (the CLI's --interval-discount, or
@@ -379,7 +385,7 @@ from .config import (
     time_series_profit_prob,
 )
 from .scanner import leg_sides
-from .treasury import SOURCE_CACHE, RiskFreeRates
+from .treasury import SOURCE_CACHE, RiskFreeRates, day_numbers
 
 # The one dashboard file every backtest run writes (and overwrites) in PROJECT_ROOT.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
@@ -408,29 +414,167 @@ def _varies(returns: pd.Series) -> bool:
     return bool(returns.max() > returns.min())
 
 
-def _rf_hurdle(risk_free: RiskFreeRates | None, dates) -> float | np.ndarray:
+def _sum_on_days(keys: np.ndarray, values: np.ndarray, days: np.ndarray) -> np.ndarray:
     """
-    The annual risk-free rate a curve's Sharpe and Sortino subtract, row by row.
+    Sum values by day number, then read each row's day's sum (0.0 on a day with none).
+
+    The dict-free half of _deployed_on_days. np.add.at accumulates in input
+    order, so a day's sum is ((0.0 + v1) + v2) + ... over its values in the
+    order given — the order a dict accumulated them in.
+
+    Args:
+        keys (np.ndarray): One int64 day number per value.
+        values (np.ndarray): The float values to sum.
+        days (np.ndarray): The rows' day numbers, positional.
+
+    Returns:
+        np.ndarray: One float per row: the sum of the values keyed exactly on
+            that row's day, or 0.0.
+    """
+    if not len(keys) or not len(days):
+        return np.zeros(len(days))
+    unique, inverse = np.unique(keys, return_inverse=True)
+    sums = np.zeros(len(unique))
+    np.add.at(sums, inverse, values)
+    pos = np.minimum(np.searchsorted(unique, days), len(unique) - 1)
+    return np.where(unique[pos] == days, sums[pos], 0.0)
+
+
+def _deployed_on_days(trades: list[BacktestTrade], days: np.ndarray) -> np.ndarray:
+    """
+    The capital tied up in open trades on each row, for rows given as day numbers.
+
+    The one definition of capital deployed (_capital_deployed returns it as a
+    list): the running sum of every trade's fee-inclusive cost (total_cost +
+    fees) from its entry row until its exit row, floored at 0 — so a row
+    counts every trade with entry <= its date < exit. Entry and exit dates are
+    matched EXACTLY against the rows' days: a trade whose entry falls on no
+    row never adds, one whose exit falls on no row never subtracts. The
+    running sum itself is not floored, only each row's value. Vectorized, as
+    it runs once per Sharpe/Sortino pair on a page with rates (measured
+    2026-09-27 on a 2,460-row curve with 300 trades: 0.42 ms with the date
+    conversion, against 0.56 ms for the per-row loop it replaced — and the
+    conversion is shared with the yield lookup, _rf_hurdle).
+
+    Bit-identical to the per-row loop it replaced (pinned by
+    tests/test_dashboard.py::TestCapitalDeployedParity): each day's entries
+    and exits are summed in trade order (_sum_on_days), a row's step is its
+    entries minus its exits, the running sum is a sequential cumsum, and the
+    floor keeps a value only when it is > 0.0, as max(0.0, x) did.
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades (entry_date and
+            exit_date are datetime.date); may be empty.
+        days (np.ndarray): The rows' day numbers (treasury.day_numbers of the
+            curve's "date" column), positional.
+
+    Returns:
+        np.ndarray: One float per row.
+    """
+    if not trades:
+        return np.zeros(len(days))
+    count = len(trades)
+    entries = np.fromiter((t.entry_date.toordinal() for t in trades), np.int64, count)
+    exits = np.fromiter((t.exit_date.toordinal() for t in trades), np.int64, count)
+    # Fee-inclusive, as the Kelly-vs-actual scatter reads a trade's stake (TS-12)
+    costs = np.fromiter((t.total_cost + t.fees for t in trades), float, count)
+    running = np.cumsum(_sum_on_days(entries, costs, days) - _sum_on_days(exits, costs, days))
+    return np.where(running > 0.0, running, 0.0)
+
+
+def _rf_hurdle(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame,
+               trades: list[BacktestTrade] | None) -> float | np.ndarray:
+    """
+    The annual risk-free rate a strategy curve's Sharpe and Sortino subtract, row by row.
+
+    The bill's yield is charged only on the capital in open trades: idle cash
+    is taken to earn that same yield. The backtester books idle cash at 0%, so
+    charging the whole balance charged every idle day the full rate (one $3.50
+    trade on a $10,000 curve read a Sharpe in the hundreds below zero). Row
+    t's hurdle is annual_t x f_t:
+
+      * annual_t — the yield in force on row t's date
+        (treasury.RiskFreeRates.annual_on_days);
+      * f_t = deployed[t-1] / portfolio_value[t-1] for t >= 1, f_0 = 0 — the
+        share of the previous close's portfolio in open trades, deployed
+        being _deployed_on_days' (fee-inclusive cost of every trade with
+        entry <= row date < exit). A trade is therefore charged for exactly
+        exit - entry days: the days after its entry, through its settlement
+        day; one entered and settled on the same day is charged nothing.
+
+    The curve's dates are converted to day numbers ONCE and read for both
+    lookups. deployed is fee-inclusive while the portfolio carries an open
+    position at cost (its fees are already gone), so on a nearly fully
+    deployed curve f can top 1 by at most the open trades' fees over the
+    portfolio value. A row whose previous value is not positive is charged
+    nothing. The ^GSPC row is fully invested and uses _rf_hurdle_invested.
 
     Every caller computes it ONCE, from the same frame whose daily_return it
-    passes, and hands it to both ratios. The array is POSITIONAL (element i
-    belongs to row i), which is why _sharpe/_sortino subtract it by position:
-    a date-indexed Series subtracted from a RangeIndex returns Series would
-    align on the index and turn every ratio into NaN.
+    passes and the trades that frame was booked from, and hands it to both
+    ratios. The array is POSITIONAL (element i belongs to row i), which is
+    why _sharpe/_sortino subtract it by position: a date-indexed Series
+    subtracted from a RangeIndex returns Series would align on the index and
+    turn every ratio into NaN.
 
     Args:
         risk_free (RiskFreeRates | None): The page's rates (generate_dashboard's
             risk_free). None — a direct section call, or a caller that supplied
-            none — subtracts nothing, exactly as before rates existed.
-        dates: The curve's dates, one per return row: its "date" column, or
-            the ^GSPC series' trading-day index.
+            none — subtracts nothing, exactly as before rates existed, and
+            reads neither equity_df nor trades.
+        equity_df (pd.DataFrame): The curve: its "date" and "portfolio_value"
+            columns, one row per return row.
+        trades (list[BacktestTrade] | None): The trades the curve was booked
+            from (a slice's own, for a category or tag view); [] for a curve
+            with none, which is charged nothing.
+
+    Returns:
+        float | np.ndarray: 0.0 without rates; else one annual rate per row
+            (zeros when the rates are unavailable, or nothing is deployed).
+
+    Raises:
+        TypeError: If rates are given without trades — never silently a
+            full-balance or a zero hurdle in their place.
+    """
+    if risk_free is None:
+        return 0.0
+    if trades is None:
+        raise TypeError("_rf_hurdle: rates were given without the curve's trades, whose "
+                        "open capital the yield is charged on")
+    if not trades:
+        # Nothing ever deployed: charged nothing, exactly (annual x 0), with
+        # no date to convert — a grid's zero-trade cells are common
+        return np.zeros(len(equity_df))
+    # treasury.day_numbers: the one day numbering, shared by both lookups
+    days = day_numbers(equity_df["date"])
+    deployed = _deployed_on_days(trades, days)
+    value = equity_df["portfolio_value"].to_numpy(dtype=float)
+    share = np.zeros(len(days))
+    # f_t from the previous close; 0 where that close is not positive
+    np.divide(deployed[:-1], value[:-1], out=share[1:], where=value[:-1] > 0.0)
+    # treasury.RiskFreeRates.annual_on_days is the one per-day rule: the
+    # latest auction on or before each day, positional, zeros when unavailable
+    return risk_free.annual_on_days(days) * share
+
+
+def _rf_hurdle_invested(risk_free: RiskFreeRates | None, dates) -> float | np.ndarray:
+    """
+    The annual risk-free rate a FULLY INVESTED series subtracts: the whole yield, every day.
+
+    For the ^GSPC benchmark row, whose index is always fully invested; every
+    strategy curve uses _rf_hurdle, which charges only its capital in open
+    trades. Positional, like _rf_hurdle.
+
+    Args:
+        risk_free (RiskFreeRates | None): The page's rates. None subtracts
+            nothing.
+        dates: The series' dates, one per return row (the ^GSPC series'
+            trading-day index).
 
     Returns:
         float | np.ndarray: 0.0 without rates; else the yield in force on each
             date (RiskFreeRates.annual_on — zeros when unavailable).
     """
-    # treasury.RiskFreeRates.annual_on is the one per-day rule: the latest
-    # auction on or before each date, positional, zeros when unavailable
+    # treasury.RiskFreeRates.annual_on: the latest auction on or before each date
     return 0.0 if risk_free is None else risk_free.annual_on(dates)
 
 
@@ -458,8 +602,10 @@ def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
     single trading-day consumer (_section_benchmark's ^GSPC row) passes
     TRADING_DAYS_PER_YEAR explicitly. The parameter is keyword-only so it can
     never be passed positionally into `rf`'s slot. Every call on the page
-    passes `rf` — _rf_hurdle's per-day yield of the 8-week Treasury bill, or
-    0.0 when the page was given no rates (pinned by
+    passes `rf` — _rf_hurdle's per-row rate on a strategy curve (the 8-week
+    Treasury bill's yield on the capital in open trades) or
+    _rf_hurdle_invested's on the fully invested ^GSPC row, each 0.0 when the
+    page was given no rates (pinned by
     tests/test_dashboard.py::TestRiskFreeIsThreaded).
 
     Args:
@@ -468,7 +614,8 @@ def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
         rf (float | np.ndarray): Annual hurdle rate as a decimal (0.05 for
             5%): one value for every period, or one per period, POSITIONALLY
             aligned with daily_returns (the page passes _rf_hurdle's — the
-            8-week bill's yield in force on each row's date). Defaults to 0.0.
+            8-week bill's yield on each row's capital in open trades — or
+            _rf_hurdle_invested's). Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
             positive; not validated, since every value that reaches it is a
             config constant — every in-module call site but one takes the
@@ -518,7 +665,8 @@ def _sortino(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
         daily_returns (pd.Series): Series of per-period fractional returns.
         rf (float | np.ndarray): Annual hurdle rate as a decimal: one value
             for every period, or one per period, POSITIONALLY aligned with
-            daily_returns (the page passes _rf_hurdle's). Defaults to 0.0.
+            daily_returns (the page passes _rf_hurdle's, the 8-week bill's
+            yield on each row's capital in open trades). Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
             positive; not validated, since both of its call sites take the
             default. Defaults to CALENDAR_DAYS_PER_YEAR (365).
@@ -952,7 +1100,8 @@ def _performance_kpis(
             of the total return.
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
             and Sortino cards subtract, row by row, on equity_df's own dates
-            (_rf_hurdle). None (default) subtracts nothing.
+            and on the capital `trades` hold open (_rf_hurdle). None (default)
+            subtracts nothing.
 
     Returns:
         list[tuple[str, str, str, str]]: (key, label, value, colour) per card:
@@ -963,8 +1112,9 @@ def _performance_kpis(
     final_value  = float(equity_df["portfolio_value"].iloc[-1])
     total_return = (final_value - initial_balance) / initial_balance
     daily_ret    = equity_df["daily_return"]
-    # The bill's yield in force on each row's date, shared by both ratios
-    hurdle       = _rf_hurdle(risk_free, equity_df["date"])
+    # The bill's yield on each row's capital in open trades — these trades' —
+    # shared by both ratios
+    hurdle       = _rf_hurdle(risk_free, equity_df, trades)
     sharpe       = _sharpe(daily_ret, rf=hurdle)
     sortino      = _sortino(daily_ret, rf=hurdle)
     # _max_drawdown reports the trough via the Series' index, so it must be
@@ -1912,8 +2062,9 @@ def _kd_cells(point: SweepPoint, is_primary: bool, *,
         is_primary (bool): True for the run's own k — its label is marked
             " (primary)".
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
-            cell subtracts, row by row, on the point's own dates (_rf_hurdle).
-            None (default) subtracts nothing.
+            cell subtracts, row by row, on the point's own dates and the
+            capital its own trades hold open (_rf_hurdle). None (default)
+            subtracts nothing.
 
     Returns:
         list[str]: The k label (_k_label), the trade count, total return,
@@ -1939,7 +2090,7 @@ def _kd_cells(point: SweepPoint, is_primary: bool, *,
     max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
     # A one-row curve has no pct_change to speak of; _sharpe returns 0.0 on
     # a curve that never moves, so no extra guard is needed here.
-    sharpe = (_sharpe(eq["daily_return"], rf=_rf_hurdle(risk_free, eq["date"]))
+    sharpe = (_sharpe(eq["daily_return"], rf=_rf_hurdle(risk_free, eq, point.trades))
               if "daily_return" in eq else 0.0)
     return [label, trades, f"{total_return:+.1%}", f"${final:,.2f}", f"{max_dd:.1%}",
             f"{sharpe:.2f}"]
@@ -3115,8 +3266,9 @@ def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) ->
     Args:
         point (SweepPoint): One simulated scenario, band sweep or not.
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
-            and Sortino subtract, row by row, on the point's own dates
-            (_rf_hurdle). None (default) subtracts nothing.
+            and Sortino subtract, row by row, on the point's own dates and the
+            capital its own trades hold open (_rf_hurdle). None (default)
+            subtracts nothing.
 
     Returns:
         dict: {trades, win_rate, mean_per_trade, median_per_trade,
@@ -3129,7 +3281,7 @@ def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) ->
             quantity, which a few outsized trades cannot move. Sharpe and
             Sortino are annualised on the calendar-day base (365), like every
             other figure computed on a strategy curve, net of risk_free's
-            per-day yield. Every value is None
+            per-day yield on the capital in open trades. Every value is None
             where the underlying quantity is undefined (no trades, or an
             empty/absent equity curve) rather than a misleading 0.0.
     """
@@ -3151,8 +3303,9 @@ def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) ->
         total_return = (final_balance - opening) / opening if opening else None
         max_dd, _ = _max_drawdown(eq["portfolio_value"].set_axis(eq["date"]))
         if "daily_return" in eq:
-            # The bill's yield in force on each row's date, shared by both ratios
-            hurdle = _rf_hurdle(risk_free, eq["date"])
+            # The bill's yield on each row's capital in the point's own open
+            # trades, shared by both ratios
+            hurdle = _rf_hurdle(risk_free, eq, trades)
             sharpe = _sharpe(eq["daily_return"], rf=hurdle)
             sortino = _sortino(eq["daily_return"], rf=hurdle)
         else:
@@ -3799,12 +3952,16 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
     Grey when the yields were downloaded this run, or when the caller
     supplied none (every ratio at 0%). Amber when the API could not be
     reached and an earlier download stands in. Red when neither was
-    available (every ratio at 0%).
+    available (every ratio at 0%). With rates it says what the yield is
+    charged on: a strategy curve's capital in open trades (idle cash is
+    taken to earn the same yield — _rf_hurdle), the S&P 500 row's whole
+    value (_rf_hurdle_invested).
 
     Args:
         risk_free (RiskFreeRates | None): generate_dashboard's risk_free.
         equity_df (pd.DataFrame): The page's curve: the window the average
-            yield is taken over.
+            yield is taken over (the yield itself, before it is scaled to
+            the capital in open trades).
 
     Returns:
         str: One <p> line.
@@ -3825,12 +3982,14 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
     text = (f"Risk-free rate: the {term} Treasury bill's auction yield "
             f"({RISK_FREE_RATE_FIELD}, Treasury Fiscal Data) in force on each day — the "
             "latest auction on or before it — is subtracted in every Sharpe and Sortino "
-            "ratio on this page.")
+            "ratio on this page, charged on the capital each day had in open trades: idle "
+            "cash is taken to earn the same yield. The S&P 500 row is fully invested and "
+            "is charged the whole yield.")
     if dates:
         # treasury.RiskFreeRates.annual_on: the same per-day yields the ratios
-        # subtract, averaged over the page's own curve
-        text += (f" It averaged {float(np.mean(risk_free.annual_on(dates))):.2%} over "
-                 "this window.")
+        # scale, averaged over the page's own curve
+        text += (f" The yield averaged {float(np.mean(risk_free.annual_on(dates))):.2%} "
+                 "over this window.")
         # Timestamps on both sides: a hand-built curve may carry Timestamps,
         # which do not compare with a datetime.date
         if pd.to_datetime(dates).min() < pd.Timestamp(first_day):
@@ -4814,6 +4973,12 @@ def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> l
     """
     Compute the capital tied up in open trades on each row of the equity curve.
 
+    The Risk section's "Capital Deployed Over Time" chart and every filter
+    view's redraw of it read this; the risk-free hurdle reads the same
+    definition (_deployed_on_days, which this returns as a list), so the
+    capital a row is charged the bill's yield on is the capital the chart
+    shows.
+
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
         equity_df (pd.DataFrame): The equity curve whose "date" column is the
@@ -4825,28 +4990,13 @@ def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> l
             trade's fee-inclusive cost from its entry date until its exit date,
             floored at 0.
     """
-    entry_by_date: dict[date, float] = {}
-    exit_by_date: dict[date, float] = {}
-    for t in trades:
-        # Fee-inclusive: fees are cash out the door at entry, so they are part
-        # of the capital deployed. The Kelly-vs-actual scatter
-        # (_kelly_points) already uses (total_cost + fees); this used not to,
-        # so the two charts on one dashboard disagreed by the fee rate (TS-12).
-        cost = t.total_cost + t.fees
-        entry_by_date[t.entry_date] = entry_by_date.get(t.entry_date, 0.0) + cost
-        exit_by_date[t.exit_date]   = exit_by_date.get(t.exit_date,   0.0) + cost
-
-    invested_by_date: list[float] = []
-    running_invested = 0.0
-    # The date column alone, not iterrows(): building a Series per row made
-    # this the slowest step of the page-wide filter, which runs it per view
-    for d in equity_df["date"]:
-        # A datetime (pd.Timestamp included) IS a date subclass, so test for
-        # it: kept whole it would match no trade's entry or exit date
-        d = d.date() if isinstance(d, datetime) else d
-        running_invested += entry_by_date.get(d, 0.0) - exit_by_date.get(d, 0.0)
-        invested_by_date.append(max(0.0, running_invested))
-    return invested_by_date
+    # Fee-inclusive: fees are cash out the door at entry, so they are part of
+    # the capital deployed. The Kelly-vs-actual scatter (_kelly_points)
+    # already uses (total_cost + fees); this used not to, so the two charts on
+    # one dashboard disagreed by the fee rate (TS-12). A timestamp IS a date
+    # subclass: treasury.day_numbers reads it as its calendar date, where kept
+    # whole it would match no trade's entry or exit date.
+    return _deployed_on_days(trades, day_numbers(equity_df["date"])).tolist()
 
 
 def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
@@ -4916,7 +5066,8 @@ def _section_risk(trades: list[BacktestTrade], equity_df: pd.DataFrame,
 # ─── Section 8: Benchmark Comparison ─────────────────────────────────────────
 
 def _strategy_row(equity_df: pd.DataFrame, initial_balance: float, *,
-                  risk_free: RiskFreeRates | None = None) -> dict[str, str]:
+                  risk_free: RiskFreeRates | None = None,
+                  trades: list[BacktestTrade] | None = None) -> dict[str, str]:
     """
     Compute the benchmark table's strategy row, formatted.
 
@@ -4925,20 +5076,29 @@ def _strategy_row(equity_df: pd.DataFrame, initial_balance: float, *,
             (_build_equity_curve: one row per CALENDAR day).
         initial_balance (float): Starting balance the return divides by.
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
-            subtracts, row by row, on equity_df's own dates (_rf_hurdle) —
-            the same yield the ^GSPC row beside it subtracts on its trading
-            days. None (default) subtracts nothing.
+            subtracts, row by row, on equity_df's own dates and on the
+            capital `trades` hold open (_rf_hurdle) — the same yield the
+            ^GSPC row beside it subtracts, fully invested, on its trading
+            days. None (default) subtracts nothing and reads no date column.
+        trades (list[BacktestTrade] | None): Keyword-only. The trades
+            equity_df was booked from — the run's, or a filter view's own
+            selection — whose open capital the yield is charged on. Required
+            with rates (_rf_hurdle raises TypeError without them); unused
+            without.
 
     Returns:
         dict[str, str]: "return" (total return), "sharpe" (annualised on the
             calendar base) and "max_dd" (max drawdown), each formatted.
+
+    Raises:
+        TypeError: If risk_free is given without trades.
     """
     strat_ret    = float(equity_df["portfolio_value"].iloc[-1] / initial_balance - 1)
     # Calendar-daily by construction (_build_equity_curve emits one row per
     # calendar day), so this takes _sharpe's CALENDAR_DAYS_PER_YEAR default
     # while the ^GSPC row overrides it to the trading-day base.
     strat_sharpe = _sharpe(equity_df["daily_return"],
-                           rf=_rf_hurdle(risk_free, equity_df["date"]))
+                           rf=_rf_hurdle(risk_free, equity_df, trades))
     strat_dd     = _max_drawdown(equity_df["portfolio_value"])[0]
     return {
         "return": f"{strat_ret:+.1%}",
@@ -4965,7 +5125,8 @@ def _bench_cell_id(row_name: str, field: str) -> str:
 
 def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
                         initial_balance: float, *,
-                        risk_free: RiskFreeRates | None = None) -> str:
+                        risk_free: RiskFreeRates | None = None,
+                        trades: list[BacktestTrade] | None = None) -> str:
     """
     Build the "Benchmark Comparison" HTML section.
 
@@ -4983,8 +5144,10 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     Sharing one factor would make the comparison this section exists for
     apples-to-oranges by exactly sqrt(365/252) = 1.2035 of magnitude. Both
     rows subtract the same risk-free yield, each on its own dates and its own
-    base: the strategy row per calendar day (rf / 365), the ^GSPC row per
-    trading day (rf / 252), so the two face one hurdle.
+    base: the strategy row per calendar day (rf / 365), on the capital its
+    trades hold open (_rf_hurdle — idle cash is taken to earn the yield), and
+    the ^GSPC row per trading day (rf / 252), fully invested
+    (_rf_hurdle_invested), so the two face one hurdle.
 
     Args:
         equity_df (pd.DataFrame): Daily equity curve with columns
@@ -4999,11 +5162,17 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             also land later than start_date - 1.
         initial_balance (float): Starting portfolio value in dollars.
         risk_free (RiskFreeRates | None): Keyword-only. The rates both rows'
-            Sharpe subtract, day by day (_rf_hurdle). None (default) subtracts
-            nothing.
+            Sharpe subtract, day by day. None (default) subtracts nothing.
+        trades (list[BacktestTrade] | None): Keyword-only. The trades
+            equity_df was booked from, whose open capital the strategy row is
+            charged the yield on (_strategy_row). Required with rates; unused
+            without.
 
     Returns:
         str: Self-contained HTML section string with comparison table and chart.
+
+    Raises:
+        TypeError: If risk_free is given without trades (_strategy_row).
     """
     # Fetch S&P 500
     sp_raw = None
@@ -5049,9 +5218,10 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
             # the page that is not calendar-daily: it must override _sharpe's
             # calendar default or the two rows of this very table would be
             # annualized on different bases (DR-56). The same bill's yield, on
-            # the S&P's own trading days, per trading day (rf / 252), so the
-            # two rows face one hurdle.
-            sp_sharpe = _sharpe(sp_daily, rf=_rf_hurdle(risk_free, sp_daily.index),
+            # the S&P's own trading days, per trading day (rf / 252), charged
+            # in full — an index is fully invested — so the two rows face one
+            # hurdle.
+            sp_sharpe = _sharpe(sp_daily, rf=_rf_hurdle_invested(risk_free, sp_daily.index),
                                 periods_per_year=TRADING_DAYS_PER_YEAR)
             bench_rows.append({
                 "name": "S&P 500",
@@ -5068,7 +5238,8 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     # here is string-matched by the table renderer below, so both must agree.
     # They are not a claim that the time-series leg is an arbitrage.
     bench_rows.insert(0, {"name": "Kalshi Arbitrage Strategy",
-                          **_strategy_row(equity_df, initial_balance, risk_free=risk_free)})
+                          **_strategy_row(equity_df, initial_balance, risk_free=risk_free,
+                                          trades=trades)})
 
     fig.update_layout(title="Strategy vs Benchmarks", yaxis_title="Portfolio Value ($)",
                       xaxis_title="Date")
@@ -7733,8 +7904,9 @@ def _view_payload(
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
             and Sortino cards and the benchmark row subtract, on the
             axis-filtered curve's own dates (its index is not reset, which
-            the positional hurdle does not need). None (default) subtracts
-            nothing.
+            the positional hurdle does not need) and on the capital `sel`
+            holds open — each slice's own trades, never the run's. None
+            (default) subtracts nothing.
 
     Returns:
         dict: "n", "idx", "kpi" (card key -> formatted value), the sparse
@@ -7764,7 +7936,8 @@ def _view_payload(
         "dd": _sparse_on_axis(dates, drawdown, axis, 4),
         "eq": _sparse_on_axis(dates, equity_df["portfolio_value"], axis, 2),
         "dep": _sparse_on_axis(dates, _capital_deployed(sel, equity_df), axis, 2),
-        "bench": _strategy_row(equity_df, initial_balance, risk_free=risk_free),
+        # The selection's own trades: a slice is charged on its own open capital
+        "bench": _strategy_row(equity_df, initial_balance, risk_free=risk_free, trades=sel),
     }
     if not sel:
         return view
@@ -9230,9 +9403,11 @@ def generate_dashboard(
             8-week bill yields. Every Sharpe and Sortino on the page — the
             performance cards, both benchmark rows, the per-k table, the
             scenario explorer and every filter-bar view — subtracts the yield
-            in force on each row's date, and the header names it
-            (_risk_free_html). None (default) subtracts 0%, exactly as before,
-            and the header says none was supplied.
+            in force on each row's date: a strategy curve on the capital its
+            own trades hold open at the previous close (_rf_hurdle; idle cash
+            is taken to earn the yield), the S&P 500 row fully invested. The
+            header names it (_risk_free_html). None (default) subtracts 0%,
+            exactly as before, and the header says none was supplied.
 
     Returns:
         Path: Absolute path to the HTML file written,
@@ -9459,8 +9634,10 @@ def generate_dashboard(
         # k must be the discount these trades were sized at, or the Kelly
         # scatter plots the config model against override-sized trades
         lambda: _section_risk(trades, equity_df, initial_balance, k=k_used),
+        # The run's trades: the strategy row is charged the yield on their
+        # open capital
         lambda: _section_benchmark(equity_df, start_date, initial_balance,
-                                   risk_free=risk_free),
+                                   risk_free=risk_free, trades=trades),
     )
 
     # Named head (not `html`) so it can't shadow the `html` module used by

@@ -7,8 +7,9 @@ Purpose:
     Tests for treasury.py: parsing the Treasury Fiscal Data API's auction
     records, paging the download, the never-raising load/cache-fallback
     contract of load_risk_free_rates(), the per-day lookup in
-    RiskFreeRates.annual_on(), and that no live-trading module can import this
-    reporting-only module.
+    RiskFreeRates.annual_on() and its day-number form (annual_on_days over
+    day_numbers, which the dashboard's deployed-capital hurdle shares), and
+    that no live-trading module can import this reporting-only module.
 
 Dependencies:
     Imports kalshi_betting.treasury. Runs fully offline: tests/conftest.py's
@@ -263,7 +264,8 @@ class TestLoad:
 
 
 class TestAnnualOn:
-    """RiskFreeRates.annual_on(): the latest auction on or before each date."""
+    """RiskFreeRates.annual_on(): the latest auction on or before each date —
+    and its day-number form, annual_on_days(day_numbers(...))."""
 
     RATES = treasury.RiskFreeRates(
         ((date(2020, 1, 6), 0.01), (date(2020, 1, 13), 0.02), (date(2020, 1, 20), 0.03)),
@@ -303,6 +305,28 @@ class TestAnnualOn:
 
     def test_empty_input_returns_an_empty_array(self):
         assert len(self.RATES.annual_on([])) == 0
+
+    def test_day_numbers_are_date_ordinals(self):
+        # The one day numbering the lookups and the dashboard's
+        # capital-deployed helper share: date.toordinal, a timestamp read as
+        # its own calendar date (as datetime.date() reads it)
+        days = [date(2019, 12, 31), date(2020, 1, 13), date(2020, 3, 1)]
+        want = [d.toordinal() for d in days]
+        assert list(treasury.day_numbers(days)) == want
+        assert list(treasury.day_numbers(pd.Series(days))) == want
+        stamped = pd.to_datetime(pd.Series(days)) + pd.Timedelta(hours=23)
+        assert list(treasury.day_numbers(stamped)) == want
+        local = stamped.dt.tz_localize("America/New_York")
+        assert list(treasury.day_numbers(local)) == [t.date().toordinal() for t in local]
+        assert list(treasury.day_numbers(local)) == want
+        assert len(treasury.day_numbers([])) == 0
+
+    def test_annual_on_days_is_annual_on_for_day_numbers(self):
+        days = [date(2019, 1, 1), date(2020, 1, 13), date(2020, 1, 15), date(2020, 6, 1)]
+        assert list(self.RATES.annual_on_days(treasury.day_numbers(days))) \
+            == list(self.RATES.annual_on(days)) == [0.01, 0.02, 0.02, 0.03]
+        unavailable = treasury.RiskFreeRates((), treasury.SOURCE_UNAVAILABLE, None)
+        assert list(unavailable.annual_on_days(treasury.day_numbers(days))) == [0.0] * 4
 
 
 _PIPELINE_MODULES = [
