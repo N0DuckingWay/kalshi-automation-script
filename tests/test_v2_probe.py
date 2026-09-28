@@ -17,7 +17,8 @@ Purpose:
     catch — must be a hard FAIL that does not go on to submit the unwind.
 
 Dependencies:
-    Imports v2_probe and trader; patches at each function's definition site.
+    Imports v2_probe, trader and config (the fee model the probe's fee line is
+    checked against); patches at each function's definition site.
     Offline-only per project policy.
 
 Notes:
@@ -40,7 +41,7 @@ from unittest.mock import MagicMock
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import trader, v2_probe
+from kalshi_betting import config, trader, v2_probe
 from kalshi_betting.scanner import PriceRange
 
 TICKER = "PROBE-TICKER"
@@ -118,7 +119,11 @@ def v2_resp(fill_count: str, remaining_count: str) -> dict:
         "fill_count": fill_count,
         "remaining_count": remaining_count,
         "average_fill_price": "0.4100",
-        "average_fee_paid": "0.0002",
+        # Per contract, as Kalshi's API reference defines the field, and
+        # including the exchange's rounding of the order's total fee up to
+        # $0.0001 — what the production API reported for the probe's
+        # 0.01-contract fills on 2026-09-28
+        "average_fee_paid": "0.0200",
     }
 
 
@@ -1262,6 +1267,96 @@ class TestNonConformingFillOrKill:
         printed = capsys.readouterr().out
         assert "nothing filled" not in printed
         assert "no average_fee_paid" in printed
+
+
+class TestFeeCheckIsPerContract:
+    """_report_fee prints the exchange's average_fee_paid — a per-contract
+    figure by Kalshi's API reference, including the exchange's rounding of the
+    order's total fee up to the account's balance precision — beside the fee
+    model per contract three ways: before rounding (TAKER_FEE_RATE × p ×
+    (1 − p)), for one whole contract rounded up to the cent
+    (config.fee_leg_exact(1, p)), and rounded as the exchange rounds this
+    order. Nothing is left for the reader to scale by the probe's count, and
+    the rounded figure is the one a tiny order's charge should match."""
+
+    @staticmethod
+    def _unrounded(price: float) -> str:
+        return f"${config.TAKER_FEE_RATE * price * (1 - price):.6f}"
+
+    def test_every_figure_is_labelled_per_contract_at_the_fill_price(self, capsys):
+        # The fee is charged on the fill price, so the model is evaluated
+        # there rather than at the limit price the order was sent at
+        v2_probe._report_fee(FILLED, "0.4300")
+        first, second = capsys.readouterr().out.strip().split("\n")
+        assert "per contract at p=0.41 (average fill price)" in first
+        assert "exchange average_fee_paid=$0.0200 per contract" in first
+        assert f"TAKER_FEE_RATE*p*(1-p) = {self._unrounded(0.41)} per contract before rounding" in first
+        assert (
+            f"config.fee_leg_exact(1, 0.41) = ${config.fee_leg_exact(1, 0.41):.2f}"
+            " for one whole contract, rounded up to the cent"
+        ) in first
+        assert second.startswith("  Kalshi rounds each order's total fee up to the account's balance precision")
+        # No hint to scale a per-contract figure by the probe's count
+        assert "probe traded" not in first + second
+
+    def test_the_exchange_rounding_reproduces_the_live_probe_charge(self, capsys):
+        # The production API charged $0.0200 per contract on the probe's
+        # 0.01-contract fills at 0.58 and 0.59, against about $0.017 before
+        # rounding; the order-rounded model at $0.0001 precision comes to
+        # exactly that, and at $0.01 precision to $1.00
+        for fill in ("0.5800", "0.5900"):
+            v2_probe._report_fee(dict(FILLED, average_fill_price=fill), "0.5700")
+            second = capsys.readouterr().out.strip().split("\n")[1]
+            assert (
+                "on this 0.01-contract order the model comes to $0.0200 per contract at"
+                " $0.0001 precision or $1.0000 per contract at $0.01 precision."
+            ) in second
+
+    def test_the_order_rounding_is_exact_decimal_arithmetic(self):
+        # At the probe's 0.01 contracts, rounding the order's total up to
+        # $0.0001 is rounding one contract's fee up to the cent — the same
+        # figure config.fee_leg_exact(1, p) gives — at every cent price
+        assert v2_probe.PROBE_COUNT_STR == "0.01"
+        for cents in range(1, 100):
+            price = cents / 100
+            rounded = v2_probe._order_rounded_fee_per_contract(price, "0.0001")
+            assert rounded == Decimal(str(config.fee_leg_exact(1, price))), price
+        assert v2_probe._order_rounded_fee_per_contract(0.5, "0.01") == Decimal("1")
+
+    def test_an_order_object_nested_under_order_is_read(self, capsys):
+        v2_probe._report_fee({"order": FILLED}, "0.4300")
+        assert "per contract at p=0.41 (average fill price)" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("fill_price", [
+        None, "garbage", True, "1.5", "-0.1", "nan", "inf", {}, 10**400, "0", "0.0000", "1",
+    ])
+    def test_the_limit_price_stands_in_for_an_unreadable_fill_price(self, fill_price, capsys):
+        # Anything that is not a price strictly between 0 and 1 — including a
+        # number too large for a float — falls back to the limit price
+        body = dict(FILLED, average_fill_price=fill_price)
+        if fill_price is None:
+            del body["average_fill_price"]
+        v2_probe._report_fee(body, "0.4300")
+        printed = capsys.readouterr().out
+        assert "per contract at p=0.43 (limit price)" in printed
+        assert f"= {self._unrounded(0.43)} per contract before rounding" in printed
+
+    def test_with_no_price_at_all_the_charge_is_still_printed(self, capsys):
+        body = dict(FILLED, average_fill_price="garbage")
+        v2_probe._report_fee(body, "not a price")
+        printed = capsys.readouterr().out
+        assert "exchange average_fee_paid=$0.0200 per contract" in printed
+        assert "'not a price'" in printed
+        assert "before rounding" not in printed
+        assert "Kalshi rounds" not in printed
+
+    def test_a_full_probe_run_prints_the_per_contract_lines(self, submits, capsys):
+        client = probe_client([0, -0.01, 0])
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        printed = capsys.readouterr().out
+        assert "exchange average_fee_paid=$0.0200 per contract" in printed
+        assert "per contract before rounding" in printed
+        assert "the model comes to $0.0200 per contract at $0.0001 precision" in printed
 
 
 def shard_statuses(transfers_active: bool = True, shards: tuple = (0, 1)) -> dict:
