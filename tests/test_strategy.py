@@ -1800,10 +1800,10 @@ _OTHER_B = _ladder_market("RAIN-2", "KXRAIN-2", "Will it rain in NYC by March 11
 
 
 class TestSelectPortfolioLadders:
-    """At most one open time-series trade per ladder. A ladder is one question
-    asked at several deadlines. Two markets are on one ladder when they share
-    an event, or ask the same question once the dates are removed. Positions
-    we hold count, and so do the specs picked earlier in the same run."""
+    """select_portfolio picks at most one time-series trade per ladder (one
+    question at several deadlines): two markets share a ladder when they share
+    an event or ask the same question once the dates are removed. Held
+    positions count, and so do specs picked earlier in the run."""
 
     def test_two_time_series_specs_on_one_ladder_take_only_the_better(self, caplog):
         best = _ladder_spec(_R1, _R3, ratio=0.20)

@@ -43,14 +43,11 @@ Dependencies:
     same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
     the one definition of the same-title close gate, with
     close_gap_bound_text, the bound its refusal line prints (DR-74), and
-    ladder_keys, the one definition of which ladders a market is on, which
-    the backtest's one-open-trade-per-ladder rule labels each market with).
+    ladder_keys, which ladders a market is on).
     pair_gap_days() is the single reader of that gap for everything
-    downstream of pair formation. ladder_keys(), market_ladder_keys() and
-    pair_ladder_keys() name the ladders a market is on (its event, and its
-    question with the dates removed), and resolve_held_ladders() finds the
-    ladders of the markets the account holds; find_time_series_pairs refuses
-    any candidate with a market on one of them. historical.py imports
+    downstream of pair formation. resolve_held_ladders() finds the ladders
+    of the markets the account holds, and find_time_series_pairs refuses any
+    candidate with a market on one of them. historical.py imports
     event_series too, so the backtest's event-title lookup budget tells a
     combo ticker from any other exactly as the one-series rule does (DR-51).
     Depends on the KalshiClient produced by auth.py.
@@ -2168,11 +2165,10 @@ def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
     """
     Return labels naming the ladders a market belongs to.
 
-    A ladder is one question asked at several deadlines. Two markets are on
-    the same ladder if they are in the same event, or ask the same question
-    once the dates are removed. Each label is tagged with its kind, so an
-    event ticker can never match a question. Blank or non-text values are
-    ignored.
+    A ladder is one question asked at several deadlines: two markets are on
+    one ladder if they share an event, or ask the same question once the
+    dates are removed. Labels are tagged with their kind, so an event can
+    never match a question. Blank or non-text values are ignored.
 
     Args:
         event_ticker (Any): The market's event ticker.
@@ -2191,10 +2187,7 @@ def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
 
 def market_ladder_keys(market: Any) -> frozenset:
     """
-    Return the ladder labels of one market.
-
-    The question label is the same key the time-series finder groups
-    markets by.
+    Return one market's ladder labels; the question is the finder's group key.
 
     Args:
         market (Any): A market object with an event ticker and titles.
@@ -2203,7 +2196,7 @@ def market_ladder_keys(market: Any) -> frozenset:
         frozenset: The market's event and question labels.
     """
     name = pair_key(market)
-    # A market whose name is not text, such as a fake one in a test, gets no question label
+    # A non-text name (a test's fake market) gives no question label
     question = (time_series_group_key(name, getattr(market, "subtitle", "") or "")
                 if isinstance(name, str) else "")
     return ladder_keys(getattr(market, "event_ticker", ""), question)
@@ -2579,10 +2572,9 @@ def _error_text(exc: BaseException) -> str:
     """
     Describe a failed request in one short line.
 
-    An error with an HTTP status gives its type, the status and any
-    reason. Any other error gives its type and the first line of its
-    message. An error's whole message is never used, because an exchange
-    error's message lists every response header.
+    The type plus the HTTP status and reason, or else the message's first
+    line. Never the whole message, which for an exchange error lists every
+    response header.
 
     Args:
         exc (BaseException): The error to describe.
@@ -2610,10 +2602,9 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
     """
     Ask the exchange for one held market and its event's title.
 
-    The event title is part of the market's question, so without it the
-    market's question label would not match the other markets on its
-    ladder. Titles are kept in `event_titles`, so two markets of one event
-    cost one event request.
+    The event title is part of the question label, so without it the label
+    would not match the market's ladder-mates. `event_titles` caches titles
+    by event.
 
     Args:
         client (Any): An authenticated Kalshi client.
@@ -2624,7 +2615,7 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
         ApiMarket | None: The market, or None if it or its event can't be read.
     """
     try:
-        # Raw reply, retried on rate limits and server errors
+        # Raw, retried read
         data = api_call_with_retry(
             fetch_json_page, client.get_market_without_preload_content, ticker=ticker
         )
@@ -2637,7 +2628,6 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
             logging.warning("Could not look up held market %s: it has no event ticker", ticker)
             return None
         if event_ticker not in event_titles:
-            # Same raw, retried request for the market's event
             ev_data = api_call_with_retry(
                 fetch_json_page, client.get_event_without_preload_content,
                 event_ticker=event_ticker,
@@ -2647,9 +2637,9 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
                 logging.warning("Could not look up held market %s: the reply for its event "
                                 "%s had no event", ticker, event_ticker)
                 return None
-            # An event without a title reads as "", as it does in the market list
+            # A title-less event reads as "", as in the market list
             event_titles[event_ticker] = event.get("title") or ""
-        # Same parsing as the market list, so its labels match the other markets on its ladder
+        # Parsed like the market list, so its labels match its ladder-mates'
         return _market_from_dict(raw, event_titles[event_ticker])
     except Exception as exc:
         logging.warning("Could not look up held market %s: %s", ticker, _error_text(exc))
@@ -2660,11 +2650,10 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set) -> froze
     """
     Return the ladder labels of every market we currently hold.
 
-    Uses this run's market list where it can, and asks the exchange about
-    any held market missing from it, such as one that has closed but not
-    yet paid out. If a held market can't be identified, it returns None:
-    the caller must then make no time-series trade, because it can't tell
-    which ladder that position is on.
+    Reads this run's market list, and asks the exchange about any held
+    market missing from it (one closed but not yet paid out, say). Returns
+    None if a held market can't be identified: the caller must then make no
+    time-series trade.
 
     Args:
         client (Any): An authenticated Kalshi client.
@@ -2680,14 +2669,13 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set) -> froze
     looked_up = 0
     for ticker in sorted(held_tickers, key=str):
         market = None
-        # A position with no ticker can't be matched to any market
         if isinstance(ticker, str) and ticker:
             market = by_ticker.get(ticker)
             if market is None:
                 market = _fetch_held_market(client, ticker, event_titles)
                 looked_up += 1
         if market is None:
-            # The answer is already None, so stop rather than wait on more requests
+            # Stop at the first: the answer is already None
             logging.error(
                 "Could not look up held market %r, so no time-series trade will be "
                 "made this run (%d held market(s) in all)", ticker, len(held_tickers))
@@ -3377,11 +3365,9 @@ def find_time_series_pairs(
     otherwise have paired the widest mismatch (DR-01).
 
     A pair is eligible when:
-      0. Neither market is on a ladder we already hold (held_ladders). A
-         ladder is one question asked at several deadlines. Two markets are
-         on one ladder when they share an event, or ask the same question
-         once the dates are removed. This is checked first, so a group whose
-         best candidate is refused here can still offer its next best.
+      0. Neither market is on a ladder we already hold (held_ladders; see
+         ladder_keys). Checked first, so a refused group can still offer its
+         next best pair.
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (which rules out an MVE event's multi-choice
          option labels) — UNLESS config.TIME_SERIES_SAME_EVENT_LADDERS is on
@@ -3447,8 +3433,8 @@ def find_time_series_pairs(
     preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
     outcome label, so the rule no longer bounds one FAMILY to one pair — a
     daily family of N strikes now yields up to N pairs, every one on the same
-    underlying over the same window. Two such pairs that share an event are
-    on one ladder, so the bot does not open one while it holds the other.
+    underlying over the same window (two that share an event are one ladder,
+    so the bot never holds both).
 
     The legs are YES on A at pA and NO on B at nB, so tradeable=True when
     pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
@@ -3587,8 +3573,7 @@ def find_time_series_pairs(
                 stated_deadline(profile, "", "", ""),
             )
 
-    # Candidates with a market on a ladder we already hold. They are refused
-    # before every other check, so none of them reaches the counters below.
+    # Refused before every other check, so counted on no other line
     held_ladder_skips = 0
     # Candidates refused because the two legs are not one question at two
     # cumulative deadlines, split by REASON (DR-72) rather than folded into
@@ -3656,9 +3641,8 @@ def find_time_series_pairs(
         # instant or in the opposite order to their deadlines.
         members_sorted = sorted(members, key=lambda m: m.close_time)
         group_pairs: list = []
-        # Tickers of this group's markets that sit on a ladder we already hold.
-        # The group key is each member's question, so a held question blocks
-        # the whole group, while a held event blocks only that event's members.
+        # Members on a held ladder: a held question blocks the whole group, a
+        # held event only its own members
         on_held_ladder = (
             {m.ticker for m in members_sorted
              if ladder_keys(m.event_ticker, norm_title) & held_ladders}
@@ -3678,8 +3662,7 @@ def find_time_series_pairs(
                 # means "this pair is tiered on close_time" (pair_gap_days).
                 stated_gap = None
 
-                # No new pair on a ladder we already hold. Refused here, before
-                # the group's best pair is chosen, so the next best can win.
+                # Before the group contest, so the next best pair can win
                 if mA.ticker in on_held_ladder or mB.ticker in on_held_ladder:
                     held_ladder_skips += 1
                     continue
@@ -3963,7 +3946,6 @@ def find_time_series_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
-    # Logged only when something was refused, so a run that holds nothing adds no line
     if held_ladder_skips:
         logging.info(
             "Time-series candidates refused because one of their markets is on a "

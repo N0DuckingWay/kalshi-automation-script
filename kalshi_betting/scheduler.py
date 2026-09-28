@@ -459,9 +459,8 @@ def run_job(retries: int = 0) -> None:
     contract in config.py (BS-14): a low-balance skip and a run with trades
     needing manual review are no longer indistinguishable from a clean run in
     this log — previously the only signal was a WARNING inside kalshi_arb.log
-    that this scheduler process never reads. EXIT_TIME_SERIES_SKIPPED (a held
-    market could not be identified, so the run made no time-series trade) is
-    an ERROR here, and still counts the slot as done.
+    that this scheduler process never reads. EXIT_TIME_SERIES_SKIPPED is an
+    ERROR that still counts the slot as done.
 
     A subprocess.TimeoutExpired's stdout/stderr are decoded before logging
     (BS-16 — see _decode()), and both streams are logged (stderr, the hung
@@ -557,8 +556,7 @@ def run_job(retries: int = 0) -> None:
             "check kalshi_arb.log and trade_log.xlsx.",
         )
     elif result.returncode == EXIT_TIME_SERIES_SKIPPED:
-        # The run scanned and could still trade same-title pairs, so the slot
-        # counts as done; a retry would most likely fail the same lookup
+        # Slot done: same-title still ran, and a retry would likely fail again
         logging.error(
             "Job made NO time-series trade (exit %d): a held market could not "
             "be identified, so the run could not tell which ladders it already "

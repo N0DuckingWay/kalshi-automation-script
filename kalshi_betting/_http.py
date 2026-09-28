@@ -57,8 +57,8 @@ Notes:
     account's position ledger. trader._execute_transfer is one exception —
     an accepted transfer has no such ledger to reconcile it against and its
     caller's generic handler would report a FAILED POST — so it guards with
-    isinstance(..., dict) instead (DR-05). Some read-only lookups also check
-    the type, and treat such a body as a failed read.
+    isinstance(..., dict) instead (DR-05). A few read-only lookups also check
+    the type, as a failed read.
 """
 import json
 import logging
@@ -256,8 +256,8 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body pa
             isinstance(..., dict) — because its 2xx has already moved money and
             nothing reconciles a transfer after the fact — is
             trader._execute_transfer, which reads signed_request_json rather
-            than this helper (DR-05). Some read-only lookups also check the
-            type, and treat such a body as a failed read.
+            than this helper (DR-05). A few read-only lookups also check the
+            type, as a failed read.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is

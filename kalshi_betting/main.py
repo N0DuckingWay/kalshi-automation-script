@@ -36,12 +36,11 @@ Dependencies:
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
-    resolve_held_ladders (the ladders the held positions are on),
-    leg_sides — the only source of truth for which side each leg buys — and
-    close_gap_bound_text, which renders that close-gap bound in the same
-    words the finders' refusal lines use), strategy.py (trade sizing and
-    portfolio selection), and trader.py (order execution). Entry point for
-    `python3 -m kalshi_betting.main`.
+    resolve_held_ladders, leg_sides — the only source of truth for which
+    side each leg buys — and close_gap_bound_text, which renders that
+    close-gap bound in the same words the finders' refusal lines use),
+    strategy.py (trade sizing and portfolio selection), and trader.py (order
+    execution). Entry point for `python3 -m kalshi_betting.main`.
 
 Notes:
     Label rule for everything this module logs: "A"/"B" always mean
@@ -236,16 +235,13 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
     scanner.close_gap_bound_text. A set category/tag filter is named too,
     since it can empty the list on its own.
 
-    When the run did not look for time-series pairs at all, the message says
-    so instead of naming a rule that was never applied.
-
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
             ("... found in sandbox ..."), False for a production run.
             Defaults to False.
         settings (LiveSettings | None): The run's toggles; None reads config.py's.
-        time_series_searched (bool): Keyword-only. False when the run skipped
-            time-series pairs because a held market could not be identified.
+        time_series_searched (bool): Keyword-only. False says the run did not
+            look for time-series pairs, instead of naming their rule.
 
     Returns:
         str: The fully formatted log message, ready to pass to logging.info().
@@ -905,10 +901,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     normally except order submission — the log still records rows with
     status="simulated".
 
-    It also finds the ladders the held positions are on (a ladder is one
-    question asked at several deadlines), and makes no new time-series trade
-    on any of them. If a held market cannot be identified, the run makes no
-    time-series trade at all; same-title trades still go ahead.
+    It makes no new time-series trade on a ladder the account holds (a ladder
+    is one question asked at several deadlines), and none at all if a held
+    market cannot be identified; same-title trades still go ahead.
 
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
@@ -932,12 +927,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             the weekly slot as satisfied by a run that never looked at a book.
             EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
             results has status "rollback_failed" or "manual_review" — either
-            means a human must check the account/trade log; it wins over the
-            code below. EXIT_TIME_SERIES_SKIPPED if a held market could not be
-            identified, so the run made no time-series trade (it still
-            searched for and traded same-title pairs). EXIT_OK for every other
-            path, including dry-run, no candidate pairs, no executable trades,
-            and all-pairs-failed-pre-execution-check.
+            means a human must check the account/trade log, and wins over the
+            next code. EXIT_TIME_SERIES_SKIPPED if a held market could not be
+            identified, so the run made no time-series trade. EXIT_OK for
+            every other path, including dry-run, no candidate pairs, no
+            executable trades, and all-pairs-failed-pre-execution-check.
 
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
@@ -1004,13 +998,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
-    # The ladders our open positions are on, read from the full market list
-    # before held markets are removed from it. None means a held market could
-    # not be identified, so this run makes no time-series trade.
+    # Our positions' ladders, read before held markets are dropped; None
+    # means one could not be identified, so no time-series trade this run
     held_ladders      = resolve_held_ladders(client, markets, held_tickers)
-    # What a run that needs no human returns from here on: EXIT_OK, or
-    # EXIT_TIME_SERIES_SKIPPED when this run makes no time-series trade, so
-    # the scheduler's log says so too
+    # The exit code of every clean return below
     clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
@@ -1038,16 +1029,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     )
 
     if not candidate_pairs:
-        # Names the entry rule this run applied, flags included, or says the
-        # time-series side was not searched at all
+        # Names the run's entry rule, or says time-series was not searched
         logging.info(_no_pairs_msg(settings=settings,
                                    time_series_searched=held_ladders is not None))
         return clean_exit
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
-    # Greedy portfolio selection ranked by monthly_profit_ratio descending, at
-    # most one time-series trade per ladder (the ladders we hold count too)
+    # Greedy selection by monthly_profit_ratio, one time-series trade per ladder
     portfolio     = select_portfolio(list(trade_specs.values()), balance_cents,
                                      held_ladders=held_ladders or frozenset())
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
@@ -1080,9 +1069,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     portfolio = drop_legacy_unroutable(portfolio)
     if not portfolio:
         logging.info("No selected pair is routable by the configured order path.")
-        # Return the code by name, never a bare return: sys.exit(None) exits
-        # 0, which would hide EXIT_TIME_SERIES_SKIPPED. Every path of
-        # _run_prod names its exit code.
+        # Never a bare return: sys.exit(None) exits 0, which would hide
+        # EXIT_TIME_SERIES_SKIPPED
         return clean_exit
 
     # Move collateral to the shards the selected trades draw from — sizing is
@@ -1096,7 +1084,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        # Return the code by name — see the routability check above
+        # Never a bare return — see the routability check above
         return clean_exit
 
     # Submit orders sequentially per leg, concurrently across pairs

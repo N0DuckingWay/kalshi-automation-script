@@ -2450,10 +2450,9 @@ _TS_MID_MARKET = _mk_market(
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdHeldLadders:
     """A production run makes no new time-series trade on a ladder it already
-    holds. A ladder is one question asked at several deadlines. Two markets
-    are on one ladder when they share an event, or ask the same question once
-    the dates are removed. The held market may be in this run's market list or
-    not; if it cannot be looked up, the run makes no time-series trade at all."""
+    holds, whether or not the held market is in this run's market list. If a
+    held market cannot be looked up, the run makes no time-series trade at
+    all."""
 
     @staticmethod
     def _dry_run(client, monkeypatch, caplog, expected_code=EXIT_OK) -> list:
@@ -2892,9 +2891,8 @@ class TestRunProdTimeSeriesSkippedCode:
         assert code == EXIT_TIME_SERIES_SKIPPED
 
     def test_every_clean_exit_after_the_lookup_uses_the_run_code(self):
-        # Every return in _run_prod after clean_exit is set returns it, or the
-        # manual-review code; a new early return that said EXIT_OK would drop
-        # the skipped-time-series signal on that path.
+        # Every return in _run_prod after clean_exit is set returns it or the
+        # manual-review code, so no later path can report EXIT_OK instead.
         tree = ast.parse(inspect.getsource(main._run_prod).lstrip())
         fn = tree.body[0]
         assigned = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)

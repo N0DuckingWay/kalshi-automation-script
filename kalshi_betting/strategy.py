@@ -12,9 +12,8 @@ Purpose:
 Dependencies:
     config (constants, fee helpers, the probability model, LiveSettings,
     live_settings, pair_size_cap) and scanner (CandidatePair,
-    leg_prices/leg_sides, book-pricing helpers, and pair_ladder_keys, which
-    names the ladders a pair's markets are on). TradeSpec is consumed by
-    trader and reporter; main calls compute_trade and
+    leg_prices/leg_sides, book-pricing helpers, pair_ladder_keys). TradeSpec
+    is consumed by trader and reporter; main calls compute_trade and
     select_portfolio. backtester and dashboard do NOT import this module: they
     share config's probability model, fee helpers and constants, but
     re-implement the Kelly formula (net spread, b with the fee in its
@@ -577,14 +576,12 @@ def select_portfolio(specs: list, balance_cents: int, *,
     runs are excluded upstream by scanner.get_held_tickers (prod only).
 
     A time-series spec is also skipped when one of its markets is on a ladder
-    where the account already holds a position, or on the ladder of a spec
-    picked earlier in this run. A ladder is one question asked at several
-    deadlines. Two markets are on one ladder when they share an event, or ask
-    the same question once the dates are removed. A same-title spec is never
-    skipped this way, but once picked its ladders count too. A skipped spec
-    spends no cash, so a later spec of either kind may then fit where it
-    would not have. The backtester repeats the ticker, cash and ladder rules;
-    change both together.
+    the account holds, or on the ladder of a spec picked earlier (a ladder is
+    one question asked at several deadlines; see scanner.ladder_keys). A
+    same-title spec is never skipped this way, but its ladders count once
+    picked. A skipped spec spends no cash, so a later spec may then fit. The
+    backtester repeats the ticker, cash and ladder rules; change both
+    together.
 
     Args:
         specs (list): TradeSpecs from compute_trade.
@@ -616,7 +613,6 @@ def select_portfolio(specs: list, balance_cents: int, *,
         # Skip trades that would re-use a ticker already committed to a higher-priority pair
         if ta in used_tickers or tb in used_tickers:
             continue
-        # The ladders this pair's two markets are on
         keys = pair_ladder_keys(spec.pair)
         # At most one open time-series trade per ladder
         if spec.pair.pair_type == "time_series" and keys & used_ladders:
@@ -631,7 +627,6 @@ def select_portfolio(specs: list, balance_cents: int, *,
         used_tickers.add(ta)
         used_tickers.add(tb)
         used_ladders |= keys
-    # Logged only when a spec was skipped this way
     if ladder_skips:
         logging.info(
             "Time-series trades skipped because the account already holds, or this "

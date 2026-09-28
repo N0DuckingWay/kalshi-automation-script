@@ -5336,15 +5336,13 @@ _HELD_LINE = ("Time-series candidates refused because one of their markets is on
 
 
 class TestFinderRefusesHeldLadders:
-    """No new time-series pair may use a market on a ladder we already hold. A
-    ladder is one question asked at several deadlines. Two markets are on one
-    ladder when they share an event, or ask the same question once the dates
-    are removed. Each test scans with the held market left out of the list,
-    as a live run does."""
+    """No new time-series pair may use a market on a ladder we already hold.
+    Each test scans with the held market left out of the list, as a live run
+    does."""
 
     @staticmethod
     def _scan(markets, **kwargs):
-        # The tier rule alone, so no test depends on the toggles config.py ships
+        # Explicit settings, so no test depends on the toggles config.py ships
         return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets,
                                       settings=_live(), **kwargs)
 
