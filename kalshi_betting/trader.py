@@ -73,15 +73,11 @@ Purpose:
     same ticker used to read as "our leg filled", and an unrelated absence used
     to read as "our leg didn't").
 
-    The write pacer keeps its waits out of that window as far as it can. A
-    pair's NO leg waits until TWO tokens are free together, sends one and
-    holds the other (_PairWrites, _WritePacer.acquire_with_hold), so the YES
-    leg is sent at once on the held place. An unwind takes a place in the
-    pacer's hedge lane, served before every waiting opening NO leg, so it waits
-    only for the refill of one token for itself and one for each unwind
-    already ahead of it. A held place counts against the bucket until it is
-    sent or given back, which is what keeps a YES leg sent late inside the
-    write limit.
+    The write pacer adds no wait before the YES leg: a pair's NO leg waits for
+    two free tokens and holds the second, so the YES leg is sent at once. An
+    unwind takes the pacer's hedge lane, ahead of every waiting NO leg, and
+    waits at most 1/rate seconds for each unwind in that lane, its own
+    included (_PairWrites).
 
     pre_execution_check() re-fetches order books for each spec in the portfolio
     concurrently and drops any whose prices have moved since the scan, reducing
@@ -127,10 +123,9 @@ Notes:
     is not idempotent, so a retried transfer moves the money twice.
     _submit_order calls fetch_json_page directly and _submit_order_v2 /
     _execute_transfer call signed_request_json directly; none of those three may
-    ever be wrapped in api_call_with_retry. Each of the three takes one place on
-    _ORDER_WRITE_PACER for its POST before sending it (a pair's NO leg also
-    holds a second place, which its YES leg sends), and that is not a retry:
-    the pacer only delays a request, which is then sent exactly once. An HTTP
+    ever be wrapped in api_call_with_retry. Each POST first takes one place on
+    _ORDER_WRITE_PACER (a YES leg uses the place its NO leg held for it);
+    that only delays the request, which is still sent exactly once. An HTTP
     429 that still comes back raises like any other error response.
 
     The read-only position lookups in _position_count ARE retried, and that
@@ -387,36 +382,27 @@ _V2_NO_MAPPING_CONFIRMED = False
 # far below any price-staleness concern.
 _V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
 
-# A pacing wait at or under this many seconds is not logged: a few orders
-# queued behind a full burst wait a fraction of a second each, and a line per
-# order would bury the execution log. A longer wait gets one INFO line, so a
-# gap between two submissions in the log has its cause beside it.
+# Pacing waits this short or shorter are not logged, so an ordinary queue
+# behind a full burst does not bury the execution log.
 _PACE_LOG_MIN_WAIT_SECONDS = 0.25
 
-# Slack on the pacer's token comparisons. A waiter sleeps exactly as long as
-# the refill needs to cover it, and float arithmetic can leave the balance a
-# hair short of a whole token when it wakes; this lets it through instead of
-# sending it back to sleep for a few nanoseconds.
+# Float slack on token comparisons: a waiter that wakes a hair short of a
+# whole token is served rather than sent back to sleep.
 _PACE_TOKEN_EPS = 1e-9
 
 
-# eq=False: requests compare by identity, so line.remove(request) in
-# _WritePacer._take removes this caller's own entry, never another waiting
-# request that happens to have the same fields.
+# eq=False so line.remove(request) removes this exact request, never another
+# caller's request with the same fields.
 @dataclass(eq=False)
 class _PaceRequest:
     """
-    One caller waiting for a place on a _WritePacer.
+    One caller waiting on a _WritePacer.
 
     Attributes:
-        need (int): Tokens the caller takes when served: 1 for a single
-            write, 2 for a write sent now plus one held for later.
-        hold (bool): True when one of those tokens is held for a later write
-            (_WritePacer.acquire_with_hold).
-        hedge (bool): True for the hedge lane, which is served before every
-            other waiting caller.
-        served_at (float | None): The pacer's clock reading when the caller
-            was served; None while it is still waiting.
+        need (int): Tokens to take: 1, or 2 for a write now plus one held.
+        hold (bool): True when one of those tokens is held for later.
+        hedge (bool): True for the hedge lane, served before the in-turn line.
+        served_at (float | None): Clock reading when served; None while waiting.
     """
     need: int
     hold: bool
@@ -426,84 +412,58 @@ class _PaceRequest:
 
 class _HeldWrite:
     """
-    One write a _WritePacer has set aside for a POST its holder sends later.
+    A write set aside on a _WritePacer for its holder to send later.
 
-    Made by _WritePacer.acquire_with_hold. While it is held, its token is
-    counted against the pacer's bucket as if it were already spent, so the
-    holder can send the write at any later moment with no wait and without
-    the account's writes going over the pacer's rate. The holder ends the
-    hold exactly once: send() when the POST goes out, or release() to give
-    the token back unsent. Whichever comes first takes effect; any later call
-    does nothing.
+    Its token counts against the bucket until the holder calls send() (the
+    POST is going out) or release() (it is not). Only the first call counts.
     """
 
     def __init__(self, pacer: "_WritePacer") -> None:
         """
-        Make a live hold. Only _WritePacer._take makes one, right after it
-        has counted the held token against its bucket.
+        Start a live hold (only _WritePacer._take makes one).
 
         Args:
-            pacer (_WritePacer): The pacer whose bucket the held token is
-                counted against.
+            pacer (_WritePacer): The pacer the token is held on.
         """
         self._pacer = pacer
         self._live = True
 
     def send(self) -> bool:
         """
-        Spend the held write on a POST the caller sends right after.
+        Use the held write for a POST about to be sent.
 
         Returns:
-            bool: True when the write was still held, so the caller may send
-                with no wait. False when it was already sent or released; the
-                caller must then take a place on the pacer of its own.
+            bool: True if it was still held, so the POST may go with no wait;
+                False if it was already used or released, so the caller must
+                take a place of its own.
         """
         return self._pacer._end_hold(self, sent=True)
 
     def release(self) -> None:
-        """Give the held write back to the pacer unsent, if it is still held."""
+        """Give the held write back unsent, if it is still held."""
         self._pacer._end_hold(self, sent=False)
 
 
 class _WritePacer:
     """
-    A thread-safe token bucket that spaces out the account's write requests.
+    A thread-safe token bucket that paces the account's order and transfer POSTs.
 
-    Holds up to `burst` tokens and refills at `rate` tokens a second. Every
-    order and transfer POST takes one token before it is sent. A caller that
-    finds too few tokens waits its turn: waiting callers are served one at a
-    time from the front of the line, as soon as the refill covers the one at
-    the front, so nobody jumps a caller that arrived first in its own lane.
+    Holds up to `burst` tokens and refills at `rate` a second; every POST takes
+    a token first. Callers wait their turn, first come, first served, in one
+    of two lines: the in-turn line (acquire, acquire_with_hold)
+    and the hedge lane (acquire_hedge), which is always served first and is
+    what an unwind of a pair's NO leg uses.
 
-    Two extras serve the pair executor (_execute_one), whose second leg hedges
-    its first:
-      * acquire_with_hold takes two tokens at once: one for a POST sent now
-        (the pair's NO leg) and one HELD for a POST the caller sends later
-        (the pair's YES leg). A held token counts against the bucket's
-        capacity until it is sent or released, so the refill stops at
-        `burst` minus the held tokens — the bucket's "room". That is what
-        makes a held write safe to send at any later moment: at every instant
-        the bucket's free tokens plus its held tokens stay within `burst`, so
-        the POSTs actually sent never exceed `burst` plus `rate` times the
-        stretch between them, however late each held write goes out.
-      * acquire_hedge takes one token in the hedge lane, which is served
-        before every waiting acquire and acquire_with_hold. An unwind of a
-        pair's NO leg uses it (see _PairWrites.hedge).
+    acquire_with_hold takes two tokens: one for a POST now (a pair's NO leg)
+    and one held for a POST later (its YES leg). Held tokens count against the
+    bucket until sent or released, so the refill stops at `burst` minus the
+    held tokens (the bucket's "room"). So in any T seconds at most
+    burst + rate*T POSTs go out, however late a held write is sent. A hold
+    needs two free tokens, so at most burst - 1 are ever held and a hedge-lane
+    write can always be served by the refill alone.
 
-    A caller that holds a write never waits on the pacer before sending it,
-    and acquire_with_hold never lets the held tokens reach `burst` (it needs
-    two free tokens, so at most burst - 1 are ever held): a hedge-lane caller
-    can always be served by the refill alone, and a caller waiting for two
-    tokens is woken whenever a held write is sent or released.
-
-    Waiting is done with the lock released (Condition.wait), so one caller's
-    wait never blocks another caller from joining the line or ending a hold.
-    Pacing is not a retry: it only delays a request that is then sent exactly
-    once.
-
-    The clock and the wait are read at call time from the time module and the
-    condition unless the constructor is given its own, so a test can drive
-    the bucket in simulated time.
+    Waiting releases the lock (Condition.wait). Pacing only delays a request,
+    which is still sent exactly once. Tests may pass their own clock and wait.
     """
 
     def __init__(
@@ -518,21 +478,19 @@ class _WritePacer:
         Build a full bucket.
 
         Args:
-            rate (float): Tokens added per second. Must be a finite number > 0.
-            burst (int): Most tokens the bucket holds, i.e. how many writes
-                pass back to back with no wait. Must be an int >= 2, since a
-                pair's two writes must fit in the bucket together.
-            clock (Callable[[], float] | None): Seconds on a clock that never
-                goes backwards. None reads time.monotonic at each call.
-            wait (Callable[[float | None], Any] | None): Blocks for at most the
-                given seconds (None: until woken), called with the pacer's
-                condition held and releasing it while blocked, as
-                threading.Condition.wait does. None calls the condition's own
-                wait.
+            rate (float): Tokens added per second; a finite number > 0.
+            burst (int): Bucket size, i.e. writes allowed back to back; an int
+                >= 2, so a pair's two writes fit together.
+            clock (Callable[[], float] | None): Monotonic seconds; None uses
+                time.monotonic.
+            wait (Callable[[float | None], Any] | None): Called with the
+                condition held; blocks up to the given seconds (None: until
+                woken) and releases the condition meanwhile, as
+                Condition.wait does. None uses the condition's own wait.
 
         Raises:
-            ValueError: When rate or burst is outside the ranges above. That
-                is a configuration error, so it is raised rather than returned.
+            ValueError: If rate or burst is out of range (a configuration
+                error, so it is raised).
         """
         if (isinstance(rate, bool) or not isinstance(rate, (int, float))
                 or not math.isfinite(rate) or rate <= 0):
@@ -544,49 +502,44 @@ class _WritePacer:
             )
         self._rate = float(rate)
         self._burst = float(burst)
-        # Free tokens. Always within [0, burst - held] once refilled.
-        self._tokens = float(burst)
-        # Writes set aside by acquire_with_hold and not yet sent or released.
-        self._held = 0
-        # When the balance was last brought up to date. None until the first
-        # request, so the bucket starts from the first reading of whichever
-        # clock it was given rather than from a reading taken at import.
+        self._tokens = float(burst)  # free tokens, never above burst - held
+        self._held = 0               # tokens held by acquire_with_hold
+        # Last refill time; None until the first request, so it comes from the
+        # pacer's own clock rather than a reading taken at import
         self._stamp: float | None = None
         self._clock = clock
         self._wait = wait
         self._cond = threading.Condition()
-        # The two lines of waiting callers, each first come, first served in
-        # the order callers take the lock. The hedge line is served first.
+        # Waiting callers, first come, first served; hedges go first
         self._hedges: deque[_PaceRequest] = deque()
         self._in_turn: deque[_PaceRequest] = deque()
 
     def acquire(self) -> float:
         """
-        Take one token for a POST sent now, waiting in turn if there is none.
+        Take a token for a POST now, waiting its turn behind earlier callers.
 
         Returns:
-            float: Seconds this caller waited (0.0 when a token was free).
+            float: Seconds waited (0.0 when a token was free).
         """
         return self._take(_PaceRequest(need=1, hold=False, hedge=False))[0]
 
     def acquire_hedge(self) -> float:
         """
-        Take one token for a POST sent now, ahead of every other waiting caller.
+        Take a token for a POST now, ahead of every caller waiting in turn.
 
         Returns:
-            float: Seconds this caller waited (0.0 when a token was free).
+            float: Seconds waited (0.0 when a token was free).
         """
         return self._take(_PaceRequest(need=1, hold=False, hedge=True))[0]
 
     def acquire_with_hold(self) -> tuple[float, _HeldWrite]:
         """
-        Take one token for a POST sent now and hold a second for a later POST.
-
-        Waits in turn until two tokens are free together.
+        Take a token for a POST now and hold a second for later, waiting in
+        turn until two are free.
 
         Returns:
-            tuple[float, _HeldWrite]: Seconds this caller waited, and the held
-                write, which the caller must end with send() or release().
+            tuple[float, _HeldWrite]: Seconds waited, and the held write (end
+                it with send() or release()).
         """
         # A request with hold=True always comes back with its held write
         return self._take(_PaceRequest(need=2, hold=True, hedge=False))  # type: ignore[return-value]
@@ -596,15 +549,14 @@ class _WritePacer:
         Read the pacer's clock.
 
         Returns:
-            float: Seconds on the clock given to the constructor, or on
-                time.monotonic.
+            float: Seconds on the given clock, or on time.monotonic.
         """
         return self._clock() if self._clock is not None else time.monotonic()
 
     def _refill(self, now: float) -> None:
         """
-        Add the tokens earned since the last update, up to burst minus the held
-        writes. Call with the condition held.
+        Add the tokens earned since the last update, up to burst minus held.
+        Call with the lock held.
 
         Args:
             now (float): The pacer's clock reading.
@@ -620,13 +572,10 @@ class _WritePacer:
 
     def _head(self) -> _PaceRequest | None:
         """
-        Find the waiting caller served next: the front of the hedge line, or
-        of the in-turn line when no hedge is waiting. Call with the condition
-        held.
+        Find the next caller to serve (hedge lane first). Call with the lock held.
 
         Returns:
-            _PaceRequest | None: That caller's request, or None when nobody
-                is waiting.
+            _PaceRequest | None: Its request, or None when nobody is waiting.
         """
         if self._hedges:
             return self._hedges[0]
@@ -636,12 +585,10 @@ class _WritePacer:
 
     def _serve(self, now: float) -> None:
         """
-        Serve waiting callers from the front of the line while tokens allow.
-        Call with the condition held.
+        Serve callers from the front of the line while tokens cover them, and
+        wake the rest if anyone was served. Call with the lock held.
 
-        Stops at the first caller the balance does not cover, so nobody behind
-        it goes first. Wakes every waiter when anyone was served, so the new
-        front of the line works out its own wait.
+        Stops at the first caller not covered, so nobody behind it goes first.
 
         Args:
             now (float): The pacer's clock reading.
@@ -662,13 +609,12 @@ class _WritePacer:
 
     def _delay(self) -> float | None:
         """
-        Work out how long the front of the line has to wait. Call with the
-        condition held, right after _serve.
+        Work out how long the front caller must wait. Call with the lock held,
+        right after _serve.
 
         Returns:
-            float | None: Seconds until the refill covers it, or None when
-                nobody is waiting or the room is too small for it, so that only
-                a held write's send or release can let it through.
+            float | None: Seconds until the refill covers it; None when nobody
+                is waiting, or when only ending a hold can make room for it.
         """
         head = self._head()
         if head is None or self._burst - self._held + _PACE_TOKEN_EPS < head.need:
@@ -677,11 +623,10 @@ class _WritePacer:
 
     def _block(self, timeout: float | None) -> None:
         """
-        Wait with the condition released until woken or until timeout.
+        Wait, with the lock released, until woken or until timeout.
 
         Args:
-            timeout (float | None): Most seconds to wait; None waits until
-                woken.
+            timeout (float | None): Most seconds to wait; None waits until woken.
         """
         if self._wait is not None:
             self._wait(timeout)
@@ -692,16 +637,15 @@ class _WritePacer:
         """
         Join the request's line and wait until it is served.
 
-        Every waiting caller tries to serve the line whenever it wakes, so the
-        front of the line goes as soon as it is covered even if its own thread
-        is slow to wake.
+        Any waiting thread that wakes serves the front of the line, so a
+        slow-waking thread never holds the line up.
 
         Args:
             request (_PaceRequest): What the caller needs.
 
         Returns:
             tuple[float, _HeldWrite | None]: Seconds waited, and the held write
-                when request.hold is True (None otherwise).
+                when request.hold is True (else None).
         """
         line = self._hedges if request.hedge else self._in_turn
         with self._cond:
@@ -714,15 +658,12 @@ class _WritePacer:
                     self._serve(self._now())
             except BaseException:
                 if request.served_at is None:
-                    # A caller that stops waiting leaves the line, so the
-                    # callers behind it are not stuck behind a place nobody
-                    # will take
+                    # Leave the line, so nobody waits behind an empty place
                     line.remove(request)
                     self._cond.notify_all()
                 elif request.hold:
-                    # Served by another waiter just before this caller stopped:
-                    # nobody will ever get the held write, so give it back (the
-                    # write the caller would have sent now is left spent)
+                    # Served just before stopping: return the held token,
+                    # which nobody else could ever send or release
                     self._refill(self._now())
                     self._held -= 1
                     self._tokens += 1.0
@@ -741,26 +682,23 @@ class _WritePacer:
 
     def _end_hold(self, held: _HeldWrite, *, sent: bool) -> bool:
         """
-        End a held write: spent on a POST (sent) or given back unsent.
-
-        A sent write's token is gone, so only the room it held is freed; an
-        unsent one's token returns to the free balance. Either way waiting
-        callers are woken, since the room the refill may fill has grown.
+        End a hold. A sent hold's token is spent; a released one's returns to
+        the free tokens. Either way the room grows, so waiters are woken.
 
         Args:
             held (_HeldWrite): The hold to end.
             sent (bool): True when the holder is about to send the write.
 
         Returns:
-            bool: True when the hold was still live and has now ended; False
-                when it had already ended (nothing changes).
+            bool: True if the hold was live and is now ended; False if it had
+                already ended (nothing changes).
         """
         with self._cond:
             if not held._live:
                 return False
             held._live = False
-            # Bring the balance up to now under the current room (burst minus
-            # the held writes), before this hold stops counting against it
+            # Refill to now under the current room first; freeing the room
+            # before refilling would credit idle time to the whole bucket
             now = self._now()
             self._refill(now)
             self._held -= 1
@@ -771,29 +709,23 @@ class _WritePacer:
         return True
 
 
-# The one pacer every order and collateral-transfer POST in this module goes
-# through, shared by all of execute_trades' worker threads, so together they
-# stay under the account's write limit (see config.ORDER_WRITES_PER_SECOND).
-# Built at import from config.py, so a bad value there fails the import.
+# The one pacer shared by every order and transfer POST in this module, from
+# every worker thread (see config.ORDER_WRITES_PER_SECOND). Built at import,
+# so a bad config value fails the import.
 _ORDER_WRITE_PACER = _WritePacer(ORDER_WRITES_PER_SECOND, ORDER_WRITE_BURST)
 
 
 class _PairWrites:
     """
-    The places on the write pacer that one pair's orders take (_execute_one).
+    One pair's places on the write pacer (used by _execute_one).
 
-    The NO leg's POST takes two places at once (opening): one for itself and
-    one held for the YES leg, so the YES leg never waits while the NO leg is
-    filled and unhedged. A hedge write (hedge) — the YES leg, or an unwind —
-    sends the held place if it is still unsent and otherwise takes a place in
-    the pacer's hedge lane, ahead of every other pair's opening NO leg.
-    close() gives an unsent held place back; _execute_legs calls it as soon as
-    the NO leg's POST raises, because working out whether that leg filled can
-    take a minute of retried position reads, and the held place would keep
-    that room from every other pair meanwhile.
-
-    The pacer is read when the object is made, so every write of one pair goes
-    through the same pacer.
+    opening() is the NO leg's place: it waits for two free tokens and holds
+    the second for the YES leg, so the YES leg never waits while the NO leg is
+    unhedged. hedge() is for the YES leg or an unwind: it uses the held place
+    if still unsent, otherwise the hedge lane. close() returns an unsent held
+    place; _execute_legs calls it as soon as the NO leg's POST raises, since
+    checking whether that leg filled can take a minute of retried reads and
+    the hold would block other pairs meanwhile.
     """
 
     def __init__(self, pacer: _WritePacer) -> None:
@@ -801,19 +733,19 @@ class _PairWrites:
         Start with no place taken.
 
         Args:
-            pacer (_WritePacer): The pacer the pair's writes take places on.
+            pacer (_WritePacer): The pacer every write of this pair uses.
         """
         self._pacer = pacer
         self._held: _HeldWrite | None = None
 
     def opening(self) -> float:
         """
-        Wait for the NO leg's place and hold one for the pair's hedge.
+        Wait for the NO leg's place and hold one for the YES leg.
 
         Returns:
             float: Seconds waited.
         """
-        # One held place per pair: an earlier one (never expected) goes back first
+        # At most one hold per pair
         if self._held is not None:
             self._held.release()
         wait, self._held = self._pacer.acquire_with_hold()
@@ -821,18 +753,17 @@ class _PairWrites:
 
     def hedge(self) -> float:
         """
-        Take a place for a hedge write: the held one if it is still unsent,
-        otherwise one in the hedge lane.
+        Take a hedge write's place: the held one if unsent, else the hedge lane.
 
         Returns:
-            float: Seconds waited (0.0 when the held place was used).
+            float: Seconds waited (0.0 on the held place).
         """
         if self._held is not None and self._held.send():
             return 0.0
         return self._pacer.acquire_hedge()
 
     def close(self) -> None:
-        """Give an unsent held place back to the pacer."""
+        """Return an unsent held place to the pacer."""
         if self._held is not None:
             self._held.release()
 
@@ -1516,9 +1447,8 @@ def _submit_order_v2(
     before it matched, so nothing filled, and it is returned as "canceled",
     exactly like a 2xx with a fill count of zero. A killed NO leg therefore ends
     the pair as "failed" at once, and a killed YES leg goes straight to the
-    rollback with no position read; the only wait is the rollback's place in
-    the pacer's hedge lane (see _PairWrites). The immediate_or_cancel
-    unwind is never read this way, so any error on it stays rollback_failed.
+    rollback with no position read. The immediate_or_cancel unwind is never
+    read this way, so any error on it stays rollback_failed.
 
     Deliberately NOT wrapped in api_call_with_retry, for the same reason as the
     legacy _submit_order: retrying a fill-or-kill leg could double-submit it at
@@ -1527,11 +1457,9 @@ def _submit_order_v2(
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         body (dict): Request body from one of the _build_*_order_v2 builders.
-        pace (Callable[[], float] | None): Keyword-only. Waits for this POST's
-            place on the write pacer and returns the seconds waited; called
-            once, right before the POST. _execute_one passes one of its
-            _PairWrites methods, so a pair's hedge writes go ahead of other
-            pairs' opening NO legs. None takes an ordinary place in turn
+        pace (Callable[[], float] | None): Keyword-only. Called once, right
+            before the POST, to wait for its place on the write pacer (e.g. a
+            _PairWrites method from _execute_one). None takes a place in turn
             (_ORDER_WRITE_PACER.acquire).
 
     Returns:
@@ -1556,9 +1484,7 @@ def _submit_order_v2(
     429 is not caught here: it raises like any other error response.
     """
     requested = int(Decimal(body["count"]))
-    # Wait for a place under the account's write limit before logging, so the
-    # log line's time is the time the order is sent. Exactly one place per
-    # POST: pacing only delays the order, which is still sent once.
+    # One pacer place per POST, taken before logging so the log time is the send time
     (pace if pace is not None else _ORDER_WRITE_PACER.acquire)()
     # Log before submitting: the client_order_id is the only handle a human has
     # for finding this order in the account if the outcome turns out ambiguous
@@ -1679,9 +1605,7 @@ def _submit_any(
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         order (Any): A V2 request-body dict, or a legacy CreateOrderRequest.
-        pace (Callable[[], float] | None): Keyword-only. Waits for the POST's
-            place on the write pacer (see _submit_order_v2); None takes an
-            ordinary place in turn.
+        pace (Callable[[], float] | None): Keyword-only; see _submit_order_v2.
 
     Returns:
         str: The order's fill status — "executed", "canceled", or any other
@@ -1879,9 +1803,7 @@ def _submit_order(
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         order (CreateOrderRequest): The order to submit.
-        pace (Callable[[], float] | None): Keyword-only. Waits for the POST's
-            place on the write pacer (see _submit_order_v2); None takes an
-            ordinary place in turn.
+        pace (Callable[[], float] | None): Keyword-only; see _submit_order_v2.
 
     Returns:
         str: The submitted order's status (e.g. "executed", "canceled").
@@ -1959,12 +1881,10 @@ def _rollback_no_leg(
         reason (str): The upstream failure that triggered the rollback; recorded
             in the TradeResult error field.
         pace (Callable[[], float] | None): Keyword-only. Waits for the
-            unwind's place on the write pacer. _execute_one passes its
-            _PairWrites.hedge, which sends the pair's held place if it is
-            unsent and otherwise takes one in the hedge lane. None takes a
-            place in the hedge lane (_ORDER_WRITE_PACER.acquire_hedge): an
-            unwind goes ahead of every write waiting in turn (unwinds already
-            in the hedge lane go first).
+            unwind's place on the write pacer (_execute_one passes
+            _PairWrites.hedge). None takes the hedge lane
+            (_ORDER_WRITE_PACER.acquire_hedge), ahead of every write waiting
+            in turn.
 
     Returns:
         TradeResult: status="rolled_back" when the unwind filled in full,
@@ -1979,8 +1899,7 @@ def _rollback_no_leg(
     rollback = _build_rollback_order_any(no_leg)
     try:
         # Raw-response / signed submission — see _submit_order and
-        # _submit_order_v2 for why the modeled create_order call cannot be used.
-        # The unwind is a hedge write: it never waits behind an opening NO leg.
+        # _submit_order_v2 for why the modeled create_order call cannot be used
         rb_status = _submit_any(
             client, rollback,
             pace=pace if pace is not None else _ORDER_WRITE_PACER.acquire_hedge,
@@ -2337,8 +2256,7 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
     applies the shared non-2xx -> ApiException + JSON-parse contract and, by
     design, contains NO retry logic of its own. That is exactly the single-shot
     contract this call site needs (the same reason _submit_order_v2 uses it).
-    The POST is a write, so it first takes a place in turn on
-    _ORDER_WRITE_PACER (acquire), as a pair's opening NO leg does.
+    The POST first takes a place in turn on _ORDER_WRITE_PACER.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -2935,15 +2853,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     -no_leg.count disproves the unverified NO-leg mapping and stops the pair
     at "manual_review" before the YES leg is submitted.
 
-    Every POST waits for its place on the shared write pacer
-    (_ORDER_WRITE_PACER), and the pair's places come from one _PairWrites.
-    The NO leg's POST waits in turn until two tokens are free together, sends
-    one and holds the other for the YES leg, which is then sent with no wait.
-    An unwind takes a place in the pacer's hedge lane, ahead of every
-    waiting opening NO leg. The held place goes back to the pacer as soon as
-    the NO leg's POST raises (the reads that work out whether it filled can
-    take a minute, and the place would keep room from every other pair
-    meanwhile), and otherwise when the pair is done, whichever way it ends.
+    The pair's places on the shared write pacer come from one _PairWrites:
+    the NO leg waits for two free tokens and holds the second, so the YES leg
+    is sent with no wait; an unwind takes the hedge lane, ahead of every
+    waiting NO leg. An unsent held place is returned as soon as the NO leg's
+    POST raises, and in any case when the pair ends.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -2958,9 +2872,7 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             attributed to this order, or the V2 NO-leg mapping was disproven —
             in every such case no automated action was taken).
     """
-    # This pair's places on the write pacer. However the pair ends — filled,
-    # killed, unwound, stopped for review, or by an exception — an unsent held
-    # place goes back, so no pair keeps room in the bucket it will not use
+    # However the pair ends, an unsent held place goes back to the pacer
     writes = _PairWrites(_ORDER_WRITE_PACER)
     try:
         return _execute_legs(client, spec, writes)
@@ -2970,16 +2882,13 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
 def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeResult:
     """
-    Submit one pair's legs and resolve the outcome: the body of _execute_one,
-    whose docstring describes every path.
+    The body of _execute_one (see its docstring for every path).
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade specification to execute.
-        writes (_PairWrites): The pair's places on the write pacer. The NO
-            leg's POST takes writes.opening; the YES leg and every unwind take
-            writes.hedge; writes.close() runs as soon as the NO leg's POST
-            raises.
+        writes (_PairWrites): The pair's pacer places: writes.opening for the
+            NO leg, writes.hedge for the YES leg and any unwind.
 
     Returns:
         TradeResult: As _execute_one.
@@ -3032,22 +2941,15 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # once there after a 1s pause (DR-64). Both use the same bounded-wait idiom
     # _await_transfer_settlement uses; the mapping read costs at most one round
     # trip and disappears for the rest of the process once confirmed.
-    # The write pacer adds no wait to that window for the YES leg: the NO
-    # leg's POST waits until two tokens are free together and holds the
-    # second (writes.opening), so the YES leg is sent on the held place at
-    # once (writes.hedge). An unwind takes a place in the pacer's hedge lane,
-    # which is served before every other pair's opening NO leg, so it waits
-    # only for the refill of one token for itself (1 / ORDER_WRITES_PER_SECOND
-    # seconds, 0.125 s at the shipped value) and one more for each unwind
-    # already waiting in that lane.
+    # The write pacer adds no wait there: the YES leg is sent on the place the
+    # NO leg held for it (see _PairWrites).
     before_no = _position_count(client, no_leg.market.ticker)
     before_yes = _position_count(client, yes_leg.market.ticker)
 
     # Submit the NO leg (version-dispatched; see _submit_any)
     no_leg_error: str | None = None
     try:
-        # Opening write: waits in turn until two tokens are free together and
-        # holds the second for this pair's YES leg
+        # Waits for two free tokens and holds the second for the YES leg
         status_no = _submit_any(client, order_no, pace=writes.opening)
         if status_no != "executed":
             # FoK rejection is a confirmed non-fill — safe to walk away
@@ -3070,10 +2972,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # full backoff schedule (~62s) before this already-urgent decision could
     # be made.
     if no_leg_error is not None:
-        # The YES leg is never sent on this path, and the reads below can take
-        # a minute of retries: give the held place back now so
-        # it does not keep room from every other pair. An unwind below takes
-        # the hedge lane instead.
+        # The YES leg is never sent on this path and the reads below can take a
+        # minute, so return the held place now rather than block other pairs
         writes.close()
         # Ambiguous: the order may have filled before the exception (e.g. a
         # timeout after the fill). Attribute by delta against the baseline.
@@ -3125,8 +3025,6 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 no_leg.label, spec.pair.canonical_title, delta, no_leg.count,
                 no_leg_error,
             )
-            # The held place was given back above, so the unwind takes the
-            # hedge lane
             return _rollback_no_leg(
                 client, spec, no_leg, f"NO leg ambiguous error: {no_leg_error}",
                 pace=writes.hedge,
@@ -3169,8 +3067,7 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     yes_leg_error: str | None = None
     yes_leg_ambiguous = False
     try:
-        # Sent on the place the NO leg held for it: no wait on the pacer while
-        # the NO leg is filled and unhedged
+        # Sent on the place the NO leg held for it: no pacer wait
         status_yes = _submit_any(client, order_yes, pace=writes.hedge)
         if status_yes != "executed":
             yes_leg_error = f"YES leg FoK not filled: status={status_yes}"
@@ -3261,9 +3158,6 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             "YES leg (%s) failed after the NO leg filled — attempting rollback: %s",
             yes_leg.label, yes_leg_error,
         )
-        # The held place went to the YES leg's POST, so the unwind takes the
-        # hedge lane (had the YES leg's submission raised before taking its
-        # place, the unwind would send the held place instead)
         return _rollback_no_leg(client, spec, no_leg, yes_leg_error, pace=writes.hedge)
 
     logging.info(
@@ -3284,10 +3178,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     _ordered_legs) is submitted first, then the YES leg only if the NO leg
     filled, with a floored-limit rollback of the NO leg if the YES leg fails.
     All specs run concurrently via ThreadPoolExecutor, so no pair waits for
-    another to finish, but their POSTs share one pacer (_ORDER_WRITE_PACER):
-    a pair's opening NO leg waits its turn under the account's write limit,
-    behind other pairs' writes, while its hedge writes go ahead of them (see
-    _execute_one).
+    another to finish, but their POSTs share one pacer (_ORDER_WRITE_PACER),
+    where a pair's YES leg and unwind go ahead of other pairs' NO legs.
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own

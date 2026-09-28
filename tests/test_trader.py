@@ -27,16 +27,10 @@ such failures through that lens first.
 The merged default is ORDER_API_VERSION="v2", so any class that drives
 _execute_one down the legacy path opts in via the `legacy_mode` fixture.
 
-The write pacer (trader._WritePacer: the token bucket every order and
-transfer POST takes a place on, with a place a pair's NO leg holds for its YES
-leg and a hedge lane for unwinds) is covered from `class _FakeClock` to the
-end: TestWritePacer, TestHeldWrites and TestHedgeLane drive the bucket itself,
-TestWritesArePaced and TestPairWrites check which place each POST takes, and
-TestExecuteTradesArePaced runs whole portfolios. Tests with one thread use
-_FakeClock, whose waits move the clock; tests with several use _SimTime, a
-simulated clock that stands still while any thread runs and jumps to the next
-deadline once all of them are blocked, so their times are exact on any
-machine.
+The write pacer (trader._WritePacer) is covered from `class _FakeClock` to
+the end. Single-thread tests use _FakeClock; multi-thread tests use _SimTime,
+simulated time that only moves once every thread is blocked, so their times
+are exact on any machine.
 """
 import ast
 import copy
@@ -3722,12 +3716,10 @@ class TestNonObject2xxTransferResponse:
 
 
 class _FakeClock:
-    """A clock and a wait for driving a _WritePacer from a single thread.
+    """A clock and a wait for driving a _WritePacer from one thread.
 
-    Each wait moves the clock on by its timeout, as a lone caller sleeping
-    through it sees. A wait with no timeout could only end when another
-    thread ends a held write, which one thread never does, so it fails the
-    test instead of hanging.
+    Each wait moves the clock on by its timeout. A wait with no timeout would
+    never end in one thread, so it fails the test instead of hanging.
     """
 
     def __init__(self, start: float = 0.0):
@@ -3750,15 +3742,14 @@ def _fake_pacer(rate, burst, clock: _FakeClock) -> _WritePacer:
 
 
 class _SimStuck(BaseException):
-    """Raised in every simulated thread once the simulation cannot move on.
-
-    A BaseException, so _execute_one's `except Exception` branches cannot
-    turn it into a trade outcome and it reaches the test."""
+    """Raised in every simulated thread once the simulation cannot move on
+    (a BaseException, so no `except Exception` in trader turns it into a
+    trade result)."""
 
 
 class _SimCondition(threading.Condition):
-    """The simulation's condition: a notification wakes every blocked thread,
-    so none of them counts as blocked until it blocks again."""
+    """The simulation's condition: notify_all() counts every blocked thread as
+    running until it blocks again."""
 
     def __init__(self, sim: "_SimTime"):
         super().__init__()
@@ -3770,20 +3761,14 @@ class _SimCondition(threading.Condition):
 
 
 class _SimTime:
-    """Simulated seconds for threads that block only through this object.
+    """Simulated time for threads that block only through wait() (the
+    pacer's) or sleep() (a round trip, a pause).
 
-    Every blocking call of the threads under test goes through wait() (the
-    pacer's wait) or sleep() (a POST's round trip, a position read,
-    _execute_one's pauses). Time stands still while any of them is running
-    and jumps to the earliest deadline once all of them are blocked, so a
-    run's times are exact and do not depend on how fast the machine is.
-    Threads woken at one instant run in whatever order the OS picks, so a
-    test reads the times, not which thread got which one.
-
-    `tasks` is how many pieces of work will run and `workers` how many
-    threads run them; every task must call done() when it ends. The pacer
-    must share the condition (_sim_pacer does that), so its notifications
-    count as waking its waiters.
+    Time stands still while any thread runs and jumps to the earliest
+    deadline once all are blocked, so times are exact. Threads woken together
+    run in OS order, so tests check times, not which thread got which.
+    `tasks` pieces of work run on `workers` threads, and each task calls
+    done() when it ends. The pacer must share `cond` (see _sim_pacer).
     """
 
     REAL_LIMIT_SECONDS = 10.0
@@ -3835,7 +3820,7 @@ class _SimTime:
             return False
         nxt = min(self._blocked.values())
         if nxt == math.inf:
-            self.stuck = True          # every thread waits for another: a deadlock
+            self.stuck = True          # everyone waits on someone: deadlock
         else:
             self.now = max(self.now, nxt)
         self.cond.notify_all()
@@ -3871,8 +3856,7 @@ def _run_sim_threads(sim: _SimTime, bodies) -> None:
 
 
 def _assert_within_bucket(send_times, rate, burst) -> None:
-    """In every stretch from one send to a later one, at most
-    burst + rate * (stretch) sends went out."""
+    """No stretch of time holds more than burst + rate * (its length) sends."""
     times = sorted(send_times)
     for i in range(len(times)):
         for j in range(i, len(times)):
@@ -3882,9 +3866,8 @@ def _assert_within_bucket(send_times, rate, burst) -> None:
 
 
 class TestWritePacer:
-    """The token bucket every order and transfer POST waits on: a burst of
-    `burst` writes back to back, then one every 1/rate seconds, callers
-    served first come, first served within their lane."""
+    """The bucket itself: `burst` writes back to back, then one per 1/rate s,
+    first come, first served within a lane."""
 
     def test_the_first_burst_does_not_wait(self):
         clock = _FakeClock()
@@ -3901,8 +3884,7 @@ class TestWritePacer:
         assert clock.waited == [pytest.approx(0.25)]
 
     def test_a_caller_after_the_line_drains_waits_only_its_own_turn(self):
-        # One caller waits its 0.25 s and the clock moves with it; the next
-        # caller arrives then and waits one more 1/rate, not the sum of both.
+        # The 4th arrives after the 3rd was served, so it waits one 1/rate, not two
         clock = _FakeClock()
         pacer = _fake_pacer(4, 2, clock)
         assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
@@ -3929,9 +3911,7 @@ class TestWritePacer:
         assert pacer.acquire() == pytest.approx(0.25)
 
     def test_the_first_acquire_starts_the_clock(self):
-        # The pacer reads its clock for the first time on its first request,
-        # so it refills from there on whatever clock it was given — here one
-        # that starts at zero, far below the real monotonic clock.
+        # Refill starts from the first request's clock reading, whatever clock
         clock = _FakeClock(start=0.0)
         pacer = _fake_pacer(1, 2, clock)
         assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
@@ -3948,14 +3928,12 @@ class TestWritePacer:
 
     @pytest.mark.parametrize("burst", [0, -1, 1, 1.5, 8.0, True, "8", None])
     def test_an_invalid_burst_raises(self, burst):
-        # A burst of 1 is refused too: a pair's NO leg takes two places at
-        # once, so a bucket of one could never serve it.
+        # 1 too: a pair's NO leg takes two places at once
         with pytest.raises(ValueError, match="burst"):
             _WritePacer(8, burst)
 
     def test_the_shipped_pacer_uses_the_config_constants(self):
-        # conftest replaces trader._ORDER_WRITE_PACER per test, so the module's
-        # construction is checked through a fresh build of the same call.
+        # conftest replaces the module's pacer, so build the same call afresh
         pacer = _WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST)
         assert pacer._rate == float(config.ORDER_WRITES_PER_SECOND)
         assert pacer._burst == float(config.ORDER_WRITE_BURST)
@@ -3963,11 +3941,8 @@ class TestWritePacer:
         assert trader.ORDER_WRITE_BURST == config.ORDER_WRITE_BURST
 
     def test_the_module_pacer_is_built_from_the_config_names(self):
-        # Read trader.py's syntax tree, not its text, so a comment or a
-        # docstring spelling the call cannot stand in for the assignment: the
-        # module binds _ORDER_WRITE_PACER exactly once at top level, to
-        # _WritePacer called with the two config names, positionally, and
-        # with nothing else — never a literal rate or burst.
+        # By syntax tree: bound once, to _WritePacer(ORDER_WRITES_PER_SECOND,
+        # ORDER_WRITE_BURST), never literal numbers
         tree = ast.parse(inspect.getsource(trader))
         bindings = []
         for node in tree.body:
@@ -4013,11 +3988,8 @@ class TestWritePacer:
         assert "Paced an order or transfer write" not in caplog.text
 
     def test_the_balance_is_read_under_the_lock_and_the_wait_is_handed_the_lock(self):
-        # acquire() reads the clock first thing in the block that updates the
-        # balance, so a reading taken without the lock means that block is
-        # not guarded; and the wait hook is called with the lock held, so the
-        # default hook (Condition.wait) can release it while it waits, or no
-        # other caller could join the line.
+        # The clock is read inside the locked block, and the wait hook gets
+        # the lock so Condition.wait can release it while waiting
         clock = _FakeClock()
         owned_at_clock: list[bool] = []
         owned_at_wait: list[bool] = []
@@ -4035,13 +4007,10 @@ class TestWritePacer:
         pacer.acquire()
         pacer.acquire()
         assert owned_at_clock and all(owned_at_clock)
-        # The default wait is the condition's own, which releases the lock;
-        # the hook is called with it held, exactly where Condition.wait is.
         assert owned_at_wait == [True]
 
     def test_a_caller_that_stops_waiting_leaves_the_line(self):
-        # A caller interrupted mid-wait (Ctrl-C) must not leave a place in the
-        # line nobody will take, or everyone behind it waits forever.
+        # An interrupted caller (Ctrl-C) leaves the line, or those behind wait forever
         clock = _FakeClock()
         interrupted = [False]
 
@@ -4060,9 +4029,8 @@ class TestWritePacer:
         assert pacer.acquire() == pytest.approx(0.25)
 
     def test_a_caller_that_stops_waiting_removes_its_own_place_not_another(self):
-        # Two callers wait in turn with identical requests; the second stops.
-        # Its own place must go, not the first caller's equal-looking one, or
-        # the first would wait forever for a place that is no longer in line.
+        # Two identical waiting requests; the second stops. Only its own place
+        # may go, or the first waits forever (why _PaceRequest is eq=False).
         sim = _SimTime(tasks=2)
         pacer = _sim_pacer(4, 2, sim)
         pacer.acquire()
@@ -4096,9 +4064,8 @@ class TestWritePacer:
         assert served == {"first": pytest.approx(0.25), "second": -1.0}
 
     def test_a_held_write_served_just_before_its_caller_stops_goes_back(self):
-        # Another waiter serves this caller's two-token request, and then the
-        # caller stops before it gets its held write: nobody could ever send
-        # or release that write, so the pacer takes it back itself.
+        # Served by another waiter, then stopped before getting its held write:
+        # the pacer takes the held token back
         clock = _FakeClock()
 
         def wait(timeout):
@@ -4113,15 +4080,13 @@ class TestWritePacer:
             pacer.acquire_with_hold()
         assert pacer._held == 0
         assert not pacer._in_turn
-        # The held token came back; the write the caller would have sent stays spent
+        # The held token is back; the one for the unsent POST stays spent
         assert pacer._tokens == pytest.approx(1.0)
 
 
 class TestHeldWrites:
-    """acquire_with_hold takes a place for a POST sent now and holds a second
-    for a POST sent later. The held place counts against the bucket until it
-    is sent or given back, which is what lets it go out late without the
-    sends ever passing burst + rate * T."""
+    """acquire_with_hold: a place now plus one held for later, counted
+    against the bucket until sent or released, so a late send stays in bounds."""
 
     def test_it_takes_two_places(self):
         clock = _FakeClock()
@@ -4150,22 +4115,18 @@ class TestHeldWrites:
         clock = _FakeClock()
         pacer = _fake_pacer(4, 3, clock)
         _, held = pacer.acquire_with_hold()
-        clock.now = 1_000.0      # a long idle spell refills to 3 - 1 held, not 3
+        clock.now = 1_000.0      # refills to 3 - 1 held, not 3
         assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
         assert pacer.acquire() == pytest.approx(0.25)
         assert held.send() is True
-        # Sending it frees its room: the refill may now reach 3 again
+        # Once sent, the refill may reach 3 again
         clock.now += 1_000.0
         assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
 
     def test_a_held_write_sent_late_frees_its_room_only_after_the_refill(self):
-        # Hold, go idle, send late, then take single writes at that instant.
-        # Over the idle spell the refill could only fill the room the hold
-        # left (burst - 1); the held send and one single use it all, so the
-        # next single waits. Freeing the room before bringing the balance up
-        # to date would let the refill fill the whole bucket over the idle
-        # spell, and three writes would go out at once where the burst allows
-        # two.
+        # Hold, idle, send late, then two singles at that instant: the held
+        # send and the first single fill the burst of 2, so the second waits.
+        # Freeing the hold's room before the refill would let all three go.
         clock = _FakeClock()
         pacer = _fake_pacer(8, 2, clock)
         _, held = pacer.acquire_with_hold()
@@ -4197,8 +4158,7 @@ class TestHeldWrites:
         assert pacer._tokens == pytest.approx(4 - 1 - 2)
 
     def test_at_most_burst_minus_one_writes_are_ever_held(self):
-        # A hold needs two free tokens, so the held writes can never fill
-        # the bucket: a single write can always be served by the refill alone.
+        # A hold needs two free tokens, so room never drops below one: a hedge still goes
         clock = _FakeClock()
         pacer = _fake_pacer(4, 3, clock)
         pacer.acquire_with_hold()
@@ -4227,16 +4187,13 @@ class TestHeldWrites:
             served["second"] = sim.now
 
         _run_sim_threads(sim, [first, second])
-        # Room for two only once the first hold ends at 0.5, and the token it
-        # gives back plus the refill from 0.5 covers two at once
+        # Released at 0.5: its token plus the refill covers two at once
         assert served["second"] == pytest.approx(0.5)
 
     def test_a_pair_waiting_for_room_is_woken_when_a_held_write_is_sent(self):
-        # Real threads and the condition's own wait. The second pair has no
-        # finite wait to work out (the one held write leaves room for one
-        # token, and it needs two), so it waits to be woken; sending the held
-        # write frees that room without adding a token, and must still wake
-        # it, or it would wait forever.
+        # Real threads. The second pair can only wait to be woken (room for
+        # one, needs two); sending the held write (which adds no token) must
+        # still wake it.
         pacer = _WritePacer(20, 2)
         _, held = pacer.acquire_with_hold()
         served = threading.Event()
@@ -4262,12 +4219,8 @@ class TestHeldWrites:
 
     @pytest.mark.parametrize("seed", range(12))
     def test_sends_never_exceed_the_bucket_however_late_held_writes_go(self, seed):
-        # Random callers: pairs that send their held write after a random
-        # delay (or give it back), single writes, and hedge-lane writes. The
-        # moments the POSTs would go out must stay inside burst + rate * T
-        # in every stretch.
-        # Each caller's plan is drawn before any thread starts, so a seed
-        # replays the same plans whatever order the OS runs the threads in.
+        # Random mixes of holds sent late or released, singles and hedges.
+        # Plans are drawn up front so a seed always replays the same plans.
         rng = random.Random(seed)
         rate, burst, callers = 8.0, 4, 8
         plans = [
@@ -4305,8 +4258,7 @@ class TestHeldWrites:
 
 
 class TestHedgeLane:
-    """acquire_hedge is served before every waiting acquire and
-    acquire_with_hold, whenever it arrives."""
+    """acquire_hedge is served before every waiting in-turn caller."""
 
     def test_a_hedge_goes_ahead_of_a_waiting_pair(self):
         sim = _SimTime(tasks=3)
@@ -4329,15 +4281,13 @@ class TestHedgeLane:
             served["hedge"] = sim.now
 
         _run_sim_threads(sim, [holder, pair, hedge])
-        # The hedge arrived after the pair but takes the first token the
-        # refill brings (0.25); the pair then waits for room for two, which
-        # the held write's send opens at 0.5, and for the refill (0.75).
+        # The hedge came later but gets the next token (0.25); the pair gets
+        # room at 0.5 when the hold is sent, and two tokens at 0.75
         assert served["hedge"] == pytest.approx(0.25)
         assert served["pair"] == pytest.approx(0.75)
 
     def test_without_the_hedge_lane_the_same_write_would_wait_behind_the_pair(self):
-        # The control for the test above: the same write taken in turn goes
-        # after the pair, a full 0.75 s later than in the hedge lane.
+        # Control for the test above: taken in turn, it goes after the pair
         sim = _SimTime(tasks=3)
         pacer = _sim_pacer(4, 2, sim)
         served: dict[str, float] = {}
@@ -4370,9 +4320,7 @@ class TestHedgeLane:
         assert pacer.acquire_hedge() == pytest.approx(0.25)
 
     def test_concurrent_callers_each_get_their_own_place(self):
-        # 20 threads at one instant: the lock hands out 20 distinct places, so
-        # the waits are exactly 0 for the burst and then 1/rate, 2/rate, ...
-        # — a lost update would repeat a wait.
+        # 20 callers at once get 20 distinct places (a lost update repeats a wait)
         rate, burst, callers = 4, 3, 20
         sim = _SimTime(tasks=callers)
         pacer = _sim_pacer(rate, burst, sim)
@@ -4386,12 +4334,8 @@ class TestHedgeLane:
         assert sorted(waits) == [pytest.approx(w) for w in expected]
 
     def test_real_threads_are_never_served_faster_than_the_bucket(self):
-        # Real time, real waits and a rate high enough to finish at once, with
-        # pairs that hold a second write and send it a moment later. Each
-        # send time is the pacer's own clock reading under its lock (the
-        # caller's arrival plus the wait it was given, or the reading taken
-        # when a held write is sent), so the check reads the pacer's schedule
-        # rather than when the OS woke a thread.
+        # Real threads at a high rate, some holding and sending late. Send
+        # times come from the pacer's own clock readings, not OS wake-ups.
         rate, burst, callers = 400.0, 4, 16
         local = threading.local()
 
@@ -4438,8 +4382,7 @@ class TestHedgeLane:
 
 
 class TestWritesArePaced:
-    """Every order and transfer POST takes one place on the pacer, before
-    the POST, and is still sent exactly once."""
+    """Each POST takes exactly one pacer place first and is sent once."""
 
     @pytest.fixture
     def events(self):
@@ -4447,9 +4390,8 @@ class TestWritesArePaced:
 
     @pytest.fixture
     def pacer(self, monkeypatch, events):
-        """A stand-in pacer that records each place it hands out in `events`:
-        "acquire" (in turn), "hedge" (hedge lane), "opening" (a place plus a
-        held one) and "held" (a held place sent)."""
+        """A stand-in pacer recording "acquire", "hedge", "opening" (a place
+        plus a held one), "held" (a held place sent) and "released" in `events`."""
         mock = MagicMock()
         mock.acquire.side_effect = lambda: events.append("acquire") or 0.0
         mock.acquire_hedge.side_effect = lambda: events.append("hedge") or 0.0
@@ -4511,8 +4453,7 @@ class TestWritesArePaced:
         assert events == ["acquire", "post"]
 
     def test_a_v2_order_takes_the_place_it_is_given(self, pacer, post, events):
-        # A caller that hands in its own place (a pair's opening or hedge
-        # write) takes that one, and no second place in turn.
+        # The given place is used instead of one in turn
         post.replies.append(v2_resp(5))
         pace = MagicMock(side_effect=lambda: events.append("given") or 0.0)
         body = _build_no_order_v2(_no_leg(make_spec()))
@@ -4521,8 +4462,7 @@ class TestWritesArePaced:
         pacer.acquire.assert_not_called()
 
     def test_the_v2_log_line_is_written_after_the_wait(self, pacer, post, caplog):
-        # The "Submitting V2 order" line's time is the send time, so a pacing
-        # wait shows up as a gap before it, never between it and the POST.
+        # So the "Submitting V2 order" line's time is the send time
         logged_before_wait = []
         pacer.acquire.side_effect = lambda: logged_before_wait.append(
             "Submitting V2 order" in caplog.text
@@ -4570,8 +4510,7 @@ class TestWritesArePaced:
     def test_a_v2_429_takes_one_place_and_one_post_and_still_raises(
         self, pacer, post, events,
     ):
-        # Pacing is not a retry: a 429 that comes back anyway raises into the
-        # caller's ambiguous path exactly as before.
+        # Pacing is not a retry: a 429 still raises
         err = self._too_many_requests()
         post.replies.append(err)
         with pytest.raises(ApiException) as exc_info:
@@ -4612,11 +4551,8 @@ class TestWritesArePaced:
     def test_a_429_on_the_yes_leg_paces_the_rollback_too(
         self, pacer, post, events, v2_mode, v2_mapping_confirmed, monkeypatch,
     ):
-        # One pair whose YES leg the exchange rejects with a 429: the position
-        # check finds nothing filled and the NO leg is unwound. The NO leg
-        # takes two places (its own and one held), the YES leg sends the held
-        # one, and the unwind takes the hedge lane; each POST has exactly one
-        # place before it and none is sent twice.
+        # YES leg 429'd and unfilled, so the NO leg is unwound: NO takes two
+        # places, YES sends the held one, the unwind takes the hedge lane
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         post.replies.extend([v2_resp(5), self._too_many_requests(), v2_resp(5)])
         client = MagicMock()
@@ -4641,13 +4577,9 @@ class TestWritesArePaced:
 
 
 class TestPairWrites:
-    """_execute_one's places on the pacer, path by path. The NO leg takes two
-    (one held for the YES leg); the YES leg sends the held one; every unwind
-    takes the hedge lane; a held place that is never sent goes back, at once
-    when the NO leg's POST raises. The pacer is real and never has to wait
-    (every case fits in one burst); how many places were held at each POST,
-    the hedge-lane places handed out and the balance afterwards show which
-    places each path took."""
+    """Which pacer places each _execute_one path takes, read from the places
+    held at each POST, the hedge-lane places and the balance afterwards (a
+    real pacer that never waits: every case fits in one burst)."""
 
     BURST = 8
 
@@ -4731,10 +4663,8 @@ class TestPairWrites:
     def test_a_no_leg_whose_fill_was_unclear_gives_its_place_back_before_the_reads(
         self, pacer, posts, v2_mode, v2_mapping_confirmed, monkeypatch,
     ):
-        # The NO leg raised, and working out whether it filled can take a
-        # minute of retried reads, so the held place goes back before the
-        # first of them; the position then moved by exactly our NO buy, and
-        # the unwind takes the hedge lane.
+        # The NO leg raised: its held place goes back before the (possibly
+        # slow) reads; they show it filled, so it is unwound through the hedge lane
         posts.replies.extend([ConnectionError("reset"), v2_resp(5)])
         hedges = self._count_hedges(pacer, monkeypatch)
         held_at_read: list[int] = []
@@ -4795,8 +4725,7 @@ class TestPairWrites:
 
     @staticmethod
     def _legacy_client(pacer, replies) -> tuple:
-        """A client whose legacy create-order call answers from `replies`,
-        recording how many places were held at each POST."""
+        """A legacy client answering from `replies`, recording held places at each POST."""
         held_at_post: list[int] = []
 
         def create(**kwargs):
@@ -4855,12 +4784,9 @@ class TestPairWrites:
 
 
 class TestExecuteTradesArePaced:
-    """execute_trades runs its pairs on concurrent workers, and every one of
-    their POSTs goes through the one shared pacer. Run in simulated time with
-    a round trip per POST and per position read, at the shipped rate and
-    burst: the pairs' writes never pass the pacer's limit, every YES leg goes
-    out the moment its NO leg's POST returns, and every unwind goes ahead of
-    the opening NO legs still waiting."""
+    """Whole portfolios through execute_trades in simulated time, at the
+    shipped rate and burst: sends stay in bounds, YES legs never wait, and
+    unwinds go ahead of waiting NO legs."""
 
     POST_SECONDS = 0.1
     READ_SECONDS = 0.05
@@ -4877,9 +4803,8 @@ class TestExecuteTradesArePaced:
         return specs
 
     def _run(self, monkeypatch, pairs: int, *, kill_yes: bool = False) -> list:
-        """Run `pairs` pairs through execute_trades in simulated time and
-        return every POST as (sent, returned, ticker, kind) with kind "no",
-        "yes" or "unwind"."""
+        """Run the pairs; return each POST as (sent, returned, ticker, kind),
+        kind being "no", "yes" or "unwind"."""
         rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
         workers = min(config.TRADER_MAX_WORKERS, pairs)
         sim = _SimTime(tasks=pairs, workers=workers)
@@ -4946,10 +4871,8 @@ class TestExecuteTradesArePaced:
     def test_the_opening_no_legs_are_spread_to_the_write_limit(
         self, monkeypatch, v2_mode, v2_mapping_confirmed,
     ):
-        # The two baseline reads take 0.05 s each, so every pair asks for its
-        # opening places at 0.1. Four pairs fit in the burst of 8 (a NO leg and its
-        # held YES place each); each later pair needs two more tokens, 2/8 s
-        # apart, and the four YES legs sent at 0.2 free their room in time.
+        # All pairs ask at 0.1 (two 0.05 s reads). Four fit in the burst of 8
+        # (two places each); each later pair goes 2/8 s after the one before.
         posts = self._run(monkeypatch, 7)
         rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
         start = 2 * self.READ_SECONDS
@@ -4964,11 +4887,9 @@ class TestExecuteTradesArePaced:
     def test_every_unwind_goes_ahead_of_the_waiting_no_legs(
         self, monkeypatch, v2_mode, v2_mapping_confirmed, pairs,
     ):
-        # Every YES leg is killed, so every pair unwinds. An unwind asks for
-        # its place the moment its YES leg's POST returns; no opening NO leg
-        # may go out between that moment and the unwind's own POST, and the
-        # unwind waits only for the refill of one token for itself and one
-        # per unwind ahead of it in the hedge lane.
+        # Every YES leg is killed. No NO leg may go out between an unwind's
+        # request and its POST, and it waits at most 1/rate for itself plus
+        # 1/rate per unwind ahead of it.
         posts = self._run(monkeypatch, pairs, kill_yes=True)
         rate = config.ORDER_WRITES_PER_SECOND
         by_pair = self._by_pair(posts)
