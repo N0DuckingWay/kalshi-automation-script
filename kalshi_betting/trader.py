@@ -102,7 +102,12 @@ Dependencies:
     from the kalshi_python_sync SDK, and fetch_json_page,
     signed_request_json plus api_call_with_retry from _http.py (the retry
     wrapper is used ONLY for the read-only position lookups, never for order
-    submission or the transfer POST). Imports leg_prices, leg_sides,
+    submission or the transfer POST), with api_error_payload (the reader of an
+    error response's JSON body, which _is_fok_kill checks for the kill code)
+    and api_error_summary (the one-line description every failed request is
+    logged and recorded with here, in place of the SDK's own exception text,
+    which lists every response header; only execute_trades' log of an
+    unexpected crash also carries the full traceback). Imports leg_prices, leg_sides,
     tick_size_for_price and validate_pair_price from scanner.py (the first two
     are the only source of the side/market assignment, see _ordered_legs),
     read_shard_balances from auth.py (the shard-aware
@@ -192,7 +197,6 @@ Notes:
     dollar-string prices, and binary float noise would produce a string the
     exchange rejects as off-grid.
 """
-import json
 import logging
 import math
 import threading
@@ -208,7 +212,13 @@ from typing import Any
 from kalshi_python_sync.exceptions import ApiException
 from kalshi_python_sync.models import CreateOrderRequest
 
-from ._http import api_call_with_retry, fetch_json_page, signed_request_json
+from ._http import (
+    api_call_with_retry,
+    api_error_payload,
+    api_error_summary,
+    fetch_json_page,
+    signed_request_json,
+)
 from .auth import read_shard_balances
 from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
@@ -1098,20 +1108,10 @@ def _is_fok_kill(exc: BaseException) -> bool:
         return False
     if getattr(exc, "status", None) != V2_FOK_KILL_HTTP_STATUS:
         return False
-    body = getattr(exc, "body", None)
-    if isinstance(body, (bytes, bytearray)):
-        try:
-            body = bytes(body).decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-    if not isinstance(body, str):
-        return False
-    try:
-        payload = json.loads(body)
-    except (ValueError, RecursionError):
-        return False
-    error = payload.get("error") if isinstance(payload, dict) else None
-    return isinstance(error, dict) and error.get("code") == V2_FOK_KILL_ERROR_CODE
+    # The one reader of an error response's body, shared with the one-line
+    # summaries this module logs
+    error = api_error_payload(exc)
+    return error is not None and error.get("code") == V2_FOK_KILL_ERROR_CODE
 
 
 def _submit_order_v2(client: Any, body: dict) -> str:
@@ -1363,7 +1363,8 @@ def _position_count_once(client: Any, ticker: str) -> float | None:
         return _read_position(client, ticker)
     except Exception as exc:
         logging.warning(
-            "Single-shot position lookup failed for %s: %s", ticker, exc
+            "Single-shot position lookup failed for %s: %s",
+            ticker, api_error_summary(exc),
         )
         return None
 
@@ -1409,7 +1410,9 @@ def _position_count(client: Any, ticker: str) -> float | None:
         # "position unknown" — see _execute_one's ambiguity handling.
         return api_call_with_retry(_read_position, client, ticker)
     except Exception as exc:
-        logging.warning("Position lookup failed for %s: %s", ticker, exc)
+        logging.warning(
+            "Position lookup failed for %s: %s", ticker, api_error_summary(exc)
+        )
         return None
 
 
@@ -1536,16 +1539,19 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
         # Raw-response / signed submission — see _submit_order and
         # _submit_order_v2 for why the modeled create_order call cannot be used
         rb_status = _submit_any(client, rollback)
-    except Exception as rb_err:
+    except Exception as exc:
+        # One line — status, reason, the exchange's error code and message —
+        # never the SDK's multi-line text with every response header
+        rb_error = api_error_summary(exc)
         logging.critical(
             "ROLLBACK FAILED for '%s' — ORPHANED POSITION: up to %d NO contracts"
             " on %s (a V2 unwind can close part of the position before it stops —"
             " check the account). Manual review required. Error: %s",
-            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_err,
+            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_error,
         )
         return TradeResult(
             spec=spec, status="rollback_failed",
-            error=f"{reason}; rollback error: {rb_err}",
+            error=f"{reason}; rollback error: {rb_error}",
         )
     if rb_status != "executed":
         logging.critical(
@@ -1613,7 +1619,7 @@ def pre_execution_check(client: Any, portfolio: list, *,
             except Exception as exc:
                 logging.warning(
                     "Pre-execution check raised for '%s' — dropping: %s",
-                    spec.pair.canonical_title, exc,
+                    spec.pair.canonical_title, api_error_summary(exc),
                 )
                 continue
             if ok:
@@ -1887,7 +1893,7 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
             "Transfer POST of $%.2f shard %d→%d was ACCEPTED (2xx) but its response "
             "could not be parsed — MONEY IS IN FLIGHT, CHECK THE ACCOUNT. Treating as "
             "accepted with no transfer_id; NOT re-sent. Parse error: %s",
-            cents / 100, source, dest, exc,
+            cents / 100, source, dest, api_error_summary(exc),
         )
         return None
     if not isinstance(data, dict):
@@ -1980,7 +1986,10 @@ def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[in
             # never the retry-wrapped verify_auth — see docstring for why.
             balances = read_shard_balances(client)
         except Exception as exc:
-            logging.warning("Balance re-read failed while awaiting transfers: %s", exc)
+            logging.warning(
+                "Balance re-read failed while awaiting transfers: %s",
+                api_error_summary(exc),
+            )
             balances = {}
         if not _unfunded_shards(required, balances):
             return balances
@@ -2110,7 +2119,7 @@ def ensure_shard_collateral(
             logging.error(
                 "Collateral transfer of $%.2f from shard %d to shard %d FAILED (not "
                 "retried — the endpoint is not idempotent): %s",
-                cents / 100, source, dest, exc,
+                cents / 100, source, dest, api_error_summary(exc),
             )
             continue
         accepted.append(str(transfer_id))
@@ -2532,7 +2541,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
                 error=f"NO leg FoK not filled: status={status_no}",
             )
     except Exception as e:
-        no_leg_error = str(e)
+        # One line — status, reason, the exchange's error code and message —
+        # for the logs below and TradeResult.error (the trade log's Notes
+        # cell); the SDK's own text spreads every response header over
+        # several lines
+        no_leg_error = api_error_summary(e)
 
     # Disambiguation runs OUTSIDE the except block (mirroring the YES leg
     # below) so the position lookup is not executed while the NO leg's
@@ -2637,7 +2650,8 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
         if status_yes != "executed":
             yes_leg_error = f"YES leg FoK not filled: status={status_yes}"
     except Exception as e:
-        yes_leg_error = f"YES leg error: {e}"
+        # One line, as for the NO leg above
+        yes_leg_error = f"YES leg error: {api_error_summary(e)}"
         yes_leg_ambiguous = True
 
     if yes_leg_error:
@@ -2818,20 +2832,23 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 # could reverse a real fill, the same reasoning behind every
                 # other manual_review case in _execute_one. "A"/"B" are MARKET
                 # labels (market_a / market_b), not submission legs.
+                # The message and the result get the one-line summary; the
+                # traceback (exc_info) stays, since this is a bug, not a
+                # rejected request
                 logging.critical(
                     "Unhandled exception executing '%s' (A=%s B=%s) — fill state "
-                    "UNKNOWN, manual review required: %r",
+                    "UNKNOWN, manual review required: %s",
                     spec.pair.canonical_title,
                     spec.pair.market_a.ticker,
                     spec.pair.market_b.ticker,
-                    exc,
+                    api_error_summary(exc),
                     exc_info=True,
                 )
                 results.append(
                     TradeResult(
                         spec=spec,
                         status="manual_review",
-                        error=f"Unhandled exception in _execute_one: {exc!r}",
+                        error=f"Unhandled exception in _execute_one: {api_error_summary(exc)}",
                     )
                 )
 

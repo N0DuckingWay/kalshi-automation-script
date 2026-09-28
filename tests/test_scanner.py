@@ -5764,6 +5764,28 @@ def _raw_market(ticker: str, title: str, status: str = "active", **extra) -> dic
     return m
 
 
+class TestFetchOrderbookFailureIsOneLine:
+    """A failed order-book read — per ticker, and inside the pre-execution
+    check right before orders are sent — is logged as one line through
+    _http.api_error_summary, never as the SDK's multi-line exception text
+    with every response header (TS-02)."""
+
+    def test_a_rejected_read_logs_one_line(self, caplog):
+        client = MagicMock()
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=400, reason="Bad Request",
+                data=b'{"error":{"code":"bad_request","message":"bad request"}}',
+                getheaders=lambda: {"Via": "1.1 x.cloudfront.net (CloudFront)"},
+            )
+        )
+        with caplog.at_level(logging.WARNING):
+            assert _fetch_orderbook(client, "MKT-400") is None
+        assert [r.getMessage() for r in caplog.records] == [
+            "Orderbook fetch failed for MKT-400: HTTP 400 Bad Request — bad_request: bad request"
+        ]
+
+
 class TestFetchOpenEventsMveStatusFilter:
     @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
     def test_mve_active_markets_kept_others_dropped(self):

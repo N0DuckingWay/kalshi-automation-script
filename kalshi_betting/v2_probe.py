@@ -668,8 +668,10 @@ def _kill_response_text(exc: Any) -> str:
         exc (Any): An exception trader._is_fok_kill accepted.
 
     Returns:
-        str: "HTTP <status> <body>", with a bytes body decoded as UTF-8 (as
-            trader._is_fok_kill reads it).
+        str: "HTTP <status> <body>", with a bytes body decoded as UTF-8 and
+            any byte that is not UTF-8 replaced, so the raw body is always
+            shown (trader._is_fok_kill reads the same body through
+            _http.api_error_payload).
     """
     body = exc.body
     if isinstance(body, (bytes, bytearray)):

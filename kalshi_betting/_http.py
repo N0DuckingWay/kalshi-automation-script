@@ -11,7 +11,11 @@ Purpose:
     request for API routes the pinned SDK has no generated method for. Both the
     live scanner and the historical fetch pipeline import from here so backoff
     behavior stays consistent and there is no scanner → historical reverse
-    import.
+    import. It also reads a failed request back: api_error_payload() parses
+    the exchange's JSON error object out of an ApiException, and
+    api_error_summary() turns any failed request into one short log line
+    (status, reason, the exchange's error code, message and details), which
+    trader.py logs and records in place of the SDK's multi-line exception text.
 
 Dependencies:
     No project imports — this module is a leaf so auth.py, scanner.py,
@@ -125,6 +129,11 @@ _MAX_ATTEMPTS = 6
 _INITIAL_DELAY = 2.0
 _MAX_DELAY = 60.0
 
+# The longest line api_error_summary returns. Room for a status, a reason, and
+# the exchange's error code, message and a sentence of details; a longer
+# description is cut rather than let one error fill a log line.
+_ERROR_SUMMARY_MAX_CHARS = 300
+
 
 def _extract_status(exc: BaseException) -> int | None:
     """
@@ -224,6 +233,156 @@ def _check_and_parse(resp: Any) -> Any:
             data=None,
         )
     return _json_loads(body)
+
+
+def _body_text(exc: BaseException) -> str | None:
+    """
+    Return a failed request's response body as text.
+
+    The SDK's ApiException keeps the body on its .body attribute as text; a
+    hand-built one may hold UTF-8 bytes instead, which are decoded here.
+
+    Args:
+        exc (BaseException): The exception a request raised.
+
+    Returns:
+        str | None: The body, or None when there is none or it is not UTF-8
+            text. Never raises.
+    """
+    try:
+        body = getattr(exc, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8")
+    except Exception:
+        return None
+    return body if isinstance(body, str) else None
+
+
+def api_error_payload(exc: BaseException) -> dict | None:
+    """
+    Read the exchange's own error object out of a failed request's response.
+
+    Kalshi answers a rejected request with a JSON body of the form
+    {"error": {"code": ..., "message": ..., "details": ...}} ("details" is
+    optional). This is the one place that body is parsed: trader._is_fok_kill
+    reads the code from it to recognise the V2 kill response, and
+    api_error_summary prints it in log lines.
+
+    Args:
+        exc (BaseException): The exception a request raised.
+
+    Returns:
+        dict | None: The object under "error", or None when the exception has
+            no body, the body is not UTF-8 text, is not JSON, or has no
+            "error" object. Never raises.
+    """
+    body = _body_text(exc)
+    if body is None:
+        return None
+    try:
+        # The stdlib parser, not _json_loads: an error body is tiny, and this
+        # keeps the parse identical whether or not the optional orjson is installed
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, dict) else None
+
+
+def _one_line(value: Any) -> str:
+    """
+    Render any value as printable text on a single line.
+
+    Every character that is not printable — newlines and tabs, but also
+    control characters such as a terminal escape or a NUL, which a JSON body
+    can carry as \\u escapes — becomes a space, and runs of spaces collapse
+    to one. The result is safe in a log line and in a spreadsheet cell (the
+    trade log's Notes cell refuses control characters).
+
+    Args:
+        value (Any): The value to render.
+
+    Returns:
+        str: The value's text on one line, stripped at both ends.
+    """
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    return " ".join(text.split())
+
+
+def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS) -> str:
+    """
+    Describe a failed request in one line, for log lines and error fields.
+
+    The SDK's own str(ApiException) spreads the status, the reason, every
+    response header and the body over several lines — about 900 bytes, most
+    of it headers — so logging the exception whole buries the part that says
+    what went wrong (TS-02 in CLAUDE.md). This keeps only that part:
+
+      * An HTTP error (the exception has a .status, as ApiException does):
+        "HTTP <status> <reason>", then the exchange's error code, message and,
+        when present, details from the response body (see api_error_payload):
+            HTTP 409 Conflict — fill_or_kill_insufficient_resting_volume: fill
+            or kill insufficient resting volume
+            HTTP 400 Bad Request — missing_parameters: missing parameters
+            (Key: 'CreateOrderV2Request.SelfTradePreventionType' ...)
+        A body that is not the exchange's JSON error object (a gateway's HTML
+        page, plain text) is kept as it is after a colon, on one line, so
+        nothing the exchange said is lost.
+      * Anything else (a dropped connection, a response the caller could not
+        read): the exception's class name and the first line of its message,
+        e.g. "ProtocolError: ('Connection aborted.', ...)".
+
+    trader.py uses it wherever it logs or records a failed request (order
+    submissions, the unwind, position and balance reads, transfers), and
+    scanner._fetch_orderbook for a failed order-book read.
+
+    Args:
+        exc (BaseException): The exception to describe.
+        limit (int): The most characters to return; a longer description is
+            cut and ends in "…".
+
+    Returns:
+        str: One line of printable text, at most `limit` characters. Never
+            raises: an exception whose attributes cannot be read is named by
+            its class.
+    """
+    try:
+        name = _one_line(type(exc).__name__) or "Exception"
+    except Exception:
+        name = "Exception"
+    try:
+        status = getattr(exc, "status", None)
+        if status is not None:
+            reason = getattr(exc, "reason", None)
+            text = f"HTTP {_one_line(status)}"
+            if reason:
+                text += f" {_one_line(reason)}"
+            error = api_error_payload(exc)
+            parts = [] if error is None else [
+                _one_line(error[key]) for key in ("code", "message")
+                if error.get(key) not in (None, "")
+            ]
+            details = None if error is None else error.get("details")
+            if parts:
+                text += " — " + ": ".join(parts)
+            if details not in (None, ""):
+                text += f" ({_one_line(details)})"
+            if not parts and details in (None, ""):
+                # Not the exchange's error object: keep whatever the body says
+                body = _one_line(_body_text(exc) or "")
+                if body:
+                    text += f": {body}"
+        else:
+            lines = str(exc).strip().splitlines()
+            first = _one_line(lines[0]) if lines else ""
+            text = f"{name}: {first}" if first else name
+    except Exception:
+        # The promise is one line and no exception: a broken error object is
+        # still named
+        text = name
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…" if limit > 0 else ""
 
 
 def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body parses to; _check_and_parse does not narrow (a literal null is None)

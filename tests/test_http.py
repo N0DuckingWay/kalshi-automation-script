@@ -5,17 +5,21 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Offline unit tests for kalshi_betting._http — the shared retry wrapper, the
-    raw-response JSON fetcher, and the signed arbitrary-method request helper.
+    raw-response JSON fetcher, the signed arbitrary-method request helper, and
+    the readers of a failed request (api_error_payload, api_error_summary).
     Covers the retry classification rules that every market-data call depends
     on (HTTP 429/5xx back off, transient transport failures back off, everything
     else fails fast) plus signed_request_json's URL/header/signature contract
     and its deliberate absence of internal retries, and the un-narrowed return
     contract both public helpers carry: a 2xx body is handed back exactly as the
-    JSON parser produced it, object or not (DR-05).
+    JSON parser produced it, object or not (DR-05). The error readers are
+    pinned to one line with the exchange's own code and message and none of
+    the response headers the SDK's exception text carries (TS-02).
 
 Dependencies:
-    Imports api_call_with_retry, fetch_json_page, signed_request_json, and
-    _is_transient_network_error from kalshi_betting._http. Uses unittest.mock
+    Imports api_call_with_retry, api_error_payload, api_error_summary,
+    fetch_json_page, signed_request_json, and _is_transient_network_error from
+    kalshi_betting._http. Uses unittest.mock
     to stand in for SDK calls — no network access.
 
 Notes:
@@ -36,6 +40,8 @@ from kalshi_betting import _http
 from kalshi_betting._http import (
     _is_transient_network_error,
     api_call_with_retry,
+    api_error_payload,
+    api_error_summary,
     fetch_json_page,
     signed_request_json,
 )
@@ -437,3 +443,198 @@ class TestNonObject2xxBodyIsReturnedUnnarrowed:
             signature = source.split('"""')[0]
             assert "-> dict" not in signature
             assert "-> Any" in signature
+
+
+# Error bodies the V2 order endpoint sent on the production API (2026-09-28),
+# verbatim
+_MISSING_PARAMETERS_BODY = (
+    '{"error":{"code":"missing_parameters","message":"missing parameters",'
+    '"details":"Key: \'CreateOrderV2Request.SelfTradePreventionType\' '
+    'Error:Field validation for \'SelfTradePreventionType\' failed on the '
+    '\'required\' tag"}}'
+)
+_TOO_MANY_REQUESTS_BODY = '{"error":{"code":"too_many_requests","message":"too many requests"}}'
+
+
+def _raised_by_the_sdk(status: int, reason: str, body: bytes) -> ApiException:
+    """The exception _check_and_parse raises for a non-2xx response, built the
+    way the SDK builds it: status, reason, the response headers and the body."""
+    resp = SimpleNamespace(
+        status=status, reason=reason, data=body,
+        getheaders=lambda: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Via": "1.1 bf301dc40604cc700e6167cb307dc8ca.cloudfront.net (CloudFront)",
+            "X-Amz-Cf-Id": "tXxaKTerCFYr3xr9TMkS6bDgVOYSG54dbMQrLCM6BNh",
+        },
+    )
+    with pytest.raises(ApiException) as exc_info:
+        _http._check_and_parse(resp)
+    return exc_info.value
+
+
+class TestApiErrorSummary:
+    """api_error_summary describes a failed request in one line: the HTTP
+    status and reason, then the exchange's error code, message and details —
+    and never the response headers the SDK's own exception text lists."""
+
+    def test_status_reason_code_message_and_details_on_one_line(self):
+        exc = _raised_by_the_sdk(400, "Bad Request", _MISSING_PARAMETERS_BODY.encode())
+        assert api_error_summary(exc) == (
+            "HTTP 400 Bad Request — missing_parameters: missing parameters"
+            " (Key: 'CreateOrderV2Request.SelfTradePreventionType' Error:Field"
+            " validation for 'SelfTradePreventionType' failed on the 'required' tag)"
+        )
+
+    def test_the_headers_the_sdk_text_carries_are_left_out(self):
+        exc = _raised_by_the_sdk(429, "Too Many Requests", _TOO_MANY_REQUESTS_BODY.encode())
+        # The SDK's own text for this exception: several lines, with every
+        # response header on one of them
+        assert len(str(exc).splitlines()) >= 4
+        assert "cloudfront" in str(exc)
+        summary = api_error_summary(exc)
+        assert summary == "HTTP 429 Too Many Requests — too_many_requests: too many requests"
+        assert "cloudfront" not in summary and "\n" not in summary
+
+    @pytest.mark.parametrize("body", [
+        _TOO_MANY_REQUESTS_BODY,                   # text, as _check_and_parse decodes it
+        _TOO_MANY_REQUESTS_BODY.encode(),          # UTF-8 bytes
+    ])
+    def test_a_text_or_bytes_body_is_read(self, body):
+        exc = ApiException(status=429, reason="Too Many Requests", body=body)
+        assert api_error_summary(exc) == (
+            "HTTP 429 Too Many Requests — too_many_requests: too many requests"
+        )
+
+    @pytest.mark.parametrize("body", [None, "", "   ", b"\xff\xfe", 123])
+    def test_no_readable_body_adds_nothing(self, body):
+        exc = ApiException(status=502, reason="Bad Gateway", body=body)
+        assert api_error_summary(exc) == "HTTP 502 Bad Gateway"
+
+    @pytest.mark.parametrize("body, shown", [
+        ("<html>\n<body>502 Bad Gateway</body></html>", "<html> <body>502 Bad Gateway</body></html>"),
+        ("upstream timed out", "upstream timed out"),
+        ("[]", "[]"),
+        ('{"message": "not under error"}', '{"message": "not under error"}'),
+        ('{"error": "a string, not an object"}', '{"error": "a string, not an object"}'),
+        ('{"error": {}}', '{"error": {}}'),
+        (b"plain bytes", "plain bytes"),
+    ])
+    def test_a_body_that_is_not_the_exchange_error_object_is_kept_on_one_line(self, body, shown):
+        # Whatever the exchange (or a gateway in front of it) said is kept
+        exc = ApiException(status=502, reason="Bad Gateway", body=body)
+        assert api_error_summary(exc) == f"HTTP 502 Bad Gateway: {shown}"
+
+    def test_only_the_fields_present_are_printed(self):
+        code_only = ApiException(status=409, reason="Conflict", body='{"error": {"code": "c"}}')
+        assert api_error_summary(code_only) == "HTTP 409 Conflict — c"
+        message_only = ApiException(status=409, reason="Conflict", body='{"error": {"message": "m"}}')
+        assert api_error_summary(message_only) == "HTTP 409 Conflict — m"
+        details_only = ApiException(
+            status=409, reason="Conflict", body='{"error": {"code": "", "details": "d"}}',
+        )
+        assert api_error_summary(details_only) == "HTTP 409 Conflict (d)"
+        no_reason = ApiException(status=409, body='{"error": {"code": "c", "message": "m"}}')
+        assert api_error_summary(no_reason) == "HTTP 409 — c: m"
+
+    def test_line_breaks_inside_the_body_fields_are_flattened(self):
+        body = json.dumps({"error": {"code": "bad\nrequest", "message": "one\r\n  two"}})
+        exc = ApiException(status=400, reason="Bad\nRequest", body=body)
+        assert api_error_summary(exc) == "HTTP 400 Bad Request — bad request: one two"
+
+    def test_control_characters_become_spaces(self):
+        # A JSON body can carry control characters as \\u escapes, which the
+        # parse turns into real ones; the trade log's spreadsheet cell refuses
+        # them and a terminal escape would reach the log
+        body = json.dumps({"error": {"code": "bad", "message": "value \u0007\u001b[0m\u0000 here"}})
+        exc = ApiException(status=400, reason="Bad Request", body=body)
+        summary = api_error_summary(exc)
+        assert summary == "HTTP 400 Bad Request — bad: value [0m here"
+        assert summary.isprintable()
+        assert api_error_summary(ValueError("a\x1bb\x00c")) == "ValueError: a b c"
+
+    def test_only_a_status_attribute_makes_an_http_summary(self):
+        # An error that keeps its status elsewhere (requests' .response) is
+        # described by its own message, which already names the status
+        exc = RuntimeError("503 Server Error: upstream said no")
+        exc.response = SimpleNamespace(status_code=503)
+        assert api_error_summary(exc) == "RuntimeError: 503 Server Error: upstream said no"
+
+    @pytest.mark.parametrize("exc, expected", [
+        (TimeoutError("timeout"), "TimeoutError: timeout"),
+        (ProtocolError("Connection aborted.", ConnectionResetError(54)),
+         "ProtocolError: ('Connection aborted.', ConnectionResetError(54))"),
+        (ValueError("Unclassifiable V2 order response: fill_count=3, requested=5\nmore"),
+         "ValueError: Unclassifiable V2 order response: fill_count=3, requested=5"),
+        (KeyError("order"), "KeyError: 'order'"),
+        (ValueError(), "ValueError"),
+    ])
+    def test_an_error_without_a_status_is_named_with_its_first_line(self, exc, expected):
+        assert api_error_summary(exc) == expected
+
+    def test_a_long_description_is_cut_to_the_limit(self):
+        body = json.dumps({"error": {"code": "c", "message": "m", "details": "x" * 1000}})
+        exc = ApiException(status=400, reason="Bad Request", body=body)
+        summary = api_error_summary(exc)
+        assert len(summary) == _http._ERROR_SUMMARY_MAX_CHARS
+        assert summary.startswith("HTTP 400 Bad Request — c: m (xxx")
+        assert summary.endswith("…")
+        assert api_error_summary(exc, limit=12) == "HTTP 400 Ba…"
+        assert api_error_summary(ValueError("short"), limit=12) == "ValueError:…"
+        assert api_error_summary(ValueError("s")) == "ValueError: s"
+
+    def test_it_never_raises(self):
+        class ExplodingStatus(Exception):
+            @property
+            def status(self):
+                raise RuntimeError("boom")
+
+        class ExplodingStr(Exception):
+            def __str__(self):
+                raise RuntimeError("boom")
+
+        class ExplodingBody(ApiException):
+            @property
+            def body(self):
+                raise RuntimeError("boom")
+
+            @body.setter
+            def body(self, value):
+                pass
+
+        class ExplodingName(type):
+            @property
+            def __name__(cls):
+                raise RuntimeError("boom")
+
+        class Unnamed(Exception, metaclass=ExplodingName):
+            pass
+
+        assert api_error_summary(ExplodingStatus()) == "ExplodingStatus"
+        assert api_error_summary(ExplodingStr()) == "ExplodingStr"
+        # A body that cannot be read leaves the status and reason
+        assert api_error_summary(ExplodingBody(status=500, reason="Internal")) == "HTTP 500 Internal"
+        assert api_error_summary(Unnamed("x")) == "Exception: x"
+        # A class name is printed on one line too
+        assert api_error_summary(type("Bad\nName", (Exception,), {})()) == "Bad Name"
+
+
+class TestApiErrorPayload:
+    """api_error_payload is the one reader of an error response's JSON body,
+    shared by the V2 kill test (trader._is_fok_kill) and api_error_summary."""
+
+    def test_the_error_object_is_returned(self):
+        exc = ApiException(status=400, reason="Bad Request", body=_MISSING_PARAMETERS_BODY)
+        error = api_error_payload(exc)
+        assert error["code"] == "missing_parameters"
+        assert error["message"] == "missing parameters"
+        assert "SelfTradePreventionType" in error["details"]
+
+    @pytest.mark.parametrize("body", [
+        None, "", "not json", b"\xff\xfe", 123, "[]", '{"error": "x"}', '{"code": "c"}',
+        "[" * 100_000,
+    ])
+    def test_anything_else_is_none(self, body):
+        assert api_error_payload(ApiException(status=400, body=body)) is None
+
+    def test_an_exception_with_no_body_is_none(self):
+        assert api_error_payload(TimeoutError("timeout")) is None
