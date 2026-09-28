@@ -1321,18 +1321,13 @@ class TestPreToggleDefaults:
 
 
 class TestScheduledRun:
-    """The weekly live run's schedule: one frozen value holding the weekday,
-    time and IANA zone, with the zone looked up only on use. instant() must
-    follow the zone's daylight-saving rules, and date_problems() must flag
-    every run date whose wall time is not one UTC moment on that same date.
-    It matters twice over: the scheduler fires the live run from this value,
-    and the backtest opens every simulated trade at instant(d), so a wrong
-    answer here moves real trading or the backtest's replay of it.
-    """
+    """ScheduledRun, the weekly live run's schedule. The scheduler fires the
+    live run from it and the backtest enters every trade at instant(d), so
+    instant() must follow daylight-saving rules and date_problems() must flag
+    every run date that is not one UTC moment on that same date."""
 
     def test_the_shipped_schedule_is_monday_0900_los_angeles(self):
-        # The live run's time: a change must fail a test rather than silently
-        # move the weekly production run.
+        # A change to the live run's time must fail a test, never pass silently
         assert SCHEDULED_RUN == ScheduledRun(0, 9, 0, "America/Los_Angeles")
 
     @pytest.mark.parametrize(
@@ -1457,15 +1452,13 @@ class TestScheduledRun:
             date(2026, 1, 1), date(2026, 12, 31)) == []
 
     def test_out_of_range_dates_are_listed_not_raised(self):
-        # Tokyo 08:00 on the first Monday of year 1 is before datetime's range
-        # in UTC; the search also reaches the last Monday before date.max.
+        # Tokyo 08:00 on year 1's first Monday is before datetime's range in UTC
         run = ScheduledRun(0, 8, 0, "Asia/Tokyo")
         first = run.date_problems(date(1, 1, 1), date(1, 1, 7))
         assert len(first) == 1 and "outside datetime's range" in first[0]
         last = run.date_problems(date(9999, 12, 20), date.max)
         assert [p[:10] for p in last] == ["9999-12-20", "9999-12-27"]
         assert SCHEDULED_RUN.date_problems(date(9999, 12, 20), date.max) == []
-        # No run weekday is left before date.max: nothing to list, and no
-        # date past date.max is ever computed.
+        # No Monday is left before date.max: an empty list, never an overflow
         assert SCHEDULED_RUN.date_problems(date(9999, 12, 28), date.max) == []
         assert SCHEDULED_RUN.date_problems(date.max, date.max) == []

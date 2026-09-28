@@ -2398,10 +2398,9 @@ class TestLiveRuleHeader:
 
 
 class TestEntryCheckpointHeader:
-    """The page header names the entry checkpoint every trade was entered at
-    — the live scheduler's weekly run time, recorded on the sweep
-    (BacktestSweep.entry_checkpoint) — on its own line under the
-    run-settings line, or says it was not recorded."""
+    """The page header names the entry checkpoint (the live scheduler's run
+    time, BacktestSweep.entry_checkpoint) under the run-settings line, or
+    says it was not recorded."""
 
     _LABEL = "Monday 09:00 America/Los_Angeles"
     _RECORDED = (f"Entry checkpoint: {_LABEL} — the live scheduler's run "
@@ -2411,9 +2410,8 @@ class TestEntryCheckpointHeader:
     def test_a_recorded_checkpoint_is_named_under_the_run_settings(
         self, monkeypatch, tmp_path,
     ):
-        # A below-floor census, so the strike-blind notice renders too: the
-        # line sits under the run-settings and live-rule lines, then come
-        # the risk-free-rate line and that notice
+        # A below-floor census renders the strike-blind notice too, so the
+        # regex below pins the line's place among all the header lines
         pt = _scn_point((0.3, 0.6), 0.75)
         sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
                               label_coverage=_coverage(0), scenarios=[],

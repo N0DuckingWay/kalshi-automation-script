@@ -802,46 +802,27 @@ TRANSFER_POLL_INTERVAL_SECONDS = 2
 
 # ── Weekly scheduler ──────────────────────────────────────────────────────────
 
-# Weekday names in datetime.weekday() order (index 0 = Monday), spelled the way
-# the `schedule` library names its weekday methods (schedule.every().monday, ...).
+# Weekday names, index 0 = Monday, spelled as the `schedule` library's methods.
 _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 @dataclass(frozen=True)
 class ScheduledRun:
     """
-    When the bot's weekly live run happens: a weekday, an hour and minute, and a time zone.
+    When the weekly live run happens: a weekday, a wall-clock time and a time zone.
 
-    The time is a WALL-CLOCK time — what a clock in that zone reads, e.g.
-    Monday 09:00 in "America/Los_Angeles" — so the matching moment in UTC
-    shifts when the zone switches between daylight-saving and standard time
-    (09:00 in Los Angeles is 16:00 UTC under daylight-saving time and 17:00
-    UTC under standard time). The one instance the bot uses is config.SCHEDULED_RUN
-    (below), and two parts of the codebase read it:
-      - scheduler.py registers the weekly live run at this weekday and time
-        as read on the host computer's clock, and checks at startup that the host computer's
-        clock puts those runs at the UTC moments instant() gives;
-      - backtester.py replays history as if the bot had run at instant(d) on
-        every run weekday d. Those moments are the backtest's ENTRY
-        CHECKPOINTS: the only moments at which it opens a simulated trade
-        (backtester._checkpoint_datetime).
-
-    Twice a year a zone with daylight-saving time changes its clocks, usually
-    by an hour. When the clock jumps forward (in spring), the wall times
-    inside the jump never happen on that date (the clock change SKIPS them);
-    when it goes back (in autumn), the wall times inside that stretch happen
-    twice (the clock change REPEATS them). clock_change() and date_problems() find the run
-    dates where that hits the run's own wall time.
-
-    The zone name is looked up only when zone() is called, never when the
-    object is built, so importing config works on a host without a time-zone
-    database. The class is a frozen (immutable) dataclass: two schedules with
-    the same fields compare equal, and because it is frozen they also hash
-    alike, so one can key a cache (backtester._checkpoint_floor's does).
+    Wall-clock means what a clock in that zone reads, so the UTC moment moves
+    with daylight-saving time. scheduler.py fires the live run at
+    config.SCHEDULED_RUN's weekday and time on the host's clock, and the
+    backtest opens simulated trades only at its UTC moments (its ENTRY
+    CHECKPOINTS). A spring clock change SKIPS the wall times in its jump and
+    an autumn one REPEATS them (clock_change()). The zone is looked up only
+    in zone(), so importing config needs no tz database. Frozen, so it can
+    key backtester._checkpoint_floor's cache.
 
     Attributes:
         weekday (int): datetime.weekday() of the run, 0 = Monday.
-        hour (int): Wall-clock hour in the zone, 0-23.
+        hour (int): Wall-clock hour, 0-23.
         minute (int): Wall-clock minute, 0-59.
         timezone (str): IANA zone name, e.g. "America/Los_Angeles".
     """
@@ -852,13 +833,7 @@ class ScheduledRun:
 
     def __post_init__(self) -> None:
         """
-        Check every field's type and range as soon as the object is built.
-
-        The dataclass calls this right after its generated __init__, so a bad
-        schedule fails where it is built (for config.SCHEDULED_RUN, when config
-        is imported) rather than when the scheduler or the backtest first uses
-        it. The zone name is only checked for being a non-empty string here;
-        whether it names a real zone is left to zone().
+        Check each field's type and range, so a bad schedule fails where it is built.
 
         Raises:
             ValueError: weekday, hour or minute is not an int in range (a bool
@@ -875,54 +850,36 @@ class ScheduledRun:
         """
         Look up the IANA time zone named by `timezone`.
 
-        Every method that places the run on a date calls this. The scheduler's
-        startup check (scheduler._host_clock_realises_run) and the backtest's
-        schedule check (backtester._prepare_candidates, through
-        date_problems()) catch its errors to report a bad zone name.
-
         Returns:
-            ZoneInfo: The zone named by `timezone`.
+            ZoneInfo: The zone.
 
         Raises:
-            zoneinfo.ZoneInfoNotFoundError: No tz database on this host has the name.
-            ValueError: The name is malformed, e.g. an absolute path.
-            OSError: The name is not a zone file, e.g. a directory such as "America".
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: The name is
+                unknown, malformed (a path) or not a zone file ("America").
         """
         return ZoneInfo(self.timezone)
 
     def weekday_name(self) -> str:
         """
-        Name the run weekday the way the `schedule` library spells its weekday methods.
-
-        scheduler._weekly_job() uses it to pick schedule.every().<weekday>, and
-        label() and cache_slug() build on it.
+        Name the run weekday as the `schedule` library spells it (schedule.every().monday).
 
         Returns:
-            str: Lower-case English weekday, e.g. "monday".
+            str: Lower-case weekday, e.g. "monday".
         """
         return _WEEKDAY_NAMES[self.weekday]
 
     def at_time(self) -> str:
         """
-        Format the run time as the "HH:MM" string the `schedule` library's Job.at() expects.
-
-        scheduler._weekly_job() passes it to .at(); label() and the scheduler's
-        log lines reuse it.
+        Format the run time as "HH:MM", the form `schedule`'s Job.at() takes.
 
         Returns:
-            str: "HH:MM", e.g. "09:00".
+            str: e.g. "09:00".
         """
         return f"{self.hour:02d}:{self.minute:02d}"
 
     def label(self) -> str:
         """
-        Describe the schedule in words, for log lines and the backtest dashboard.
-
-        scheduler.py and backtester.py print it in their log lines and error
-        messages, and the backtest records it as
-        BacktestSweep.entry_checkpoint, which the dashboard's page header
-        prints so a reader knows at what weekly moment the simulated trades
-        were opened.
+        Describe the schedule for log lines and the backtest dashboard's header.
 
         Returns:
             str: e.g. "Monday 09:00 America/Los_Angeles".
@@ -931,13 +888,7 @@ class ScheduledRun:
 
     def cache_slug(self) -> str:
         """
-        Name the schedule in a short form that is safe inside a file name.
-
-        backtester._prefilter_cache_tag() joins it to
-        SETTLED_PREFILTER_CACHE_TAG to build the cache tag that goes into the
-        file name of the backtest's cached market list (see
-        SETTLED_PREFILTER_CACHE_TAG), so a list filtered for one schedule is
-        never reused for another.
+        Name the schedule in a file-name-safe form, for the backtest's cache tag.
 
         Returns:
             str: e.g. "mon0900-America-Los_Angeles".
@@ -947,19 +898,16 @@ class ScheduledRun:
 
     def wall_time(self, d: date) -> datetime:
         """
-        Build the run's wall-clock time on date `d`, as a datetime that carries the zone.
+        Build the run's wall-clock time on date `d` as a datetime carrying the zone.
 
-        instant() and clock_change() start from it. When a clock change skips
-        or repeats that wall time on `d`, Python's default reading (fold=0)
-        applies: the UTC offset in force just before the change. date_problems()
-        lists such dates, and the backtest refuses a schedule that has one in
-        the range it checks.
+        When a clock change skips or repeats that time, Python's default applies
+        (fold=0: the UTC offset before the change).
 
         Args:
-            d (date): The calendar date in the zone. Any weekday is accepted.
+            d (date): A date in the zone; any weekday.
 
         Returns:
-            datetime: The tz-aware wall-clock moment, tzinfo = zone().
+            datetime: tz-aware, tzinfo = zone().
 
         Raises:
             zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
@@ -970,25 +918,17 @@ class ScheduledRun:
         """
         Convert the run's wall-clock time on date `d` to the UTC moment it happens.
 
-        This defines WHEN the run happens on a given date (date_problems()
-        repeats the same conversion inline rather than calling it). The
-        scheduler's startup check compares the host's clock with it
-        (scheduler._host_clock_realises_run), and the backtest's entry
-        checkpoints are these moments (backtester._checkpoint_datetime and
-        backtester._checkpoint_floor both call it). The zone's own rules
-        decide the UTC offset on that date, so the result follows
-        daylight-saving changes: 09:00 America/Los_Angeles is 16:00 UTC under
-        daylight time and 17:00 UTC under standard time.
+        The one definition of when the run happens (date_problems() repeats it inline).
 
         Args:
-            d (date): The calendar date in the zone. Any weekday is accepted.
+            d (date): A date in the zone; any weekday.
 
         Returns:
-            datetime: The tz-aware UTC moment of the run on `d`.
+            datetime: tz-aware, in UTC.
 
         Raises:
             zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
-            OverflowError: The UTC moment falls outside datetime's range.
+            OverflowError: The UTC moment is outside datetime's range.
         """
         return self.wall_time(d).astimezone(UTC)
 
@@ -996,22 +936,14 @@ class ScheduledRun:
         """
         Say whether a clock change skips or repeats the run's wall time on date `d`.
 
-        (The class docstring explains skipped and repeated wall times.) Python
-        marks the two possible readings of a wall time with `fold`: fold=0
-        uses the UTC offset in force before a clock change, fold=1 the one
-        after. The two offsets differ only when a clock change touches that
-        wall time. The offset grows when the clock springs forward (the wall
-        time is skipped) and shrinks when it falls back (the wall time happens
-        twice). date_problems() uses this, and so does
-        scheduler._host_clock_realises_run(), which reports a skipped run date
-        as a problem with the schedule rather than with the host.
+        It compares the UTC offsets before (fold=0) and after (fold=1) a
+        change: larger after means skipped, smaller means repeated.
 
         Args:
-            d (date): The calendar date in the zone. Any weekday is accepted.
+            d (date): A date in the zone; any weekday.
 
         Returns:
-            str | None: "skipped" or "repeated", or None when the wall time
-                occurs exactly once on `d`.
+            str | None: "skipped", "repeated", or None when it occurs once.
 
         Raises:
             zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
@@ -1024,29 +956,21 @@ class ScheduledRun:
 
     def date_problems(self, first: date, last: date) -> list[str]:
         """
-        List the run dates in [first, last] whose run time is not one UTC moment on that same date.
+        List the run dates in [first, last] whose run is not one UTC moment on that same date.
 
-        The backtest keeps its dates as UTC calendar dates (its start
-        date, entry dates and equity curve), so it needs each run's UTC moment
-        to fall on the run's own date in UTC and to happen exactly once.
-        backtester._prepare_candidates() calls this before fetching anything
-        and refuses the schedule if the list is not empty.
-
-        Only dates on the run weekday are checked. Each is listed at most
-        once, naming the first of these problems found, in this order: its UTC
-        moment falls outside the range Python's datetime can hold; a clock
-        change skips or repeats the wall time (clock_change()); or the UTC
-        moment (instant(d)) lies on another calendar date in UTC. Never raises
-        OverflowError: an out-of-range date is listed instead, and the walk
-        stops rather than step past date.max.
+        The backtest works in UTC dates, so backtester._prepare_candidates()
+        refuses the schedule, before fetching, if this list is not empty. Only
+        run weekdays are checked; a bad one is listed once, with its first
+        problem: out of datetime's range, skipped or repeated by a clock
+        change, or on another UTC date. Never raises OverflowError: an
+        out-of-range date is listed, and the walk never steps past date.max.
 
         Args:
-            first (date): First date of the range, inclusive.
-            last (date): Last date of the range, inclusive.
+            first (date): First date, inclusive.
+            last (date): Last date, inclusive.
 
         Returns:
-            list[str]: One "YYYY-MM-DD: <problem>" entry per problem date, in
-                date order; empty when every run date is sound.
+            list[str]: "YYYY-MM-DD: <problem>" entries in date order.
 
         Raises:
             zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
@@ -1079,21 +1003,12 @@ class ScheduledRun:
         return problems
 
 
-# The bot's weekly live run: Monday 09:00 in Los Angeles, which is 16:00 UTC
-# under daylight-saving time and 17:00 UTC under standard time.
-#  - scheduler.py fires run_job at this weekday, hour and minute on the host
-#    computer's clock, and at daemon start checks that the host's clock puts
-#    those runs at SCHEDULED_RUN.instant(d).
-#  - The backtest uses the same moments as its entry checkpoints: on each run
-#    weekday it may open simulated trades only at instant(d), so it replays
-#    the live run's timing. Changing this therefore also moves every backtest
-#    entry and gives the backtest's cached market list a new name
-#    (backtester._prefilter_cache_tag). The backtest refuses a schedule whose
-#    UTC moment falls on another calendar date in UTC, or whose wall time a
-#    clock change skips or repeats (ScheduledRun.date_problems).
-# scheduler.py and backtester.py each hold their own reference to this object
-# from import time, so tests change the schedule by patching
-# scheduler.SCHEDULED_RUN or backtester.SCHEDULED_RUN, never config.*.
+# The weekly live run: Monday 09:00 Los Angeles time (16:00 UTC under daylight
+# time, 17:00 under standard time). scheduler.py fires it on the host's clock;
+# the backtest opens simulated trades only at these moments, so a change here
+# moves every backtest entry and renames its cached market list. scheduler.py
+# and backtester.py bind this at import: tests patch scheduler.SCHEDULED_RUN /
+# backtester.SCHEDULED_RUN, never config.*.
 SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
 
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
@@ -1407,47 +1322,16 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # concurrent write against the account.
 TRADER_MAX_WORKERS = 8
 
-# The version name of the backtest's eligibility PREFILTER: the test
-# backtester._can_ever_enter() applies to each settled market to decide
-# whether it could ever be part of a simulated trade.
-# backtester._prepare_candidates() hands that test to
-# historical.fetch_all_settled_markets(), which drops the markets that fail it
-# while it assembles the backtest's market list, so they never reach that list
-# or the ASSEMBLED CACHE — the on-disk copy of that filtered list, which later
-# runs with the same start date reuse. The cache's file name includes a CACHE
-# TAG, which backtester._prefilter_cache_tag() builds when the fetch is
-# called: this version name plus SCHEDULED_RUN.cache_slug() (e.g.
-# "checkpoint-v3-mon0900-America-Los_Angeles"). The prefilter reads the same
-# SCHEDULED_RUN, so the tag always names the schedule the list was filtered
-# for, and changing the schedule gives the cache a new name by itself.
-#
-# The tag is part of the cache's file name
-# (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz, or the same stem with
-# .json for a legacy cache; the trailing _nomve marks INCLUDE_MVE_MARKETS=False,
-# DR-57) and of the streamed cache's meta block, so a list filtered one way is
-# never served to code expecting another. Because _nomve is a bare suffix
-# rather than a separate field, a tag ending in "_nomve" would collide with
-# the same tag minus the suffix under the other flag setting; harmless while
-# the tag is built from this literal and a schedule slug, worth a delimiter if
-# tags ever become caller-supplied. (A streamed cache would still be refused
-# on such a collision, because its meta block carries the tag and the flag
-# separately; a legacy .json has no meta block to check.)
-#
-# MUST be changed to a new version name whenever _can_ever_enter's logic
-# changes, and whenever CANDLESTICK_PERIOD_INTERVAL_MINUTES changes (a candle
-# is one CANDLESTICK_PERIOD_INTERVAL_MINUTES period of a market's price
-# history; the prefilter compares a market's opening time with the start of
-# the candle period that holds each entry checkpoint,
-# backtester._checkpoint_floor, and the tag does not name the period's
-# length). Otherwise an old cache is served and the backtest
-# sees a market list the current prefilter would not have produced.
-# _prepare_candidates re-applies the prefilter to every fetched list, and a
-# re-check that rejects anything on a list assembled under this tag is a
-# WARNING naming this constant (backtester._log_corpus_prefilter): that
-# catches a prefilter made STRICTER. One made LOOSER goes unnoticed, since the
-# markets the old version dropped are simply absent from the cache. The
-# per-day files the fetch keeps (day slices) are not named by this tag.
-# Past versions: CLAUDE.md's prefilter gotcha.
+# Version name of backtester._can_ever_enter(), the backtest's eligibility
+# PREFILTER (a per-market test that drops settled markets no simulated trade
+# could use). The backtest's market list is cached on disk under this name
+# plus SCHEDULED_RUN.cache_slug() (backtester._prefilter_cache_tag), in the
+# file name (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz, or .json
+# when legacy) and meta block, so a list filtered one way is never served to
+# another. MUST get a new version name whenever _can_ever_enter's logic or
+# CANDLESTICK_PERIOD_INTERVAL_MINUTES changes, or a stale cache is served
+# (_prepare_candidates' re-check WARNs on a stricter prefilter, but a looser
+# one goes unnoticed). Past versions: CLAUDE.md's prefilter gotcha.
 SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 
 # How young an EMPTY assembled settled-market cache must be to still be served
@@ -1639,17 +1523,12 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 # ── Backtest candlestick granularity ────────────────────────────────────────
 
 # Minutes per candle requested from /historical/markets/{ticker}/candlesticks.
-# Daily (1440) only emits a bar for a market whose lifespan crosses a UTC
-# midnight boundary — confirmed 2026-07 by direct API testing: a 2-hour-long
-# market entirely within one day returned 0 daily candles but 2 hourly ones.
-# Most Kalshi markets are single-game/few-hour windows within one calendar
-# day, so daily granularity structurally produced zero price data for most
-# markets regardless of liquidity, which silently zeroed out backtest entries.
-# 60 (hourly) is the finest granularity actually available — period_interval=1
-# (minute) returns HTTP 400.
-# The backtest's eligibility prefilter reads this period too
-# (backtester._can_ever_enter, through _checkpoint_floor), and its cache tag
-# does not include it: changing it requires a new SETTLED_PREFILTER_CACHE_TAG.
+# 60 (hourly) is the finest the endpoint serves (period_interval=1 returns
+# HTTP 400). Daily (1440) will not do: it emits a bar only for a market open
+# across a UTC midnight, and most Kalshi markets open and close within one
+# day, so daily candles would leave most markets with no prices at all.
+# The backtest's prefilter reads this period too (backtester._checkpoint_floor):
+# changing it requires a new SETTLED_PREFILTER_CACHE_TAG.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 
 # The most candles /historical/markets/{ticker}/candlesticks serves in ONE

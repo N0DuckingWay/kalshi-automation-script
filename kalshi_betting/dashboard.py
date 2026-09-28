@@ -124,9 +124,8 @@ Notes:
     config.BACKTEST_DEFAULT_SPREAD_BAND when neither was passed) and its own
     per-trade size cap — until the page-wide filter bar re-scopes it (the
     k-hat breakdown is k-independent: the k is only its reference line). The
-    interval-discount section has no selector of its own any more (it used
-    to carry a native Plotly `updatemenus` dropdown over one trace per swept
-    k): it draws ONE equity trace (div id "kd-equity") and a per-k table
+    interval-discount section has no selector of its own: it draws ONE
+    equity trace (div id "kd-equity") and a per-k table
     (tbody "kd-rows"), both at the primary spread band, and the filter bar's
     k and size cap move them (_KdVisitor's data, "kd" in the base block) —
     its category and tag never do, since the section's k-hat population and
@@ -290,8 +289,8 @@ Notes:
     re-renders — no new dependency, and no hand-rolled charting: Plotly
     still owns every pixel that gets drawn. With the tier floors off, a band
     they bind at reads its own tier-off cells and calibration and every
-    other band its tier-on ones (#68's rule: the tiers never bind there, so
-    that run IS its off view), so no cell ships twice.
+    other band its tier-on ones (the tiers never bind there, so that run IS
+    its off view), so no cell ships twice.
 
     Directly under the Period line the header says what settled-market corpus
     the run read (BacktestSweep.corpus_provenance): when it was assembled (a
@@ -299,25 +298,24 @@ Notes:
     runs to today, the corpus only to that moment — whether it was served
     from an earlier run's cache, and the archive cutoff as of that assembly,
     with a red banner when the window starts at or after it and so could
-    never enter a trade (DR-13, M2) — or, when some simulated point DID
+    never enter a trade — or, when some simulated point DID
     trade (backtester.max_trades_simulated's eager points, or a size-cap
     scenario the filter's walk simulated), an amber line saying that
     verdict is stale instead. It renders on every run, "not recorded"
-    included, never as a silence (DR-66).
+    included, never as a silence.
 
     The page header also names the run's primary spread band, its same-event
-    ladder setting (DR-73) and its per-trade size cap (and whether the
+    ladder setting and its per-trade size cap (and whether the
     size-cap sweep ran) under the Period line, or "not recorded" when the
     run passed no sweep: the ladder setting decides which pairs exist, the
     band which of them are ever entered and the cap how big each trade is,
-    so, like DR-66b's strike-blind notice, they qualify every section rather
-    than only the explorer. The ladder reading is itself read against the
-    configured switch the run recorded
+    so, like the notice for a corpus missing outcome labels, they qualify
+    every section rather than only the explorer. The ladder reading is
+    itself read against the configured switch the run recorded
     (BacktestSweep.config_same_event_ladders), naming a departure from this
     checkout's config rather than rendering a bare on/off. The line under it
-    names the entry checkpoint — the weekly moment at which every simulated
-    trade was opened, which is the live scheduler's run time
-    (BacktestSweep.entry_checkpoint) — or says "not recorded".
+    names the entry checkpoint (BacktestSweep.entry_checkpoint), the live
+    scheduler's weekly run time at which every simulated trade was opened.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -4129,14 +4127,10 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line naming the weekly moment at which the run opened its trades.
 
-    The backtest opens simulated trades only at its entry checkpoints: the
-    live bot's weekly run time (config.SCHEDULED_RUN), and every entry is
-    priced from each market's latest candle (its hourly price record) at or
-    before that moment. The run records that schedule's label as
-    BacktestSweep.entry_checkpoint, and generate_dashboard() prints this
-    line under the run-settings line. The value is checked by type:
-    anything but a non-empty str (no sweep, a hand-built sweep that did not
-    record it, a stand-in test object) reads "not recorded".
+    That moment is the live bot's weekly run time (config.SCHEDULED_RUN),
+    recorded as BacktestSweep.entry_checkpoint; generate_dashboard() prints
+    this line under the run-settings line. Anything but a non-empty str (no
+    sweep, a hand-built sweep, a test stand-in) reads "not recorded".
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -9441,8 +9435,7 @@ def generate_dashboard(
     primary calibration itself, not from that data, so they render either
     way (with a sweep; without one there is no k-hat and no card) — then the file is
     written to PROJECT_ROOT as backtest_dashboard.html, REPLACING the
-    previous run's page (operator decision, 2026-09-25: one current dashboard
-    rather than a timestamped one per run, which TS-18 had made collision-free).
+    previous run's page (one current dashboard, not a timestamped one per run).
     The page is streamed into a temporary file beside it, one piece at a
     time through one open handle — never joined into one string or encoded
     whole, since a size-cap grid's chunks can reach tens of MB — and then
@@ -9451,14 +9444,13 @@ def generate_dashboard(
     the previous dashboard intact. Two runs finishing together each write a
     complete page and the later rename wins.
 
-    The two sweep-related parameters are keyword-only WITH defaults, so the
-    existing four-argument positional call still works verbatim. Omit both and
+    The two sweep-related parameters are keyword-only with defaults, so a
+    four-argument positional call works. Omit both and
     the interval-discount and scenario-explorer sections each show the same
     kind of short placeholder every other builder emits for empty input, and
-    the header's run-settings line reads "not recorded" for the spread band,
-    the ladder setting and the size cap, as its entry-checkpoint line does
-    for the checkpoint — with no coverage line and no strike-blind notice,
-    since that path has no census to report.
+    the header's run-settings and entry-checkpoint lines read "not recorded"
+    — with no coverage line and no strike-blind notice, since that path has
+    no census to report.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades from
@@ -9500,14 +9492,14 @@ def generate_dashboard(
             config.BACKTEST_OUTCOME_LABEL_WARN_FRACTION, a one-line notice is
             also emitted under the Period line, because a strike-blind corpus
             changes which pairs exist and so taints all nine sections, not
-            just the one that renders the census (DR-66b).
+            just the one that renders the census.
 
             Its corpus_provenance is rendered directly under the Period line
             on every run (_corpus_provenance_html): when the corpus was
             assembled — the Period runs to today, the corpus only to that
             moment — whether it came from an earlier run's cache, and the
             archive cutoff at assembly, with a red banner when the window
-            starts at or after it (DR-13, M2), or an amber stale-verdict line
+            starts at or after it, or an amber stale-verdict line
             when a simulated point — an eager one or a size-cap cell the
             filter's walk simulated — traded anyway. "not recorded" when the
             sweep carries none or there is no sweep.
@@ -9729,8 +9721,7 @@ def generate_dashboard(
     # The rate every ratio below subtracts, or its absence (DR-66)
     rf_note = _risk_free_html(risk_free, equity_df)
 
-    # The weekly moment every entry was priced at (the live scheduler's run
-    # time, BacktestSweep.entry_checkpoint), shown under the run-settings line
+    # The weekly moment every entry was priced at, under the run-settings line
     entry_checkpoint = _entry_checkpoint_html(sweep)
 
     # Each section is built as it is written, so only one is alive at a time

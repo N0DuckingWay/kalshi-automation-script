@@ -1,21 +1,8 @@
-"""Tests for scheduler.py's exit-code mapping (BS-14), TimeoutExpired/OSError
-handling (BS-16, BS-31), missed-run catch-up (BS-17), the weekly job's
-registration from config.SCHEDULED_RUN (_weekly_job, _cron_line), and the
-startup host-clock check (_host_clock_realises_run).
-
-run_job spawns kalshi_betting.main as a subprocess and used to log only
-"completed successfully" / a generic failure based on returncode == 0. It now
-maps the shared EXIT_* contract from config.py to a distinct log level and
-message per outcome, so a low-balance skip or a manual-review run is visible
-in the scheduler's own log stream, not just buried inside kalshi_arb.log
-(which this process never reads). subprocess.run is mocked — tests run
-offline and never spawn the real bot subprocess.
-
-BS-17 gave run_job() a side effect: it now claims and finalizes its Monday
-09:00 slot in scheduler_state.json (PROJECT_ROOT / "scheduler_state.json").
-The `_tmp_project_root` fixture below is applied to every test in this file
-(autouse) so those writes land under pytest's tmp_path instead of the real
-repo root.
+"""Tests for scheduler.py: exit-code logging, TimeoutExpired/OSError handling,
+missed-run catch-up, the weekly job (_weekly_job, _cron_line) and the startup
+host-clock check (_host_clock_realises_run). subprocess.run is mocked, and the
+autouse `_tmp_project_root` fixture sends run_job's scheduler_state.json
+writes to tmp_path instead of the repo root.
 """
 import ast
 import contextlib
@@ -244,8 +231,7 @@ class TestOSErrorHandling:
 
 
 class TestMostRecentSlot:
-    """_most_recent_slot: the latest slot <= now on the host's clock, at
-    SCHEDULED_RUN's weekday and time."""
+    """_most_recent_slot: the latest SCHEDULED_RUN slot <= now, on the host's clock."""
 
     def test_monday_before_0900_uses_previous_week(self):
         # Monday 2026-08-31 is a real Monday.
@@ -289,7 +275,6 @@ class TestMostRecentSlot:
         ],
     )
     def test_a_patched_schedule_moves_the_slot(self, monkeypatch, now, expected):
-        # The slot is read from SCHEDULED_RUN, not from a fixed Monday 09:00.
         monkeypatch.setattr(
             scheduler, "SCHEDULED_RUN", ScheduledRun(3, 14, 30, "America/Los_Angeles"),
         )
@@ -325,8 +310,7 @@ class TestCatchUp:
         assert any("no recorded run" in r.getMessage() for r in caplog.records)
 
     def test_the_catch_up_warning_names_the_slot_on_the_hosts_clock(self, tmp_path, caplog):
-        # The slot is computed on the host's clock, so the WARNING says so and
-        # never names SCHEDULED_RUN's zone, which a mismatched host does not keep.
+        # The slot is on the host's clock, so the WARNING says so and names no zone
         now = datetime(2026, 9, 2, 10, 0)
 
         with patch("kalshi_betting.scheduler.run_job"), caplog.at_level(logging.WARNING):
@@ -870,13 +854,10 @@ class TestGuardedJobRegistration:
             scheduler._guarded_job(boom, on_error=schedule.CancelJob)
 
     def test_ast_weekly_job_is_registered_through_the_guard(self):
-        """DR-59: main() must register run_job through _guarded_job, on the
-        job _weekly_job() builds from config.SCHEDULED_RUN. main() spawns a
-        real prod run and is never invoked by this suite, so no runtime test
-        can reach this line. Without the pin, an edit back to `.do(run_job)`
-        would let a job that raises re-fire on every 60-second poll tick
-        (the DR-59 failure), and one registering any other job (a daily one,
-        say) would move the live run — both with a green suite."""
+        """main() must register run_job through _guarded_job on _weekly_job()'s
+        job. main() is never invoked by this suite, so only this pin catches a
+        revert to `.do(run_job)` (a raising job would re-fire every 60-second
+        poll tick) or another job (which would move the live run)."""
         calls = _do_calls_in("main")
         assert len(calls) == 1, "main() should register exactly one job"
         args = calls[0].args
@@ -1043,12 +1024,10 @@ class TestSetupLogging:
 
 
 class TestWeeklyJobIsTheOldRegistration:
-    """On the shipped schedule, _weekly_job() builds exactly the job the
-    literal `schedule.every().monday.at("09:00")` builds — same weekday, time
-    and first fire — so the live run fires at Monday 09:00 on the host's
-    clock, with no time zone of its own. It must never carry one: schedule's
-    time-zone option goes through the pytz library, whose America/Los_Angeles
-    table has no daylight-saving time after 2037."""
+    """On the shipped schedule, _weekly_job() builds the same job as the literal
+    `schedule.every().monday.at("09:00")`: Monday 09:00 on the host's clock,
+    with no time zone. It must never take one: schedule's zone option uses
+    pytz, whose Los Angeles table has no daylight time after 2037."""
 
     def test_the_job_matches_the_literal_registration(self):
         job = scheduler._weekly_job()
@@ -1077,9 +1056,8 @@ class TestWeeklyJobIsTheOldRegistration:
 
 
 class TestOneRunSchedule:
-    """scheduler.py takes the weekly run's weekday and time from
-    config.SCHEDULED_RUN alone: no "09:00" literal and no `.monday` attribute
-    are left to fall out of step with it, and no `.at()` call passes a zone."""
+    """scheduler.py takes the run's weekday and time from config.SCHEDULED_RUN
+    alone: no "09:00" literal, no `.monday`, and no `.at()` call with a zone."""
 
     @staticmethod
     def _tree():
@@ -1115,17 +1093,11 @@ class TestOneRunSchedule:
 @contextlib.contextmanager
 def _host_zone(name: str):
     """
-    Run the block as if the host computer's clock were set to zone `name`.
+    Run the block with the host's clock set to IANA zone `name`.
 
-    Sets the TZ environment variable and calls time.tzset(), which makes
-    Python's local-time conversions (e.g. converting a datetime with no zone
-    attached to UTC) use that zone — the conversion the scheduler's
-    host-clock check relies on, and one the backtest must not depend on
-    (tests/test_backtester.py imports this helper to show it does not). TZ
-    is restored, or deleted if it was unset, BEFORE the closing tzset(), so
-    the process is back on its own zone when the block exits. Skips where
-    time.tzset is missing, or where the C library cannot load `name` (checked
-    against zoneinfo in January and July).
+    Sets TZ and calls time.tzset(): the scheduler's host-clock check depends on
+    the host zone, and test_backtester imports this to show the backtest does
+    not. Restores TZ on exit; skips where the platform cannot load `name`.
 
     Args:
         name (str): IANA zone name to set as TZ.
@@ -1159,11 +1131,8 @@ def _criticals(caplog) -> list[str]:
 
 def _late_on(late: date) -> ScheduledRun:
     """
-    Build the shipped schedule with instant() one minute late on one date.
-
-    A test double for the host-clock check: on a host whose clock keeps the
-    schedule's own zone, every run date matches except `late`, so a test can
-    put exactly one mismatch where it wants it.
+    Build the shipped schedule with instant() one minute late on `late` only,
+    so a host keeping the schedule's zone sees exactly one mismatch.
 
     Args:
         late (date): The run date whose instant is moved.
@@ -1180,11 +1149,9 @@ def _late_on(late: date) -> ScheduledRun:
 
 
 class TestHostClockCheck:
-    """_host_clock_realises_run(): the daemon fires on the host's clock, so its
-    fires land at SCHEDULED_RUN.instant(d) only on a host whose clock keeps
-    SCHEDULED_RUN's zone. A mismatch, an unresolvable zone or an unplaceable
-    date is logged CRITICAL; the check never raises, because main() runs it
-    before the catch-up and the weekly registration."""
+    """_host_clock_realises_run(): fires land at SCHEDULED_RUN.instant(d) only if
+    the host's clock keeps SCHEDULED_RUN's zone. A mismatch, bad zone or
+    unplaceable date is logged CRITICAL, never raised (main() runs it at startup)."""
 
     def test_a_host_in_the_schedules_zone_passes(self, caplog):
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
@@ -1195,28 +1162,23 @@ class TestHostClockCheck:
         )
 
     def test_a_utc_host_is_flagged_on_the_first_run_date(self, caplog):
-        # Wednesday 2026-09-23: the first run date checked is Monday 2026-09-28,
-        # where 09:00 on a UTC clock is 09:00 UTC, not 16:00 UTC.
+        # The first run date checked is Monday 2026-09-28: 09:00 UTC on this host
         with _host_zone("UTC"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 23)) is False
         [message] = _criticals(caplog)
         assert "on 2026-09-28" in message
         assert "2026-09-28 09:00 UTC, not 2026-09-28 16:00 UTC" in message
-        # The backtest enters at SCHEDULED_RUN's instants, so the operator is
-        # told it no longer replays this host's runs.
         assert "the backtest" in message and "no longer replays this host's runs" in message
 
     def test_a_host_without_daylight_time_is_flagged_at_the_clock_change(self, caplog):
-        # Phoenix keeps UTC-7 all year: it matches Los Angeles until Los Angeles
-        # falls back, so only a check that spans a clock change catches it.
+        # Phoenix has no daylight time: it first differs when Los Angeles falls back
         with _host_zone("America/Phoenix"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 21)) is False
         [message] = _criticals(caplog)
         assert "on 2026-11-02" in message
 
     def test_a_fixed_offset_host_is_flagged_at_the_spring_change(self, caplog):
-        # A host fixed at UTC-8 matches Los Angeles all winter; from Monday
-        # 2026-11-09 the first mismatch is 18 weeks out, after the spring change.
+        # A UTC-8 host matches Los Angeles all winter: the first mismatch is 18 weeks out
         with _host_zone("Etc/GMT+8"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 11, 9)) is False
         [message] = _criticals(caplog)
@@ -1231,8 +1193,7 @@ class TestHostClockCheck:
     def test_the_check_covers_exactly_the_next_104_runs(
         self, monkeypatch, caplog, weeks_out, passes,
     ):
-        # Two years of weekly runs: the 104th run date from 2026-09-21 is
-        # checked, the 105th is not.
+        # The 104th run date from 2026-09-21 is checked; the 105th is not
         late = date(2026, 9, 21) + timedelta(weeks=weeks_out)
         monkeypatch.setattr(scheduler, "SCHEDULED_RUN", _late_on(late))
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
@@ -1247,9 +1208,7 @@ class TestHostClockCheck:
     def test_a_skipped_wall_time_is_the_schedules_problem_not_the_hosts(
         self, monkeypatch, caplog,
     ):
-        # Sunday 02:30 Los Angeles does not exist on the spring-forward days. A
-        # host in Los Angeles is not at fault: the CRITICAL names the skipped
-        # dates and the schedule, never the host's time zone.
+        # Sunday 02:30 is skipped each spring: the CRITICAL blames the schedule, not the host
         monkeypatch.setattr(
             scheduler, "SCHEDULED_RUN", ScheduledRun(6, 2, 30, "America/Los_Angeles"),
         )
@@ -1260,8 +1219,7 @@ class TestHostClockCheck:
         assert "set the host's time zone" not in message
 
     def test_a_skipped_wall_time_does_not_hide_a_host_mismatch(self, monkeypatch, caplog):
-        # From Monday 2026-03-02 the first run date, Sunday 2026-03-08, is
-        # skipped; the next, 2026-03-15, exposes the UTC host.
+        # Sunday 2026-03-08 is skipped; 2026-03-15 then exposes the UTC host
         monkeypatch.setattr(
             scheduler, "SCHEDULED_RUN", ScheduledRun(6, 2, 30, "America/Los_Angeles"),
         )
@@ -1287,20 +1245,16 @@ class TestHostClockCheck:
         assert repr(zone) in message and "cannot be resolved" in message
 
     def test_the_end_of_the_calendar_is_critical_and_never_raises(self, caplog):
-        # Monday 9999-12-27 is the last run date datetime can hold; the week
-        # after it cannot be placed.
+        # 9999-12-27 is the last Monday datetime holds; the next cannot be placed
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(9999, 12, 27)) is False
         [message] = _criticals(caplog)
         assert "could not be checked" in message
 
     def test_ast_main_checks_the_host_clock_first_and_never_gates_on_it(self):
-        # main() spawns a real prod run and is never invoked by this suite, so
-        # its order is pinned on the source: the check runs after logging is
-        # set up (a log call before basicConfig turns _setup_logging into a
-        # no-op and the daemon's log file is never written) and before the
-        # catch-up and the weekly registration, as a bare statement whose
-        # result gates nothing.
+        # main() is never invoked here, so its order is pinned on the source: after
+        # _setup_logging (an earlier log call would stop the log file being set up),
+        # before the catch-up and registration, and gating nothing.
         tree = ast.parse(inspect.getsource(scheduler))
         main_fn = next(
             node for node in ast.walk(tree)
@@ -1319,10 +1273,9 @@ class TestHostClockCheck:
 
 
 class TestCronLine:
-    """_cron_line(): the crontab line the daemon logs for operators who prefer
-    cron. It fires on the host's clock like the daemon, at SCHEDULED_RUN's
-    weekday and time; cron counts Sunday as 0 where datetime.weekday() counts
-    Monday as 0, so a wrong mapping would move the live run to another day."""
+    """_cron_line(): the crontab line main() logs for operators who prefer cron,
+    at SCHEDULED_RUN's weekday and time on the host's clock. Cron's day 0 is
+    Sunday, datetime.weekday()'s is Monday: a wrong mapping moves the live run."""
 
     def test_the_shipped_schedule_is_monday_0900(self):
         assert scheduler._cron_line("/repo", "/py") == (
@@ -1344,8 +1297,7 @@ class TestCronLine:
         assert scheduler._cron_line("/repo", "/py").startswith(prefix)
 
     def test_ast_main_logs_the_helpers_line(self):
-        # main() is never invoked by this suite: pin that its cron hint is
-        # _cron_line()'s, not a second copy of the arithmetic.
+        # main() is never invoked here: pin that it logs _cron_line()'s line
         tree = ast.parse(inspect.getsource(scheduler.main))
         assert [
             n for n in ast.walk(tree)
