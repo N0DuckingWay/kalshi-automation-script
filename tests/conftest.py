@@ -129,10 +129,11 @@ def _fresh_order_write_pacer(monkeypatch):
 
     trader._ORDER_WRITE_PACER is one module-level token bucket shared by every
     order and transfer POST. Without this, the writes of every earlier test
-    would drain it, and a later test would sleep (a real time.sleep, or one a
-    test records) for reasons of its own history. A fresh pacer built from
-    config's rate and burst lets any test make up to ORDER_WRITE_BURST writes
-    with no wait.
+    would drain it, and a later test would wait (in real time) for reasons of
+    its own history. A fresh pacer built from config's rate and burst lets any
+    test take up to ORDER_WRITE_BURST places with no wait — a pair takes two,
+    its NO leg's and the one held for its YES leg, and an unwind after a
+    failed YES leg a third.
 
     Args:
         monkeypatch (pytest.MonkeyPatch): Restores the module's pacer afterwards.

@@ -1140,12 +1140,11 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # execution pool submits real orders, so each extra worker is another
 # concurrent write against the account. The workers' writes share one pacer
 # (ORDER_WRITES_PER_SECOND below), so more workers never mean faster writes,
-# but they do mean longer waits: a pair's YES leg and its rollback each wait
-# their turn behind the other workers' writes while its NO leg is filled and
-# unhedged, at most TRADER_MAX_WORKERS / ORDER_WRITES_PER_SECOND seconds per
-# write (1 s at 8 and 8), since each worker holds at most one place in line.
-# That wait is the accepted cost of the HTTP 429s the pacer prevents (a 429 on
-# a rollback leaves the position open); see trader._execute_one.
+# but they do mean longer waits for a pair's opening NO leg, which waits its
+# turn behind the other workers' writes. A pair's hedge writes do not: its NO
+# leg holds a place for its YES leg, and an unwind goes ahead of every waiting
+# NO leg, waiting at most 1/ORDER_WRITES_PER_SECOND seconds for each unwind
+# already ahead of it (trader._PairWrites; see trader._execute_one).
 TRADER_MAX_WORKERS = 8
 
 # How fast trader.py sends order and collateral-transfer POSTs, across every
@@ -1168,7 +1167,9 @@ TRADER_MAX_WORKERS = 8
 # one, a probe's transfer) paces itself separately at the full rate. A higher
 # usage tier (GET /account/limits names the account's own) allows more; these
 # are safe to raise only up to that tier's write budget divided by the order
-# cost (10 tokens).
+# cost (10 tokens). A pair's NO leg takes two places at once (its own and one
+# held for its YES leg, trader._WritePacer.acquire_with_hold), so the burst
+# must be at least 2; the pacer refuses a smaller one at import.
 ORDER_WRITES_PER_SECOND = 8
 ORDER_WRITE_BURST = 8
 
