@@ -425,6 +425,20 @@ def v2_mapping_confirmed(monkeypatch):
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
 
 
+def assert_disproof_names_the_remedy(caplog) -> None:
+    """The one CRITICAL a disproven V2 NO-leg mapping logs tells the operator
+    to stop trading and flatten by hand in the Kalshi UI, and never to switch
+    the bot to another order path: the V2 endpoint is the only one there is."""
+    criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert len(criticals) == 1, criticals
+    message = criticals[0]
+    assert "MAPPING DISPROVEN" in message
+    assert "Stop trading" in message and "Kalshi UI" in message
+    assert "no other order path to fall back on" in message
+    assert "legacy" not in message.lower()
+    assert "ORDER_API_VERSION" not in message
+
+
 class TestRollbackVerification:
     @pytest.fixture(autouse=True)
     def _use_legacy(self, legacy_mode):
@@ -2584,6 +2598,7 @@ class TestV2NoMappingBackstop:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         # YES leg was never submitted, so a false confirmation cannot have latched
         assert post.call_count == 1
@@ -2625,6 +2640,7 @@ class TestV2NoMappingBackstop:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         # A disproven mapping must NOT latch — nothing was confirmed
         assert trader._V2_NO_MAPPING_CONFIRMED is False
 
@@ -2825,7 +2841,7 @@ class TestOrderVersionDispatch:
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
         assert client.create_order_without_preload_content.call_count == 2
-        # The V2 route is never touched on the rollback path
+        # The V2 route is never touched on the legacy path
         posted.assert_not_called()
 
     def test_v2_mode_never_touches_legacy_endpoint(
@@ -2839,7 +2855,7 @@ class TestOrderVersionDispatch:
         assert client.create_order_without_preload_content.call_count == 0
 
     def test_config_default_is_v2(self):
-        # The default must be V2; "legacy" is only ever a deliberate rollback.
+        # "v2" is the only order path; config.order_api_version_error refuses any other.
         assert config.ORDER_API_VERSION == "v2"
         assert trader.ORDER_API_VERSION == "v2"
 
@@ -3450,6 +3466,7 @@ class TestTimeSeriesLegOrder:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error and "TICK-B" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         # Only the NO leg went out — no YES leg, no unwind
         assert post.call_count == 1

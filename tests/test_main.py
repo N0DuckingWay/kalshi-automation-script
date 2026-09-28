@@ -301,6 +301,36 @@ def _main_with(monkeypatch, argv: list, **patches) -> dict:
     return seen
 
 
+class TestOrderApiVersionGate:
+    """main() refuses any config.ORDER_API_VERSION but "v2" as a usage error
+    (exit 2) in either mode, before the live settings are resolved, logging is
+    configured (TS-20), a client is built or a run mode starts: the V2
+    endpoint is the only order path the bot has, so no order may be built
+    under another value."""
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("value", ["legacy", "V2", "", None])
+    def test_a_non_v2_order_path_exits_2_before_anything_runs(
+        self, monkeypatch, capsys, mode, value,
+    ):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", value)
+        seen = _main_with(
+            monkeypatch, ["--mode", mode],
+            _resolve_live_settings=lambda *a: pytest.fail("resolved settings first"),
+        )
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen and "mode" not in seen
+        err = capsys.readouterr().err
+        assert config.order_api_version_error() in err
+        assert repr(value) in err and '"v2"' in err
+
+    def test_the_shipped_value_reaches_the_run_mode(self, monkeypatch):
+        assert config.ORDER_API_VERSION == "v2"
+        seen = _main_with(monkeypatch, ["--mode", "dev"])
+        assert seen["code"] == EXIT_OK and seen["mode"] == "dev"
+
+
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLiveSettingsFlags:
     """Each live-toggle flag overrides ONE config.py toggle for one run, over

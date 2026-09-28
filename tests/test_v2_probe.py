@@ -15,6 +15,14 @@ Purpose:
     that will run), it must never submit before confirmation, and a position
     going the WRONG way after the ask — the exact failure the probe exists to
     catch — must be a hard FAIL that does not go on to submit the unwind.
+    The probe refuses to start on any ORDER_API_VERSION but "v2", and never
+    tells the operator to switch order paths: there is no other path to
+    switch to. The FAIL lines that doubt the V2 path after a submission on an
+    account the probe verified flat say to stop trading and flatten by hand in
+    the Kalshi UI; main()'s closing line says to stop trading after a FAIL
+    (checking shard balances after a transfer FAIL) but never, by itself, to
+    flatten, since the ticker may carry the bot's own position; and after a
+    NEUTRAL it calls for no action at all.
 
 Dependencies:
     Imports v2_probe and trader; patches at each function's definition site.
@@ -40,7 +48,7 @@ from unittest.mock import MagicMock
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import trader, v2_probe
+from kalshi_betting import config, trader, v2_probe
 from kalshi_betting.scanner import PriceRange
 
 TICKER = "PROBE-TICKER"
@@ -246,6 +254,23 @@ def answer(monkeypatch, value: str) -> None:
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: value)
 
 
+def assert_names_no_other_order_path(printed: str) -> None:
+    """The probe's output never tells the operator to switch the bot to
+    another order path: the V2 endpoint is the only one there is."""
+    assert "legacy" not in printed.lower()
+    assert "ORDER_API_VERSION" not in printed
+
+
+def assert_names_the_remedy(printed: str) -> None:
+    """A FAIL line that doubts the V2 path after a submission on an account
+    the probe verified flat tells the operator to stop trading and flatten by
+    hand in the Kalshi UI (v2_probe._REMEDY), and never to switch the bot to
+    another order path."""
+    assert v2_probe._REMEDY in printed
+    assert "Kalshi UI" in printed
+    assert_names_no_other_order_path(printed)
+
+
 class TestBodyConstruction:
     """The probe must exercise the REAL trader builders, overriding only the
     fields its fractional count and its price-independent verdict require:
@@ -421,7 +446,10 @@ class TestNoMappingVerdict:
         assert len(submits) == 1
         printed = capsys.readouterr().out
         assert "HYPOTHESIS DISPROVEN" in printed
-        assert "legacy" in printed
+        assert f"A POSITION IS OPEN ON {TICKER}" in printed
+        assert_names_the_remedy(printed)
+        # The message says "flatten" once, in the remedy
+        assert printed.lower().count("flatten") == 1
 
     def test_no_fill_is_neutral_and_submits_no_unwind(self, monkeypatch):
         submitted = []
@@ -591,6 +619,7 @@ class TestZeroPositionIsReReadOnce:
         assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
         printed = capsys.readouterr().out
         assert "HYPOTHESIS DISPROVEN" in printed
+        assert_names_the_remedy(printed)
         assert len(submits) == 1
 
     def test_zero_then_none_is_a_lookup_failure_never_a_confirmation(
@@ -873,6 +902,7 @@ class TestCloseVerdictReRead:
         printed = capsys.readouterr().out
         assert "did NOT return the position to flat" in printed
         assert f"Position after re-read: {last}" in printed
+        assert_names_the_remedy(printed)
 
     def test_a_flat_read_after_the_close_is_not_re_read(self, submits, monkeypatch):
         observed, slept = TestZeroPositionIsReReadOnce._arm(monkeypatch, [0, -0.01, 0])
@@ -1193,6 +1223,7 @@ class TestNonConformingFillOrKill:
         assert "FLATTEN IT MANUALLY" in printed
         # The false claim this bug was made of must be gone.
         assert "still flat" not in printed
+        assert_names_the_remedy(printed)
 
     def test_partial_fill_with_a_genuinely_flat_ledger_still_fails(
         self, monkeypatch, capsys,
@@ -1428,6 +1459,127 @@ class TestMainDispatch:
         monkeypatch.setattr(v2_probe.auth, "verify_auth", boom)
         assert v2_probe.main(["--ticker", TICKER]) == 1
 
+    @pytest.mark.parametrize("value", ["legacy", "V2", "", None])
+    @pytest.mark.parametrize("step", sorted(v2_probe._STEPS))
+    def test_a_non_v2_order_path_is_refused_before_anything_runs(
+        self, monkeypatch, capsys, value, step,
+    ):
+        # "v2" is the only order path there is: any other value is a usage
+        # error (exit 2) before the banner, logging, a client or any step
+        monkeypatch.setattr(config, "ORDER_API_VERSION", value)
+        monkeypatch.setattr(
+            v2_probe.auth, "build_client",
+            lambda mode: pytest.fail("must refuse before building a client"),
+        )
+        monkeypatch.setattr(
+            v2_probe.logging, "basicConfig",
+            lambda *a, **k: pytest.fail("must refuse before configuring logging"),
+        )
+        monkeypatch.setitem(
+            v2_probe._STEPS, step, lambda *a: pytest.fail("must refuse before any step"),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            v2_probe.main(["--ticker", TICKER, "--step", step, "--yes"])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "KALSHI V2 ORDER-PATH LIVE PROBE" not in captured.out
+        assert config.order_api_version_error() in captured.err
+        assert repr(value) in captured.err
+
+    @staticmethod
+    def _closing(monkeypatch, capsys, step: str, outcome: str, argv: list) -> str:
+        """Run main() with `step` stubbed to return `outcome`; return what it
+        printed after the RESULT banner (the closing line)."""
+        monkeypatch.setattr(v2_probe.auth, "build_client", lambda mode: MagicMock())
+        monkeypatch.setattr(v2_probe.auth, "verify_auth", lambda c: {0: 100})
+        monkeypatch.setitem(v2_probe._STEPS, step, lambda c, t, y, d: outcome)
+        v2_probe.main(argv)
+        printed = capsys.readouterr().out
+        return printed.split(f"RESULT: {step} -> {outcome}", 1)[1]
+
+    @pytest.mark.parametrize("step", sorted(v2_probe._TICKER_STEPS))
+    def test_an_order_step_fail_ends_on_stop_trading_and_never_says_flatten(
+        self, monkeypatch, capsys, step,
+    ):
+        # A FAIL of an order step halts the bot, but the closing line itself
+        # never tells the operator to flatten: the ticker may carry the bot's
+        # own position, so only the step's own position warnings may
+        closing = self._closing(
+            monkeypatch, capsys, step, v2_probe._FAIL, ["--ticker", TICKER, "--step", step],
+        )
+        assert v2_probe._STOP_TRADING in closing
+        assert "Act only on the position warnings printed above" in closing
+        assert v2_probe._FLATTEN not in closing
+        assert "flatten any position" not in closing.lower()
+        assert ("Both --step no-mapping and --step unfillable-ask have to PASS before the "
+                "V2 order path should be trusted to run unsupervised") in closing
+        assert_names_no_other_order_path(closing)
+
+    def test_a_transfer_fail_ends_on_stop_trading_and_the_shard_balances(
+        self, monkeypatch, capsys,
+    ):
+        # A transfer moves collateral and opens no position: its FAIL halts the
+        # bot and points at the shard balances, never at a ticker to flatten
+        closing = self._closing(
+            monkeypatch, capsys, "transfer", v2_probe._FAIL,
+            ["--step", "transfer", "--ticker", TICKER],
+        )
+        assert v2_probe._STOP_TRADING in closing
+        assert "Check each shard's balance in the Kalshi UI" in closing
+        assert "flatten" not in closing.lower()
+        assert TICKER not in closing and "ticker" not in closing.lower()
+        assert_names_no_other_order_path(closing)
+
+    @pytest.mark.parametrize("step", sorted(v2_probe._STEPS))
+    def test_a_neutral_calls_for_no_action(self, monkeypatch, capsys, step):
+        # A NEUTRAL reached no verdict on the V2 path, so its closing line must
+        # neither halt the bot nor ask for a position to be closed; the
+        # transfer step runs with no ticker at all
+        argv = ["--step", step] + (["--ticker", TICKER] if step in v2_probe._TICKER_STEPS
+                                   else [])
+        closing = self._closing(monkeypatch, capsys, step, v2_probe._NEUTRAL, argv)
+        assert "inconclusive" in closing
+        assert "stop trading" not in closing.lower()
+        assert "flatten" not in closing.lower()
+        assert ("Both --step no-mapping and --step unfillable-ask have to PASS before the "
+                "V2 order path should be trusted to run unsupervised") in closing
+        assert_names_no_other_order_path(closing)
+
+    @pytest.mark.parametrize("step", sorted(v2_probe._TICKER_STEPS))
+    @pytest.mark.parametrize("cause", ["position_not_flat", "no_market"])
+    def test_a_fail_before_any_submission_never_says_to_flatten(
+        self, monkeypatch, capsys, submits, step, cause,
+    ):
+        # The real steps, refusing before they submit: the account already
+        # holds a position on the ticker (possibly the bot's own live
+        # position), or the market cannot be read. Nothing printed may tell
+        # the operator to flatten, and nothing is submitted
+        client = probe_client([5])
+        if cause == "no_market":
+            client.get_market_without_preload_content = MagicMock(
+                return_value=SimpleNamespace(status=200, data=b'{"market": {}}'),
+            )
+        monkeypatch.setattr(v2_probe.auth, "build_client", lambda mode: client)
+        monkeypatch.setattr(v2_probe.auth, "verify_auth", lambda c: {0: 100})
+        assert v2_probe.main(["--ticker", TICKER, "--step", step, "--yes"]) == 1
+        assert submits == []
+        printed = capsys.readouterr().out
+        assert ("probe must start FLAT" if cause == "position_not_flat"
+                else "no market returned") in printed
+        assert v2_probe._FLATTEN not in printed
+        assert "flatten any position" not in printed.lower()
+        assert "FLATTEN" not in printed
+        assert "close the position" not in printed.lower()
+        assert "never flatten a position the bot holds" in printed
+        assert_names_no_other_order_path(printed)
+
+    def test_a_step_that_passes_prints_no_remedy(self, monkeypatch, capsys):
+        closing = self._closing(
+            monkeypatch, capsys, "no-mapping", v2_probe._PASS, ["--ticker", TICKER],
+        )
+        assert "Record this output" in closing
+        assert v2_probe._STOP_TRADING not in closing
+        assert "flatten" not in closing.lower()
 
 _PIPELINE_MODULES = [
     "main", "trader", "scanner", "auth", "strategy", "reporter", "scheduler",

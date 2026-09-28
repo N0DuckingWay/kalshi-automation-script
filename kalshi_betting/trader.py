@@ -35,11 +35,13 @@ Purpose:
     drawing HTTP 429 rejections from the exchange.
 
     Two order paths exist, selected by config.ORDER_API_VERSION:
-      "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
-        a JSON body: bid/ask side on the single YES book, a dollar-string
-        fill_or_kill LIMIT price, a fixed-point count, and an explicit
-        exchange_index taken from THAT LEG'S OWN market, so each order routes to
-        the shard its market actually lives on. There is no "market" order type
+      "v2" — the path every entry point requires (main.py and the human-run
+        order-path probe refuse any other value). POST config.V2_ORDER_PATH
+        (/portfolio/events/orders) with a JSON body: bid/ask side on the
+        single YES book, a dollar-string fill_or_kill LIMIT price, a
+        fixed-point count, and an explicit exchange_index taken from THAT
+        LEG'S OWN market, so each order routes to the shard its market
+        actually lives on. There is no "market" order type
         in V2, so a taker order IS a marketable FoK limit and the LIMIT PRICE IS
         THE PRICE PROTECTION: scanned price ceiled to the market's own tick grid
         plus config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price). Every body
@@ -52,12 +54,13 @@ Purpose:
         (config.V2_FOK_KILL_ERROR_CODE) rather than a 2xx; _submit_order_v2
         reads exactly that response as the status "canceled" (_is_fok_kill).
       "legacy" — the original /portfolio/orders create-order call
-        (CreateOrderRequest, type="market", integer-cents buy_max_cost). Kept
-        fully intact and unmodified so flipping ORDER_API_VERSION back to
-        "legacy" is an instant, code-free rollback if the V2 mapping misbehaves
-        on its first real submission. That endpoint has NO shard-routing
+        (CreateOrderRequest, type="market", integer-cents buy_max_cost). No
+        entry point reaches it: main.py and the human-run order-path probe
+        refuse to start on any ORDER_API_VERSION but "v2"
+        (config.order_api_version_error). That endpoint has NO shard-routing
         parameter, so while it is selected a pair with a leg off
-        config.DEFAULT_EXCHANGE_INDEX is refused outright (see _legacy_routable).
+        config.DEFAULT_EXCHANGE_INDEX is refused outright (see
+        _legacy_routable).
 
     An exception from either submission path does NOT prove the order was
     rejected (a timeout can land after the fill), so exception paths consult the
@@ -572,8 +575,9 @@ def _legacy_routable(spec: TradeSpec) -> bool:
 
     Consulted ONLY while config.ORDER_API_VERSION is not "v2". On the V2 path it
     does not apply, because every V2 body routes itself via its own market's
-    exchange_index. The legacy path is retained indefinitely as the instant
-    rollback, so this guard outlives the migration with it.
+    exchange_index. No entry point runs the legacy path: main.py and the
+    human-run order-path probe refuse to start on any ORDER_API_VERSION but
+    "v2" (config.order_api_version_error).
 
     Args:
         spec (TradeSpec): The trade specification about to be executed. Both
@@ -2384,9 +2388,11 @@ def _confirm_v2_no_mapping(
         into "rollback_failed", but a human — not the bot — must decide what
         to do with a position that moved in a way our model cannot explain.
         This is the module's standing manual_review philosophy: never act
-        automatically on a state we cannot model. Remedy: set
-        config.ORDER_API_VERSION = "legacy", the instant rollback to the
-        endpoint whose side mapping is already proven.
+        automatically on a state we cannot model. Remedy, named in the
+        CRITICAL log: stop trading until the disproof is understood (stop the
+        scheduler daemon, do not run main.py --mode prod) and flatten the
+        position by hand in the Kalshi UI — the V2 endpoint is the only order
+        path the bot has, so there is no other path to fall back on.
       * delta unknown (None — either snapshot missing) -> unknown, NOT
         disproven. Warn and proceed WITHOUT latching, so the next V2 NO fill
         re-arms the check. One flaky positions read must not stall trading, and
@@ -2466,9 +2472,11 @@ def _confirm_v2_no_mapping(
         "V2 NO-LEG MAPPING DISPROVEN on %s — the NO leg's ask did not open NO"
         " exposure: expected a position delta of %d, got %s. NOT submitting the"
         " YES leg and NOT auto-unwinding (the unwind is a bid resting on the"
-        " same disproven hypothesis, so it could double the error). A human"
-        " must flatten this account position; set config.ORDER_API_VERSION ="
-        " \"legacy\" to revert to the proven order path.",
+        " same disproven hypothesis, so it could double the error). Stop"
+        " trading until this is understood (stop the scheduler daemon if it is"
+        " running, and do not run main.py --mode prod), and flatten this"
+        " position by hand in the Kalshi UI; there is no other order path to"
+        " fall back on.",
         ticker, -no_leg.count, delta,
     )
     return TradeResult(

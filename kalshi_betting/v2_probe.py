@@ -25,14 +25,20 @@ Purpose:
     priced at the top of the market's own grid and crosses any resting YES ask
     (see PRICE OVERRIDE below); reduce_only is what bounds it.
 
-    STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is on by default
-    (config.ORDER_API_VERSION = "v2") and does not wait for this probe. What
-    backstops it instead is trader._confirm_v2_no_mapping(), which checks the
-    very same position MOVEMENT on the first live V2 NO fill of a process — but
-    that check pays for its evidence with a REAL trade-sized position, while
-    this probe buys the identical evidence for ~1c. If either mapping step
-    FAILS, set config.ORDER_API_VERSION = "legacy" to hold the bot on the
-    legacy order path.
+    STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is the bot's only order
+    path and does not wait for this probe. What backstops it instead is
+    trader._confirm_v2_no_mapping(), which checks the very same position
+    MOVEMENT on the first live V2 NO fill of a process — but that check pays
+    for its evidence with a REAL trade-sized position, while this probe buys
+    the identical evidence for ~1c. If either mapping step FAILS, stop trading
+    until the failure is understood: there is no other order path to fall
+    back on. The three FAIL lines that doubt the path after a submission on
+    an account the probe had verified flat also say to flatten any position
+    on the probed ticker by hand in the Kalshi UI (_REMEDY). main()'s closing
+    line after a FAIL says to stop trading but never, by itself, to flatten —
+    a FAIL before anything was submitted opened nothing, and a position on
+    the ticker may then be the bot's own — and after a NEUTRAL it calls for
+    no action at all.
 
     *** REAL MONEY. *** Every step here submits live orders (or moves live
     collateral) against the PRODUCTION account. Worst-case exposure is the V2
@@ -40,7 +46,7 @@ Purpose:
     real, it is not a simulation, and there is no dry-run mode: a probe that
     doesn't submit proves nothing. Every request body and every raw response is
     printed verbatim, and that printed output IS the evidence log behind the
-    decision to keep ORDER_API_VERSION = "v2" (or to flip it to "legacy").
+    decision to keep trading on the V2 order path.
 
 Dependencies:
     Imports the auth, config, scanner and trader MODULES (module-style, so the
@@ -57,6 +63,11 @@ Notes:
     PROD ONLY. auth.build_client("prod") is hardcoded — the sandbox implements
     neither the V2 order endpoint nor exchange sharding, so a sandbox "pass"
     would prove nothing about the mapping this probe exists to verify.
+
+    V2 ONLY. main() refuses to start unless config.ORDER_API_VERSION is "v2"
+    (config.order_api_version_error, the same check main.py runs): it exits 2
+    through parser.error right after parsing its arguments, before the banner,
+    logging or any request.
 
     CANCEL YOUR RESTING ORDERS ON THE PROBE TICKER FIRST. Every order the
     probe submits carries the builders' self_trade_prevention_type
@@ -175,7 +186,9 @@ Notes:
     close a real open position is not a neutral outcome, and the printed
     message tells the operator to flatten it manually. Only a 0 from BOTH
     mapping steps (--step no-mapping and --step unfillable-ask) is evidence
-    that the V2 order path may be trusted to run unsupervised.
+    that the V2 order path may be trusted to run unsupervised. A usage error
+    (an invalid argument, or an ORDER_API_VERSION other than "v2") also exits
+    2, through argparse, before any step runs.
 """
 import argparse
 import json
@@ -211,6 +224,63 @@ _FAIL = "FAIL"
 _NEUTRAL = "NEUTRAL"
 
 _EXIT_CODES = {_PASS: 0, _FAIL: 1, _NEUTRAL: 2}
+
+# What the operator must do when a step shows the V2 order path misbehaving,
+# in two halves. The V2 endpoint is the bot's only order path
+# (config.order_api_version_error refuses any other), so the remedy is to stop
+# the bot from trading and clean up by hand, never to switch paths.
+#
+# _STOP_TRADING is the one wording of "halt the bot": _REMEDY and every
+# closing line main() prints after a FAIL start with it.
+_STOP_TRADING = (
+    "Stop trading until this is understood: stop the scheduler daemon if it is running, "
+    "and do not run main.py --mode prod."
+)
+# _FLATTEN is printed only where the probe checked that the account was flat
+# on the ticker before it submitted, so any position there now is the probe's
+# own. Anywhere else the position could be the bot's, and closing it by hand
+# could undo a live trade.
+_FLATTEN = (
+    "Flatten any position on the probed ticker by hand in the Kalshi UI; there is no "
+    "other order path to fall back on."
+)
+# The full remedy, printed by the three FAIL lines that doubt the path after a
+# submission on an account the probe had verified flat: a disproven NO-leg
+# mapping, a non-conforming fill-or-kill response, and a close that did not
+# return the position to flat (all in _step_no_mapping).
+_REMEDY = f"{_STOP_TRADING} {_FLATTEN}"
+
+# The last sentence of main()'s closing line after an order step that did not
+# PASS: one PASS of each mapping step is the evidence the V2 path needs.
+_BOTH_STEPS_MUST_PASS = (
+    "Both --step no-mapping and --step unfillable-ask have to PASS before the V2 order "
+    "path should be trusted to run unsupervised."
+)
+# main()'s closing line after --step no-mapping or --step unfillable-ask FAILs.
+# It does not tell the operator to flatten: the step's own lines above say
+# whether a position the probe opened is on the ticker, and a FAIL that came
+# before any submission opened nothing.
+_ORDER_FAIL_CLOSING = (
+    f"{_STOP_TRADING} Act only on the position warnings printed above: a FAIL before "
+    "anything was submitted (a market that could not be read, or a starting position "
+    "that was not flat or could not be read) opened nothing, so never flatten a position "
+    f"the bot holds because of it. {_BOTH_STEPS_MUST_PASS}"
+)
+# main()'s closing line after --step transfer FAILs. A transfer moves
+# collateral between shards and opens no position, so it names shard
+# balances, never a ticker.
+_TRANSFER_FAIL_CLOSING = (
+    f"{_STOP_TRADING} Check each shard's balance in the Kalshi UI before the bot moves "
+    "collateral again."
+)
+# main()'s closing line after any step comes back NEUTRAL (no liquidity, a
+# declined confirmation, a kill with the account flat, a skipped transfer):
+# the step reached no verdict, so there is nothing to halt or clean up.
+_NEUTRAL_CLOSING = (
+    "This result is inconclusive: nothing above shows the V2 order path misbehaving, so "
+    "it gives no reason to halt the bot or close a position. Address the reason printed "
+    f"above and re-run the step. {_BOTH_STEPS_MUST_PASS}"
+)
 
 
 def _emit(label: str, payload: Any) -> None:
@@ -853,7 +923,8 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     if start != 0:
         print(
             f"{_FAIL}: probe must start FLAT on {ticker} (position={start}; None means the "
-            "lookup itself failed). Close the position or pick another ticker."
+            "lookup itself failed). Pick another ticker: the position may be one the bot "
+            "holds, so never close it for the probe."
         )
         return _FAIL
 
@@ -1000,8 +1071,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             "the requested count nor zero (trader._v2_fill_status), but it reads no "
             "remaining_count at all — so a surprise confined to that field would pass it "
             "as a clean fill or a clean kill. This probe checks both counts deliberately. "
-            "*** CHECK THE ACCOUNT. *** Set config.ORDER_API_VERSION = \"legacy\" to hold "
-            "the bot on the legacy order path."
+            f"*** CHECK THE ACCOUNT. *** {_REMEDY}"
         )
         _recheck_and_report_position(client, ticker, after)
         return _FAIL
@@ -1026,8 +1096,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             f"(YES) position of {after} on {ticker}. 'ask' does NOT open a NO position, so "
             "trader._V2_LEG_SIDE takes the wrong side of the market. The reduce_only "
             "unwind is NOT being submitted — it rests on the same disproven mapping and "
-            "would add to this exposure. *** FLATTEN THE POSITION MANUALLY. *** "
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'
+            f"would add to this exposure. *** A POSITION IS OPEN ON {ticker}. *** {_REMEDY}"
         )
         return _FAIL
     if after == 0:
@@ -1083,7 +1152,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
         print(
             f"{_FAIL}: the reduce_only bid did NOT return the position to flat (position="
             f"{final}; None means the lookup failed). *** CHECK THE ACCOUNT MANUALLY. *** "
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'
+            f"{_REMEDY}"
         )
         return _FAIL
 
@@ -1452,10 +1521,20 @@ def main(argv: list | None = None) -> int:
     """
     Parse arguments, run one probe step against the live account, and report.
 
-    Builds a PRODUCTION client unconditionally (the sandbox implements neither
-    the V2 order endpoint nor sharding, so a sandbox result would prove
-    nothing), verifies credentials with a balance read, then runs the selected
-    step.
+    Refuses to start unless config.ORDER_API_VERSION is "v2"
+    (config.order_api_version_error, through parser.error: exit 2 before the
+    banner, logging or any request). Then builds a PRODUCTION client
+    unconditionally (the sandbox implements neither the V2 order endpoint nor
+    sharding, so a sandbox result would prove nothing), verifies credentials
+    with a balance read, and runs the selected step. The closing line after
+    the RESULT banner depends on the outcome: after a NEUTRAL it says the
+    result is inconclusive and calls for no action (_NEUTRAL_CLOSING); after
+    a FAIL of --step transfer it says to stop trading and check each shard's
+    balance (_TRANSFER_FAIL_CLOSING); after a FAIL of an order step it says
+    to stop trading and to act only on the position warnings the step printed
+    (_ORDER_FAIL_CLOSING). It never tells the operator to flatten on its own:
+    only the step lines that follow a submission on an account the probe had
+    verified flat print _REMEDY, whose second half does.
 
     Args:
         argv (list | None): Argument vector for testing. None reads sys.argv.
@@ -1468,6 +1547,10 @@ def main(argv: list | None = None) -> int:
             FAIL, not a NEUTRAL — DR-20). Only a 0 from BOTH no-mapping and
             unfillable-ask is evidence that the V2 order path may be trusted
             to run unsupervised.
+
+    Raises:
+        SystemExit: Status 2 (parser.error) on an invalid argument or on any
+            config.ORDER_API_VERSION but "v2", before anything is submitted.
     """
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.v2_probe",
@@ -1501,6 +1584,12 @@ def main(argv: list | None = None) -> int:
         help="Skip the interactive confirmation before each submission.",
     )
     args = parser.parse_args(argv)
+    # "v2" is the only order path the bot has, and the only one this probe
+    # verifies; any other ORDER_API_VERSION is a config error, refused (exit 2)
+    # before the banner, logging or any request
+    problem = config.order_api_version_error()
+    if problem:
+        parser.error(problem)
 
     # The scanner/trader/auth calls below log at INFO (order-book key mismatches,
     # transfer acceptance, submissions); without a handler those lines would be
@@ -1532,17 +1621,22 @@ def main(argv: list | None = None) -> int:
     outcome = _STEPS[args.step](client, args.ticker, args.yes, args.dest_shard)
 
     print(f"\n================ RESULT: {args.step} -> {outcome} ================")
-    if outcome != _PASS:
-        print(
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy order '
-            "path. Both --step no-mapping and --step unfillable-ask have to PASS before "
-            "the V2 order path should be trusted to run unsupervised."
-        )
-    else:
+    # The closing line depends on the outcome and the step: a NEUTRAL calls for
+    # no action, a transfer FAIL for a look at the shard balances, and an order
+    # step FAIL for a halt plus only the position warnings the step printed —
+    # never a blanket "flatten", since the ticker may carry the bot's own
+    # position
+    if outcome == _PASS:
         print(
             "Record this output. The V2 order path is only known-good once BOTH "
             "--step no-mapping and --step unfillable-ask have PASSED."
         )
+    elif outcome == _NEUTRAL:
+        print(_NEUTRAL_CLOSING)
+    elif args.step in _TICKER_STEPS:
+        print(_ORDER_FAIL_CLOSING)
+    else:
+        print(_TRANSFER_FAIL_CLOSING)
     return _EXIT_CODES[outcome]
 
 

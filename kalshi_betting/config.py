@@ -593,10 +593,11 @@ TAKER_FEE_RATE                = 0.07
 # `center_deci_edge_centi_cent` tick regime — $0.0001 ticks below $0.01 and
 # above $0.99, $0.001 ticks in between — so this 1c tolerance permits roughly
 # 10-100 ticks of price drift on those markets, depending on where in the band
-# the price sits, rather than the intended ~1. That is precisely why the
-# default order path is now ORDER_API_VERSION = "v2" (below), whose dollar-
-# string limit price is capped in ticks; this constant only still applies when
-# that switch is flipped back to "legacy" as a rollback.
+# the price sits, rather than the intended ~1. That is why the bot orders
+# through the V2 path (ORDER_API_VERSION, below), whose dollar-string limit
+# price is capped in ticks (BUY_SLIPPAGE_TICKS). Only trader.py's legacy order
+# builders read this constant, and no entry point reaches them: main.py and
+# the human-run order-path probe refuse to start on any order path but "v2".
 BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 
 # Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
@@ -681,24 +682,21 @@ MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
 # genuinely sub-threshold pairs at the bottom of the book.
 PRICE_EPSILON                 = 1e-6
 
-# Which create-order endpoint trader.py submits through. Allowed values:
-#   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
-#              (the reduce_only unwind is immediate_or_cancel instead; the
-#              limit price IS the price protection), fixed-point counts,
-#              bid/ask sides on the single YES book, explicit exchange_index.
-#              Only this path can express a cap at the market's real tick
-#              resolution (see BUY_SLIPPAGE_TICKS above).
-#   "legacy" — the original /portfolio/orders create-order call
-#              (CreateOrderRequest, type="market", integer-cents buy_max_cost
-#              via BUY_MAX_COST_SLIPPAGE_CENTS).
-# The legacy path is retained UNMODIFIED in trader.py purely so flipping this
-# constant to "legacy" is the instant rollback procedure if the first live or
-# sandbox V2 submission misbehaves — no code change, no redeploy of logic.
-# Default is "v2" because the legacy endpoint is past its "no earlier than
-# 2026-05-06" deprecation window and costs 5x rate-limit tokens per request.
-# Note that dev/sandbox V2 support is UNVERIFIED (dev mode never submits
-# orders), so the first real production submission is the true verification of
-# the V2 request/response mapping — see the V2 gotcha in CLAUDE.md.
+# The order path the bot submits through. "v2" is the only supported value:
+# POST V2_ORDER_PATH below, with dollar-string fill-or-kill LIMIT prices (the
+# reduce_only unwind is immediate_or_cancel instead; the limit price IS the
+# price protection), fixed-point counts, bid/ask sides on the single YES book
+# and an explicit exchange_index on every order. It is the only endpoint
+# Kalshi accepts orders on, and the only one that can cap a price at the
+# market's real tick resolution (see BUY_SLIPPAGE_TICKS above).
+#
+# It stays a named, checked setting so a wrong value is caught before any
+# money moves: main.py and the human-run order-path probe call
+# order_api_version_error() at startup, before logging is configured or any
+# request is made, and exit 2 on anything but "v2". If the V2 path ever
+# misbehaves, the remedy is to stop trading and flatten by hand in the Kalshi
+# UI — there is no other order path to fall back on (see the V2 gotcha in
+# CLAUDE.md).
 ORDER_API_VERSION             = "v2"
 
 # Full API path of the V2 create-order endpoint, including the /trade-api/v2
@@ -2244,6 +2242,38 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
         out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
                    "positive, so no time-series trade can size")
     return out
+
+
+def order_api_version_error() -> str | None:
+    """
+    Say why ORDER_API_VERSION is unusable, or return None when it is "v2".
+
+    The bot has one order path, the V2 endpoint at V2_ORDER_PATH, so the only
+    accepted value is exactly the str "v2": anything else — another spelling
+    ("V2", " v2"), an empty string, a non-str, or the name of an order path
+    Kalshi does not accept — is a configuration error. main.main() and the
+    human-run order-path probe's main() call this right after parsing their
+    arguments, before logging is configured and before any request is made,
+    and hand a message to argparse's parser.error, so the process exits 2
+    with the message on stderr and no order can be built. The message only
+    ever points back at "v2", since there is no other path to switch to.
+
+    Reads this module's ORDER_API_VERSION at call time, so a test that
+    monkeypatches config.ORDER_API_VERSION takes effect.
+
+    Returns:
+        str | None: None if ORDER_API_VERSION is exactly "v2"; otherwise one
+            line naming the value (by repr) and how to fix it.
+    """
+    value = ORDER_API_VERSION
+    if type(value) is str and value == "v2":
+        return None
+    return (
+        f"config.ORDER_API_VERSION is {value!r}, but \"v2\" (POST {V2_ORDER_PATH}) is the "
+        "only order path this bot has: Kalshi retired the legacy /portfolio/orders order "
+        "endpoint, so there is nothing to switch to. Set ORDER_API_VERSION = \"v2\" in "
+        "config.py."
+    )
 
 
 def create_new_output(path: Path) -> tuple[Path, BinaryIO]:
