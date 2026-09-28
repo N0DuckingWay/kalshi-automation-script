@@ -27,7 +27,9 @@ Purpose:
     manual review), naming how many NO contracts are still open when a V2
     unwind's response reports a partial close. Multiple pairs are executed
     concurrently via ThreadPoolExecutor, so no pair waits for another to
-    complete, but their POSTs share one pacer: every order and
+    complete — except on the V2 path until this process has confirmed or
+    disproven the NO-leg side mapping, when pairs run one at a time (see
+    execute_trades) — but their POSTs share one pacer: every order and
     collateral-transfer POST, from every worker, first takes a place on
     _ORDER_WRITE_PACER (a token bucket at
     config.ORDER_WRITES_PER_SECOND with bursts of config.ORDER_WRITE_BURST),
@@ -165,7 +167,12 @@ Notes:
     otherwise both fake a disproof and mask a real one. A process-lifetime
     latch (_V2_NO_MAPPING_CONFIRMED) keeps the cost at one extra positions
     read per run; the latch is shared across pair types, because it verifies
-    the exchange's side mapping, not any particular market.
+    the exchange's side mapping, not any particular market. A disproof sets a
+    second process-lifetime latch (_V2_NO_MAPPING_DISPROVEN), and every later
+    pair of the run is then stopped before anything is read or sent
+    (status "failed"). Until one of the two latches is set, execute_trades
+    runs pairs one at a time, so a disproof costs one wrong-side position
+    rather than one per pair already in flight.
 
     Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
     shards and every market carries its own exchange_index; each V2 order body
@@ -198,6 +205,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal, Inexact, localcontext
 from json import JSONDecodeError
@@ -358,18 +366,29 @@ def _ordered_legs(spec: TradeSpec) -> tuple[_Leg, _Leg]:
 _V2_PRICE_QUANTUM = Decimal("0.0001")
 
 # Process-lifetime latch for the V2 NO-leg mapping backstop in _execute_one().
-# False until a V2 NO buy has been observed to produce a NEGATIVE account
-# position (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
-# hypothesises). The mapping only needs disproving ONCE, and one confirmed
-# negative-sign position proves it for every later trade this run — so once
-# confirmed the check is skipped and the backstop costs one extra positions
-# read per PROCESS, not one per trade. Shared across pair types on purpose:
+# False until a V2 NO buy has been observed to move the account position by
+# exactly -count (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
+# hypothesises). One confirmation proves the mapping for every later trade
+# this run — so once confirmed the check is skipped and the backstop costs
+# one extra positions read per PROCESS, not one per trade. Shared across pair
+# types on purpose:
 # it verifies the exchange's side mapping, not any market, so a same_title NO
 # fill (on market_a) proves it for a time_series NO fill (on market_b) and
 # vice versa. Deliberately not persisted anywhere: a fresh process
 # re-verifies, which is cheap and keeps the check honest across restarts and
 # API changes.
 _V2_NO_MAPPING_CONFIRMED = False
+
+# Process-lifetime latch set when the backstop DISPROVES the V2 NO-leg
+# mapping. From then on no pair in this process sends anything: _execute_one
+# stops each later pair before it reads a position or builds an order
+# (status "failed", nothing submitted), and a pair whose NO leg filled before
+# the stop reached it stops at manual_review before its YES leg. The CRITICAL
+# logged at the disproof tells the operator to stop trading and flatten by
+# hand, so the bot must not keep opening positions on the same mapping for
+# the rest of the run. Only a new process clears it; like the confirmation
+# latch it is never persisted.
+_V2_NO_MAPPING_DISPROVEN = False
 
 # Pause before re-reading a ZERO position delta. Named for its first caller,
 # the V2 NO-mapping backstop, but it is now the module's single ledger-lag
@@ -2650,7 +2669,8 @@ def _confirm_v2_no_mapping(
     Called by _execute_one() immediately after the NO leg's FoK reports filled
     and BEFORE the YES leg is submitted, so a disproven mapping is caught with
     exactly one wrong-side position outstanding rather than a completed pair.
-    No-ops entirely on the legacy path and after the first confirmation
+    No-ops entirely on the legacy path and, unless the mapping has been
+    disproven (see below), after the first confirmation
     (_V2_NO_MAPPING_CONFIRMED), so the mapping is verified once per process
     rather than once per trade — it is a property of the exchange, not of a
     particular trade, market or pair type. The latch is therefore shared
@@ -2672,9 +2692,11 @@ def _confirm_v2_no_mapping(
     Three outcomes:
       * delta ~= -no_leg.count -> hypothesis holds; latch it and proceed to
         the YES leg.
-      * any other delta -> hypothesis DISPROVEN live. Return a manual_review
-        result: the YES leg is not submitted (it would hedge a position we do
-        not actually hold) and the NO leg is deliberately NOT auto-unwound,
+      * any other delta -> hypothesis DISPROVEN live. Set the disproven
+        latch (_V2_NO_MAPPING_DISPROVEN), so _execute_one sends nothing for
+        any later pair of this process, and return a manual_review result:
+        the YES leg is not submitted (it would hedge a position we do not
+        actually hold) and the NO leg is deliberately NOT auto-unwound,
         because the unwind is a bid resting on the SAME mapping hypothesis, so
         an automated unwind could double the error rather than reverse it.
         The rollback's reduce_only flag would make a wrong unwind fail safe
@@ -2692,12 +2714,25 @@ def _confirm_v2_no_mapping(
 
     A delta of exactly zero gets one short pause and a re-read before being
     judged: genuine disproof moves the position the wrong way, while a
-    momentarily unchanged ledger is usually read-after-write lag.
+    momentarily unchanged ledger is usually read-after-write lag. A zero that
+    survives the re-read is judged disproven like any other wrong delta, and
+    sets the latch too: the ledger then contradicts the fill report, a state
+    the bot cannot model.
 
-    Concurrency: execute_trades() runs pairs in parallel, so two trades can
-    reach this before either latches — that costs a duplicate positions read
-    and, in the disproven case, sends both to manual_review. Both outcomes are
-    harmless; a bool assignment is atomic under the GIL.
+    If the mapping was already disproven in this process when this runs —
+    this pair's NO leg filled after another pair's disproof — no position is
+    read: the pair stops at manual_review with the YES leg unsubmitted and
+    the NO leg left in place, exactly as the disproving pair did. The
+    disproven latch is checked before the confirmed one, so a disproof is
+    never outweighed by a confirmation from another pair.
+
+    Concurrency: execute_trades() runs pairs one at a time until this check
+    has confirmed or disproven the mapping, so through it no two pairs reach
+    the check together, and no pair is past its NO leg when the disproven
+    latch is set. A caller that ran _execute_one concurrently some other way
+    could send two pairs here at once: that costs a duplicate positions read,
+    and each pair still stops on its own evidence or on the latch. A bool
+    assignment is atomic under the GIL.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -2715,14 +2750,35 @@ def _confirm_v2_no_mapping(
         TradeResult | None: None when the caller should proceed to the YES leg
             (mapping confirmed, already confirmed this process, legacy path, or
             unverifiable); a status="manual_review" TradeResult when the
-            mapping was disproven and the pair must stop.
+            mapping was disproven — by this pair, or earlier in this process —
+            and the pair must stop.
     """
-    global _V2_NO_MAPPING_CONFIRMED
+    global _V2_NO_MAPPING_CONFIRMED, _V2_NO_MAPPING_DISPROVEN
     # Read the module-level ORDER_API_VERSION exactly as the _*_any dispatchers
     # do, so the backstop can never check a path that was not the one submitted
-    if ORDER_API_VERSION != "v2" or _V2_NO_MAPPING_CONFIRMED:
+    if ORDER_API_VERSION != "v2":
         return None
     ticker = no_leg.market.ticker
+    if _V2_NO_MAPPING_DISPROVEN:
+        # Another pair already disproved the mapping and this pair's NO leg
+        # filled anyway (it was past _execute_one's stop when the latch was
+        # set). Treat it like the disproving pair: its YES leg and any unwind
+        # would rest on the same disproven mapping.
+        logging.critical(
+            "V2 NO leg on %s filled after the NO-leg mapping was disproven"
+            " earlier in this run — NOT submitting the YES leg and NOT"
+            " auto-unwinding. A human must flatten this account position too.",
+            ticker,
+        )
+        return TradeResult(
+            spec=spec, status="manual_review",
+            error=(
+                f"V2 NO-leg mapping disproven earlier in this run; NO leg on"
+                f" {ticker} filled, YES leg not submitted and NO leg not unwound"
+            ),
+        )
+    if _V2_NO_MAPPING_CONFIRMED:
+        return None
     # Ground truth for the mapping: how the account's own signed position
     # MOVED across the fill. Single-shot on purpose — see the docstring.
     delta = _fill_delta(before_no, _position_count_once(client, ticker))
@@ -2759,11 +2815,14 @@ def _confirm_v2_no_mapping(
             ticker, delta, no_leg.count,
         )
         return None
+    # Latch before logging, so no later pair of this process sends anything
+    _V2_NO_MAPPING_DISPROVEN = True
     logging.critical(
         "V2 NO-LEG MAPPING DISPROVEN on %s — the NO leg's ask did not open NO"
         " exposure: expected a position delta of %d, got %s. NOT submitting the"
         " YES leg and NOT auto-unwinding (the unwind is a bid resting on the"
-        " same disproven hypothesis, so it could double the error). A human"
+        " same disproven hypothesis, so it could double the error). The rest"
+        " of this run is stopped: no later pair sends any order. A human"
         " must flatten this account position; set config.ORDER_API_VERSION ="
         " \"legacy\" to revert to the proven order path.",
         ticker, -no_leg.count, delta,
@@ -2853,6 +2912,19 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     -no_leg.count disproves the unverified NO-leg mapping and stops the pair
     at "manual_review" before the YES leg is submitted.
 
+    Once the mapping has been disproven in this process
+    (_V2_NO_MAPPING_DISPROVEN), a pair is stopped first of all, before any
+    position is read or any order is built: status "failed", because nothing
+    was sent and there is nothing to unwind. The check sits at the top rather
+    than just before the NO leg's POST because execute_trades runs pairs one
+    at a time until the mapping is confirmed or disproven, so no pair can be
+    between the two points when the latch is set; checking first also spares
+    each stopped pair its two baseline reads. A pair already past this check
+    when another pair sets the latch — possible only for a caller that runs
+    pairs concurrently before the mapping is verified, which execute_trades
+    does not — still sends its NO leg, and stops at manual_review before its
+    YES leg (see _confirm_v2_no_mapping).
+
     The pair's places on the shared write pacer come from one _PairWrites:
     the NO leg waits for two free tokens and holds the second, so the YES leg
     is sent with no wait; an unwind takes the hedge lane, ahead of every
@@ -2864,7 +2936,10 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
         spec (TradeSpec): The trade specification to execute.
 
     Returns:
-        TradeResult: With status "executed", "failed", "rolled_back",
+        TradeResult: With status "executed", "failed" (the NO leg confirmed
+            unfilled, or nothing sent at all — a legacy-unroutable pair, or a
+            pair stopped because the V2 NO-leg mapping was disproven earlier
+            in this process), "rolled_back",
             "rollback_failed" (the unwind did not fill, or — on V2, whose
             immediate-or-cancel unwind can stop part-way — closed only part of
             the position; what is left open is an orphaned position needing
@@ -2893,6 +2968,26 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     Returns:
         TradeResult: As _execute_one.
     """
+    # Once a pair has disproven the V2 NO-leg mapping, nothing else is sent in
+    # this process: stop before any position read or order build, so the stop
+    # costs no API call. Nothing was sent, so "failed" (nothing to unwind);
+    # the run still exits EXIT_TRADES_NEED_ATTENTION through the disproving
+    # pair's own manual_review result.
+    if _V2_NO_MAPPING_DISPROVEN:
+        logging.warning(
+            "Not sending '%s' (A=%s B=%s) — the V2 NO-leg mapping was disproven"
+            " earlier in this run; nothing submitted",
+            spec.pair.canonical_title, spec.pair.market_a.ticker,
+            spec.pair.market_b.ticker,
+        )
+        return TradeResult(
+            spec=spec, status="failed",
+            error=(
+                "NO leg not sent: V2 NO-leg mapping disproven earlier in this"
+                " run; nothing submitted"
+            ),
+        )
+
     # Legacy-mode shard guard — must run before ANY order is built or sent.
     # Markets are tagged with their shard at ingest, but the legacy order
     # endpoint has no shard-routing parameter and can only reach
@@ -3168,6 +3263,25 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     return TradeResult(spec=spec, status="executed")
 
 
+def _v2_mapping_unverified() -> bool:
+    """
+    Whether pairs must still run one at a time (see execute_trades).
+
+    Returns:
+        bool: True while the V2 order path is selected and this process has
+            neither confirmed nor disproven the NO-leg side mapping; False on
+            the legacy path, which has no mapping check, and once either
+            latch is set (neither is ever cleared within a process).
+    """
+    # Read the module-level ORDER_API_VERSION exactly as _confirm_v2_no_mapping
+    # does, so the one-at-a-time phase covers exactly the pairs it checks
+    return (
+        ORDER_API_VERSION == "v2"
+        and not _V2_NO_MAPPING_CONFIRMED
+        and not _V2_NO_MAPPING_DISPROVEN
+    )
+
+
 def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     """
     Execute each TradeSpec as a sequential two-leg trade, with pairs running
@@ -3177,9 +3291,25 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     for a same_title pair, market_b for a time_series pair — see
     _ordered_legs) is submitted first, then the YES leg only if the NO leg
     filled, with a floored-limit rollback of the NO leg if the YES leg fails.
-    All specs run concurrently via ThreadPoolExecutor, so no pair waits for
-    another to finish, but their POSTs share one pacer (_ORDER_WRITE_PACER),
-    where a pair's YES leg and unwind go ahead of other pairs' NO legs.
+    Specs run concurrently via ThreadPoolExecutor, and their POSTs share one
+    pacer (_ORDER_WRITE_PACER), where a pair's YES leg and unwind go ahead of
+    other pairs' NO legs.
+
+    The exception is the V2 path before this process has confirmed or
+    disproven the NO-leg side mapping (_confirm_v2_no_mapping): until then
+    each pair must finish before the next one starts. The mapping is checked
+    on a pair's own NO fill, and concurrent pairs all send their NO legs
+    before the first check can finish (on the first live run, 2026-09-28, all
+    7 NO legs went out before the first confirmation), so a disproof would
+    otherwise find a wrong-side position on every pair already in flight.
+    One at a time, a disproof costs one position: its latch stops every later
+    pair before anything is sent (status "failed"). Once the mapping is
+    confirmed the remaining pairs start together, as before. The cost is
+    paid once per process: the first pair (and any after it whose NO leg is
+    killed, or whose check cannot read the account's positions) runs alone,
+    typically a few round trips, or about a second more when the ledger lags
+    and the check re-reads. The legacy path has no mapping check and always
+    runs pairs concurrently.
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own
@@ -3198,7 +3328,9 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     Returns:
         list: List of TradeResult objects (from reporter.py), one per spec. Each
             result has status="executed" (both legs filled), "simulated" (dry
-            run), "failed" (NO leg confirmed unfilled), "rolled_back" (YES leg
+            run), "failed" (NO leg confirmed unfilled, or nothing sent — e.g. a
+            pair stopped after the V2 NO-leg mapping was disproven),
+            "rolled_back" (YES leg
             confirmed unfilled, NO leg unwound), "rollback_failed" (NO-leg
             unwind did not fill, or on V2 closed only part of the position —
             orphaned position), or "manual_review" (a
@@ -3230,7 +3362,17 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
         return results
 
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
-        future_to_spec = {pool.submit(_execute_one, client, spec): spec for spec in specs}
+        future_to_spec: dict = {}
+        for spec in specs:
+            future = pool.submit(_execute_one, client, spec)
+            future_to_spec[future] = spec
+            # While the V2 NO-leg mapping is neither confirmed nor disproven,
+            # let this pair finish before the next one starts (see the
+            # docstring). Checked after submitting: if this pair settled the
+            # mapping in the meantime, there is nothing to wait for. wait()
+            # never raises; a worker's exception is collected below.
+            if _v2_mapping_unverified():
+                wait_for_futures([future])
         results = []
         # Collect per-future so one worker's exception cannot discard every other
         # pair's TradeResult — including confirmed real fills. A list

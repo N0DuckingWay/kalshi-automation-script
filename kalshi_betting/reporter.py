@@ -131,8 +131,10 @@ class TradeResult:
             check confirmed the fill — see error below), "simulated" for a
             dry-run or dev-mode run, "failed" for a NO leg that is confirmed
             unfilled (a clean FoK rejection, an error with an attributable zero
-            delta, or — on the legacy order path — a spec refused before
-            submission because a leg sits off the routable shard),
+            delta, or a spec refused before anything was submitted: on the
+            legacy order path because a leg sits off the routable shard, and
+            on the V2 path because the NO-leg side mapping was disproven
+            earlier in the process),
             "rolled_back" if the NO leg filled but the YES leg is confirmed
             unfilled and the NO leg's unwind filled in full, "rollback_failed"
             if that unwind itself did not fill or closed only part of the
@@ -141,7 +143,8 @@ class TradeResult:
             or "manual_review" if a leg's fill state could not be
             attributed to this order (the position lookup failed, the position
             moved by an unexplained amount, the NO-leg side mapping was
-            disproven after the NO leg filled on the V2 path, or an unhandled
+            disproven after the NO leg filled on the V2 path — by this pair's
+            own check or earlier in the process — or an unhandled
             exception escaped the pair's worker thread in execute_trades) and
             no automated order was submitted in response.
         error (Optional[str]): Error message when the leg(s) involved required

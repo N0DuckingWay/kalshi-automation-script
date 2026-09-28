@@ -1087,7 +1087,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # Never a bare return — see the routability check above
         return clean_exit
 
-    # Submit orders sequentially per leg, concurrently across pairs
+    # Submit orders sequentially per leg, concurrently across pairs (on the V2
+    # path, one pair at a time until the first NO fill has confirmed the
+    # order-side mapping; a disproof stops every later pair)
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
     # Read the post-trade balance for the Excel log separator row. Real orders
@@ -1146,7 +1148,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # NO-leg side mapping was disproven by the positions ledger after a
     # confirmed NO-leg fill, leaving that leg in place and the YES leg
     # unsubmitted. Every case is just as urgent as an orphaned rollback
-    # failure, so it's counted in the same manual-review alert.
+    # failure, so it's counted in the same manual-review alert. The later
+    # pairs a disproof stops sent nothing and come back "failed", so they are
+    # not counted here; the disproving pair's manual_review is what returns
+    # EXIT_TRADES_NEED_ATTENTION.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "

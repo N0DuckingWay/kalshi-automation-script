@@ -4,12 +4,14 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and one helper. Three autouse guards: one points
+    Suite-wide pytest fixtures and one helper. Four autouse guards: one points
     the event-title accumulator and Kalshi's cached /series listing at a
     per-test tmp_path, so no test can touch the operator's real event-title
     accumulators or series_categories.json; one keeps every test off the
-    Treasury API and the real rates cache; and one gives every test a full,
-    fresh order-write pacer, so no test waits on writes an earlier test made.
+    Treasury API and the real rates cache; one gives every test a full,
+    fresh order-write pacer, so no test waits on writes an earlier test made;
+    and one clears trader's disproven-mapping latch, so a test that disproves
+    the V2 NO-leg mapping cannot stop every later test's trades.
     pre_toggle_defaults pins the live toggles for a test whose figures assume
     fixed values (they pin arithmetic, not config.py's policy); its helper,
     apply_pre_toggle_defaults, also serves class-scoped fixtures.
@@ -17,7 +19,8 @@ Purpose:
 Dependencies:
     Imports kalshi_betting.historical (the three cache paths),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
-    kalshi_betting.trader (its _WritePacer and _ORDER_WRITE_PACER), config, and
+    kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER and
+    _V2_NO_MAPPING_DISPROVEN), config, and
     backtester and backtest (the by-value copies they bind). Imported by
     pytest, and by test modules for apply_pre_toggle_defaults.
 
@@ -139,3 +142,20 @@ def _fresh_order_write_pacer(monkeypatch):
         trader, "_ORDER_WRITE_PACER",
         trader._WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST),
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_v2_mapping_disproof_latch(monkeypatch):
+    """
+    Start each test with trader's disproven-mapping latch clear.
+
+    trader._V2_NO_MAPPING_DISPROVEN lasts for the process, and once set,
+    _execute_one sends nothing for any pair. A test anywhere in the suite that
+    disproves the V2 NO-leg mapping would otherwise make every later test's
+    trades come back "failed" with nothing sent. monkeypatch puts back the
+    value from before the test, so it can never carry over in either direction.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Restores the latch afterwards.
+    """
+    monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)

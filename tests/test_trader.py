@@ -413,7 +413,9 @@ def _reset_v2_mapping_latch(monkeypatch):
     execution flips, so without this a single test that confirms the mapping
     would silently disable the backstop for every test that runs after it.
     monkeypatch restores the pre-test value at teardown, so the latch can never
-    leak across tests in either direction.
+    leak across tests in either direction. Its twin, the disproven latch
+    (trader._V2_NO_MAPPING_DISPROVEN), is cleared the same way for the whole
+    suite by conftest.py.
     """
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
 
@@ -2796,6 +2798,341 @@ class TestV2NoMappingBackstop:
         # those two reads happen and no third.
         assert client.get_positions_without_preload_content.call_count == 2
         assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+
+class _SharedLedgerExchange:
+    """A V2 order endpoint and positions ledger that concurrent pairs share.
+
+    Each filled order moves the account's signed position on its ticker: a
+    bid by +count, and an ask by ask_sign * count. An ask_sign of -1 is the
+    mapping the bot assumes (an ask opens NO, a short YES); +1 is a wrong
+    mapping the backstop must disprove. A ticker in `killed` gets the
+    exchange's HTTP 409 kill response instead of a fill. A ticker in
+    `unreadable` reads fine the first time (the pair's baseline) and fails on
+    every later read (the mapping check's).
+    """
+
+    def __init__(self, *, ask_sign: int = -1, killed=(), unreadable=()):
+        self.ask_sign = ask_sign
+        self.killed = set(killed)
+        self.unreadable = set(unreadable)
+        self.positions: dict[str, float] = {}
+        self.posts: list[dict] = []
+        self.reads: list[str] = []
+        self._lock = threading.Lock()
+
+    def post(self, client, method, path, body):
+        """Stand-in for trader.signed_request_json."""
+        with self._lock:
+            self.posts.append(dict(body))
+        if body["ticker"] in self.killed:
+            raise fok_kill_error()
+        count = int(Decimal(body["count"]))
+        sign = 1 if body["side"] == "bid" else self.ask_sign
+        with self._lock:
+            self.positions[body["ticker"]] = (
+                self.positions.get(body["ticker"], 0) + sign * count
+            )
+        return v2_resp(count, count)
+
+    def read(self, **kwargs):
+        """Stand-in for client.get_positions_without_preload_content."""
+        ticker = kwargs["ticker"]
+        with self._lock:
+            earlier = self.reads.count(ticker)
+            self.reads.append(ticker)
+            position = self.positions.get(ticker, 0)
+        if ticker in self.unreadable and earlier:
+            raise RuntimeError("positions endpoint down")
+        return positions_resp(ticker, position)
+
+    def client(self) -> MagicMock:
+        """A client whose position reads come from this ledger."""
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=self.read)
+        return client
+
+
+class TestV2MappingDisproofStopsTheRun:
+    """Once the backstop disproves the V2 NO-leg mapping, the process sends
+    nothing more: _V2_NO_MAPPING_DISPROVEN is set, every later pair stops
+    before it reads a position or builds an order (status "failed", nothing
+    submitted), and execute_trades runs pairs one at a time until the mapping
+    is confirmed or disproven, so a disproof costs one wrong-side position
+    instead of one per pair in flight.
+
+    Without the latch, 12 pairs whose NO fills all moved the position the wrong
+    way gave 12 manual_review results, 12 NO-leg POSTs and 12 CRITICALs. And
+    concurrency alone is enough to lose the protection: on the first live run
+    (2026-09-28 02:26) all 7 NO legs were sent before the first mapping check
+    finished, so a latch that pairs check only when they start would have
+    stopped none of them."""
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mode):
+        """V2 path, both latches clear: a fresh process's first run."""
+
+    @staticmethod
+    def _specs(n: int, types=("same_title", "time_series")) -> list:
+        """n specs on distinct tickers, cycling through the given pair types."""
+        specs = []
+        for i in range(n):
+            spec = make_spec(title=f"pair {i}", pair_type=types[i % len(types)])
+            spec.pair.market_a.ticker = f"TICK-A{i}"
+            spec.pair.market_b.ticker = f"TICK-B{i}"
+            specs.append(spec)
+        return specs
+
+    @pytest.mark.parametrize(
+        "types",
+        [("same_title", "time_series"), ("time_series", "same_title")],
+        ids=["same-title-disproves", "time-series-disproves"],
+    )
+    def test_a_disproof_stops_every_later_pair_before_its_no_leg(
+        self, monkeypatch, caplog, types,
+    ):
+        # Every NO fill moves the position the wrong way. The first pair's
+        # check disproves the mapping; the other eleven, of both pair types,
+        # send nothing and read nothing.
+        exchange = _SharedLedgerExchange(ask_sign=+1)
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        specs = self._specs(12, types)
+        with caplog.at_level(logging.INFO, logger="root"):
+            results = execute_trades(exchange.client(), specs, dry_run=False)
+
+        assert [r.spec for r in results] == specs
+        assert results[0].status == "manual_review"
+        assert "mapping disproven" in results[0].error
+        assert [r.status for r in results[1:]] == ["failed"] * 11
+        assert {r.error for r in results[1:]} == {
+            "NO leg not sent: V2 NO-leg mapping disproven earlier in this run;"
+            " nothing submitted"
+        }
+        # One order in the whole run: the first pair's NO leg
+        assert len(exchange.posts) == 1
+        assert exchange.posts[0]["ticker"] == _no_leg(specs[0]).market.ticker
+        assert exchange.posts[0]["side"] == "ask"
+        # Only the first pair read the account: its two baselines and the check
+        assert len(exchange.reads) == 3
+        assert trader._V2_NO_MAPPING_DISPROVEN is True
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+
+        disproofs = [
+            r for r in caplog.records
+            if r.levelno == logging.CRITICAL and "DISPROVEN" in r.getMessage()
+        ]
+        assert len(disproofs) == 1
+        assert "The rest of this run is stopped" in disproofs[0].getMessage()
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.CRITICAL and r not in disproofs
+        ]
+        stopped = [r.getMessage() for r in caplog.records if "Not sending" in r.getMessage()]
+        assert len(stopped) == 11
+        assert all("A=TICK-A" in m and "B=TICK-B" in m for m in stopped)
+
+    def test_pairs_run_one_at_a_time_until_the_mapping_is_confirmed(self, monkeypatch):
+        # Pair 0's NO leg is killed and pair 1's check cannot read the
+        # account, so neither settles the mapping and each runs alone. Pair 2
+        # confirms it, and pairs 3-5 then start together: they can only get
+        # past the barrier together, so run one at a time the first of them
+        # would wait out its timeout and every one would fail.
+        specs = self._specs(6)
+        exchange = _SharedLedgerExchange(
+            killed=[_no_leg(specs[0]).market.ticker],
+            unreadable=[_no_leg(specs[1]).market.ticker],
+        )
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        # A roomy pacer, so no pair waits on the write limit in real time
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", trader._WritePacer(1000, 100))
+        index = {id(spec): i for i, spec in enumerate(specs)}
+        events: list[tuple[str, int]] = []
+        lock = threading.Lock()
+        together = threading.Barrier(3, timeout=5)
+        real = trader._execute_one
+
+        def run(client, spec):
+            i = index[id(spec)]
+            with lock:
+                events.append(("start", i))
+            try:
+                if i >= 3:
+                    together.wait()
+                return real(client, spec)
+            finally:
+                with lock:
+                    events.append(("end", i))
+
+        monkeypatch.setattr(trader, "_execute_one", run)
+        results = execute_trades(exchange.client(), specs, dry_run=False)
+
+        assert [r.status for r in results] == ["failed"] + ["executed"] * 5
+        assert events[:6] == [
+            ("start", 0), ("end", 0), ("start", 1), ("end", 1), ("start", 2), ("end", 2),
+        ]
+        assert sorted(events[6:]) == [
+            ("end", 3), ("end", 4), ("end", 5), ("start", 3), ("start", 4), ("start", 5),
+        ]
+        assert trader._V2_NO_MAPPING_CONFIRMED is True
+        assert trader._V2_NO_MAPPING_DISPROVEN is False
+
+    @pytest.mark.parametrize("state", ["legacy", "confirmed"])
+    def test_pairs_start_together_when_there_is_no_mapping_to_verify(
+        self, monkeypatch, state,
+    ):
+        # The legacy path has no mapping check, and a confirmed mapping is not
+        # re-checked, so nothing makes a pair wait for another: all four must
+        # be running at once to get past the barrier.
+        if state == "legacy":
+            monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
+        else:
+            monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
+        specs = self._specs(4)
+        together = threading.Barrier(4, timeout=5)
+
+        def run(client, spec):
+            together.wait()
+            return TradeResult(spec=spec, status="executed")
+
+        monkeypatch.setattr(trader, "_execute_one", run)
+        results = execute_trades(MagicMock(), specs, dry_run=False)
+        assert [r.status for r in results] == ["executed"] * 4
+
+    @pytest.mark.parametrize("pair_type", ["same_title", "time_series"])
+    def test_a_stopped_pair_reads_builds_and_sends_nothing(
+        self, monkeypatch, caplog, pair_type,
+    ):
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        post = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        builder = MagicMock(side_effect=AssertionError("an order was built"))
+        monkeypatch.setattr(trader, "_build_no_order_any", builder)
+        client = MagicMock()
+        pacer = trader._ORDER_WRITE_PACER
+        with caplog.at_level(logging.WARNING, logger="root"):
+            result = _execute_one(client, make_spec(pair_type=pair_type))
+        assert result.status == "failed"
+        assert result.error == (
+            "NO leg not sent: V2 NO-leg mapping disproven earlier in this run;"
+            " nothing submitted"
+        )
+        builder.assert_not_called()
+        post.assert_not_called()
+        client.get_positions_without_preload_content.assert_not_called()
+        client.create_order_without_preload_content.assert_not_called()
+        # Not even a place on the write pacer was taken
+        assert pacer._held == 0
+        assert pacer._tokens == float(config.ORDER_WRITE_BURST)
+        assert any(
+            r.levelno == logging.WARNING and "Not sending" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        "readings",
+        [
+            (("TICK-A", 5),),                    # moved the wrong way
+            (("TICK-A", -1),),                   # right way, wrong size
+            (("TICK-A", 0), ("TICK-A", 0)),      # unmoved, even after the re-read
+        ],
+        ids=["wrong-direction", "wrong-size", "persistent-zero"],
+    )
+    def test_every_disproof_sets_the_latch(self, monkeypatch, readings):
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post = MagicMock(side_effect=[v2_resp(5)])
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, *readings,
+        ))
+        assert _execute_one(client, make_spec()).status == "manual_review"
+        assert trader._V2_NO_MAPPING_DISPROVEN is True
+        assert trader._V2_NO_MAPPING_CONFIRMED is False
+        assert post.call_count == 1
+
+    @pytest.mark.parametrize(
+        "readings",
+        [
+            (("TICK-A", -5),),                                   # confirmed
+            (RuntimeError("positions endpoint down"),),          # unknown
+            (("TICK-A", 0), RuntimeError("positions endpoint down")),  # zero, then unknown
+        ],
+        ids=["confirmed", "unknown", "zero-then-unknown"],
+    )
+    def test_no_other_outcome_sets_the_latch(self, monkeypatch, readings):
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        monkeypatch.setattr(
+            trader, "signed_request_json", MagicMock(side_effect=[v2_resp(5), v2_resp(5)]),
+        )
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            None, None, *readings,
+        ))
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert trader._V2_NO_MAPPING_DISPROVEN is False
+
+    def test_the_legacy_path_never_sets_the_latch(self, monkeypatch):
+        monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"), order_resp("executed"),
+        ])
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        assert _execute_one(client, make_spec()).status == "executed"
+        assert trader._V2_NO_MAPPING_DISPROVEN is False
+
+    @pytest.mark.parametrize("confirmed", [False, True], ids=["unverified", "also-confirmed"])
+    def test_a_no_fill_after_another_pairs_disproof_stops_before_the_yes_leg(
+        self, monkeypatch, caplog, confirmed,
+    ):
+        # This pair was already past the stop when another pair disproved the
+        # mapping (the latch is set while its NO leg is in flight). That
+        # cannot happen through execute_trades, which runs pairs one at a time
+        # until the mapping is verified; it guards a caller that does not. The
+        # disproof outweighs a confirmation from yet another pair.
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", confirmed)
+        bodies: list[dict] = []
+
+        def post(client, method, path, body):
+            bodies.append(body)
+            monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+            return v2_resp(5)
+
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock(get_positions_without_preload_content=positions_seq(None, None))
+        with caplog.at_level(logging.INFO, logger="root"):
+            result = _execute_one(client, make_spec(pair_type="time_series"))
+        assert result.status == "manual_review"
+        assert "disproven earlier in this run" in result.error
+        assert "TICK-B" in result.error          # the time-series NO leg's market
+        # The NO leg only: no YES leg, and no unwind on the disproven mapping
+        assert [b["side"] for b in bodies] == ["ask"]
+        # The two baselines only: no mapping-check read
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert any(
+            r.levelno == logging.CRITICAL and "earlier in this run" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_dry_run_is_unaffected_by_the_latch(self, monkeypatch):
+        # A dry run never reaches _execute_one, so the latch changes nothing
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        post = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        results = execute_trades(client, self._specs(3), dry_run=True)
+        assert [r.status for r in results] == ["simulated"] * 3
+        post.assert_not_called()
+        client.get_positions_without_preload_content.assert_not_called()
+
+    def test_which_states_run_pairs_one_at_a_time(self, monkeypatch):
+        assert trader._v2_mapping_unverified() is True
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
+        assert trader._v2_mapping_unverified() is False
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        assert trader._v2_mapping_unverified() is False
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)
+        monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
+        assert trader._v2_mapping_unverified() is False
 
 
 class TestOrderVersionDispatch:
